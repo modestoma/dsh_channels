@@ -10,10 +10,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { FeishuService } from '../src/service.ts'
 import type { FeishuConfig } from '../src/config.ts'
 import type { ChannelFactory, FeishuChannel, NormalizedMessage } from '../src/feishu-channel.ts'
+import type { AgentHandle, SessionId } from '../src/dsh-types.ts'
 import {
-  makeHostContext, makeChannel, makeMessage, makeAgentPresets,
+  makeHostContext, makeChannel, makeMessage, makeAgentPresets, makeSession, makeAgent,
 } from './helpers.ts'
-import type { FakeAgentPresets, FakeAgentPresetsOptions } from './helpers.ts'
+import type { FakeAgentPresets, FakeAgentPresetsOptions, FakeAgentsOptions } from './helpers.ts'
 
 function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
   return {
@@ -45,12 +46,14 @@ async function setup(
   partial: Partial<FeishuConfig> = {},
   channelOptions: Parameters<typeof makeChannel>[0] = {},
   presetOptions?: FakeAgentPresetsOptions,
+  agentsOptions: FakeAgentsOptions = {},
 ): Promise<Harness> {
   const config = makeConfig(partial)
   const channel = makeChannel(channelOptions)
   const ctxState = makeHostContext(
     undefined,
     presetOptions === undefined ? undefined : makeAgentPresets(presetOptions),
+    agentsOptions,
   )
   const factoryCalls: unknown[] = []
   const factory: ChannelFactory = options => {
@@ -337,6 +340,106 @@ describe('FeishuService', () => {
       { agentCtx: resumed.setupCtx, id: 'standard' },
     ])
     await service2.shutdown()
+  })
+
+  it('borrows a live agent owned elsewhere instead of cold-resuming it', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: 'hello' }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const sessionId = h.ctxState.agents.created[0]!.options.sessionId
+    await h.service.shutdown()
+
+    // The session stays live under a foreign owner (e.g. the web UI's
+    // api-remote resolver resumed it right after the restart).
+    const foreignAgent = makeAgent(makeSession(sessionId))
+    const foreignDispose = vi.fn(async () => {})
+    h.ctxState.agents.liveAgents.set(sessionId, { agent: foreignAgent, dispose: foreignDispose })
+
+    const channel2 = makeChannel()
+    const service2 = new FeishuService(h.ctxState.ctx, h.config, () => channel2)
+    await service2.start()
+    const registered = (channel2.onMessage as unknown as ReturnType<typeof vi.fn>).mock.calls
+    const handler = registered[registered.length - 1]?.[0] as (msg: NormalizedMessage) => Promise<void> | undefined
+    await handler(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: '还在吗', threadId: 'omt_1' }))
+
+    // No cold resume: the borrowed agent received the followup directly.
+    await waitUntil(() => expect(mock(foreignAgent.followup)).toHaveBeenCalledTimes(1))
+    expect(h.ctxState.agents.resumed).toHaveLength(0)
+    const calls = mock(foreignAgent.followup).mock.calls
+    expect((calls[0]?.[0] as { content: Array<{ text: string }> }).content[0]?.text).toBe('还在吗')
+
+    // The reply card still lands in the topic as usual.
+    const sends = channel2.sent as Array<{ options?: { replyInThread?: boolean } }>
+    expect(sends[0]?.options?.replyInThread).toBe(true)
+
+    // Borrowed ≠ owned: shutdown must not dispose the foreign owner's agent.
+    await service2.shutdown()
+    expect(foreignDispose).not.toHaveBeenCalled()
+  })
+
+  it('borrows the live winner when a concurrent cold resume wins the race', async () => {
+    let sessionId: SessionId = '' as SessionId
+    let winner: AgentHandle | undefined
+    const h = await setup({}, {}, undefined, {
+      failResume: new Error('cannot prepare session "x" while it is live'),
+      onFailResume: () => {
+        // The other cold resume published the session and then our resume lost.
+        const agent = makeAgent(makeSession(sessionId))
+        winner = { agent, dispose: vi.fn(async () => {}) }
+        h.ctxState.agents.liveAgents.set(sessionId, winner)
+      },
+    })
+    await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: 'hello' }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    sessionId = h.ctxState.agents.created[0]!.options.sessionId
+    await h.service.shutdown()
+
+    const channel2 = makeChannel()
+    const service2 = new FeishuService(h.ctxState.ctx, h.config, () => channel2)
+    await service2.start()
+    const registered = (channel2.onMessage as unknown as ReturnType<typeof vi.fn>).mock.calls
+    const handler = registered[registered.length - 1]?.[0] as (msg: NormalizedMessage) => Promise<void> | undefined
+    await handler(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: '还在吗', threadId: 'omt_1' }))
+
+    await waitUntil(() => expect(winner).toBeDefined())
+    await waitUntil(() => expect(mock(winner!.agent.followup)).toHaveBeenCalledTimes(1))
+    expect((mock(winner!.agent.followup).mock.calls[0]?.[0] as { content: Array<{ text: string }> }).content[0]?.text).toBe('还在吗')
+
+    // The race must not surface to the user as a 处理失败 message.
+    expect(JSON.stringify(channel2.sent)).not.toContain('处理失败')
+    await service2.shutdown()
+  })
+
+  it('disposes an agent resumed during shutdown instead of leaking it live', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: 'hello' }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const sessionId = h.ctxState.agents.created[0]!.options.sessionId
+    await h.service.shutdown()
+
+    const channel2 = makeChannel()
+    const service2 = new FeishuService(h.ctxState.ctx, h.config, () => channel2)
+    await service2.start()
+
+    // Gate the resume so the shutdown can run while it is in flight.
+    let releaseResume: (handle: AgentHandle) => void = () => {}
+    const gate = new Promise<AgentHandle>(resolve => { releaseResume = resolve })
+    const resumeCalled = vi.fn(() => gate)
+    h.ctxState.ctx.agents.resume = resumeCalled
+
+    const registered = (channel2.onMessage as unknown as ReturnType<typeof vi.fn>).mock.calls
+    const handler = registered[registered.length - 1]?.[0] as (msg: NormalizedMessage) => Promise<void> | undefined
+    void handler(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: '还在吗', threadId: 'omt_1' }))
+    await waitUntil(() => expect(resumeCalled).toHaveBeenCalled())
+    await service2.shutdown()
+
+    // Release the in-flight resume: the just-published agent must be disposed
+    // so it cannot poison the next instance's resumes ("while it is live").
+    const lateAgent = makeAgent(makeSession(sessionId))
+    const lateDispose = vi.fn(async () => {})
+    releaseResume({ agent: lateAgent, dispose: lateDispose })
+    await waitUntil(() => expect(lateDispose).toHaveBeenCalledTimes(1))
+    expect(mock(lateAgent.followup)).not.toHaveBeenCalled()
   })
 
   it('reports session-creation failure on the card instead of crashing', async () => {

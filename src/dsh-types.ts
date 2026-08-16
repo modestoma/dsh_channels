@@ -193,6 +193,14 @@ export interface ResumeAgentOptions {
 export interface AgentRegistry {
   create(options: CreateAgentOptions): Promise<AgentHandle>
   resume(options: ResumeAgentOptions): Promise<AgentHandle>
+  /**
+   * Synchronous live-registry lookup (host parity with `ctx.agents.get`):
+   * the published agent for a session id when one is live, regardless of
+   * which owner published it. The plugin uses this to BORROW a live agent
+   * instead of cold-resuming a session another owner already holds (the
+   * persistence layer rejects `resume` on a live session).
+   */
+  get(id: SessionId): Agent | undefined
 }
 
 // ---- Workspace surface --------------------------------------------------

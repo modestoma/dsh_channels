@@ -53,6 +53,16 @@ interface LiveAgent {
   handle: AgentHandle
 }
 
+/**
+ * Wrap a live agent owned by someone else (web UI api-remote resolver, a
+ * previous plugin instance, a won cold-resume race). The borrow is fully
+ * deliverable through `followup`, but `dispose` is a no-op — the real owner
+ * retains the lifecycle, and shutting the plugin down must never kill it.
+ */
+function borrowLiveAgent(agent: Agent): LiveAgent {
+  return { agent, handle: { agent, dispose: async () => {} } }
+}
+
 /** What `agents.create`/`resume` need to compose one agent from a preset. */
 interface PresetComposition {
   /** Preset id recorded on the session header meta (absent without a roster). */
@@ -109,7 +119,7 @@ export class FeishuService {
   private domain: FeishuDomainHandle | undefined
   private readonly routeCache = new Map<string, RouteRecord>()
   private readonly live = new Map<string, LiveAgent>()
-  private readonly pendingResume = new Map<string, Promise<AgentHandle>>()
+  private readonly pendingResume = new Map<string, Promise<LiveAgent>>()
   /** `<provider>/<model>` → context window (lazy async fill; sync reads). */
   private readonly contextWindows = new Map<string, number>()
   private readonly windowRequests = new Set<string>()
@@ -430,6 +440,15 @@ export class FeishuService {
     const live = this.live.get(record.sessionId)
     if (live !== undefined) return live
 
+    // The session may already be live under another owner — the web UI's
+    // api-remote resolver, a previous plugin instance whose shutdown is still
+    // draining, or a concurrent cold resume that won the race. `agents.resume`
+    // refuses a live session ("cannot prepare … while it is live"), so BORROW
+    // the live agent instead: `followup` delivery works identically and the
+    // owning side keeps the dispose responsibility.
+    const foreign = this.ctx.agents.get(record.sessionId as SessionId)
+    if (foreign !== undefined) return borrowLiveAgent(foreign)
+
     let pending = this.pendingResume.get(record.sessionId)
     if (pending === undefined) {
       // Compose the resumed world from the same preset resolution as creation
@@ -443,18 +462,31 @@ export class FeishuService {
           setup: composition.setup,
         }))
         .then(handle => {
-          this.live.set(record.sessionId, { agent: handle.agent, handle })
-          return handle
+          if (!this.started) {
+            // Shutdown raced this in-flight resume: dispose the just-published
+            // agent so it cannot leak into the live registry of the next
+            // instance (whose every resume would then fail as "while it is live").
+            void handle.dispose().catch(() => {})
+            throw new Error('dsh-channels: session resume aborted by shutdown')
+          }
+          const liveAgent: LiveAgent = { agent: handle.agent, handle }
+          this.live.set(record.sessionId, liveAgent)
+          return liveAgent
+        })
+        .catch((error: unknown) => {
+          // Lost a cold-resume race: another owner published the session
+          // while our resume was in flight. Borrow the winner instead of
+          // failing the turn with "cannot prepare … while it is live".
+          const winner = this.ctx.agents.get(record.sessionId as SessionId)
+          if (winner !== undefined) return borrowLiveAgent(winner)
+          throw error
         })
         .finally(() => {
           this.pendingResume.delete(record.sessionId)
         })
       this.pendingResume.set(record.sessionId, pending)
     }
-    const handle = await pending
-    const entry = this.live.get(record.sessionId)
-    if (entry !== undefined) return entry
-    return { agent: handle.agent, handle }
+    return await pending
   }
 
   // ---- outbound helpers ------------------------------------------------

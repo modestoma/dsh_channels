@@ -36,16 +36,24 @@ export function makeAgent(session: Session): Agent {
 
 export interface FakeAgentsOptions {
   failCreate?: Error
+  /** When set, `resume()` rejects with this error (before registering anything). */
   failResume?: Error
+  /** Runs immediately before a failing `resume()` rejects (race seam: lets a
+   *  test register the "winner" agent the way a concurrent cold resume would). */
+  onFailResume?: (options: Parameters<AgentRegistry['resume']>[0]) => void
 }
 
 export function makeAgentRegistry(fail: FakeAgentsOptions = {}): {
   registry: AgentRegistry
   created: Array<{ options: Parameters<AgentRegistry['create']>[0]; handle: AgentHandle; setupCtx: unknown }>
   resumed: Array<{ options: Parameters<AgentRegistry['resume']>[0]; handle: AgentHandle; setupCtx: unknown }>
+  /** Live agents the registry answers to `get()`, mirroring the host's
+   *  published-agent registry (create/resume register, dispose unregisters). */
+  liveAgents: Map<string, AgentHandle>
 } {
   const created: Array<{ options: Parameters<AgentRegistry['create']>[0]; handle: AgentHandle; setupCtx: unknown }> = []
   const resumed: Array<{ options: Parameters<AgentRegistry['resume']>[0]; handle: AgentHandle; setupCtx: unknown }> = []
+  const liveAgents = new Map<string, AgentHandle>()
   const registry: AgentRegistry = {
     async create(options) {
       if (fail.failCreate !== undefined) throw fail.failCreate
@@ -56,22 +64,30 @@ export function makeAgentRegistry(fail: FakeAgentsOptions = {}): {
       await options.setup?.(setupCtx)
       const session = makeSession(options.sessionId)
       const agent = makeAgent(session)
-      const handle: AgentHandle = { agent, dispose: vi.fn(async () => {}) }
+      const handle: AgentHandle = { agent, dispose: vi.fn(async () => { liveAgents.delete(options.sessionId) }) }
+      liveAgents.set(options.sessionId, handle)
       created.push({ options, handle, setupCtx })
       return handle
     },
     async resume(options) {
-      if (fail.failResume !== undefined) throw fail.failResume
+      if (fail.failResume !== undefined) {
+        fail.onFailResume?.(options)
+        throw fail.failResume
+      }
       const setupCtx = {}
       await options.setup?.(setupCtx)
       const session = makeSession(options.resumeSessionId)
       const agent = makeAgent(session)
-      const handle: AgentHandle = { agent, dispose: vi.fn(async () => {}) }
+      const handle: AgentHandle = { agent, dispose: vi.fn(async () => { liveAgents.delete(options.resumeSessionId) }) }
+      liveAgents.set(options.resumeSessionId, handle)
       resumed.push({ options, handle, setupCtx })
       return handle
     },
+    get(id: SessionId) {
+      return liveAgents.get(id)?.agent
+    },
   }
-  return { registry, created, resumed }
+  return { registry, created, resumed, liveAgents }
 }
 
 export function makeWorkspaceRegistry(): { registry: WorkspaceRegistry; workspaces: Map<string, Workspace> } {
@@ -179,6 +195,7 @@ export function makeAgentPresets(options: FakeAgentPresetsOptions = {}): FakeAge
 export function makeHostContext(
   credentialValues?: Record<string, string>,
   agentPresets?: FakeAgentPresets,
+  agentsOptions: FakeAgentsOptions = {},
 ): {
   ctx: HostContext
   agents: ReturnType<typeof makeAgentRegistry>
@@ -187,7 +204,7 @@ export function makeHostContext(
   credentials: { resolve: ReturnType<typeof vi.fn>; values: Record<string, string> }
   sessionListeners: Array<(session: Session, event: SessionEvent) => void>
 } {
-  const agents = makeAgentRegistry()
+  const agents = makeAgentRegistry(agentsOptions)
   const workspaces = makeWorkspaceRegistry()
   const domain = makeDomain()
   const sessionListeners: Array<(session: Session, event: SessionEvent) => void> = []
