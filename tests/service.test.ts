@@ -68,10 +68,9 @@ describe('FeishuService', () => {
   beforeEach(() => {})
   afterEach(async () => {})
 
-  it('starts, connects, and uploads the chevron icon once', async () => {
+  it('starts and connects the channel', async () => {
     const h = await setup()
     expect(mock(h.channel.connect)).toHaveBeenCalled()
-    expect(mock(h.channel.uploadImage)).toHaveBeenCalledTimes(1)
     await h.service.shutdown()
     expect(mock(h.channel.disconnect)).toHaveBeenCalled()
   })

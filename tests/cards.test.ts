@@ -1,10 +1,11 @@
 /**
- * Card 2.0 JSON structure tests.
+ * Card JSON 2.0 structure tests.
  */
 
 import { describe, expect, it } from 'vitest'
 import {
   BODY_MAX_CHARS,
+  PANEL_CHEVRON_TOKEN,
   PANEL_TITLES,
   REASONING_MAX_CHARS,
   buildCard,
@@ -21,86 +22,66 @@ function baseState(partial: Partial<CardState> = {}): CardState {
   }
 }
 
-function firstElement(card: { elements: Array<{ tag: string }> }): { tag: string } {
-  const element = card.elements[0]
-  if (element === undefined) throw new Error('card has no elements')
-  return element
+interface CardShape {
+  schema: string
+  config: { width_mode: string }
+  body: { elements: Array<Record<string, any>> }
+}
+
+function elements(state: Partial<CardState> = {}): Array<Record<string, any>> {
+  const card = buildCard(baseState(state)) as unknown as CardShape
+  return card.body.elements
 }
 
 describe('buildCard', () => {
-  it('emits a classic-shape card (no schema marker) with the three sections in order', () => {
-    const card = buildCard(baseState()) as { schema?: unknown; elements: Array<{ tag: string }> }
-    expect(card.schema).toBeUndefined()
-    expect(card.elements.map(element => element.tag)).toEqual([
+  it('emits the 2.0 structure: schema + config.width_mode + body.elements', () => {
+    const card = buildCard(baseState()) as unknown as CardShape
+    expect(card.schema).toBe('2.0')
+    expect(card.config.width_mode).toBe('fill')
+    expect(card.body.elements.map(element => element.tag)).toEqual([
       'collapsible_panel',
       'hr',
       'markdown',
       'hr',
-      'note',
+      'markdown',
+      'markdown',
     ])
   })
 
-  it('renders the fold panel: default collapsed, bordered, right-aligned rotating chevron', () => {
-    const card = buildCard(baseState(), { imgKey: 'img_chevron' }) as {
-      elements: [{
-        tag: string
-        expanded: boolean
-        border: { color: string; corner_radius: string }
-        header: { title: { content: string }; icon: object; icon_position: string; icon_expanded_angle: number }
-      }]
-    }
-    const panel = card.elements[0]
-    expect(panel.expanded).toBe(false)
-    expect(panel.border).toEqual({ color: 'grey-200', corner_radius: '8px' })
-    expect(panel.header.title.content).toBe('推理中')
-    expect(panel.header.icon_position).toBe('right')
-    expect(panel.header.icon_expanded_angle).toBe(180)
-    expect(panel.header.icon).toEqual({
-      tag: 'img',
-      img_key: 'img_chevron',
-      alt: { tag: 'plain_text', content: '' },
+  it('renders the fold panel: default collapsed, bordered, right-aligned built-in chevron', () => {
+    const panel = elements()[0]
+    expect(panel?.expanded).toBe(false)
+    expect(panel?.border).toEqual({ color: 'grey', corner_radius: '8px' })
+    expect(panel?.header.title.content).toBe('推理中')
+    expect(panel?.header.icon_position).toBe('right')
+    expect(panel?.header.icon_expanded_angle).toBe(180)
+    expect(panel?.header.icon).toEqual({
+      tag: 'standard_icon',
+      token: PANEL_CHEVRON_TOKEN,
     })
-  })
-
-  it('omits the chevron icon when no img key was uploaded', () => {
-    const card = buildCard(baseState()) as {
-      elements: [{ header: { icon?: unknown } }]
-    }
-    expect(card.elements[0]?.header.icon).toBeUndefined()
   })
 
   it('switches the panel title by phase', () => {
     for (const phase of ['thinking', 'replying', 'done'] as const) {
-      const card = buildCard(baseState({ phase })) as {
-        elements: [{ header: { title: { content: string } } }]
-      }
-      expect(card.elements[0]?.header.title.content).toBe(PANEL_TITLES[phase])
+      const panel = elements({ phase })[0]
+      expect(panel?.header.title.content).toBe(PANEL_TITLES[phase])
     }
   })
 
   it('uses placeholders for empty reasoning and body', () => {
-    const card = buildCard(baseState({ phase: 'thinking' })) as {
-      elements: [
-        { elements: Array<{ content: string }> },
-        { tag: string },
-        { content: string },
-      ]
-    }
-    expect(card.elements[0]?.elements[0]?.content).toContain('等待模型输出')
-    expect(card.elements[2]?.content).toContain('正在生成')
+    const list = elements({ phase: 'thinking' })
+    expect(list[0]?.elements[0]?.content).toContain('等待模型输出')
+    expect(list[2]?.content).toContain('正在生成')
   })
 
   it('clips overly long reasoning and body under the 30 KB card budget', () => {
-    const long = 'x'.repeat(REASONING_MAX_CHARS + 5000)
-    const card = buildCard(baseState({ reasoning: long, body: 'y'.repeat(BODY_MAX_CHARS + 200) })) as {
-      elements: [
-        { elements: Array<{ content: string }> },
-        { tag: string },
-        { content: string },
-      ]
-    }
-    const reasoning = card.elements[0]?.elements[0]?.content ?? ''
-    const body = card.elements[2]?.content ?? ''
+    const card = buildCard(baseState({
+      reasoning: 'x'.repeat(REASONING_MAX_CHARS + 5000),
+      body: 'y'.repeat(BODY_MAX_CHARS + 200),
+    }))
+    const list = (card as unknown as CardShape).body.elements
+    const reasoning = list[0]?.elements[0]?.content ?? ''
+    const body = list[2]?.content ?? ''
     expect(reasoning.length).toBeLessThan(REASONING_MAX_CHARS + 100)
     expect(reasoning).toContain('已截断')
     expect(body.length).toBeLessThan(BODY_MAX_CHARS + 100)
@@ -108,8 +89,8 @@ describe('buildCard', () => {
     expect(JSON.stringify(card).length).toBeLessThan(30_000)
   })
 
-  it('renders the two info lines with session-cumulative figures', () => {
-    const card = buildCard(baseState({
+  it('renders the two info lines with session-cumulative figures in notation size', () => {
+    const list = elements({
       stats: {
         sessionId: 'sess-42',
         inputTokens: 12345,
@@ -120,15 +101,11 @@ describe('buildCard', () => {
         model: 'deepseek-v4-pro',
         effort: 'max',
       },
-    })) as {
-      elements: [
-        object, object, object, object,
-        { elements: Array<{ content: string }> },
-      ]
-    }
-    const note = card.elements[4]?.elements ?? []
-    const line1 = note[0]?.content ?? ''
-    const line2 = note[1]?.content ?? ''
+    })
+    const line1 = list[4]?.content ?? ''
+    const line2 = list[5]?.content ?? ''
+    expect(list[4]?.text_size).toBe('notation')
+    expect(list[5]?.text_size).toBe('notation')
     expect(line1).toContain('🔑 sess-42')
     expect(line1).toContain('input token 12,345')
     expect(line1).toContain('output token 678')
@@ -138,14 +115,9 @@ describe('buildCard', () => {
   })
 
   it('renders placeholders for missing cache/context figures', () => {
-    const card = buildCard(baseState()) as {
-      elements: [
-        object, object, object, object,
-        { elements: Array<{ content: string }> },
-      ]
-    }
-    const note = card.elements[4]?.elements ?? []
-    expect(note[1]?.content).toContain('缓存命中 —')
-    expect(note[1]?.content).toContain('上下文 —')
+    const list = elements()
+    const line2 = list[5]?.content ?? ''
+    expect(line2).toContain('缓存命中 —')
+    expect(line2).toContain('上下文 —')
   })
 })

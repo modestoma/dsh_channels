@@ -108,37 +108,44 @@
 - 折叠面板标题三态：首个 reasoning 增量前“推理中”；推理结束、正文开始后“回复中”；`agent.whenIdle()` 后“回复结束”。
 - 终态：`reaction.delete(Typing)` → `reaction.create("DONE")`。
 
-### 3.3 卡片 JSON（卡片 2.0 组件 · 经典结构）
+### 3.3 卡片 JSON（卡片 JSON 2.0 结构）
 
-> 根对象**不带** `schema: "2.0"`：飞书当前解析器见到 `schema` 会按新 schema 解析，并把经典结构的顶层 `elements` 判为未知属性（`230099 / 200621: unknown property, property: elements`）。省略 `schema` 即走经典卡片 JSON 结构，与官方 Lark 机器人扩展现行实现一致。
+> 整卡采用**当前 2.0 结构**：声明 `schema: "2.0"`，组件统一放在 `body.elements` 下。2.0 是富文本（标题/引用/表格/代码块）和流式能力的第一等结构，官方 Lark 机器人扩展现行实现同款。注意两点踩坑史：
+> - `schema: "2.0"` 与顶层 `elements` 混用会被拒（`230099 / 200621: unknown property, property: elements`）——2.0 的组件必须在 `body` 里；
+> - 折叠面板 header 的 `icon` 只支持 `standard_icon`（图标库 token）或 `custom_icon`，`tag: "img"` 非法（面板会被客户端丢弃）；此处用内置 `down-small-ccm_outlined` 下箭头，无需上传图片。
 
 ```jsonc
 {
-  "elements": [
-    { // 第一段：推理折叠面板
-      "tag": "collapsible_panel",
-      "expanded": false,
-      "border": { "color": "default", "corner_radius": "8px" },
-      "header": {
-        "title": { "tag": "plain_text", "content": "推理中" }, // 推理中|回复中|回复结束
-        "icon": { "tag": "standard_icon", "token": "down_chevron" }, // 折叠向下
-        "icon_expanded_angle": 180 // 展开时旋转 180° → 箭头向上
+  "schema": "2.0",
+  "config": { "width_mode": "fill" },
+  "body": {
+    "elements": [
+      { // 第一段：推理折叠面板
+        "tag": "collapsible_panel",
+        "expanded": false,
+        "border": { "color": "grey", "corner_radius": "8px" },
+        "header": {
+          "title": { "tag": "plain_text", "content": "推理中" }, // 推理中|回复中|回复结束
+          "icon": { "tag": "standard_icon", "token": "down-small-ccm_outlined" }, // 折叠向下
+          "icon_position": "right",
+          "icon_expanded_angle": 180 // 展开时旋转 180° → 箭头向上
+        },
+        "elements": [ { "tag": "markdown", "content": "<推理内容>" } ]
       },
-      "elements": [ { "tag": "markdown", "content": "<推理内容>" } ]
-    },
-    { "tag": "hr" },
-    { // 第二段：回复正文（富文本 markdown）
-      "tag": "markdown", "content": "<正文>"
-    },
-    { "tag": "hr" },
-    { // 第三段：session 信息，两行小字
-      "tag": "note",
-      "elements": [
-        { "tag": "plain_text", "content": "🔑 om_session_xxxx · ⬆ input token 12,345 · ⬇ output token 678" },
-        { "tag": "plain_text", "content": "🧠 模型 deepseek-v4-pro(max) · ⚡ 缓存命中 87.3% · 📊 上下文 24.1k/128k" }
-      ]
-    }
-  ]
+      { "tag": "hr" },
+      { // 第二段：回复正文（富文本 markdown，2.0 全语法）
+        "tag": "markdown", "content": "<正文>"
+      },
+      { "tag": "hr" },
+      { // 第三段：session 信息，两行小字（2.0 无 note 组件 → markdown + notation 字号）
+        "tag": "markdown",
+        "text_size": "notation",
+        "content": "🔑 om_session_xxxx · ⬆ input token 12,345 · ⬇ output token 678"
+      },
+      { "tag": "markdown", "text_size": "notation",
+        "content": "🧠 模型 deepseek-v4-pro(max) · ⚡ 缓存命中 87.3% · 📊 上下文 24.1k/128k" }
+    ]
+  }
 }
 ```
 

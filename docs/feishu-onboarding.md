@@ -178,7 +178,8 @@ DSH_HOME=$DSH_HOME pnpm dsh web        # 默认 http://127.0.0.1:3080
 | 流式期间手动展开面板又被收起 | v1 已知取舍：patch 是全量替换卡片，500ms 内的下一次刷新会重置折叠状态；流式结束后可自由展开 |
 | 错误码 `230013` | 用户不在可用范围 / 被禁用 |
 | 错误码 `230071` | 该群不支持话题回复 → 自动降级路径（见 §5.1） |
-| 错误码 `230099`（`parse card json err` / `unknown property, property: elements`） | 卡片根对象带 `schema: "2.0"` 与顶层 `elements`（新旧结构混用）。新版插件已改为不带 `schema` 的经典结构：重装插件并重启 dsh |
+| 错误码 `230099`（`parse card json err` / `unknown property, property: elements`） | 卡片结构混用：2.0 声明下把组件放在顶层 `elements`（应在 `body.elements`）。新版插件已改为规范 2.0 结构：重装插件并重启 dsh |
+| 折叠面板不显示 / 正文不是富文本 | 旧版卡片的两个已知问题（`icon.tag: "img"` 非法、1.0 结构 markdown 语法受限），新版插件已切 2.0 结构 + 内置 `standard_icon` 箭头：重装插件并重启 dsh |
 | 错误码 `231001` / `231002` | 表态表情失败：表情名（`Typing`/`DONE`）必须一字不差；机器人需在会话内 |
 
 ## 7. 改代码 → 生效的循环

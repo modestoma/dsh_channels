@@ -28,7 +28,6 @@ function channel(): FeishuChannel & { updated: Array<{ messageId: string; card: 
     addReaction: vi.fn(async () => 'react-1'),
     removeReaction: vi.fn(async () => {}),
     threadIdOfMessage: vi.fn(async () => undefined),
-    uploadImage: vi.fn(async () => ({ imageKey: 'img' })),
     updated,
   }
 }
@@ -43,7 +42,7 @@ function hooks() {
 }
 
 function markdownOf(card: object, index: number): string {
-  const elements = (card as { elements: Array<{ tag: string; content?: string }> }).elements
+  const elements = (card as { body: { elements: Array<{ tag: string; content?: string }> } }).body.elements
   return elements.filter(element => element.tag === 'markdown')[index]?.content ?? ''
 }
 
@@ -58,7 +57,7 @@ describe('TurnStreamer', () => {
 
   it('publishes the first frame immediately, then throttles to refreshMs', async () => {
     const ch = channel()
-    const streamer = new TurnStreamer(ch, 500, () => ({}), hooks())
+    const streamer = new TurnStreamer(ch, 500, hooks())
     const session = makeSession('sess-stream')
     streamer.attach(session, 'om_card', 'om_trigger', 'react-typing')
 
@@ -90,7 +89,7 @@ describe('TurnStreamer', () => {
 
   it('collects reasoning deltas into the fold panel and flips the title on first text', async () => {
     const ch = channel()
-    const streamer = new TurnStreamer(ch, 500, () => ({}), hooks())
+    const streamer = new TurnStreamer(ch, 500, hooks())
     const session = makeSession('sess-reason')
     streamer.attach(session, 'om_card', 'om_trigger', undefined)
 
@@ -107,20 +106,21 @@ describe('TurnStreamer', () => {
     await vi.advanceTimersByTimeAsync(500)
 
     const card = ch.updated[0]!.card as {
-      elements: [{
+      body: { elements: [{
         tag: string
         header: { title: { content: string } }
         elements: Array<{ content: string }>
-      }, { tag: string }]
+      }, { tag: string }] }
     }
-    expect(card.elements[0]?.header.title.content).toBe('回复中')
-    expect(card.elements[0]?.elements[0]?.content).toContain('先想想')
+    const panel = card.body.elements[0]
+    expect(panel?.header.title.content).toBe('回复中')
+    expect(panel?.elements[0]?.content).toContain('先想想')
   })
 
   it('finalizes on turn/end: 回复结束 title, final patch, and Typing→DONE swap', async () => {
     const ch = channel()
     const hooksInstance = hooks()
-    const streamer = new TurnStreamer(ch, 500, () => ({}), hooksInstance)
+    const streamer = new TurnStreamer(ch, 500, hooksInstance)
     const session = makeSession('sess-done')
     streamer.attach(session, 'om_card', 'om_trigger', 'react-typing')
 
@@ -139,7 +139,7 @@ describe('TurnStreamer', () => {
 
     // turn/end finalizes immediately without waiting for the throttle.
     const finalized = ch.updated.at(-1)!
-    const panel = (finalized.card as { elements: [{ header: { title: { content: string } } }] }).elements[0]
+    const panel = (finalized.card as { body: { elements: [{ header: { title: { content: string } } }] } }).body.elements[0]
     expect(panel?.header.title.content).toBe('回复结束')
 
     await vi.advanceTimersByTimeAsync(0)
@@ -154,7 +154,7 @@ describe('TurnStreamer', () => {
 
   it('skips removal when the Typing reaction was never added, still adds DONE', async () => {
     const ch = channel()
-    const streamer = new TurnStreamer(ch, 500, () => ({}), hooks())
+    const streamer = new TurnStreamer(ch, 500, hooks())
     const session = makeSession('sess-noreact')
     streamer.attach(session, 'om_card', 'om_trigger', undefined)
     streamer.onSessionEvent(session, { type: 'turn/end', seq: 1, data: { turn: 1, reason: 'stop' } })
@@ -169,7 +169,7 @@ describe('TurnStreamer', () => {
 
   it('keeps session-cumulative token figures across turns', async () => {
     const ch = channel()
-    const streamer = new TurnStreamer(ch, 500, () => ({}), hooks())
+    const streamer = new TurnStreamer(ch, 500, hooks())
     const session = makeSession('sess-cum')
     // Historical usage already in the log before attach.
     ;(session.events as SessionEvent[]).push(
@@ -182,9 +182,9 @@ describe('TurnStreamer', () => {
     })
     streamer.onSessionEvent(session, { type: 'turn/end', seq: 3, data: { turn: 2, reason: 'stop' } })
 
-    const card = ch.updated.at(-1)!.card as { elements: [object, object, object, object, { elements: Array<{ content: string }> }] }
-    const line1 = card.elements[4]?.elements[0]?.content ?? ''
-    const line2 = card.elements[4]?.elements[1]?.content ?? ''
+    const card = ch.updated.at(-1)!.card as { body: { elements: [object, object, object, object, { content: string }, { content: string }] } }
+    const line1 = card.body.elements[4]?.content ?? ''
+    const line2 = card.body.elements[5]?.content ?? ''
     expect(line1).toContain('input token 130')
     expect(line1).toContain('output token 50')
     expect(line2).toContain('缓存命中 60.0%')

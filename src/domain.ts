@@ -54,7 +54,9 @@ export interface FeishuDomainSpecShape {
 }
 
 export const feishuDomainGlobalSchema = z.object({
-  /** img_key of the uploaded chevron icon used by the fold-panel header. */
+  /** Legacy: img_key of a previously uploaded chevron icon. Kept optional so
+   *  storage written by older plugin versions still validates; the card now
+   *  uses the built-in `standard_icon` chevron and never writes this. */
   chevronImgKey: z.string().optional(),
 })
 

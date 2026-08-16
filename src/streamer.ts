@@ -18,7 +18,7 @@
 
 import type { Session, SessionEvent } from './dsh-types.ts'
 import { buildCard } from './cards.ts'
-import type { CardState, ChevronIcon } from './cards.ts'
+import type { CardState } from './cards.ts'
 import type { FeishuChannel } from './feishu-channel.ts'
 import { cacheHitPct, foldAll, foldEvent } from './stats.ts'
 import type { StatsFold } from './stats.ts'
@@ -55,7 +55,6 @@ interface TurnState {
 export class TurnStreamer {
   private readonly channel: FeishuChannel
   private readonly refreshMs: number
-  private readonly chevronAccessor: () => ChevronIcon
   private readonly hooks: StreamerHooks
   /** sessionId → queue of turn states (FIFO consumption of the driver). */
   private readonly bySession = new Map<string, TurnState[]>()
@@ -66,10 +65,9 @@ export class TurnStreamer {
   /** sessionId → context pressure cache (refreshed every N patches). */
   private readonly contextCache = new Map<string, { contextTokens?: number; contextWindow?: number }>()
 
-  constructor(channel: FeishuChannel, refreshMs: number, chevronAccessor: () => ChevronIcon, hooks: StreamerHooks) {
+  constructor(channel: FeishuChannel, refreshMs: number, hooks: StreamerHooks) {
     this.channel = channel
     this.refreshMs = refreshMs
-    this.chevronAccessor = chevronAccessor
     this.hooks = hooks
   }
 
@@ -221,7 +219,7 @@ export class TurnStreamer {
       reasoning: state.reasoning,
       body: state.body,
       stats: this.statsFor(sessionId),
-    }, this.chevronAccessor())
+    })
     this.channel.updateCard(state.cardMessageId, card).catch((error: unknown) => {
       this.hooks.onError(sessionId, error)
     })
@@ -241,7 +239,7 @@ export class TurnStreamer {
       reasoning: state.reasoning,
       body: state.body,
       stats: this.statsFor(sessionId),
-    }, this.chevronAccessor())
+    })
     this.channel.updateCard(state.cardMessageId, card).catch((error: unknown) => {
       this.hooks.onError(sessionId, error)
     })

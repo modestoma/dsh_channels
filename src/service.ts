@@ -26,7 +26,7 @@ import type {
   TokenMeter,
   UserMessage,
 } from './dsh-types.ts'
-import { buildCard, CHEVRON_DOWN_PNG_BASE64 } from './cards.ts'
+import { buildCard } from './cards.ts'
 import type { CardState } from './cards.ts'
 import { chatRouteKey, feishuDomain } from './domain.ts'
 import type { FeishuDomainGlobal, FeishuDomainHandle, RawDomainHandle, RouteRecord } from './domain.ts'
@@ -97,7 +97,6 @@ export class FeishuService {
   private channel: FeishuChannel | undefined
   private streamer: TurnStreamer | undefined
   private domain: FeishuDomainHandle | undefined
-  private chevronImgKey: string | undefined
   private readonly routeCache = new Map<string, RouteRecord>()
   private readonly live = new Map<string, LiveAgent>()
   private readonly pendingResume = new Map<string, Promise<AgentHandle>>()
@@ -148,7 +147,6 @@ export class FeishuService {
     this.streamer = new TurnStreamer(
       channel,
       this.config.refreshMs,
-      () => (this.chevronImgKey === undefined ? {} : { imgKey: this.chevronImgKey }),
       hooks,
     )
 
@@ -156,7 +154,6 @@ export class FeishuService {
     for (const [key, record] of this.domain.routes.entries()) {
       this.routeCache.set(key, record)
     }
-    await this.ensureChevronIcon()
 
     this.ctx.on('session/event', (session, event) => {
       this.streamer?.onSessionEvent(session, event)
@@ -363,7 +360,7 @@ export class FeishuService {
       body: '',
       stats: { sessionId, inputTokens: 0, outputTokens: 0 },
     }
-    return buildCard(state, this.chevronImgKey === undefined ? {} : { imgKey: this.chevronImgKey })
+    return buildCard(state)
   }
 
   /**
@@ -429,22 +426,5 @@ export class FeishuService {
     }
 
     return { contextTokens, contextWindow }
-  }
-
-  // ---- chevron icon upload --------------------------------------------
-
-  private async ensureChevronIcon(): Promise<void> {
-    const stored = this.domain?.getGlobal().chevronImgKey
-    if (stored !== undefined) {
-      this.chevronImgKey = stored
-      return
-    }
-    try {
-      const uploaded = await this.requireChannel().uploadImage(Buffer.from(CHEVRON_DOWN_PNG_BASE64, 'base64'))
-      this.chevronImgKey = uploaded.imageKey
-      await this.domain?.setGlobal({ chevronImgKey: uploaded.imageKey })
-    } catch (error) {
-      this.ctx.logger?.warn?.('dsh-channels: chevron icon upload failed (fold arrow disabled): %s', String(error))
-    }
   }
 }

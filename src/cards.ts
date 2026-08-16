@@ -1,15 +1,21 @@
 /**
- * Feishu card 2.0 JSON renderer for the three-section streaming card.
+ * Feishu card JSON 2.0 renderer for the three-section streaming card.
+ *
+ * The card uses the CURRENT 2.0 structure (`schema: "2.0"` + `body.elements`),
+ * which is required for full rich-text markdown (headings, blockquotes,
+ * tables, code fences) and is the shape the official Lark bot extensions
+ * ship today.
  *
  * Layout (top → bottom):
  *  1. `collapsible_panel` — bordered, default-collapsed reasoning panel. The
  *     header title carries the three phases (推理中 / 回复中 / 回复结束) and a
- *     right-aligned chevron icon that rotates 180° when expanded
- *     (`icon_expanded_angle`), i.e. down when folded, up when expanded.
+ *     right-aligned built-in chevron (`standard_icon`, no upload needed) that
+ *     rotates 180° when expanded (`icon_expanded_angle`).
  *  2. `markdown` — the reply body (rich text).
- *  3. `note` — two small-print lines of session info:
+ *  3. two `markdown` lines in `notation` text size — session info:
  *     line 1: session id · input token · output token   (session cumulative)
  *     line 2: model(effort) · cache hit · context
+ *     (the 1.0 `note` component does not exist in the 2.0 structure)
  *
  * Pure functions only — no I/O, no host imports.
  *
@@ -23,6 +29,9 @@ export const PANEL_TITLES: Record<PanelPhase, string> = {
   replying: '回复中',
   done: '回复结束',
 }
+
+/** Built-in icon token for the fold-panel chevron (from the official component docs). */
+export const PANEL_CHEVRON_TOKEN = 'down-small-ccm_outlined'
 
 /** Session-scoped figures rendered on the info lines. */
 export interface CardStats {
@@ -89,54 +98,42 @@ function buildSessionLine(stats: CardStats): string {
   return `🔑 ${stats.sessionId} · ⬆ input token ${fmt(stats.inputTokens)} · ⬇ output token ${fmt(stats.outputTokens)}`
 }
 
-export interface ChevronIcon {
-  /** img_key of the uploaded chevron icon, or undefined to omit the icon. */
-  imgKey?: string
-}
-
 /** The raw markdown content sent into the reasoning panel. */
 export function reasoningContent(reasoning: string, phase: PanelPhase): string {
   if (reasoning.trim() === '') {
-    return phase === 'thinking' ? '_等待模型输出…_' : '_（本次无推理内容）_'
+    return phase === 'thinking' ? '*等待模型输出…*' : '*（本次无推理内容）*'
   }
   return clip(reasoning, REASONING_MAX_CHARS)
 }
 
 export function bodyContent(body: string, phase: PanelPhase): string {
   if (body.trim() === '') {
-    return phase === 'done' ? '_（本次无正文输出）_' : '_正在生成…_'
+    return phase === 'done' ? '*（本次无正文输出）*' : '*正在生成…*'
   }
   return clip(body, BODY_MAX_CHARS)
 }
 
 /**
- * Assemble the complete card JSON for one streaming snapshot.
+ * Assemble the complete card JSON 2.0 for one streaming snapshot.
  *
- * NOTE: the root object deliberately carries NO `schema` field. Feishu's
- * current parser treats a card whose root declares `schema: "2.0"` as the
- * new-schema format and then rejects the classic top-level `elements` key
- * (`230099 / 200621: unknown property, property: elements`). Omitting
- * `schema` selects the classic card JSON shape (`config` / `header` /
- * top-level `elements`) instead — the same shape the official Lark bot
- * extensions still use.
+ * Root: `{ schema: "2.0", config: { width_mode: "fill" }, body: { elements } }`.
+ * `schema` MUST be declared for the 2.0 structure — and with it declared,
+ * elements MUST live under `body` (top-level `elements` is rejected with
+ * 230099 / "unknown property, property: elements").
  */
-export function buildCard(state: CardState, chevron: ChevronIcon = {}): object {
+export function buildCard(state: CardState): object {
   const elements: object[] = []
-
-  const header: Record<string, unknown> = {
-    title: { tag: 'plain_text', content: PANEL_TITLES[state.phase] },
-    icon_position: 'right',
-    icon_expanded_angle: 180,
-  }
-  if (chevron.imgKey !== undefined) {
-    header.icon = { tag: 'img', img_key: chevron.imgKey, alt: { tag: 'plain_text', content: '' } }
-  }
 
   elements.push({
     tag: 'collapsible_panel',
     expanded: false,
-    border: { color: 'grey-200', corner_radius: '8px' },
-    header,
+    border: { color: 'grey', corner_radius: '8px' },
+    header: {
+      title: { tag: 'plain_text', content: PANEL_TITLES[state.phase] },
+      icon: { tag: 'standard_icon', token: PANEL_CHEVRON_TOKEN },
+      icon_position: 'right',
+      icon_expanded_angle: 180,
+    },
     elements: [
       { tag: 'markdown', content: reasoningContent(state.reasoning, state.phase) },
     ],
@@ -145,16 +142,12 @@ export function buildCard(state: CardState, chevron: ChevronIcon = {}): object {
   elements.push({ tag: 'hr' })
   elements.push({ tag: 'markdown', content: bodyContent(state.body, state.phase) })
   elements.push({ tag: 'hr' })
-  elements.push({
-    tag: 'note',
-    elements: [
-      { tag: 'plain_text', content: buildSessionLine(state.stats) },
-      { tag: 'plain_text', content: buildModelLine(state.stats) },
-    ],
-  })
+  elements.push({ tag: 'markdown', content: buildSessionLine(state.stats), text_size: 'notation' })
+  elements.push({ tag: 'markdown', content: buildModelLine(state.stats), text_size: 'notation' })
 
-  return { elements }
+  return {
+    schema: '2.0',
+    config: { width_mode: 'fill' },
+    body: { elements },
+  }
 }
-
-export const CHEVRON_DOWN_PNG_BASE64 =
-  'iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAYAAADgdz34AAAAJUlEQVR42mNIySr+T0vMMGrBqAWjFoxaMGrBqAWjFoxaMDQsAAANFBBMbtFu8QAAAABJRU5ErkJggg=='

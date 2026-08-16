@@ -1,17 +1,15 @@
 /**
  * Thin wrapper over the official SDK's `createLarkChannel` high-level module.
  *
- * The wrapper exists for two reasons:
- *  1. It pins the exact surface the plugin uses behind one interface so the
- *     unit tests can stub the official SDK wholesale (no network, no creds).
- *  2. It owns the one-shot chevron icon upload used by the fold-panel header.
+ * The wrapper exists to pin the exact surface the plugin uses behind one
+ * interface so the unit tests can stub the official SDK wholesale (no
+ * network, no creds).
  *
  * @module dsh-channels/feishu-channel
  */
 
 import { createLarkChannel, LoggerLevel } from '@larksuiteoapi/node-sdk'
 import type { LarkChannel, NormalizedMessage, SendResult } from '@larksuiteoapi/node-sdk'
-import { CHEVRON_DOWN_PNG_BASE64 } from './cards.ts'
 
 export type { NormalizedMessage, SendResult } from '@larksuiteoapi/node-sdk'
 
@@ -39,8 +37,6 @@ export interface FeishuChannel {
   removeReaction(messageId: string, reactionId: string): Promise<void>
   /** Fetch the thread id of a sent message (undefined when not a topic message). */
   threadIdOfMessage(messageId: string): Promise<string | undefined>
-  /** Upload one image (message-type) and return its image key. */
-  uploadImage(buffer: Buffer): Promise<{ imageKey: string }>
 }
 
 export interface ChannelConnectOptions {
@@ -113,17 +109,6 @@ class LarkChannelAdapter implements FeishuChannel {
     const res = await this.channel.rawClient.im.v1.message.get({ path: { message_id: messageId } })
     return res?.data?.items?.[0]?.thread_id
   }
-
-  async uploadImage(buffer: Buffer): Promise<{ imageKey: string }> {
-    const res = await this.channel.rawClient.im.v1.image.create({
-      data: { image_type: 'message', image: buffer },
-    })
-    const imageKey = res?.image_key
-    if (imageKey === undefined || imageKey === null) {
-      throw new Error('feishu image upload returned no image_key')
-    }
-    return { imageKey }
-  }
 }
 
 const LOGGER_LEVELS: Record<ChannelConnectOptions['loggerLevel'], LoggerLevel> = {
@@ -137,5 +122,3 @@ const LOGGER_LEVELS: Record<ChannelConnectOptions['loggerLevel'], LoggerLevel> =
 export type ChannelFactory = (options: ChannelConnectOptions) => FeishuChannel
 
 export const defaultChannelFactory: ChannelFactory = options => new LarkChannelAdapter(options)
-
-export { CHEVRON_DOWN_PNG_BASE64 }

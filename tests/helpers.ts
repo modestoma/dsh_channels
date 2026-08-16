@@ -225,7 +225,6 @@ export function makeChannel(options: FakeChannelOptions = {}): FeishuChannel & {
       removedReactions.push({ messageId, reactionId })
     }),
     threadIdOfMessage: options.threadIdOfMessage ?? (async () => `omt_${serial}`),
-    uploadImage: vi.fn(async () => ({ imageKey: 'img_chevron' })),
   }
   return Object.assign(channel, { sent, updated, reactions, removedReactions })
 }
