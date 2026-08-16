@@ -20,6 +20,16 @@ describe('resolveConfig', () => {
     expect(config.dmMode).toBe('open')
     expect(config.threadFallback).toBe('degrade')
     expect(config.loggerLevel).toBe('info')
+    expect(config.agentPreset).toBeUndefined()
+  })
+
+  it('accepts an optional agentPreset id', () => {
+    const config = resolveConfig({
+      appId: 'FEISHU_APP_ID',
+      appSecret: 'FEISHU_APP_SECRET',
+      agentPreset: 'channels',
+    })
+    expect(config.agentPreset).toBe('channels')
   })
 
   it('rejects non-identifier spellings (the schema cannot tell refs from secrets)', () => {

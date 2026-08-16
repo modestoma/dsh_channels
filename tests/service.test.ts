@@ -10,7 +10,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { FeishuService } from '../src/service.ts'
 import type { FeishuConfig } from '../src/config.ts'
 import type { ChannelFactory, FeishuChannel, NormalizedMessage } from '../src/feishu-channel.ts'
-import { makeHostContext, makeChannel, makeMessage } from './helpers.ts'
+import {
+  makeHostContext, makeChannel, makeMessage, makeAgentPresets,
+} from './helpers.ts'
+import type { FakeAgentPresets, FakeAgentPresetsOptions } from './helpers.ts'
 
 function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
   return {
@@ -38,10 +41,17 @@ interface Harness {
   config: FeishuConfig
 }
 
-async function setup(partial: Partial<FeishuConfig> = {}, channelOptions: Parameters<typeof makeChannel>[0] = {}): Promise<Harness> {
+async function setup(
+  partial: Partial<FeishuConfig> = {},
+  channelOptions: Parameters<typeof makeChannel>[0] = {},
+  presetOptions?: FakeAgentPresetsOptions,
+): Promise<Harness> {
   const config = makeConfig(partial)
   const channel = makeChannel(channelOptions)
-  const ctxState = makeHostContext()
+  const ctxState = makeHostContext(
+    undefined,
+    presetOptions === undefined ? undefined : makeAgentPresets(presetOptions),
+  )
   const factoryCalls: unknown[] = []
   const factory: ChannelFactory = options => {
     factoryCalls.push(options)
@@ -153,6 +163,54 @@ describe('FeishuService', () => {
     expect(entries[0]?.[0]).toBe('omt_1')
   })
 
+  it('composes created sessions from the roster default preset (mount in setup + header meta)', async () => {
+    const h = await setup({}, {}, {})
+    await h.onMessage(makeMessage({ chatType: 'p2p', senderId: 'ou_alice', mentionedBot: false, content: 'hi' }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+
+    const created = h.ctxState.agents.created[0]!
+    expect(created.options.meta?.agentPreset).toBe('standard')
+    expect(typeof created.options.setup).toBe('function')
+
+    // The fake registry awaited setup before publishing, exactly like the host
+    // factory, so the roster mount must have seen the unpublished agent scope.
+    const presets = h.ctxState.ctx.get!('agentPresets') as FakeAgentPresets
+    expect(presets.resolve).toHaveBeenCalledWith(undefined)
+    expect(presets.mounts).toEqual([{ agentCtx: created.setupCtx, id: 'standard' }])
+  })
+
+  it('mounts the configured agentPreset id instead of the roster default', async () => {
+    const h = await setup({ agentPreset: 'channels' }, {}, { defaultId: 'standard' })
+    await h.onMessage(makeMessage({ chatType: 'p2p', senderId: 'ou_alice', mentionedBot: false, content: 'hi' }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+
+    const created = h.ctxState.agents.created[0]!
+    expect(created.options.meta?.agentPreset).toBe('channels')
+    const presets = h.ctxState.ctx.get!('agentPresets') as FakeAgentPresets
+    expect(presets.resolve).toHaveBeenCalledWith('channels')
+    expect(presets.mounts).toEqual([{ agentCtx: created.setupCtx, id: 'channels' }])
+  })
+
+  it('leaves creation bare when no preset roster exists (headless deployments)', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({ chatType: 'p2p', senderId: 'ou_alice', mentionedBot: false, content: 'hi' }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+
+    const created = h.ctxState.agents.created[0]!
+    expect(created.options.meta?.agentPreset).toBeUndefined()
+    expect(created.options.setup).toBeUndefined()
+  })
+
+  it('reports preset resolution failure on the card instead of publishing a bare session', async () => {
+    const h = await setup({}, {}, { failResolve: new Error('unknown preset') })
+    await h.onMessage(makeMessage({ chatType: 'p2p', content: 'x' }))
+    await waitUntil(() => expect(h.channel.updated.length).toBeGreaterThan(0))
+
+    const update = h.channel.updated[0] as { card: object }
+    expect(JSON.stringify(update.card)).toContain('会话创建失败')
+    expect(h.ctxState.agents.created).toHaveLength(0)
+  })
+
   it('routes a thread continuation to the SAME session without a mention', async () => {
     const h = await setup()
     const first = makeMessage({ chatType: 'group', chatId: 'oc_grp', senderId: 'ou_alice', content: '开始' })
@@ -253,6 +311,31 @@ describe('FeishuService', () => {
     await waitUntil(() => expect(h.ctxState.agents.resumed).toHaveLength(1))
     expect(h.ctxState.agents.resumed[0]!.options.resumeSessionId).toBe(sessionId)
     await waitUntil(() => expect(mock(h.ctxState.agents.resumed[0]!.handle.agent.followup)).toHaveBeenCalledTimes(1))
+    await service2.shutdown()
+  })
+
+  it('composes resumed sessions from the same preset resolution as creation', async () => {
+    const h = await setup({}, {}, {})
+    await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: 'hello' }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+
+    // Simulate a restart: drop live agents, keep the route table.
+    await h.service.shutdown()
+    const channel2 = makeChannel()
+    const service2 = new FeishuService(h.ctxState.ctx, h.config, () => channel2)
+    await service2.start()
+    const registered = (channel2.onMessage as unknown as ReturnType<typeof vi.fn>).mock.calls
+    const handler = registered[registered.length - 1]?.[0] as (msg: NormalizedMessage) => Promise<void> | undefined
+    await handler(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: '还在吗', threadId: 'omt_1' }))
+    await waitUntil(() => expect(h.ctxState.agents.resumed).toHaveLength(1))
+
+    const resumed = h.ctxState.agents.resumed[0]!
+    expect(typeof resumed.options.setup).toBe('function')
+    const presets = h.ctxState.ctx.get!('agentPresets') as FakeAgentPresets
+    expect(presets.mounts).toEqual([
+      { agentCtx: h.ctxState.agents.created[0]!.setupCtx, id: 'standard' },
+      { agentCtx: resumed.setupCtx, id: 'standard' },
+    ])
     await service2.shutdown()
   })
 

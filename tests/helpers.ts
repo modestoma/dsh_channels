@@ -41,26 +41,33 @@ export interface FakeAgentsOptions {
 
 export function makeAgentRegistry(fail: FakeAgentsOptions = {}): {
   registry: AgentRegistry
-  created: Array<{ options: Parameters<AgentRegistry['create']>[0]; handle: AgentHandle }>
-  resumed: Array<{ options: Parameters<AgentRegistry['resume']>[0]; handle: AgentHandle }>
+  created: Array<{ options: Parameters<AgentRegistry['create']>[0]; handle: AgentHandle; setupCtx: unknown }>
+  resumed: Array<{ options: Parameters<AgentRegistry['resume']>[0]; handle: AgentHandle; setupCtx: unknown }>
 } {
-  const created: Array<{ options: Parameters<AgentRegistry['create']>[0]; handle: AgentHandle }> = []
-  const resumed: Array<{ options: Parameters<AgentRegistry['resume']>[0]; handle: AgentHandle }> = []
+  const created: Array<{ options: Parameters<AgentRegistry['create']>[0]; handle: AgentHandle; setupCtx: unknown }> = []
+  const resumed: Array<{ options: Parameters<AgentRegistry['resume']>[0]; handle: AgentHandle; setupCtx: unknown }> = []
   const registry: AgentRegistry = {
     async create(options) {
       if (fail.failCreate !== undefined) throw fail.failCreate
+      // Mirror the host factory: setup composes the unpublished scope and is
+      // awaited BEFORE the session/agent become visible; a rejection rolls the
+      // creation back.
+      const setupCtx = {}
+      await options.setup?.(setupCtx)
       const session = makeSession(options.sessionId)
       const agent = makeAgent(session)
       const handle: AgentHandle = { agent, dispose: vi.fn(async () => {}) }
-      created.push({ options, handle })
+      created.push({ options, handle, setupCtx })
       return handle
     },
     async resume(options) {
       if (fail.failResume !== undefined) throw fail.failResume
+      const setupCtx = {}
+      await options.setup?.(setupCtx)
       const session = makeSession(options.resumeSessionId)
       const agent = makeAgent(session)
       const handle: AgentHandle = { agent, dispose: vi.fn(async () => {}) }
-      resumed.push({ options, handle })
+      resumed.push({ options, handle, setupCtx })
       return handle
     },
   }
@@ -131,10 +138,48 @@ export function makeDomain(): { facility: StorageDomainFacility; raw: RawDomainH
   return { facility, raw }
 }
 
-export function makeHostContext(credentialValues: Record<string, string> = {
-  FEISHU_APP_ID: 'cli_test_app',
-  FEISHU_APP_SECRET: 'test_secret',
-}): {
+/** One fake preset roster entry (`resolve`/`mount` vi.fn's + call log). */
+export interface FakeAgentPresets {
+  resolve: ReturnType<typeof vi.fn>
+  mount: ReturnType<typeof vi.fn>
+  mounts: Array<{ agentCtx: unknown; id?: string }>
+}
+
+export interface FakeAgentPresetsOptions {
+  /** Preset id the roster resolves for any request (default 'standard'). */
+  defaultId?: string
+  /** When set, `resolve()` rejects with this error. */
+  failResolve?: Error
+}
+
+/**
+ * Fake host roster: `resolve(id)` answers `{ id: id ?? defaultId, path }` and
+ * `mount` records `(agentCtx, id)` calls, mirroring the real service's
+ * contract closely enough for the plugin's composition flow.
+ */
+export function makeAgentPresets(options: FakeAgentPresetsOptions = {}): FakeAgentPresets {
+  const mounts: Array<{ agentCtx: unknown; id?: string }> = []
+  const presetFor = (id: string | undefined) => ({
+    id: id ?? options.defaultId ?? 'standard',
+    path: `/presets/${id ?? options.defaultId ?? 'standard'}`,
+  })
+  return {
+    resolve: vi.fn(async (id?: string) => {
+      if (options.failResolve !== undefined) throw options.failResolve
+      return presetFor(id)
+    }),
+    mount: vi.fn(async (agentCtx: unknown, id?: string) => {
+      mounts.push({ agentCtx, id })
+      return presetFor(id)
+    }),
+    mounts,
+  }
+}
+
+export function makeHostContext(
+  credentialValues?: Record<string, string>,
+  agentPresets?: FakeAgentPresets,
+): {
   ctx: HostContext
   agents: ReturnType<typeof makeAgentRegistry>
   workspaces: ReturnType<typeof makeWorkspaceRegistry>
@@ -149,7 +194,11 @@ export function makeHostContext(credentialValues: Record<string, string> = {
   const tokenMeter = { measure: () => ({ totalTokens: 1234 }) }
   const llm = { resolveModelInfo: vi.fn(async () => ({ context: { contextWindow: 128000 } })) }
   const credentials = {
-    values: { ...credentialValues },
+    values: {
+      ...(credentialValues === undefined
+        ? { FEISHU_APP_ID: 'cli_test_app', FEISHU_APP_SECRET: 'test_secret' }
+        : credentialValues),
+    },
     resolve: vi.fn(async (ref: string) => {
       const value = credentials.values[ref]
       return value === undefined ? undefined : { value, source: 'file' }
@@ -159,6 +208,7 @@ export function makeHostContext(credentialValues: Record<string, string> = {
     tokenMeter,
     llm,
     credentials,
+    ...(agentPresets === undefined ? {} : { agentPresets }),
   }
   const ctx: HostContext = {
     agents: agents.registry,

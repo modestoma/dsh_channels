@@ -18,6 +18,8 @@ import { randomUUID } from 'node:crypto'
 import type {
   Agent,
   AgentHandle,
+  AgentPresets,
+  AgentSetup,
   CredentialProvider,
   HostContext,
   LlmService,
@@ -49,6 +51,14 @@ export function feishuUserMessage(text: string): UserMessage {
 interface LiveAgent {
   agent: Agent
   handle: AgentHandle
+}
+
+/** What `agents.create`/`resume` need to compose one agent from a preset. */
+interface PresetComposition {
+  /** Preset id recorded on the session header meta (absent without a roster). */
+  agentPreset?: string
+  /** Mounts the resolved preset inside the agent factory's setup. */
+  setup?: AgentSetup
 }
 
 /** Wrap the host's storage facility open behind a stable local type. */
@@ -300,6 +310,43 @@ export class FeishuService {
     return options
   }
 
+  /**
+   * Resolve the agent-preset composition for sessions this plugin creates or
+   * resumes.
+   *
+   * `agents.create()` never applies a preset on its own — the caller composes
+   * the agent's world through the `setup` callback, which the factory awaits
+   * before publishing the session. In web-profile deployments the model-facing
+   * tools exist only inside agent presets (the host disables the tool rows at
+   * the host layer), so sessions created without mounting one reach the model
+   * with an empty tool list: the agent writes `<tool_calls>` as plain text and
+   * stops. Web-UI sessions mount the default preset via `session.create`;
+   * channels sessions must do the same through `setup`, and record the preset
+   * id on the header meta exactly like the host's own `composeAgent` does.
+   *
+   * The id resolves BEFORE the session exists because the session boundary
+   * snapshots `meta` before asynchronous setup begins. Mounting stays inside
+   * `setup`, where a failure rolls the whole creation back rather than
+   * publishing a session whose capabilities are half-installed.
+   *
+   * Deployments without a preset roster compose nothing: their tools live in
+   * the host composition and the agent already sees them.
+   */
+  private async resolvePresetComposition(): Promise<PresetComposition> {
+    // Read through ctx.get (safe lookup): only the web profile ships a roster,
+    // and direct property access on a cordis context throws for services the
+    // plugin did not inject.
+    const presets = this.ctx.get?.('agentPresets') as AgentPresets | undefined
+    if (presets === undefined) return {}
+    const resolved = await presets.resolve(this.config.agentPreset)
+    return {
+      agentPreset: resolved.id,
+      setup: async (agentCtx) => {
+        await presets.mount(agentCtx, resolved.id)
+      },
+    }
+  }
+
   private async startSession(msg: NormalizedMessage, content: string): Promise<void> {
     // 1. "Typing" reaction immediately (id captured for the swap).
     const typingPromise = this.requireChannel().addReaction(msg.messageId, 'Typing').catch(() => undefined)
@@ -319,10 +366,15 @@ export class FeishuService {
     // 4. Create the agent/session bound to the workspace directory.
     let handle: AgentHandle
     try {
+      const composition = await this.resolvePresetComposition()
       handle = await this.ctx.agents.create({
         sessionId,
-        meta: { cwd: workspace.path },
+        meta: {
+          cwd: workspace.path,
+          ...(composition.agentPreset === undefined ? {} : { agentPreset: composition.agentPreset }),
+        },
         agentOptions: this.agentOptions(),
+        setup: composition.setup,
       })
     } catch (error) {
       await this.requireChannel().updateCard(sent.messageId, buildCard({
@@ -380,15 +432,23 @@ export class FeishuService {
 
     let pending = this.pendingResume.get(record.sessionId)
     if (pending === undefined) {
-      pending = this.ctx.agents.resume({
-        resumeSessionId: record.sessionId as SessionId,
-        agentOptions: this.agentOptions(),
-      }).then(handle => {
-        this.live.set(record.sessionId, { agent: handle.agent, handle })
-        return handle
-      }).finally(() => {
-        this.pendingResume.delete(record.sessionId)
-      })
+      // Compose the resumed world from the same preset resolution as creation
+      // (config override or roster default). A session persisted before this
+      // fix has no preset recorded on its header; re-resolving here is what
+      // repairs it on the first resume after a restart.
+      pending = this.resolvePresetComposition()
+        .then(composition => this.ctx.agents.resume({
+          resumeSessionId: record.sessionId as SessionId,
+          agentOptions: this.agentOptions(),
+          setup: composition.setup,
+        }))
+        .then(handle => {
+          this.live.set(record.sessionId, { agent: handle.agent, handle })
+          return handle
+        })
+        .finally(() => {
+          this.pendingResume.delete(record.sessionId)
+        })
       this.pendingResume.set(record.sessionId, pending)
     }
     const handle = await pending

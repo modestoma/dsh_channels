@@ -39,6 +39,14 @@ export const configSchema = z.object({
   model: z.string().optional(),
   /** Output-token cap per model request (optional → adapter default). */
   maxTokens: z.number().int().positive().optional(),
+  /**
+   * Agent preset id sessions this plugin creates are composed from
+   * (optional → the roster default, e.g. `standard`). In web-profile
+   * deployments the model-facing tools exist only inside agent presets, so
+   * leaving this unset mounts the default; name a leaner preset (e.g. one
+   * with only bash/fs) to restrict what the bot can do.
+   */
+  agentPreset: z.string().optional(),
   /** Streaming card refresh interval in milliseconds. */
   refreshMs: z.number().int().min(200).max(10_000).default(500),
   /** Accept p2p (private) chats. */

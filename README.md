@@ -57,6 +57,7 @@ DSH_HOME=$DSH_HOME pnpm dsh plugin --profile web add dsh-channels@file:/path/to/
         baseDir: './channels-data'          # 工作区根目录（按 私聊/群聊/用户 组织）
         provider: 'deepseek-official'       # 可选：省略则用部署默认
         model: 'deepseek-v4-flash'          # 可选
+        agentPreset: 'standard'             # 可选：省略则挂 roster 默认 preset（web profile 下工具只在 preset 里）
         refreshMs: 500                      # 卡片刷新频率
         requireMention: true                # 普通群需 @ 机器人
         dmMode: 'open'
@@ -78,6 +79,8 @@ FEISHU_APP_SECRET: xxxxxxxx
 启动成功标志（控制台）：`[dsh-channels] feishu long connection established, bot open_id: ou_xxx`
 
 宿主 profile 已内置所需服务（agent-loop、llm-deepseek、session 持久化、storage-domain、workspace）；推荐确认 `dsh-token-meter` 已启用（卡片上下文占用显示）。
+
+**工具与 agent preset（web profile）**：web profile 把 bash/fs/todo 等工具行全部标为 `disabled: true`，工具只存在于 agent preset 里，且 `agents.create()` 不会自动应用 preset——插件因此在创建/恢复会话时通过 `setup` 回调挂载 preset（默认 `standard`，可用 `agentPreset` 指定更精简的 preset，如只含 bash/fs 的自定义项），并把 preset id 记录进会话头。若机器人回复把 `<tool_calls>…` 当纯文本吐出，即该会话没挂上 preset；修好后再看会话的 `request/header` 应带 `tools` 字段、日志出现 `tool/call` 事件。无 preset roster 的部署（如 headless）不做此步骤，工具本就位于宿主层。
 
 ## 飞书侧准备
 
