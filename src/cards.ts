@@ -11,16 +11,21 @@
  *     header title carries the three phases (推理中 / 回复中 / 回复结束) and a
  *     right-aligned built-in chevron (`standard_icon`, no upload needed) that
  *     rotates 180° when expanded (`icon_expanded_angle`).
- *  2. `markdown` — the reply body (rich text).
- *  3. two `markdown` lines in `notation` text size — session info:
+ *  2. optional `markdown` in `notation` size — the activity status line
+ *     (tool calls, subagent/workflow progress, heartbeat elapsed). Rendered
+ *     only while `state.activity` is non-empty, so it never changes the
+ *     element layout of cards without transient activity.
+ *  3. `markdown` — the reply body (rich text).
+ *  4. two `markdown` lines in `notation` text size — session info:
  *     line 1: session id · input token · output token   (session cumulative)
  *     line 2: model(effort) · cache hit · context
  *
  * Layout, continuation card (`options.panel: false` — body segments that do
  * not fit the first card):
  *  1. `markdown` in `notation` size — `📄 回复分段 {n} · {phase}` header.
- *  2. `markdown` — this segment's body.
- *  3. the same two session-info lines.
+ *  2. optional activity status line (same as above).
+ *  3. `markdown` — this segment's body.
+ *  4. the same two session-info lines.
  *
  * Size budget: Feishu caps one card's JSON at 30 KB (`CARD_MAX_BYTES`). While
  * streaming, cards are kept ≤ `CARD_TARGET_BYTES` (28 KB), leaving 2 KB of
@@ -87,6 +92,13 @@ export interface CardState {
   reasoning: string
   /** Reply body accumulated so far (may be empty). */
   body: string
+  /**
+   * Transient activity status (tool call, subagent/workflow progress,
+   * heartbeat elapsed) rendered as a notation line between the panel and the
+   * body. Empty/undefined → the line is omitted. Callers cap its length so it
+   * stays well inside the card budget headroom.
+   */
+  activity?: string
   stats: CardStats
 }
 
@@ -219,6 +231,7 @@ function assemble(
   body: string,
   stats: CardStats,
   options: CardOptions,
+  activity?: string,
 ): object {
   const elements: object[] = []
 
@@ -240,6 +253,10 @@ function assemble(
     })
   } else {
     elements.push({ tag: 'markdown', content: segmentHeader(options, phase), text_size: 'notation' })
+  }
+
+  if (activity !== undefined && activity !== '') {
+    elements.push({ tag: 'markdown', content: activity, text_size: 'notation' })
   }
 
   elements.push({ tag: 'hr' })
@@ -298,7 +315,7 @@ const SUFFIX_JSON_BYTES = new TextEncoder().encode(JSON.stringify(TRUNCATION_SUF
  */
 export function buildCard(state: CardState, options: CardOptions = {}): object {
   const render = (reasoning: string, body: string) =>
-    assemble(state.phase, reasoning, body, state.stats, options)
+    assemble(state.phase, reasoning, body, state.stats, options, state.activity)
 
   const body = clipText(state.body, TRUNCATION_SUFFIX, content => render('', content), CARD_MAX_BYTES - SUFFIX_JSON_BYTES)
   const reasoningBudget = cardJsonBytes(render('', body)) <= CARD_TARGET_BYTES
@@ -319,7 +336,7 @@ export function buildCard(state: CardState, options: CardOptions = {}): object {
  */
 function largestBodyPrefix(state: CardState, options: CardOptions): number {
   const text = state.body
-  const render = (content: string) => assemble('done', '', content, state.stats, options)
+  const render = (content: string) => assemble('done', '', content, state.stats, options, state.activity)
   if (cardJsonBytes(render(text)) <= CARD_TARGET_BYTES) return text.length
   let lo = 0
   let hi = text.length

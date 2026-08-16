@@ -111,6 +111,49 @@ describe('buildCard', () => {
     expect(line2).toContain('缓存命中 —')
     expect(line2).toContain('上下文 —')
   })
+
+  it('renders the activity status line between the panel and the body, omitted when empty', () => {
+    const list = elements({ activity: '🤖 子代理执行中：研究实现方案 · 已运行 12s' })
+    expect(list.map(element => element.tag)).toEqual([
+      'collapsible_panel',
+      'markdown',
+      'hr',
+      'markdown',
+      'hr',
+      'markdown',
+      'markdown',
+    ])
+    expect(list[1]?.content).toBe('🤖 子代理执行中：研究实现方案 · 已运行 12s')
+    expect(list[1]?.text_size).toBe('notation')
+    // Empty / undefined activity keeps the original element layout.
+    expect(elements({ activity: '' }).map(element => element.tag)).toEqual([
+      'collapsible_panel',
+      'hr',
+      'markdown',
+      'hr',
+      'markdown',
+      'markdown',
+    ])
+  })
+
+  it('renders the activity line on continuation cards too (after the segment header)', () => {
+    const list = elements(
+      { activity: '🧵 工作流 audit · 3/8 子代理完成 · 已运行 1分2s' },
+      { panel: false, segment: 2 },
+    )
+    expect(list.map(element => element.tag)).toEqual([
+      'markdown',
+      'markdown',
+      'hr',
+      'markdown',
+      'hr',
+      'markdown',
+      'markdown',
+    ])
+    expect(list[0]?.content).toContain('回复分段 2')
+    expect(list[1]?.content).toContain('工作流 audit')
+    expect(list[1]?.text_size).toBe('notation')
+  })
 })
 
 describe('card budget (28 KB target, 30 KB cap)', () => {

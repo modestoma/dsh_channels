@@ -6,7 +6,9 @@
  *  1. `attach()` — the reply card was just sent; bind it to the session as
  *     segment 1.
  *  2. `session/event` consumption — text deltas fill the body, reasoning
- *     deltas fill the fold panel, usage/header events advance the stats fold.
+ *     deltas fill the fold panel, usage/header events advance the stats fold,
+ *     and tool-call / workflow-record events feed the transient activity
+ *     status line (工具调用 / 子代理 / 工作流 progress).
  *  3. When the body outgrows one card's budget, the overflow is split at a
  *     clean breakpoint and sent as a continuation segment card (segment 2, 3,
  *     …) into the same topic; the stream then keeps flowing into the newest
@@ -19,6 +21,11 @@
  * final patch flips it to 回复结束. Patching is throttled to `refreshMs` and
  * only runs when the content actually changed. Segment sends are serialized
  * per session so cards arrive in order.
+ *
+ * Keep-alive: turns that produce no text deltas for a while (tool calls,
+ * subagent/workflow runs, provider-side work) are kept visibly alive by the
+ * activity line, whose elapsed counter is re-rendered on a slow heartbeat
+ * (`heartbeatMs`, default 5 s) — the card never sits silently on a live turn.
  *
  * @module dsh-channels/streamer
  */
@@ -102,12 +109,86 @@ interface TurnState {
   finalized: boolean
   /** Set by `detach()`; pending sends then stop scheduling further patches. */
   disposed: boolean
+  /** Unix ms when the turn was attached (heartbeat elapsed base). */
+  turnStartedAt: number
+  /** The in-flight tool call, if any (cleared by its `tool/result`). */
+  toolActivity: { name: string; label: string; since: number } | undefined
+  /** Live workflow-run folds projected by the workflow tool into this session. */
+  workflowRuns: Map<string, WorkflowRun>
+  /** The last settled workflow run (kept visible until the next activity). */
+  workflowEndStatus: { name: string; stopReason: string } | undefined
+  /** Currently rendered activity line (recomputed on every snapshot). */
+  activity: string
+  /** Slow keep-alive timer re-rendering the activity elapsed counter. */
+  heartbeatTimer: ReturnType<typeof setTimeout> | undefined
+}
+
+/** One live `tool-workflow/run-*` fold: run identity and member progress. */
+interface WorkflowRun {
+  name: string
+  startedAt: number
+  /** Members started so far. */
+  started: number
+  /** Members settled so far. */
+  ended: number
+  /** Still-running members (started minus ended), in start order. */
+  active: Array<{ seq: number; label: string }>
+  /** Latest phase declared by a member (`phase()` in the workflow script). */
+  phase?: string
+}
+
+/** Hard cap on the activity line so it can never threaten the card budget. */
+const ACTIVITY_MAX_CHARS = 64
+
+/** Trim an activity line to `ACTIVITY_MAX_CHARS` (ellipsis counts as one char). */
+function clipActivity(line: string): string {
+  return line.length <= ACTIVITY_MAX_CHARS ? line : `${line.slice(0, ACTIVITY_MAX_CHARS - 1)}…`
+}
+
+/** `已运行 45s` / `已运行 2分5s` — the activity line's elapsed counter. */
+function fmtElapsed(ms: number): string {
+  const total = Math.max(0, Math.floor(ms / 1000))
+  if (total < 60) return `已运行 ${total}s`
+  return `已运行 ${Math.floor(total / 60)}分${total % 60}s`
+}
+
+/**
+ * Human label for one tool call: the subagent tool contributes its
+ * `description`, the workflow tool its `meta.name`; anything else uses the
+ * bare tool name. Arguments are model-produced JSON — parsing failures fall
+ * back to the tool name instead of failing the fold.
+ */
+function toolActivityLabel(name: string, rawArguments: string): string {
+  if (name !== 'subagent' && name !== 'workflow') return name
+  try {
+    const args = JSON.parse(rawArguments) as Record<string, unknown>
+    if (name === 'subagent' && typeof args.description === 'string' && args.description !== '') {
+      return args.description
+    }
+    if (name === 'workflow') {
+      const meta = args.meta as Record<string, unknown> | undefined
+      if (meta !== undefined && typeof meta.name === 'string' && meta.name !== '') return meta.name
+    }
+  } catch {
+    // Unparseable arguments: fall back to the bare tool name.
+  }
+  return name
+}
+
+/** `completed`/`failed`/`cancelled` → the Chinese line fragment. */
+const WORKFLOW_OUTCOMES: Record<string, string> = {
+  completed: '完成',
+  failed: '失败',
+  cancelled: '已取消',
+  error: '失败',
 }
 
 export class TurnStreamer {
   private readonly channel: FeishuChannel
   private readonly refreshMs: number
   private readonly hooks: StreamerHooks
+  /** Slow keep-alive interval for the activity line's elapsed counter. */
+  private readonly heartbeatMs: number
   /** sessionId → queue of turn states (FIFO consumption of the driver). */
   private readonly bySession = new Map<string, TurnState[]>()
   /** sessionId → session-log stats fold (session cumulative). */
@@ -119,10 +200,11 @@ export class TurnStreamer {
   /** sessionId → serialized segment-send chain (keeps card order). */
   private readonly segmentChains = new Map<string, Promise<void>>()
 
-  constructor(channel: FeishuChannel, refreshMs: number, hooks: StreamerHooks) {
+  constructor(channel: FeishuChannel, refreshMs: number, hooks: StreamerHooks, heartbeatMs: number = 5_000) {
     this.channel = channel
     this.refreshMs = refreshMs
     this.hooks = hooks
+    this.heartbeatMs = heartbeatMs
   }
 
   /** Bind a freshly sent reply card to a session; seeds the stats fold from the log. */
@@ -156,8 +238,16 @@ export class TurnStreamer {
       timer: undefined,
       finalized: false,
       disposed: false,
+      turnStartedAt: Date.now(),
+      toolActivity: undefined,
+      workflowRuns: new Map(),
+      workflowEndStatus: undefined,
+      activity: '',
+      heartbeatTimer: undefined,
     })
     this.bySession.set(session.id, queue)
+    const state = queue[queue.length - 1]!
+    this.scheduleHeartbeat(session.id, state)
   }
 
   /** Drop all state for a session (agent disposed / route removed). */
@@ -166,6 +256,7 @@ export class TurnStreamer {
     for (const state of queue) {
       state.disposed = true
       if (state.timer !== undefined) clearTimeout(state.timer)
+      if (state.heartbeatTimer !== undefined) clearTimeout(state.heartbeatTimer)
     }
     this.bySession.delete(sessionId)
     this.folds.delete(sessionId)
@@ -228,6 +319,70 @@ export class TurnStreamer {
         }
         break
       }
+      case 'tool/call': {
+        if (state.turn === undefined) state.turn = event.data.turn
+        state.toolActivity = {
+          name: event.data.name,
+          label: toolActivityLabel(event.data.name, event.data.arguments),
+          since: Date.now(),
+        }
+        // A new call supersedes the settled-workflow end status.
+        state.workflowEndStatus = undefined
+        this.markDirty(session.id, state)
+        break
+      }
+      case 'tool/result': {
+        if (state.turn === undefined) state.turn = event.data.turn
+        state.toolActivity = undefined
+        this.markDirty(session.id, state)
+        break
+      }
+      case 'tool-workflow/run-start': {
+        // Workflow record events carry no turn/step — they belong to the
+        // front (oldest unfinished) turn by construction.
+        state.workflowRuns.set(event.data.runId, {
+          name: event.data.name,
+          startedAt: Date.now(),
+          started: 0,
+          ended: 0,
+          active: [],
+        })
+        state.workflowEndStatus = undefined
+        this.markDirty(session.id, state)
+        break
+      }
+      case 'tool-workflow/agent-start': {
+        const run = state.workflowRuns.get(event.data.runId)
+        if (run !== undefined) {
+          run.started++
+          run.active.push({ seq: event.data.seq, label: event.data.label })
+          if (event.data.phase !== undefined) run.phase = event.data.phase
+          this.markDirty(session.id, state)
+        }
+        break
+      }
+      case 'tool-workflow/agent-end': {
+        const run = state.workflowRuns.get(event.data.runId)
+        if (run !== undefined) {
+          run.ended++
+          const index = run.active.findIndex(member => member.seq === event.data.seq)
+          if (index >= 0) run.active.splice(index, 1)
+          this.markDirty(session.id, state)
+        }
+        break
+      }
+      case 'tool-workflow/run-end': {
+        const run = state.workflowRuns.get(event.data.runId)
+        if (run !== undefined) {
+          state.workflowRuns.delete(event.data.runId)
+          state.workflowEndStatus = {
+            name: run.name,
+            stopReason: WORKFLOW_OUTCOMES[event.data.stopReason] ?? event.data.stopReason,
+          }
+          this.markDirty(session.id, state)
+        }
+        break
+      }
       case 'turn/end': {
         // The ended turn belongs to the front state: assign it if a turn was
         // rejected/emptied before any step started.
@@ -280,11 +435,82 @@ export class TurnStreamer {
     }
   }
 
+  /**
+   * The transient activity status line, by priority:
+   *  1. the most recently started live workflow run (member progress + phase);
+   *  2. the in-flight tool call (subagent/workflow tools get their label);
+   *  3. the last settled workflow run's outcome (until the next activity);
+   *  4. heartbeat fallback — a thinking turn with no output yet still shows
+   *     an elapsed counter so the card never sits silently.
+   * Empty once the turn is finalized; the heartbeat fallback also disappears
+   * as soon as visible text exists (the streaming body itself shows liveness).
+   */
+  private activityLine(state: TurnState, now: number): string {
+    if (state.finalized) return ''
+
+    let latest: WorkflowRun | undefined
+    for (const run of state.workflowRuns.values()) {
+      if (latest === undefined || run.startedAt > latest.startedAt) latest = run
+    }
+    if (latest !== undefined) {
+      let line = `🧵 工作流 ${latest.name} · ${latest.ended}/${latest.started} 子代理完成`
+      if (latest.phase !== undefined) line += ` · 阶段 ${latest.phase}`
+      const labels = latest.active.slice(0, 3).map(member => member.label)
+      if (labels.length > 0) line += ` · ${labels.join('、')}`
+      line += ` · ${fmtElapsed(now - latest.startedAt)}`
+      return clipActivity(line)
+    }
+
+    const tool = state.toolActivity
+    if (tool !== undefined) {
+      const prefix = tool.name === 'subagent'
+        ? '🤖 子代理执行中：'
+        : tool.name === 'workflow'
+          ? '🧵 工作流启动：'
+          : '🔧 调用工具：'
+      return clipActivity(`${prefix}${tool.label} · ${fmtElapsed(now - tool.since)}`)
+    }
+
+    if (state.workflowEndStatus !== undefined) {
+      const { name, stopReason } = state.workflowEndStatus
+      return clipActivity(`🧵 工作流 ${name} 结束（${stopReason}）`)
+    }
+
+    const empty = state.cards.every(card => card.body === '')
+    if (state.phase === 'thinking' && empty) {
+      return clipActivity(`⏳ 处理中 · ${fmtElapsed(now - state.turnStartedAt)}`)
+    }
+    return ''
+  }
+
+  /**
+   * Slow keep-alive: recompute the activity line and patch only when its
+   * rendered text actually changed (the elapsed counter ticking). Reschedules
+   * itself while the turn is pending; `finalize`/`detach` cancel it.
+   */
+  private scheduleHeartbeat(sessionId: string, state: TurnState): void {
+    if (state.disposed || state.finalized || state.heartbeatTimer !== undefined) return
+    state.heartbeatTimer = setTimeout(() => {
+      state.heartbeatTimer = undefined
+      if (state.disposed || state.finalized) return
+      const line = this.activityLine(state, Date.now())
+      if (line !== state.activity) {
+        state.activity = line
+        this.markDirty(sessionId, state)
+      }
+      this.scheduleHeartbeat(sessionId, state)
+    }, this.heartbeatMs)
+  }
+
   private cardState(sessionId: string, state: TurnState, body: string): CardState {
+    // The snapshot point recomputes (and remembers) the activity line so every
+    // patch — including heartbeat-driven ones — carries the current status.
+    state.activity = this.activityLine(state, Date.now())
     return {
       phase: state.phase,
       reasoning: state.reasoning,
       body,
+      activity: state.activity,
       stats: this.statsFor(sessionId),
     }
   }
@@ -396,12 +622,16 @@ export class TurnStreamer {
   }
 
   /** Patch one card when due; failed updates retry with exponential backoff
-   *  (logged on the first failure and every 10th — no per-flush spam). */
-  private patchCard(sessionId: string, state: TurnState, index: number, force: boolean): void {
+   *  (logged on the first failure and every 10th — no per-flush spam).
+   *
+   *  The patch gate covers both per-card body growth (`card.dirty`) and
+   *  turn-scoped snapshot changes (`turnDirty`: phase, reasoning, activity
+   *  line, session stats), so activity-only events still reach the card. */
+  private patchCard(sessionId: string, state: TurnState, index: number, force: boolean, turnDirty: boolean): void {
     const card = state.cards[index]
     if (card === undefined || card.messageId === undefined || card.mode === 'text' || card.failed) return
     const now = Date.now()
-    if (!force && !card.dirty) return
+    if (!force && !card.dirty && !turnDirty) return
     if (!force && card.nextRetryAt > now) return
     card.dirty = false
     const options = index === 0 ? {} : { panel: false, segment: index + 1 }
@@ -418,12 +648,13 @@ export class TurnStreamer {
 
   private flush(sessionId: string, state: TurnState): void {
     state.lastPatchAt = Date.now()
+    const turnDirty = state.dirty
     if (state.dirty) {
       state.dirty = false
       this.splitOverflow(sessionId, state)
     }
     for (const [index] of state.cards.entries()) {
-      this.patchCard(sessionId, state, index, false)
+      this.patchCard(sessionId, state, index, false, turnDirty)
     }
   }
 
@@ -435,6 +666,13 @@ export class TurnStreamer {
       clearTimeout(state.timer)
       state.timer = undefined
     }
+    // Transient activity is not part of the settled card: the heartbeat stops
+    // and the activity line renders empty on every final patch.
+    if (state.heartbeatTimer !== undefined) {
+      clearTimeout(state.heartbeatTimer)
+      state.heartbeatTimer = undefined
+    }
+    state.activity = ''
     // Freeze the tail and spawn any remaining segment cards.
     this.splitOverflow(sessionId, state)
 
@@ -442,7 +680,7 @@ export class TurnStreamer {
     // 回复结束 (backoff is bypassed once so the final state always lands;
     // late-arriving sends are patched when they resolve).
     for (const [index] of state.cards.entries()) {
-      this.patchCard(sessionId, state, index, true)
+      this.patchCard(sessionId, state, index, true, false)
     }
 
     // Reaction swap: Typing → DONE on the triggering message.

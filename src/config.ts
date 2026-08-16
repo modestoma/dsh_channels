@@ -49,6 +49,13 @@ export const configSchema = z.object({
   agentPreset: z.string().optional(),
   /** Streaming card refresh interval in milliseconds. */
   refreshMs: z.number().int().min(200).max(10_000).default(500),
+  /**
+   * Keep-alive interval for the card's activity status line (tool calls,
+   * subagent / workflow progress). While a turn produces no text deltas, the
+   * line's elapsed counter is re-rendered at this cadence so the card never
+   * sits silently. Min 1 s keeps Feishu card-update traffic modest.
+   */
+  statusRefreshMs: z.number().int().min(1_000).max(60_000).default(5_000),
   /** Accept p2p (private) chats. */
   dmMode: z.enum(['open', 'disabled']).default('open'),
   /**

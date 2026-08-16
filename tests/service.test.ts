@@ -25,6 +25,8 @@ function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
     model: 'deepseek-v4-flash',
     maxTokens: undefined,
     refreshMs: 500,
+    // Effectively disables the keep-alive heartbeat in service tests (real timers).
+    statusRefreshMs: 60_000,
     dmMode: 'open',
     requireMention: true,
     threadFallback: 'degrade',

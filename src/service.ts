@@ -170,6 +170,7 @@ export class FeishuService {
       channel,
       this.config.refreshMs,
       hooks,
+      this.config.statusRefreshMs,
     )
 
     this.domain = await openFeishuDomain(this.ctx)

@@ -130,9 +130,56 @@ export interface RequestHeaderEvent extends SessionEventEnvelope {
   }
 }
 
+export interface ToolCallEvent extends SessionEventEnvelope {
+  type: 'tool/call'
+  data: {
+    turn: number
+    step: number
+    callId: string
+    /** Model-facing tool name (e.g. `bash`, `subagent`, `workflow`). */
+    name: string
+    /** Raw arguments JSON exactly as the model produced it (unparsed). */
+    arguments: string
+  }
+}
+
+export interface ToolResultEvent extends SessionEventEnvelope {
+  type: 'tool/result'
+  data: {
+    turn: number
+    step: number
+    message: unknown
+    error?: { name: string; code: string }
+    meta?: unknown
+  }
+}
+
+/** Durable workflow-run progress record projected into the calling session's log. */
+export interface ToolWorkflowRunStartEvent extends SessionEventEnvelope {
+  type: 'tool-workflow/run-start'
+  data: { runId: string; name: string }
+}
+
+export interface ToolWorkflowAgentStartEvent extends SessionEventEnvelope {
+  type: 'tool-workflow/agent-start'
+  data: { runId: string; seq: number; label: string; phase?: string; childId: string }
+}
+
+export interface ToolWorkflowAgentEndEvent extends SessionEventEnvelope {
+  type: 'tool-workflow/agent-end'
+  data: { runId: string; seq: number; outcome: 'completed' | 'failed' | 'cancelled' }
+}
+
+export interface ToolWorkflowRunEndEvent extends SessionEventEnvelope {
+  type: 'tool-workflow/run-end'
+  data: { runId: string; stopReason: 'completed' | 'cancelled' | 'error' }
+}
+
 export interface OtherSessionEvent extends SessionEventEnvelope {
   /** Unknown/extension event types are ignored by the folds. */
-  type: Exclude<string, 'assistant/chunk' | 'assistant/message' | 'step/start' | 'turn/end' | 'request/header'>
+  type: Exclude<string, 'assistant/chunk' | 'assistant/message' | 'step/start' | 'turn/end' | 'request/header'
+    | 'tool/call' | 'tool/result'
+    | 'tool-workflow/run-start' | 'tool-workflow/agent-start' | 'tool-workflow/agent-end' | 'tool-workflow/run-end'>
   data: unknown
 }
 
@@ -142,6 +189,12 @@ export type SessionEvent =
   | StepStartEvent
   | TurnEndEvent
   | RequestHeaderEvent
+  | ToolCallEvent
+  | ToolResultEvent
+  | ToolWorkflowRunStartEvent
+  | ToolWorkflowAgentStartEvent
+  | ToolWorkflowAgentEndEvent
+  | ToolWorkflowRunEndEvent
 
 // ---- Agent surface ------------------------------------------------------
 
