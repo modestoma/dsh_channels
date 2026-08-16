@@ -266,4 +266,58 @@ describe('FeishuService', () => {
     const update = h.channel.updated[0] as { card: object }
     expect(JSON.stringify(update.card)).toContain('会话创建失败')
   })
+
+  it('sends oversized body segments as continuation cards inside the topic', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: '长文' }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    const listener = h.ctxState.sessionListeners[0]!
+    const huge = 'x'.repeat(30_000)
+    listener(agent.session, {
+      type: 'assistant/chunk', seq: 1,
+      data: { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: huge } },
+    })
+    listener(agent.session, { type: 'turn/end', seq: 2, data: { turn: 1, reason: 'stop' } })
+
+    await waitUntil(() => expect(h.channel.sent.length).toBeGreaterThanOrEqual(2))
+    const second = h.channel.sent[1] as {
+      options?: { replyTo?: string; replyInThread?: boolean }
+      input: { card: object }
+    }
+    expect(second.options).toMatchObject({ replyTo: 'om_1', replyInThread: true })
+    expect(JSON.stringify(second.input.card).length).toBeLessThan(30_000)
+  })
+
+  it('falls back to plain text for a rejected segment while the initial card succeeded', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: '长文' }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+
+    // Reject only subsequent card sends (the initial reply card already landed).
+    const originalSend = h.channel.send.bind(h.channel)
+    ;(h.channel as unknown as { send: typeof h.channel.send }).send = async (chatId, input, options) => {
+      if ('card' in input) throw new Error('card rejected (230099)')
+      return originalSend(chatId, input, options)
+    }
+
+    const listener = h.ctxState.sessionListeners[0]!
+    listener(agent.session, {
+      type: 'assistant/chunk', seq: 1,
+      data: { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: 'x'.repeat(30_000) } },
+    })
+    listener(agent.session, { type: 'turn/end', seq: 2, data: { turn: 1, reason: 'stop' } })
+
+    await waitUntil(() => expect(h.channel.sent.length).toBeGreaterThanOrEqual(2))
+    const second = h.channel.sent[1] as {
+      options?: { replyTo?: string; replyInThread?: boolean }
+      input: { text?: string }
+    }
+    expect(second.options).toMatchObject({ replyTo: 'om_1', replyInThread: true })
+    expect(second.input.text).toContain('回复分段 2')
+    expect(second.input.text).toContain('降级为纯文本')
+    expect(second.input.text).toContain('xxx')
+  })
 })

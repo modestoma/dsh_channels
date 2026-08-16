@@ -38,6 +38,12 @@ function hooks() {
     sessionLabel: (id: string) => id,
     onError: vi.fn(),
     onTurnFinalized: vi.fn(),
+    sendSegmentCard: vi.fn(async (
+      _sessionId: string,
+      segment: number,
+      _card: object,
+      _fallbackText: string,
+    ) => ({ messageId: `om_seg_${segment}`, mode: 'card' as const })),
   }
 }
 
@@ -188,5 +194,187 @@ describe('TurnStreamer', () => {
     expect(line1).toContain('input token 130')
     expect(line1).toContain('output token 50')
     expect(line2).toContain('缓存命中 60.0%')
+  })
+
+  it('splits an oversized body into continuation segment cards, losing nothing', async () => {
+    const ch = channel()
+    const hooksInstance = hooks()
+    const streamer = new TurnStreamer(ch, 500, hooksInstance)
+    const session = makeSession('sess-seg')
+    streamer.attach(session, 'om_card', 'om_trigger', undefined)
+
+    const huge = 'x'.repeat(30_000)
+    streamer.onSessionEvent(session, {
+      type: 'assistant/chunk', seq: 1,
+      data: { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: huge } },
+    })
+
+    // First flush: split + continuation send issued.
+    await vi.advanceTimersByTimeAsync(500)
+    const sendSegment = hooksInstance.sendSegmentCard as unknown as ReturnType<typeof vi.fn>
+    expect(sendSegment).toHaveBeenCalledTimes(1)
+    expect(sendSegment.mock.calls[0]?.[1]).toBe(2)
+
+    // Send resolves → the new card is patched; turn/end finalizes everything.
+    await vi.advanceTimersByTimeAsync(500)
+    streamer.onSessionEvent(session, { type: 'turn/end', seq: 2, data: { turn: 1, reason: 'stop' } })
+    await vi.advanceTimersByTimeAsync(0)
+
+    const headCard = ch.updated.filter(update => update.messageId === 'om_card').at(-1)
+    const segCard = ch.updated.filter(update => update.messageId === 'om_seg_2').at(-1)
+    expect(headCard).toBeDefined()
+    expect(segCard).toBeDefined()
+    const headBody = markdownOf(headCard!.card, 0)
+    const segBody = markdownOf(segCard!.card, 1)
+    expect(headBody + segBody).toBe(huge)
+  })
+
+  it('finalizes continuation cards with the 回复结束 header', async () => {
+    const ch = channel()
+    const streamer = new TurnStreamer(ch, 500, hooks())
+    const session = makeSession('sess-seg-done')
+    streamer.attach(session, 'om_card', 'om_trigger', undefined)
+
+    streamer.onSessionEvent(session, {
+      type: 'assistant/chunk', seq: 1,
+      data: { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: 'x'.repeat(30_000) } },
+    })
+    streamer.onSessionEvent(session, { type: 'turn/end', seq: 2, data: { turn: 1, reason: 'stop' } })
+    await vi.advanceTimersByTimeAsync(500)
+    await vi.advanceTimersByTimeAsync(500)
+
+    const segCard = ch.updated.filter(update => update.messageId === 'om_seg_2').at(-1)
+    expect(segCard).toBeDefined()
+    const header = markdownOf(segCard!.card, 0)
+    expect(header).toContain('回复分段 2')
+    expect(header).toContain('回复结束')
+
+    const headCard = ch.updated.filter(update => update.messageId === 'om_card').at(-1)!.card as {
+      body: { elements: [{ header: { title: { content: string } } }] }
+    }
+    expect(headCard.body.elements[0]?.header.title.content).toBe('回复结束')
+  })
+
+  it('splits a multi-table body into table-capped segments without losing content', async () => {
+    const ch = channel()
+    const hooksInstance = hooks()
+    const streamer = new TurnStreamer(ch, 500, hooksInstance)
+    const session = makeSession('sess-tables')
+    streamer.attach(session, 'om_card', 'om_trigger', undefined)
+
+    const table = (n: number) => `| 列${n} | 值 |\n| --- | --- |\n| 行 | ${n} |`
+    const tables = Array.from({ length: 7 }, (_, i) => table(i + 1)).join('\n\n')
+    const body = `开头\n\n${tables}\n\n结尾`
+    streamer.onSessionEvent(session, {
+      type: 'assistant/chunk', seq: 1,
+      data: { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: body } },
+    })
+    streamer.onSessionEvent(session, { type: 'turn/end', seq: 2, data: { turn: 1, reason: 'stop' } })
+    await vi.advanceTimersByTimeAsync(500)
+    await vi.advanceTimersByTimeAsync(500)
+    await vi.advanceTimersByTimeAsync(500)
+
+    // Final patch per message id, in first-seen order.
+    const byId = new Map<string, object>()
+    for (const update of ch.updated) {
+      byId.set(update.messageId, update.card)
+    }
+    const bodies = [...byId.entries()].map(([messageId, card]) =>
+      markdownOf(card, messageId === 'om_card' ? 0 : 1),
+    )
+
+    // Nothing lost (modulo blank-line separators at the cuts).
+    const flat = (text: string) => text.replace(/\s+/g, '')
+    expect(flat(bodies.join(''))).toBe(flat(body))
+    // Every card carries at most 5 tables (3 pipe lines each).
+    for (const content of bodies) {
+      const pipeLines = (content.match(/^\s*\|[^\n]*\|/gm) ?? []).length
+      expect(pipeLines).toBeLessThanOrEqual(15)
+    }
+  })
+
+  it('stops streaming into a text-fallback segment and continues in a new one', async () => {
+    const ch = channel()
+    const hooksInstance = hooks()
+    const sendSegment = hooksInstance.sendSegmentCard as unknown as ReturnType<typeof vi.fn>
+    sendSegment.mockResolvedValueOnce({ messageId: 'om_text', mode: 'text' })
+
+    const streamer = new TurnStreamer(ch, 500, hooksInstance)
+    const session = makeSession('sess-textmode')
+    streamer.attach(session, 'om_card', 'om_trigger', undefined)
+
+    streamer.onSessionEvent(session, {
+      type: 'assistant/chunk', seq: 1,
+      data: { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: 'x'.repeat(30_000) } },
+    })
+    await vi.advanceTimersByTimeAsync(500)
+
+    // One segment delivered as plain text (fallback).
+    expect(sendSegment).toHaveBeenCalledTimes(1)
+    expect(sendSegment.mock.calls[0]?.[3]).toContain('xxxx')
+    // The text-mode card is never patched via updateCard.
+    expect(ch.updated.some(update => update.messageId === 'om_text')).toBe(false)
+
+    // More text arrives after the text-fallback delivery: it must NOT be lost
+    // (it flows into a fresh segment card, never into the finished text one).
+    streamer.onSessionEvent(session, {
+      type: 'assistant/chunk', seq: 2,
+      data: { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: '后续内容' } },
+    })
+    await vi.advanceTimersByTimeAsync(500)
+
+    // The follow-up content triggered its own segment send (card attempt).
+    expect(sendSegment).toHaveBeenCalledTimes(2)
+    expect(sendSegment.mock.calls[1]?.[1]).toBe(3)
+  })
+
+  it('throttles failed card updates with exponential backoff instead of per-flush spam', async () => {
+    const ch = channel()
+    ch.updateCard = vi.fn(async () => {
+      throw new Error('card rejected')
+    })
+    const hooksInstance = hooks()
+    const streamer = new TurnStreamer(ch, 500, hooksInstance)
+    const session = makeSession('sess-backoff')
+    streamer.attach(session, 'om_card', 'om_trigger', undefined)
+
+    // Stream deltas for ~10 s; the rejected card must be retried at most a
+    // handful of times (backoff), never once per flush.
+    for (let i = 0; i < 20; i++) {
+      streamer.onSessionEvent(session, {
+        type: 'assistant/chunk', seq: i + 1,
+        data: { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: `行${i}\n` } },
+      })
+      await vi.advanceTimersByTimeAsync(500)
+    }
+    const attempts = (ch.updateCard as unknown as ReturnType<typeof vi.fn>).mock.calls.length
+    expect(attempts).toBeGreaterThanOrEqual(3)
+    expect(attempts).toBeLessThanOrEqual(6)
+    const onError = hooksInstance.onError as unknown as ReturnType<typeof vi.fn>
+    expect(onError.mock.calls.length).toBeLessThanOrEqual(4)
+  })
+
+  it('gives up after retries when segment delivery keeps failing', async () => {
+    const ch = channel()
+    const hooksInstance = hooks()
+    const sendSegment = hooksInstance.sendSegmentCard as unknown as ReturnType<typeof vi.fn>
+    sendSegment.mockRejectedValue(new Error('both card and text failed'))
+
+    const streamer = new TurnStreamer(ch, 500, hooksInstance)
+    const session = makeSession('sess-sendfail')
+    streamer.attach(session, 'om_card', 'om_trigger', undefined)
+    streamer.onSessionEvent(session, {
+      type: 'assistant/chunk', seq: 1,
+      data: { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: 'x'.repeat(30_000) } },
+    })
+    await vi.advanceTimersByTimeAsync(500)
+    // Retry backoffs: 1s + 2s.
+    await vi.advanceTimersByTimeAsync(1_000)
+    await vi.advanceTimersByTimeAsync(2_000)
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(sendSegment).toHaveBeenCalledTimes(3)
+    const onError = hooksInstance.onError as unknown as ReturnType<typeof vi.fn>
+    expect(onError).toHaveBeenCalledTimes(1)
   })
 })

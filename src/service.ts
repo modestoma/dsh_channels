@@ -143,6 +143,8 @@ export class FeishuService {
         this.ctx.logger?.warn?.('dsh-channels stream error: %s', String(error))
       },
       onTurnFinalized: () => { /* reaction swap is handled per turn inside the streamer */ },
+      sendSegmentCard: (sessionId, segment, card, fallbackText) =>
+        this.sendSegmentCard(sessionId, segment, card, fallbackText),
     }
     this.streamer = new TurnStreamer(
       channel,
@@ -242,6 +244,50 @@ export class FeishuService {
   private async persistRoute(key: string, record: RouteRecord): Promise<void> {
     this.routeCache.set(key, record)
     await this.domain?.routes.put(key, record)
+  }
+
+  /** Find the route record owning a session (prefers the thread route). */
+  private findRouteBySession(sessionId: string): RouteRecord | undefined {
+    let fallback: RouteRecord | undefined
+    for (const record of this.routeCache.values()) {
+      if (record.sessionId !== sessionId) continue
+      if (record.kind === 'thread') return record
+      fallback ??= record
+    }
+    return fallback
+  }
+
+  /**
+   * Send one body-segment continuation card into the session's topic (or, for
+   * degraded chat-scoped routes, as a plain reply anchored to the main card).
+   * When Feishu rejects the card (e.g. per-card table limit, error 11310) the
+   * segment is re-delivered as a plain-text message so the content is never
+   * lost — text messages carry no card constraints.
+   */
+  private async sendSegmentCard(
+    sessionId: string,
+    segment: number,
+    card: object,
+    fallbackText: string,
+  ): Promise<{ messageId: string; mode: 'card' | 'text' }> {
+    const record = this.findRouteBySession(sessionId)
+    if (record === undefined) {
+      throw new Error(`dsh-channels: no route record for session ${sessionId}; segment card not sent`)
+    }
+    const options = { replyTo: record.cardMessageId, replyInThread: record.kind === 'thread' }
+    try {
+      const res = await this.requireChannel().send(record.chatId, { card }, options)
+      return { messageId: res.messageId, mode: 'card' }
+    } catch (error) {
+      this.ctx.logger?.warn?.(
+        'dsh-channels: segment %d card for session %s rejected, falling back to plain text: %s',
+        segment, sessionId, String(error),
+      )
+      const res = await this.requireChannel().send(record.chatId, {
+        text: `📄 回复分段 ${segment}（卡片发送失败，已降级为纯文本）\n\n${fallbackText}`,
+      }, options)
+      return { messageId: res.messageId, mode: 'text' }
+    }
   }
 
   // ---- session lifecycle ----------------------------------------------

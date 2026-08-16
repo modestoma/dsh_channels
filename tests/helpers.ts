@@ -185,6 +185,8 @@ export interface FakeChannelOptions {
   threadIdOfMessage?: (messageId: string) => Promise<string | undefined>
   failFirstSend?: boolean
   failReplyInThread?: boolean
+  /** Reject every card send (used to exercise the plain-text fallback). */
+  failCardSends?: boolean
 }
 
 export function makeChannel(options: FakeChannelOptions = {}): FeishuChannel & {
@@ -206,6 +208,7 @@ export function makeChannel(options: FakeChannelOptions = {}): FeishuChannel & {
     disconnect: vi.fn(async () => {}),
     async send(chatId, input, sendOptions) {
       if (options.failFirstSend) throw new Error('send failed')
+      if (options.failCardSends && 'card' in input) throw new Error('card rejected (230099)')
       if (sendOptions?.replyInThread === true && options.failReplyInThread === true) {
         throw new Error('topic unsupported')
       }

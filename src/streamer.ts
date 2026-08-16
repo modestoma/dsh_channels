@@ -3,25 +3,40 @@
  * and patches the Feishu card on a fixed refresh interval (default 500 ms).
  *
  * Lifecycle per (session, user message):
- *  1. `attach()` — the reply card was just sent; bind it to the session.
+ *  1. `attach()` — the reply card was just sent; bind it to the session as
+ *     segment 1.
  *  2. `session/event` consumption — text deltas fill the body, reasoning
  *     deltas fill the fold panel, usage/header events advance the stats fold.
- *  3. `turnEnded(turn)` — finalize that turn's card (`回复结束`) and request
+ *  3. When the body outgrows one card's budget, the overflow is split at a
+ *     clean breakpoint and sent as a continuation segment card (segment 2, 3,
+ *     …) into the same topic; the stream then keeps flowing into the newest
+ *     card. Reasoning is never segmented — it stays on card 1 and is clipped
+ *     to the leftover budget (body has priority).
+ *  4. `turnEnded(turn)` — finalize every segment card (`回复结束`) and request
  *     the Typing → DONE reaction swap on the triggering message.
  *
  * The first visible text delta flips the panel title 推理中 → 回复中; the
  * final patch flips it to 回复结束. Patching is throttled to `refreshMs` and
- * only runs when the content actually changed.
+ * only runs when the content actually changed. Segment sends are serialized
+ * per session so cards arrive in order.
  *
  * @module dsh-channels/streamer
  */
 
 import type { Session, SessionEvent } from './dsh-types.ts'
-import { buildCard } from './cards.ts'
-import type { CardState } from './cards.ts'
+import { buildCard, segmentCardContent } from './cards.ts'
+import type { CardState, PanelPhase } from './cards.ts'
 import type { FeishuChannel } from './feishu-channel.ts'
 import { cacheHitPct, foldAll, foldEvent } from './stats.ts'
 import type { StatsFold } from './stats.ts'
+
+/** How a segment card reached Feishu. */
+export interface SegmentDelivery {
+  messageId: string
+  /** `card` segments stream via `updateCard`; `text` messages are final
+   *  (delivered as a plain-text fallback and never patched afterwards). */
+  mode: 'card' | 'text'
+}
 
 export interface StreamerHooks {
   /** Fetch current context pressure for one session (may be expensive → cached by caller). */
@@ -32,24 +47,61 @@ export interface StreamerHooks {
   onError(sessionId: string, error: unknown): void
   /** Invoked once when a turn's card reaches its final state. */
   onTurnFinalized(sessionId: string, turn: number): void
+  /**
+   * Send one continuation segment card for a turn (calls arrive in segment
+   * order per session). Implementations may fall back to a plain-text message
+   * (reporting `mode: 'text'`) when the card is rejected — e.g. Feishu's
+   * per-card table limit (error 11310) — so the content always reaches the
+   * user. `fallbackText` carries the raw segment body for that fallback.
+   */
+  sendSegmentCard(
+    sessionId: string,
+    segment: number,
+    card: object,
+    fallbackText: string,
+  ): Promise<SegmentDelivery>
+}
+
+/** One segment card of a turn. Card 1 is the attached reply card; further
+ *  cards are created lazily when the body overflows the previous card. */
+interface SegmentCard {
+  /** Feishu message id; undefined until the segment send resolves. */
+  messageId: string | undefined
+  /** Body accumulated for this segment (frozen once a later segment exists). */
+  body: string
+  /** True when the card has unsent content for its message id. */
+  dirty: boolean
+  /** True once this card stopped accepting body growth. */
+  frozen: boolean
+  /** Delivery mode once known; `text` segments are never patched. */
+  mode: SegmentDelivery['mode'] | undefined
+  /** True when delivery failed permanently (logged; never retried again). */
+  failed: boolean
+  /** True while a segment send is enqueued/in flight (prevents duplicate sends). */
+  sending: boolean
+  /** Consecutive update failures (drives the retry backoff). */
+  failures: number
+  /** Earliest timestamp for the next update attempt. */
+  nextRetryAt: number
 }
 
 interface TurnState {
   /** Turn number once known; undefined until the first `step/start`. */
   turn: number | undefined
-  /** The card message this turn streams into. */
-  cardMessageId: string
   /** Message whose reaction carries Typing → DONE. */
   triggerMessageId: string
   /** Reaction id of the Typing reaction (undefined when the add failed). */
   reactionId: string | undefined
-  phase: CardState['phase']
+  phase: PanelPhase
   reasoning: string
-  body: string
+  /** Segment cards in order; `cards[0]` is the attached reply card. */
+  cards: SegmentCard[]
   dirty: boolean
   lastPatchAt: number
   timer: ReturnType<typeof setTimeout> | undefined
   finalized: boolean
+  /** Set by `detach()`; pending sends then stop scheduling further patches. */
+  disposed: boolean
 }
 
 export class TurnStreamer {
@@ -64,6 +116,8 @@ export class TurnStreamer {
   private readonly sessions = new Map<string, Session>()
   /** sessionId → context pressure cache (refreshed every N patches). */
   private readonly contextCache = new Map<string, { contextTokens?: number; contextWindow?: number }>()
+  /** sessionId → serialized segment-send chain (keeps card order). */
+  private readonly segmentChains = new Map<string, Promise<void>>()
 
   constructor(channel: FeishuChannel, refreshMs: number, hooks: StreamerHooks) {
     this.channel = channel
@@ -82,16 +136,26 @@ export class TurnStreamer {
     const queue = this.bySession.get(session.id) ?? []
     queue.push({
       turn: undefined,
-      cardMessageId,
       triggerMessageId,
       reactionId,
       phase: 'thinking',
       reasoning: '',
-      body: '',
+      cards: [{
+        messageId: cardMessageId,
+        body: '',
+        dirty: true,
+        frozen: false,
+        mode: 'card',
+        failed: false,
+        sending: false,
+        failures: 0,
+        nextRetryAt: 0,
+      }],
       dirty: true,
       lastPatchAt: 0,
       timer: undefined,
       finalized: false,
+      disposed: false,
     })
     this.bySession.set(session.id, queue)
   }
@@ -100,12 +164,14 @@ export class TurnStreamer {
   detach(sessionId: string): void {
     const queue = this.bySession.get(sessionId) ?? []
     for (const state of queue) {
+      state.disposed = true
       if (state.timer !== undefined) clearTimeout(state.timer)
     }
     this.bySession.delete(sessionId)
     this.folds.delete(sessionId)
     this.sessions.delete(sessionId)
     this.contextCache.delete(sessionId)
+    this.segmentChains.delete(sessionId)
   }
 
   hasSession(sessionId: string): boolean {
@@ -144,9 +210,12 @@ export class TurnStreamer {
         if (state.turn === undefined) state.turn = event.data.turn
         switch (chunk.type) {
           case 'text-delta': {
-            state.body += chunk.text
-            if (state.phase === 'thinking') state.phase = 'replying'
-            this.markDirty(session.id, state)
+            const last = state.cards[state.cards.length - 1]
+            if (last !== undefined && !last.frozen) {
+              last.body += chunk.text
+              if (state.phase === 'thinking') state.phase = 'replying'
+              this.markDirty(session.id, state)
+            }
             break
           }
           case 'reasoning-delta': {
@@ -172,6 +241,7 @@ export class TurnStreamer {
   }
 
   private markDirty(sessionId: string, state: TurnState): void {
+    if (state.disposed) return
     state.dirty = true
     if (state.timer !== undefined) return
     const wait = state.lastPatchAt === 0
@@ -210,19 +280,151 @@ export class TurnStreamer {
     }
   }
 
-  private flush(sessionId: string, state: TurnState): void {
-    state.lastPatchAt = Date.now()
-    if (!state.dirty) return
-    state.dirty = false
-    const card = buildCard({
+  private cardState(sessionId: string, state: TurnState, body: string): CardState {
+    return {
       phase: state.phase,
       reasoning: state.reasoning,
-      body: state.body,
+      body,
       stats: this.statsFor(sessionId),
+    }
+  }
+
+  /**
+   * Freeze the newest card once its body stops fitting its budget (bytes or
+   * the per-card table cap) and move the overflow into fresh segment cards
+   * (their sends are chained in order).
+   */
+  private splitOverflow(sessionId: string, state: TurnState): void {
+    for (;;) {
+      const index = state.cards.length - 1
+      const card = state.cards[index]
+      if (card === undefined || card.frozen || card.mode === 'text') return
+
+      const options = index === 0 ? {} : { panel: false, segment: index + 1 }
+      const split = segmentCardContent(this.cardState(sessionId, state, card.body), options)
+      if (split.head === '') {
+        // Degenerate budget (cannot happen with the real fixed overhead):
+        // keep streaming into this card; buildCard's absolute clip still
+        // guards the card size.
+        return
+      }
+      if (split.tail === '') {
+        card.body = split.head
+        card.dirty = true
+        // A card with content but no message id yet (e.g. the continuation of
+        // a text-fallback segment) needs its own send, not just a patch.
+        if (card.messageId === undefined && !card.sending && !card.failed && card.body !== '') {
+          this.sendSegment(sessionId, state, index)
+        }
+        return
+      }
+
+      card.body = split.head
+      card.frozen = true
+      card.dirty = true
+      const next: SegmentCard = this.freshSegment(split.tail)
+      state.cards.push(next)
+      this.sendSegment(sessionId, state, state.cards.length - 1)
+    }
+  }
+
+  private freshSegment(body: string): SegmentCard {
+    return {
+      messageId: undefined,
+      body,
+      dirty: true,
+      frozen: false,
+      mode: undefined,
+      failed: false,
+      sending: false,
+      failures: 0,
+      nextRetryAt: 0,
+    }
+  }
+
+  private delay(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms))
+  }
+
+  /**
+   * Serialize one continuation-card send per session (order on Feishu), with
+   * up to two retries (1s / 2s backoff) for transient failures. When delivery
+   * resolves as a text fallback the segment is frozen and further growth
+   * continues in a new segment — text messages cannot be patched afterwards.
+   */
+  private sendSegment(sessionId: string, state: TurnState, index: number): void {
+    const card = state.cards[index]
+    if (card === undefined || card.failed || card.sending || state.disposed) return
+    card.sending = true
+
+    const previous = this.segmentChains.get(sessionId) ?? Promise.resolve()
+    const next = previous.then(async () => {
+      let lastError: unknown
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const snapshot = buildCard(this.cardState(sessionId, state, card.body), {
+            panel: false,
+            segment: index + 1,
+          })
+          const delivery = await this.hooks.sendSegmentCard(sessionId, index + 1, snapshot, card.body)
+          card.sending = false
+          card.messageId = delivery.messageId
+          card.mode = delivery.mode
+          if (delivery.mode === 'card') {
+            card.dirty = true
+            this.markDirty(sessionId, state)
+          } else if (!card.frozen && !state.disposed) {
+            // Text fallback: this card is final; keep streaming into a new one.
+            card.frozen = true
+            if (state.cards[state.cards.length - 1] === card) {
+              state.cards.push(this.freshSegment(''))
+            }
+            this.markDirty(sessionId, state)
+          }
+          return
+        } catch (error) {
+          lastError = error
+          if (attempt >= 2 || state.disposed) break
+          await this.delay(1_000 * 2 ** attempt)
+        }
+      }
+      card.sending = false
+      card.failed = true
+      this.hooks.onError(sessionId, lastError)
     })
-    this.channel.updateCard(state.cardMessageId, card).catch((error: unknown) => {
-      this.hooks.onError(sessionId, error)
+    this.segmentChains.set(sessionId, next.then(() => {}, () => {}))
+  }
+
+  /** Patch one card when due; failed updates retry with exponential backoff
+   *  (logged on the first failure and every 10th — no per-flush spam). */
+  private patchCard(sessionId: string, state: TurnState, index: number, force: boolean): void {
+    const card = state.cards[index]
+    if (card === undefined || card.messageId === undefined || card.mode === 'text' || card.failed) return
+    const now = Date.now()
+    if (!force && !card.dirty) return
+    if (!force && card.nextRetryAt > now) return
+    card.dirty = false
+    const options = index === 0 ? {} : { panel: false, segment: index + 1 }
+    const snapshot = buildCard(this.cardState(sessionId, state, card.body), options)
+    this.channel.updateCard(card.messageId, snapshot).catch((error: unknown) => {
+      card.dirty = true
+      card.failures++
+      card.nextRetryAt = Date.now() + Math.min(1_000 * 2 ** Math.min(card.failures, 6), 60_000)
+      if (card.failures === 1 || card.failures % 10 === 0) {
+        this.hooks.onError(sessionId, error)
+      }
     })
+  }
+
+  private flush(sessionId: string, state: TurnState): void {
+    state.lastPatchAt = Date.now()
+    if (state.dirty) {
+      state.dirty = false
+      this.splitOverflow(sessionId, state)
+    }
+    for (const [index] of state.cards.entries()) {
+      this.patchCard(sessionId, state, index, false)
+    }
   }
 
   private finalize(sessionId: string, state: TurnState): void {
@@ -233,16 +435,15 @@ export class TurnStreamer {
       clearTimeout(state.timer)
       state.timer = undefined
     }
-    // Final patch with the settled content and stats.
-    const card = buildCard({
-      phase: 'done',
-      reasoning: state.reasoning,
-      body: state.body,
-      stats: this.statsFor(sessionId),
-    })
-    this.channel.updateCard(state.cardMessageId, card).catch((error: unknown) => {
-      this.hooks.onError(sessionId, error)
-    })
+    // Freeze the tail and spawn any remaining segment cards.
+    this.splitOverflow(sessionId, state)
+
+    // Final patches with the settled content: every patchable card flips to
+    // 回复结束 (backoff is bypassed once so the final state always lands;
+    // late-arriving sends are patched when they resolve).
+    for (const [index] of state.cards.entries()) {
+      this.patchCard(sessionId, state, index, true)
+    }
 
     // Reaction swap: Typing → DONE on the triggering message.
     void this.swapReaction(state)
