@@ -492,6 +492,17 @@ describe('TurnStreamer activity status + keep-alive', () => {
     await vi.advanceTimersByTimeAsync(500)
     expect(markdownLines(headCard(ch))[0]).toContain('工作流 audit 结束（完成）')
     expect(markdownLines(headCard(ch)).join('\n')).not.toContain('调用工具')
+
+    // The settled card keeps the workflow conclusion; only the tool line
+    // disappears.
+    streamer.onSessionEvent(session, { type: 'turn/end', seq: 9, data: { turn: 1, reason: 'stop' } })
+    await vi.advanceTimersByTimeAsync(0)
+    const finalCard = headCard(ch)
+    expect(markdownLines(finalCard)[0]).toContain('🧵 工作流 audit 结束（完成）')
+    expect(markdownLines(finalCard).join('\n')).not.toContain('调用工具')
+    // panel, status line, hr, body, hr, info line 1, info line 2.
+    const elements = (finalCard as { body: { elements: unknown[] } }).body.elements
+    expect(elements.length).toBe(7)
   })
 
   it('folds tool-workflow run events into a progress line with member counts', async () => {
@@ -663,6 +674,43 @@ describe('TurnStreamer subagent child folding', () => {
     expect(activity(ch)).not.toContain('子代理执行中')
     // Parent's tool line remains until its own tool/result.
     expect(markdownLines(headCard(ch)).join('\n')).toContain('调用子代理：检索实现方案')
+  })
+
+  it('summarizes finished subagents on the settled card (tool line disappears)', async () => {
+    const ch = channel()
+    const streamer = new TurnStreamer(ch, 500, hooks())
+    const session = makeSession('sess-settled-sub')
+    streamer.attach(session, 'om_card', 'om_trigger', undefined)
+
+    streamer.onSessionEvent(session, {
+      type: 'tool/call', seq: 1,
+      data: {
+        turn: 1, step: 1, callId: 'call-1', name: 'subagent',
+        arguments: JSON.stringify({ description: '检索实现方案', prompt: '…' }),
+      },
+    })
+    const child = makeChildSession('child-1', 'sess-settled-sub')
+    streamer.onSessionEvent(child, {
+      type: 'subagent/descriptor', seq: 1,
+      data: { version: 2, mode: 'one-shot', provider: 'spawn', label: '检索实现方案' },
+    })
+    streamer.onSessionEvent(child, { type: 'turn/end', seq: 2, data: { turn: 1, reason: 'stop' } })
+    streamer.onSessionEvent(session, {
+      type: 'tool/result', seq: 3,
+      data: { turn: 1, step: 1, message: { type: 'text', text: 'done' } },
+    })
+    streamer.onSessionEvent(session, {
+      type: 'assistant/chunk', seq: 4,
+      data: { turn: 1, step: 2, chunk: { type: 'text-delta', index: 0, text: '答案' } },
+    })
+    streamer.onSessionEvent(session, { type: 'turn/end', seq: 5, data: { turn: 1, reason: 'stop' } })
+    await vi.advanceTimersByTimeAsync(0)
+
+    const finalCard = headCard(ch)
+    const lines = markdownLines(finalCard)
+    expect(lines[0]).toContain('🤖 子代理完成：检索实现方案')
+    expect(lines.join('\n')).not.toContain('调用子代理')
+    expect(lines.join('\n')).not.toContain('子代理执行中')
   })
 
   it('counts parallel children and defaults the label to 子代理 before the descriptor', async () => {

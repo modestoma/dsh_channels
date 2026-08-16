@@ -137,6 +137,12 @@ interface TurnState {
    * and removed when their own turn ends.
    */
   children: Map<string, ChildActivity>
+  /**
+   * Labels of subagent children that FINISHED during this turn (capped). They
+   * leave the live `children` fold at their turn/end but are summarized on
+   * the settled card: `🤖 子代理完成：a、b`.
+   */
+  settled: string[]
   /** Currently rendered delegation status line (recomputed on every snapshot). */
   status: string
   /** Kind of the status line currently logged (change-detection only). */
@@ -285,6 +291,7 @@ export class TurnStreamer {
       workflowRuns: new Map(),
       workflowEndStatus: undefined,
       children: new Map(),
+      settled: [],
       status: '',
       statusKind: '',
       tool: '',
@@ -541,7 +548,15 @@ export class TurnStreamer {
         break
       }
       case 'turn/end': {
-        if (state.children.delete(child.id)) this.markDirty(parentId, state)
+        const entry = state.children.get(child.id)
+        if (entry === undefined) break
+        state.children.delete(child.id)
+        // A finished child leaves the live fold but is summarized on the
+        // settled card (capped; placeholder labels are skipped).
+        if (entry.label !== '子代理' && state.settled.length < 3) {
+          state.settled.push(entry.label)
+        }
+        this.markDirty(parentId, state)
         break
       }
       default:
@@ -554,15 +569,16 @@ export class TurnStreamer {
    *  1. the most recently started live workflow run (member progress + phase);
    *  2. running subagent children (label + current tool + elapsed);
    *  3. the last settled workflow run's outcome — it persists across later
-   *     tool calls and text streaming (only a new run-start or the turn's end
-   *     replaces it), so the workflow conclusion stays visible;
+   *     tool calls and text streaming (only a new run-start replaces it), so
+   *     the workflow conclusion stays visible;
    *  4. heartbeat fallback — a thinking turn with no output yet still shows
    *     an elapsed counter so the card never sits silently.
-   * Empty once the turn is finalized; the heartbeat fallback also disappears
-   * as soon as visible text exists (the streaming body itself shows liveness).
+   * Once the turn is finalized, the line switches to the SETTLED form
+   * (workflow conclusion + finished-subagent summary) — the final card keeps
+   * the delegation status; only the tool line disappears.
    */
   private delegationLine(state: TurnState, now: number): string {
-    if (state.finalized) return ''
+    if (state.finalized) return this.settledLine(state)
 
     let latest: WorkflowRun | undefined
     for (const run of state.workflowRuns.values()) {
@@ -605,9 +621,39 @@ export class TurnStreamer {
   }
 
   /**
+   * The settled-card form of the delegation status line: the workflow
+   * conclusion and/or the finished-subagent summary, without elapsed counters.
+   * Still-running (background) children are noted factually. Empty when the
+   * turn delegated nothing.
+   */
+  private settledLine(state: TurnState): string {
+    const parts: string[] = []
+    if (state.workflowEndStatus !== undefined) {
+      const { name, stopReason } = state.workflowEndStatus
+      parts.push(`🧵 工作流 ${name} 结束（${stopReason}）`)
+    }
+    if (state.settled.length > 0) {
+      parts.push(`🤖 子代理完成：${state.settled.join('、')}`)
+    }
+    if (parts.length > 0) return clipActivity(parts.join(' · '))
+
+    const children = [...state.children.values()]
+    if (children.length > 0) {
+      const listed = children.slice(0, 2).map(child =>
+        `${child.label}${child.tool === undefined ? '' : ` (${child.tool})`}`)
+      const head = children.length === 1
+        ? `🤖 子代理执行中：${listed[0]}`
+        : `🤖 ${children.length} 个子代理执行中：${listed.join('、')}${children.length > 2 ? '、…' : ''}`
+      return clipActivity(head)
+    }
+    return ''
+  }
+
+  /**
    * The tool-call line: the parent agent's in-flight tool call, independent
    * of the delegation status line — workflow/subagent status never hides it
-   * and it never hides them. Cleared by the tool's `tool/result`.
+   * and it never hides them. Cleared by the tool's `tool/result`; always
+   * empty on the settled card.
    */
   private toolLine(state: TurnState, now: number): string {
     if (state.finalized) return ''
@@ -830,13 +876,14 @@ export class TurnStreamer {
       clearTimeout(state.timer)
       state.timer = undefined
     }
-    // Transient activity is not part of the settled card: the heartbeat stops
-    // and both activity lines render empty on every final patch.
+    // The settled card keeps the delegation status (workflow conclusion /
+    // subagent summary — `delegationLine` renders its settled form once
+    // `finalized` is set); only the transient tool line disappears. The
+    // heartbeat stops.
     if (state.heartbeatTimer !== undefined) {
       clearTimeout(state.heartbeatTimer)
       state.heartbeatTimer = undefined
     }
-    state.status = ''
     state.tool = ''
     // Freeze the tail and spawn any remaining segment cards.
     this.splitOverflow(sessionId, state)
