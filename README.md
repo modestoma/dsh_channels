@@ -67,6 +67,7 @@ DSH_HOME=$DSH_HOME pnpm dsh plugin --profile web add dsh-channels@file:/path/to/
         requireMention: true                # 普通群需 @ 机器人
         dmMode: 'open'
         threadFallback: 'degrade'           # 话题被拒时降级为会话级路由
+        routeTtlMs: 2592000000              # 路由表 GC 阈值：30 天无活动即清理（默认；0 = 关闭）
         loggerLevel: 'info'
 ```
 
@@ -102,9 +103,12 @@ FEISHU_APP_SECRET: xxxxxxxx
 ## 行为与降级
 
 - **话题创建**：通过回复消息接口 `reply_in_thread: true`（官方文档明示的“以话题方式回复（即创建话题）”）。响应后经 `im.v1.message.get` 取回 `thread_id` 写入路由表。
-- **话题延续**：`im.message.receive_v1` 事件自带 `thread_id`，命中路由表即 `agent.followup()`，无需 @。
+- **话题延续**：`im.message.receive_v1` 事件自带 `thread_id`，命中路由表即 `agent.followup()`，无需 @。同一 (chat, user) 的**并发首消息会被串行化**：后到的消息等待在途的会话建立完成，再按串行语义续聊同一 session 或另起新话题——不会重复建 session、覆盖路由，也不会落入“无路由、无 @”的丢弃窗口。
 - **降级（`threadFallback: 'degrade'`）**：私聊或群聊拒绝话题回复（如 230071）时，自动改为普通回复，路由键退化为 `chat:p2p:<chat_id>:<open_id>` / `chat:group:<chat_id>:<open_id>`（会话级延续）；`strict` 则直接失败。
 - **重启恢复**：路由表持久化在 `storageDomain`；消息到达时 `ctx.agents.resume()` 懒恢复 session。若会话已被其他 owner 恢复为 live（如 Web UI 打开过该会话、并发冷恢复竞态），插件**借用**该 live agent 直接 `followup()`，不再报 "cannot prepare session … while it is live"。借用的 agent 不归插件 dispose；shutdown 与在途 resume 竞态时，刚发布的 agent 会被立即 dispose 以避免泄漏进下一实例的 live 注册表。
+- **重启修复（流式中断）**：每条正在流式的 turn 会把自己的修复凭据（trigger 消息、Typing reaction id、全部段卡 id）写入 `channels_routes` 域的 `inflight` 表（键 = 主卡 message id，turn 结束即删）。重启后长连接一建立，插件就把上一实例留下的中途卡片 patch 成「⚠️ 服务已重启，本次回复中断，请重新发送消息。」终态并补 DONE 表情；patch 失败重试一次（上限 2 次）后放弃。持久化盘点与缺口清单见 [docs/persistence.md](docs/persistence.md)。
+- **消息去重（WS 重投幂等）**：飞书长连接重连会重投未 ack 的事件；每条消息在任何副作用之前先落一条 `processed` 记录（键 = message id，飞书全局唯一），重投消息被直接丢弃——同进程靠内存守卫、跨重启靠持久化记录，每条消息至多处理一次。记录保留 24 小时后由 GC 清扫。
+- **路由表 GC**：超过 `routeTtlMs`（默认 30 天）无活动的路由记录（被删除的话题永远不会再出现）与陈年 in-flight 快照在启动时及每 6 小时被清扫；只删插件自己的路由条目，DSH session 与工作区不动，被 GC 的话题后来再有消息等同新话题。`routeTtlMs: 0` 关闭 GC。
 - **表情**：`Typing` 与 `DONE` 均为飞书**官方内置**表态表情（emoji_type 即 `"Typing"`/`"DONE"`），无需上传自定义表情。
 - **限频**：卡片更新单条消息 5 QPS、应用级 1000 次/分钟；500ms（2 QPS）默认安全，`refreshMs` 下限 200ms；活动状态行的保活心跳默认 5s（`statusRefreshMs` 下限 1s），远低于限频。
 - **卡片体积**：单卡片 JSON 目标 ≤ 28 KB（飞书上限 30 KB，留 2 KB 冗余）；正文超长自动分段为多张续卡（按段落/标题/代码块边界切分，每卡 ≤ 5 个表格，全文保留），推理内容按剩余预算截断（正文优先）。
@@ -117,6 +121,10 @@ FEISHU_APP_SECRET: xxxxxxxx
 - 子代理只显示状态（label / 当前工具 / 计时 / 并行计数），不显示其输出正文；后台子代理（`run_in_background`）在父 turn 结束后不再继续显示进度（卡片随父 turn 收尾）。
 - 私聊 `reply_in_thread` 需真机验证（文档未明示限制，失败走降级路径，见上文）。
 - 会话的 agent 常驻内存，不做空闲回收（重启后按需懒恢复）。
+- 重启修复会**全量替换**中断的卡片：旧进程里已流出的部分正文随之消失（本地没有副本，patch 是全量语义）；修复是一次性 + 一次重试，不再无限重试。
+- 路由 GC 是 TTL 兜底：未监听飞书“群解散/话题删除”事件做主动清理；被 GC 的话题在 TTL 内无新活动，用户回来后将从新 session 开始。
+- 消息去重是**至多一次**语义：接受后、副作用完成前崩溃的极小窗口内，重投消息会被丢弃——中断修复卡提示“请重新发送消息”，用户重发即可（新 message id 正常处理）。
+- 持久化盘点与全部缺口状态见 [docs/persistence.md](docs/persistence.md)。
 
 ## 开发
 

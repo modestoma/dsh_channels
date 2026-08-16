@@ -112,26 +112,40 @@ export function makeWorkspaceRegistry(): { registry: WorkspaceRegistry; workspac
 interface FakeTable {
   get(key: string): unknown
   put(key: string, value: unknown): Promise<unknown>
+  update(key: string, fn: (current: unknown) => unknown): Promise<unknown>
   delete(key: string): Promise<unknown>
   entries(): IterableIterator<[string, unknown]>
 }
 
 export function makeDomain(): { facility: StorageDomainFacility; raw: RawDomainHandle } {
-  const tableData = new Map<string, unknown>()
+  /** One record map per table name (mirrors the host's per-table layout). */
+  const tableData = new Map<string, Map<string, unknown>>()
   const tableHandles = new Map<string, FakeTable>()
   let globalValue: unknown = {}
 
   const tableFor = (name: string): FakeTable => {
     const existing = tableHandles.get(name)
     if (existing !== undefined) return existing
+    let data = tableData.get(name)
+    if (data === undefined) {
+      data = new Map<string, unknown>()
+      tableData.set(name, data)
+    }
+    const records = data
     const handle: FakeTable = {
-      get: (key: string) => tableData.get(key),
+      get: (key: string) => records.get(key),
       put: vi.fn(async (key: string, value: unknown) => {
-        tableData.set(key, value)
+        records.set(key, value)
         return true
       }),
-      delete: vi.fn(async (key: string) => tableData.delete(key)),
-      entries: () => tableData.entries(),
+      update: vi.fn(async (key: string, fn: (current: unknown) => unknown) => {
+        if (!records.has(key)) throw new Error('missing-key')
+        const next = fn(records.get(key))
+        records.set(key, next)
+        return next
+      }),
+      delete: vi.fn(async (key: string) => records.delete(key)),
+      entries: () => records.entries(),
     }
     tableHandles.set(name, handle)
     return handle

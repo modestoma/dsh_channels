@@ -20,6 +20,9 @@ export type FeishuLoggerLevel = (typeof FEISHU_LOGGER_LEVELS)[number]
 /** Same shape as the host credentials seam's `CredentialRef` (shell identifier). */
 export const CREDENTIAL_REF_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
 
+/** Default route-table GC threshold: 30 days without activity. */
+export const DEFAULT_ROUTE_TTL_MS = 30 * 24 * 60 * 60 * 1000
+
 /** A credential reference: `FEISHU_APP_ID`-style name resolved through ctx.credentials. */
 const credentialRefSchema = z.string().regex(
   CREDENTIAL_REF_PATTERN,
@@ -72,6 +75,15 @@ export const configSchema = z.object({
    * `strict` fails the reply instead.
    */
   threadFallback: z.enum(['degrade', 'strict']).default('degrade'),
+  /**
+   * Route-table GC threshold. Route records (and stale in-flight repair
+   * snapshots) whose last activity is older than this many milliseconds are
+   * deleted at startup and on every periodic sweep — a deleted topic's
+   * `thread_id` never reappears, so its record is dead weight forever
+   * otherwise. Only the plugin's routing entry is removed: the DSH session
+   * and workspace stay untouched. `0` disables GC entirely.
+   */
+  routeTtlMs: z.number().int().min(0).default(DEFAULT_ROUTE_TTL_MS),
 })
 
 export type FeishuConfig = z.infer<typeof configSchema>

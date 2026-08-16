@@ -338,6 +338,35 @@ export function buildCard(state: CardState, options: CardOptions = {}): object {
   return render(reasoning, body)
 }
 
+/** Interruption notice body for cards repaired after a restart mid-turn. */
+export const INTERRUPTION_NOTICE = '⚠️ 服务已重启，本次回复中断，请重新发送消息。'
+
+/**
+ * Terminal "interrupted" card used by the restart repair pass (`repairInflight`).
+ *
+ * Deliberately NOT built through `buildCard`: the local process has no copy of
+ * the partial body/reasoning the card previously streamed (patch is full
+ * replacement), and fabricating zero-valued token stats would be misleading.
+ * The card is therefore minimal — a plain notice (+ segment header on
+ * continuation cards) — and always far inside the size budget.
+ */
+export function buildInterruptionCard(options: CardOptions = {}): object {
+  const elements: object[] = []
+  if (options.panel === false) {
+    elements.push({
+      tag: 'markdown',
+      content: `📄 ${options.segment === undefined ? '续上一条卡片' : `回复分段 ${options.segment}`} · 回复中断`,
+      text_size: 'notation',
+    })
+  }
+  elements.push({ tag: 'markdown', content: INTERRUPTION_NOTICE })
+  return {
+    schema: '2.0',
+    config: { width_mode: 'fill' },
+    body: { elements },
+  }
+}
+
 /**
  * Largest body prefix (char count) whose card renders ≤ `CARD_TARGET_BYTES`
  * with reasoning minimized — i.e. the body gets the full card budget. The

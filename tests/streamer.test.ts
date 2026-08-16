@@ -38,6 +38,7 @@ function hooks() {
     sessionLabel: (id: string) => id,
     onError: vi.fn(),
     onTurnFinalized: vi.fn(),
+    onSegmentDelivered: vi.fn(),
     sendSegmentCard: vi.fn(async (
       _sessionId: string,
       segment: number,
@@ -155,7 +156,7 @@ describe('TurnStreamer', () => {
       expect(remove).toHaveBeenCalledWith('om_trigger', 'react-typing')
       expect(add).toHaveBeenCalledWith('om_trigger', 'DONE')
     })
-    expect(hooksInstance.onTurnFinalized).toHaveBeenCalledWith('sess-done', 1)
+    expect(hooksInstance.onTurnFinalized).toHaveBeenCalledWith('sess-done', 1, 'om_card')
   })
 
   it('skips removal when the Typing reaction was never added, still adds DONE', async () => {
@@ -291,6 +292,23 @@ describe('TurnStreamer', () => {
       const pipeLines = (content.match(/^\s*\|[^\n]*\|/gm) ?? []).length
       expect(pipeLines).toBeLessThanOrEqual(15)
     }
+  })
+
+  it('reports segment deliveries to the hooks with the main card id', async () => {
+    const ch = channel()
+    const hooksInstance = hooks()
+    const streamer = new TurnStreamer(ch, 500, hooksInstance)
+    const session = makeSession('sess-segdelivery')
+    streamer.attach(session, 'om_main', 'om_trigger', undefined)
+
+    streamer.onSessionEvent(session, {
+      type: 'assistant/chunk', seq: 1,
+      data: { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: 'x'.repeat(30_000) } },
+    })
+    await vi.advanceTimersByTimeAsync(500)
+    await vi.waitFor(() => {
+      expect(hooksInstance.onSegmentDelivered).toHaveBeenCalledWith('om_main', 1, 'om_seg_2', 'card')
+    })
   })
 
   it('stops streaming into a text-fallback segment and continues in a new one', async () => {

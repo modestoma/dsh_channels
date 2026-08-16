@@ -66,8 +66,24 @@ export interface StreamerHooks {
   sessionLabel(sessionId: string): string
   /** Log a non-fatal streaming error. */
   onError(sessionId: string, error: unknown): void
-  /** Invoked once when a turn's card reaches its final state. */
-  onTurnFinalized(sessionId: string, turn: number): void
+  /**
+   * Invoked once when a turn's card reaches its final state. Carries the main
+   * card's message id so the caller can retire the turn's in-flight repair
+   * snapshot (the id is the snapshot's storage key).
+   */
+  onTurnFinalized(sessionId: string, turn: number, mainCardMessageId: string): void
+  /**
+   * Invoked when a continuation segment's message id resolves (delivery
+   * succeeded). Lets the caller fold the resolved id into the turn's repair
+   * snapshot. `segmentIndex` is the card index within the turn (`0` is the
+   * main card; never reported).
+   */
+  onSegmentDelivered?(
+    mainCardMessageId: string,
+    segmentIndex: number,
+    messageId: string,
+    mode: SegmentDelivery['mode'],
+  ): void
   /**
    * Send one continuation segment card for a turn (calls arrive in segment
    * order per session). Implementations may fall back to a plain-text message
@@ -806,6 +822,12 @@ export class TurnStreamer {
           card.sending = false
           card.messageId = delivery.messageId
           card.mode = delivery.mode
+          this.hooks.onSegmentDelivered?.(
+            state.cards[0]?.messageId ?? '',
+            index,
+            delivery.messageId,
+            delivery.mode,
+          )
           if (delivery.mode === 'card') {
             card.dirty = true
             this.markDirty(sessionId, state)
@@ -907,7 +929,7 @@ export class TurnStreamer {
       if (index >= 0) queue.splice(index, 1)
     })
 
-    this.hooks.onTurnFinalized(sessionId, state.turn ?? 0)
+    this.hooks.onTurnFinalized(sessionId, state.turn ?? 0, state.cards[0]?.messageId ?? '')
   }
 
   private async swapReaction(state: TurnState): Promise<void> {

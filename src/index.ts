@@ -23,11 +23,11 @@ export type * from './config.ts'
 export type * from './cards.ts'
 export type * from './domain.ts'
 export type * from './feishu-channel.ts'
-export { buildCard, cardJsonBytes, CARD_MAX_BYTES, CARD_TARGET_BYTES, MAX_TABLES_PER_CARD, PANEL_TITLES, PANEL_CHEVRON_TOKEN, segmentCardContent, splitBodyForCard, stripTables, tableBlocks, TRUNCATION_SUFFIX } from './cards.ts'
+export { buildCard, buildInterruptionCard, cardJsonBytes, CARD_MAX_BYTES, CARD_TARGET_BYTES, INTERRUPTION_NOTICE, MAX_TABLES_PER_CARD, PANEL_TITLES, PANEL_CHEVRON_TOKEN, segmentCardContent, splitBodyForCard, stripTables, tableBlocks, TRUNCATION_SUFFIX } from './cards.ts'
 export { FeishuService } from './service.ts'
 export { TurnStreamer } from './streamer.ts'
 export { ensureWorkspace, workspacePathFor, workspaceTitleFor } from './workspaces.ts'
-export { chatRouteKey, feishuDomain, routeRecordSchema } from './domain.ts'
+export { chatRouteKey, feishuDomain, routeRecordSchema, inflightSnapshotSchema, processedRecordSchema } from './domain.ts'
 
 /** Cordis function-plugin name. */
 export const name = 'channels'

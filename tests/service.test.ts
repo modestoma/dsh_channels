@@ -31,6 +31,9 @@ function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
     requireMention: true,
     threadFallback: 'degrade',
     loggerLevel: 'info',
+    // GC disabled by default in tests: restart scenarios rely on routes
+    // surviving, and GC tests opt in with explicit TTLs.
+    routeTtlMs: 0,
     ...partial,
   }
 }
@@ -220,7 +223,13 @@ describe('FeishuService', () => {
     const h = await setup()
     const first = makeMessage({ chatType: 'group', chatId: 'oc_grp', senderId: 'ou_alice', content: '开始' })
     await h.onMessage(first)
-    await flush()
+    // Deterministic barrier: the route must be durable before the thread
+    // message arrives — otherwise the message lands in the (legitimate)
+    // "no route, no mention" drop window and the test flakes.
+    await waitUntil(() => {
+      const entries = [...(h.ctxState.domain.raw.table('routes').entries() as IterableIterator<[string, unknown]>)]
+      expect(entries).toHaveLength(1)
+    })
 
     const second = makeMessage({
       chatType: 'group',
@@ -290,8 +299,12 @@ describe('FeishuService', () => {
 
     const sends = h.channel.sent as Array<{ options?: { replyInThread?: boolean } }>
     expect(sends[0]?.options?.replyInThread).toBeUndefined()
-    const entries = [...(h.ctxState.domain.raw.table('routes').entries() as IterableIterator<[string, unknown]>)]
-    expect(entries[0]?.[0]).toBe('chat:group:oc_test_chat:ou_test_user')
+    // Deterministic barrier: wait for the chat-scoped route to be durable
+    // before the follow-up message (same race as the thread test above).
+    await waitUntil(() => {
+      const entries = [...(h.ctxState.domain.raw.table('routes').entries() as IterableIterator<[string, unknown]>)]
+      expect(entries[0]?.[0]).toBe('chat:group:oc_test_chat:ou_test_user')
+    })
 
     // A later mention in the same chat continues the same session.
     await h.onMessage(makeMessage({ chatType: 'group', content: '再来' }))
@@ -507,5 +520,498 @@ describe('FeishuService', () => {
     expect(second.input.text).toContain('回复分段 2')
     expect(second.input.text).toContain('降级为纯文本')
     expect(second.input.text).toContain('xxx')
+  })
+
+  // ---- in-flight turn snapshots (restart repair) -------------------------
+
+  const inflightEntries = (h: Harness) =>
+    [...(h.ctxState.domain.raw.table('inflight').entries() as IterableIterator<[string, unknown]>)]
+
+  it('persists an in-flight snapshot on session start and retires it on turn end', async () => {
+    const h = await setup()
+    const msg = makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', mentionedBot: false, content: 'hi' })
+    await h.onMessage(msg)
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+
+    const entries = inflightEntries(h)
+    expect(entries).toHaveLength(1)
+    const [key, snapshot] = entries[0]!
+    expect(key).toBe('om_1')
+    expect(snapshot).toMatchObject({
+      key: 'om_1',
+      sessionId: h.ctxState.agents.created[0]!.options.sessionId,
+      chatId: 'oc_p2p',
+      triggerMessageId: msg.messageId,
+      reactionId: 'react-1',
+      cards: [{ messageId: 'om_1', mode: 'card' }],
+      attempts: 0,
+    })
+
+    // The turn ends → the snapshot is retired.
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    const listener = h.ctxState.sessionListeners[0]!
+    listener(agent.session, { type: 'turn/end', seq: 1, data: { turn: 1, reason: 'stop' } })
+    await waitUntil(() => expect(inflightEntries(h)).toHaveLength(0))
+  })
+
+  it('writes a fresh snapshot per turn (concurrent turns never overwrite each other)', async () => {
+    const h = await setup()
+    const first = makeMessage({ chatType: 'group', chatId: 'oc_grp', senderId: 'ou_alice', content: '一' })
+    await h.onMessage(first)
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+
+    // Second message while the first turn is still "streaming" (never ended).
+    const second = makeMessage({
+      chatType: 'group', chatId: 'oc_grp', senderId: 'ou_alice', mentionedBot: false,
+      threadId: 'omt_1', messageId: 'om_second_msg', content: '二',
+    })
+    await h.onMessage(second)
+    await waitUntil(() => expect(h.channel.sent.length).toBeGreaterThanOrEqual(2))
+    await waitUntil(() => expect(inflightEntries(h)).toHaveLength(2))
+
+    const entries = inflightEntries(h)
+    const keys = entries.map(([key]) => key).sort()
+    expect(keys).toEqual(['om_1', 'om_2'])
+    const secondSnapshot = entries.find(([key]) => key === 'om_2')?.[1] as { triggerMessageId: string }
+    expect(secondSnapshot.triggerMessageId).toBe('om_second_msg')
+  })
+
+  it('folds resolved segment card ids into the snapshot', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: '长文' }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    const listener = h.ctxState.sessionListeners[0]!
+
+    listener(agent.session, {
+      type: 'assistant/chunk', seq: 1,
+      data: { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: 'x'.repeat(30_000) } },
+    })
+    await waitUntil(() => {
+      const entries = inflightEntries(h)
+      expect(entries).toHaveLength(1)
+      const snapshot = entries[0]![1] as { cards: Array<{ messageId: string; mode: string }> }
+      expect(snapshot.cards).toEqual([
+        { messageId: 'om_1', mode: 'card' },
+        { messageId: 'om_2', mode: 'card' },
+      ])
+    })
+  })
+
+  it('clears the snapshot when session creation fails (card already final)', async () => {
+    const h = await setup()
+    h.ctxState.agents.registry.create = async () => {
+      throw new Error('boom')
+    }
+    await h.onMessage(makeMessage({ chatType: 'p2p', content: 'x' }))
+    await waitUntil(() => expect(h.channel.updated.length).toBeGreaterThan(0))
+    await waitUntil(() => expect(inflightEntries(h)).toHaveLength(0))
+  })
+
+  it('repairs an interrupted turn after restart: terminal card, Typing→DONE, snapshot retired', async () => {
+    const h = await setup()
+    const msg = makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: 'hi' })
+    await h.onMessage(msg)
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+
+    // Crash mid-turn: shutdown without the turn ever ending.
+    await h.service.shutdown()
+
+    const channel2 = makeChannel()
+    const service2 = new FeishuService(h.ctxState.ctx, h.config, () => channel2)
+    await service2.start()
+    await waitUntil(() => expect(channel2.updated.length).toBeGreaterThan(0))
+
+    const update = channel2.updated[0]!
+    expect(update.messageId).toBe('om_1')
+    expect(JSON.stringify(update.card)).toContain('服务已重启')
+    expect(JSON.stringify(update.card)).toContain('请重新发送消息')
+
+    // Typing removed and DONE added on the original trigger message.
+    expect(channel2.removedReactions).toContainEqual({ messageId: msg.messageId, reactionId: 'react-1' })
+    expect(channel2.reactions).toContainEqual({ messageId: msg.messageId, emojiType: 'DONE' })
+
+    // Snapshot retired after the repair.
+    await waitUntil(() => expect(inflightEntries(h)).toHaveLength(0))
+    await service2.shutdown()
+  })
+
+  it('retries a failed repair once, then retires the snapshot', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: 'hi' }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await h.service.shutdown()
+
+    // First boot: every card patch fails → attempts 0→1, snapshot kept.
+    const channel2 = makeChannel()
+    mock(channel2.updateCard).mockRejectedValue(new Error('patch rejected'))
+    const service2 = new FeishuService(h.ctxState.ctx, h.config, () => channel2)
+    await service2.start()
+    await waitUntil(() => {
+      const entries = inflightEntries(h)
+      expect(entries).toHaveLength(1)
+      expect((entries[0]![1] as { attempts: number }).attempts).toBe(1)
+    })
+    await service2.shutdown()
+
+    // Second boot: still failing → the attempts cap (2) retires the snapshot.
+    const channel3 = makeChannel()
+    mock(channel3.updateCard).mockRejectedValue(new Error('patch rejected'))
+    const service3 = new FeishuService(h.ctxState.ctx, h.config, () => channel3)
+    await service3.start()
+    await waitUntil(() => expect(inflightEntries(h)).toHaveLength(0))
+    await service3.shutdown()
+  })
+
+  it('skips text-mode segment cards during repair (content already delivered)', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: '长文' }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+
+    // Segment 2 lands as a text fallback, then the crash happens mid-turn.
+    const originalSend = h.channel.send.bind(h.channel)
+    ;(h.channel as unknown as { send: typeof h.channel.send }).send = async (chatId, input, options) => {
+      if ('card' in input && h.channel.sent.length > 0) throw new Error('card rejected (230099)')
+      return originalSend(chatId, input, options)
+    }
+    const listener = h.ctxState.sessionListeners[0]!
+    listener(agent.session, {
+      type: 'assistant/chunk', seq: 1,
+      data: { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: 'x'.repeat(30_000) } },
+    })
+    await waitUntil(() => expect(h.channel.sent.length).toBeGreaterThanOrEqual(2))
+    await waitUntil(() => {
+      const entries = inflightEntries(h)
+      const snapshot = entries[0]?.[1] as { cards: Array<{ mode: string }> } | undefined
+      expect(snapshot?.cards.some(card => card.mode === 'text')).toBe(true)
+    })
+    await h.service.shutdown()
+
+    const channel2 = makeChannel()
+    const service2 = new FeishuService(h.ctxState.ctx, h.config, () => channel2)
+    await service2.start()
+    await waitUntil(() => expect(channel2.updated.length).toBeGreaterThan(0))
+
+    // Only the main card was patched; the text-mode segment message is untouched.
+    const patchedIds = channel2.updated.map(update => update.messageId)
+    expect(patchedIds).toContain('om_1')
+    expect(patchedIds).not.toContain('om_2')
+    await waitUntil(() => expect(inflightEntries(h)).toHaveLength(0))
+    await service2.shutdown()
+  })
+
+  // ---- establishment serialization (gap 5: concurrent first messages) ----
+
+  it('a topic message racing the first message continues the establishing session (no duplicate, no drop)', async () => {
+    const h = await setup()
+    // Park the first card send so the second message lands mid-establishment
+    // (before the route commit — the exact window that used to drop or fork).
+    let releaseFirst: () => void = () => {}
+    const gate = new Promise<void>(resolve => { releaseFirst = resolve })
+    const originalSend = h.channel.send.bind(h.channel)
+    let gated = false
+    ;(h.channel as unknown as { send: typeof h.channel.send }).send = async (chatId, input, options) => {
+      if (!gated) {
+        gated = true
+        await gate
+      }
+      return originalSend(chatId, input, options)
+    }
+
+    const first = makeMessage({ chatType: 'group', chatId: 'oc_grp', senderId: 'ou_alice', content: '开始' })
+    await h.onMessage(first)
+    await waitUntil(() => expect(gated).toBe(true))
+
+    // Second message already inside the just-created topic, no mention.
+    const second = makeMessage({
+      chatType: 'group', chatId: 'oc_grp', senderId: 'ou_alice',
+      mentionedBot: false, threadId: 'omt_1', messageId: 'om_second', content: '继续',
+    })
+    await h.onMessage(second)
+
+    releaseFirst()
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    await waitUntil(() => expect(mock(agent.followup)).toHaveBeenCalledTimes(2))
+
+    // ONE session and ONE route: the racing message continued it, in-topic.
+    expect(h.ctxState.agents.created).toHaveLength(1)
+    const calls = mock(agent.followup).mock.calls
+    expect((calls[1]?.[0] as { content: Array<{ text: string }> }).content[0]?.text).toBe('继续')
+    const sends = h.channel.sent as Array<{ options?: { replyTo?: string; replyInThread?: boolean } }>
+    expect(sends).toHaveLength(2)
+    expect(sends[1]?.options).toMatchObject({ replyTo: 'om_second', replyInThread: true })
+    const routes = [...(h.ctxState.domain.raw.table('routes').entries() as IterableIterator<[string, unknown]>)]
+    expect(routes).toHaveLength(1)
+  })
+
+  it('serializes degraded (topic-less) first messages into one chat-scoped session', async () => {
+    const h = await setup({}, { failReplyInThread: true })
+    const first = makeMessage({ chatType: 'group', chatId: 'oc_grp', senderId: 'ou_alice', content: '一' })
+    const second = makeMessage({
+      chatType: 'group', chatId: 'oc_grp', senderId: 'ou_alice', messageId: 'om_second', content: '二',
+    })
+    await h.onMessage(first)
+    await h.onMessage(second)
+
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    await waitUntil(() => expect(mock(agent.followup)).toHaveBeenCalledTimes(2))
+
+    expect(h.ctxState.agents.created).toHaveLength(1)
+    expect((mock(agent.followup).mock.calls[1]?.[0] as { content: Array<{ text: string }> }).content[0]?.text).toBe('二')
+    const routes = [...(h.ctxState.domain.raw.table('routes').entries() as IterableIterator<[string, unknown]>)]
+    expect(routes).toHaveLength(1)
+  })
+
+  it('lets a concurrent message start its own session when the first establishment fails', async () => {
+    const h = await setup()
+    // Fail only the FIRST creation; the waiter's fall-through must succeed.
+    const originalCreate = h.ctxState.agents.registry.create.bind(h.ctxState.agents.registry)
+    let failFirst = true
+    h.ctxState.agents.registry.create = async options => {
+      if (failFirst) {
+        failFirst = false
+        throw new Error('boom')
+      }
+      return originalCreate(options)
+    }
+
+    const first = makeMessage({ chatType: 'group', chatId: 'oc_grp', senderId: 'ou_alice', content: '失败的首条' })
+    await h.onMessage(first)
+    const second = makeMessage({
+      chatType: 'group', chatId: 'oc_grp', senderId: 'ou_alice', messageId: 'om_second', content: '重试',
+    })
+    await h.onMessage(second)
+
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    await waitUntil(() => expect(mock(agent.followup)).toHaveBeenCalledTimes(1))
+    expect((mock(agent.followup).mock.calls[0]?.[0] as { content: Array<{ text: string }> }).content[0]?.text).toBe('重试')
+
+    const routes = [...(h.ctxState.domain.raw.table('routes').entries() as IterableIterator<[string, unknown]>)]
+    expect(routes).toHaveLength(1)
+  })
+
+  it('starts a separate session for a concurrent chat-level message after establishment settles (serial semantics)', async () => {
+    const h = await setup()
+    let releaseFirst: () => void = () => {}
+    const gate = new Promise<void>(resolve => { releaseFirst = resolve })
+    const originalSend = h.channel.send.bind(h.channel)
+    let gated = false
+    ;(h.channel as unknown as { send: typeof h.channel.send }).send = async (chatId, input, options) => {
+      if (!gated) {
+        gated = true
+        await gate
+      }
+      return originalSend(chatId, input, options)
+    }
+
+    const first = makeMessage({ chatType: 'group', chatId: 'oc_grp', senderId: 'ou_alice', content: '开始' })
+    await h.onMessage(first)
+    await waitUntil(() => expect(gated).toBe(true))
+
+    // Concurrent message OUTSIDE the new topic (no threadId): it must wait
+    // for the establishment, then start its own session — never hijack the
+    // first one and never race the route write.
+    const second = makeMessage({
+      chatType: 'group', chatId: 'oc_grp', senderId: 'ou_alice', messageId: 'om_second', content: '旁路',
+    })
+    await h.onMessage(second)
+
+    releaseFirst()
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
+    await waitUntil(() => expect(mock(h.ctxState.agents.created[1]!.handle.agent.followup)).toHaveBeenCalledTimes(1))
+
+    const firstAgent = h.ctxState.agents.created[0]!.handle.agent
+    const secondAgent = h.ctxState.agents.created[1]!.handle.agent
+    expect((mock(secondAgent.followup).mock.calls[0]?.[0] as { content: Array<{ text: string }> }).content[0]?.text).toBe('旁路')
+    expect((mock(firstAgent.followup).mock.calls[0]?.[0] as { content: Array<{ text: string }> }).content[0]?.text).toBe('开始')
+
+    // Two topics → two thread routes, each owned by its own session.
+    const routes = [...(h.ctxState.domain.raw.table('routes').entries() as IterableIterator<[string, unknown]>)]
+    expect(routes).toHaveLength(2)
+    const routeKeys = routes.map(([key]) => key).sort()
+    expect(routeKeys).toEqual(['omt_1', 'omt_2'])
+  })
+
+  // ---- route-table GC (gap 3) ----------------------------------------------
+
+  const DAY_MS = 24 * 60 * 60 * 1000
+
+  function seedRoute(
+    raw: ReturnType<typeof makeHostContext>['domain']['raw'],
+    key: string,
+    lastActivityAt: number,
+  ): Promise<unknown> {
+    return raw.table('routes').put(key, {
+      key,
+      kind: 'thread',
+      sessionId: `session-${key}`,
+      chatId: 'oc_test_chat',
+      chatType: 'group',
+      senderOpenId: 'ou_test_user',
+      workspacePath: '/tmp/ws',
+      cardMessageId: `om_${key}`,
+      createdAt: lastActivityAt,
+      lastActivityAt,
+    })
+  }
+
+  it('garbage-collects route records idle past routeTtlMs at startup', async () => {
+    const ctxState = makeHostContext()
+    await seedRoute(ctxState.domain.raw, 'omt_stale', Date.now() - 40 * DAY_MS)
+    await seedRoute(ctxState.domain.raw, 'omt_fresh', Date.now())
+    const channel = makeChannel()
+    const service = new FeishuService(ctxState.ctx, makeConfig({ routeTtlMs: 30 * DAY_MS }), () => channel)
+    await service.start()
+
+    await waitUntil(() => {
+      const entries = [...(ctxState.domain.raw.table('routes').entries() as IterableIterator<[string, unknown]>)]
+      expect(entries.map(([key]) => key).sort()).toEqual(['omt_fresh'])
+    })
+    await service.shutdown()
+  })
+
+  it('drops stale in-flight snapshots during GC without repairing them', async () => {
+    const ctxState = makeHostContext()
+    await ctxState.domain.raw.table('inflight').put('om_stale_card', {
+      key: 'om_stale_card',
+      sessionId: 'session-x',
+      chatId: 'oc_test_chat',
+      triggerMessageId: 'om_trigger',
+      cards: [{ messageId: 'om_stale_card', mode: 'card' }],
+      startedAt: Date.now() - 40 * DAY_MS,
+      attempts: 0,
+    })
+    const channel = makeChannel()
+    const service = new FeishuService(ctxState.ctx, makeConfig({ routeTtlMs: 30 * DAY_MS }), () => channel)
+    await service.start()
+
+    await waitUntil(() =>
+      expect([...(ctxState.domain.raw.table('inflight').entries() as IterableIterator<[string, unknown]>)]).toHaveLength(0))
+    // The ancient card must NOT be patched — repairing it would surprise the
+    // user; GC drops the snapshot silently.
+    await new Promise(resolve => setTimeout(resolve, 50))
+    expect(channel.updated).toHaveLength(0)
+    expect(channel.reactions).toHaveLength(0)
+    await service.shutdown()
+  })
+
+  it('keeps expired routes when routeTtlMs is 0 (GC disabled)', async () => {
+    const ctxState = makeHostContext()
+    await seedRoute(ctxState.domain.raw, 'omt_stale', Date.now() - 40 * DAY_MS)
+    const channel = makeChannel()
+    const service = new FeishuService(ctxState.ctx, makeConfig({ routeTtlMs: 0 }), () => channel)
+    await service.start()
+
+    await new Promise(resolve => setTimeout(resolve, 50))
+    const entries = [...(ctxState.domain.raw.table('routes').entries() as IterableIterator<[string, unknown]>)]
+    expect(entries).toHaveLength(1)
+    await service.shutdown()
+  })
+
+  it('a message in a GC-d topic starts a fresh session instead of resuming the old one', async () => {
+    const ctxState = makeHostContext()
+    await seedRoute(ctxState.domain.raw, 'omt_gc', Date.now() - 40 * DAY_MS)
+    const channel = makeChannel()
+    const service = new FeishuService(ctxState.ctx, makeConfig({ routeTtlMs: 30 * DAY_MS }), () => channel)
+    await service.start()
+    await waitUntil(() =>
+      expect([...(ctxState.domain.raw.table('routes').entries() as IterableIterator<[string, unknown]>)]).toHaveLength(0))
+
+    const registered = (channel.onMessage as unknown as ReturnType<typeof vi.fn>).mock.calls
+    const handler = registered[registered.length - 1]?.[0] as (msg: NormalizedMessage) => Promise<void> | undefined
+    await handler(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: '重新开始', threadId: 'omt_gc' }))
+
+    await waitUntil(() => expect(ctxState.agents.created).toHaveLength(1))
+    expect(ctxState.agents.resumed).toHaveLength(0)
+    expect(ctxState.agents.created[0]!.options.sessionId).not.toBe('session-omt_gc')
+    await service.shutdown()
+  })
+
+  // ---- message idempotency (gap 2: WS redelivery dedup) --------------------
+
+  const processedEntries = (h: Harness) =>
+    [...(h.ctxState.domain.raw.table('processed').entries() as IterableIterator<[string, unknown]>)]
+  const settle = (ms = 50) => new Promise<void>(resolve => setTimeout(resolve, ms))
+
+  it('ignores a redelivered first message (single session, single card)', async () => {
+    const h = await setup()
+    const msg = makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: '你好' })
+    await h.onMessage(msg)
+    await h.onMessage(msg) // WS redelivery of the same event
+
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await settle()
+    expect(h.ctxState.agents.created).toHaveLength(1)
+    expect(h.channel.sent).toHaveLength(1)
+    expect(h.channel.reactions).toHaveLength(1)
+    expect(mock(h.ctxState.agents.created[0]!.handle.agent.followup)).toHaveBeenCalledTimes(1)
+    expect(processedEntries(h)).toHaveLength(1)
+  })
+
+  it('ignores a redelivered continuation message (no duplicate turn)', async () => {
+    const h = await setup()
+    const first = makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: '开始' })
+    await h.onMessage(first)
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitUntil(() => {
+      const entries = [...(h.ctxState.domain.raw.table('routes').entries() as IterableIterator<[string, unknown]>)]
+      expect(entries).toHaveLength(1)
+    })
+
+    const cont = makeMessage({
+      chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice',
+      threadId: 'omt_1', messageId: 'om_cont', content: '继续',
+    })
+    await h.onMessage(cont)
+    await h.onMessage(cont) // redelivery
+
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    await waitUntil(() => expect(mock(agent.followup)).toHaveBeenCalledTimes(2))
+    await settle()
+    expect(mock(agent.followup)).toHaveBeenCalledTimes(2)
+    expect(h.channel.sent).toHaveLength(2)
+    expect(processedEntries(h).map(([key]) => key).sort()).toEqual([first.messageId, 'om_cont'].sort())
+  })
+
+  it('deduplicates across restarts through the persisted record', async () => {
+    const h = await setup()
+    const msg = makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: '跨重启' })
+    await h.onMessage(msg)
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitUntil(() => expect(processedEntries(h)).toHaveLength(1))
+    await h.service.shutdown()
+
+    const channel2 = makeChannel()
+    const service2 = new FeishuService(h.ctxState.ctx, h.config, () => channel2)
+    await service2.start()
+    const registered = (channel2.onMessage as unknown as ReturnType<typeof vi.fn>).mock.calls
+    const handler = registered[registered.length - 1]?.[0] as (msg: NormalizedMessage) => Promise<void> | undefined
+    await handler(msg) // same message id redelivered after restart
+
+    await settle()
+    expect(h.ctxState.agents.created).toHaveLength(1) // no second session
+    expect(h.ctxState.agents.resumed).toHaveLength(0)  // not even a lazy resume
+    expect(channel2.sent).toHaveLength(0)              // no reply card
+    await service2.shutdown()
+  })
+
+  it('prunes old processed records in the GC sweep (unconditional, routeTtlMs: 0)', async () => {
+    const ctxState = makeHostContext()
+    const raw = ctxState.domain.raw
+    await raw.table('processed').put('om_msg_old', { key: 'om_msg_old', processedAt: Date.now() - 25 * 3600 * 1000 })
+    await raw.table('processed').put('om_msg_new', { key: 'om_msg_new', processedAt: Date.now() })
+    const channel = makeChannel()
+    const service = new FeishuService(ctxState.ctx, makeConfig({ routeTtlMs: 0 }), () => channel)
+    await service.start()
+
+    await waitUntil(() => {
+      const entries = [...(raw.table('processed').entries() as IterableIterator<[string, unknown]>)]
+      expect(entries.map(([key]) => key)).toEqual(['om_msg_new'])
+    })
+    await service.shutdown()
   })
 })
