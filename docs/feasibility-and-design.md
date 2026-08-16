@@ -105,6 +105,7 @@
 
 - 订阅 `session/event`，按 `(sessionId, turn)` 聚合：`assistant/chunk` 里 `text-delta` → 正文，`reasoning-delta` → 折叠面板内容。
 - **活动状态行**：`tool/call`（含 subagent 的 description、workflow 的 meta.name）与 `tool-workflow/run-start / agent-start / agent-end / run-end`（workflow 进度：完成数/总数、阶段、活动成员、结束原因）折叠为一条小字状态行（正文上方），并在无正文输出的等待期以 `statusRefreshMs`（默认 5s）慢心跳刷新“已运行 Ns”计时——进入 subagent / workflow 时卡片不再静默等待。
+- **子代理进度（跨会话映射）**：子代理是独立 session（header `parentSession` 指向主会话、`origin: 'subagent'`），其 `subagent/descriptor`（label）、`tool/call`（当前工具）、`turn/end`（结束移除）经全局 `session/event` 总线折叠进主卡片的同一状态行；workflow 成员经 `tool-workflow/agent-start` 的 `childId` 登记在 run 折叠里、跳过通用子代理折叠以免重复。**只显示状态不显示输出**：子代理正文是父模型的中间产物（工具契约“You receive its result, not its intermediate steps”），绝不进卡片正文。
 - 500ms 节流器（仅内容变化时 patch），拼接卡片 2.0 JSON 全量 `im.v1.message.patch`。
 - 折叠面板标题三态：首个 reasoning 增量前“推理中”；推理结束、正文开始后“回复中”；`agent.whenIdle()` 后“回复结束”。
 - 终态：`reaction.delete(Typing)` → `reaction.create("DONE")`。

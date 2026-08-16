@@ -529,3 +529,174 @@ describe('TurnStreamer activity status + keep-alive', () => {
     expect(elements.length).toBe(6)
   })
 })
+
+describe('TurnStreamer subagent child folding', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  function makeChildSession(id: string, parentId: string): Session {
+    return {
+      id: id as SessionId,
+      header: {
+        version: 0,
+        id: id as SessionId,
+        createdAt: Date.now(),
+        parentSession: parentId as SessionId,
+        origin: 'subagent',
+        delegationDepth: 1,
+      },
+      events: [],
+      firstLiveSeq: 0,
+    }
+  }
+
+  function markdownLines(card: object): string[] {
+    const elements = (card as { body: { elements: Array<{ tag: string; content?: string }> } }).body.elements
+    return elements.filter(element => element.tag === 'markdown').map(element => element.content ?? '')
+  }
+
+  function headCard(ch: ReturnType<typeof channel>): object {
+    return ch.updated.filter(update => update.messageId === 'om_card').at(-1)!.card
+  }
+
+  function activity(ch: ReturnType<typeof channel>): string {
+    return markdownLines(headCard(ch))[0]!
+  }
+
+  it('folds a child subagent\'s descriptor and tool calls into the parent card (status only)', async () => {
+    const ch = channel()
+    const streamer = new TurnStreamer(ch, 500, hooks())
+    const session = makeSession('sess-parent')
+    streamer.attach(session, 'om_card', 'om_trigger', undefined)
+
+    // The parent model called the subagent tool (label from description arg).
+    streamer.onSessionEvent(session, {
+      type: 'tool/call', seq: 1,
+      data: {
+        turn: 1, step: 1, callId: 'call-1', name: 'subagent',
+        arguments: JSON.stringify({ description: '检索实现方案', prompt: '…' }),
+      },
+    })
+    await vi.advanceTimersByTimeAsync(500)
+    expect(activity(ch)).toContain('🤖 子代理执行中：检索实现方案')
+
+    // The child session publishes its descriptor, then starts working.
+    const child = makeChildSession('child-1', 'sess-parent')
+    streamer.onSessionEvent(child, {
+      type: 'subagent/descriptor', seq: 1,
+      data: { version: 2, mode: 'one-shot', provider: 'spawn', label: '检索实现方案' },
+    })
+    streamer.onSessionEvent(child, {
+      type: 'tool/call', seq: 2,
+      data: { turn: 1, step: 1, callId: 'c-call-1', name: 'read', arguments: '{"path":"src"}' },
+    })
+    await vi.advanceTimersByTimeAsync(500)
+    expect(activity(ch)).toContain('🤖 子代理执行中：检索实现方案 (read)')
+
+    // The child's tool result drops the tool suffix; its turn/end removes it
+    // from the fold, falling back to the parent's own subagent tool line.
+    streamer.onSessionEvent(child, {
+      type: 'tool/result', seq: 3,
+      data: { turn: 1, step: 1, message: { type: 'text', text: '…' } },
+    })
+    await vi.advanceTimersByTimeAsync(500)
+    expect(activity(ch)).toContain('🤖 子代理执行中：检索实现方案')
+    expect(activity(ch)).not.toContain('(read)')
+
+    streamer.onSessionEvent(child, { type: 'turn/end', seq: 4, data: { turn: 1, reason: 'stop' } })
+    await vi.advanceTimersByTimeAsync(500)
+    expect(activity(ch)).not.toContain('(read)')
+    // Parent's toolActivity line remains until its own tool/result.
+    expect(activity(ch)).toContain('检索实现方案')
+  })
+
+  it('counts parallel children and defaults the label to 子代理 before the descriptor', async () => {
+    const ch = channel()
+    const streamer = new TurnStreamer(ch, 500, hooks())
+    const session = makeSession('sess-multi')
+    streamer.attach(session, 'om_card', 'om_trigger', undefined)
+
+    const childA = makeChildSession('child-a', 'sess-multi')
+    streamer.onSessionEvent(childA, {
+      type: 'tool/call', seq: 1,
+      data: { turn: 1, step: 1, callId: 'a-1', name: 'bash', arguments: '{}' },
+    })
+    await vi.advanceTimersByTimeAsync(500)
+    // Descriptor not seen yet → placeholder label.
+    expect(activity(ch)).toContain('🤖 子代理执行中：子代理 (bash)')
+
+    const childB = makeChildSession('child-b', 'sess-multi')
+    streamer.onSessionEvent(childB, {
+      type: 'subagent/descriptor', seq: 1,
+      data: { version: 2, mode: 'one-shot', provider: 'spawn', label: '代码审查' },
+    })
+    await vi.advanceTimersByTimeAsync(500)
+    const line = activity(ch)
+    expect(line).toContain('🤖 2 个子代理执行中')
+    expect(line).toContain('子代理 (bash)')
+    expect(line).toContain('代码审查')
+  })
+
+  it('ignores workflow member children (the workflow line already aggregates them)', async () => {
+    const ch = channel()
+    const streamer = new TurnStreamer(ch, 500, hooks())
+    const session = makeSession('sess-wf-member')
+    streamer.attach(session, 'om_card', 'om_trigger', undefined)
+
+    streamer.onSessionEvent(session, {
+      type: 'tool-workflow/run-start', seq: 1, data: { runId: 'run-1', name: 'audit' },
+    })
+    streamer.onSessionEvent(session, {
+      type: 'tool-workflow/agent-start', seq: 2,
+      data: { runId: 'run-1', seq: 1, label: '检索代码', childId: 'wf-child-1' },
+    })
+    const member = makeChildSession('wf-child-1', 'sess-wf-member')
+    streamer.onSessionEvent(member, {
+      type: 'tool/call', seq: 1,
+      data: { turn: 1, step: 1, callId: 'w-1', name: 'grep', arguments: '{}' },
+    })
+    await vi.advanceTimersByTimeAsync(500)
+    // While the run is live the workflow line has priority anyway; settle the
+    // run and check the member never leaked into the generic children fold.
+    streamer.onSessionEvent(session, {
+      type: 'tool-workflow/agent-end', seq: 3, data: { runId: 'run-1', seq: 1, outcome: 'completed' },
+    })
+    streamer.onSessionEvent(session, {
+      type: 'tool-workflow/run-end', seq: 4, data: { runId: 'run-1', stopReason: 'completed' },
+    })
+    await vi.advanceTimersByTimeAsync(500)
+    const line = activity(ch)
+    expect(line).toContain('工作流 audit 结束（完成）')
+    expect(line).not.toContain('(grep)')
+    expect(line).not.toContain('子代理执行中')
+  })
+
+  it('ignores child sessions whose parent has no active turn', async () => {
+    const ch = channel()
+    const streamer = new TurnStreamer(ch, 500, hooks())
+    const session = makeSession('sess-orphan-parent')
+    streamer.attach(session, 'om_card', 'om_trigger', undefined)
+
+    // Seed one patch so the card state is observable.
+    streamer.onSessionEvent(session, {
+      type: 'assistant/chunk', seq: 1,
+      data: { turn: 1, step: 1, chunk: { type: 'reasoning-delta', index: 0, text: '想' } },
+    })
+    await vi.advanceTimersByTimeAsync(500)
+    expect(activity(ch)).toContain('⏳ 处理中')
+
+    // A child of some other session: must neither crash nor touch this card.
+    const foreign = makeChildSession('child-x', 'unknown-session')
+    streamer.onSessionEvent(foreign, {
+      type: 'tool/call', seq: 1,
+      data: { turn: 1, step: 1, callId: 'x-1', name: 'bash', arguments: '{}' },
+    })
+    await vi.advanceTimersByTimeAsync(500)
+    expect(activity(ch)).not.toContain('子代理')
+  })
+})

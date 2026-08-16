@@ -74,6 +74,16 @@ export interface SessionHeader {
   readonly id: SessionId
   readonly createdAt: number
   readonly cwd?: string
+  /**
+   * The session this one was forked/derived from — for a subagent child this
+   * is the calling parent session's id (the link the streamer uses to fold
+   * child progress into the parent's card).
+   */
+  readonly parentSession?: SessionId
+  /** Coarse product classification (`'subagent'` for subagent children). */
+  readonly origin?: string
+  /** Delegation depth: 1 for a direct subagent child. */
+  readonly delegationDepth?: number
 }
 
 /** The live session object (durable event log + header). */
@@ -175,10 +185,26 @@ export interface ToolWorkflowRunEndEvent extends SessionEventEnvelope {
   data: { runId: string; stopReason: 'completed' | 'cancelled' | 'error' }
 }
 
+/**
+ * Durable subagent identity appended to the CHILD session's own log at
+ * creation (in-process drivers). The `label` is the delegating model's short
+ * description — what the parent card displays while the child runs.
+ */
+export interface SubagentDescriptorEvent extends SessionEventEnvelope {
+  type: 'subagent/descriptor'
+  data: {
+    version: number
+    mode: 'one-shot' | 'continuable'
+    provider: string
+    label?: string
+    [key: string]: unknown
+  }
+}
+
 export interface OtherSessionEvent extends SessionEventEnvelope {
   /** Unknown/extension event types are ignored by the folds. */
   type: Exclude<string, 'assistant/chunk' | 'assistant/message' | 'step/start' | 'turn/end' | 'request/header'
-    | 'tool/call' | 'tool/result'
+    | 'tool/call' | 'tool/result' | 'subagent/descriptor'
     | 'tool-workflow/run-start' | 'tool-workflow/agent-start' | 'tool-workflow/agent-end' | 'tool-workflow/run-end'>
   data: unknown
 }
@@ -191,6 +217,7 @@ export type SessionEvent =
   | RequestHeaderEvent
   | ToolCallEvent
   | ToolResultEvent
+  | SubagentDescriptorEvent
   | ToolWorkflowRunStartEvent
   | ToolWorkflowAgentStartEvent
   | ToolWorkflowAgentEndEvent

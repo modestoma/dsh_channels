@@ -8,7 +8,11 @@
  *  2. `session/event` consumption — text deltas fill the body, reasoning
  *     deltas fill the fold panel, usage/header events advance the stats fold,
  *     and tool-call / workflow-record events feed the transient activity
- *     status line (工具调用 / 子代理 / 工作流 progress).
+ *     status line (工具调用 / 子代理 / 工作流 progress). Subagent children
+ *     live in their own sessions: their `subagent/descriptor` / `tool/call` /
+ *     `turn/end` events are folded into the parent turn's activity line
+ *     through `session.header.parentSession` (status only — the child's text
+ *     output never reaches the card).
  *  3. When the body outgrows one card's budget, the overflow is split at a
  *     clean breakpoint and sent as a continuation segment card (segment 2, 3,
  *     …) into the same topic; the stream then keeps flowing into the newest
@@ -117,6 +121,12 @@ interface TurnState {
   workflowRuns: Map<string, WorkflowRun>
   /** The last settled workflow run (kept visible until the next activity). */
   workflowEndStatus: { name: string; stopReason: string } | undefined
+  /**
+   * Live subagent child sessions folded into this turn (child session id →
+   * status). Children are discovered through `session.header.parentSession`
+   * and removed when their own turn ends.
+   */
+  children: Map<string, ChildActivity>
   /** Currently rendered activity line (recomputed on every snapshot). */
   activity: string
   /** Slow keep-alive timer re-rendering the activity elapsed counter. */
@@ -135,6 +145,22 @@ interface WorkflowRun {
   active: Array<{ seq: number; label: string }>
   /** Latest phase declared by a member (`phase()` in the workflow script). */
   phase?: string
+  /**
+   * Child session ids of this run's members — their own events are already
+   * aggregated by the workflow line and must not be folded again as generic
+   * children.
+   */
+  memberIds: Set<string>
+}
+
+/** One running subagent child's displayable status. */
+interface ChildActivity {
+  /** Delegation description (subagent/descriptor label), default 子代理. */
+  label: string
+  /** The child's latest tool call, if any. */
+  tool?: string
+  /** When the child was first observed (elapsed base). */
+  since: number
 }
 
 /** Hard cap on the activity line so it can never threaten the card budget. */
@@ -242,6 +268,7 @@ export class TurnStreamer {
       toolActivity: undefined,
       workflowRuns: new Map(),
       workflowEndStatus: undefined,
+      children: new Map(),
       activity: '',
       heartbeatTimer: undefined,
     })
@@ -284,6 +311,18 @@ export class TurnStreamer {
     const fold = this.folds.get(session.id)
     if (fold !== undefined) foldEvent(fold, event)
     this.sessions.set(session.id, session)
+
+    // Subagent children live in their OWN sessions (header.parentSession →
+    // caller). Their events never touch the parent's log, so fold their
+    // status into the parent turn's activity line here.
+    const parentId = session.header.parentSession
+    if (parentId !== undefined) {
+      const parentState = this.front(parentId)
+      if (parentState !== undefined) {
+        this.foldChildEvent(parentId, parentState, session, event)
+        return
+      }
+    }
 
     const state = this.front(session.id)
     if (state === undefined) return
@@ -346,6 +385,7 @@ export class TurnStreamer {
           started: 0,
           ended: 0,
           active: [],
+          memberIds: new Set(),
         })
         state.workflowEndStatus = undefined
         this.markDirty(session.id, state)
@@ -356,6 +396,7 @@ export class TurnStreamer {
         if (run !== undefined) {
           run.started++
           run.active.push({ seq: event.data.seq, label: event.data.label })
+          run.memberIds.add(event.data.childId)
           if (event.data.phase !== undefined) run.phase = event.data.phase
           this.markDirty(session.id, state)
         }
@@ -436,11 +477,66 @@ export class TurnStreamer {
   }
 
   /**
+   * Fold one event from a subagent child session into its parent turn's
+   * activity state. Only identity/progress signals are kept — the child's
+   * text output stays out of the user-facing card (the parent model receives
+   * it as the tool result and composes the final reply itself).
+   *
+   * Workflow members are skipped here: their childId is recorded on the run
+   * fold and the workflow line already aggregates them.
+   */
+  private foldChildEvent(parentId: string, state: TurnState, child: Session, event: SessionEvent): void {
+    for (const run of state.workflowRuns.values()) {
+      if (run.memberIds.has(child.id)) return
+    }
+    switch (event.type) {
+      case 'subagent/descriptor': {
+        const label = typeof event.data.label === 'string' && event.data.label !== ''
+          ? event.data.label
+          : '子代理'
+        const existing = state.children.get(child.id)
+        if (existing === undefined) {
+          state.children.set(child.id, { label, tool: undefined, since: Date.now() })
+        } else if (existing.label === '子代理') {
+          existing.label = label
+        }
+        this.markDirty(parentId, state)
+        break
+      }
+      case 'tool/call': {
+        const existing = state.children.get(child.id)
+        if (existing === undefined) {
+          state.children.set(child.id, { label: '子代理', tool: event.data.name, since: Date.now() })
+        } else {
+          existing.tool = event.data.name
+        }
+        this.markDirty(parentId, state)
+        break
+      }
+      case 'tool/result': {
+        const existing = state.children.get(child.id)
+        if (existing !== undefined && existing.tool !== undefined) {
+          existing.tool = undefined
+          this.markDirty(parentId, state)
+        }
+        break
+      }
+      case 'turn/end': {
+        if (state.children.delete(child.id)) this.markDirty(parentId, state)
+        break
+      }
+      default:
+        break
+    }
+  }
+
+  /**
    * The transient activity status line, by priority:
    *  1. the most recently started live workflow run (member progress + phase);
-   *  2. the in-flight tool call (subagent/workflow tools get their label);
-   *  3. the last settled workflow run's outcome (until the next activity);
-   *  4. heartbeat fallback — a thinking turn with no output yet still shows
+   *  2. running subagent children (label + current tool + elapsed);
+   *  3. the in-flight tool call (subagent/workflow tools get their label);
+   *  4. the last settled workflow run's outcome (until the next activity);
+   *  5. heartbeat fallback — a thinking turn with no output yet still shows
    *     an elapsed counter so the card never sits silently.
    * Empty once the turn is finalized; the heartbeat fallback also disappears
    * as soon as visible text exists (the streaming body itself shows liveness).
@@ -459,6 +555,19 @@ export class TurnStreamer {
       if (labels.length > 0) line += ` · ${labels.join('、')}`
       line += ` · ${fmtElapsed(now - latest.startedAt)}`
       return clipActivity(line)
+    }
+
+    const children = [...state.children.values()]
+    if (children.length > 0) {
+      const listed = children.slice(0, 2).map(child => {
+        const tool = child.tool === undefined ? '' : ` (${child.tool})`
+        return `${child.label}${tool}`
+      })
+      const head = children.length === 1
+        ? `🤖 子代理执行中：${listed[0]}`
+        : `🤖 ${children.length} 个子代理执行中：${listed.join('、')}${children.length > 2 ? '、…' : ''}`
+      const oldest = Math.min(...children.map(child => child.since))
+      return clipActivity(`${head} · ${fmtElapsed(now - oldest)}`)
     }
 
     const tool = state.toolActivity
