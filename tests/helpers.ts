@@ -1,0 +1,250 @@
+/**
+ * Shared fakes: a stub Feishu channel and a fake host context surface.
+ *
+ * @module tests/helpers
+ */
+
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+import { vi } from 'vitest'
+import type {
+  Agent, AgentHandle, AgentRegistry, HostContext, Session, SessionEvent,
+  SessionId, StorageDomainFacility, Workspace, WorkspaceRegistry,
+} from '../src/dsh-types.ts'
+import type { FeishuChannel, NormalizedMessage, SendResult } from '../src/feishu-channel.ts'
+import type { RawDomainHandle } from '../src/domain.ts'
+
+export function makeSession(id = `session-${Math.random().toString(36).slice(2, 10)}`): Session {
+  return {
+    id: id as SessionId,
+    header: { version: 0, id: id as SessionId, createdAt: Date.now() },
+    events: [],
+    firstLiveSeq: 0,
+  }
+}
+
+export function makeAgent(session: Session): Agent {
+  return {
+    id: session.id,
+    session,
+    status: 'idle',
+    inbox: { nextTurn: [], nextStep: [] },
+    followup: vi.fn(),
+  }
+}
+
+export interface FakeAgentsOptions {
+  failCreate?: Error
+  failResume?: Error
+}
+
+export function makeAgentRegistry(fail: FakeAgentsOptions = {}): {
+  registry: AgentRegistry
+  created: Array<{ options: Parameters<AgentRegistry['create']>[0]; handle: AgentHandle }>
+  resumed: Array<{ options: Parameters<AgentRegistry['resume']>[0]; handle: AgentHandle }>
+} {
+  const created: Array<{ options: Parameters<AgentRegistry['create']>[0]; handle: AgentHandle }> = []
+  const resumed: Array<{ options: Parameters<AgentRegistry['resume']>[0]; handle: AgentHandle }> = []
+  const registry: AgentRegistry = {
+    async create(options) {
+      if (fail.failCreate !== undefined) throw fail.failCreate
+      const session = makeSession(options.sessionId)
+      const agent = makeAgent(session)
+      const handle: AgentHandle = { agent, dispose: vi.fn(async () => {}) }
+      created.push({ options, handle })
+      return handle
+    },
+    async resume(options) {
+      if (fail.failResume !== undefined) throw fail.failResume
+      const session = makeSession(options.resumeSessionId)
+      const agent = makeAgent(session)
+      const handle: AgentHandle = { agent, dispose: vi.fn(async () => {}) }
+      resumed.push({ options, handle })
+      return handle
+    },
+  }
+  return { registry, created, resumed }
+}
+
+export function makeWorkspaceRegistry(): { registry: WorkspaceRegistry; workspaces: Map<string, Workspace> } {
+  const workspaces = new Map<string, Workspace>()
+  const registry: WorkspaceRegistry = {
+    async create(dir: string, title?: string) {
+      const existing = workspaces.get(dir)
+      if (existing !== undefined) return existing
+      const workspace: Workspace = {
+        id: `ws-${dir}`,
+        path: dir,
+        title: title ?? path.basename(dir),
+        attachSession: vi.fn(),
+      }
+      workspaces.set(dir, workspace)
+      return workspace
+    },
+  }
+  return { registry, workspaces }
+}
+
+interface FakeTable {
+  get(key: string): unknown
+  put(key: string, value: unknown): Promise<unknown>
+  delete(key: string): Promise<unknown>
+  entries(): IterableIterator<[string, unknown]>
+}
+
+export function makeDomain(): { facility: StorageDomainFacility; raw: RawDomainHandle } {
+  const tableData = new Map<string, unknown>()
+  const tableHandles = new Map<string, FakeTable>()
+  let globalValue: unknown = {}
+
+  const tableFor = (name: string): FakeTable => {
+    const existing = tableHandles.get(name)
+    if (existing !== undefined) return existing
+    const handle: FakeTable = {
+      get: (key: string) => tableData.get(key),
+      put: vi.fn(async (key: string, value: unknown) => {
+        tableData.set(key, value)
+        return true
+      }),
+      delete: vi.fn(async (key: string) => tableData.delete(key)),
+      entries: () => tableData.entries(),
+    }
+    tableHandles.set(name, handle)
+    return handle
+  }
+
+  const raw: RawDomainHandle = {
+    table: tableFor,
+    global: {
+      get: () => globalValue,
+      set: vi.fn(async (value: unknown) => {
+        globalValue = value
+      }),
+    },
+    close: vi.fn(async () => {}),
+  }
+
+  const facility: StorageDomainFacility = {
+    open: vi.fn(async () => raw),
+  }
+  return { facility, raw }
+}
+
+export function makeHostContext(credentialValues: Record<string, string> = {
+  FEISHU_APP_ID: 'cli_test_app',
+  FEISHU_APP_SECRET: 'test_secret',
+}): {
+  ctx: HostContext
+  agents: ReturnType<typeof makeAgentRegistry>
+  workspaces: ReturnType<typeof makeWorkspaceRegistry>
+  domain: ReturnType<typeof makeDomain>
+  credentials: { resolve: ReturnType<typeof vi.fn>; values: Record<string, string> }
+  sessionListeners: Array<(session: Session, event: SessionEvent) => void>
+} {
+  const agents = makeAgentRegistry()
+  const workspaces = makeWorkspaceRegistry()
+  const domain = makeDomain()
+  const sessionListeners: Array<(session: Session, event: SessionEvent) => void> = []
+  const tokenMeter = { measure: () => ({ totalTokens: 1234 }) }
+  const llm = { resolveModelInfo: vi.fn(async () => ({ context: { contextWindow: 128000 } })) }
+  const credentials = {
+    values: { ...credentialValues },
+    resolve: vi.fn(async (ref: string) => {
+      const value = credentials.values[ref]
+      return value === undefined ? undefined : { value, source: 'file' }
+    }),
+  }
+  const services: Record<string, unknown> = {
+    tokenMeter,
+    llm,
+    credentials,
+  }
+  const ctx: HostContext = {
+    agents: agents.registry,
+    workspaceRegistry: workspaces.registry,
+    storageDomain: domain.facility,
+    credentials,
+    tokenMeter,
+    llm,
+    logger: { warn: vi.fn(), error: vi.fn(), info: vi.fn(), debug: vi.fn() },
+    get: (name: string) => services[name],
+    on: vi.fn((name, listener) => {
+      if (name === 'session/event') {
+        const wrapped = listener as (session: Session, event: SessionEvent) => void
+        sessionListeners.push(wrapped)
+      }
+      return () => true
+    }),
+    effect: vi.fn(),
+  }
+  return { ctx, agents, workspaces, domain, credentials, sessionListeners }
+}
+
+export interface FakeChannelOptions {
+  threadIdOfMessage?: (messageId: string) => Promise<string | undefined>
+  failFirstSend?: boolean
+  failReplyInThread?: boolean
+}
+
+export function makeChannel(options: FakeChannelOptions = {}): FeishuChannel & {
+  sent: Array<{ chatId: string; input: object; options?: { replyTo?: string; replyInThread?: boolean } }>
+  updated: Array<{ messageId: string; card: object }>
+  reactions: Array<{ messageId: string; emojiType: string }>
+  removedReactions: Array<{ messageId: string; reactionId: string }>
+} {
+  const sent: Array<{ chatId: string; input: object; options?: { replyTo?: string; replyInThread?: boolean } }> = []
+  const updated: Array<{ messageId: string; card: object }> = []
+  const reactions: Array<{ messageId: string; emojiType: string }> = []
+  const removedReactions: Array<{ messageId: string; reactionId: string }> = []
+  let serial = 0
+
+  const channel: FeishuChannel = {
+    onMessage: vi.fn(() => () => {}),
+    botOpenId: () => 'bot-open-id',
+    connect: vi.fn(async () => {}),
+    disconnect: vi.fn(async () => {}),
+    async send(chatId, input, sendOptions) {
+      if (options.failFirstSend) throw new Error('send failed')
+      if (sendOptions?.replyInThread === true && options.failReplyInThread === true) {
+        throw new Error('topic unsupported')
+      }
+      const messageId = `om_${++serial}`
+      sent.push({ chatId, input, options: sendOptions })
+      const result: SendResult = { messageId }
+      return result
+    },
+    updateCard: vi.fn(async (messageId: string, card: object) => {
+      updated.push({ messageId, card })
+    }),
+    addReaction: vi.fn(async (messageId: string, emojiType: string) => {
+      reactions.push({ messageId, emojiType })
+      return `react-${reactions.length}`
+    }),
+    removeReaction: vi.fn(async (messageId: string, reactionId: string) => {
+      removedReactions.push({ messageId, reactionId })
+    }),
+    threadIdOfMessage: options.threadIdOfMessage ?? (async () => `omt_${serial}`),
+    uploadImage: vi.fn(async () => ({ imageKey: 'img_chevron' })),
+  }
+  return Object.assign(channel, { sent, updated, reactions, removedReactions })
+}
+
+export function makeMessage(partial: Partial<Omit<NormalizedMessage, 'content'>> & { content: string }): NormalizedMessage {
+  return {
+    messageId: `om_msg_${Math.random().toString(36).slice(2, 10)}`,
+    chatId: 'oc_test_chat',
+    chatType: 'group',
+    senderId: 'ou_test_user',
+    rawContentType: 'text',
+    resources: [],
+    mentions: [],
+    mentionAll: false,
+    mentionedBot: true,
+    ...partial,
+  } as NormalizedMessage
+}
+
+export function makeTempBaseDir(): string {
+  return mkdtempSync(path.join(tmpdir(), 'dsh-channels-test-'))
+}

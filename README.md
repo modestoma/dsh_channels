@@ -1,0 +1,118 @@
+# dsh-channels
+
+DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞书机器人**，用户只需与飞书机器人对话即可使用 dsh。
+
+- 对话入口：私聊、群聊 @ 机器人、话题群 @ 机器人
+- 收到触发消息：立刻加 **“Typing”** 表情 → 以话题形式回复（**创建话题**）→ 绑定 DSH session → 卡片 2.0 **流式回复** → 结束移除 “Typing”、更新为 **“DONE”**
+- 话题内后续消息**无需再 @**，自动延续该 session
+- 工作区归属：私聊一人一工作区；群里**每个用户各自一个工作区**（同群不同用户互不影响）
+- 全部基于飞书官方 SDK [`@larksuiteoapi/node-sdk`](https://www.npmjs.com/package/@larksuiteoapi/node-sdk)（WebSocket 长连接，免公网）
+
+设计与可行性论证见 [docs/feasibility-and-design.md](docs/feasibility-and-design.md)。
+
+## 流式卡片
+
+卡片 2.0，三段式，默认 500ms 刷新（`refreshMs` 可调）：
+
+1. **推理折叠面板**（`collapsible_panel`）：带边框、默认折叠；标题三态 **推理中 → 回复中 → 回复结束**；右侧箭头随折叠状态翻转（折叠向下、展开向上，`icon_expanded_angle: 180`）
+2. **回复正文**：富文本 markdown
+3. **session 信息**（两行小字）：
+   - `🔑 {session id} · ⬆ input token {input} · ⬇ output token {output}`（session 累计口径）
+   - `🧠 模型 {model}({effort}) · ⚡ 缓存命中 {cache} · 📊 上下文 {tokens}/{window}`
+
+## 目录结构
+
+```
+src/
+├── index.ts           # 插件入口 apply(ctx)
+├── config.ts          # 配置 schema 与 env: 凭据解析
+├── dsh-types.ts       # DSH 宿主表面的最小类型桥（无运行时依赖）
+├── feishu-channel.ts  # 官方 SDK Channel 模块适配（可注入 stub）
+├── service.ts         # 路由 / 工作区 / session 编排
+├── streamer.ts        # session/event → 卡片快照，500ms 节流 patch
+├── cards.ts           # 卡片 2.0 JSON 纯函数渲染
+├── stats.ts           # session 累计 token / 缓存命中 / 上下文折叠
+├── domain.ts          # storageDomain 路由表（thread_id → sessionId）
+└── workspaces.ts      # (chat, user) → 工作区目录
+```
+
+## 接入 DSH
+
+插件安装进 dsh 的 **profile**（`$DSH_HOME/profiles/<name>/`，未设置 `DSH_HOME` 时默认 `~/.dsh`），web 界面即 `web` profile。已在真实 dsh 上实测通过的完整流程见 [docs/feishu-onboarding.md](docs/feishu-onboarding.md)（含飞书控制台配置、逐通道联调清单与故障排查），这里给出最小步骤：
+
+```bash
+# 在 deepseek-harness 仓库内：把本地插件装进 web profile（幂等，可重复执行以更新）
+DSH_HOME=$DSH_HOME pnpm dsh plugin --profile web add dsh-channels@file:/path/to/dsh_channels
+```
+
+在 `$DSH_HOME/profiles/web/cordis.patch.yml` 追加（新条目用 `insert:` 列表）：
+
+```yaml
+- insert:
+    - id: channels
+      name: 'dsh-channels'
+      config:
+        appId: 'FEISHU_APP_ID'              # 凭据引用名（非密钥本身），经 ctx.credentials 解析
+        appSecret: 'FEISHU_APP_SECRET'
+        baseDir: './channels-data'          # 工作区根目录（按 私聊/群聊/用户 组织）
+        provider: 'deepseek-official'       # 可选：省略则用部署默认
+        model: 'deepseek-v4-flash'          # 可选
+        refreshMs: 500                      # 卡片刷新频率
+        requireMention: true                # 普通群需 @ 机器人
+        dmMode: 'open'
+        threadFallback: 'degrade'           # 话题被拒时降级为会话级路由
+        loggerLevel: 'info'
+```
+
+**凭据**放在 `$DSH_HOME/.credentials.yaml`（dsh 受管凭据库，热加载，与 `DEEPSEEK_API_KEY` 同库）：
+
+```yaml
+FEISHU_APP_ID: cli_xxxxxxxx
+FEISHU_APP_SECRET: xxxxxxxx
+```
+
+文件必须仅属主可读（dsh 强制校验，否则拒绝启动）：`chmod 600 $DSH_HOME/.credentials.yaml`。解析优先级：进程环境变量 > `.credentials.yaml` > `<cwd>/.env` > `$DSH_HOME/.env`（由 `dsh-credentials-local` 提供，热加载）。配置里只写引用名，明文密钥会被 schema 拒绝。凭据改动后重启 dsh 生效。
+
+验证组合（不启动服务）：`DSH_HOME=$DSH_HOME pnpm dsh web --dump-config | grep dsh-channels`
+
+启动成功标志（控制台）：`[dsh-channels] feishu long connection established, bot open_id: ou_xxx`
+
+宿主 profile 已内置所需服务（agent-loop、llm-deepseek、session 持久化、storage-domain、workspace）；推荐确认 `dsh-token-meter` 已启用（卡片上下文占用显示）。
+
+## 飞书侧准备
+
+1. [飞书开放平台](https://open.feishu.cn/app) 创建**企业自建应用**，开启**机器人**能力。
+2. 权限（至少）：
+   - `im:message`（获取与发送单聊、群组消息）
+   - `im:message.p2p_msg:readonly`（读取用户发给机器人的单聊消息）
+   - 事件：**接收消息 im.message.receive_v1**（含“接收群聊中 @ 机器人消息”）
+   - `im:message.reactions:write_only`（发送、删除消息表情回复）
+   - `im:message:update`（更新卡片）
+3. 事件订阅方式选**长连接**（WebSocket，免公网）。
+4. 发布版本并把用户加入可用范围；将机器人拉入测试群。
+
+## 行为与降级
+
+- **话题创建**：通过回复消息接口 `reply_in_thread: true`（官方文档明示的“以话题方式回复（即创建话题）”）。响应后经 `im.v1.message.get` 取回 `thread_id` 写入路由表。
+- **话题延续**：`im.message.receive_v1` 事件自带 `thread_id`，命中路由表即 `agent.followup()`，无需 @。
+- **降级（`threadFallback: 'degrade'`）**：私聊或群聊拒绝话题回复（如 230071）时，自动改为普通回复，路由键退化为 `chat:p2p:<chat_id>:<open_id>` / `chat:group:<chat_id>:<open_id>`（会话级延续）；`strict` 则直接失败。
+- **重启恢复**：路由表持久化在 `storageDomain`；消息到达时 `ctx.agents.resume()` 懒恢复 session。
+- **表情**：`Typing` 与 `DONE` 均为飞书**官方内置**表态表情（emoji_type 即 `"Typing"`/`"DONE"`），无需上传自定义表情。
+- **限频**：卡片更新单条消息 5 QPS、应用级 1000 次/分钟；500ms（2 QPS）默认安全，`refreshMs` 下限 200ms。
+- **卡片体积**：正文/推理分别截断（11k/13k 字符），保证低于 30 KB 上限。
+
+## 已知取舍（v1）
+
+- patch 为全量替换：流式期间用户手动展开折叠面板会被下一次刷新收起；流式结束后不再刷新，可自由展开。
+- 私聊 `reply_in_thread` 需真机验证（文档未明示限制，失败走降级路径，见上文）。
+- 会话的 agent 常驻内存，不做空闲回收（重启后按需懒恢复）。
+
+## 开发
+
+```bash
+pnpm install --store-dir ./.pnpm-store   # 受限环境；正常环境直接 pnpm install
+pnpm typecheck
+pnpm test
+```
+
+测试以 stub 替换官方 SDK 与 DSH 宿主服务，无需真实凭据。
