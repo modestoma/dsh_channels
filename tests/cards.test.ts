@@ -112,9 +112,27 @@ describe('buildCard', () => {
     expect(line2).toContain('上下文 —')
   })
 
-  it('renders the activity status line between the panel and the body, omitted when empty', () => {
-    const list = elements({ activity: '🤖 子代理执行中：研究实现方案 · 已运行 12s' })
+  it('renders the two activity lines (status + tool) between the panel and the body, omitted when empty', () => {
+    const list = elements({
+      status: '🧵 工作流 audit 结束（完成）',
+      tool: '🔧 调用工具：bash · 已运行 12s',
+    })
     expect(list.map(element => element.tag)).toEqual([
+      'collapsible_panel',
+      'markdown',
+      'markdown',
+      'hr',
+      'markdown',
+      'hr',
+      'markdown',
+      'markdown',
+    ])
+    expect(list[1]?.content).toBe('🧵 工作流 audit 结束（完成）')
+    expect(list[1]?.text_size).toBe('notation')
+    expect(list[2]?.content).toBe('🔧 调用工具：bash · 已运行 12s')
+    expect(list[2]?.text_size).toBe('notation')
+    // Only the tool line.
+    expect(elements({ tool: '🔧 调用工具：bash' }).map(element => element.tag)).toEqual([
       'collapsible_panel',
       'markdown',
       'hr',
@@ -123,10 +141,8 @@ describe('buildCard', () => {
       'markdown',
       'markdown',
     ])
-    expect(list[1]?.content).toBe('🤖 子代理执行中：研究实现方案 · 已运行 12s')
-    expect(list[1]?.text_size).toBe('notation')
     // Empty / undefined activity keeps the original element layout.
-    expect(elements({ activity: '' }).map(element => element.tag)).toEqual([
+    expect(elements({ status: '', tool: '' }).map(element => element.tag)).toEqual([
       'collapsible_panel',
       'hr',
       'markdown',
@@ -136,12 +152,13 @@ describe('buildCard', () => {
     ])
   })
 
-  it('renders the activity line on continuation cards too (after the segment header)', () => {
+  it('renders both activity lines on continuation cards too (after the segment header)', () => {
     const list = elements(
-      { activity: '🧵 工作流 audit · 3/8 子代理完成 · 已运行 1分2s' },
+      { status: '🧵 工作流 audit · 3/8 子代理完成 · 已运行 1分2s', tool: '🔧 调用工具：grep' },
       { panel: false, segment: 2 },
     )
     expect(list.map(element => element.tag)).toEqual([
+      'markdown',
       'markdown',
       'markdown',
       'hr',
@@ -153,6 +170,8 @@ describe('buildCard', () => {
     expect(list[0]?.content).toContain('回复分段 2')
     expect(list[1]?.content).toContain('工作流 audit')
     expect(list[1]?.text_size).toBe('notation')
+    expect(list[2]?.content).toContain('调用工具：grep')
+    expect(list[2]?.text_size).toBe('notation')
   })
 })
 

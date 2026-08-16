@@ -7,12 +7,15 @@
  *     segment 1.
  *  2. `session/event` consumption — text deltas fill the body, reasoning
  *     deltas fill the fold panel, usage/header events advance the stats fold,
- *     and tool-call / workflow-record events feed the transient activity
- *     status line (工具调用 / 子代理 / 工作流 progress). Subagent children
- *     live in their own sessions: their `subagent/descriptor` / `tool/call` /
- *     `turn/end` events are folded into the parent turn's activity line
- *     through `session.header.parentSession` (status only — the child's text
- *     output never reaches the card).
+ *     and tool-call / workflow-record events feed the two transient activity
+ *     lines: the delegation status line (子代理 / 工作流 progress, settled
+ *     workflow outcome, heartbeat) and the tool line (the parent's in-flight
+ *     tool call). The lines are INDEPENDENT — a later tool call never
+ *     supersedes the settled workflow status. Subagent children live in their
+ *     own sessions: their `subagent/descriptor` / `tool/call` / `turn/end`
+ *     events are folded into the parent turn's status line through
+ *     `session.header.parentSession` (status only — the child's text output
+ *     never reaches the card).
  *  3. When the body outgrows one card's budget, the overflow is split at a
  *     clean breakpoint and sent as a continuation segment card (segment 2, 3,
  *     …) into the same topic; the stream then keeps flowing into the newest
@@ -28,7 +31,7 @@
  *
  * Keep-alive: turns that produce no text deltas for a while (tool calls,
  * subagent/workflow runs, provider-side work) are kept visibly alive by the
- * activity line, whose elapsed counter is re-rendered on a slow heartbeat
+ * activity lines, whose elapsed counters are re-rendered on a slow heartbeat
  * (`heartbeatMs`, default 5 s) — the card never sits silently on a live turn.
  *
  * @module dsh-channels/streamer
@@ -46,7 +49,7 @@ import type { StatsFold } from './stats.ts'
  * console can confirm which build of the activity status line is loaded.
  * Bump on every behavior change to this feature.
  */
-export const ACTIVITY_BUILD_MARKER = 'activity-status-v2'
+export const ACTIVITY_BUILD_MARKER = 'activity-status-v3'
 
 /** How a segment card reached Feishu. */
 export interface SegmentDelivery {
@@ -134,10 +137,14 @@ interface TurnState {
    * and removed when their own turn ends.
    */
   children: Map<string, ChildActivity>
-  /** Currently rendered activity line (recomputed on every snapshot). */
-  activity: string
-  /** Kind of the activity line currently logged (change-detection only). */
-  activityKind: string
+  /** Currently rendered delegation status line (recomputed on every snapshot). */
+  status: string
+  /** Kind of the status line currently logged (change-detection only). */
+  statusKind: string
+  /** Currently rendered tool-call line (recomputed on every snapshot). */
+  tool: string
+  /** Kind of the tool line currently logged (change-detection only). */
+  toolKind: string
   /** Slow keep-alive timer re-rendering the activity elapsed counter. */
   heartbeatTimer: ReturnType<typeof setTimeout> | undefined
 }
@@ -278,8 +285,10 @@ export class TurnStreamer {
       workflowRuns: new Map(),
       workflowEndStatus: undefined,
       children: new Map(),
-      activity: '',
-      activityKind: '',
+      status: '',
+      statusKind: '',
+      tool: '',
+      toolKind: '',
       heartbeatTimer: undefined,
     })
     this.bySession.set(session.id, queue)
@@ -375,8 +384,8 @@ export class TurnStreamer {
           label: toolActivityLabel(event.data.name, event.data.arguments),
           since: Date.now(),
         }
-        // A new call supersedes the settled-workflow end status.
-        state.workflowEndStatus = undefined
+        // The tool line is independent: it never supersedes the settled
+        // workflow end status on the delegation line (both render together).
         this.markDirty(session.id, state)
         break
       }
@@ -541,17 +550,18 @@ export class TurnStreamer {
   }
 
   /**
-   * The transient activity status line, by priority:
+   * The delegation status line, by priority:
    *  1. the most recently started live workflow run (member progress + phase);
    *  2. running subagent children (label + current tool + elapsed);
-   *  3. the in-flight tool call (subagent/workflow tools get their label);
-   *  4. the last settled workflow run's outcome (until the next activity);
-   *  5. heartbeat fallback — a thinking turn with no output yet still shows
+   *  3. the last settled workflow run's outcome — it persists across later
+   *     tool calls and text streaming (only a new run-start or the turn's end
+   *     replaces it), so the workflow conclusion stays visible;
+   *  4. heartbeat fallback — a thinking turn with no output yet still shows
    *     an elapsed counter so the card never sits silently.
    * Empty once the turn is finalized; the heartbeat fallback also disappears
    * as soon as visible text exists (the streaming body itself shows liveness).
    */
-  private activityLine(state: TurnState, now: number): string {
+  private delegationLine(state: TurnState, now: number): string {
     if (state.finalized) return ''
 
     let latest: WorkflowRun | undefined
@@ -580,30 +590,39 @@ export class TurnStreamer {
       return clipActivity(`${head} · ${fmtElapsed(now - oldest)}`)
     }
 
-    const tool = state.toolActivity
-    if (tool !== undefined) {
-      const prefix = tool.name === 'subagent'
-        ? '🤖 子代理执行中：'
-        : tool.name === 'workflow'
-          ? '🧵 工作流启动：'
-          : '🔧 调用工具：'
-      return clipActivity(`${prefix}${tool.label} · ${fmtElapsed(now - tool.since)}`)
-    }
-
     if (state.workflowEndStatus !== undefined) {
       const { name, stopReason } = state.workflowEndStatus
       return clipActivity(`🧵 工作流 ${name} 结束（${stopReason}）`)
     }
 
     const empty = state.cards.every(card => card.body === '')
-    if (state.phase === 'thinking' && empty) {
+    // The tool line already shows liveness while a call is in flight, so the
+    // heartbeat fallback stays out of the way.
+    if (state.phase === 'thinking' && empty && state.toolActivity === undefined) {
       return clipActivity(`⏳ 处理中 · ${fmtElapsed(now - state.turnStartedAt)}`)
     }
     return ''
   }
 
   /**
-   * Slow keep-alive: recompute the activity line and patch only when its
+   * The tool-call line: the parent agent's in-flight tool call, independent
+   * of the delegation status line — workflow/subagent status never hides it
+   * and it never hides them. Cleared by the tool's `tool/result`.
+   */
+  private toolLine(state: TurnState, now: number): string {
+    if (state.finalized) return ''
+    const tool = state.toolActivity
+    if (tool === undefined) return ''
+    const prefix = tool.name === 'subagent'
+      ? '🤖 调用子代理：'
+      : tool.name === 'workflow'
+        ? '🧵 调用工作流：'
+        : '🔧 调用工具：'
+    return clipActivity(`${prefix}${tool.label} · ${fmtElapsed(now - tool.since)}`)
+  }
+
+  /**
+   * Slow keep-alive: recompute both activity lines and patch only when their
    * rendered text actually changed (the elapsed counter ticking). Reschedules
    * itself while the turn is pending; `finalize`/`detach` cancel it.
    */
@@ -612,9 +631,9 @@ export class TurnStreamer {
     state.heartbeatTimer = setTimeout(() => {
       state.heartbeatTimer = undefined
       if (state.disposed || state.finalized) return
-      const line = this.activityLine(state, Date.now())
-      if (line !== state.activity) {
-        state.activity = line
+      const now = Date.now()
+      if (this.delegationLine(state, now) !== state.status
+        || this.toolLine(state, now) !== state.tool) {
         this.markDirty(sessionId, state)
       }
       this.scheduleHeartbeat(sessionId, state)
@@ -622,27 +641,42 @@ export class TurnStreamer {
   }
 
   private cardState(sessionId: string, state: TurnState, body: string): CardState {
-    // The snapshot point recomputes (and remembers) the activity line so every
-    // patch — including heartbeat-driven ones — carries the current status.
-    const line = this.activityLine(state, Date.now())
-    if (line !== state.activity) {
-      state.activity = line
-      // Diagnostic: log activity-type transitions only (first segment of the
-      // line, stable across elapsed/count ticks) so a live test can confirm
-      // exactly which status the card is being patched with.
-      const kind = line === '' ? '' : (line.split('·')[0] ?? '').trim()
-      if (kind !== state.activityKind) {
-        state.activityKind = kind
-        console.info('[dsh-channels] activity →', kind === '' ? '（收起）' : kind)
-      }
+    // The snapshot point recomputes (and remembers) both activity lines so
+    // every patch — including heartbeat-driven ones — carries the current
+    // status and tool call.
+    const now = Date.now()
+    const status = this.delegationLine(state, now)
+    if (status !== state.status) {
+      state.status = status
+      const kind = this.noteKind('status', status, state.statusKind)
+      if (kind !== undefined) state.statusKind = kind
+    }
+    const tool = this.toolLine(state, now)
+    if (tool !== state.tool) {
+      state.tool = tool
+      const kind = this.noteKind('tool', tool, state.toolKind)
+      if (kind !== undefined) state.toolKind = kind
     }
     return {
       phase: state.phase,
       reasoning: state.reasoning,
       body,
-      activity: state.activity,
+      status: state.status,
+      tool: state.tool,
       stats: this.statsFor(sessionId),
     }
+  }
+
+  /**
+   * Diagnostic: log activity-type transitions only (first segment of the
+   * line, stable across elapsed/count ticks) so a live test can confirm
+   * exactly which status the card is being patched with.
+   */
+  private noteKind(slot: 'status' | 'tool', line: string, current: string): string | undefined {
+    const kind = line === '' ? '' : (line.split('·')[0] ?? '').trim()
+    if (kind === current) return undefined
+    console.info(`[dsh-channels] activity ${slot} →`, kind === '' ? '（收起）' : kind)
+    return kind
   }
 
   /**
@@ -797,12 +831,13 @@ export class TurnStreamer {
       state.timer = undefined
     }
     // Transient activity is not part of the settled card: the heartbeat stops
-    // and the activity line renders empty on every final patch.
+    // and both activity lines render empty on every final patch.
     if (state.heartbeatTimer !== undefined) {
       clearTimeout(state.heartbeatTimer)
       state.heartbeatTimer = undefined
     }
-    state.activity = ''
+    state.status = ''
+    state.tool = ''
     // Freeze the tail and spawn any remaining segment cards.
     this.splitOverflow(sessionId, state)
 

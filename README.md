@@ -15,10 +15,10 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 卡片 2.0，三段式，默认 500ms 刷新（`refreshMs` 可调）：
 
 1. **推理折叠面板**（`collapsible_panel`）：带边框、默认折叠；标题三态 **推理中 → 回复中 → 回复结束**；右侧箭头随折叠状态翻转（折叠向下、展开向上，`icon_expanded_angle: 180`）
-2. **活动状态行**（小字，仅在存在临时活动时渲染）：工具调用、子代理 / 工作流进度、等待兜底计时，让卡片在“模型不吐字”的阶段（工具执行、subagent、workflow）**不再静默**——按 `statusRefreshMs`（默认 5s）慢节奏刷新计时；正文开始输出或回复结束即收起。覆盖：
-   - `tool/call`（含 subagent 的 description、workflow 的 meta.name）
-   - `tool-workflow/run-start / agent-start / agent-end / run-end`（工作流进度：完成数/总数、阶段、活动成员、结束原因）
-   - **子代理进度**（跨会话映射）：子代理是独立 session（`header.parentSession` 指向主会话），其 `subagent/descriptor`（label）、`tool/call`（当前工具）、`turn/end`（结束移除）被折叠为 `🤖 子代理执行中：检索实现方案 (read) · 已运行 45s`，并行子代理显示计数。**只显示状态，不显示输出**——子代理正文是父模型的中间产物，最终回答由父模型组织，绝不进卡片正文
+2. **活动状态两行**（小字，仅在存在临时活动时渲染，**互相独立、互不顶替**），让卡片在“模型不吐字”的阶段（工具执行、subagent、workflow）**不再静默**——按 `statusRefreshMs`（默认 5s）慢节奏刷新计时；正文开始输出后随活动结束收起：
+   - **状态行**（委托进度）：`tool-workflow/run-start / agent-start / agent-end / run-end`（工作流进度：完成数/总数、阶段、活动成员）→ run 结束转为 `🧵 工作流 xxx 结束（完成）` 并**一直保留到整轮回复结束**（后续工具调用、正文输出都不会顶掉它）；**子代理进度**（跨会话映射）：子代理是独立 session（`header.parentSession` 指向主会话），其 `subagent/descriptor`（label）、`tool/call`（当前工具）、`turn/end`（结束移除）被折叠为 `🤖 子代理执行中：检索实现方案 (read) · 已运行 45s`，并行子代理显示计数。**只显示状态，不显示输出**——子代理正文是父模型的中间产物，绝不进卡片正文
+   - **工具行**（父会话当前工具调用）：`tool/call` → `🔧 调用工具：bash · 已运行 Ns`（subagent 工具显示其 description、workflow 工具显示 meta.name），`tool/result` 返回即清除
+   - 两者可同屏：如 `🧵 工作流 xxx 结束（完成）` + `🔧 调用工具：bash`
 3. **回复正文**：富文本 markdown；超长正文**自动分段投放**——单卡片预算用满后按干净断点（段落 / 标题 / 代码块边界）切分，且**每张卡最多 5 个表格**（飞书硬限制，错误 11310），表格绝不会被从中间切断；续片以「📄 回复分段 n」卡片跟进同一话题，**全文无丢失**；续卡被飞书拒收时自动降级为纯文本消息（内容仍送达）
 4. **session 信息**（两行小字）：
    - `🔑 {session id} · ⬆ input token {input} · ⬇ output token {output}`（session 累计口径）

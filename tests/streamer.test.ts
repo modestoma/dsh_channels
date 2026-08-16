@@ -397,7 +397,7 @@ describe('TurnStreamer activity status + keep-alive', () => {
     return ch.updated.filter(update => update.messageId === 'om_card').at(-1)!.card
   }
 
-  it('shows a tool call as the activity line and clears it on tool/result', async () => {
+  it('shows a tool call on the tool line and clears it on tool/result', async () => {
     const ch = channel()
     const streamer = new TurnStreamer(ch, 500, hooks())
     const session = makeSession('sess-tool')
@@ -408,8 +408,11 @@ describe('TurnStreamer activity status + keep-alive', () => {
       data: { turn: 1, step: 1, callId: 'call-1', name: 'bash', arguments: '{"command":"ls"}' },
     })
     await vi.advanceTimersByTimeAsync(500)
-    expect(markdownLines(headCard(ch))[0]).toContain('🔧 调用工具：bash')
-    expect(markdownLines(headCard(ch))[0]).toContain('已运行')
+    // Only the tool line renders (no status): the heartbeat fallback stays
+    // hidden while a tool call already shows liveness.
+    expect(markdownLines(headCard(ch)).join('\n')).toContain('🔧 调用工具：bash')
+    expect(markdownLines(headCard(ch)).join('\n')).toContain('已运行')
+    expect(markdownLines(headCard(ch))).not.toContain('⏳ 处理中')
 
     streamer.onSessionEvent(session, {
       type: 'tool/result', seq: 2,
@@ -433,7 +436,7 @@ describe('TurnStreamer activity status + keep-alive', () => {
       },
     })
     await vi.advanceTimersByTimeAsync(500)
-    expect(markdownLines(headCard(ch))[0]).toContain('🤖 子代理执行中：检索实现方案')
+    expect(markdownLines(headCard(ch)).join('\n')).toContain('🤖 调用子代理：检索实现方案')
 
     // Unparseable arguments fall back to the bare tool name.
     streamer.onSessionEvent(session, {
@@ -441,7 +444,54 @@ describe('TurnStreamer activity status + keep-alive', () => {
       data: { turn: 1, step: 1, callId: 'call-2', name: 'subagent', arguments: '{broken' },
     })
     await vi.advanceTimersByTimeAsync(500)
-    expect(markdownLines(headCard(ch))[0]).toContain('🤖 子代理执行中：subagent')
+    expect(markdownLines(headCard(ch)).join('\n')).toContain('🤖 调用子代理：subagent')
+  })
+
+  it('keeps the workflow end status while a later tool call runs (two independent lines)', async () => {
+    const ch = channel()
+    const streamer = new TurnStreamer(ch, 500, hooks())
+    const session = makeSession('sess-end-tool')
+    streamer.attach(session, 'om_card', 'om_trigger', undefined)
+
+    streamer.onSessionEvent(session, {
+      type: 'tool-workflow/run-start', seq: 1, data: { runId: 'run-1', name: 'audit' },
+    })
+    streamer.onSessionEvent(session, {
+      type: 'tool-workflow/agent-start', seq: 2,
+      data: { runId: 'run-1', seq: 1, label: '检索代码', childId: 'child-1' },
+    })
+    streamer.onSessionEvent(session, {
+      type: 'tool-workflow/agent-end', seq: 3, data: { runId: 'run-1', seq: 1, outcome: 'completed' },
+    })
+    streamer.onSessionEvent(session, {
+      type: 'tool-workflow/run-end', seq: 4, data: { runId: 'run-1', stopReason: 'completed' },
+    })
+    streamer.onSessionEvent(session, {
+      type: 'tool/result', seq: 5,
+      data: { turn: 1, step: 1, message: { type: 'text', text: 'done' } },
+    })
+    // The model follows up with a plain tool call — it must NOT supersede
+    // the settled workflow status: both lines render together.
+    streamer.onSessionEvent(session, {
+      type: 'tool/call', seq: 6,
+      data: { turn: 1, step: 2, callId: 'call-2', name: 'bash', arguments: '{"command":"git log"}' },
+    })
+    await vi.advanceTimersByTimeAsync(500)
+    expect(markdownLines(headCard(ch))[0]).toContain('🧵 工作流 audit 结束（完成）')
+    expect(markdownLines(headCard(ch))[1]).toContain('🔧 调用工具：bash')
+
+    // Tool settles, text starts: the workflow end status persists.
+    streamer.onSessionEvent(session, {
+      type: 'tool/result', seq: 7,
+      data: { turn: 1, step: 2, message: { type: 'text', text: 'ok' } },
+    })
+    streamer.onSessionEvent(session, {
+      type: 'assistant/chunk', seq: 8,
+      data: { turn: 1, step: 2, chunk: { type: 'text-delta', index: 0, text: '结论' } },
+    })
+    await vi.advanceTimersByTimeAsync(500)
+    expect(markdownLines(headCard(ch))[0]).toContain('工作流 audit 结束（完成）')
+    expect(markdownLines(headCard(ch)).join('\n')).not.toContain('调用工具')
   })
 
   it('folds tool-workflow run events into a progress line with member counts', async () => {
@@ -583,7 +633,7 @@ describe('TurnStreamer subagent child folding', () => {
       },
     })
     await vi.advanceTimersByTimeAsync(500)
-    expect(activity(ch)).toContain('🤖 子代理执行中：检索实现方案')
+    expect(markdownLines(headCard(ch)).join('\n')).toContain('🤖 调用子代理：检索实现方案')
 
     // The child session publishes its descriptor, then starts working.
     const child = makeChildSession('child-1', 'sess-parent')
@@ -610,9 +660,9 @@ describe('TurnStreamer subagent child folding', () => {
 
     streamer.onSessionEvent(child, { type: 'turn/end', seq: 4, data: { turn: 1, reason: 'stop' } })
     await vi.advanceTimersByTimeAsync(500)
-    expect(activity(ch)).not.toContain('(read)')
-    // Parent's toolActivity line remains until its own tool/result.
-    expect(activity(ch)).toContain('检索实现方案')
+    expect(activity(ch)).not.toContain('子代理执行中')
+    // Parent's tool line remains until its own tool/result.
+    expect(markdownLines(headCard(ch)).join('\n')).toContain('调用子代理：检索实现方案')
   })
 
   it('counts parallel children and defaults the label to 子代理 before the descriptor', async () => {
