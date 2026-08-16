@@ -33,7 +33,7 @@ import type { CardState } from './cards.ts'
 import { chatRouteKey, feishuDomain } from './domain.ts'
 import type { FeishuDomainGlobal, FeishuDomainHandle, RawDomainHandle, RouteRecord } from './domain.ts'
 import type { ChannelFactory, FeishuChannel, NormalizedMessage } from './feishu-channel.ts'
-import { TurnStreamer } from './streamer.ts'
+import { ACTIVITY_BUILD_MARKER, TurnStreamer } from './streamer.ts'
 import type { StreamerHooks } from './streamer.ts'
 import { ensureWorkspace } from './workspaces.ts'
 import type { FeishuConfig } from './config.ts'
@@ -197,6 +197,7 @@ export class FeishuService {
       this.routeCache.size,
     )
     console.info('[dsh-channels] feishu long connection established, bot open_id:', channel.botOpenId())
+    console.info('[dsh-channels] activity build:', ACTIVITY_BUILD_MARKER)
   }
 
   /** Tear down: close the connection and dispose all live agents. */

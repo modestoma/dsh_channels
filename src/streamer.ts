@@ -41,6 +41,13 @@ import type { FeishuChannel } from './feishu-channel.ts'
 import { cacheHitPct, foldAll, foldEvent } from './stats.ts'
 import type { StatsFold } from './stats.ts'
 
+/**
+ * Compact build marker printed by the service at startup so a deployment's
+ * console can confirm which build of the activity status line is loaded.
+ * Bump on every behavior change to this feature.
+ */
+export const ACTIVITY_BUILD_MARKER = 'activity-status-v2'
+
 /** How a segment card reached Feishu. */
 export interface SegmentDelivery {
   messageId: string
@@ -129,6 +136,8 @@ interface TurnState {
   children: Map<string, ChildActivity>
   /** Currently rendered activity line (recomputed on every snapshot). */
   activity: string
+  /** Kind of the activity line currently logged (change-detection only). */
+  activityKind: string
   /** Slow keep-alive timer re-rendering the activity elapsed counter. */
   heartbeatTimer: ReturnType<typeof setTimeout> | undefined
 }
@@ -270,6 +279,7 @@ export class TurnStreamer {
       workflowEndStatus: undefined,
       children: new Map(),
       activity: '',
+      activityKind: '',
       heartbeatTimer: undefined,
     })
     this.bySession.set(session.id, queue)
@@ -614,7 +624,18 @@ export class TurnStreamer {
   private cardState(sessionId: string, state: TurnState, body: string): CardState {
     // The snapshot point recomputes (and remembers) the activity line so every
     // patch — including heartbeat-driven ones — carries the current status.
-    state.activity = this.activityLine(state, Date.now())
+    const line = this.activityLine(state, Date.now())
+    if (line !== state.activity) {
+      state.activity = line
+      // Diagnostic: log activity-type transitions only (first segment of the
+      // line, stable across elapsed/count ticks) so a live test can confirm
+      // exactly which status the card is being patched with.
+      const kind = line === '' ? '' : (line.split('·')[0] ?? '').trim()
+      if (kind !== state.activityKind) {
+        state.activityKind = kind
+        console.info('[dsh-channels] activity →', kind === '' ? '（收起）' : kind)
+      }
+    }
     return {
       phase: state.phase,
       reasoning: state.reasoning,
