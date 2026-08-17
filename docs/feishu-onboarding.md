@@ -37,21 +37,22 @@ dsh 的插件装在 **profile** 里（`$DSH_HOME/profiles/<name>/`，`$DSH_HOME`
 
 ```bash
 cd $HARNESS
-DSH_HOME=$DSH_HOME pnpm dsh plugin --profile web add dsh-channels@file:$PLUGIN
+DSH_HOME=$DSH_HOME pnpm dsh plugin --profile web add "link:$PLUGIN"
 ```
 
 说明：
 
-- `file:` 指向本地插件目录，机器上即可完成安装（不需要发布到 npm）。
+- `link:` 把本地插件 checkout 链接进 profile，不需要先发布到 npm。
+- 本包声明了 `dsh.bundle`；安装成功后，`dsh plugin` 会自动把 `dsh-channels` 加入 profile 的 bundle 列表，并由包内 `cordis.patch.yml` 提供 Loader 行。
 - pnpm 可能输出 `[WARN] Issues with peer dependencies`（`@deepseek-ai/cordis` 由 dsh 统一提供，属预期）与 `[ERR_PNPM_IGNORED_BUILDS] Ignored build scripts: protobufjs`——**安装实际已成功**，`dsh plugin` 的非零退出码可忽略；想消除告警可在 profile 目录的 `pnpm-workspace.yaml` 加 `onlyBuiltDependencies: [protobufjs]`。
-- **改了插件代码后**：重新执行上面的 `add` 命令（幂等）再重启 dsh。同一磁盘上 pnpm 会用硬链接安装 `file:` 依赖，有时改源文件会直接生效，但不要依赖这个行为。
+- **改了插件代码后**：运行检查并重启 dsh 即可，不必重复安装；只有 `package.json`、bundle patch 或依赖关系发生变化时才重新执行 `add`。
 
 验证安装与组合（不启动服务）：
 
 ```bash
 cd $HARNESS
 DSH_HOME=$DSH_HOME pnpm dsh web --dump-config | grep -A 9 "dsh-channels"
-# 尚未配置补丁层时这里还看不到条目，属正常；配置完第 3 步后应能看到
+# 安装完成后即应看到包内 bundle 提供的 Loader 行
 ```
 
 ## 3. 配置插件
@@ -76,26 +77,26 @@ chmod 600 $DSH_HOME/.credentials.yaml
 
 ### 3.2 写补丁层
 
-编辑 `$DSH_HOME/profiles/web/cordis.patch.yml`（新条目必须用 `insert:` 列表格式）：
+编辑 `$DSH_HOME/profiles/web/cordis.patch.yml`。包内 bundle 已插入 Loader 行，这里仅按稳定 id 覆盖该实例的完整配置：
 
 ```yaml
-# 用户补丁层：插入 dsh-channels 渠道插件
-- insert:
-    - id: channels
-      name: 'dsh-channels'
-      config:
-        appId: 'FEISHU_APP_ID'              # 凭据引用名（密钥在 .credentials.yaml）
-        appSecret: 'FEISHU_APP_SECRET'
-        baseDir: './channels-data'          # 工作区根目录（相对 profile 目录）
-        provider: 'deepseek-official'       # 可选，省略用部署默认
-        model: 'deepseek-v4-flash'          # 可选
-        refreshMs: 500                      # 卡片刷新间隔（下限 200ms）
-        requireMention: true                # 普通群需 @ 机器人
-        dmMode: 'open'                      # 私聊通道开关
-        threadFallback: 'degrade'           # 话题被拒时降级为会话级路由
-        approvalTimeoutMs: 300000           # HITL 审批决策卡等待时长（默认 5 分钟）
-        loggerLevel: 'info'
+# 用户补丁层：只配置 bundle 已提供的 dsh-channels 行
+- id: dsh-channels
+  config:
+    appId: 'FEISHU_APP_ID'              # 凭据引用名（密钥在 .credentials.yaml）
+    appSecret: 'FEISHU_APP_SECRET'
+    baseDir: './channels-data'          # 工作区根目录（相对 profile 目录）
+    provider: 'deepseek-official'       # 可选，省略用部署默认
+    model: 'deepseek-v4-flash'          # 可选
+    refreshMs: 500                      # 卡片刷新间隔（下限 200ms）
+    requireMention: true                # 普通群需 @ 机器人
+    dmMode: 'open'                      # 私聊通道开关
+    threadFallback: 'degrade'           # 话题被拒时降级为会话级路由
+    approvalTimeoutMs: 300000           # HITL 审批决策卡等待时长（默认 5 分钟）
+    loggerLevel: 'info'
 ```
+
+从旧版配置迁移时，删除原来的 `insert` / `id: channels` 条目；不要同时保留旧行和 `id: dsh-channels`，否则同一机器人会建立两个长连接并重复处理消息。
 
 | 配置项 | 默认 | 说明 |
 |--------|------|------|
@@ -205,7 +206,7 @@ DSH_HOME=$DSH_HOME pnpm dsh web        # 默认 http://127.0.0.1:3080
 ```bash
 # 1) 修改 $PLUGIN 源码后：
 cd $PLUGIN && pnpm typecheck && pnpm test
-# 2) 重装（幂等）并重启：
-cd $HARNESS && DSH_HOME=$DSH_HOME pnpm dsh plugin --profile web add dsh-channels@file:$PLUGIN
+# 2) link 安装无需重装，直接重启：
+cd $HARNESS
 DSH_HOME=$DSH_HOME pnpm dsh web
 ```

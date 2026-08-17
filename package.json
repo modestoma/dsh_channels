@@ -12,8 +12,14 @@
   "files": [
     "src",
     "docs",
-    "README.md"
+    "README.md",
+    "cordis.patch.yml"
   ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "vitest run",

@@ -47,32 +47,32 @@ src/
 插件安装进 dsh 的 **profile**（`$DSH_HOME/profiles/<name>/`，未设置 `DSH_HOME` 时默认 `~/.dsh`），web 界面即 `web` profile。已在真实 dsh 上实测通过的完整流程见 [docs/feishu-onboarding.md](docs/feishu-onboarding.md)（含飞书控制台配置、逐通道联调清单与故障排查），这里给出最小步骤：
 
 ```bash
-# 在 deepseek-harness 仓库内：把本地插件装进 web profile（幂等，可重复执行以更新）
-DSH_HOME=$DSH_HOME pnpm dsh plugin --profile web add dsh-channels@file:/path/to/dsh_channels
+# 在 deepseek-harness 仓库内：把本地 checkout 链接进 web profile
+DSH_HOME=$DSH_HOME pnpm dsh plugin --profile web add link:/path/to/dsh_channels
 ```
 
-在 `$DSH_HOME/profiles/web/cordis.patch.yml` 追加（新条目用 `insert:` 列表）：
+包内的 `cordis.patch.yml` 会自动把 `dsh-channels` 加入 Loader；profile 只需在 `$DSH_HOME/profiles/web/cordis.patch.yml` 中按稳定 id 提供该实例的配置：
 
 ```yaml
-- insert:
-    - id: channels
-      name: 'dsh-channels'
-      config:
-        appId: 'FEISHU_APP_ID'              # 凭据引用名（非密钥本身），经 ctx.credentials 解析
-        appSecret: 'FEISHU_APP_SECRET'
-        baseDir: './channels-data'          # 工作区根目录（按 私聊/群聊/用户 组织）
-        provider: 'deepseek-official'       # 可选：省略则用部署默认
-        model: 'deepseek-v4-flash'          # 可选
-        agentPreset: 'standard'             # 可选：省略则挂 roster 默认 preset（web profile 下工具只在 preset 里）
-        refreshMs: 500                      # 卡片刷新频率
-        statusRefreshMs: 5000               # 活动状态行保活间隔（工具/子代理/工作流等待期的计时刷新）
-        requireMention: true                # 普通群需 @ 机器人
-        dmMode: 'open'
-        threadFallback: 'degrade'           # 话题被拒时降级为会话级路由
-        routeTtlMs: 2592000000              # 路由表 GC 阈值：30 天无活动即清理（默认；0 = 关闭）
-        approvalTimeoutMs: 300000           # HITL 审批决策卡等待时长（默认 5 分钟；超时自动拒绝）
-        loggerLevel: 'info'
+- id: dsh-channels
+  config:
+    appId: 'FEISHU_APP_ID'              # 凭据引用名（非密钥本身），经 ctx.credentials 解析
+    appSecret: 'FEISHU_APP_SECRET'
+    baseDir: './channels-data'          # 工作区根目录（按 私聊/群聊/用户 组织）
+    provider: 'deepseek-official'       # 可选：省略则用部署默认
+    model: 'deepseek-v4-flash'          # 可选
+    agentPreset: 'standard'             # 可选：省略则挂 roster 默认 preset（web profile 下工具只在 preset 里）
+    refreshMs: 500                      # 卡片刷新频率
+    statusRefreshMs: 5000               # 活动状态行保活间隔（工具/子代理/工作流等待期的计时刷新）
+    requireMention: true                # 普通群需 @ 机器人
+    dmMode: 'open'
+    threadFallback: 'degrade'           # 话题被拒时降级为会话级路由
+    routeTtlMs: 2592000000              # 路由表 GC 阈值：30 天无活动即清理（默认；0 = 关闭）
+    approvalTimeoutMs: 300000           # HITL 审批决策卡等待时长（默认 5 分钟；超时自动拒绝）
+    loggerLevel: 'info'
 ```
+
+从旧版手写 Loader 行迁移时，删除原来的 `insert` / `id: channels` 条目；不要让旧行与 bundle 提供的 `id: dsh-channels` 同时存在，否则会启动两个插件实例。
 
 **凭据**放在 `$DSH_HOME/.credentials.yaml`（dsh 受管凭据库，热加载，与 `DEEPSEEK_API_KEY` 同库）：
 
