@@ -275,6 +275,206 @@ describe('FeishuService', () => {
     expect(JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)).toContain('无权操作此会话')
   })
 
+  it('renders /status from the complete durable Session log without starting a model turn', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_status', senderId: 'ou_owner', messageId: 'om_status_start', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    const events = agent.session.events as unknown as Array<Record<string, unknown>>
+    events.push(
+      { type: 'request/header', seq: 1, time: 100, data: { header: { config: {
+        provider: 'deepseek-official', model: 'deepseek-v4-pro', reasoningEffort: 'high',
+      } } } },
+      { type: 'step/start', seq: 2, time: 1_000, data: { turn: 1, step: 1 } },
+      { type: 'assistant/chunk', seq: 3, time: 1_400, data: {
+        turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: 'a' },
+      } },
+      { type: 'assistant/message', seq: 4, time: 2_400, data: {
+        turn: 1, step: 1, message: {}, usage: { inputTokens: 100, outputTokens: 20, cacheReadTokens: 900 },
+      } },
+      { type: 'tool/call', seq: 5, time: 2_500, data: {
+        turn: 1, step: 1, callId: 'call-1', name: 'bash', arguments: '{"secret":"value"}',
+      } },
+      { type: 'tool/result', seq: 6, time: 3_000, data: {
+        turn: 1, step: 1,
+        message: {
+          source: { kind: 'tool', callId: 'call-1' },
+          content: [{ type: 'tool-result', toolCallId: 'call-1', isError: false, text: 'private-output' }],
+        },
+      } },
+    )
+    mock(agent.followup).mockClear()
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_status', senderId: 'ou_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_status_command', content: '/status',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
+
+    const json = JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)
+    expect(json).toContain('Session 状态')
+    expect(json).toContain('deepseek-official/deepseek-v4-pro')
+    expect(json).toContain('90.0%')
+    expect(json).toContain('1,234 / 128,000')
+    expect(json).toContain('bash')
+    expect(json).not.toContain('secret')
+    expect(json).not.toContain('private-output')
+    expect(mock(agent.followup)).not.toHaveBeenCalled()
+    expect(agent.session.events.slice(-2).map(event => event.type)).toEqual(['command/run', 'command/done'])
+  })
+
+  it('returns /work-dir only when Session header and route agree', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_workdir', senderId: 'ou_owner', messageId: 'om_workdir_start', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    const cwd = agent.session.header.cwd
+    expect(cwd).toBeDefined()
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_workdir', senderId: 'ou_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_workdir_command', content: '/work-dir',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
+    expect(JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)).toContain(cwd)
+  })
+
+  it('rejects a mismatched /work-dir and logs no path values', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_workdir_bad', senderId: 'ou_owner', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    const header = agent.session.header as unknown as { cwd: string }
+    const routePath = header.cwd
+    header.cwd = '/different/private/workspace'
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_workdir_bad', senderId: 'ou_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_workdir_bad_command', content: '/work-dir',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
+
+    const json = JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)
+    expect(json).toContain('工作目录不一致')
+    expect(json).not.toContain('/different/private/workspace')
+    expect(json).not.toContain(routePath)
+    const warnings = mock(h.ctxState.ctx.logger?.warn).mock.calls.flat().join(' ')
+    expect(warnings).toContain('paths redacted')
+    expect(warnings).not.toContain('/different/private/workspace')
+    expect(warnings).not.toContain(routePath)
+  })
+
+  it('runs native /compact once and renders before/after context bars', async () => {
+    const h = await setup()
+    let tokens = 99_840
+    h.ctxState.ctx.tokenMeter.measure = vi.fn(() => ({ totalTokens: tokens }))
+    h.ctxState.ctx.commands.register({
+      name: 'compact', description: 'Compact older conversation history',
+      handler: () => {
+        tokens = 39_680
+        return { kind: 'success', text: 'Compacted 9 history items (~60,160 tokens).' }
+      },
+    })
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_compact', senderId: 'ou_owner', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    ;(agent.session.events as unknown as Array<Record<string, unknown>>).push({
+      type: 'request/header', seq: 1, time: 1,
+      data: { header: { config: { provider: 'deepseek-official', model: 'deepseek-v4-pro' } } },
+    })
+    mock(agent.followup).mockClear()
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_compact', senderId: 'ou_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_compact_command', content: '/compact',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
+
+    const json = JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)
+    expect(json).toContain('████████░░')
+    expect(json).toContain('███░░░░░░░')
+    expect(json).toContain('60,160 tokens')
+    expect(mock(agent.followup)).not.toHaveBeenCalled()
+    expect(agent.session.events.slice(-2).map(event => event.type)).toEqual(['command/run', 'command/done'])
+  })
+
+  it('renders a native no-history /compact as a zero-release comparison', async () => {
+    const h = await setup()
+    h.ctxState.ctx.tokenMeter.measure = vi.fn(() => ({ totalTokens: 500 }))
+    h.ctxState.ctx.commands.register({
+      name: 'compact', description: 'Compact older conversation history',
+      handler: () => ({ kind: 'success', text: 'No compactable history yet.' }),
+    })
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_compact_empty', senderId: 'ou_owner',
+      messageId: 'om_compact_empty_start', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_compact_empty', senderId: 'ou_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_compact_empty_command', content: '/compact',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
+
+    const json = JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)
+    expect(json).toContain('No compactable history yet.')
+    expect(json).toContain('压缩前  500 tokens')
+    expect(json).toContain('压缩后  500 tokens')
+    expect(json).toContain('释放    0 tokens')
+  })
+
+  it.each([
+    ['Compaction is unavailable because this process has an active compaction, or the agent is not idle.', '会话正忙'],
+    ['Compaction cancelled.', '命令暂不可用'],
+    ['backend unavailable', '命令暂不可用'],
+  ])('preserves native /compact error %s and reports unchanged context', async (text, title) => {
+    const h = await setup()
+    h.ctxState.ctx.commands.register({
+      name: 'compact', description: 'Compact older conversation history',
+      handler: () => ({ kind: 'error', text }),
+    })
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_compact_error', senderId: 'ou_owner',
+      messageId: 'om_compact_error_start', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_compact_error', senderId: 'ou_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_compact_error_command', content: '/compact',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
+
+    const json = JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)
+    expect(json).toContain(text)
+    expect(json).toContain(title)
+    expect(json).toContain('上下文保持不变')
+  })
+
+  it('reports a missing native /compact deployment without executing a command lifecycle', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_no_compact', senderId: 'ou_owner', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_no_compact', senderId: 'ou_owner', threadId: 'omt_1',
+      mentionedBot: false, content: '/compact',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
+
+    expect(JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)).toContain('未挂载 Harness 原生 /compact')
+    expect(agent.session.events).toHaveLength(0)
+  })
+
   it('resolves app credentials through the host credentials seam', async () => {
     const h = await setup()
     expect(h.factoryCalls[0]).toMatchObject({

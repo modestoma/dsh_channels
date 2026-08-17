@@ -45,6 +45,12 @@ import type {
 import type { ChannelFactory, FeishuChannel, NormalizedMessage } from './feishu-channel.ts'
 import { buildHealthCard, foldHealthSnapshot, HEALTH_DEPENDENCY_NAMES } from './health.ts'
 import type { HealthDependencyName, HealthSnapshot } from './health.ts'
+import {
+  buildCompactComparisonCard, buildSessionStatusCard, buildWorkDirCard,
+  compactFailureContext, resolveWorkDir,
+} from './session-commands.ts'
+import { foldAll, measureSessionContext } from './stats.ts'
+import type { ContextMeasurement, ContextServices } from './stats.ts'
 import { ACTIVITY_BUILD_MARKER, TurnStreamer } from './streamer.ts'
 import type { StreamerHooks } from './streamer.ts'
 import { ensureWorkspace } from './workspaces.ts'
@@ -507,6 +513,9 @@ export class FeishuService {
             })
             return
           }
+          const compactBefore = parsed.name === 'compact'
+            ? await this.measureCommandContext(live.agent.session)
+            : undefined
           const execution = await this.ctx.commands.execute(live.agent, line, new AbortController().signal)
           if (execution === undefined) {
             await this.sendCommandCard(msg, {
@@ -518,6 +527,53 @@ export class FeishuService {
           const result = execution.result
           if (parsed.name === 'health' && result.kind === 'success') {
             await this.sendHealthCard(msg)
+            return
+          }
+          if (parsed.name === 'status' && result.kind === 'success') {
+            const stats = foldAll(live.agent.session.events)
+            const context = await measureSessionContext(
+              live.agent.session, this.commandContextServices(), stats.lastHeader,
+            )
+            await this.sendStandaloneCard(msg, buildSessionStatusCard({
+              sessionId: current.sessionId,
+              stats,
+              context,
+            }))
+            return
+          }
+          if (parsed.name === 'work-dir' && result.kind === 'success') {
+            const resolved = resolveWorkDir(live.agent.session.header.cwd, current.workspacePath)
+            if (resolved.kind === 'success') {
+              await this.sendStandaloneCard(msg, buildWorkDirCard(current.sessionId, resolved.path))
+              return
+            }
+            if (resolved.kind === 'mismatch') {
+              this.ctx.logger?.warn?.(
+                'dsh-channels: workspace mismatch for session %s (paths redacted)', current.sessionId,
+              )
+            }
+            await this.sendCommandCard(msg, {
+              kind: 'unavailable', command: parsed.name,
+              text: resolved.text, sessionId: current.sessionId,
+            })
+            return
+          }
+          if (parsed.name === 'compact' && compactBefore !== undefined) {
+            const compactAfter = await this.measureCommandContext(live.agent.session)
+            if (result.kind === 'success') {
+              await this.sendStandaloneCard(msg, buildCompactComparisonCard({
+                sessionId: current.sessionId,
+                resultText: result.text ?? '命令已执行。',
+                before: compactBefore,
+                after: compactAfter,
+              }))
+              return
+            }
+            await this.sendCommandCard(msg, {
+              kind: commandResultCardKind(result), command: parsed.name,
+              text: `${result.text}\n\n${compactFailureContext(compactBefore, compactAfter)}`,
+              sessionId: current.sessionId,
+            })
             return
           }
           await this.sendCommandCard(msg, {
@@ -560,6 +616,19 @@ export class FeishuService {
   /** Collect and send a privacy-preserving snapshot without Session I/O. */
   private async sendHealthCard(msg: NormalizedMessage): Promise<void> {
     await this.sendStandaloneCard(msg, buildHealthCard(this.healthSnapshot()))
+  }
+
+  /** Optional diagnostic services resolved without topology-sensitive property access. */
+  private commandContextServices(): ContextServices {
+    return {
+      tokenMeter: this.ctx.get?.('tokenMeter') as TokenMeter | undefined,
+      llm: this.ctx.get?.('llm') as LlmService | undefined,
+    }
+  }
+
+  /** Exact command-time measurement shared by `/status` and `/compact`. */
+  private measureCommandContext(session: Session): Promise<ContextMeasurement> {
+    return measureSessionContext(session, this.commandContextServices())
   }
 
   /** Shared delivery policy for command-plane cards. */

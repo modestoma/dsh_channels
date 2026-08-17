@@ -35,6 +35,18 @@ describe('slash command primitives', () => {
       rawInput: '',
       signal: new AbortController().signal,
     })).toEqual({ kind: 'success', text: '健康检查已完成。' })
+    expect(await commands.definitions.get('status')!.handler({
+      commandId: 'cmd-test' as never,
+      agent,
+      rawInput: '',
+      signal: new AbortController().signal,
+    })).toEqual({ kind: 'success', text: 'Session 状态已读取。' })
+    expect(await commands.definitions.get('work-dir')!.handler({
+      commandId: 'cmd-test' as never,
+      agent,
+      rawInput: ' extra',
+      signal: new AbortController().signal,
+    })).toEqual({ kind: 'error', text: '用法错误：/work-dir 不接受参数。' })
   })
 
   it('serializes operations per route without poisoning the queue after failure', async () => {

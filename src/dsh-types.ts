@@ -66,6 +66,7 @@ export type StreamChunk =
   | { type: 'block-start'; index: number; blockType: string }
   | { type: 'text-delta'; index: number; text: string }
   | { type: 'reasoning-delta'; index: number; text: string }
+  | { type: 'tool-call-delta'; index: number; argumentsDelta: string; name?: string }
   | { type: 'block-end'; index: number; block: { type: string; text?: string } }
   | { type: 'usage'; usage: TokenUsage }
   | { type: string; [key: string]: unknown }
@@ -169,16 +170,39 @@ export interface ToolResultEvent extends SessionEventEnvelope {
     turn: number
     step: number
     message: {
-      /** The first tool-result block retains the originating tool call id. */
+      /** Message-level source is the authoritative call correlation. */
+      source?: { kind?: string; callId?: string; [key: string]: unknown }
+      /** The first tool-result block repeats correlation and outcome. */
       content?: ReadonlyArray<{
         type: string
         toolCallId?: string
+        isError?: boolean
         [key: string]: unknown
       }>
       [key: string]: unknown
     }
     error?: { name: string; code: string }
     meta?: unknown
+  }
+}
+
+export interface CommandRunEvent extends SessionEventEnvelope {
+  type: 'command/run'
+  data: {
+    commandId: CommandId
+    name: string
+    args?: string
+    source: { kind: string }
+  }
+}
+
+export interface CommandDoneEvent extends SessionEventEnvelope {
+  type: 'command/done'
+  data: {
+    commandId: CommandId
+    kind: 'success' | 'error'
+    text?: string
+    sourceEventSeq?: number
   }
 }
 
@@ -223,6 +247,7 @@ export interface OtherSessionEvent extends SessionEventEnvelope {
   /** Unknown/extension event types are ignored by the folds. */
   type: Exclude<string, 'assistant/chunk' | 'assistant/message' | 'step/start' | 'turn/end' | 'request/header'
     | 'tool/call' | 'tool/result' | 'subagent/descriptor'
+    | 'command/run' | 'command/done'
     | 'tool-workflow/run-start' | 'tool-workflow/agent-start' | 'tool-workflow/agent-end' | 'tool-workflow/run-end'>
   data: unknown
 }
@@ -236,6 +261,8 @@ export type SessionEvent =
   | RequestHeaderEvent
   | ToolCallEvent
   | ToolResultEvent
+  | CommandRunEvent
+  | CommandDoneEvent
   | SubagentDescriptorEvent
   | ToolWorkflowRunStartEvent
   | ToolWorkflowAgentStartEvent

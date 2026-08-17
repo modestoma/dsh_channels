@@ -78,11 +78,26 @@ function pendingHandler(name: string): CommandDefinition['handler'] {
   }
 }
 
+function readyHandler(name: string, text: string): CommandDefinition['handler'] {
+  return ({ rawInput }): CommandResult => {
+    if (rawInput.trim() !== '') {
+      return { kind: 'error', text: `用法错误：/${name} 不接受参数。` }
+    }
+    return { kind: 'success', text }
+  }
+}
+
 const healthHandler: CommandDefinition['handler'] = ({ rawInput }): CommandResult => {
   if (rawInput.trim() !== '') {
     return { kind: 'error', text: '用法错误：/health 不接受参数。' }
   }
   return { kind: 'success', text: '健康检查已完成。' }
+}
+
+const READY_HANDLERS: Readonly<Record<string, CommandDefinition['handler']>> = {
+  health: healthHandler,
+  status: readyHandler('status', 'Session 状态已读取。'),
+  'work-dir': readyHandler('work-dir', '工作目录已读取。'),
 }
 
 /**
@@ -93,7 +108,7 @@ export function registerChannelCommands(commands: CommandRuntime): void {
   for (const descriptor of DESCRIPTORS) {
     commands.register({
       ...descriptor,
-      handler: descriptor.name === 'health' ? healthHandler : pendingHandler(descriptor.name),
+      handler: READY_HANDLERS[descriptor.name] ?? pendingHandler(descriptor.name),
     })
   }
 }

@@ -18,10 +18,13 @@ import type {
 } from '../src/feishu-channel.ts'
 import type { RawDomainHandle } from '../src/domain.ts'
 
-export function makeSession(id = `session-${Math.random().toString(36).slice(2, 10)}`): Session {
+export function makeSession(
+  id = `session-${Math.random().toString(36).slice(2, 10)}`,
+  cwd?: string,
+): Session {
   return {
     id: id as SessionId,
-    header: { version: 0, id: id as SessionId, createdAt: Date.now() },
+    header: { version: 0, id: id as SessionId, createdAt: Date.now(), ...(cwd === undefined ? {} : { cwd }) },
     events: [],
     firstLiveSeq: 0,
   }
@@ -128,7 +131,7 @@ export function makeAgentRegistry(fail: FakeAgentsOptions = {}): {
       // creation back.
       const setupCtx: AgentContext = { commands: makeCommandRuntime() }
       await options.setup?.(setupCtx)
-      const session = makeSession(options.sessionId)
+      const session = makeSession(options.sessionId, options.meta?.cwd)
       const agent = makeAgent(session, options.agentOptions, setupCtx)
       const handle: AgentHandle = { agent, dispose: vi.fn(async () => { liveAgents.delete(options.sessionId) }) }
       liveAgents.set(options.sessionId, handle)
