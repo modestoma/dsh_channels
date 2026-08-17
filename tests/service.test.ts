@@ -6,6 +6,8 @@
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+import { promisify } from 'node:util'
+import { gunzip } from 'node:zlib'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { FeishuService } from '../src/service.ts'
 import type { FeishuConfig } from '../src/config.ts'
@@ -13,6 +15,7 @@ import type { CardActionEvent, ChannelFactory, FeishuChannel, NormalizedMessage 
 import { CordisFiberState } from '../src/dsh-types.ts'
 import type { AgentHandle, ApprovalOutcome, CordisPluginRuntime, SessionId } from '../src/dsh-types.ts'
 import type { RouteRecord } from '../src/domain.ts'
+import type { SessionExportBuilder } from '../src/session-export.ts'
 import {
   makeHostContext, makeChannel, makeMessage, makeAgentPresets, makeSession, makeAgent,
 } from './helpers.ts'
@@ -62,6 +65,7 @@ async function setup(
   channelOptions: Parameters<typeof makeChannel>[0] = {},
   presetOptions?: FakeAgentPresetsOptions,
   agentsOptions: FakeAgentsOptions = {},
+  sessionExportBuilder?: SessionExportBuilder,
 ): Promise<Harness> {
   const config = makeConfig(partial)
   const channel = makeChannel(channelOptions)
@@ -75,7 +79,7 @@ async function setup(
     factoryCalls.push(options)
     return channel
   }
-  const service = new FeishuService(ctxState.ctx, config, factory)
+  const service = new FeishuService(ctxState.ctx, config, factory, sessionExportBuilder)
   await service.start()
   const registered = (channel.onMessage as unknown as ReturnType<typeof vi.fn>).mock.calls
   const handler = registered[registered.length - 1]?.[0] as (msg: NormalizedMessage) => Promise<void> | undefined
@@ -91,6 +95,7 @@ const waitUntil = async (assert: () => void) => {
 
 /** Narrow a stub method back to its vitest mock for assertions. */
 const mock = (fn: unknown) => fn as unknown as ReturnType<typeof vi.fn>
+const gunzipBuffer = promisify(gunzip)
 
 describe('FeishuService', () => {
   beforeEach(() => {})
@@ -738,6 +743,148 @@ describe('FeishuService', () => {
     expect(h.ctxState.agents.resumed.some(entry => entry.options.resumeSessionId === firstSessionId)).toBe(false)
     expect(h.ctxState.agents.resumed.some(entry => entry.options.resumeSessionId === secondSessionId)).toBe(false)
     await service.shutdown()
+  })
+
+  it('exports one post-command logical snapshot to the owner topic and deduplicates redelivery', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_export', senderId: 'ou_owner',
+      messageId: 'om_export_start', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    ;(agent.session.events as unknown as Array<Record<string, unknown>>).push({
+      type: 'turn/end', seq: 41, time: 1_000, data: { turn: 1, reason: 'complete' },
+    })
+    mock(agent.followup).mockClear()
+
+    const command = makeMessage({
+      chatType: 'group', chatId: 'oc_export', senderId: 'ou_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_export_command', content: '/export',
+    })
+    await h.onMessage(command)
+    await h.onMessage(command)
+    await waitUntil(() => expect((h.channel.sent as Array<{ input: object }>).filter(
+      entry => 'file' in entry.input,
+    )).toHaveLength(1))
+
+    const fileSends = (h.channel.sent as Array<{
+      chatId: string
+      input: { file?: { source: Buffer; fileName: string } }
+      options?: { replyTo?: string; replyInThread?: boolean }
+    }>).filter(entry => entry.input.file !== undefined)
+    expect(fileSends).toHaveLength(1)
+    const delivery = fileSends[0]!
+    expect(delivery.chatId).toBe('oc_export')
+    expect(delivery.options).toEqual({ replyTo: 'om_export_command', replyInThread: true })
+    expect(delivery.input.file?.fileName).toBe(`dsh-session-${agent.session.id}.logical.jsonl.gz`)
+
+    const jsonl = (await gunzipBuffer(delivery.input.file!.source)).toString('utf8').trimEnd()
+    const lines = jsonl.split('\n').map(line => JSON.parse(line) as Record<string, unknown>)
+    expect(lines[0]).toMatchObject({
+      format: 'dsh-logical-session-jsonl', formatVersion: 1, logical: true,
+      includes: { descendants: false, attachments: false, rawArtifacts: false },
+      session: { id: agent.session.id, header: agent.session.header },
+    })
+    expect(lines.slice(1)).toEqual(agent.session.events)
+    expect(lines.slice(-2).map(event => event.type)).toEqual(['command/run', 'command/done'])
+    expect(lines.at(-1)).toMatchObject({ type: 'command/done', data: { kind: 'success' } })
+    expect(mock(agent.followup)).not.toHaveBeenCalled()
+    expect(mock(h.ctxState.ctx.commands.execute)).toHaveBeenCalledTimes(1)
+  })
+
+  it('rejects /export arguments without sending a file', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_export_args', senderId: 'ou_owner', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_export_args', senderId: 'ou_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_export_args', content: '/export extra',
+    }))
+    await waitUntil(() => expect(agent.session.events.at(-1)).toMatchObject({
+      type: 'command/done', data: { kind: 'error' },
+    }))
+
+    expect((h.channel.sent as Array<{ input: object }>).some(entry => 'file' in entry.input)).toBe(false)
+    expect(JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)).toContain('命令格式不正确')
+    expect(JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)).toContain('/export 不接受参数')
+  })
+
+  it('denies a non-owner /export before Session I/O and does not leak a file or Session id', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_export_owned', senderId: 'ou_owner', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    mock(h.ctxState.ctx.commands.execute).mockClear()
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_export_owned', senderId: 'ou_intruder', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_export_intruder', content: '/export',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
+
+    expect(mock(h.ctxState.ctx.commands.execute)).not.toHaveBeenCalled()
+    expect(agent.session.events).toHaveLength(0)
+    expect((h.channel.sent as Array<{ input: object }>).some(entry => 'file' in entry.input)).toBe(false)
+    const card = JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)
+    expect(card).toContain('无权操作此会话')
+    expect(card).not.toContain(agent.session.id)
+  })
+
+  it('reports gzip/serialization failure as an error card without claiming file delivery', async () => {
+    const buildFailure = vi.fn<SessionExportBuilder>(async () => {
+      throw new Error('simulated gzip failure')
+    })
+    const h = await setup({}, {}, undefined, {}, buildFailure)
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_export_gzip_fail', senderId: 'ou_owner', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_export_gzip_fail', senderId: 'ou_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_export_gzip_fail', content: '/export',
+    }))
+    await waitUntil(() => expect(buildFailure).toHaveBeenCalledTimes(1))
+
+    expect(agent.session.events.slice(-2).map(event => event.type)).toEqual(['command/run', 'command/done'])
+    expect((h.channel.sent as Array<{ input: object }>).some(entry => 'file' in entry.input)).toBe(false)
+    const card = JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)
+    expect(card).toContain('导出失败，未交付文件')
+    expect(card).not.toContain('导出已请求')
+    expect(card).not.toContain('simulated gzip failure')
+  })
+
+  it('attempts one file send and reports a Feishu upload failure separately', async () => {
+    const h = await setup({}, { failFileSends: true })
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_export_upload_fail', senderId: 'ou_owner', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_export_upload_fail', senderId: 'ou_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_export_upload_fail', content: '/export',
+    }))
+    await waitUntil(() => expect(JSON.stringify(h.channel.sent)).toContain('导出失败，未交付文件'))
+
+    const fileAttempts = mock(h.channel.send).mock.calls.filter(call => {
+      const input = call[1] as object
+      return 'file' in input
+    })
+    expect(fileAttempts).toHaveLength(1)
+    expect((h.channel.sent as Array<{ input: object }>).some(entry => 'file' in entry.input)).toBe(false)
+    const card = JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)
+    expect(card).toContain('命令执行失败')
+    expect(card).toContain('未交付文件')
+    expect(card).not.toContain('file upload failed')
   })
 
   it('renews through a borrowed external Agent without disposing its owner handle', async () => {

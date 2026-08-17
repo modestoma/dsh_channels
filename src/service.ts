@@ -55,6 +55,8 @@ import {
 } from './session-commands.ts'
 import { foldAll, measureSessionContext } from './stats.ts'
 import type { ContextMeasurement, ContextServices } from './stats.ts'
+import { createLogicalSessionExport } from './session-export.ts'
+import type { SessionExportBuilder } from './session-export.ts'
 import { ACTIVITY_BUILD_MARKER, TurnStreamer } from './streamer.ts'
 import type { StreamerHooks } from './streamer.ts'
 import { ensureWorkspace, workspaceTitleFor } from './workspaces.ts'
@@ -171,6 +173,7 @@ export class FeishuService {
   private readonly ctx: HostContext
   private readonly config: FeishuConfig
   private readonly channelFactory: ChannelFactory
+  private readonly sessionExportBuilder: SessionExportBuilder
   private channel: FeishuChannel | undefined
   private streamer: TurnStreamer | undefined
   private domain: FeishuDomainHandle | undefined
@@ -209,10 +212,16 @@ export class FeishuService {
   private unlistenApproval: (() => boolean) | undefined
   private unlistenCardAction: (() => void) | undefined
 
-  constructor(ctx: HostContext, config: FeishuConfig, channelFactory: ChannelFactory) {
+  constructor(
+    ctx: HostContext,
+    config: FeishuConfig,
+    channelFactory: ChannelFactory,
+    sessionExportBuilder: SessionExportBuilder = createLogicalSessionExport,
+  ) {
     this.ctx = ctx
     this.config = config
     this.channelFactory = channelFactory
+    this.sessionExportBuilder = sessionExportBuilder
   }
 
   /** The live channel (created in `start()` once credentials resolve). */
@@ -611,6 +620,26 @@ export class FeishuService {
           }
           if (parsed.name === 'history' && result.kind === 'success') {
             await this.sendStandaloneCard(msg, buildSessionHistoryCard(current))
+            return
+          }
+          if (parsed.name === 'export' && result.kind === 'success') {
+            try {
+              const file = await this.sessionExportBuilder(live.agent.session)
+              await this.requireChannel().send(msg.chatId, { file }, {
+                replyTo: msg.messageId,
+                replyInThread: true,
+              })
+            } catch (error) {
+              this.ctx.logger?.warn?.(
+                'dsh-channels: logical export delivery failed for session %s: %s',
+                current.sessionId, String(error),
+              )
+              await this.sendCommandCard(msg, {
+                kind: 'internal-error', command: parsed.name,
+                text: 'Session 逻辑日志导出失败，未交付文件；请稍后重试并查看 Harness 日志。',
+                sessionId: current.sessionId,
+              })
+            }
             return
           }
           if (parsed.name === 'compact' && compactBefore !== undefined) {

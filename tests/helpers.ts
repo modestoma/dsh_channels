@@ -359,6 +359,8 @@ export interface FakeChannelOptions {
   failReplyInThread?: boolean
   /** Reject every card send (used to exercise the plain-text fallback). */
   failCardSends?: boolean
+  /** Reject Buffer-backed file messages while leaving error-card delivery available. */
+  failFileSends?: boolean
   /** Official SDK WebSocket lifecycle snapshot returned by the stub. */
   connectionStatus?: FeishuConnectionStatus
 }
@@ -389,9 +391,10 @@ export function makeChannel(options: FakeChannelOptions = {}): FeishuChannel & {
     getConnectionStatus: vi.fn(() => options.connectionStatus),
     connect: vi.fn(async () => {}),
     disconnect: vi.fn(async () => {}),
-    async send(chatId, input, sendOptions) {
+    send: vi.fn(async (chatId, input, sendOptions) => {
       if (options.failFirstSend) throw new Error('send failed')
       if (options.failCardSends && 'card' in input) throw new Error('card rejected (230099)')
+      if (options.failFileSends && 'file' in input) throw new Error('file upload failed')
       if (sendOptions?.replyInThread === true && options.failReplyInThread === true) {
         throw new Error('topic unsupported')
       }
@@ -399,7 +402,7 @@ export function makeChannel(options: FakeChannelOptions = {}): FeishuChannel & {
       sent.push({ chatId, input, options: sendOptions })
       const result: SendResult = { messageId }
       return result
-    },
+    }),
     updateCard: vi.fn(async (messageId: string, card: object) => {
       updated.push({ messageId, card })
     }),

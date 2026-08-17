@@ -59,6 +59,18 @@ describe('slash command primitives', () => {
       rawInput: ' extra',
       signal: new AbortController().signal,
     })).toEqual({ kind: 'error', text: '用法错误：/history 不接受参数。' })
+    expect(await commands.definitions.get('export')!.handler({
+      commandId: 'cmd-test' as never,
+      agent,
+      rawInput: '',
+      signal: new AbortController().signal,
+    })).toEqual({ kind: 'success', text: '导出已请求。' })
+    expect(await commands.definitions.get('export')!.handler({
+      commandId: 'cmd-test' as never,
+      agent,
+      rawInput: ' extra',
+      signal: new AbortController().signal,
+    })).toEqual({ kind: 'error', text: '用法错误：/export 不接受参数。' })
   })
 
   it('requires one armed Feishu admission for /renew and rejects busy inboxes first', async () => {
