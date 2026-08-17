@@ -887,6 +887,148 @@ describe('FeishuService', () => {
     expect(card).not.toContain('file upload failed')
   })
 
+  // ---- SC-10 command-plane concurrency and recovery ---------------------
+
+  it('serializes a routed command ahead of a concurrent ordinary message', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_command_serial', senderId: 'ou_owner',
+      messageId: 'om_command_serial_start', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    mock(agent.followup).mockClear()
+
+    const originalExecute = h.ctxState.ctx.commands.execute
+    let releaseCommand: () => void = () => {}
+    const commandGate = new Promise<void>(resolve => { releaseCommand = resolve })
+    let markCommandStarted: () => void = () => {}
+    const commandStarted = new Promise<void>(resolve => { markCommandStarted = resolve })
+    mock(originalExecute).mockImplementationOnce(async (...args: Parameters<typeof originalExecute>) => {
+      markCommandStarted()
+      await commandGate
+      return await originalExecute(...args)
+    })
+
+    const command = h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_command_serial', senderId: 'ou_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_command_serial_status', content: '/status',
+    }))
+    await commandStarted
+    const ordinary = h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_command_serial', senderId: 'ou_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_command_serial_turn', content: '排在命令之后',
+    }))
+    await flush()
+
+    expect(mock(agent.followup)).not.toHaveBeenCalled()
+    expect(h.channel.sent).toHaveLength(1)
+
+    releaseCommand()
+    await Promise.all([command, ordinary])
+    await waitUntil(() => expect(mock(agent.followup)).toHaveBeenCalledTimes(1))
+
+    expect(mock(agent.followup)).toHaveBeenCalledTimes(1)
+    expect((mock(agent.followup).mock.calls[0]?.[0] as { content: Array<{ text: string }> })
+      .content[0]?.text).toBe('排在命令之后')
+    expect(JSON.stringify((h.channel.sent[1] as { input: object }).input)).toContain('Session 状态')
+    expect(h.channel.sent[2]).toMatchObject({
+      options: { replyTo: 'om_command_serial_turn', replyInThread: true },
+    })
+  })
+
+  it('deduplicates concurrent redelivery of /renew before any route side effect repeats', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_renew_redelivery', senderId: 'ou_owner',
+      messageId: 'om_renew_redelivery_start', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const old = h.ctxState.agents.created[0]!
+    mock(h.ctxState.ctx.commands.execute).mockClear()
+
+    const redelivery = makeMessage({
+      chatType: 'group', chatId: 'oc_renew_redelivery', senderId: 'ou_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_renew_redelivery_command', content: '/renew',
+    })
+    await Promise.all([h.onMessage(redelivery), h.onMessage(redelivery)])
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
+
+    const route = h.ctxState.domain.raw.table('routes').get('omt_1') as RouteRecord
+    expect(h.ctxState.agents.created).toHaveLength(2)
+    expect(mock(h.ctxState.ctx.commands.execute)).toHaveBeenCalledTimes(1)
+    expect(mock(old.handle.dispose)).toHaveBeenCalledTimes(1)
+    expect(route.sessionHistory).toHaveLength(2)
+    expect(new Set(route.sessionHistory?.map(entry => entry.sessionId)).size).toBe(2)
+  })
+
+  it('aborts an in-flight command during shutdown without sending a late result card', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_command_shutdown', senderId: 'ou_owner',
+      messageId: 'om_command_shutdown_start', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+
+    let commandSignal: AbortSignal | undefined
+    let markCommandStarted: () => void = () => {}
+    const commandStarted = new Promise<void>(resolve => { markCommandStarted = resolve })
+    mock(h.ctxState.ctx.commands.execute).mockImplementationOnce(async (_agent, _line, signal) => {
+      commandSignal = signal
+      markCommandStarted()
+      await new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), { once: true }))
+      return undefined
+    })
+
+    const command = h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_command_shutdown', senderId: 'ou_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_command_shutdown_status', content: '/status',
+    }))
+    await commandStarted
+    await h.service.shutdown()
+    await expect(command).resolves.toBeUndefined()
+    expect(h.channel.reactions).toContainEqual({
+      messageId: 'om_command_shutdown_status', emojiType: 'DONE',
+    })
+
+    expect(commandSignal?.aborted).toBe(true)
+    expect(h.channel.sent).toHaveLength(1)
+    expect(JSON.stringify(h.channel.sent)).not.toContain('命令执行失败')
+    expect(JSON.stringify(h.channel.sent)).not.toContain('处理失败')
+  })
+
+  it('keeps standalone command cards out of TurnStreamer and restart repair state', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_command_isolation', senderId: 'ou_owner',
+      messageId: 'om_command_isolation_start', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    const listener = h.ctxState.sessionListeners[0]!
+    listener(agent.session, { type: 'turn/end', seq: 1, data: { turn: 1, reason: 'stop' } })
+    await waitUntil(() => expect(inflightEntries(h)).toHaveLength(0))
+    const streamedPatchCount = h.channel.updated.length
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_command_isolation', senderId: 'ou_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_command_isolation_status', content: '/status',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
+
+    expect(inflightEntries(h)).toHaveLength(0)
+    expect(h.channel.updated).toHaveLength(streamedPatchCount)
+    expect(mock(agent.followup)).toHaveBeenCalledTimes(1)
+
+    await h.service.shutdown()
+    const channel = makeChannel()
+    const service = new FeishuService(h.ctxState.ctx, h.config, () => channel)
+    await service.start()
+    await flush()
+    expect(channel.updated).toHaveLength(0)
+    await service.shutdown()
+  })
+
   it('renews through a borrowed external Agent without disposing its owner handle', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({

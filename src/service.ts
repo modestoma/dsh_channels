@@ -191,6 +191,10 @@ export class FeishuService {
   private readonly establishing = new Map<string, Promise<RouteRecord>>()
   /** FIFO admission for ordinary turns and commands targeting one route. */
   private readonly routeOperations = new RouteOperationQueue()
+  /** Active Host command executions, aborted before shutdown tears peers down. */
+  private readonly commandControllers = new Set<AbortController>()
+  /** Whole command admissions, drained before channel/storage teardown. */
+  private readonly commandOperations = new Set<Promise<void>>()
   /**
    * In-process dedup guard: message id → accept timestamp. Set synchronously
    * at acceptance so a same-process redelivery can never slip through the
@@ -340,6 +344,14 @@ export class FeishuService {
 
   /** Tear down: close the connection and dispose all live agents. */
   async shutdown(): Promise<void> {
+    // Close admission first. In-flight Host commands receive cancellation
+    // before their Agent/channel/storage dependencies are disposed, while
+    // already queued route operations observe `started === false` and retire.
+    this.started = false
+    for (const controller of this.commandControllers) controller.abort()
+    await Promise.allSettled([...this.commandOperations])
+    this.commandControllers.clear()
+    this.commandOperations.clear()
     this.unlisten?.()
     this.unlisten = undefined
     this.unlistenCardAction?.()
@@ -370,7 +382,6 @@ export class FeishuService {
     this.streamer = undefined
     await this.domain?.close()
     this.domain = undefined
-    this.started = false
   }
 
   // ---- inbound routing -------------------------------------------------
@@ -415,8 +426,10 @@ export class FeishuService {
     if (msg.threadId !== undefined) {
       const record = this.lookupRoute(msg.threadId)
       if (record !== undefined) {
-        await this.routeOperations.run(record.key, () =>
-          this.continueSession(msg, this.lookupRoute(record.key) ?? record))
+        await this.routeOperations.run(record.key, () => {
+          if (!this.started) return
+          return this.continueSession(msg, this.lookupRoute(record.key) ?? record)
+        })
         return
       }
     }
@@ -425,8 +438,10 @@ export class FeishuService {
     const chatKey = chatRouteKey(msg.chatType, msg.chatId, msg.senderId)
     const chatRecord = this.lookupRoute(chatKey)
     if (chatRecord !== undefined) {
-      await this.routeOperations.run(chatRecord.key, () =>
-        this.continueSession(msg, this.lookupRoute(chatRecord.key) ?? chatRecord))
+      await this.routeOperations.run(chatRecord.key, () => {
+        if (!this.started) return
+        return this.continueSession(msg, this.lookupRoute(chatRecord.key) ?? chatRecord)
+      })
       return
     }
 
@@ -437,8 +452,10 @@ export class FeishuService {
       const record = await pending.catch(() => undefined)
       if (record !== undefined
         && (record.kind === 'chat' || (msg.threadId !== undefined && msg.threadId === record.key))) {
-        await this.routeOperations.run(record.key, () =>
-          this.continueSession(msg, this.lookupRoute(record.key) ?? record))
+        await this.routeOperations.run(record.key, () => {
+          if (!this.started) return
+          return this.continueSession(msg, this.lookupRoute(record.key) ?? record)
+        })
         return
       }
       // Thread-scoped record but this message is not in that topic (or the
@@ -471,6 +488,7 @@ export class FeishuService {
 
   /** Slash-command plane. Nothing in this method calls `agent.followup()`. */
   private async handleSlashMessage(msg: NormalizedMessage, line: string): Promise<void> {
+    if (!this.started) return
     const parsed = parseSlashCommand(line)
     if (parsed === undefined) {
       await this.sendCommandCard(msg, {
@@ -516,7 +534,8 @@ export class FeishuService {
       return
     }
 
-    await this.routeOperations.run(route.key, async () => {
+    const operation = this.routeOperations.run(route.key, async () => {
+      if (!this.started) return
       const current = this.lookupRoute(route.key) ?? route
       if (msg.senderId !== current.senderOpenId) {
         await this.sendCommandCard(msg, {
@@ -548,6 +567,7 @@ export class FeishuService {
             ? await this.measureCommandContext(live.agent.session)
             : undefined
           const controller = new AbortController()
+          this.commandControllers.add(controller)
           const renewAdmission: RenewAdmission | undefined = parsed.name === 'renew'
             ? { route: current, live }
             : undefined
@@ -561,6 +581,7 @@ export class FeishuService {
           try {
             execution = await this.ctx.commands.execute(live.agent, line, controller.signal)
           } finally {
+            this.commandControllers.delete(controller)
             disarmRenew?.()
             unregisterBorrowedRenew?.()
             if (renewAdmission !== undefined) {
@@ -569,6 +590,7 @@ export class FeishuService {
               }
             }
           }
+          if (controller.signal.aborted || !this.started) return
           if (execution === undefined) {
             await this.sendCommandCard(msg, {
               kind: 'unavailable', command: parsed.name,
@@ -677,18 +699,26 @@ export class FeishuService {
         }
       })
     })
+    this.commandOperations.add(operation)
+    try {
+      await operation
+    } finally {
+      this.commandOperations.delete(operation)
+    }
   }
 
   /** Apply the command-only Typing → DONE reaction lifecycle. */
   private async withCommandReaction(msg: NormalizedMessage, operation: () => Promise<void>): Promise<void> {
-    const reactionId = await this.requireChannel().addReaction(msg.messageId, 'Typing').catch(() => undefined)
+    if (!this.started) return
+    const channel = this.requireChannel()
+    const reactionId = await channel.addReaction(msg.messageId, 'Typing').catch(() => undefined)
     try {
       await operation()
     } finally {
       if (reactionId !== undefined) {
-        await this.requireChannel().removeReaction(msg.messageId, reactionId).catch(() => {})
+        await channel.removeReaction(msg.messageId, reactionId).catch(() => {})
       }
-      await this.requireChannel().addReaction(msg.messageId, 'DONE').catch(() => {})
+      await channel.addReaction(msg.messageId, 'DONE').catch(() => {})
     }
   }
 
@@ -717,7 +747,8 @@ export class FeishuService {
 
   /** Shared delivery policy for command-plane cards. */
   private async sendStandaloneCard(msg: NormalizedMessage, card: object): Promise<void> {
-    const channel = this.requireChannel()
+    const channel = this.channel
+    if (!this.started || channel === undefined) return
     try {
       await channel.send(msg.chatId, { card }, { replyTo: msg.messageId, replyInThread: true })
     } catch (error) {
