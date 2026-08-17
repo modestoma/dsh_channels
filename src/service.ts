@@ -32,6 +32,11 @@ import type {
 } from './dsh-types.ts'
 import { buildCard, buildInterruptionCard } from './cards.ts'
 import type { CardState } from './cards.ts'
+import {
+  buildCommandResultCard, commandResultCardKind, isSupportedCommand, parseSlashCommand,
+  registerChannelCommands, RouteOperationQueue, supportedCommandList,
+} from './commands.ts'
+import type { CommandCardState } from './commands.ts'
 import { chatRouteKey, feishuDomain } from './domain.ts'
 import type {
   FeishuDomainGlobal, FeishuDomainHandle, InflightSnapshot, ProcessedRecord, RawDomainHandle, RouteRecord,
@@ -156,6 +161,8 @@ export class FeishuService {
    * overwrites, or the "no route, no mention" drop window.
    */
   private readonly establishing = new Map<string, Promise<RouteRecord>>()
+  /** FIFO admission for ordinary turns and commands targeting one route. */
+  private readonly routeOperations = new RouteOperationQueue()
   /**
    * In-process dedup guard: message id → accept timestamp. Set synchronously
    * at acceptance so a same-process redelivery can never slip through the
@@ -318,6 +325,7 @@ export class FeishuService {
     this.live.clear()
     this.pendingResume.clear()
     this.establishing.clear()
+    this.routeOperations.clear()
     this.accepted.clear()
     try {
       await this.channel?.disconnect()
@@ -362,11 +370,19 @@ export class FeishuService {
       this.ctx.logger?.warn?.('dsh-channels: recording processed message %s failed: %s', msg.messageId, String(error))
     }
 
+    // Slash admission stays behind message-id dedup but ahead of every route,
+    // mention, workspace, Session, card-stream, and model side effect.
+    if (content.startsWith('/')) {
+      await this.handleSlashMessage(msg, content)
+      return
+    }
+
     // 1. Real topic route first (works without a mention, per product spec).
     if (msg.threadId !== undefined) {
       const record = this.lookupRoute(msg.threadId)
       if (record !== undefined) {
-        await this.continueSession(msg, record)
+        await this.routeOperations.run(record.key, () =>
+          this.continueSession(msg, this.lookupRoute(record.key) ?? record))
         return
       }
     }
@@ -375,7 +391,8 @@ export class FeishuService {
     const chatKey = chatRouteKey(msg.chatType, msg.chatId, msg.senderId)
     const chatRecord = this.lookupRoute(chatKey)
     if (chatRecord !== undefined) {
-      await this.continueSession(msg, chatRecord)
+      await this.routeOperations.run(chatRecord.key, () =>
+        this.continueSession(msg, this.lookupRoute(chatRecord.key) ?? chatRecord))
       return
     }
 
@@ -386,7 +403,8 @@ export class FeishuService {
       const record = await pending.catch(() => undefined)
       if (record !== undefined
         && (record.kind === 'chat' || (msg.threadId !== undefined && msg.threadId === record.key))) {
-        await this.continueSession(msg, record)
+        await this.routeOperations.run(record.key, () =>
+          this.continueSession(msg, this.lookupRoute(record.key) ?? record))
         return
       }
       // Thread-scoped record but this message is not in that topic (or the
@@ -398,6 +416,154 @@ export class FeishuService {
     if (msg.chatType === 'group' && this.config.requireMention && !msg.mentionedBot) return
 
     await this.startSession(msg, content)
+  }
+
+  /** Resolve the route visible to one command without creating a Session. */
+  private async commandRoute(msg: NormalizedMessage): Promise<RouteRecord | undefined> {
+    if (msg.threadId !== undefined) {
+      const threaded = this.lookupRoute(msg.threadId)
+      if (threaded !== undefined) return threaded
+    }
+    const chatKey = chatRouteKey(msg.chatType, msg.chatId, msg.senderId)
+    const degraded = this.lookupRoute(chatKey)
+    if (degraded !== undefined) return degraded
+    const pending = this.establishing.get(chatKey)
+    if (pending === undefined) return undefined
+    const record = await pending.catch(() => undefined)
+    if (record?.kind === 'chat') return record
+    if (record !== undefined && msg.threadId === record.key) return record
+    return undefined
+  }
+
+  /** Slash-command plane. Nothing in this method calls `agent.followup()`. */
+  private async handleSlashMessage(msg: NormalizedMessage, line: string): Promise<void> {
+    const parsed = parseSlashCommand(line)
+    if (parsed === undefined) {
+      await this.sendCommandCard(msg, {
+        kind: 'input-error',
+        text: '命令名必须以小写字母开头，且只能包含小写字母、数字、下划线或连字符。',
+        supported: supportedCommandList(),
+      })
+      return
+    }
+    if (!isSupportedCommand(parsed.name)) {
+      await this.sendCommandCard(msg, {
+        kind: 'unknown', command: parsed.name,
+        text: `未找到命令 /${parsed.name}。`, supported: supportedCommandList(),
+      })
+      return
+    }
+
+    const route = await this.commandRoute(msg)
+    if (route === undefined) {
+      if (parsed.name !== 'health') {
+        await this.sendCommandCard(msg, {
+          kind: 'unbound', command: parsed.name,
+          text: '当前话题尚未绑定 Session。请先发送普通消息创建会话，或使用 /health 检查通道。',
+        })
+        return
+      }
+      if (parsed.rawInput.trim() !== '') {
+        await this.sendCommandCard(msg, {
+          kind: 'input-error', command: parsed.name, text: '用法错误：/health 不接受参数。',
+        })
+        return
+      }
+      await this.withCommandReaction(msg, async () => {
+        await this.sendCommandCard(msg, {
+          kind: 'unavailable', command: parsed.name,
+          text: '完整健康检查将在 SC-03 中启用；本次请求未创建工作区或 Session。',
+        })
+      })
+      return
+    }
+
+    if (msg.senderId !== route.senderOpenId) {
+      await this.sendCommandCard(msg, {
+        kind: 'forbidden', command: parsed.name, text: '无权操作此会话。',
+      })
+      return
+    }
+
+    await this.routeOperations.run(route.key, async () => {
+      const current = this.lookupRoute(route.key) ?? route
+      if (msg.senderId !== current.senderOpenId) {
+        await this.sendCommandCard(msg, {
+          kind: 'forbidden', command: parsed.name, text: '无权操作此会话。',
+        })
+        return
+      }
+      await this.withCommandReaction(msg, async () => {
+        try {
+          const live = await this.ensureLiveAgent(current)
+          const definition = this.ctx.commands.find(live.agent, parsed.name)
+          if (definition === undefined) {
+            const text = parsed.name === 'compact'
+              ? '当前部署未挂载 Harness 原生 /compact 命令。'
+              : `当前 Session 未挂载 /${parsed.name} 命令。`
+            await this.sendCommandCard(msg, {
+              kind: 'unavailable', command: parsed.name, text,
+              sessionId: current.sessionId,
+            })
+            return
+          }
+          const execution = await this.ctx.commands.execute(live.agent, line, new AbortController().signal)
+          if (execution === undefined) {
+            await this.sendCommandCard(msg, {
+              kind: 'unavailable', command: parsed.name,
+              text: `当前 Session 无法执行 /${parsed.name}。`, sessionId: current.sessionId,
+            })
+            return
+          }
+          const result = execution.result
+          await this.sendCommandCard(msg, {
+            kind: commandResultCardKind(result), command: parsed.name,
+            text: result.text ?? '命令已执行。', sessionId: current.sessionId,
+          })
+        } catch (error) {
+          this.ctx.logger?.warn?.(
+            'dsh-channels: command /%s failed for session %s: %s',
+            parsed.name, current.sessionId, String(error),
+          )
+          await this.sendCommandCard(msg, {
+            kind: 'internal-error', command: parsed.name,
+            text: '命令执行失败，请稍后重试；若持续发生，请查看 Harness 日志。',
+            sessionId: current.sessionId,
+          })
+        }
+      })
+    })
+  }
+
+  /** Apply the command-only Typing → DONE reaction lifecycle. */
+  private async withCommandReaction(msg: NormalizedMessage, operation: () => Promise<void>): Promise<void> {
+    const reactionId = await this.requireChannel().addReaction(msg.messageId, 'Typing').catch(() => undefined)
+    try {
+      await operation()
+    } finally {
+      if (reactionId !== undefined) {
+        await this.requireChannel().removeReaction(msg.messageId, reactionId).catch(() => {})
+      }
+      await this.requireChannel().addReaction(msg.messageId, 'DONE').catch(() => {})
+    }
+  }
+
+  /** Standalone, non-streaming result card with a non-threaded fallback. */
+  private async sendCommandCard(msg: NormalizedMessage, state: CommandCardState): Promise<void> {
+    const channel = this.requireChannel()
+    const card = buildCommandResultCard(state)
+    try {
+      await channel.send(msg.chatId, { card }, { replyTo: msg.messageId, replyInThread: true })
+    } catch (error) {
+      try {
+        await channel.send(msg.chatId, { card }, { replyTo: msg.messageId })
+      } catch (fallbackError) {
+        this.ctx.logger?.warn?.(
+          'dsh-channels: command result delivery failed for message %s: %s / %s',
+          msg.messageId, String(error), String(fallbackError),
+        )
+      }
+    }
   }
 
   private lookupRoute(key: string): RouteRecord | undefined {
@@ -710,12 +876,15 @@ export class FeishuService {
     // and direct property access on a cordis context throws for services the
     // plugin did not inject.
     const presets = this.ctx.get?.('agentPresets') as AgentPresets | undefined
-    if (presets === undefined) return {}
+    if (presets === undefined) {
+      return { setup: agentCtx => { registerChannelCommands(agentCtx.commands) } }
+    }
     const resolved = await presets.resolve(this.config.agentPreset)
     return {
       agentPreset: resolved.id,
       setup: async (agentCtx) => {
         await presets.mount(agentCtx, resolved.id)
+        registerChannelCommands(agentCtx.commands)
       },
     }
   }

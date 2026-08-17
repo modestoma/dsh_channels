@@ -101,6 +101,83 @@ describe('FeishuService', () => {
     expect(mock(h.channel.disconnect)).toHaveBeenCalled()
   })
 
+  it('handles unbound /health without creating a workspace or Session', async () => {
+    const h = await setup()
+    const msg = makeMessage({
+      chatType: 'group', chatId: 'oc_health', senderId: 'ou_alice',
+      mentionedBot: false, messageId: 'om_health', content: '  /health  ',
+    })
+    await h.onMessage(msg)
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
+
+    expect(h.ctxState.agents.created).toHaveLength(0)
+    expect(h.ctxState.workspaces.workspaces.size).toBe(0)
+    expect(h.channel.sent).toHaveLength(1)
+    expect(JSON.stringify((h.channel.sent[0] as { input: object }).input)).toContain('SC-03')
+    expect(h.channel.reactions).toEqual([
+      { messageId: 'om_health', emojiType: 'Typing' },
+      { messageId: 'om_health', emojiType: 'DONE' },
+    ])
+  })
+
+  it('rejects an unknown slash command without creating a Session or model turn', async () => {
+    const h = await setup()
+    const msg = makeMessage({ chatType: 'p2p', senderId: 'ou_alice', content: '/foo' })
+    await h.onMessage(msg)
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
+
+    expect(h.ctxState.agents.created).toHaveLength(0)
+    expect(h.channel.sent).toHaveLength(1)
+    const json = JSON.stringify((h.channel.sent[0] as { input: object }).input)
+    expect(json).toContain('未知命令')
+    expect(json).toContain('/health')
+  })
+
+  it('executes a routed command once with one lifecycle pair and no followup', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_commands', senderId: 'ou_owner',
+      messageId: 'om_start', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    mock(agent.followup).mockClear()
+
+    const command = makeMessage({
+      chatType: 'group', chatId: 'oc_commands', senderId: 'ou_owner',
+      threadId: 'omt_1', messageId: 'om_status', mentionedBot: false, content: '/status',
+    })
+    await h.onMessage(command)
+    await h.onMessage(command) // Feishu redelivery
+    await waitUntil(() => expect(mock(h.ctxState.ctx.commands.execute)).toHaveBeenCalledTimes(1))
+
+    expect(mock(h.ctxState.ctx.commands.execute)).toHaveBeenCalledTimes(1)
+    expect(mock(agent.followup)).not.toHaveBeenCalled()
+    expect(agent.session.events.map(event => event.type)).toEqual(['command/run', 'command/done'])
+    expect(h.channel.sent).toHaveLength(2)
+  })
+
+  it('denies a non-owner before resume, command execution, or Session inspection', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_owned', senderId: 'ou_owner', messageId: 'om_owner', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    mock(h.ctxState.ctx.commands.execute).mockClear()
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_owned', senderId: 'ou_intruder',
+      threadId: 'omt_1', messageId: 'om_intruder', mentionedBot: false, content: '/status',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
+
+    expect(mock(h.ctxState.ctx.commands.execute)).not.toHaveBeenCalled()
+    expect(h.ctxState.agents.resumed).toHaveLength(0)
+    expect(agent.session.events).toHaveLength(0)
+    expect(JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)).toContain('无权操作此会话')
+  })
+
   it('resolves app credentials through the host credentials seam', async () => {
     const h = await setup()
     expect(h.factoryCalls[0]).toMatchObject({
@@ -207,14 +284,15 @@ describe('FeishuService', () => {
     expect(presets.mounts).toEqual([{ agentCtx: created.setupCtx, id: 'channels' }])
   })
 
-  it('leaves creation bare when no preset roster exists (headless deployments)', async () => {
+  it('leaves preset composition bare but still mounts channel commands without a roster', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({ chatType: 'p2p', senderId: 'ou_alice', mentionedBot: false, content: 'hi' }))
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
 
     const created = h.ctxState.agents.created[0]!
     expect(created.options.meta?.agentPreset).toBeUndefined()
-    expect(created.options.setup).toBeUndefined()
+    expect(created.options.setup).toBeTypeOf('function')
+    expect(created.setupCtx.commands.find(created.handle.agent, 'health')).toBeDefined()
   })
 
   it('reports preset resolution failure on the card instead of publishing a bare session', async () => {

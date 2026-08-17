@@ -10,7 +10,7 @@ import path from 'node:path'
 import { vi } from 'vitest'
 import type {
   Agent, AgentContext, AgentHandle, AgentOptions, AgentRegistry, ApprovalAnswererListener,
-  CommandDefinition, CommandRuntime, HostContext, Session, SessionEvent, SessionId,
+  CommandDefinition, CommandInvocation, CommandRuntime, HostContext, Session, SessionEvent, SessionId,
   StorageDomainFacility, Workspace, WorkspaceRegistry,
 } from '../src/dsh-types.ts'
 import type {
@@ -29,26 +29,73 @@ export function makeSession(id = `session-${Math.random().toString(36).slice(2, 
 
 export function makeCommandRuntime(): CommandRuntime & { definitions: Map<string, CommandDefinition> } {
   const definitions = new Map<string, CommandDefinition>()
-  return {
+  let commandSeq = 0
+  const runtime: CommandRuntime & { definitions: Map<string, CommandDefinition> } = {
     definitions,
     register: vi.fn((definition: CommandDefinition) => {
       definitions.set(definition.name, definition)
       return () => { definitions.delete(definition.name) }
     }),
-    list: vi.fn(() => [...definitions.values()].map(({ handler: _handler, recordInput: _recordInput, ...entry }) => entry)),
-    find: vi.fn((_agent: Agent, name: string) => definitions.get(name)),
-    execute: vi.fn(async () => undefined),
+    list: vi.fn((agent: Agent) => {
+      const effective = new Map(definitions)
+      if (agent.ctx.commands !== runtime) {
+        for (const entry of agent.ctx.commands.list(agent)) {
+          const definition = agent.ctx.commands.find(agent, entry.name)
+          if (definition !== undefined) effective.set(entry.name, definition)
+        }
+      }
+      return [...effective.values()].map(({ handler: _handler, recordInput: _recordInput, ...entry }) => entry)
+    }),
+    find: vi.fn((agent: Agent, name: string) => {
+      if (agent.ctx.commands !== runtime) {
+        const scoped = agent.ctx.commands.find(agent, name)
+        if (scoped !== undefined) return scoped
+      }
+      return definitions.get(name)
+    }),
+    execute: vi.fn(async (agent: Agent, line: string, signal: AbortSignal) => {
+      const match = /^\/([a-z][a-z0-9_-]*)(?=$|[\t\n\r ])/u.exec(line)
+      const name = match?.[1]
+      if (name === undefined || match === null) return undefined
+      const definition = runtime.find(agent, name)
+      if (definition === undefined) return undefined
+      const commandId = `cmd-test-${++commandSeq}` as CommandInvocation['commandId']
+      const events = agent.session.events as unknown as Array<{ seq: number; type: string; data: Record<string, unknown> }>
+      events.push({
+        seq: events.length,
+        type: 'command/run',
+        data: {
+          commandId,
+          name,
+          ...(definition.recordInput === false ? {} : { args: line.slice(match[0].length) }),
+          source: { kind: 'user' },
+        },
+      })
+      const result = await definition.handler({
+        commandId,
+        agent,
+        rawInput: line.slice(match[0].length),
+        signal,
+      })
+      events.push({
+        seq: events.length,
+        type: 'command/done',
+        data: { commandId, kind: result.kind, ...(result.text === undefined ? {} : { text: result.text }) },
+      })
+      return { commandId, result }
+    }),
   }
+  return runtime
 }
 
-export function makeAgent(session: Session, options: AgentOptions = {}): Agent {
+export function makeAgent(session: Session, options: AgentOptions = {}, ctx?: AgentContext): Agent {
   return {
     id: session.id,
     options,
     session,
     status: 'idle',
     inbox: { nextTurn: [], nextStep: [] },
-    ctx: { commands: makeCommandRuntime() },
+    ctx: ctx ?? { commands: makeCommandRuntime() },
     followup: vi.fn(),
   }
 }
@@ -82,7 +129,7 @@ export function makeAgentRegistry(fail: FakeAgentsOptions = {}): {
       const setupCtx: AgentContext = { commands: makeCommandRuntime() }
       await options.setup?.(setupCtx)
       const session = makeSession(options.sessionId)
-      const agent = makeAgent(session, options.agentOptions)
+      const agent = makeAgent(session, options.agentOptions, setupCtx)
       const handle: AgentHandle = { agent, dispose: vi.fn(async () => { liveAgents.delete(options.sessionId) }) }
       liveAgents.set(options.sessionId, handle)
       created.push({ options, handle, setupCtx })
@@ -96,7 +143,7 @@ export function makeAgentRegistry(fail: FakeAgentsOptions = {}): {
       const setupCtx: AgentContext = { commands: makeCommandRuntime() }
       await options.setup?.(setupCtx)
       const session = makeSession(options.resumeSessionId)
-      const agent = makeAgent(session, options.agentOptions)
+      const agent = makeAgent(session, options.agentOptions, setupCtx)
       const handle: AgentHandle = { agent, dispose: vi.fn(async () => { liveAgents.delete(options.resumeSessionId) }) }
       liveAgents.set(options.resumeSessionId, handle)
       resumed.push({ options, handle, setupCtx })
