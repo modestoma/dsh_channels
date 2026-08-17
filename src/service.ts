@@ -23,6 +23,7 @@ import type {
   AgentPresets,
   AgentSetup,
   CredentialProvider,
+  CordisFiber,
   HostContext,
   LlmService,
   Session,
@@ -42,6 +43,8 @@ import type {
   FeishuDomainGlobal, FeishuDomainHandle, InflightSnapshot, ProcessedRecord, RawDomainHandle, RouteRecord,
 } from './domain.ts'
 import type { ChannelFactory, FeishuChannel, NormalizedMessage } from './feishu-channel.ts'
+import { buildHealthCard, foldHealthSnapshot, HEALTH_DEPENDENCY_NAMES } from './health.ts'
+import type { HealthDependencyName, HealthSnapshot } from './health.ts'
 import { ACTIVITY_BUILD_MARKER, TurnStreamer } from './streamer.ts'
 import type { StreamerHooks } from './streamer.ts'
 import { ensureWorkspace } from './workspaces.ts'
@@ -470,10 +473,7 @@ export class FeishuService {
         return
       }
       await this.withCommandReaction(msg, async () => {
-        await this.sendCommandCard(msg, {
-          kind: 'unavailable', command: parsed.name,
-          text: '完整健康检查将在 SC-03 中启用；本次请求未创建工作区或 Session。',
-        })
+        await this.sendHealthCard(msg)
       })
       return
     }
@@ -516,6 +516,10 @@ export class FeishuService {
             return
           }
           const result = execution.result
+          if (parsed.name === 'health' && result.kind === 'success') {
+            await this.sendHealthCard(msg)
+            return
+          }
           await this.sendCommandCard(msg, {
             kind: commandResultCardKind(result), command: parsed.name,
             text: result.text ?? '命令已执行。', sessionId: current.sessionId,
@@ -550,8 +554,17 @@ export class FeishuService {
 
   /** Standalone, non-streaming result card with a non-threaded fallback. */
   private async sendCommandCard(msg: NormalizedMessage, state: CommandCardState): Promise<void> {
+    await this.sendStandaloneCard(msg, buildCommandResultCard(state))
+  }
+
+  /** Collect and send a privacy-preserving snapshot without Session I/O. */
+  private async sendHealthCard(msg: NormalizedMessage): Promise<void> {
+    await this.sendStandaloneCard(msg, buildHealthCard(this.healthSnapshot()))
+  }
+
+  /** Shared delivery policy for command-plane cards. */
+  private async sendStandaloneCard(msg: NormalizedMessage, card: object): Promise<void> {
     const channel = this.requireChannel()
-    const card = buildCommandResultCard(state)
     try {
       await channel.send(msg.chatId, { card }, { replyTo: msg.messageId, replyInThread: true })
     } catch (error) {
@@ -564,6 +577,73 @@ export class FeishuService {
         )
       }
     }
+  }
+
+  /** Capture aggregate health only; raw configuration and errors are excluded. */
+  private healthSnapshot(): HealthSnapshot {
+    const serviceKeys: Record<HealthDependencyName, string> = {
+      agents: 'agents',
+      commands: 'commands',
+      workspace: 'workspaceRegistry',
+      storage: 'storageDomain',
+      credentials: 'credentials',
+      llm: 'llm',
+      'token-meter': 'tokenMeter',
+    }
+    const directServices: Record<HealthDependencyName, () => unknown> = {
+      agents: () => this.ctx.agents,
+      commands: () => this.ctx.commands,
+      workspace: () => this.ctx.workspaceRegistry,
+      storage: () => this.ctx.storageDomain,
+      credentials: () => this.ctx.credentials,
+      llm: () => this.ctx.llm,
+      'token-meter': () => this.ctx.tokenMeter,
+    }
+    const dependencies = Object.fromEntries(HEALTH_DEPENDENCY_NAMES.map(name => {
+      try {
+        const service = this.ctx.get === undefined
+          ? directServices[name]()
+          : this.ctx.get(serviceKeys[name])
+        return [name, service !== undefined]
+      } catch {
+        return [name, false]
+      }
+    })) as Record<HealthDependencyName, boolean>
+
+    const fibers: CordisFiber[] = []
+    try {
+      for (const runtime of this.ctx.registry.values()) {
+        for (const fiber of runtime.fibers) fibers.push(fiber)
+      }
+    } catch {
+      // Registry inspection is diagnostic only. An empty fold is safer than
+      // exposing or propagating an internal registry error to the user.
+    }
+
+    let inflightTurnCount = 0
+    try {
+      if (this.domain !== undefined) {
+        for (const _entry of this.domain.inflight.entries()) inflightTurnCount++
+      }
+    } catch {
+      // The storage dependency is reported separately; never expose details.
+    }
+
+    let connection
+    let botOpenId: string | undefined
+    try { connection = this.channel?.getConnectionStatus() } catch {}
+    try { botOpenId = this.channel?.botOpenId() } catch {}
+
+    return foldHealthSnapshot({
+      fibers,
+      dependencies,
+      connection,
+      botOpenId,
+      started: this.started,
+      routeCount: this.routeCache.size,
+      liveAgentCount: this.live.size,
+      inflightTurnCount,
+    })
   }
 
   private lookupRoute(key: string): RouteRecord | undefined {

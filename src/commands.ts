@@ -78,13 +78,23 @@ function pendingHandler(name: string): CommandDefinition['handler'] {
   }
 }
 
+const healthHandler: CommandDefinition['handler'] = ({ rawInput }): CommandResult => {
+  if (rawInput.trim() !== '') {
+    return { kind: 'error', text: '用法错误：/health 不接受参数。' }
+  }
+  return { kind: 'success', text: '健康检查已完成。' }
+}
+
 /**
  * Register this channel's commands inside one agent scope. `/compact` stays
  * global and is intentionally not registered here.
  */
 export function registerChannelCommands(commands: CommandRuntime): void {
   for (const descriptor of DESCRIPTORS) {
-    commands.register({ ...descriptor, handler: pendingHandler(descriptor.name) })
+    commands.register({
+      ...descriptor,
+      handler: descriptor.name === 'health' ? healthHandler : pendingHandler(descriptor.name),
+    })
   }
 }
 

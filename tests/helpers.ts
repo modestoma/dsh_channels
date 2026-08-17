@@ -305,10 +305,13 @@ export function makeHostContext(
     }),
   }
   const services: Record<string, unknown> = {
+    agents: agents.registry,
+    commands,
+    workspaceRegistry: workspaces.registry,
+    storageDomain: domain.facility,
     tokenMeter,
     llm,
     credentials,
-    commands,
     ...(agentPresets === undefined ? {} : { agentPresets }),
   }
   const ctx: HostContext = {

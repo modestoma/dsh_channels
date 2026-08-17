@@ -29,6 +29,12 @@ describe('slash command primitives', () => {
       rawInput: ' extra',
       signal: new AbortController().signal,
     })).toEqual({ kind: 'error', text: '用法错误：/health 不接受参数。' })
+    expect(await commands.definitions.get('health')!.handler({
+      commandId: 'cmd-test' as never,
+      agent,
+      rawInput: '',
+      signal: new AbortController().signal,
+    })).toEqual({ kind: 'success', text: '健康检查已完成。' })
   })
 
   it('serializes operations per route without poisoning the queue after failure', async () => {

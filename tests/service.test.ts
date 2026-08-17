@@ -10,7 +10,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { FeishuService } from '../src/service.ts'
 import type { FeishuConfig } from '../src/config.ts'
 import type { CardActionEvent, ChannelFactory, FeishuChannel, NormalizedMessage } from '../src/feishu-channel.ts'
-import type { AgentHandle, ApprovalOutcome, SessionId } from '../src/dsh-types.ts'
+import { CordisFiberState } from '../src/dsh-types.ts'
+import type { AgentHandle, ApprovalOutcome, CordisPluginRuntime, SessionId } from '../src/dsh-types.ts'
 import {
   makeHostContext, makeChannel, makeMessage, makeAgentPresets, makeSession, makeAgent,
 } from './helpers.ts'
@@ -113,11 +114,84 @@ describe('FeishuService', () => {
     expect(h.ctxState.agents.created).toHaveLength(0)
     expect(h.ctxState.workspaces.workspaces.size).toBe(0)
     expect(h.channel.sent).toHaveLength(1)
-    expect(JSON.stringify((h.channel.sent[0] as { input: object }).input)).toContain('SC-03')
+    const json = JSON.stringify((h.channel.sent[0] as { input: object }).input)
+    expect(json).toContain('健康检查')
+    expect(json).toContain('degraded')
+    expect(json).not.toContain('bot-open-id')
+    expect(json).toContain('…n-id')
     expect(h.channel.reactions).toEqual([
       { messageId: 'om_health', emojiType: 'Typing' },
       { messageId: 'om_health', emojiType: 'DONE' },
     ])
+  })
+
+  it.each([
+    ['connected', 'healthy'],
+    ['reconnecting', 'degraded'],
+    ['failed', 'unhealthy'],
+  ] as const)('maps an unbound %s channel to %s health', async (state, level) => {
+    const h = await setup({}, {
+      connectionStatus: {
+        state,
+        lastConnectTime: 100,
+        ...(state === 'reconnecting' ? { nextConnectTime: 200 } : {}),
+        reconnectAttempts: state === 'connected' ? 0 : 2,
+      },
+    })
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', senderId: 'ou_alice', mentionedBot: false,
+      messageId: `om_health_${state}`, content: '/health',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
+
+    const json = JSON.stringify((h.channel.sent[0] as { input: object }).input)
+    expect(json).toContain(`整体结论：**${level}**`)
+    expect(json).toContain(state)
+    expect(h.ctxState.agents.created).toHaveLength(0)
+    expect(h.ctxState.workspaces.workspaces.size).toBe(0)
+  })
+
+  it.each([
+    [CordisFiberState.PENDING, 'degraded'],
+    [CordisFiberState.FAILED, 'unhealthy'],
+  ] as const)('includes Cordis fiber state %s in health as %s', async (fiberState, level) => {
+    const h = await setup({}, {
+      connectionStatus: { state: 'connected', lastConnectTime: 100, reconnectAttempts: 0 },
+    })
+    const runtimes = new Map<string, CordisPluginRuntime>([
+      ['test', { fibers: [{ state: CordisFiberState.ACTIVE }, { state: fiberState }] }],
+    ])
+    h.ctxState.ctx.registry = { size: runtimes.size, values: () => runtimes.values() }
+
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', senderId: 'ou_alice', mentionedBot: false,
+      messageId: `om_health_fiber_${fiberState}`, content: '/health',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
+
+    const json = JSON.stringify((h.channel.sent[0] as { input: object }).input)
+    expect(json).toContain(`整体结论：**${level}**`)
+    expect(json).toContain(fiberState === CordisFiberState.PENDING ? 'pending 1' : 'failed 1')
+  })
+
+  it('reports a missing critical Host dependency as unhealthy without exposing details', async () => {
+    const h = await setup({}, {
+      connectionStatus: { state: 'connected', lastConnectTime: 100, reconnectAttempts: 0 },
+    })
+    const get = h.ctxState.ctx.get!
+    h.ctxState.ctx.get = name => name === 'llm' ? undefined : get(name)
+
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_health_missing_llm', content: '/health',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
+
+    const json = JSON.stringify((h.channel.sent[0] as { input: object }).input)
+    expect(json).toContain('整体结论：**unhealthy**')
+    expect(json).toContain('❌ llm')
+    expect(json).not.toContain('stack')
+    expect(json).not.toContain('cause')
   })
 
   it('rejects an unknown slash command without creating a Session or model turn', async () => {
@@ -155,6 +229,29 @@ describe('FeishuService', () => {
     expect(mock(agent.followup)).not.toHaveBeenCalled()
     expect(agent.session.events.map(event => event.type)).toEqual(['command/run', 'command/done'])
     expect(h.channel.sent).toHaveLength(2)
+  })
+
+  it('executes routed /health through the command lifecycle and sends the health card', async () => {
+    const h = await setup({}, {
+      connectionStatus: { state: 'connected', lastConnectTime: 100, reconnectAttempts: 0 },
+    })
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_health_route', senderId: 'ou_owner',
+      messageId: 'om_health_start', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    mock(agent.followup).mockClear()
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_health_route', senderId: 'ou_owner',
+      threadId: 'omt_1', messageId: 'om_health_bound', mentionedBot: false, content: '/health',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
+
+    expect(agent.session.events.map(event => event.type)).toEqual(['command/run', 'command/done'])
+    expect(mock(agent.followup)).not.toHaveBeenCalled()
+    expect(JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)).toContain('整体结论：**healthy**')
   })
 
   it('denies a non-owner before resume, command execution, or Session inspection', async () => {
