@@ -372,6 +372,11 @@ export interface CommandRuntime {
 /** Agent-scoped Cordis context slice used to register scoped commands. */
 export interface AgentContext {
   commands: CommandRuntime
+  /** Mount a child plugin only after its declared Host services are available. */
+  inject(
+    dependencies: readonly string[],
+    callback: (ctx: AgentContext) => void,
+  ): PromiseLike<unknown>
 }
 
 export interface Agent {

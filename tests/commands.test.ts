@@ -1,9 +1,11 @@
+import { Context } from '@deepseek-ai/cordis'
 import { describe, expect, it, vi } from 'vitest'
 import {
-  armRenewCommand, buildCommandResultCard, commandResultCardKind, parseSlashCommand, registerChannelCommands,
-  RouteOperationQueue, supportedCommandList,
+  armRenewCommand, buildCommandResultCard, commandResultCardKind, mountChannelCommands, parseSlashCommand,
+  registerChannelCommands, RouteOperationQueue, supportedCommandList,
 } from '../src/commands.ts'
-import { makeAgent, makeCommandRuntime, makeSession } from './helpers.ts'
+import type { AgentContext } from '../src/dsh-types.ts'
+import { makeAgent, makeAgentContext, makeCommandRuntime, makeSession } from './helpers.ts'
 
 describe('slash command primitives', () => {
   it('parses the Harness command grammar and preserves raw input', () => {
@@ -22,7 +24,7 @@ describe('slash command primitives', () => {
     ])
     expect(commands.definitions.has('compact')).toBe(false)
 
-    const agent = makeAgent(makeSession(), {}, { commands })
+    const agent = makeAgent(makeSession(), {}, makeAgentContext(commands))
     expect(await commands.definitions.get('health')!.handler({
       commandId: 'cmd-test' as never,
       agent,
@@ -73,10 +75,47 @@ describe('slash command primitives', () => {
     })).toEqual({ kind: 'error', text: '用法错误：/export 不接受参数。' })
   })
 
+  it('mounts scoped commands through an explicit commands injection', async () => {
+    const ctx = new Context()
+    const commands = makeCommandRuntime()
+    ctx.provide('commands', commands)
+
+    let bareAgentCtx!: Context
+    await ctx.plugin((inner) => { bareAgentCtx = inner })
+    expect(bareAgentCtx.get('commands')).toBe(commands)
+
+    await mountChannelCommands(bareAgentCtx as unknown as AgentContext)
+    expect([...commands.definitions.keys()].sort()).toEqual([
+      'export', 'health', 'history', 'renew', 'status', 'work-dir',
+    ])
+
+    await ctx.fiber.dispose()
+  })
+
+  it('never reads commands from an uninjected Agent context', async () => {
+    const commands = makeCommandRuntime()
+    const injectedCtx = makeAgentContext(commands)
+    let directReads = 0
+    const guardedCtx = {
+      get commands() {
+        directReads += 1
+        throw new Error('cannot get property "commands" without inject')
+      },
+      async inject(dependencies: readonly string[], callback: (ctx: AgentContext) => void) {
+        expect(dependencies).toEqual(['commands'])
+        callback(injectedCtx)
+      },
+    } as unknown as AgentContext
+
+    await mountChannelCommands(guardedCtx)
+    expect(directReads).toBe(0)
+    expect(commands.definitions.has('health')).toBe(true)
+  })
+
   it('requires one armed Feishu admission for /renew and rejects busy inboxes first', async () => {
     const commands = makeCommandRuntime()
     registerChannelCommands(commands)
-    const agent = makeAgent(makeSession(), {}, { commands })
+    const agent = makeAgent(makeSession(), {}, makeAgentContext(commands))
     const signal = new AbortController().signal
     const invocation = {
       commandId: 'cmd-renew' as never,

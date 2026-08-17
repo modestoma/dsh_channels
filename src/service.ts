@@ -37,7 +37,7 @@ import { buildCard, buildInterruptionCard } from './cards.ts'
 import type { CardState } from './cards.ts'
 import {
   armRenewCommand, buildCommandResultCard, commandResultCardKind, isSupportedCommand, parseSlashCommand,
-  registerChannelCommands, registerRenewCommand, RouteOperationQueue, supportedCommandList,
+  mountChannelCommands, registerRenewCommand, RouteOperationQueue, supportedCommandList,
 } from './commands.ts'
 import type { CommandCardState } from './commands.ts'
 import {
@@ -1147,20 +1147,18 @@ export class FeishuService {
     const presets = this.ctx.get?.('agentPresets') as AgentPresets | undefined
     if (presets === undefined) {
       return {
-        setup: agentCtx => {
-          registerChannelCommands(agentCtx.commands)
-        },
+        setup: mountChannelCommands,
       }
     }
     if (requestedPreset === undefined && !useRosterDefault) {
-      return { setup: agentCtx => { registerChannelCommands(agentCtx.commands) } }
+      return { setup: mountChannelCommands }
     }
     const resolved = await presets.resolve(requestedPreset)
     return {
       agentPreset: resolved.id,
       setup: async (agentCtx) => {
         await presets.mount(agentCtx, resolved.id)
-        registerChannelCommands(agentCtx.commands)
+        await mountChannelCommands(agentCtx)
       },
     }
   }

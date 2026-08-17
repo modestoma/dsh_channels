@@ -10,7 +10,7 @@
  */
 
 import type {
-  CommandDefinition, CommandDescriptor, CommandResult, CommandRuntime,
+  AgentContext, CommandDefinition, CommandDescriptor, CommandResult, CommandRuntime,
 } from './dsh-types.ts'
 
 export const CHANNEL_COMMAND_NAMES = [
@@ -148,6 +148,19 @@ export function registerChannelCommands(commands: CommandRuntime): void {
       handler: READY_HANDLERS[descriptor.name] ?? pendingHandler(descriptor.name),
     })
   }
+}
+
+function registerScopedChannelCommands(ctx: AgentContext): void {
+  registerChannelCommands(ctx.commands)
+}
+
+/**
+ * Mount channel commands through an Agent child plugin that explicitly
+ * injects the command service. The Agent scope is minted by `agent-loop`, so
+ * it does not inherit this package's top-level dependency declaration.
+ */
+export async function mountChannelCommands(agentCtx: AgentContext): Promise<void> {
+  await agentCtx.inject(['commands'], registerScopedChannelCommands)
 }
 
 /**

@@ -98,6 +98,16 @@ export function makeCommandRuntime(): CommandRuntime & { definitions: Map<string
   return runtime
 }
 
+export function makeAgentContext(commands = makeCommandRuntime()): AgentContext {
+  const ctx: AgentContext = {
+    commands,
+    async inject(_dependencies, callback) {
+      callback(ctx)
+    },
+  }
+  return ctx
+}
+
 export function makeAgent(session: Session, options: AgentOptions = {}, ctx?: AgentContext): Agent {
   return {
     id: session.id,
@@ -105,7 +115,7 @@ export function makeAgent(session: Session, options: AgentOptions = {}, ctx?: Ag
     session,
     status: 'idle',
     inbox: { nextTurn: [], nextStep: [] },
-    ctx: ctx ?? { commands: makeCommandRuntime() },
+    ctx: ctx ?? makeAgentContext(),
     followup: vi.fn(),
   }
 }
@@ -136,7 +146,7 @@ export function makeAgentRegistry(fail: FakeAgentsOptions = {}): {
       // Mirror the host factory: setup composes the unpublished scope and is
       // awaited BEFORE the session/agent become visible; a rejection rolls the
       // creation back.
-      const setupCtx: AgentContext = { commands: makeCommandRuntime() }
+      const setupCtx = makeAgentContext()
       await options.setup?.(setupCtx)
       const session = makeSession(options.sessionId, options.meta?.cwd, options.meta?.agentPreset)
       const agent = makeAgent(session, options.agentOptions, setupCtx)
@@ -150,7 +160,7 @@ export function makeAgentRegistry(fail: FakeAgentsOptions = {}): {
         fail.onFailResume?.(options)
         throw fail.failResume
       }
-      const setupCtx: AgentContext = { commands: makeCommandRuntime() }
+      const setupCtx = makeAgentContext()
       await options.setup?.(setupCtx)
       const session = makeSession(options.resumeSessionId)
       const agent = makeAgent(session, options.agentOptions, setupCtx)
