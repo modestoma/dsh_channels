@@ -15,6 +15,8 @@
  */
 
 import { randomUUID } from 'node:crypto'
+import { ApprovalAnswerer } from './approvals.ts'
+import type { ApprovalRoute } from './approvals.ts'
 import type {
   Agent,
   AgentHandle,
@@ -169,6 +171,11 @@ export class FeishuService {
   private unlisten: (() => void) | undefined
   /** Periodic route-GC timer (unref'd; only armed when `routeTtlMs > 0`). */
   private gcTimer: ReturnType<typeof setInterval> | undefined
+  /** HITL approval answerer (created in `start()`). */
+  private approvalAnswerer: ApprovalAnswerer | undefined
+  /** Disposers for the host approval waterfall listener + card actions. */
+  private unlistenApproval: (() => boolean) | undefined
+  private unlistenCardAction: (() => void) | undefined
 
   constructor(ctx: HostContext, config: FeishuConfig, channelFactory: ChannelFactory) {
     this.ctx = ctx
@@ -230,6 +237,22 @@ export class FeishuService {
       this.routeCache.set(key, record)
     }
 
+    // HITL: answer the host's approval/request waterfall for sessions this
+    // channel routes. `prepend` claims such requests BEFORE the web gateway's
+    // generic answerer (its panel would be invisible to a Feishu user), while
+    // non-owned sessions delegate through `next()`.
+    const answerer = new ApprovalAnswerer(channel, {
+      routeFor: sessionId => this.approvalRouteFor(sessionId),
+      onError: (sessionId, error) => {
+        this.ctx.logger?.warn?.('dsh-channels approval error (session %s): %s', sessionId, String(error))
+      },
+    }, this.config.approvalTimeoutMs)
+    this.approvalAnswerer = answerer
+    this.unlistenApproval = this.ctx.on('approval/request', (req, next) => answerer.onRequest(req, next), { prepend: true })
+    this.unlistenCardAction = channel.onCardAction(event => {
+      answerer.onCardAction(event)
+    })
+
     this.ctx.on('session/event', (session, event) => {
       this.streamer?.onSessionEvent(session, event)
     })
@@ -266,12 +289,25 @@ export class FeishuService {
     )
     console.info('[dsh-channels] feishu long connection established, bot open_id:', channel.botOpenId())
     console.info('[dsh-channels] activity build:', ACTIVITY_BUILD_MARKER)
+    const approvalMounted = this.ctx.get?.('approval') !== undefined
+    console.info(
+      approvalMounted
+        ? `[dsh-channels] HITL 审批应答已就绪（决策卡片超时 ${this.config.approvalTimeoutMs} ms）`
+        : '[dsh-channels] 主机未挂载 approval 服务，HITL 审批应答关闭',
+    )
   }
 
   /** Tear down: close the connection and dispose all live agents. */
   async shutdown(): Promise<void> {
     this.unlisten?.()
     this.unlisten = undefined
+    this.unlistenCardAction?.()
+    this.unlistenCardAction = undefined
+    this.unlistenApproval?.()
+    this.unlistenApproval = undefined
+    // Withdraw in-flight approval questions (the host settles them cancelled).
+    this.approvalAnswerer?.dispose()
+    this.approvalAnswerer = undefined
     if (this.gcTimer !== undefined) {
       clearInterval(this.gcTimer)
       this.gcTimer = undefined
@@ -586,6 +622,22 @@ export class FeishuService {
       fallback ??= record
     }
     return fallback
+  }
+
+  /**
+   * HITL answerer hook: the Feishu placement of one session's approval cards,
+   * or `undefined` when this channel does not route the session (the answerer
+   * then delegates to other answerers).
+   */
+  private approvalRouteFor(sessionId: string): ApprovalRoute | undefined {
+    const record = this.findRouteBySession(sessionId)
+    if (record === undefined) return undefined
+    return {
+      chatId: record.chatId,
+      cardMessageId: record.cardMessageId,
+      inThread: record.kind === 'thread',
+      senderOpenId: record.senderOpenId,
+    }
   }
 
   /**

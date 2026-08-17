@@ -9,10 +9,10 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { vi } from 'vitest'
 import type {
-  Agent, AgentHandle, AgentRegistry, HostContext, Session, SessionEvent,
+  Agent, AgentHandle, AgentRegistry, ApprovalAnswererListener, HostContext, Session, SessionEvent,
   SessionId, StorageDomainFacility, Workspace, WorkspaceRegistry,
 } from '../src/dsh-types.ts'
-import type { FeishuChannel, NormalizedMessage, SendResult } from '../src/feishu-channel.ts'
+import type { CardActionEvent, FeishuChannel, NormalizedMessage, SendResult } from '../src/feishu-channel.ts'
 import type { RawDomainHandle } from '../src/domain.ts'
 
 export function makeSession(id = `session-${Math.random().toString(36).slice(2, 10)}`): Session {
@@ -217,11 +217,13 @@ export function makeHostContext(
   domain: ReturnType<typeof makeDomain>
   credentials: { resolve: ReturnType<typeof vi.fn>; values: Record<string, string> }
   sessionListeners: Array<(session: Session, event: SessionEvent) => void>
+  approvalListeners: Array<{ listener: ApprovalAnswererListener; options: { prepend?: boolean } | undefined }>
 } {
   const agents = makeAgentRegistry(agentsOptions)
   const workspaces = makeWorkspaceRegistry()
   const domain = makeDomain()
   const sessionListeners: Array<(session: Session, event: SessionEvent) => void> = []
+  const approvalListeners: Array<{ listener: ApprovalAnswererListener; options: { prepend?: boolean } | undefined }> = []
   const tokenMeter = { measure: () => ({ totalTokens: 1234 }) }
   const llm = { resolveModelInfo: vi.fn(async () => ({ context: { contextWindow: 128000 } })) }
   const credentials = {
@@ -250,16 +252,21 @@ export function makeHostContext(
     llm,
     logger: { warn: vi.fn(), error: vi.fn(), info: vi.fn(), debug: vi.fn() },
     get: (name: string) => services[name],
-    on: vi.fn((name, listener) => {
+    on: vi.fn((name: unknown, listener?: unknown, options?: unknown) => {
       if (name === 'session/event') {
         const wrapped = listener as (session: Session, event: SessionEvent) => void
         sessionListeners.push(wrapped)
+      } else if (name === 'approval/request') {
+        approvalListeners.push({
+          listener: listener as ApprovalAnswererListener,
+          options: options as { prepend?: boolean } | undefined,
+        })
       }
       return () => true
     }),
     effect: vi.fn(),
   }
-  return { ctx, agents, workspaces, domain, credentials, sessionListeners }
+  return { ctx, agents, workspaces, domain, credentials, sessionListeners, approvalListeners }
 }
 
 export interface FakeChannelOptions {
@@ -275,15 +282,23 @@ export function makeChannel(options: FakeChannelOptions = {}): FeishuChannel & {
   updated: Array<{ messageId: string; card: object }>
   reactions: Array<{ messageId: string; emojiType: string }>
   removedReactions: Array<{ messageId: string; reactionId: string }>
+  cardActionHandlers: Array<(event: CardActionEvent) => void | Promise<void>>
+  /** Dispatch one card action through every registered handler. */
+  fireCardAction: (event: CardActionEvent) => Promise<void>
 } {
   const sent: Array<{ chatId: string; input: object; options?: { replyTo?: string; replyInThread?: boolean } }> = []
   const updated: Array<{ messageId: string; card: object }> = []
   const reactions: Array<{ messageId: string; emojiType: string }> = []
   const removedReactions: Array<{ messageId: string; reactionId: string }> = []
+  const cardActionHandlers: Array<(event: CardActionEvent) => void | Promise<void>> = []
   let serial = 0
 
   const channel: FeishuChannel = {
     onMessage: vi.fn(() => () => {}),
+    onCardAction: vi.fn((handler: (event: CardActionEvent) => void | Promise<void>) => {
+      cardActionHandlers.push(handler)
+      return () => {}
+    }),
     botOpenId: () => 'bot-open-id',
     connect: vi.fn(async () => {}),
     disconnect: vi.fn(async () => {}),
@@ -310,7 +325,12 @@ export function makeChannel(options: FakeChannelOptions = {}): FeishuChannel & {
     }),
     threadIdOfMessage: options.threadIdOfMessage ?? (async () => `omt_${serial}`),
   }
-  return Object.assign(channel, { sent, updated, reactions, removedReactions })
+  return Object.assign(channel, {
+    sent, updated, reactions, removedReactions, cardActionHandlers,
+    fireCardAction: async (event: CardActionEvent) => {
+      for (const handler of cardActionHandlers) await handler(event)
+    },
+  })
 }
 
 export function makeMessage(partial: Partial<Omit<NormalizedMessage, 'content'>> & { content: string }): NormalizedMessage {

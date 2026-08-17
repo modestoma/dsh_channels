@@ -9,8 +9,8 @@ import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { FeishuService } from '../src/service.ts'
 import type { FeishuConfig } from '../src/config.ts'
-import type { ChannelFactory, FeishuChannel, NormalizedMessage } from '../src/feishu-channel.ts'
-import type { AgentHandle, SessionId } from '../src/dsh-types.ts'
+import type { CardActionEvent, ChannelFactory, FeishuChannel, NormalizedMessage } from '../src/feishu-channel.ts'
+import type { AgentHandle, ApprovalOutcome, SessionId } from '../src/dsh-types.ts'
 import {
   makeHostContext, makeChannel, makeMessage, makeAgentPresets, makeSession, makeAgent,
 } from './helpers.ts'
@@ -34,13 +34,21 @@ function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
     // GC disabled by default in tests: restart scenarios rely on routes
     // surviving, and GC tests opt in with explicit TTLs.
     routeTtlMs: 0,
+    approvalTimeoutMs: 300_000,
     ...partial,
   }
 }
 
 interface Harness {
   service: FeishuService
-  channel: FeishuChannel & { sent: unknown[]; updated: unknown[]; reactions: unknown[]; removedReactions: unknown[] }
+  channel: FeishuChannel & {
+    sent: unknown[]
+    updated: unknown[]
+    reactions: unknown[]
+    removedReactions: unknown[]
+    cardActionHandlers: Array<(event: CardActionEvent) => void | Promise<void>>
+    fireCardAction: (event: CardActionEvent) => Promise<void>
+  }
   factoryCalls: unknown[]
   onMessage: (msg: NormalizedMessage) => Promise<void>
   ctxState: ReturnType<typeof makeHostContext>
@@ -1013,5 +1021,106 @@ describe('FeishuService', () => {
       expect(entries.map(([key]) => key)).toEqual(['om_msg_new'])
     })
     await service.shutdown()
+  })
+})
+
+describe('HITL approval wiring', () => {
+  it('registers a prepend approval answerer and card-action routing', async () => {
+    const h = await setup()
+    expect(h.ctxState.approvalListeners).toHaveLength(1)
+    expect(h.ctxState.approvalListeners[0]!.options).toEqual({ prepend: true })
+    expect(h.channel.cardActionHandlers).toHaveLength(1)
+    await h.service.shutdown()
+  })
+
+  it('answers a routed session\'s approval through a decision card, owner-gated', async () => {
+    const h = await setup()
+    const msg = makeMessage({
+      chatType: 'group', chatId: 'oc_approval', senderId: 'ou_owner', content: '审批一下',
+    })
+    await h.onMessage(msg)
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    const { listener } = h.ctxState.approvalListeners[0]!
+    const next = vi.fn(async () => 'unavailable' as ApprovalOutcome)
+    const pending = listener({
+      agent,
+      toolName: 'bash',
+      reason: '写入工作区之外的文件',
+      signal: undefined,
+    }, next)
+
+    // The decision card lands as its own message (2nd send, after the stream card).
+    await waitUntil(() => {
+      const index = h.channel.sent.findIndex(s => {
+        const input = (s as { input: object }).input
+        return 'card' in input && JSON.stringify((input as { card: object }).card).includes('需要你的审批')
+      })
+      expect(index).toBeGreaterThanOrEqual(0)
+    })
+    const approvalIndex = h.channel.sent.findIndex(s => {
+      const input = (s as { input: object }).input
+      return 'card' in input && JSON.stringify((input as { card: object }).card).includes('需要你的审批')
+    })
+    expect(next).not.toHaveBeenCalled()
+    const sentOptions = (h.channel.sent[approvalIndex] as { options?: { replyTo?: string; replyInThread?: boolean } }).options
+    expect(sentOptions?.replyInThread).toBe(true)
+    const approvalMessageId = `om_${approvalIndex + 1}`
+
+    // A stranger's click changes nothing.
+    await h.channel.fireCardAction({
+      messageId: approvalMessageId,
+      chatId: 'oc_approval',
+      operator: { openId: 'ou_stranger' },
+      action: { value: { decision: 'allow' }, tag: 'button' },
+    })
+    await flush()
+    expect(h.channel.updated.some(update =>
+      (update as { messageId: string }).messageId === approvalMessageId
+      && JSON.stringify((update as { card: object }).card).includes('已允许执行'),
+    )).toBe(false)
+
+    // The owner's 允许 settles the question and patches the card terminal.
+    await h.channel.fireCardAction({
+      messageId: approvalMessageId,
+      chatId: 'oc_approval',
+      operator: { openId: 'ou_owner' },
+      action: { value: { decision: 'allow' }, tag: 'button' },
+    })
+    await expect(pending).resolves.toBe('allowed-once')
+    await waitUntil(() => expect(h.channel.updated.some(update =>
+      (update as { messageId: string }).messageId === approvalMessageId
+      && JSON.stringify((update as { card: object }).card).includes('已允许执行'),
+    )).toBe(true))
+    await h.service.shutdown()
+  })
+
+  it('delegates approval requests for sessions the channel does not route', async () => {
+    const h = await setup()
+    const { listener } = h.ctxState.approvalListeners[0]!
+    const foreign = makeAgent(makeSession('sess-foreign'))
+    const next = vi.fn(async () => 'unavailable' as ApprovalOutcome)
+    await expect(listener({ agent: foreign, toolName: 'bash' }, next)).resolves.toBe('unavailable')
+    expect(next).toHaveBeenCalled()
+    expect(h.channel.sent).toHaveLength(0)
+    await h.service.shutdown()
+  })
+
+  it('withdraws in-flight approvals on shutdown', async () => {
+    const h = await setup()
+    const msg = makeMessage({
+      chatType: 'group', chatId: 'oc_shutdown', senderId: 'ou_owner', content: '先问后关',
+    })
+    await h.onMessage(msg)
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    const { listener } = h.ctxState.approvalListeners[0]!
+    const pending = listener({
+      agent, toolName: 'bash', reason: '关机前问一句', signal: undefined,
+    }, vi.fn(async () => 'unavailable' as ApprovalOutcome))
+    await waitUntil(() => expect(h.channel.sent.length).toBe(2))
+    await h.service.shutdown()
+    await expect(pending).resolves.toBe('cancelled')
   })
 })

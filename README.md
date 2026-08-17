@@ -6,6 +6,7 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 - 收到触发消息：立刻加 **“Typing”** 表情 → 以话题形式回复（**创建话题**）→ 绑定 DSH session → 卡片 2.0 **流式回复** → 结束移除 “Typing”、更新为 **“DONE”**
 - 话题内后续消息**无需再 @**，自动延续该 session
 - 工作区归属：私聊一人一工作区；群里**每个用户各自一个工作区**（同群不同用户互不影响）
+- **HITL 审批**：当模型请求需要授权的动作（如 bash 沙箱升级 `sandbox_permissions`）时，插件监听主机 `approval/request` 事件，在同一话题里**新发一张独立审批决策卡**（✅ 允许 / ❌ 拒绝 按钮），用户点击后回填主机审批结果；超时（`approvalTimeoutMs`，默认 5 分钟）自动拒绝（fail-closed），非会话发起人点击无效
 - 全部基于飞书官方 SDK [`@larksuiteoapi/node-sdk`](https://www.npmjs.com/package/@larksuiteoapi/node-sdk)（WebSocket 长连接，免公网）
 
 设计与可行性论证见 [docs/feasibility-and-design.md](docs/feasibility-and-design.md)。
@@ -33,8 +34,9 @@ src/
 ├── dsh-types.ts       # DSH 宿主表面的最小类型桥（无运行时依赖）
 ├── feishu-channel.ts  # 官方 SDK Channel 模块适配（可注入 stub）
 ├── service.ts         # 路由 / 工作区 / session 编排
+├── approvals.ts       # HITL 审批应答器（approval/request → 决策卡）
 ├── streamer.ts        # session/event → 卡片快照，500ms 节流 patch
-├── cards.ts           # 卡片 2.0 JSON 纯函数渲染
+├── cards.ts           # 卡片 2.0 JSON 纯函数渲染（含审批决策卡）
 ├── stats.ts           # session 累计 token / 缓存命中 / 上下文折叠
 ├── domain.ts          # storageDomain 路由表（thread_id → sessionId）
 └── workspaces.ts      # (chat, user) → 工作区目录
@@ -68,6 +70,7 @@ DSH_HOME=$DSH_HOME pnpm dsh plugin --profile web add dsh-channels@file:/path/to/
         dmMode: 'open'
         threadFallback: 'degrade'           # 话题被拒时降级为会话级路由
         routeTtlMs: 2592000000              # 路由表 GC 阈值：30 天无活动即清理（默认；0 = 关闭）
+        approvalTimeoutMs: 300000           # HITL 审批决策卡等待时长（默认 5 分钟；超时自动拒绝）
         loggerLevel: 'info'
 ```
 
@@ -95,6 +98,7 @@ FEISHU_APP_SECRET: xxxxxxxx
    - `im:message`（获取与发送单聊、群组消息）
    - `im:message.p2p_msg:readonly`（读取用户发给机器人的单聊消息）
    - 事件：**接收消息 im.message.receive_v1**（含“接收群聊中 @ 机器人消息”）
+   - 回调：**卡片回传交互 card.action.trigger**（HITL 审批按钮的回传事件，同样走长连接）
    - `im:message.reactions:write_only`（发送、删除消息表情回复）
    - `im:message:update`（更新卡片）
 3. 事件订阅方式选**长连接**（WebSocket，免公网）。
@@ -109,6 +113,7 @@ FEISHU_APP_SECRET: xxxxxxxx
 - **重启修复（流式中断）**：每条正在流式的 turn 会把自己的修复凭据（trigger 消息、Typing reaction id、全部段卡 id）写入 `channels_routes` 域的 `inflight` 表（键 = 主卡 message id，turn 结束即删）。重启后长连接一建立，插件就把上一实例留下的中途卡片 patch 成「⚠️ 服务已重启，本次回复中断，请重新发送消息。」终态并补 DONE 表情；patch 失败重试一次（上限 2 次）后放弃。持久化盘点与缺口清单见 [docs/persistence.md](docs/persistence.md)。
 - **消息去重（WS 重投幂等）**：飞书长连接重连会重投未 ack 的事件；每条消息在任何副作用之前先落一条 `processed` 记录（键 = message id，飞书全局唯一），重投消息被直接丢弃——同进程靠内存守卫、跨重启靠持久化记录，每条消息至多处理一次。记录保留 24 小时后由 GC 清扫。
 - **路由表 GC**：超过 `routeTtlMs`（默认 30 天）无活动的路由记录（被删除的话题永远不会再出现）与陈年 in-flight 快照在启动时及每 6 小时被清扫；只删插件自己的路由条目，DSH session 与工作区不动，被 GC 的话题后来再有消息等同新话题。`routeTtlMs: 0` 关闭 GC。
+- **HITL 审批**：插件以 `prepend: true` 注册为宿主 `approval/request` 瀑布的应答者——本频道路由的 session 的审批请求**优先于** Web 网关的通用应答（其面板对飞书用户不可见），非本频道的请求原样 `next()` 交给其他应答者。审批卡是**独立消息**（锚定到该 session 最新流式卡、同话题），绝不嵌入流式卡（其全量替换 patch 会冲掉按钮）。待审批时允许/拒绝按钮以两列等宽方式排列在同一行；决策仅在会话发起人点击时生效：允许 → `allowed-once`、拒绝 → `rejected`、超时 → `rejected`（fail-closed，卡面显示「已超时」）、请求被撤回（abort）→ `cancelled`、卡片发送失败 → `unavailable`（fail-closed）；每次决策后卡片更新为终态并移除两个按钮。审批记录（`approval/asked`/`decided`）由宿主会话日志负责，插件不做持久化——重启后遗留问题随 turn 消亡，与 Web 网关一致。需要飞书应用订阅 **card.action.trigger** 回调（见「飞书侧准备」）；启动日志 `HITL 审批应答已就绪` 表示生效，`主机未挂载 approval 服务` 表示该部署未启用 HITL。
 - **表情**：`Typing` 与 `DONE` 均为飞书**官方内置**表态表情（emoji_type 即 `"Typing"`/`"DONE"`），无需上传自定义表情。
 - **限频**：卡片更新单条消息 5 QPS、应用级 1000 次/分钟；500ms（2 QPS）默认安全，`refreshMs` 下限 200ms；活动状态行的保活心跳默认 5s（`statusRefreshMs` 下限 1s），远低于限频。
 - **卡片体积**：单卡片 JSON 目标 ≤ 28 KB（飞书上限 30 KB，留 2 KB 冗余）；正文超长自动分段为多张续卡（按段落/标题/代码块边界切分，每卡 ≤ 5 个表格，全文保留），推理内容按剩余预算截断（正文优先）。

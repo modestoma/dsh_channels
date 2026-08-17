@@ -18,6 +18,7 @@ function channel(): FeishuChannel & { updated: Array<{ messageId: string; card: 
   const updated: Array<{ messageId: string; card: object }> = []
   return {
     onMessage: vi.fn(() => () => {}),
+    onCardAction: vi.fn(() => () => {}),
     botOpenId: () => 'bot',
     connect: vi.fn(async () => {}),
     disconnect: vi.fn(async () => {}),

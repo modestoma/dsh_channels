@@ -23,6 +23,9 @@ export const CREDENTIAL_REF_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
 /** Default route-table GC threshold: 30 days without activity. */
 export const DEFAULT_ROUTE_TTL_MS = 30 * 24 * 60 * 60 * 1000
 
+/** Default HITL approval decision window: 5 minutes per question. */
+export const DEFAULT_APPROVAL_TIMEOUT_MS = 5 * 60 * 1000
+
 /** A credential reference: `FEISHU_APP_ID`-style name resolved through ctx.credentials. */
 const credentialRefSchema = z.string().regex(
   CREDENTIAL_REF_PATTERN,
@@ -84,6 +87,13 @@ export const configSchema = z.object({
    * and workspace stay untouched. `0` disables GC entirely.
    */
   routeTtlMs: z.number().int().min(0).default(DEFAULT_ROUTE_TTL_MS),
+  /**
+   * HITL approval decision window: how long one approval decision card waits
+   * for an 允许/拒绝 click before failing closed (`rejected`; the card is
+   * patched to 已超时). The pending turn is blocked while the question is
+   * open, so the window trades user think-time against agent stall time.
+   */
+  approvalTimeoutMs: z.number().int().min(10_000).max(3_600_000).default(DEFAULT_APPROVAL_TIMEOUT_MS),
 })
 
 export type FeishuConfig = z.infer<typeof configSchema>

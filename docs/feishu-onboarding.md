@@ -25,6 +25,7 @@
    > 卡片更新接口本身支持 `im:message` 一项即可，但建议把 `im:message:update` 也加上，避免组合差异。
 4. **事件与回调** → 事件订阅方式选择 **使用长连接接收事件**（WebSocket，免公网 IP）。
    - 添加事件：**接收消息 im.message.receive_v1**（勾选“接收群聊中 @ 机器人消息”）。
+   - 添加回调：**卡片回传交互 card.action.trigger**（HITL 审批决策卡的按钮回传，同样走长连接）。
 5. **凭证与基础信息** 页复制 `App ID` 与 `App Secret`。
 6. **版本管理与发布** → 创建版本（权限与事件配置随版本生效）→ 发布。
 7. **可用范围**：把自己（和测试同事）加入可用范围。
@@ -92,6 +93,7 @@ chmod 600 $DSH_HOME/.credentials.yaml
         requireMention: true                # 普通群需 @ 机器人
         dmMode: 'open'                      # 私聊通道开关
         threadFallback: 'degrade'           # 话题被拒时降级为会话级路由
+        approvalTimeoutMs: 300000           # HITL 审批决策卡等待时长（默认 5 分钟）
         loggerLevel: 'info'
 ```
 
@@ -105,6 +107,7 @@ chmod 600 $DSH_HOME/.credentials.yaml
 | `dmMode` | `open` | 私聊开关 |
 | `requireMention` | `true` | 普通群是否需要 @ 机器人（话题内续聊不受影响） |
 | `threadFallback` | `degrade` | 话题回复被拒时：`degrade` 降级为会话级延续 / `strict` 直接失败 |
+| `approvalTimeoutMs` | `300000` | HITL 审批决策卡等待时长（10s–1h）；超时自动拒绝 |
 | `loggerLevel` | `info` | 官方 SDK 日志级别 |
 
 验证组合无误：
@@ -125,7 +128,10 @@ DSH_HOME=$DSH_HOME pnpm dsh web        # 默认 http://127.0.0.1:3080
 
 ```
 [dsh-channels] feishu long connection established, bot open_id: ou_xxxxxxxx
+[dsh-channels] HITL 审批应答已就绪（决策卡片超时 300000 ms）
 ```
+
+> 第二行只在宿主挂载了 `approval` 服务时出现；若显示 `主机未挂载 approval 服务，HITL 审批应答关闭`，说明该部署未启用 HITL（`approval/request` 事件永远不会派发），并非插件故障。
 
 **常见启动失败**：
 
@@ -153,6 +159,15 @@ DSH_HOME=$DSH_HOME pnpm dsh web        # 默认 http://127.0.0.1:3080
 | 7 | 折叠面板 | 点面板标题 | 展开推理内容，右侧箭头翻转向上；再点收起 |
 | 8 | 重启恢复 | 重启 dsh 后在旧话题里发消息 | 机器人懒恢复原 session，token 统计继续累计 |
 | 9 | 降级路径 | 在关闭话题功能的群里 @ 机器人 | 正常回复（普通回复气泡），后续 @ 延续同一 session |
+| 10 | HITL 审批 | 让模型执行需要审批的动作（如提示沙箱升级：`bash` 被沙箱拒绝后带 `sandbox_permissions` 重试） | 同一话题内出现独立的「⚠️ 需要你的审批」卡片（✅ 允许 / ❌ 拒绝）；点允许后卡片变「✅ 已允许执行」且动作继续，点拒绝变「❌ 已拒绝」；不点则到时（默认 5 分钟）变「⏱ 已超时未处理，自动拒绝」 |
+
+### 5.0 HITL 审批验证点（重点）
+
+1. **卡片形态**：审批卡是流式卡之外**新发的独立消息**，锚定在最新流式卡下、同一话题内；流式卡本身不带按钮。
+2. **按钮回传**：待审批时允许/拒绝按钮在同一行等宽排列；点击后卡片立即更新为终态并移除两个按钮。若点击无反应，先核对 §1 第 4 步是否已订阅 **card.action.trigger** 回调并**重新发布版本**（回调订阅随版本生效）。
+3. **归属校验**：群里非发起人点击审批卡：卡片出现「ℹ️ 仅发起该会话的用户可操作此卡片」提示，动作不生效。
+4. **超时**：`approvalTimeoutMs` 内不点 → 卡片变「已超时」，动作被自动拒绝（fail-closed），模型收到拒绝结果后会换路径继续。
+5. **多会话并行**：不同话题的审批互不串扰（每张卡只结算自己的问题）。
 
 ### 5.1 私聊话题验证点（重点）
 
@@ -181,6 +196,8 @@ DSH_HOME=$DSH_HOME pnpm dsh web        # 默认 http://127.0.0.1:3080
 | 错误码 `230071` | 该群不支持话题回复 → 自动降级路径（见 §5.1） |
 | 错误码 `230099`（`parse card json err` / `unknown property, property: elements`） | 卡片结构混用：2.0 声明下把组件放在顶层 `elements`（应在 `body.elements`）。新版插件已改为规范 2.0 结构：重装插件并重启 dsh |
 | 折叠面板不显示 / 正文不是富文本 | 旧版卡片的两个已知问题（`icon.tag: "img"` 非法、1.0 结构 markdown 语法受限），新版插件已切 2.0 结构 + 内置 `standard_icon` 箭头：重装插件并重启 dsh |
+| 审批卡不出现 | 确认该部署启用了 HITL：启动日志应有「HITL 审批应答已就绪」；若显示「主机未挂载 approval 服务」则该部署不会派发审批请求；另外确认当前会话的审批策略不是 `never`（`/permission danger-full-access` 会关闭审批） |
+| 审批卡点击无反应 | 未订阅 **card.action.trigger** 回调（或订阅后未重新发布版本），见 §1 第 4 步；按 §5.0 重新核对 |
 | 错误码 `231001` / `231002` | 表态表情失败：表情名（`Typing`/`DONE`）必须一字不差；机器人需在会话内 |
 
 ## 7. 改代码 → 生效的循环

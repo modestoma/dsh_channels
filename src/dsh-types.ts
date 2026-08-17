@@ -223,6 +223,48 @@ export type SessionEvent =
   | ToolWorkflowAgentEndEvent
   | ToolWorkflowRunEndEvent
 
+// ---- Approval (HITL) surface --------------------------------------------
+
+/**
+ * Closed approval outcomes, mirrored from
+ * `@deepseek-ai/dsh-user-approval/types`: a one-shot grant, explicit
+ * rejection, withdrawn request, or unavailable answerer. Callers fail closed
+ * on anything but `allowed-once`; a missing answerer yields `unavailable`.
+ */
+export type ApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'
+
+/**
+ * Readonly same-process permission question (the payload of the host's
+ * `approval/request` waterfall event). `callId` links to an already-presented
+ * tool call; the plugin only renders `toolName` + `reason` on its decision
+ * card and does not duplicate tool arguments.
+ */
+export interface ApprovalRequest {
+  /** The agent on whose behalf the question is asked (routes + audit). */
+  readonly agent: Agent
+  /** The tool the question is about (model-facing name, e.g. `bash`). */
+  readonly toolName: string
+  /** The exact tool call being decided, when the asker has one. */
+  readonly callId?: string
+  /** The asker's human-readable explanation of WHY it is asking. */
+  readonly reason?: string
+  /**
+   * Aborting withdraws the question: the request settles `'cancelled'` and a
+   * late answer is discarded.
+   */
+  readonly signal?: AbortSignal
+}
+
+/**
+ * One `approval/request` waterfall listener: return an outcome to claim the
+ * request, or delegate by returning `next()`. The first claim occupies the
+ * single decision slot.
+ */
+export type ApprovalAnswererListener = (
+  req: ApprovalRequest,
+  next: () => Promise<ApprovalOutcome>,
+) => Promise<ApprovalOutcome>
+
 // ---- Agent surface ------------------------------------------------------
 
 export interface AgentOptions {
@@ -395,7 +437,20 @@ export interface HostContext {
   logger?: HostLogger
   /** Safe service lookup (returns undefined for absent services). */
   get?(name: string): unknown
-  /** The only host event this plugin subscribes to. */
+  /** Host events this plugin subscribes to (overloads per event). */
   on(name: 'session/event', listener: (session: Session, event: SessionEvent) => void): () => boolean
+  /**
+   * The host's HITL answerer waterfall. Registered with `prepend: true` so
+   * this channel claims its own sessions before generic answerers (the web
+   * gateway); non-owned requests delegate through `next()`. Untagged plugin
+   * contexts receive requests for EVERY agent, so ownership filtering is
+   * mandatory. Safe to register without the approval service mounted — the
+   * event simply never fires.
+   */
+  on(
+    name: 'approval/request',
+    listener: ApprovalAnswererListener,
+    options?: { prepend?: boolean },
+  ): () => boolean
   effect(callback: () => (() => void | Promise<void>) | void): void
 }

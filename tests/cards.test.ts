@@ -9,6 +9,8 @@ import {
   PANEL_CHEVRON_TOKEN,
   PANEL_TITLES,
   TRUNCATION_SUFFIX,
+  buildApprovalCard,
+  buildApprovalSettledCard,
   buildCard,
   cardJsonBytes,
   segmentCardContent,
@@ -16,7 +18,7 @@ import {
   stripTables,
   tableBlocks,
 } from '../src/cards.ts'
-import type { CardState } from '../src/cards.ts'
+import type { ApprovalQuestion, CardState } from '../src/cards.ts'
 
 function baseState(partial: Partial<CardState> = {}): CardState {
   return {
@@ -341,5 +343,118 @@ describe('markdown table handling', () => {
       const pipeLines = (piece.match(/^\s*\|[^\n]*\|/gm) ?? []).length
       expect(pipeLines).toBeLessThanOrEqual(15)
     }
+  })
+})
+
+describe('approval decision cards', () => {
+  const question: ApprovalQuestion = {
+    token: 'tok-1',
+    toolName: 'bash',
+    reason: '需要写入工作区外的文件',
+    timeoutMs: 300_000,
+    sessionId: 'sess-1',
+  }
+
+  function approvalElements(card: object): Array<Record<string, any>> {
+    return (card as unknown as CardShape).body.elements
+  }
+
+  function markdownsOf(card: object): string[] {
+    return approvalElements(card)
+      .filter(element => element.tag === 'markdown')
+      .map(element => element.content as string)
+  }
+
+  function buttonsOf(card: object): Array<Record<string, any>> {
+    const row = approvalElements(card).find(element => element.tag === 'column_set')
+    return row?.columns.flatMap((column: Record<string, any>) =>
+      column.elements.filter((element: Record<string, any>) => element.tag === 'button')) ?? []
+  }
+
+  function notationMarkdownsOf(card: object): string[] {
+    return approvalElements(card)
+      .filter(element => element.tag === 'markdown' && element.text_size === 'notation')
+      .map(element => element.content as string)
+  }
+
+  it('renders the 2.0 structure with question summary and two enabled callback buttons', () => {
+    const card = buildApprovalCard(question) as unknown as CardShape
+    expect(card.schema).toBe('2.0')
+    expect(card.config.width_mode).toBe('fill')
+    expect(approvalElements(card).map(element => element.tag)).toEqual([
+      'markdown', 'markdown', 'markdown', 'hr', 'markdown', 'markdown', 'column_set',
+    ])
+
+    const markdowns = markdownsOf(card)
+    expect(markdowns[0]).toContain('需要你的审批')
+    expect(markdowns[1]).toContain('bash')
+    // The reason renders as its own blockquote markdown line.
+    expect(markdowns[2]).toBe('> 需要写入工作区外的文件')
+    expect(markdowns[3]).toContain('5 分钟')
+    expect(markdowns[3]).toContain('超时自动拒绝')
+    expect(markdowns[4]).toContain('sess-1')
+
+    const actionRow = approvalElements(card).at(-1)!
+    expect(actionRow.tag).toBe('column_set')
+    expect(actionRow.flex_mode).toBe('bisect')
+    expect(actionRow.horizontal_spacing).toBe('medium')
+    expect(actionRow.columns).toHaveLength(2)
+    expect(actionRow.columns.every((column: Record<string, any>) =>
+      column.tag === 'column' && column.width === 'weighted' && column.weight === 1,
+    )).toBe(true)
+
+    const [allow, deny] = buttonsOf(card)
+    expect(allow!.text.content).toBe('✅ 允许')
+    expect(allow!.type).toBe('primary')
+    expect(allow!.width).toBe('fill')
+    expect(allow!.behaviors).toEqual([{ type: 'callback', value: { decision: 'allow', token: 'tok-1' } }])
+    expect(deny!.text.content).toBe('❌ 拒绝')
+    expect(deny!.type).toBe('danger')
+    expect(deny!.width).toBe('fill')
+    expect(deny!.behaviors).toEqual([{ type: 'callback', value: { decision: 'deny', token: 'tok-1' } }])
+
+    expect(notationMarkdownsOf(card)).toContain(markdowns[3]!)
+  })
+
+  it('omits the reason blockquote and session line when absent', () => {
+    const card = buildApprovalCard({ token: 'tok-1', toolName: 'pwsh', timeoutMs: 60_000 })
+    const markdowns = markdownsOf(card)
+    expect(markdowns.join('\n')).not.toContain('sess-')
+    expect(markdowns.some(text => text.startsWith('> '))).toBe(false)
+    expect(notationMarkdownsOf(card)).toEqual([
+      expect.stringContaining('1 分钟'),
+    ])
+  })
+
+  it('adds the owner-only notice when requested', () => {
+    const card = buildApprovalCard(question, { unauthorizedNote: true })
+    const notices = notationMarkdownsOf(card)
+    expect(notices).toHaveLength(3)
+    expect(notices.some(content => content.includes('仅发起该会话的用户'))).toBe(true)
+  })
+
+  it('clips a pathological reason and stays far under the 30 KB cap', () => {
+    const huge = buildApprovalCard({
+      token: 'tok-1',
+      toolName: 'bash',
+      reason: 'x'.repeat(50_000),
+      timeoutMs: 300_000,
+    })
+    expect(cardJsonBytes(huge)).toBeLessThanOrEqual(CARD_MAX_BYTES)
+    expect(cardJsonBytes(huge)).toBeLessThan(5_000)
+  })
+
+  it.each([
+    ['allowed', '已允许执行'],
+    ['denied', '已拒绝'],
+    ['expired', '已超时'],
+    ['cancelled', '已取消'],
+  ] as const)('renders the %s settled variant without decision controls', (state, expected) => {
+    const card = buildApprovalSettledCard(question, state) as unknown as CardShape
+    expect(markdownsOf(card)[0]).toContain(expected)
+    expect(buttonsOf(card)).toHaveLength(0)
+    expect(approvalElements(card).some(element => element.tag === 'column_set')).toBe(false)
+    // The settled card keeps the question summary for context.
+    expect(markdownsOf(card).some(text => text.includes('bash'))).toBe(true)
   })
 })

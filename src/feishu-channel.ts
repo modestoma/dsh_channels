@@ -13,10 +13,27 @@ import type { LarkChannel, NormalizedMessage, SendResult } from '@larksuiteoapi/
 
 export type { NormalizedMessage, SendResult } from '@larksuiteoapi/node-sdk'
 
+/**
+ * One normalized card action (button click) event, as delivered by the
+ * official SDK's `card.action.trigger` handler (card JSON 2.0 callback
+ * behaviors). `messageId` is the card's own message id; `action.value` is the
+ * callback value object the button carried (SDK contract: object values).
+ */
+export interface CardActionEvent {
+  /** Message id of the card the action belongs to. */
+  messageId: string
+  chatId: string
+  operator: { openId: string; userId?: string; name?: string }
+  action: { value: unknown; tag: string; name?: string; option?: string }
+  raw?: unknown
+}
+
 /** The minimal channel surface the plugin consumes. */
 export interface FeishuChannel {
   /** Bound handler for normalized inbound messages. */
   onMessage(handler: (message: NormalizedMessage) => void | Promise<void>): () => void
+  /** Bound handler for card button-callback events. */
+  onCardAction(handler: (event: CardActionEvent) => void | Promise<void>): () => void
   /** Bot open_id, available after `connect()` resolves. */
   botOpenId(): string | undefined
   /** Start the WebSocket long connection (resolves after the handshake). */
@@ -71,6 +88,10 @@ class LarkChannelAdapter implements FeishuChannel {
 
   onMessage(handler: (message: NormalizedMessage) => void | Promise<void>): () => void {
     return this.channel.on('message', handler)
+  }
+
+  onCardAction(handler: (event: CardActionEvent) => void | Promise<void>): () => void {
+    return this.channel.on('cardAction', handler)
   }
 
   botOpenId(): string | undefined {
