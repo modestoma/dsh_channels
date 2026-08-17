@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
-  buildCommandResultCard, commandResultCardKind, parseSlashCommand, registerChannelCommands,
+  armRenewCommand, buildCommandResultCard, commandResultCardKind, parseSlashCommand, registerChannelCommands,
   RouteOperationQueue, supportedCommandList,
 } from '../src/commands.ts'
 import { makeAgent, makeCommandRuntime, makeSession } from './helpers.ts'
@@ -47,6 +47,34 @@ describe('slash command primitives', () => {
       rawInput: ' extra',
       signal: new AbortController().signal,
     })).toEqual({ kind: 'error', text: '用法错误：/work-dir 不接受参数。' })
+  })
+
+  it('requires one armed Feishu admission for /renew and rejects busy inboxes first', async () => {
+    const commands = makeCommandRuntime()
+    registerChannelCommands(commands)
+    const agent = makeAgent(makeSession(), {}, { commands })
+    const signal = new AbortController().signal
+    const invocation = {
+      commandId: 'cmd-renew' as never,
+      agent,
+      rawInput: '',
+      signal,
+    }
+    const handler = commands.definitions.get('renew')!.handler
+    expect(await handler(invocation)).toMatchObject({ kind: 'error', text: expect.stringContaining('已授权') })
+
+    const operation = vi.fn(async () => ({ kind: 'success' as const, text: 'renewed' }))
+    const disarm = armRenewCommand(signal, operation)
+    expect(await handler(invocation)).toEqual({ kind: 'success', text: 'renewed' })
+    expect(operation).toHaveBeenCalledTimes(1)
+    disarm()
+
+    ;(agent.inbox.nextTurn as unknown[]).push({ queued: true })
+    const busyOperation = vi.fn(async () => ({ kind: 'success' as const }))
+    const disarmBusy = armRenewCommand(signal, busyOperation)
+    expect(await handler(invocation)).toMatchObject({ kind: 'error', text: expect.stringContaining('正忙') })
+    expect(busyOperation).not.toHaveBeenCalled()
+    disarmBusy()
   })
 
   it('serializes operations per route without poisoning the queue after failure', async () => {

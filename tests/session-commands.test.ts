@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
-  buildCompactComparisonCard, buildSessionStatusCard, buildWorkDirCard,
+  buildCompactComparisonCard, buildRenewCard, buildSessionStatusCard, buildWorkDirCard,
   compactFailureContext, resolveWorkDir,
 } from '../src/session-commands.ts'
 import { foldAll } from '../src/stats.ts'
@@ -66,6 +66,18 @@ describe('Session command result cards', () => {
     expect(resolveWorkDir(undefined, '/workspace/alice')).toMatchObject({ kind: 'missing' })
     expect(resolveWorkDir('relative', '/workspace/alice')).toMatchObject({ kind: 'missing' })
     expect(JSON.stringify(buildWorkDirCard('session-1', '/workspace/alice'))).toContain('/workspace/alice')
+  })
+
+  it('renders both Session ids and the reused workspace after renew', () => {
+    const json = JSON.stringify(buildRenewCard({
+      previousSessionId: 'session-old',
+      currentSessionId: 'session-new',
+      workspacePath: '/workspace/alice',
+    }))
+    expect(json).toContain('session-old')
+    expect(json).toContain('session-new')
+    expect(json).toContain('/workspace/alice')
+    expect(json).toContain('仍由 Harness 保留')
   })
 
   it('renders compact before/after bars and exact token accounting', () => {

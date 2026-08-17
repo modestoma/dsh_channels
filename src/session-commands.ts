@@ -147,6 +147,25 @@ export function buildWorkDirCard(sessionId: string, workspacePath: string): obje
   ])
 }
 
+export interface RenewCardInput {
+  previousSessionId: string
+  currentSessionId: string
+  workspacePath: string
+}
+
+/** Render the committed route switch without implying that the old log was deleted. */
+export function buildRenewCard(input: RenewCardInput): object {
+  return standaloneCard('**🔄 Session 已续建**', [
+    {
+      tag: 'markdown',
+      content: `**旧 Session**：${input.previousSessionId}\n`
+        + `**新 Session**：${input.currentSessionId}\n`
+        + `**复用工作区**：\`${escapeInlineCode(input.workspacePath)}\``,
+    },
+    { tag: 'markdown', content: '旧 Session 及其日志仍由 Harness 保留。', text_size: 'notation' },
+  ])
+}
+
 function comparisonLine(label: string, tokens: number | undefined, window: number | undefined): string {
   if (tokens === undefined) return `${label}  暂无数据`
   if (window === undefined) return `${label}  ${fmtCount(tokens)} tokens`

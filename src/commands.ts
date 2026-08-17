@@ -94,10 +94,45 @@ const healthHandler: CommandDefinition['handler'] = ({ rawInput }): CommandResul
   return { kind: 'success', text: '健康检查已完成。' }
 }
 
+type RenewOperation = (invocation: Parameters<CommandDefinition['handler']>[0]) =>
+  ReturnType<CommandDefinition['handler']>
+
+/** Per-execution authority: handlers stay instance-neutral when an Agent is borrowed. */
+const RENEW_OPERATIONS = new WeakMap<AbortSignal, RenewOperation>()
+
+const renewHandler: CommandDefinition['handler'] = invocation => {
+  if (invocation.rawInput.trim() !== '') {
+    return { kind: 'error', text: '用法错误：/renew 不接受参数。' }
+  }
+  if (invocation.agent.status !== 'idle'
+    || invocation.agent.inbox.nextTurn.length > 0
+    || invocation.agent.inbox.nextStep.length > 0) {
+    return { kind: 'error', text: '当前 Session 正忙或仍有排队消息，暂时不能续建。' }
+  }
+  const operation = RENEW_OPERATIONS.get(invocation.signal)
+  if (operation === undefined) {
+    return { kind: 'error', text: '/renew 只能通过已授权的飞书话题执行。' }
+  }
+  return operation(invocation)
+}
+
 const READY_HANDLERS: Readonly<Record<string, CommandDefinition['handler']>> = {
   health: healthHandler,
   status: readyHandler('status', 'Session 状态已读取。'),
   'work-dir': readyHandler('work-dir', '工作目录已读取。'),
+  renew: renewHandler,
+}
+
+/** Arm exactly one Feishu-issued `/renew` execution, then return its disarmer. */
+export function armRenewCommand(signal: AbortSignal, operation: RenewOperation): () => void {
+  RENEW_OPERATIONS.set(signal, operation)
+  return () => { RENEW_OPERATIONS.delete(signal) }
+}
+
+/** Install only `/renew` into a borrowed Agent scope that lacks channel commands. */
+export function registerRenewCommand(commands: CommandRuntime): () => void {
+  const descriptor = DESCRIPTORS.find(entry => entry.name === 'renew')!
+  return commands.register({ ...descriptor, handler: renewHandler })
 }
 
 /**

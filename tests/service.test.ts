@@ -12,6 +12,7 @@ import type { FeishuConfig } from '../src/config.ts'
 import type { CardActionEvent, ChannelFactory, FeishuChannel, NormalizedMessage } from '../src/feishu-channel.ts'
 import { CordisFiberState } from '../src/dsh-types.ts'
 import type { AgentHandle, ApprovalOutcome, CordisPluginRuntime, SessionId } from '../src/dsh-types.ts'
+import type { RouteRecord } from '../src/domain.ts'
 import {
   makeHostContext, makeChannel, makeMessage, makeAgentPresets, makeSession, makeAgent,
 } from './helpers.ts'
@@ -473,6 +474,240 @@ describe('FeishuService', () => {
 
     expect(JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)).toContain('未挂载 Harness 原生 /compact')
     expect(agent.session.events).toHaveLength(0)
+  })
+
+  it('renews the topic atomically, preserves history, and routes the next message only to the new Session', async () => {
+    const h = await setup({}, {}, { defaultId: 'standard' })
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_renew', senderId: 'ou_owner',
+      messageId: 'om_renew_start', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const old = h.ctxState.agents.created[0]!
+    let disposedAfterCommandDone = false
+    mock(old.handle.dispose).mockImplementationOnce(async () => {
+      disposedAfterCommandDone = old.handle.agent.session.events.at(-1)?.type === 'command/done'
+      h.ctxState.agents.liveAgents.delete(old.options.sessionId)
+    })
+    ;(old.handle.agent.session.events as unknown as Array<Record<string, unknown>>).push({
+      type: 'agent-preset/selected', seq: 0, time: 1, data: { agentPreset: 'minimal' },
+    })
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_renew', senderId: 'ou_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_renew_command', content: '/renew',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
+
+    const renewed = h.ctxState.agents.created[1]!
+    const route = h.ctxState.domain.raw.table('routes').get('omt_1') as RouteRecord
+    expect(route.sessionId).toBe(renewed.options.sessionId)
+    expect(route.sessionHistory?.map(entry => entry.sessionId)).toEqual([
+      old.options.sessionId, renewed.options.sessionId,
+    ])
+    expect(renewed.options.meta).toMatchObject({
+      cwd: route.workspacePath,
+      agentPreset: 'minimal',
+    })
+    expect(renewed.options.agentOptions).toEqual(old.handle.agent.options)
+    expect(mock(old.handle.dispose)).toHaveBeenCalledTimes(1)
+    expect(disposedAfterCommandDone).toBe(true)
+    expect(old.handle.agent.session.events.slice(-2).map(event => event.type)).toEqual([
+      'command/run', 'command/done',
+    ])
+    expect(old.handle.agent.session.events.at(-1)).toMatchObject({
+      type: 'command/done', data: { kind: 'success' },
+    })
+    const workspace = h.ctxState.workspaces.workspaces.get(route.workspacePath)!
+    expect(mock(workspace.attachSession)).toHaveBeenLastCalledWith(renewed.options.sessionId)
+
+    const resultCard = JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)
+    expect(resultCard).toContain(old.options.sessionId)
+    expect(resultCard).toContain(renewed.options.sessionId)
+    expect(resultCard).toContain(route.workspacePath)
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_renew', senderId: 'ou_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_after_renew', content: '只进入新会话',
+    }))
+    await waitUntil(() => expect(mock(renewed.handle.agent.followup)).toHaveBeenCalledTimes(1))
+    expect(mock(old.handle.agent.followup)).toHaveBeenCalledTimes(1)
+  })
+
+  it.each(['running', 'next-turn', 'next-step'] as const)(
+    'rejects /renew while the old Agent has %s work without creating a Session',
+    async busyKind => {
+      const h = await setup()
+      await h.onMessage(makeMessage({
+        chatType: 'group', chatId: 'oc_renew_busy', senderId: 'ou_owner', content: '开始',
+      }))
+      await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+      const agent = h.ctxState.agents.created[0]!.handle.agent
+      if (busyKind === 'running') Object.defineProperty(agent, 'status', { value: 'running' })
+      if (busyKind === 'next-turn') (agent.inbox.nextTurn as unknown[]).push({ queued: true })
+      if (busyKind === 'next-step') (agent.inbox.nextStep as unknown[]).push({ queued: true })
+
+      await h.onMessage(makeMessage({
+        chatType: 'group', chatId: 'oc_renew_busy', senderId: 'ou_owner', threadId: 'omt_1',
+        mentionedBot: false, content: '/renew',
+      }))
+      await waitUntil(() => expect(agent.session.events.at(-1)).toMatchObject({
+        type: 'command/done', data: { kind: 'error' },
+      }))
+
+      expect(h.ctxState.agents.created).toHaveLength(1)
+      expect(JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)).toContain('会话正忙')
+      expect(agent.session.events.at(-1)).toMatchObject({
+        type: 'command/done', data: { kind: 'error' },
+      })
+      expect(mock(h.ctxState.agents.created[0]!.handle.dispose)).not.toHaveBeenCalled()
+    },
+  )
+
+  it('rolls back a failed renewed Agent creation and keeps the old route live', async () => {
+    const agentsOptions: FakeAgentsOptions = {}
+    const h = await setup({}, {}, undefined, agentsOptions)
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_renew_create_fail', senderId: 'ou_owner', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const old = h.ctxState.agents.created[0]!
+    agentsOptions.failCreate = new Error('simulated renewed create failure')
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_renew_create_fail', senderId: 'ou_owner', threadId: 'omt_1',
+      mentionedBot: false, content: '/renew',
+    }))
+    await waitUntil(() => expect(old.handle.agent.session.events.at(-1)).toMatchObject({
+      type: 'command/done', data: { kind: 'error' },
+    }))
+
+    const route = h.ctxState.domain.raw.table('routes').get('omt_1') as RouteRecord
+    expect(route.sessionId).toBe(old.options.sessionId)
+    expect(h.ctxState.agents.created).toHaveLength(1)
+    expect(mock(old.handle.dispose)).not.toHaveBeenCalled()
+    expect(old.handle.agent.session.events.at(-1)).toMatchObject({
+      type: 'command/done', data: { kind: 'error' },
+    })
+    expect(JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)).toContain('原 Session 仍保持绑定')
+  })
+
+  it('rolls back workspace attachment and the new handle when route commit fails', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_renew_route_fail', senderId: 'ou_owner', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const old = h.ctxState.agents.created[0]!
+    mock(h.ctxState.domain.raw.table('routes').put).mockRejectedValueOnce(new Error('route write failed'))
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_renew_route_fail', senderId: 'ou_owner', threadId: 'omt_1',
+      mentionedBot: false, content: '/renew',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
+
+    const failed = h.ctxState.agents.created[1]!
+    const route = h.ctxState.domain.raw.table('routes').get('omt_1') as RouteRecord
+    const workspace = h.ctxState.workspaces.workspaces.get(route.workspacePath)!
+    expect(route.sessionId).toBe(old.options.sessionId)
+    expect(mock(failed.handle.dispose)).toHaveBeenCalledTimes(1)
+    expect(mock(workspace.detachSession)).toHaveBeenCalledWith(failed.options.sessionId)
+    expect(mock(old.handle.dispose)).not.toHaveBeenCalled()
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_renew_route_fail', senderId: 'ou_owner', threadId: 'omt_1',
+      mentionedBot: false, content: '仍进入旧会话',
+    }))
+    await waitUntil(() => expect(mock(old.handle.agent.followup)).toHaveBeenCalledTimes(2))
+  })
+
+  it('keeps the renewed route usable when both result-card deliveries fail', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_renew_card_fail', senderId: 'ou_owner', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const old = h.ctxState.agents.created[0]!
+    h.channel.send = vi.fn(async () => { throw new Error('result delivery failed') })
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_renew_card_fail', senderId: 'ou_owner', threadId: 'omt_1',
+      mentionedBot: false, content: '/renew',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
+
+    const renewed = h.ctxState.agents.created[1]!
+    const route = h.ctxState.domain.raw.table('routes').get('omt_1') as RouteRecord
+    expect(route.sessionId).toBe(renewed.options.sessionId)
+    expect(mock(old.handle.dispose)).toHaveBeenCalledTimes(1)
+    expect(h.ctxState.agents.liveAgents.get(renewed.options.sessionId)?.agent).toBe(renewed.handle.agent)
+  })
+
+  it('resumes the renewed Session with complete history after a restart', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_renew_restart', senderId: 'ou_owner', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const oldSessionId = h.ctxState.agents.created[0]!.options.sessionId
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_renew_restart', senderId: 'ou_owner', threadId: 'omt_1',
+      mentionedBot: false, content: '/renew',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
+    const renewedSessionId = h.ctxState.agents.created[1]!.options.sessionId
+    await h.service.shutdown()
+
+    const channel = makeChannel()
+    const service = new FeishuService(h.ctxState.ctx, h.config, () => channel)
+    await service.start()
+    const handlers = (channel.onMessage as unknown as ReturnType<typeof vi.fn>).mock.calls
+    const onMessage = handlers.at(-1)?.[0] as (msg: NormalizedMessage) => Promise<void> | undefined
+    await onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_renew_restart', senderId: 'ou_owner', threadId: 'omt_1',
+      mentionedBot: false, content: '重启后继续',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.resumed).toHaveLength(1))
+
+    expect(h.ctxState.agents.resumed[0]!.options.resumeSessionId).toBe(renewedSessionId)
+    const route = h.ctxState.domain.raw.table('routes').get('omt_1') as RouteRecord
+    expect(route.sessionHistory?.map(entry => entry.sessionId)).toEqual([oldSessionId, renewedSessionId])
+    await service.shutdown()
+  })
+
+  it('renews through a borrowed external Agent without disposing its owner handle', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_renew_borrowed', senderId: 'ou_owner', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const route = h.ctxState.domain.raw.table('routes').get('omt_1') as RouteRecord
+    await h.service.shutdown()
+
+    const foreignDispose = vi.fn(async () => {})
+    const foreignAgent = makeAgent(makeSession(route.sessionId, route.workspacePath), {
+      provider: 'borrowed-provider', model: 'borrowed-model',
+    })
+    h.ctxState.agents.liveAgents.set(route.sessionId, { agent: foreignAgent, dispose: foreignDispose })
+
+    const channel = makeChannel()
+    const service = new FeishuService(h.ctxState.ctx, h.config, () => channel)
+    await service.start()
+    const handlers = (channel.onMessage as unknown as ReturnType<typeof vi.fn>).mock.calls
+    const onMessage = handlers.at(-1)?.[0] as (msg: NormalizedMessage) => Promise<void> | undefined
+    await onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_renew_borrowed', senderId: 'ou_owner', threadId: 'omt_1',
+      mentionedBot: false, content: '/renew',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
+
+    const renewed = h.ctxState.agents.created[1]!
+    expect(renewed.options.agentOptions).toEqual(foreignAgent.options)
+    expect((h.ctxState.domain.raw.table('routes').get('omt_1') as RouteRecord).sessionId)
+      .toBe(renewed.options.sessionId)
+    expect(foreignDispose).not.toHaveBeenCalled()
+    await service.shutdown()
   })
 
   it('resolves app credentials through the host credentials seam', async () => {

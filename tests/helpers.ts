@@ -21,10 +21,17 @@ import type { RawDomainHandle } from '../src/domain.ts'
 export function makeSession(
   id = `session-${Math.random().toString(36).slice(2, 10)}`,
   cwd?: string,
+  agentPreset?: string,
 ): Session {
   return {
     id: id as SessionId,
-    header: { version: 0, id: id as SessionId, createdAt: Date.now(), ...(cwd === undefined ? {} : { cwd }) },
+    header: {
+      version: 0,
+      id: id as SessionId,
+      createdAt: Date.now(),
+      ...(cwd === undefined ? {} : { cwd }),
+      ...(agentPreset === undefined ? {} : { agentPreset }),
+    },
     events: [],
     firstLiveSeq: 0,
   }
@@ -131,7 +138,7 @@ export function makeAgentRegistry(fail: FakeAgentsOptions = {}): {
       // creation back.
       const setupCtx: AgentContext = { commands: makeCommandRuntime() }
       await options.setup?.(setupCtx)
-      const session = makeSession(options.sessionId, options.meta?.cwd)
+      const session = makeSession(options.sessionId, options.meta?.cwd, options.meta?.agentPreset)
       const agent = makeAgent(session, options.agentOptions, setupCtx)
       const handle: AgentHandle = { agent, dispose: vi.fn(async () => { liveAgents.delete(options.sessionId) }) }
       liveAgents.set(options.sessionId, handle)
@@ -170,6 +177,7 @@ export function makeWorkspaceRegistry(): { registry: WorkspaceRegistry; workspac
         path: dir,
         title: title ?? path.basename(dir),
         attachSession: vi.fn(),
+        detachSession: vi.fn(),
       }
       workspaces.set(dir, workspace)
       return workspace

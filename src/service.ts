@@ -20,6 +20,8 @@ import type { ApprovalRoute } from './approvals.ts'
 import type {
   Agent,
   AgentHandle,
+  CommandInvocation,
+  CommandResult,
   AgentPresets,
   AgentSetup,
   CredentialProvider,
@@ -34,11 +36,13 @@ import type {
 import { buildCard, buildInterruptionCard } from './cards.ts'
 import type { CardState } from './cards.ts'
 import {
-  buildCommandResultCard, commandResultCardKind, isSupportedCommand, parseSlashCommand,
-  registerChannelCommands, RouteOperationQueue, supportedCommandList,
+  armRenewCommand, buildCommandResultCard, commandResultCardKind, isSupportedCommand, parseSlashCommand,
+  registerChannelCommands, registerRenewCommand, RouteOperationQueue, supportedCommandList,
 } from './commands.ts'
 import type { CommandCardState } from './commands.ts'
-import { chatRouteKey, feishuDomain } from './domain.ts'
+import {
+  appendSessionHistory, chatRouteKey, feishuDomain, normalizeRouteRecord,
+} from './domain.ts'
 import type {
   FeishuDomainGlobal, FeishuDomainHandle, InflightSnapshot, ProcessedRecord, RawDomainHandle, RouteRecord,
 } from './domain.ts'
@@ -46,14 +50,14 @@ import type { ChannelFactory, FeishuChannel, NormalizedMessage } from './feishu-
 import { buildHealthCard, foldHealthSnapshot, HEALTH_DEPENDENCY_NAMES } from './health.ts'
 import type { HealthDependencyName, HealthSnapshot } from './health.ts'
 import {
-  buildCompactComparisonCard, buildSessionStatusCard, buildWorkDirCard,
+  buildCompactComparisonCard, buildRenewCard, buildSessionStatusCard, buildWorkDirCard,
   compactFailureContext, resolveWorkDir,
 } from './session-commands.ts'
 import { foldAll, measureSessionContext } from './stats.ts'
 import type { ContextMeasurement, ContextServices } from './stats.ts'
 import { ACTIVITY_BUILD_MARKER, TurnStreamer } from './streamer.ts'
 import type { StreamerHooks } from './streamer.ts'
-import { ensureWorkspace } from './workspaces.ts'
+import { ensureWorkspace, workspaceTitleFor } from './workspaces.ts'
 import type { FeishuConfig } from './config.ts'
 
 /** Periodic route-GC sweep cadence (a long-running instance also accumulates
@@ -77,6 +81,18 @@ export function feishuUserMessage(text: string): UserMessage {
 interface LiveAgent {
   agent: Agent
   handle: AgentHandle
+}
+
+interface RenewCommit {
+  previous: RouteRecord
+  current: RouteRecord
+  oldLive: LiveAgent
+}
+
+interface RenewAdmission {
+  route: RouteRecord
+  live: LiveAgent
+  commit?: RenewCommit
 }
 
 /**
@@ -250,7 +266,7 @@ export class FeishuService {
 
     this.domain = await openFeishuDomain(this.ctx)
     for (const [key, record] of this.domain.routes.entries()) {
-      this.routeCache.set(key, record)
+      this.routeCache.set(key, normalizeRouteRecord(record))
     }
 
     // HITL: answer the host's approval/request waterfall for sessions this
@@ -502,8 +518,14 @@ export class FeishuService {
       await this.withCommandReaction(msg, async () => {
         try {
           const live = await this.ensureLiveAgent(current)
-          const definition = this.ctx.commands.find(live.agent, parsed.name)
+          let definition = this.ctx.commands.find(live.agent, parsed.name)
+          let unregisterBorrowedRenew: (() => void) | undefined
+          if (definition === undefined && parsed.name === 'renew') {
+            unregisterBorrowedRenew = registerRenewCommand(live.agent.ctx.commands)
+            definition = this.ctx.commands.find(live.agent, parsed.name)
+          }
           if (definition === undefined) {
+            unregisterBorrowedRenew?.()
             const text = parsed.name === 'compact'
               ? '当前部署未挂载 Harness 原生 /compact 命令。'
               : `当前 Session 未挂载 /${parsed.name} 命令。`
@@ -516,7 +538,28 @@ export class FeishuService {
           const compactBefore = parsed.name === 'compact'
             ? await this.measureCommandContext(live.agent.session)
             : undefined
-          const execution = await this.ctx.commands.execute(live.agent, line, new AbortController().signal)
+          const controller = new AbortController()
+          const renewAdmission: RenewAdmission | undefined = parsed.name === 'renew'
+            ? { route: current, live }
+            : undefined
+          const disarmRenew = renewAdmission === undefined
+            ? undefined
+            : armRenewCommand(
+                controller.signal,
+                invocation => this.runRenewCommand(invocation, renewAdmission),
+              )
+          let execution
+          try {
+            execution = await this.ctx.commands.execute(live.agent, line, controller.signal)
+          } finally {
+            disarmRenew?.()
+            unregisterBorrowedRenew?.()
+            if (renewAdmission !== undefined) {
+              if (renewAdmission.commit !== undefined) {
+                await this.releaseRenewedAgent(renewAdmission.commit)
+              }
+            }
+          }
           if (execution === undefined) {
             await this.sendCommandCard(msg, {
               kind: 'unavailable', command: parsed.name,
@@ -525,6 +568,14 @@ export class FeishuService {
             return
           }
           const result = execution.result
+          if (parsed.name === 'renew' && result.kind === 'success' && renewAdmission?.commit !== undefined) {
+            await this.sendStandaloneCard(msg, buildRenewCard({
+              previousSessionId: renewAdmission.commit.previous.sessionId,
+              currentSessionId: renewAdmission.commit.current.sessionId,
+              workspacePath: renewAdmission.commit.current.workspacePath,
+            }))
+            return
+          }
           if (parsed.name === 'health' && result.kind === 'success') {
             await this.sendHealthCard(msg)
             return
@@ -719,13 +770,15 @@ export class FeishuService {
     const cached = this.routeCache.get(key)
     if (cached !== undefined) return cached
     const stored = this.domain?.routes.get(key)
-    if (stored !== undefined) this.routeCache.set(key, stored)
-    return stored
+    if (stored === undefined) return undefined
+    const normalized = normalizeRouteRecord(stored)
+    this.routeCache.set(key, normalized)
+    return normalized
   }
 
   private async persistRoute(key: string, record: RouteRecord): Promise<void> {
-    this.routeCache.set(key, record)
     await this.domain?.routes.put(key, record)
+    this.routeCache.set(key, normalizeRouteRecord(record))
   }
 
   // ---- in-flight turn snapshots (restart repair) -------------------------
@@ -1020,21 +1073,134 @@ export class FeishuService {
    * Deployments without a preset roster compose nothing: their tools live in
    * the host composition and the agent already sees them.
    */
-  private async resolvePresetComposition(): Promise<PresetComposition> {
+  private async resolvePresetComposition(
+    requestedPreset: string | undefined = this.config.agentPreset,
+    useRosterDefault = true,
+  ): Promise<PresetComposition> {
     // Read through ctx.get (safe lookup): only the web profile ships a roster,
     // and direct property access on a cordis context throws for services the
     // plugin did not inject.
     const presets = this.ctx.get?.('agentPresets') as AgentPresets | undefined
     if (presets === undefined) {
+      return {
+        setup: agentCtx => {
+          registerChannelCommands(agentCtx.commands)
+        },
+      }
+    }
+    if (requestedPreset === undefined && !useRosterDefault) {
       return { setup: agentCtx => { registerChannelCommands(agentCtx.commands) } }
     }
-    const resolved = await presets.resolve(this.config.agentPreset)
+    const resolved = await presets.resolve(requestedPreset)
     return {
       agentPreset: resolved.id,
       setup: async (agentCtx) => {
         await presets.mount(agentCtx, resolved.id)
         registerChannelCommands(agentCtx.commands)
       },
+    }
+  }
+
+  /** Effective preset after folding any durable runtime preset switch. */
+  private effectiveAgentPreset(session: Session): string | undefined {
+    let selected = session.header.agentPreset
+    for (const event of session.events) {
+      if (event.type === 'agent-preset/selected') selected = event.data.agentPreset
+    }
+    return selected
+  }
+
+  /**
+   * Agent-scoped `/renew` handler. Only the Feishu admission path arms its
+   * AbortSignal, preventing another Host client from switching a Feishu route
+   * by invoking the scoped command out of band.
+   */
+  private async runRenewCommand(
+    invocation: CommandInvocation,
+    admission: RenewAdmission,
+  ): Promise<CommandResult> {
+    if (admission.live.agent !== invocation.agent) {
+      return { kind: 'error', text: '/renew 只能通过已授权的飞书话题执行。' }
+    }
+    const current = this.lookupRoute(admission.route.key)
+    if (current === undefined || current.sessionId !== admission.route.sessionId) {
+      return { kind: 'error', text: '当前话题绑定已变化，请重试 /renew。' }
+    }
+    try {
+      admission.commit = await this.commitRenew(current, admission.live)
+      return { kind: 'success', text: '新 Session 已创建并绑定。' }
+    } catch (error) {
+      this.ctx.logger?.warn?.(
+        'dsh-channels: renew transaction failed for session %s: %s',
+        current.sessionId, String(error),
+      )
+      return { kind: 'error', text: 'Session 续建失败，原 Session 仍保持绑定；请稍后重试。' }
+    }
+  }
+
+  /** Create, workspace-attach, and atomically publish one renewed route. */
+  private async commitRenew(record: RouteRecord, oldLive: LiveAgent): Promise<RenewCommit> {
+    const sessionId = randomUUID() as SessionId
+    const preset = this.effectiveAgentPreset(oldLive.agent.session)
+    const composition = await this.resolvePresetComposition(preset, false)
+    const workspace = await this.ctx.workspaceRegistry.create(
+      record.workspacePath,
+      workspaceTitleFor(record.chatType, record.chatId, record.senderOpenId),
+    )
+
+    let newHandle: AgentHandle | undefined
+    let attached = false
+    try {
+      newHandle = await this.ctx.agents.create({
+        sessionId,
+        meta: {
+          cwd: record.workspacePath,
+          ...(composition.agentPreset === undefined ? {} : { agentPreset: composition.agentPreset }),
+        },
+        agentOptions: { ...oldLive.agent.options },
+        setup: composition.setup,
+      })
+      await workspace.attachSession(sessionId)
+      attached = true
+      const createdAt = newHandle.agent.session.header.createdAt
+
+      const current: RouteRecord = {
+        ...record,
+        sessionId,
+        sessionHistory: appendSessionHistory(record, sessionId, createdAt),
+        lastActivityAt: Date.now(),
+      }
+      await this.persistRoute(record.key, current)
+      this.live.set(sessionId, { agent: newHandle.agent, handle: newHandle })
+      return { previous: record, current, oldLive }
+    } catch (error) {
+      if (attached) {
+        await Promise.resolve(workspace.detachSession(sessionId)).catch((detachError: unknown) => {
+          this.ctx.logger?.warn?.(
+            'dsh-channels: rolling back workspace attachment for session %s failed: %s',
+            sessionId, String(detachError),
+          )
+        })
+      }
+      await newHandle?.dispose().catch(() => {})
+      throw error
+    }
+  }
+
+  /** Release only this plugin's old handle, after `command/done` has landed. */
+  private async releaseRenewedAgent(commit: RenewCommit): Promise<void> {
+    const oldSessionId = commit.previous.sessionId
+    if (this.live.get(oldSessionId) === commit.oldLive) {
+      this.live.delete(oldSessionId)
+      this.streamer?.detach(oldSessionId)
+    }
+    try {
+      await commit.oldLive.handle.dispose()
+    } catch (error) {
+      this.ctx.logger?.warn?.(
+        'dsh-channels: releasing renewed session %s handle failed: %s',
+        oldSessionId, String(error),
+      )
     }
   }
 
@@ -1115,10 +1281,16 @@ export class FeishuService {
       throw error
     }
     this.live.set(sessionId, { agent: handle.agent, handle })
-    workspace.attachSession?.(sessionId)
+    void Promise.resolve(workspace.attachSession(sessionId)).catch(error => {
+      this.ctx.logger?.warn?.(
+        'dsh-channels: attaching initial session %s to workspace failed: %s',
+        sessionId, String(error),
+      )
+    })
 
     // 5. Persist the route (thread-scoped, or degraded chat-scoped).
     const key = sent.degraded || sent.threadId === undefined ? chatKey : sent.threadId
+    const createdAt = handle.agent.session.header.createdAt
     const record: RouteRecord = {
       key,
       kind: sent.degraded || sent.threadId === undefined ? 'chat' : 'thread',
@@ -1128,8 +1300,9 @@ export class FeishuService {
       senderOpenId: msg.senderId,
       workspacePath: workspace.path,
       cardMessageId: sent.messageId,
-      createdAt: Date.now(),
-      lastActivityAt: Date.now(),
+      createdAt,
+      lastActivityAt: createdAt,
+      sessionHistory: [{ sessionId, createdAt }],
     }
     await this.persistRoute(key, record)
 

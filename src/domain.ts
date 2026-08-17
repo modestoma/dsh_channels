@@ -13,6 +13,15 @@ import { z } from 'zod'
 /** Route key kinds. `thread` = real Feishu topic; `chat` = degraded chat-scoped fallback. */
 export const ROUTE_RECORD_VERSION = 1
 
+export const sessionHistoryEntrySchema = z.object({
+  /** One Session that has been bound to this route. */
+  sessionId: z.string().min(1),
+  /** Epoch ms when the Session was created. */
+  createdAt: z.number().int().nonnegative(),
+})
+
+export type SessionHistoryEntry = z.infer<typeof sessionHistoryEntrySchema>
+
 export const routeRecordSchema = z.object({
   /** Route key the record is stored under (thread_id or chat:<chatId>). */
   key: z.string().min(1),
@@ -34,9 +43,48 @@ export const routeRecordSchema = z.object({
   createdAt: z.number().int().nonnegative(),
   /** Epoch ms of the last activity routed through this record. */
   lastActivityAt: z.number().int().nonnegative(),
+  /** Sessions this topic has pointed at, oldest first. Optional for v1 compatibility. */
+  sessionHistory: z.array(sessionHistoryEntrySchema).optional(),
 })
 
 export type RouteRecord = z.infer<typeof routeRecordSchema>
+
+/**
+ * Normalize legacy and partially duplicated histories without mutating the
+ * durable record. The current Session is always represented, duplicate ids
+ * collapse to their earliest timestamp, and output order is deterministic.
+ */
+export function normalizeSessionHistory(record: RouteRecord): SessionHistoryEntry[] {
+  const bySession = new Map<string, SessionHistoryEntry>()
+  for (const entry of record.sessionHistory ?? []) {
+    const existing = bySession.get(entry.sessionId)
+    if (existing === undefined || entry.createdAt < existing.createdAt) {
+      bySession.set(entry.sessionId, { ...entry })
+    }
+  }
+  if (!bySession.has(record.sessionId)) {
+    bySession.set(record.sessionId, { sessionId: record.sessionId, createdAt: record.createdAt })
+  }
+  return [...bySession.values()].sort((left, right) => left.createdAt - right.createdAt)
+}
+
+/** Materialize the optional legacy history field for in-memory consumers. */
+export function normalizeRouteRecord(record: RouteRecord): RouteRecord {
+  return { ...record, sessionHistory: normalizeSessionHistory(record) }
+}
+
+/** Append a newly created Session to one normalized route history. */
+export function appendSessionHistory(
+  record: RouteRecord,
+  sessionId: string,
+  createdAt: number,
+): SessionHistoryEntry[] {
+  return normalizeSessionHistory({
+    ...record,
+    sessionId,
+    sessionHistory: [...normalizeSessionHistory(record), { sessionId, createdAt }],
+  })
+}
 
 /**
  * In-flight turn snapshot: everything needed to repair a streaming card that a

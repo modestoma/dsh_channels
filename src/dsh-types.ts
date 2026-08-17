@@ -88,6 +88,8 @@ export interface SessionHeader {
   readonly origin?: string
   /** Delegation depth: 1 for a direct subagent child. */
   readonly delegationDepth?: number
+  /** Preset used to compose this Session's agent, when the host uses presets. */
+  readonly agentPreset?: string
 }
 
 /** The live session object (durable event log + header). */
@@ -243,6 +245,12 @@ export interface SubagentDescriptorEvent extends SessionEventEnvelope {
   }
 }
 
+/** Runtime preset switches are durable and define the currently composed preset. */
+export interface AgentPresetSelectedEvent extends SessionEventEnvelope {
+  type: 'agent-preset/selected'
+  data: { agentPreset: string }
+}
+
 export interface OtherSessionEvent extends SessionEventEnvelope {
   /** Unknown/extension event types are ignored by the folds. */
   type: Exclude<string, 'assistant/chunk' | 'assistant/message' | 'step/start' | 'turn/end' | 'request/header'
@@ -263,6 +271,7 @@ export type SessionEvent =
   | ToolResultEvent
   | CommandRunEvent
   | CommandDoneEvent
+  | AgentPresetSelectedEvent
   | SubagentDescriptorEvent
   | ToolWorkflowRunStartEvent
   | ToolWorkflowAgentStartEvent
@@ -425,7 +434,8 @@ export interface Workspace {
   readonly id: string
   readonly path: string
   readonly title: string
-  attachSession(id: SessionId): unknown
+  attachSession(id: SessionId): Promise<void> | void
+  detachSession(id: SessionId): Promise<void> | void
 }
 
 export interface WorkspaceRegistry {
