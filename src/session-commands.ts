@@ -5,6 +5,8 @@
  */
 
 import path from 'node:path'
+import type { RouteRecord, SessionHistoryEntry } from './domain.ts'
+import { normalizeSessionHistory } from './domain.ts'
 import type { ContextMeasurement, StatsFold, ToolEventSample } from './stats.ts'
 import {
   averageDecodeTokensPerSecond, averageTtftMs, cacheHitPct,
@@ -164,6 +166,50 @@ export function buildRenewCard(input: RenewCardInput): object {
     },
     { tag: 'markdown', content: '旧 Session 及其日志仍由 Harness 保留。', text_size: 'notation' },
   ])
+}
+
+export const SESSION_HISTORY_DISPLAY_LIMIT = 20
+
+export interface SessionHistoryItem extends SessionHistoryEntry {
+  current: boolean
+}
+
+export interface SessionHistoryView {
+  total: number
+  items: SessionHistoryItem[]
+  hidden: number
+}
+
+/** Read one route's normalized history without consulting the Session repository. */
+export function querySessionHistory(record: RouteRecord): SessionHistoryView {
+  const history = normalizeSessionHistory(record)
+  const items = history
+    .slice(-SESSION_HISTORY_DISPLAY_LIMIT)
+    .reverse()
+    .map(entry => ({ ...entry, current: entry.sessionId === record.sessionId }))
+  return {
+    total: history.length,
+    items,
+    hidden: Math.max(0, history.length - items.length),
+  }
+}
+
+function historyLine(item: SessionHistoryItem, index: number): string {
+  const marker = item.current ? ' · **当前**' : ''
+  return `${index + 1}. \`${escapeInlineCode(item.sessionId)}\`${marker}\n   创建时间：${new Date(item.createdAt).toISOString()}`
+}
+
+/** Render the newest route-local Session history, including the current marker. */
+export function buildSessionHistoryCard(record: RouteRecord): object {
+  const view = querySessionHistory(record)
+  const elements: object[] = [
+    { tag: 'markdown', content: `**总数**：${fmtCount(view.total)}\n**当前 Session**：\`${escapeInlineCode(record.sessionId)}\`` },
+    { tag: 'markdown', content: view.items.map(historyLine).join('\n') },
+  ]
+  if (view.hidden > 0) {
+    elements.push({ tag: 'markdown', content: `另有 ${fmtCount(view.hidden)} 条未展示。`, text_size: 'notation' })
+  }
+  return standaloneCard('**🕘 Session 历史**', elements)
 }
 
 function comparisonLine(label: string, tokens: number | undefined, window: number | undefined): string {

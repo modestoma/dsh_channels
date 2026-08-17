@@ -33,7 +33,7 @@ export { buildCard, buildInterruptionCard, cardJsonBytes, CARD_MAX_BYTES, CARD_T
 export { ApprovalAnswerer } from './approvals.ts'
 export { buildCommandResultCard, CHANNEL_COMMAND_NAMES, commandResultCardKind, isSupportedCommand, parseSlashCommand, registerChannelCommands, RouteOperationQueue, SUPPORTED_COMMAND_NAMES, supportedCommandList } from './commands.ts'
 export { buildHealthCard, countFiberStates, foldHealthSnapshot, HEALTH_DEPENDENCY_NAMES, maskOpenIdTail } from './health.ts'
-export { buildCompactComparisonCard, buildRenewCard, buildSessionStatusCard, buildWorkDirCard, compactFailureContext, resolveWorkDir } from './session-commands.ts'
+export { buildCompactComparisonCard, buildRenewCard, buildSessionHistoryCard, buildSessionStatusCard, buildWorkDirCard, compactFailureContext, querySessionHistory, resolveWorkDir, SESSION_HISTORY_DISPLAY_LIMIT } from './session-commands.ts'
 export { addUsage, averageDecodeTokensPerSecond, averageTtftMs, cacheHitPct, EMPTY_TOTALS, foldAll, foldEvent, measureSessionContext } from './stats.ts'
 export { FeishuService } from './service.ts'
 export { TurnStreamer } from './streamer.ts'

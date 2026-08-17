@@ -50,7 +50,7 @@ import type { ChannelFactory, FeishuChannel, NormalizedMessage } from './feishu-
 import { buildHealthCard, foldHealthSnapshot, HEALTH_DEPENDENCY_NAMES } from './health.ts'
 import type { HealthDependencyName, HealthSnapshot } from './health.ts'
 import {
-  buildCompactComparisonCard, buildRenewCard, buildSessionStatusCard, buildWorkDirCard,
+  buildCompactComparisonCard, buildRenewCard, buildSessionHistoryCard, buildSessionStatusCard, buildWorkDirCard,
   compactFailureContext, resolveWorkDir,
 } from './session-commands.ts'
 import { foldAll, measureSessionContext } from './stats.ts'
@@ -607,6 +607,10 @@ export class FeishuService {
               kind: 'unavailable', command: parsed.name,
               text: resolved.text, sessionId: current.sessionId,
             })
+            return
+          }
+          if (parsed.name === 'history' && result.kind === 'success') {
+            await this.sendStandaloneCard(msg, buildSessionHistoryCard(current))
             return
           }
           if (parsed.name === 'compact' && compactBefore !== undefined) {

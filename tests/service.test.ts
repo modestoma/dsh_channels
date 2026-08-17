@@ -255,25 +255,28 @@ describe('FeishuService', () => {
     expect(JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)).toContain('整体结论：**healthy**')
   })
 
-  it('denies a non-owner before resume, command execution, or Session inspection', async () => {
+  it('denies a non-owner /history before resume, command execution, or Session enumeration', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_owned', senderId: 'ou_owner', messageId: 'om_owner', content: '开始',
     }))
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
     const agent = h.ctxState.agents.created[0]!.handle.agent
+    const route = h.ctxState.domain.raw.table('routes').get('omt_1') as RouteRecord
     mock(h.ctxState.ctx.commands.execute).mockClear()
 
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_owned', senderId: 'ou_intruder',
-      threadId: 'omt_1', messageId: 'om_intruder', mentionedBot: false, content: '/status',
+      threadId: 'omt_1', messageId: 'om_intruder', mentionedBot: false, content: '/history',
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
 
     expect(mock(h.ctxState.ctx.commands.execute)).not.toHaveBeenCalled()
     expect(h.ctxState.agents.resumed).toHaveLength(0)
     expect(agent.session.events).toHaveLength(0)
-    expect(JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)).toContain('无权操作此会话')
+    const json = JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)
+    expect(json).toContain('无权操作此会话')
+    expect(json).not.toContain(route.sessionId)
   })
 
   it('renders /status from the complete durable Session log without starting a model turn', async () => {
@@ -673,6 +676,67 @@ describe('FeishuService', () => {
     expect(h.ctxState.agents.resumed[0]!.options.resumeSessionId).toBe(renewedSessionId)
     const route = h.ctxState.domain.raw.table('routes').get('omt_1') as RouteRecord
     expect(route.sessionHistory?.map(entry => entry.sessionId)).toEqual([oldSessionId, renewedSessionId])
+    await service.shutdown()
+  })
+
+  it('renders newest-first /history consistently across restart without resuming historical Agents', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_history', senderId: 'ou_owner',
+      messageId: 'om_history_start', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const firstSessionId = h.ctxState.agents.created[0]!.options.sessionId
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_history', senderId: 'ou_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_history_renew_1', content: '/renew',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
+    const secondSessionId = h.ctxState.agents.created[1]!.options.sessionId
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_history', senderId: 'ou_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_history_renew_2', content: '/renew',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(3))
+    const current = h.ctxState.agents.created[2]!
+    const currentSessionId = current.options.sessionId
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_history', senderId: 'ou_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_history_before_restart', content: '/history',
+    }))
+    await waitUntil(() => expect(current.handle.agent.session.events.at(-1)).toMatchObject({
+      type: 'command/done', data: { kind: 'success' },
+    }))
+
+    const beforeRestart = JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)
+    expect(beforeRestart).toContain('Session 历史')
+    expect(beforeRestart).toContain('**总数**：3')
+    expect(beforeRestart).toContain('**当前**')
+    expect(beforeRestart.indexOf(currentSessionId)).toBeLessThan(beforeRestart.indexOf(secondSessionId))
+    expect(beforeRestart.indexOf(secondSessionId)).toBeLessThan(beforeRestart.indexOf(firstSessionId))
+    expect(mock(current.handle.agent.followup)).not.toHaveBeenCalled()
+    expect(h.ctxState.agents.resumed).toHaveLength(0)
+
+    await h.service.shutdown()
+    const channel = makeChannel()
+    const service = new FeishuService(h.ctxState.ctx, h.config, () => channel)
+    await service.start()
+    const handlers = (channel.onMessage as unknown as ReturnType<typeof vi.fn>).mock.calls
+    const onMessage = handlers.at(-1)?.[0] as (msg: NormalizedMessage) => Promise<void> | undefined
+    await onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_history', senderId: 'ou_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_history_after_restart', content: '/history',
+    }))
+    await waitUntil(() => expect(channel.sent).toHaveLength(1))
+
+    const afterRestart = JSON.stringify((channel.sent[0] as { input: object }).input)
+    expect(afterRestart).toBe(beforeRestart)
+    expect(h.ctxState.agents.resumed).toHaveLength(1)
+    expect(h.ctxState.agents.resumed[0]!.options.resumeSessionId).toBe(currentSessionId)
+    expect(h.ctxState.agents.resumed.some(entry => entry.options.resumeSessionId === firstSessionId)).toBe(false)
+    expect(h.ctxState.agents.resumed.some(entry => entry.options.resumeSessionId === secondSessionId)).toBe(false)
     await service.shutdown()
   })
 

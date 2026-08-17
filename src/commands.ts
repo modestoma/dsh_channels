@@ -121,6 +121,7 @@ const READY_HANDLERS: Readonly<Record<string, CommandDefinition['handler']>> = {
   status: readyHandler('status', 'Session 状态已读取。'),
   'work-dir': readyHandler('work-dir', '工作目录已读取。'),
   renew: renewHandler,
+  history: readyHandler('history', 'Session 历史已读取。'),
 }
 
 /** Arm exactly one Feishu-issued `/renew` execution, then return its disarmer. */

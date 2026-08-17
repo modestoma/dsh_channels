@@ -1,13 +1,22 @@
 import { describe, expect, it } from 'vitest'
 import {
-  buildCompactComparisonCard, buildRenewCard, buildSessionStatusCard, buildWorkDirCard,
-  compactFailureContext, resolveWorkDir,
+  buildCompactComparisonCard, buildRenewCard, buildSessionHistoryCard, buildSessionStatusCard,
+  buildWorkDirCard, compactFailureContext, querySessionHistory, resolveWorkDir,
 } from '../src/session-commands.ts'
 import { foldAll } from '../src/stats.ts'
 import type { SessionEvent } from '../src/dsh-types.ts'
+import type { RouteRecord } from '../src/domain.ts'
 
 function at(time: number, type: string, data: unknown): SessionEvent {
   return { type, seq: time, time, data } as unknown as SessionEvent
+}
+
+function route(partial: Partial<RouteRecord> = {}): RouteRecord {
+  return {
+    key: 'thread-1', kind: 'thread', sessionId: 'session-current', chatId: 'chat-1', chatType: 'group',
+    senderOpenId: 'ou_owner', workspacePath: '/workspace/alice', cardMessageId: 'message-1',
+    createdAt: 1_000, lastActivityAt: 1_000, ...partial,
+  }
 }
 
 describe('Session command result cards', () => {
@@ -78,6 +87,42 @@ describe('Session command result cards', () => {
     expect(json).toContain('session-new')
     expect(json).toContain('/workspace/alice')
     expect(json).toContain('仍由 Harness 保留')
+  })
+
+  it('queries newest-first history, marks the current Session, and limits output to 20 rows', () => {
+    const sessionHistory = Array.from({ length: 25 }, (_, index) => ({
+      sessionId: `session-${String(index + 1).padStart(2, '0')}`,
+      createdAt: Date.UTC(2026, 7, 17, 0, index),
+    }))
+    const record = route({ sessionId: 'session-25', sessionHistory })
+    const view = querySessionHistory(record)
+
+    expect(view.total).toBe(25)
+    expect(view.hidden).toBe(5)
+    expect(view.items).toHaveLength(20)
+    expect(view.items[0]).toMatchObject({ sessionId: 'session-25', current: true })
+    expect(view.items.at(-1)).toMatchObject({ sessionId: 'session-06', current: false })
+
+    const json = JSON.stringify(buildSessionHistoryCard(record))
+    expect(json).toContain('**总数**：25')
+    expect(json).toContain('session-25')
+    expect(json).toContain('**当前**')
+    expect(json).toContain('2026-08-17T00:24:00.000Z')
+    expect(json).toContain('另有 5 条未展示')
+    expect(json).not.toContain('session-05')
+  })
+
+  it('uses the current Session as the sole history entry for a legacy route', () => {
+    const legacy = route({ sessionId: 'legacy-session', createdAt: Date.UTC(2026, 7, 17, 8) })
+    expect(querySessionHistory(legacy)).toEqual({
+      total: 1,
+      hidden: 0,
+      items: [{ sessionId: 'legacy-session', createdAt: Date.UTC(2026, 7, 17, 8), current: true }],
+    })
+    const json = JSON.stringify(buildSessionHistoryCard(legacy))
+    expect(json).toContain('**总数**：1')
+    expect(json).toContain('legacy-session')
+    expect(json).not.toContain('未展示')
   })
 
   it('renders compact before/after bars and exact token accounting', () => {
