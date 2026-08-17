@@ -20,6 +20,7 @@ function channel(): FeishuChannel & { updated: Array<{ messageId: string; card: 
     onMessage: vi.fn(() => () => {}),
     onCardAction: vi.fn(() => () => {}),
     botOpenId: () => 'bot',
+    getConnectionStatus: vi.fn(() => ({ state: 'connected' as const, reconnectAttempts: 0 })),
     connect: vi.fn(async () => {}),
     disconnect: vi.fn(async () => {}),
     send: vi.fn(async () => ({ messageId: 'om_1' })),

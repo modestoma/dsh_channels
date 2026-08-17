@@ -43,7 +43,7 @@ export const name = 'channels'
  * for it. `llm` / `tokenMeter` feed the card's context line and ship with
  * every dsh-base profile.
  */
-export const inject = ['agents', 'workspaceRegistry', 'storageDomain', 'credentials', 'llm', 'tokenMeter'] as const
+export const inject = ['agents', 'commands', 'workspaceRegistry', 'storageDomain', 'credentials', 'llm', 'tokenMeter'] as const
 
 export interface FeishuPluginOptions extends FeishuConfig {
   /** Test seam: substitute a channel implementation. */
@@ -71,4 +71,3 @@ export function apply(ctx: HostContext, config?: unknown): void {
     return () => service.shutdown()
   })
 }
-

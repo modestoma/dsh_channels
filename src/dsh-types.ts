@@ -10,6 +10,7 @@
  *
  * The consumed surface is deliberately narrow and stable:
  *   ctx.agents.create/resume · agent.followup · agent.session
+ *   ctx.commands.register/list/find/execute
  *   ctx.workspaceRegistry.create · workspace.attachSession
  *   ctx.storageDomain.open · table/global handles
  *   ctx.tokenMeter.measure · ctx.llm.resolveModelInfo
@@ -23,6 +24,8 @@
 export type SessionId = string & { readonly __sessionId: never }
 /** Branded message identity (runtime value is a plain string). */
 export type MessageId = string & { readonly __messageId: never }
+/** Branded command-execution identity (runtime value is a plain string). */
+export type CommandId = string & { readonly __commandId: never }
 
 // ---- LLM surface --------------------------------------------------------
 
@@ -96,6 +99,8 @@ export interface Session {
 
 export interface SessionEventEnvelope {
   readonly seq: number
+  /** Unix epoch milliseconds recorded by the Session append boundary. */
+  readonly time?: number
   readonly ignorable?: boolean
 }
 
@@ -117,6 +122,11 @@ export interface AssistantMessageEvent extends SessionEventEnvelope {
 
 export interface StepStartEvent extends SessionEventEnvelope {
   type: 'step/start'
+  data: { turn: number; step: number }
+}
+
+export interface StepEndEvent extends SessionEventEnvelope {
+  type: 'step/end'
   data: { turn: number; step: number }
 }
 
@@ -158,7 +168,15 @@ export interface ToolResultEvent extends SessionEventEnvelope {
   data: {
     turn: number
     step: number
-    message: unknown
+    message: {
+      /** The first tool-result block retains the originating tool call id. */
+      content?: ReadonlyArray<{
+        type: string
+        toolCallId?: string
+        [key: string]: unknown
+      }>
+      [key: string]: unknown
+    }
     error?: { name: string; code: string }
     meta?: unknown
   }
@@ -213,6 +231,7 @@ export type SessionEvent =
   | AssistantChunkEvent
   | AssistantMessageEvent
   | StepStartEvent
+  | StepEndEvent
   | TurnEndEvent
   | RequestHeaderEvent
   | ToolCallEvent
@@ -273,14 +292,62 @@ export interface AgentOptions {
   maxTokens?: number
 }
 
+// ---- Human-command surface ---------------------------------------------
+
+export interface CommandInputDescriptor {
+  readonly hint: string
+}
+
+export type CommandResult =
+  | { readonly kind: 'success'; readonly text?: string; readonly sourceEventSeq?: number }
+  | { readonly kind: 'error'; readonly text: string }
+
+export interface CommandExecution {
+  readonly commandId: CommandId
+  readonly result: CommandResult
+}
+
+export interface CommandDescriptor {
+  readonly name: string
+  readonly description: string
+  readonly input?: CommandInputDescriptor
+}
+
+export interface CommandInvocation {
+  readonly commandId: CommandId
+  readonly agent: Agent
+  readonly rawInput: string
+  readonly signal: AbortSignal
+}
+
+export interface CommandDefinition extends CommandDescriptor {
+  readonly recordInput?: boolean
+  readonly handler: (invocation: CommandInvocation) => CommandResult | Promise<CommandResult>
+}
+
+/** Minimal structural bridge to `@deepseek-ai/dsh-commands`' runtime. */
+export interface CommandRuntime {
+  register(definition: CommandDefinition): () => void
+  list(agent: Agent): readonly CommandDescriptor[]
+  find(agent: Agent, name: string): CommandDefinition | undefined
+  execute(agent: Agent, line: string, signal: AbortSignal): Promise<CommandExecution | undefined>
+}
+
+/** Agent-scoped Cordis context slice used to register scoped commands. */
+export interface AgentContext {
+  commands: CommandRuntime
+}
+
 export interface Agent {
   readonly id: SessionId
+  readonly options: AgentOptions
   readonly session: Session
   readonly status: 'idle' | 'running'
   readonly inbox: {
     readonly nextTurn: readonly unknown[]
     readonly nextStep: readonly unknown[]
   }
+  readonly ctx: AgentContext
   followup(message: UserMessage): void
 }
 
@@ -297,7 +364,7 @@ export interface AgentHandle {
  * rolls the creation back. The plugin only returns `void` — the synchronous
  * `AgentSetupCommit` flavor is never produced here.
  */
-export type AgentSetup = (agentCtx: unknown) => Promise<void> | void
+export type AgentSetup = (agentCtx: AgentContext) => Promise<void> | void
 
 export interface CreateAgentOptions {
   readonly sessionId: SessionId
@@ -407,7 +474,34 @@ export interface AgentPresets {
    * agent creation back. `id` defaults to the roster default.
    * @returns the composed preset.
    */
-  mount(agentCtx: unknown, id?: string): Promise<AgentPreset>
+  mount(agentCtx: AgentContext, id?: string): Promise<AgentPreset>
+}
+
+// ---- Cordis diagnostic surface -----------------------------------------
+
+/** Numeric values mirror Cordis 4's public `FiberState` enum. */
+export const CordisFiberState = {
+  PENDING: 0,
+  LOADING: 1,
+  ACTIVE: 2,
+  FAILED: 3,
+  DISPOSED: 4,
+  UNLOADING: 5,
+} as const
+
+export type CordisFiberState = typeof CordisFiberState[keyof typeof CordisFiberState]
+
+export interface CordisFiber {
+  readonly state: CordisFiberState
+}
+
+export interface CordisPluginRuntime {
+  readonly fibers: Iterable<CordisFiber>
+}
+
+export interface CordisRegistry {
+  readonly size: number
+  values(): IterableIterator<CordisPluginRuntime>
 }
 
 // ---- Host context surface ----------------------------------------------
@@ -428,12 +522,15 @@ export interface HostLogger {
 
 export interface HostContext {
   agents: AgentRegistry
+  commands: CommandRuntime
   workspaceRegistry: WorkspaceRegistry
   storageDomain: StorageDomainFacility
   /** Resolved through the injected `credentials` seam (env > .credentials.yaml > .env). */
   credentials: CredentialProvider
   tokenMeter: TokenMeter
   llm: LlmService
+  /** Built-in Cordis plugin registry used for aggregate health diagnostics. */
+  registry: CordisRegistry
   logger?: HostLogger
   /** Safe service lookup (returns undefined for absent services). */
   get?(name: string): unknown

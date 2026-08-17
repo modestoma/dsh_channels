@@ -9,9 +9,16 @@
  */
 
 import { createLarkChannel, LoggerLevel } from '@larksuiteoapi/node-sdk'
-import type { LarkChannel, NormalizedMessage, SendResult } from '@larksuiteoapi/node-sdk'
+import type { LarkChannel, NormalizedMessage, SendResult, WSConnectionStatus } from '@larksuiteoapi/node-sdk'
 
 export type { NormalizedMessage, SendResult } from '@larksuiteoapi/node-sdk'
+export type FeishuConnectionStatus = WSConnectionStatus
+
+/** Outbound payloads used by this plugin, including Buffer-backed file upload. */
+export type FeishuSendInput =
+  | { card: object }
+  | { text: string }
+  | { file: { source: string | Buffer; fileName: string } }
 
 /**
  * One normalized card action (button click) event, as delivered by the
@@ -36,6 +43,8 @@ export interface FeishuChannel {
   onCardAction(handler: (event: CardActionEvent) => void | Promise<void>): () => void
   /** Bot open_id, available after `connect()` resolves. */
   botOpenId(): string | undefined
+  /** Current official-SDK WebSocket lifecycle snapshot, when initialized. */
+  getConnectionStatus(): FeishuConnectionStatus | undefined
   /** Start the WebSocket long connection (resolves after the handshake). */
   connect(): Promise<void>
   /** Stop the connection. */
@@ -43,7 +52,7 @@ export interface FeishuChannel {
   /** Send one message (text or card) with optional reply targeting. */
   send(
     chatId: string,
-    input: { card: object } | { text: string },
+    input: FeishuSendInput,
     options?: { replyTo?: string; replyInThread?: boolean },
   ): Promise<SendResult>
   /** Full-card replacement of a previously sent card message. */
@@ -98,6 +107,10 @@ class LarkChannelAdapter implements FeishuChannel {
     return this.channel.botIdentity?.openId
   }
 
+  getConnectionStatus(): FeishuConnectionStatus | undefined {
+    return this.channel.getConnectionStatus()
+  }
+
   async connect(): Promise<void> {
     await this.channel.connect()
   }
@@ -108,7 +121,7 @@ class LarkChannelAdapter implements FeishuChannel {
 
   async send(
     chatId: string,
-    input: { card: object } | { text: string },
+    input: FeishuSendInput,
     options?: { replyTo?: string; replyInThread?: boolean },
   ): Promise<SendResult> {
     return this.channel.send(chatId, input, options)

@@ -9,10 +9,13 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { vi } from 'vitest'
 import type {
-  Agent, AgentHandle, AgentRegistry, ApprovalAnswererListener, HostContext, Session, SessionEvent,
-  SessionId, StorageDomainFacility, Workspace, WorkspaceRegistry,
+  Agent, AgentContext, AgentHandle, AgentOptions, AgentRegistry, ApprovalAnswererListener,
+  CommandDefinition, CommandRuntime, HostContext, Session, SessionEvent, SessionId,
+  StorageDomainFacility, Workspace, WorkspaceRegistry,
 } from '../src/dsh-types.ts'
-import type { CardActionEvent, FeishuChannel, NormalizedMessage, SendResult } from '../src/feishu-channel.ts'
+import type {
+  CardActionEvent, FeishuChannel, FeishuConnectionStatus, NormalizedMessage, SendResult,
+} from '../src/feishu-channel.ts'
 import type { RawDomainHandle } from '../src/domain.ts'
 
 export function makeSession(id = `session-${Math.random().toString(36).slice(2, 10)}`): Session {
@@ -24,12 +27,28 @@ export function makeSession(id = `session-${Math.random().toString(36).slice(2, 
   }
 }
 
-export function makeAgent(session: Session): Agent {
+export function makeCommandRuntime(): CommandRuntime & { definitions: Map<string, CommandDefinition> } {
+  const definitions = new Map<string, CommandDefinition>()
+  return {
+    definitions,
+    register: vi.fn((definition: CommandDefinition) => {
+      definitions.set(definition.name, definition)
+      return () => { definitions.delete(definition.name) }
+    }),
+    list: vi.fn(() => [...definitions.values()].map(({ handler: _handler, recordInput: _recordInput, ...entry }) => entry)),
+    find: vi.fn((_agent: Agent, name: string) => definitions.get(name)),
+    execute: vi.fn(async () => undefined),
+  }
+}
+
+export function makeAgent(session: Session, options: AgentOptions = {}): Agent {
   return {
     id: session.id,
+    options,
     session,
     status: 'idle',
     inbox: { nextTurn: [], nextStep: [] },
+    ctx: { commands: makeCommandRuntime() },
     followup: vi.fn(),
   }
 }
@@ -45,14 +64,14 @@ export interface FakeAgentsOptions {
 
 export function makeAgentRegistry(fail: FakeAgentsOptions = {}): {
   registry: AgentRegistry
-  created: Array<{ options: Parameters<AgentRegistry['create']>[0]; handle: AgentHandle; setupCtx: unknown }>
-  resumed: Array<{ options: Parameters<AgentRegistry['resume']>[0]; handle: AgentHandle; setupCtx: unknown }>
+  created: Array<{ options: Parameters<AgentRegistry['create']>[0]; handle: AgentHandle; setupCtx: AgentContext }>
+  resumed: Array<{ options: Parameters<AgentRegistry['resume']>[0]; handle: AgentHandle; setupCtx: AgentContext }>
   /** Live agents the registry answers to `get()`, mirroring the host's
    *  published-agent registry (create/resume register, dispose unregisters). */
   liveAgents: Map<string, AgentHandle>
 } {
-  const created: Array<{ options: Parameters<AgentRegistry['create']>[0]; handle: AgentHandle; setupCtx: unknown }> = []
-  const resumed: Array<{ options: Parameters<AgentRegistry['resume']>[0]; handle: AgentHandle; setupCtx: unknown }> = []
+  const created: Array<{ options: Parameters<AgentRegistry['create']>[0]; handle: AgentHandle; setupCtx: AgentContext }> = []
+  const resumed: Array<{ options: Parameters<AgentRegistry['resume']>[0]; handle: AgentHandle; setupCtx: AgentContext }> = []
   const liveAgents = new Map<string, AgentHandle>()
   const registry: AgentRegistry = {
     async create(options) {
@@ -60,10 +79,10 @@ export function makeAgentRegistry(fail: FakeAgentsOptions = {}): {
       // Mirror the host factory: setup composes the unpublished scope and is
       // awaited BEFORE the session/agent become visible; a rejection rolls the
       // creation back.
-      const setupCtx = {}
+      const setupCtx: AgentContext = { commands: makeCommandRuntime() }
       await options.setup?.(setupCtx)
       const session = makeSession(options.sessionId)
-      const agent = makeAgent(session)
+      const agent = makeAgent(session, options.agentOptions)
       const handle: AgentHandle = { agent, dispose: vi.fn(async () => { liveAgents.delete(options.sessionId) }) }
       liveAgents.set(options.sessionId, handle)
       created.push({ options, handle, setupCtx })
@@ -74,10 +93,10 @@ export function makeAgentRegistry(fail: FakeAgentsOptions = {}): {
         fail.onFailResume?.(options)
         throw fail.failResume
       }
-      const setupCtx = {}
+      const setupCtx: AgentContext = { commands: makeCommandRuntime() }
       await options.setup?.(setupCtx)
       const session = makeSession(options.resumeSessionId)
-      const agent = makeAgent(session)
+      const agent = makeAgent(session, options.agentOptions)
       const handle: AgentHandle = { agent, dispose: vi.fn(async () => { liveAgents.delete(options.resumeSessionId) }) }
       liveAgents.set(options.resumeSessionId, handle)
       resumed.push({ options, handle, setupCtx })
@@ -172,7 +191,7 @@ export function makeDomain(): { facility: StorageDomainFacility; raw: RawDomainH
 export interface FakeAgentPresets {
   resolve: ReturnType<typeof vi.fn>
   mount: ReturnType<typeof vi.fn>
-  mounts: Array<{ agentCtx: unknown; id?: string }>
+  mounts: Array<{ agentCtx: AgentContext; id?: string }>
 }
 
 export interface FakeAgentPresetsOptions {
@@ -188,7 +207,7 @@ export interface FakeAgentPresetsOptions {
  * contract closely enough for the plugin's composition flow.
  */
 export function makeAgentPresets(options: FakeAgentPresetsOptions = {}): FakeAgentPresets {
-  const mounts: Array<{ agentCtx: unknown; id?: string }> = []
+  const mounts: Array<{ agentCtx: AgentContext; id?: string }> = []
   const presetFor = (id: string | undefined) => ({
     id: id ?? options.defaultId ?? 'standard',
     path: `/presets/${id ?? options.defaultId ?? 'standard'}`,
@@ -198,7 +217,7 @@ export function makeAgentPresets(options: FakeAgentPresetsOptions = {}): FakeAge
       if (options.failResolve !== undefined) throw options.failResolve
       return presetFor(id)
     }),
-    mount: vi.fn(async (agentCtx: unknown, id?: string) => {
+    mount: vi.fn(async (agentCtx: AgentContext, id?: string) => {
       mounts.push({ agentCtx, id })
       return presetFor(id)
     }),
@@ -226,6 +245,7 @@ export function makeHostContext(
   const approvalListeners: Array<{ listener: ApprovalAnswererListener; options: { prepend?: boolean } | undefined }> = []
   const tokenMeter = { measure: () => ({ totalTokens: 1234 }) }
   const llm = { resolveModelInfo: vi.fn(async () => ({ context: { contextWindow: 128000 } })) }
+  const commands = makeCommandRuntime()
   const credentials = {
     values: {
       ...(credentialValues === undefined
@@ -241,15 +261,18 @@ export function makeHostContext(
     tokenMeter,
     llm,
     credentials,
+    commands,
     ...(agentPresets === undefined ? {} : { agentPresets }),
   }
   const ctx: HostContext = {
     agents: agents.registry,
+    commands,
     workspaceRegistry: workspaces.registry,
     storageDomain: domain.facility,
     credentials,
     tokenMeter,
     llm,
+    registry: { size: 0, values: () => new Map().values() },
     logger: { warn: vi.fn(), error: vi.fn(), info: vi.fn(), debug: vi.fn() },
     get: (name: string) => services[name],
     on: vi.fn((name: unknown, listener?: unknown, options?: unknown) => {
@@ -275,6 +298,8 @@ export interface FakeChannelOptions {
   failReplyInThread?: boolean
   /** Reject every card send (used to exercise the plain-text fallback). */
   failCardSends?: boolean
+  /** Official SDK WebSocket lifecycle snapshot returned by the stub. */
+  connectionStatus?: FeishuConnectionStatus
 }
 
 export function makeChannel(options: FakeChannelOptions = {}): FeishuChannel & {
@@ -300,6 +325,7 @@ export function makeChannel(options: FakeChannelOptions = {}): FeishuChannel & {
       return () => {}
     }),
     botOpenId: () => 'bot-open-id',
+    getConnectionStatus: vi.fn(() => options.connectionStatus),
     connect: vi.fn(async () => {}),
     disconnect: vi.fn(async () => {}),
     async send(chatId, input, sendOptions) {
