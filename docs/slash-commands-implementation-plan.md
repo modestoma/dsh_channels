@@ -99,7 +99,7 @@ sessionHistory?: Array<{
 2. 新建路由从第一个 Session 起写入历史数组。
 3. `/renew` 成功创建新 Session 后，用一次 `routes.put()` 同时写入新的 `sessionId` 和追加后的 `sessionHistory`，避免两个表之间出现提交裂缝。
 4. 同一个 `sessionId` 不重复追加；数组按创建时间升序，当前项始终等于 `RouteRecord.sessionId`。
-5. 路由 TTL GC 仍只删除插件路由记录；其历史 Session 和工作区由 Harness 持久化层拥有，不随路由 GC 删除。
+5. 路由 TTL GC 退休插件活动路由；真实话题留下最小墓碑以拒绝后续消息误建 Session，其历史 Session 和工作区由 Harness 持久化层拥有，不随路由 GC 删除。
 6. 存储域 version 保持现值；新增字段为可选字段，旧介质可直接读取。
 
 ## 5. 任务依赖

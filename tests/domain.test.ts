@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
-  appendSessionHistory, normalizeRouteRecord, normalizeSessionHistory, routeRecordSchema,
+  appendSessionHistory, expiredRouteRecordSchema, feishuDomain, normalizeRouteRecord, normalizeSessionHistory,
+  routeRecordSchema,
 } from '../src/domain.ts'
 import type { RouteRecord } from '../src/domain.ts'
 
@@ -57,5 +58,31 @@ describe('route Session history', () => {
     expect(() => routeRecordSchema.parse(route({
       sessionHistory: [{ sessionId: '', createdAt: -1 }],
     }))).toThrow()
+  })
+})
+
+describe('expired route tombstone', () => {
+  it('keeps only the identity needed to reject a retired topic', () => {
+    expect(expiredRouteRecordSchema.parse({
+      key: 'omt_expired',
+      chatId: 'oc_chat',
+      chatType: 'group',
+      senderOpenId: 'ou_owner',
+      expiredAt: 300,
+    })).toEqual({
+      key: 'omt_expired',
+      chatId: 'oc_chat',
+      chatType: 'group',
+      senderOpenId: 'ou_owner',
+      expiredAt: 300,
+    })
+  })
+})
+
+describe('storage domain descriptor', () => {
+  it('uses backend-safe table names', () => {
+    for (const tableName of Object.keys(feishuDomain.tables)) {
+      expect(tableName).toMatch(/^[a-z][a-z0-9_]*$/)
+    }
   })
 })

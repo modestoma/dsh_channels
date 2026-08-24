@@ -10,7 +10,7 @@
 
 ## 一、已持久化的内容
 
-1. **路由表**（`src/domain.ts` 域 `channels_routes`，`routes` 表）：键为 `thread_id` 或降级键 `chat:p2p|group:<chatId>:<openId>`，值为 `RouteRecord`（sessionId / chatId / chatType / senderOpenId / workspacePath / cardMessageId / createdAt / lastActivityAt）。`cardMessageId` 每 turn 更新；`lastActivityAt` 已落盘但**暂无消费方**（见缺口 3）。
+1. **路由与过期墓碑**（`src/domain.ts` 域 `channels_routes`）：`routes` 表以 `thread_id` 或降级键 `chat:p2p|group:<chatId>:<openId>` 保存活动 `RouteRecord`（sessionId / chatId / chatType / senderOpenId / workspacePath / cardMessageId / createdAt / lastActivityAt）；`expired_routes` 以 thread id 保存 TTL 退休后的最小墓碑，跨重启拒绝旧话题误建 Session。`cardMessageId` 每 turn 更新，`lastActivityAt` 供路由退休使用。
 2. **会话本体与事件日志**：宿主代持。插件消费的 `assistant/chunk`、`tool/call`、`tool-workflow/run-*`、`subagent/descriptor` 等全部在持久化日志里，因此 `src/stats.ts` 的 token/缓存统计不单独存，`foldAll()` 重放日志，重启后继续累计。`meta.cwd`、`agentPreset` 随 header 落盘。
 3. **工作区**：目录确定性生成、幂等 mkdir；宿主 `workspace.json` 持久化 path/title/sessionIds。
 4. **凭据**：密钥存宿主 `$DSH_HOME/.credentials.yaml`，插件只持引用名。
@@ -26,7 +26,7 @@
 |---|---|---|---|
 | 1 | in-flight turn 快照：重启后卡片/表情无法修复 | 重启（含插件热更新）发生在回复中途时，飞书端卡片永远停在「推理中/回复中」，Typing 表情残留、DONE 永不补 | ✅ 已修复（见下文） |
 | 2 | 消息幂等去重：WS 重连/重投会重复处理同一 message id | 同一条用户消息可能触发两次 followup 或重复建 session | ✅ 已修复（见下文） |
-| 3 | 路由表 GC：记录永不删除 | 话题被删除后死记录无限增长；`lastActivityAt` 已备好待用 | ✅ 已修复（见下文） |
+| 3 | 路由表 GC：活动记录永不退休 | 话题长期不用后仍保留完整 Session 路由；直接删除又会让旧话题误建新 Session | ✅ 已修复（见下文） |
 | 4 | 段卡 message id 持久化 | 重启后无法引用/修复旧续卡（已随缺口 1 一并解决） | ✅ 已修复（随缺口 1） |
 | 5 | 路由并发窗口：同话题并发首消息会重复建 session | 两 session 两路由，后写覆盖 | ✅ 已修复（见下文） |
 
@@ -130,34 +130,36 @@
 
 ## 问题
 
-`routes` 表只增不减：话题被用户删除后，其 `thread_id` 永远不会再次出现，死记录无限增长；`lastActivityAt` 早就落盘但无人消费。in-flight 快照同样存在老化残留（跨多轮重启的僵尸快照）。
+`routes` 表只增不减会让长期不用的话题一直保留完整 Session 路由；但直接删除又会把后来出现在同一可见话题中的消息误判为新对话，静默创建没有旧上下文的新 Session。`lastActivityAt` 用于退休活动路由，最小墓碑用于跨重启拒绝旧话题。in-flight 快照同样存在老化残留（跨多轮重启的僵尸快照）。
 
 ## 方案
 
-- **配置** `routeTtlMs`（默认 `DEFAULT_ROUTE_TTL_MS` = 30 天，`0` = 关闭）：超过该时长无活动的路由记录视为死记录。
+- **配置** `routeTtlMs`（默认 `DEFAULT_ROUTE_TTL_MS` = 30 天，`0` = 关闭）：超过该时长无活动的真实话题路由视为过期。
 - **清扫时机**：启动时一次（长连接建立后，与中断修复同批后台任务）+ 每 6 小时一次的周期清扫（`GC_SWEEP_INTERVAL_MS`，unref 不阻塞进程退出，shutdown 时清除定时器）。
 - **清扫内容**（`gcExpiredEntries()`）：
-  - `routes` 表：`lastActivityAt < cutoff` 的记录删除，并同步清 `routeCache`（内存缓存与持久层不偏离）；
+  - `routes` 表中过期的 `thread` 记录：先写入 `expired_routes` 最小持久化墓碑，再删除活动记录并同步清 `routeCache`；后续消息和 Session 命令明确拒绝，不恢复也不新建 Session；
+  - 过期的降级 `chat` 路由：直接删除（它没有可辨识的独立话题边界）；
   - `inflight` 表：`startedAt < cutoff` 的僵尸快照**静默删除**——不 patch 卡片（给陈年老卡打"服务已重启"补丁反而惊扰用户）；
-  - 单键删除失败只 warn 跳过，不中断整体清扫。
+  - 单键处理失败只 warn 跳过，不中断整体清扫。
 - **与中断修复的分工**：`repairInflight()` 在 TTL 开启时跳过超龄快照（GC 的职责），两轮后台任务无论执行顺序如何都收敛一致；TTL 关闭时修复逻辑不变（照常修复全部快照）。
-- **边界**：只删插件自己的路由条目，宿主侧的 session / 工作区不动；被 GC 的话题后来再有消息，等同未知话题 → 新建 session，语义与"新消息开新话题"一致。
+- **边界**：只退休插件自己的路由条目，宿主侧的 Session / 工作区不动；被 GC 的真实话题后来再有消息会命中过期墓碑并明确拒绝，绝不在旧话题中新建 Session。`/health` 不依赖 Session，仍可执行。
 
 ## 语义保证
 
 - 活跃话题（每 turn 都会刷新 `lastActivityAt`）永远不会被误删。
-- 删除是持久的（先落盘后清内存缓存），与并发写入安全（`entries()` 快照 + 只删超龄键）。
+- 过期拒绝是持久的：先写墓碑再删活动路由，即使两步之间重启，墓碑仍优先阻止误建 Session。
 
 ## 已知取舍（v1）
 
 - 未监听飞书侧"群解散/话题删除"事件做主动清理（TTL 兜底，事件清理列为后续可选优化）。
+- 墓碑为避免跨重启误建 Session 而持久保留；`routeTtlMs: 0` 只关闭后续过期处理，不自动解除已有墓碑。
 - 跨实例共享同一介质时，各实例各自清扫同一套记录——幂等无害。
 
 ## 涉及文件
 
 - `src/config.ts` — `routeTtlMs` 配置项 + `DEFAULT_ROUTE_TTL_MS`
 - `src/service.ts` — `gcExpiredEntries()`、启动/周期清扫接线、`repairInflight` 超龄跳过
-- `tests/service.test.ts` — GC 用例（启动清扫、僵尸快照静默删除、0 关闭、GC 后话题重建 session）
+- `tests/service.test.ts` — GC 用例（启动退休、墓碑跨重启拒绝、命令拒绝、降级路由清理、僵尸快照静默删除、0 关闭）
 - `tests/config.test.ts` — `routeTtlMs` 默认值 / 0 / 负值校验
 
 ---

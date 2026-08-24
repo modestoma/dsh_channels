@@ -192,6 +192,7 @@ export type CommandCardKind =
   | 'input-error'
   | 'unknown'
   | 'unbound'
+  | 'expired'
   | 'forbidden'
   | 'busy'
   | 'unavailable'
@@ -218,6 +219,7 @@ const CARD_TITLES: Record<CommandCardKind, string> = {
   'input-error': '⚠️ 命令格式不正确',
   unknown: '❓ 未知命令',
   unbound: '🔗 尚未绑定会话',
+  expired: '⌛ 话题已过期',
   forbidden: '🔒 无权操作此会话',
   busy: '⏳ 会话正忙',
   unavailable: '🧩 命令暂不可用',

@@ -1815,6 +1815,7 @@ describe('FeishuService', () => {
     raw: ReturnType<typeof makeHostContext>['domain']['raw'],
     key: string,
     lastActivityAt: number,
+    partial: Partial<RouteRecord> = {},
   ): Promise<unknown> {
     return raw.table('routes').put(key, {
       key,
@@ -1827,6 +1828,7 @@ describe('FeishuService', () => {
       cardMessageId: `om_${key}`,
       createdAt: lastActivityAt,
       lastActivityAt,
+      ...partial,
     })
   }
 
@@ -1842,6 +1844,9 @@ describe('FeishuService', () => {
       const entries = [...(ctxState.domain.raw.table('routes').entries() as IterableIterator<[string, unknown]>)]
       expect(entries.map(([key]) => key).sort()).toEqual(['omt_fresh'])
     })
+    expect([...(ctxState.domain.raw.table('expired_routes').entries() as IterableIterator<[string, unknown]>)]).toEqual([
+      ['omt_stale', expect.objectContaining({ key: 'omt_stale', chatId: 'oc_test_chat' })],
+    ])
     await service.shutdown()
   })
 
@@ -1883,7 +1888,7 @@ describe('FeishuService', () => {
     await service.shutdown()
   })
 
-  it('a message in a GC-d topic starts a fresh session instead of resuming the old one', async () => {
+  it('persists a tombstone and rejects messages in a GC-d topic without creating a Session', async () => {
     const ctxState = makeHostContext()
     await seedRoute(ctxState.domain.raw, 'omt_gc', Date.now() - 40 * DAY_MS)
     const channel = makeChannel()
@@ -1891,14 +1896,111 @@ describe('FeishuService', () => {
     await service.start()
     await waitUntil(() =>
       expect([...(ctxState.domain.raw.table('routes').entries() as IterableIterator<[string, unknown]>)]).toHaveLength(0))
+    expect([...(ctxState.domain.raw.table('expired_routes').entries() as IterableIterator<[string, unknown]>)]).toHaveLength(1)
+    await service.shutdown()
 
-    const registered = (channel.onMessage as unknown as ReturnType<typeof vi.fn>).mock.calls
+    // A fresh service instance must load the tombstone from storage; this is
+    // what prevents a process restart from re-enabling the old topic.
+    const restartedChannel = makeChannel()
+    const restarted = new FeishuService(
+      ctxState.ctx,
+      makeConfig({ routeTtlMs: 30 * DAY_MS }),
+      () => restartedChannel,
+    )
+    await restarted.start()
+
+    const registered = (restartedChannel.onMessage as unknown as ReturnType<typeof vi.fn>).mock.calls
     const handler = registered[registered.length - 1]?.[0] as (msg: NormalizedMessage) => Promise<void> | undefined
     await handler(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: '重新开始', threadId: 'omt_gc' }))
 
-    await waitUntil(() => expect(ctxState.agents.created).toHaveLength(1))
+    await waitUntil(() => expect(restartedChannel.sent).toHaveLength(1))
+    expect(ctxState.agents.created).toHaveLength(0)
     expect(ctxState.agents.resumed).toHaveLength(0)
-    expect(ctxState.agents.created[0]!.options.sessionId).not.toBe('session-omt_gc')
+    expect(restartedChannel.sent).toHaveLength(1)
+    expect(JSON.stringify(restartedChannel.sent[0]!.input)).toContain('话题已过期')
+    expect(JSON.stringify(restartedChannel.sent[0]!.input)).toContain('不会在此话题创建新 Session')
+    await restarted.shutdown()
+  })
+
+  it('retires an overdue topic at message admission before the periodic GC runs again', async () => {
+    const ctxState = makeHostContext()
+    const routeTtlMs = 100
+    await seedRoute(ctxState.domain.raw, 'omt_admission_ttl', Date.now())
+    const channel = makeChannel()
+    const service = new FeishuService(ctxState.ctx, makeConfig({ routeTtlMs }), () => channel)
+    await service.start()
+    // The startup sweep saw a fresh route. Crossing TTL afterwards exercises
+    // the per-message deadline check rather than the six-hour timer.
+    await new Promise(resolve => setTimeout(resolve, routeTtlMs + 25))
+    const registered = (channel.onMessage as unknown as ReturnType<typeof vi.fn>).mock.calls
+    const handler = registered[registered.length - 1]?.[0] as (msg: NormalizedMessage) => Promise<void> | undefined
+
+    await handler(makeMessage({
+      chatType: 'group', chatId: 'oc_test_chat', senderId: 'ou_test_user',
+      content: '继续', threadId: 'omt_admission_ttl', mentionedBot: false,
+    }))
+
+    await waitUntil(() => expect(channel.sent).toHaveLength(1))
+    expect(ctxState.agents.created).toHaveLength(0)
+    expect(ctxState.agents.resumed).toHaveLength(0)
+    expect(JSON.stringify(channel.sent[0]!.input)).toContain('话题已过期')
+    expect([...(ctxState.domain.raw.table('expired_routes').entries() as IterableIterator<[string, unknown]>)]).toHaveLength(1)
+    await service.shutdown()
+  })
+
+  it('rejects Session commands in an expired topic before Agent resume', async () => {
+    const ctxState = makeHostContext()
+    await ctxState.domain.raw.table('expired_routes').put('omt_expired_cmd', {
+      key: 'omt_expired_cmd',
+      chatId: 'oc_test_chat',
+      chatType: 'group',
+      senderOpenId: 'ou_test_user',
+      expiredAt: Date.now(),
+    })
+    const channel = makeChannel()
+    const service = new FeishuService(ctxState.ctx, makeConfig(), () => channel)
+    await service.start()
+    const registered = (channel.onMessage as unknown as ReturnType<typeof vi.fn>).mock.calls
+    const handler = registered[registered.length - 1]?.[0] as (msg: NormalizedMessage) => Promise<void> | undefined
+
+    await handler(makeMessage({
+      chatType: 'group', chatId: 'oc_test_chat', senderId: 'ou_test_user',
+      content: '/status', threadId: 'omt_expired_cmd', mentionedBot: false,
+    }))
+
+    await waitUntil(() => expect(channel.sent).toHaveLength(1))
+    expect(ctxState.agents.created).toHaveLength(0)
+    expect(ctxState.agents.resumed).toHaveLength(0)
+    expect(JSON.stringify(channel.sent[0]!.input)).toContain('话题已过期')
+
+    await handler(makeMessage({
+      chatType: 'group', chatId: 'oc_test_chat', senderId: 'ou_test_user',
+      content: '/health', threadId: 'omt_expired_cmd', mentionedBot: false,
+      messageId: 'om_expired_health',
+    }))
+    await waitUntil(() => expect(channel.sent).toHaveLength(2))
+    expect(JSON.stringify(channel.sent[1]!.input)).toContain('健康检查')
+    expect(ctxState.agents.created).toHaveLength(0)
+    expect(ctxState.agents.resumed).toHaveLength(0)
+    await service.shutdown()
+  })
+
+  it('deletes an expired degraded chat route without creating a thread tombstone', async () => {
+    const ctxState = makeHostContext()
+    await seedRoute(ctxState.domain.raw, 'chat:p2p:oc_p2p:ou_alice', Date.now() - 40 * DAY_MS, {
+      key: 'chat:p2p:oc_p2p:ou_alice',
+      kind: 'chat',
+      chatId: 'oc_p2p',
+      chatType: 'p2p',
+      senderOpenId: 'ou_alice',
+    })
+    const channel = makeChannel()
+    const service = new FeishuService(ctxState.ctx, makeConfig({ routeTtlMs: 30 * DAY_MS }), () => channel)
+    await service.start()
+
+    await waitUntil(() =>
+      expect([...(ctxState.domain.raw.table('routes').entries() as IterableIterator<[string, unknown]>)]).toHaveLength(0))
+    expect([...(ctxState.domain.raw.table('expired_routes').entries() as IterableIterator<[string, unknown]>)]).toHaveLength(0)
     await service.shutdown()
   })
 

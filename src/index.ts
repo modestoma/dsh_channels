@@ -40,7 +40,7 @@ export { addUsage, averageDecodeTokensPerSecond, averageTtftMs, cacheHitPct, EMP
 export { FeishuService } from './service.ts'
 export { TurnStreamer } from './streamer.ts'
 export { ensureWorkspace, workspacePathFor, workspaceTitleFor } from './workspaces.ts'
-export { appendSessionHistory, chatRouteKey, feishuDomain, normalizeRouteRecord, normalizeSessionHistory, routeRecordSchema, sessionHistoryEntrySchema, inflightSnapshotSchema, processedRecordSchema } from './domain.ts'
+export { appendSessionHistory, chatRouteKey, expiredRouteRecordSchema, feishuDomain, normalizeRouteRecord, normalizeSessionHistory, routeRecordSchema, sessionHistoryEntrySchema, inflightSnapshotSchema, processedRecordSchema } from './domain.ts'
 
 /** Cordis function-plugin name. */
 export const name = 'channels'

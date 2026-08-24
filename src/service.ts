@@ -44,7 +44,8 @@ import {
   appendSessionHistory, chatRouteKey, feishuDomain, normalizeRouteRecord,
 } from './domain.ts'
 import type {
-  FeishuDomainGlobal, FeishuDomainHandle, InflightSnapshot, ProcessedRecord, RawDomainHandle, RouteRecord,
+  ExpiredRouteRecord, FeishuDomainGlobal, FeishuDomainHandle, InflightSnapshot, ProcessedRecord, RawDomainHandle,
+  RouteRecord,
 } from './domain.ts'
 import type { ChannelFactory, FeishuChannel, NormalizedMessage } from './feishu-channel.ts'
 import { buildHealthCard, foldHealthSnapshot, HEALTH_DEPENDENCY_NAMES } from './health.ts'
@@ -69,6 +70,8 @@ const GC_SWEEP_INTERVAL_MS = 6 * 60 * 60 * 1000
 /** Dedup-record retention: Feishu redelivery windows are minutes-scale, so a
  *  day is 100×+ headroom while keeping the table bounded. */
 const PROCESSED_RETENTION_MS = 24 * 60 * 60 * 1000
+
+const EXPIRED_ROUTE_TEXT = '该话题已超过路由保留时间，并已与原 Session 解绑。为避免误接续上下文，插件不会在此话题创建新 Session；请从私聊或群聊主会话发起新消息（群聊请 @ 机器人）创建新话题。'
 
 /** Build one durable user message from inbound Feishu text (no host runtime import). */
 export function feishuUserMessage(text: string): UserMessage {
@@ -121,6 +124,7 @@ async function openFeishuDomain(ctx: HostContext): Promise<FeishuDomainHandle> {
   const table = domain.table('routes')
   const inflightRaw = domain.table('inflight')
   const processedRaw = domain.table('processed')
+  const expiredRoutesRaw = domain.table('expired_routes')
   return {
     routes: {
       get: key => table.get(key) as RouteRecord | undefined,
@@ -140,6 +144,11 @@ async function openFeishuDomain(ctx: HostContext): Promise<FeishuDomainHandle> {
       put: (key, value) => processedRaw.put(key, value),
       delete: key => processedRaw.delete(key),
       entries: () => processedRaw.entries() as IterableIterator<[string, ProcessedRecord]>,
+    },
+    expiredRoutes: {
+      get: key => expiredRoutesRaw.get(key) as ExpiredRouteRecord | undefined,
+      put: (key, value) => expiredRoutesRaw.put(key, value),
+      entries: () => expiredRoutesRaw.entries() as IterableIterator<[string, ExpiredRouteRecord]>,
     },
     getGlobal: () => (domain.global.get() ?? {}) as FeishuDomainGlobal,
     setGlobal: value => domain.global.set(value),
@@ -178,6 +187,8 @@ export class FeishuService {
   private streamer: TurnStreamer | undefined
   private domain: FeishuDomainHandle | undefined
   private readonly routeCache = new Map<string, RouteRecord>()
+  /** Thread ids retired by TTL; retained so later messages cannot fork context. */
+  private readonly expiredRouteCache = new Map<string, ExpiredRouteRecord>()
   private readonly live = new Map<string, LiveAgent>()
   private readonly pendingResume = new Map<string, Promise<LiveAgent>>()
   /**
@@ -281,6 +292,12 @@ export class FeishuService {
     for (const [key, record] of this.domain.routes.entries()) {
       this.routeCache.set(key, normalizeRouteRecord(record))
     }
+    for (const [key, record] of this.domain.expiredRoutes.entries()) {
+      this.expiredRouteCache.set(key, record)
+      // Tombstone wins over an active row left behind by an interrupted or
+      // failed delete; expired Sessions must not remain approval-routable.
+      this.routeCache.delete(key)
+    }
 
     // HITL: answer the host's approval/request waterfall for sessions this
     // channel routes. `prepend` claims such requests BEFORE the web gateway's
@@ -373,6 +390,7 @@ export class FeishuService {
     this.establishing.clear()
     this.routeOperations.clear()
     this.accepted.clear()
+    this.expiredRouteCache.clear()
     try {
       await this.channel?.disconnect()
     } catch {
@@ -415,10 +433,25 @@ export class FeishuService {
       this.ctx.logger?.warn?.('dsh-channels: recording processed message %s failed: %s', msg.messageId, String(error))
     }
 
+    // Enforce TTL at admission as well as in the periodic sweep. A message that
+    // arrives after the deadline must not get one chance to revive the route
+    // merely because the background GC has not run yet.
+    const expiredThread = msg.threadId === undefined
+      ? undefined
+      : await this.expiredRouteForThread(msg.threadId)
+
     // Slash admission stays behind message-id dedup but ahead of every route,
     // mention, workspace, Session, card-stream, and model side effect.
     if (content.startsWith('/')) {
       await this.handleSlashMessage(msg, content)
+      return
+    }
+
+    // A TTL-retired topic is permanently closed on the channel plane. Keeping
+    // a durable tombstone avoids silently forking a fresh Session in a topic
+    // whose visible history still belongs to the old Session.
+    if (expiredThread !== undefined) {
+      await this.sendExpiredRouteCard(msg)
       return
     }
 
@@ -503,6 +536,24 @@ export class FeishuService {
         kind: 'unknown', command: parsed.name,
         text: `未找到命令 /${parsed.name}。`, supported: supportedCommandList(),
       })
+      return
+    }
+
+    const expiredRoute = msg.threadId === undefined ? undefined : this.lookupExpiredRoute(msg.threadId)
+    if (expiredRoute !== undefined) {
+      if (parsed.name === 'health') {
+        if (parsed.rawInput.trim() !== '') {
+          await this.sendCommandCard(msg, {
+            kind: 'input-error', command: parsed.name, text: '用法错误：/health 不接受参数。',
+          })
+          return
+        }
+        await this.withCommandReaction(msg, async () => {
+          await this.sendHealthCard(msg)
+        })
+        return
+      }
+      await this.sendExpiredRouteCard(msg, parsed.name)
       return
     }
 
@@ -727,6 +778,15 @@ export class FeishuService {
     await this.sendStandaloneCard(msg, buildCommandResultCard(state))
   }
 
+  /** Reject a post-TTL topic message without creating or resuming an Agent. */
+  private async sendExpiredRouteCard(msg: NormalizedMessage, command?: string): Promise<void> {
+    await this.sendCommandCard(msg, {
+      kind: 'expired',
+      ...(command === undefined ? {} : { command }),
+      text: EXPIRED_ROUTE_TEXT,
+    })
+  }
+
   /** Collect and send a privacy-preserving snapshot without Session I/O. */
   private async sendHealthCard(msg: NormalizedMessage): Promise<void> {
     await this.sendStandaloneCard(msg, buildHealthCard(this.healthSnapshot()))
@@ -838,6 +898,62 @@ export class FeishuService {
     const normalized = normalizeRouteRecord(stored)
     this.routeCache.set(key, normalized)
     return normalized
+  }
+
+  private lookupExpiredRoute(key: string): ExpiredRouteRecord | undefined {
+    const cached = this.expiredRouteCache.get(key)
+    if (cached !== undefined) return cached
+    const stored = this.domain?.expiredRoutes.get(key)
+    if (stored === undefined) return undefined
+    this.expiredRouteCache.set(key, stored)
+    return stored
+  }
+
+  /** Whether one active route has crossed the configured inactivity deadline. */
+  private routeHasExpired(record: RouteRecord, now = Date.now()): boolean {
+    return this.config.routeTtlMs > 0
+      && record.lastActivityAt < now - this.config.routeTtlMs
+  }
+
+  /**
+   * Resolve or create the persistent tombstone for a thread whose active route
+   * has crossed TTL. Tombstone publication comes first and wins even if the
+   * best-effort active-route delete fails.
+   */
+  private async expiredRouteForThread(key: string, now = Date.now()): Promise<ExpiredRouteRecord | undefined> {
+    const existing = this.lookupExpiredRoute(key)
+    if (existing !== undefined) {
+      this.routeCache.delete(key)
+      if (this.domain?.routes.get(key) !== undefined) {
+        try {
+          await this.domain.routes.delete(key)
+        } catch (error) {
+          this.ctx.logger?.warn?.('dsh-channels: deleting tombstoned route %s failed: %s', key, String(error))
+        }
+      }
+      return existing
+    }
+    const record = this.lookupRoute(key)
+    if (record === undefined || record.kind !== 'thread' || !this.routeHasExpired(record, now)) return undefined
+
+    const expired: ExpiredRouteRecord = {
+      key,
+      chatId: record.chatId,
+      chatType: record.chatType,
+      senderOpenId: record.senderOpenId,
+      expiredAt: now,
+    }
+    await this.domain?.expiredRoutes.put(key, expired)
+    this.expiredRouteCache.set(key, expired)
+    this.routeCache.delete(key)
+    try {
+      await this.domain?.routes.delete(key)
+    } catch (error) {
+      // The durable tombstone already makes expiry fail-closed. Keep serving
+      // the explicit rejection and let a later sweep retry the stale delete.
+      this.ctx.logger?.warn?.('dsh-channels: deleting retired route %s failed: %s', key, String(error))
+    }
+    return expired
   }
 
   private async persistRoute(key: string, record: RouteRecord): Promise<void> {
@@ -966,14 +1082,13 @@ export class FeishuService {
    *    guard entries older than `PROCESSED_RETENTION_MS` are dropped —
    *    redelivery windows are minutes, so a day of retention is ample and
    *    keeps the table bounded regardless of the route TTL setting.
-   * 2. Route/inflight GC (`routeTtlMs > 0`): route records idle past the TTL
-   *    (a deleted topic's thread id never reappears) and stale in-flight
-   *    snapshots (the card they describe is ancient — repairing it now would
-   *    surprise the user) are deleted; `routeCache` is purged after the
-   *    durable delete lands. Only the plugin's own routing entries are
-   *    touched: sessions and workspaces stay in the host, and a later message
-   *    in a GC'd topic simply starts a fresh session, exactly like an unknown
-   *    topic.
+   * 2. Route/inflight GC (`routeTtlMs > 0`): thread routes idle past the TTL
+   *    are retired into minimal persistent tombstones before their active
+   *    records are deleted. A later message in that visible topic is then
+   *    rejected instead of silently creating a context-free Session. Degraded
+   *    chat-scoped routes have no topic boundary and are deleted normally.
+   *    Stale in-flight snapshots are deleted without surprising the user with
+   *    a repair of an ancient card. Sessions and workspaces remain host-owned.
    *
    * Per-key failures are logged and skipped; concurrent writes are safe
    * because `entries()` snapshots.
@@ -982,6 +1097,7 @@ export class FeishuService {
     const now = Date.now()
     const processedCutoff = now - PROCESSED_RETENTION_MS
     let removedRoutes = 0
+    let retiredThreadRoutes = 0
     let removedInflight = 0
     let removedProcessed = 0
 
@@ -1015,8 +1131,13 @@ export class FeishuService {
       for (const [key, record] of [...routes.entries()]) {
         if (record.lastActivityAt >= cutoff) continue
         try {
-          await routes.delete(key)
-          this.routeCache.delete(key)
+          if (record.kind === 'thread') {
+            await this.expiredRouteForThread(key, now)
+            retiredThreadRoutes++
+          } else {
+            await routes.delete(key)
+            this.routeCache.delete(key)
+          }
           removedRoutes++
         } catch (error) {
           this.ctx.logger?.warn?.('dsh-channels: GC of route %s failed: %s', key, String(error))
@@ -1039,8 +1160,8 @@ export class FeishuService {
 
     if (removedRoutes > 0 || removedInflight > 0 || removedProcessed > 0) {
       this.ctx.logger?.info?.(
-        'dsh-channels: record GC removed %d route(s), %d stale snapshot(s), %d dedup record(s)',
-        removedRoutes, removedInflight, removedProcessed,
+        'dsh-channels: record GC removed %d route(s) (%d thread tombstone(s)), %d stale snapshot(s), %d dedup record(s)',
+        removedRoutes, retiredThreadRoutes, removedInflight, removedProcessed,
       )
     }
   }

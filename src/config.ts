@@ -81,10 +81,11 @@ export const configSchema = z.object({
   /**
    * Route-table GC threshold. Route records (and stale in-flight repair
    * snapshots) whose last activity is older than this many milliseconds are
-   * deleted at startup and on every periodic sweep — a deleted topic's
-   * `thread_id` never reappears, so its record is dead weight forever
-   * otherwise. Only the plugin's routing entry is removed: the DSH session
-   * and workspace stay untouched. `0` disables GC entirely.
+   * retired at startup and on every periodic sweep. Real thread routes leave a
+   * minimal persistent tombstone, so a later message in the visibly old topic
+   * is rejected instead of silently creating a context-free Session. Degraded
+   * chat-scoped routes are deleted normally. The DSH session and workspace
+   * stay untouched. `0` disables route retirement entirely.
    */
   routeTtlMs: z.number().int().min(0).default(DEFAULT_ROUTE_TTL_MS),
   /**

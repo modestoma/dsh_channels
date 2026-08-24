@@ -50,6 +50,29 @@ export const routeRecordSchema = z.object({
 export type RouteRecord = z.infer<typeof routeRecordSchema>
 
 /**
+ * Minimal persistent tombstone for a thread route retired by route TTL.
+ *
+ * Deleting the active route alone would make a later message look like a new
+ * conversation and silently create another Session in the same Feishu topic.
+ * The tombstone preserves only enough identity to reject that message across
+ * process restarts; the old Session and workspace remain host-owned.
+ */
+export const expiredRouteRecordSchema = z.object({
+  /** Expired Feishu thread id (also the table key). */
+  key: z.string().min(1),
+  /** Feishu chat containing the expired topic. */
+  chatId: z.string().min(1),
+  /** Original chat type, retained for diagnostics and future policy. */
+  chatType: z.enum(['p2p', 'group']),
+  /** Original route owner; never used to grant access after expiry. */
+  senderOpenId: z.string().min(1),
+  /** Epoch ms when the route was retired. */
+  expiredAt: z.number().int().nonnegative(),
+})
+
+export type ExpiredRouteRecord = z.infer<typeof expiredRouteRecordSchema>
+
+/**
  * Normalize legacy and partially duplicated histories without mutating the
  * durable record. The current Session is always represented, duplicate ids
  * collapse to their earliest timestamp, and output order is deterministic.
@@ -165,6 +188,10 @@ export interface FeishuDomainSpecShape {
       valueSchema: typeof processedRecordSchema
       __key?: string
     }
+    expired_routes: {
+      valueSchema: typeof expiredRouteRecordSchema
+      __key?: string
+    }
   }
 }
 
@@ -193,6 +220,7 @@ export const feishuDomain: FeishuDomainSpecShape = {
     routes: { valueSchema: routeRecordSchema },
     inflight: { valueSchema: inflightSnapshotSchema },
     processed: { valueSchema: processedRecordSchema },
+    expired_routes: { valueSchema: expiredRouteRecordSchema },
   },
 }
 
@@ -228,11 +256,19 @@ export interface ProcessedTable {
   entries(): IterableIterator<[string, ProcessedRecord]>
 }
 
+/** Persistent thread tombstones used to reject post-TTL messages. */
+export interface ExpiredRoutesTable {
+  get(key: string): ExpiredRouteRecord | undefined
+  put(key: string, value: ExpiredRouteRecord): Promise<unknown> | void
+  entries(): IterableIterator<[string, ExpiredRouteRecord]>
+}
+
 /** Normalized domain handle. */
 export interface FeishuDomainHandle {
   routes: RoutesTable
   inflight: InflightTable
   processed: ProcessedTable
+  expiredRoutes: ExpiredRoutesTable
   getGlobal(): FeishuDomainGlobal
   setGlobal(value: FeishuDomainGlobal): Promise<unknown> | void
   close(): Promise<void>
