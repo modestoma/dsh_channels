@@ -10,9 +10,12 @@
 
 | 命令 | 行为 |
 |---|---|
+| `/help` | 列出当前支持的斜杠命令；允许在尚未绑定 Session 或已过期话题中使用 |
+| `/userid` | 仅在私聊中直接回复当前消息发送者的 user ID；无需绑定 Session，不创建话题 |
+| `/groupid` | 仅在群聊中直接回复当前群组的 group ID；无需绑定 Session，不创建话题；普通群聊遵循 `requireMention`，话题内无需重复 @ |
 | `/health` | 显示 Harness 组合状态和飞书 WebSocket 通道状态；允许在尚未绑定 Session 的私聊或群聊中使用 |
 | `/status` | 显示当前 Session 的模型、推理强度、token、上下文、缓存、LLM/工具耗时和吞吐指标 |
-| `/work-dir` | 显示当前 Session 绑定的工作区绝对路径 |
+| `/workspace` | 显示当前 Session 绑定的工作区绝对路径 |
 | `/compact` | 调用 Harness 已注册的原生 `/compact`，显示压缩前后上下文占用和文本条形图 |
 | `/renew` | 在当前飞书话题中创建并绑定新 Session，复用原工作区，保留旧 Session |
 | `/history` | 显示当前话题绑定过的历史 Session；默认展示最近 20 条并标记当前项 |
@@ -32,16 +35,18 @@
 
 1. 消息仍先经过现有 message-id 去重门，确保命令副作用不会因飞书重投而重复执行。
 2. 仅当去除消息首尾空白后的内容以 `/` 开头时进入命令平面；命令名沿用 Harness 的小写字母、数字、`_`、`-` 语法。
-3. `/health` 可以在无路由的话题、私聊或群聊中执行；其余命令必须先解析到当前话题的 `RouteRecord`。
-4. 有 Session 的命令通过 `ctx.commands.execute(agent, line, signal)` 执行，以保留 Harness 的 `command/run`、`command/done` 生命周期记录。
+3. `/help`、`/userid`、`/groupid`、`/health` 可以在无路由或已过期话题中执行；`/userid` 只接受私聊，`/groupid` 只接受群聊；普通群聊中的 ID 查询遵循 `requireMention`，未 @ 时静默忽略，话题内无需重复 @；其余命令必须先解析到当前话题的 `RouteRecord`。
+4. 除全局快速返回的 `/help`、`/userid`、`/groupid` 外，有 Session 的命令通过 `ctx.commands.execute(agent, line, signal)` 执行，以保留 Harness 的 `command/run`、`command/done` 生命周期记录。
 5. Harness 未注册的命令返回明确错误和当前支持的命令列表，不调用 `agent.followup()`。
-6. 命令结果使用独立、非流式的飞书结果卡；命令执行期间沿用 Typing → DONE 表态，但不创建模型 turn。
+6. 命令结果使用独立、非流式的飞书结果卡；`/userid`、`/groupid` 使用普通回复，不设置 `reply_in_thread`，其余命令保持话题回复；命令执行期间沿用 Typing → DONE 表态，但不创建模型 turn。
 7. 同一路由上的普通消息、`/compact`、`/renew` 和 `/export` 必须串行准入，避免路由切换、压缩和普通 turn 互相穿插。
 
 ### 2.2 身份与信息边界
 
+- `/help` 只显示公开的命令名和功能说明，不读取 Session 或路由信息。
+- `/userid` 只在私聊中回显当前消息的 `senderId`；`/groupid` 只在群聊中回显当前消息的 `chatId`，错误会话类型不回显 ID。
 - `/health` 只显示脱敏的整体状态，不显示凭据引用值、错误堆栈、插件配置或文件路径。
-- 其余命令仅允许 `msg.senderId === route.senderOpenId` 的话题所有者执行。
+- 其余 Session 命令仅允许 `msg.senderId === route.senderOpenId` 的话题所有者执行。
 - 非所有者执行 Session 命令时返回“无权操作此会话”，不恢复 Agent、不读取 Session 日志、不产生命令生命周期事件。
 - `/status` 的工具事件只显示工具名称、状态和耗时，不显示调用参数或工具结果正文。
 - `/export` 含完整逻辑日志，可能包含工作区路径、用户输入和工具输出；只能发送给当前路由所有者所在的原话题。
@@ -109,7 +114,7 @@ SC-01 命令 Host 类型桥与组合依赖
   └─ SC-02 命令准入、授权、串行和结果卡
       ├─ SC-03 /health
       ├─ SC-04 /status
-      ├─ SC-05 /work-dir
+      ├─ SC-05 /workspace
       ├─ SC-06 /compact
       ├─ SC-07 /renew 与历史持久化
       │   └─ SC-08 /history
@@ -153,9 +158,9 @@ SC-01 命令 Host 类型桥与组合依赖
 
 - 在普通消息路由到 `continueSession()` / `startSession()` 之前增加 slash admission。
 - 保留现有 message-id 去重顺序，保证命令至多处理一次。
-- 实现无 Session `/health` 快速路径，以及有 Session 的 `ctx.commands.execute()` 路径。
+- 实现无 Session `/help`、`/health` 快速路径，以及有 Session 的 `ctx.commands.execute()` 路径。
 - 增加路由所有者校验和每路由异步操作串行器。
-- 在 Agent setup 中注册 channel-scoped 的 `health`、`status`、`work-dir`、`renew`、`history`、`export`；复用全局 `compact`，不重复注册同名命令。
+- 在 Agent setup 中注册 channel-scoped 的 `help`、`health`、`status`、`workspace`、`renew`、`history`、`export`；复用全局 `compact`，不重复注册同名命令。
 - 增加统一成功、输入错误、未知命令、未绑定 Session、无权限、busy 和内部错误结果卡。
 - 命令输入、错误和结果不进入 `agent.followup()`，结果卡不接入 `TurnStreamer`。
 
@@ -163,7 +168,7 @@ SC-01 命令 Host 类型桥与组合依赖
 
 **验收条件**：
 
-- 已知命令产生且只产生一对 `command/run` / `command/done`；无 Session `/health` 不伪造 Session 日志。
+- Session 命令产生且只产生一对 `command/run` / `command/done`；全局 `/help` 和无 Session `/health` 不伪造 Session 日志。
 - 未知 `/foo` 明确报错，Session 中没有 user/message 或 model turn。
 - 同一 message id 重投不重复压缩、renew、导出或发送结果卡。
 - 群话题中的非所有者不能执行任何 Session 命令。
@@ -214,7 +219,7 @@ SC-01 命令 Host 类型桥与组合依赖
 - 平均 TTFT 和 token/s 使用本文件第 3 节口径。
 - `/status` 自身不增加模型 token；新增的命令生命周期事件不改变统计。
 
-### SC-05：实现 `/work-dir`
+### SC-05：实现 `/workspace`
 
 **依赖**：SC-02。
 
@@ -374,10 +379,11 @@ SC-01 命令 Host 类型桥与组合依赖
 
 | 编号 | 场景 | 操作与预期 | 状态 | 日期/证据 |
 |---|---|---|---|---|
+| MV-00 | 命令帮助 | 新私聊首条发送 `/help`；返回完整命令与说明，不创建 Session | 未执行 | — |
 | MV-01 | 无 Session 健康检查 | 私聊首条发送 `/health`；返回健康卡，不创建 Session | 未执行 | — |
 | MV-02 | 已绑定健康检查 | 话题内 `/health`；显示 Harness 与飞书连接状态 | 未执行 | — |
 | MV-03 | Session 状态 | 完成含工具调用的 turn 后 `/status`；模型、effort、token、上下文、耗时和工具事件正确 | 未执行 | — |
-| MV-04 | 工作区 | 私聊和群聊分别 `/work-dir`；路径符合用户隔离规则 | 未执行 | — |
+| MV-04 | 工作区 | 私聊和群聊分别 `/workspace`；路径符合用户隔离规则 | 未执行 | — |
 | MV-05 | 压缩成功 | 构造可压缩历史后 `/compact`；显示前后数值和条形图 | 未执行 | — |
 | MV-06 | 压缩 busy | turn 运行中发送 `/compact`；明确拒绝且不破坏当前回复 | 未执行 | — |
 | MV-07 | Renew | idle 话题执行 `/renew`；下一条消息进入新 Session，工作区不变 | 未执行 | — |
@@ -385,7 +391,7 @@ SC-01 命令 Host 类型桥与组合依赖
 | MV-09 | 重启恢复 | renew 后重启插件；`/history` 和当前绑定保持不变 | 未执行 | — |
 | MV-10 | Export | `/export`；收到 gzip 文件，解压后包含本次命令生命周期 | 未执行 | — |
 | MV-11 | 未知命令 | 发送 `/foo`；返回支持列表，模型没有收到该文本 | 未执行 | — |
-| MV-12 | 跨用户拒绝 | 群话题内由另一用户执行 `/status`、`/work-dir`、`/history`、`/export`；全部拒绝 | 未执行 | — |
+| MV-12 | 跨用户拒绝 | 群话题内由另一用户执行 `/status`、`/workspace`、`/history`、`/export`；全部拒绝 | 未执行 | — |
 | MV-13 | 飞书重投 | 重放同一 message id 的 `/renew` 或 `/export`；副作用只发生一次 | 未执行 | — |
 | MV-14 | 通道重连 | WebSocket reconnecting/reconnected 期间检查 `/health`；状态转换准确 | 未执行 | — |
 

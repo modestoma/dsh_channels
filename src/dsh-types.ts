@@ -361,12 +361,24 @@ export interface CommandDefinition extends CommandDescriptor {
   readonly handler: (invocation: CommandInvocation) => CommandResult | Promise<CommandResult>
 }
 
+/** Exact wire image input accepted by the Host command runtime. */
+export interface EncodedImageAttachment {
+  readonly mediaType: 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif'
+  readonly data: string
+  readonly name?: string
+}
+
 /** Minimal structural bridge to `@deepseek-ai/dsh-commands`' runtime. */
 export interface CommandRuntime {
   register(definition: CommandDefinition): () => void
   list(agent: Agent): readonly CommandDescriptor[]
   find(agent: Agent, name: string): CommandDefinition | undefined
-  execute(agent: Agent, line: string, signal: AbortSignal): Promise<CommandExecution | undefined>
+  execute(
+    agent: Agent,
+    line: string,
+    images: readonly EncodedImageAttachment[],
+    signal: AbortSignal,
+  ): Promise<CommandExecution | undefined>
 }
 
 /** Agent-scoped Cordis context slice used to register scoped commands. */

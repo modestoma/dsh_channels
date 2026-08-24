@@ -131,6 +131,178 @@ describe('FeishuService', () => {
     ])
   })
 
+  it('lists all supported commands for unbound /help without creating a workspace or Session', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_help', content: '/help',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
+
+    expect(h.ctxState.agents.created).toHaveLength(0)
+    expect(h.ctxState.workspaces.workspaces.size).toBe(0)
+    const json = JSON.stringify((h.channel.sent[0] as { input: object }).input)
+    expect(json).toContain('斜杠命令帮助')
+    expect(json).toContain('/help')
+    expect(json).toContain('/health')
+    expect(json).toContain('/status')
+    expect(json).toContain('/workspace')
+    expect(json).not.toContain('/work-dir')
+    expect(json).toContain('/compact')
+    expect(json).toContain('/renew')
+    expect(json).toContain('/history')
+    expect(json).toContain('/export')
+    expect(h.channel.reactions).toEqual([
+      { messageId: 'om_help', emojiType: 'Typing' },
+      { messageId: 'om_help', emojiType: 'DONE' },
+    ])
+  })
+
+  it('rejects /help arguments without creating a workspace or Session', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_help_args', content: '/help extra',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
+
+    expect(h.ctxState.agents.created).toHaveLength(0)
+    expect(h.ctxState.workspaces.workspaces.size).toBe(0)
+    expect(JSON.stringify((h.channel.sent[0] as { input: object }).input))
+      .toContain('/help 不接受参数')
+  })
+
+  it('returns /userid only in a private chat without creating a workspace or Session', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_private', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_userid', content: '/userid',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
+
+    expect(h.ctxState.agents.created).toHaveLength(0)
+    expect(h.ctxState.workspaces.workspaces.size).toBe(0)
+    const json = JSON.stringify((h.channel.sent[0] as { input: object }).input)
+    expect(json).toContain('当前用户 ID')
+    expect(json).toContain('ou_alice')
+    expect(mock(h.channel.send)).toHaveBeenCalledTimes(1)
+    expect((h.channel.sent[0] as { options?: object }).options).toEqual({ replyTo: 'om_userid' })
+    expect(h.channel.reactions).toEqual([
+      { messageId: 'om_userid', emojiType: 'Typing' },
+      { messageId: 'om_userid', emojiType: 'DONE' },
+    ])
+  })
+
+  it('returns /groupid in a group root when the bot is mentioned', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_group', senderId: 'ou_alice', mentionedBot: true,
+      messageId: 'om_groupid', content: '/groupid',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
+
+    expect(h.ctxState.agents.created).toHaveLength(0)
+    expect(h.ctxState.workspaces.workspaces.size).toBe(0)
+    const json = JSON.stringify((h.channel.sent[0] as { input: object }).input)
+    expect(json).toContain('当前群组 ID')
+    expect(json).toContain('oc_group')
+    expect(mock(h.channel.send)).toHaveBeenCalledTimes(1)
+    expect((h.channel.sent[0] as { options?: object }).options).toEqual({ replyTo: 'om_groupid' })
+    expect(h.channel.reactions).toEqual([
+      { messageId: 'om_groupid', emojiType: 'Typing' },
+      { messageId: 'om_groupid', emojiType: 'DONE' },
+    ])
+  })
+
+  it.each(['userid', 'groupid'] as const)(
+    'ignores unmentioned /%s in a group root when requireMention is enabled',
+    async command => {
+      const h = await setup()
+      await h.onMessage(makeMessage({
+        chatType: 'group', chatId: 'oc_group', senderId: 'ou_alice', mentionedBot: false,
+        messageId: `om_${command}_unmentioned`, content: `/${command}`,
+      }))
+      await flush()
+
+      expect(h.channel.sent).toHaveLength(0)
+      expect(h.channel.reactions).toHaveLength(0)
+      expect(h.ctxState.agents.created).toHaveLength(0)
+      expect(h.ctxState.workspaces.workspaces.size).toBe(0)
+    },
+  )
+
+  it('returns /groupid without a repeated mention inside an existing topic', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_topic_group', senderId: 'ou_alice', mentionedBot: false,
+      threadId: 'omt_existing', messageId: 'om_groupid_topic', content: '/groupid',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
+
+    expect(JSON.stringify((h.channel.sent[0] as { input: object }).input)).toContain('oc_topic_group')
+    expect((h.channel.sent[0] as { options?: object }).options)
+      .toEqual({ replyTo: 'om_groupid_topic' })
+    expect(h.ctxState.agents.created).toHaveLength(0)
+  })
+
+  it('returns /groupid without a mention when requireMention is disabled', async () => {
+    const h = await setup({ requireMention: false })
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_open_group', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_groupid_open', content: '/groupid',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
+
+    expect(JSON.stringify((h.channel.sent[0] as { input: object }).input)).toContain('oc_open_group')
+    expect((h.channel.sent[0] as { options?: object }).options)
+      .toEqual({ replyTo: 'om_groupid_open' })
+  })
+
+  it.each([
+    ['userid', 'group', '命令 /userid 仅支持在私聊中使用。', 'ou_group_user'],
+    ['groupid', 'p2p', '命令 /groupid 仅支持在群聊中使用。', 'oc_private_chat'],
+  ] as const)('rejects /%s in the wrong chat type without exposing its ID', async (
+    command, chatType, expected, hiddenId,
+  ) => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType,
+      chatId: chatType === 'group' ? 'oc_group_chat' : hiddenId,
+      senderId: chatType === 'group' ? hiddenId : 'ou_private_user',
+      mentionedBot: true,
+      messageId: `om_${command}_wrong_chat`,
+      content: `/${command}`,
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
+
+    expect(h.ctxState.agents.created).toHaveLength(0)
+    expect(h.ctxState.workspaces.workspaces.size).toBe(0)
+    const json = JSON.stringify((h.channel.sent[0] as { input: object }).input)
+    expect(json).toContain(expected)
+    expect(json).not.toContain(hiddenId)
+    expect(mock(h.channel.send)).toHaveBeenCalledTimes(1)
+    expect((h.channel.sent[0] as { options?: object }).options)
+      .toEqual({ replyTo: `om_${command}_wrong_chat` })
+  })
+
+  it.each(['userid', 'groupid'] as const)('rejects /%s arguments without creating a Session', async command => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: command === 'userid' ? 'p2p' : 'group',
+      mentionedBot: command === 'groupid',
+      messageId: `om_${command}_args`,
+      content: `/${command} extra`,
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
+
+    expect(h.ctxState.agents.created).toHaveLength(0)
+    expect(JSON.stringify((h.channel.sent[0] as { input: object }).input))
+      .toContain(`/${command} 不接受参数`)
+    expect(mock(h.channel.send)).toHaveBeenCalledTimes(1)
+    expect((h.channel.sent[0] as { options?: object }).options)
+      .toEqual({ replyTo: `om_${command}_args` })
+  })
+
   it.each([
     ['connected', 'healthy'],
     ['reconnecting', 'degraded'],
@@ -232,6 +404,9 @@ describe('FeishuService', () => {
     await waitUntil(() => expect(mock(h.ctxState.ctx.commands.execute)).toHaveBeenCalledTimes(1))
 
     expect(mock(h.ctxState.ctx.commands.execute)).toHaveBeenCalledTimes(1)
+    expect(mock(h.ctxState.ctx.commands.execute)).toHaveBeenCalledWith(
+      agent, '/status', [], expect.any(AbortSignal),
+    )
     expect(mock(agent.followup)).not.toHaveBeenCalled()
     expect(agent.session.events.map(event => event.type)).toEqual(['command/run', 'command/done'])
     expect(h.channel.sent).toHaveLength(2)
@@ -334,7 +509,7 @@ describe('FeishuService', () => {
     expect(agent.session.events.slice(-2).map(event => event.type)).toEqual(['command/run', 'command/done'])
   })
 
-  it('returns /work-dir only when Session header and route agree', async () => {
+  it('returns /workspace only when Session header and route agree', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_workdir', senderId: 'ou_owner', messageId: 'om_workdir_start', content: '开始',
@@ -346,13 +521,13 @@ describe('FeishuService', () => {
 
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_workdir', senderId: 'ou_owner', threadId: 'omt_1',
-      mentionedBot: false, messageId: 'om_workdir_command', content: '/work-dir',
+      mentionedBot: false, messageId: 'om_workspace_command', content: '/workspace',
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
     expect(JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)).toContain(cwd)
   })
 
-  it('rejects a mismatched /work-dir and logs no path values', async () => {
+  it('rejects a mismatched /workspace and logs no path values', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_workdir_bad', senderId: 'ou_owner', content: '开始',
@@ -365,7 +540,7 @@ describe('FeishuService', () => {
 
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_workdir_bad', senderId: 'ou_owner', threadId: 'omt_1',
-      mentionedBot: false, messageId: 'om_workdir_bad_command', content: '/work-dir',
+      mentionedBot: false, messageId: 'om_workspace_bad_command', content: '/workspace',
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
 
@@ -973,7 +1148,7 @@ describe('FeishuService', () => {
     let commandSignal: AbortSignal | undefined
     let markCommandStarted: () => void = () => {}
     const commandStarted = new Promise<void>(resolve => { markCommandStarted = resolve })
-    mock(h.ctxState.ctx.commands.execute).mockImplementationOnce(async (_agent, _line, signal) => {
+    mock(h.ctxState.ctx.commands.execute).mockImplementationOnce(async (_agent, _line, _images, signal) => {
       commandSignal = signal
       markCommandStarted()
       await new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), { once: true }))
@@ -1980,6 +2155,16 @@ describe('FeishuService', () => {
     }))
     await waitUntil(() => expect(channel.sent).toHaveLength(2))
     expect(JSON.stringify(channel.sent[1]!.input)).toContain('健康检查')
+    expect(ctxState.agents.created).toHaveLength(0)
+    expect(ctxState.agents.resumed).toHaveLength(0)
+
+    await handler(makeMessage({
+      chatType: 'group', chatId: 'oc_test_chat', senderId: 'ou_test_user',
+      content: '/help', threadId: 'omt_expired_cmd', mentionedBot: false,
+      messageId: 'om_expired_help',
+    }))
+    await waitUntil(() => expect(channel.sent).toHaveLength(3))
+    expect(JSON.stringify(channel.sent[2]!.input)).toContain('斜杠命令帮助')
     expect(ctxState.agents.created).toHaveLength(0)
     expect(ctxState.agents.resumed).toHaveLength(0)
     await service.shutdown()

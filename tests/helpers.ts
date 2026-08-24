@@ -10,7 +10,7 @@ import path from 'node:path'
 import { vi } from 'vitest'
 import type {
   Agent, AgentContext, AgentHandle, AgentOptions, AgentRegistry, ApprovalAnswererListener,
-  CommandDefinition, CommandInvocation, CommandRuntime, HostContext, Session, SessionEvent, SessionId,
+  CommandDefinition, CommandInvocation, CommandRuntime, EncodedImageAttachment, HostContext, Session, SessionEvent, SessionId,
   StorageDomainFacility, Workspace, WorkspaceRegistry,
 } from '../src/dsh-types.ts'
 import type {
@@ -63,7 +63,12 @@ export function makeCommandRuntime(): CommandRuntime & { definitions: Map<string
       }
       return definitions.get(name)
     }),
-    execute: vi.fn(async (agent: Agent, line: string, signal: AbortSignal) => {
+    execute: vi.fn(async (
+      agent: Agent,
+      line: string,
+      _images: readonly EncodedImageAttachment[],
+      signal: AbortSignal,
+    ) => {
       const match = /^\/([a-z][a-z0-9_-]*)(?=$|[\t\n\r ])/u.exec(line)
       const name = match?.[1]
       if (name === undefined || match === null) return undefined

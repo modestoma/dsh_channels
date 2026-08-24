@@ -14,18 +14,22 @@ import type {
 } from './dsh-types.ts'
 
 export const CHANNEL_COMMAND_NAMES = [
+  'help',
   'health',
   'status',
-  'work-dir',
+  'workspace',
   'renew',
   'history',
   'export',
 ] as const
 
 export const SUPPORTED_COMMAND_NAMES = [
+  'help',
+  'userid',
+  'groupid',
   'health',
   'status',
-  'work-dir',
+  'workspace',
   'compact',
   'renew',
   'history',
@@ -60,10 +64,31 @@ export function supportedCommandList(): string {
   return SUPPORTED_COMMAND_NAMES.map(name => `/${name}`).join('、')
 }
 
+const SUPPORTED_COMMAND_DESCRIPTIONS: Readonly<Record<SupportedCommandName, string>> = {
+  help: '显示当前支持的斜杠命令',
+  userid: '在私聊中显示当前用户 ID',
+  groupid: '在群聊中显示当前群组 ID',
+  health: '显示 Harness 与飞书通道健康状态',
+  status: '显示当前 Session 状态与性能指标',
+  workspace: '显示当前 Session 工作目录',
+  compact: '压缩当前 Session 上下文',
+  renew: '在当前话题创建并绑定新 Session',
+  history: '显示当前话题的 Session 历史',
+  export: '导出当前 Session 的逻辑日志',
+}
+
+/** Markdown help generated from the canonical supported-command order. */
+export function supportedCommandHelp(): string {
+  return SUPPORTED_COMMAND_NAMES
+    .map(name => `**/${name}** — ${SUPPORTED_COMMAND_DESCRIPTIONS[name]}`)
+    .join('\n')
+}
+
 const DESCRIPTORS: ReadonlyArray<CommandDescriptor> = [
+  { name: 'help', description: SUPPORTED_COMMAND_DESCRIPTIONS.help },
   { name: 'health', description: '显示 Harness 与飞书通道健康状态' },
   { name: 'status', description: '显示当前 Session 状态与性能指标' },
-  { name: 'work-dir', description: '显示当前 Session 工作目录' },
+  { name: 'workspace', description: '显示当前 Session 工作目录' },
   { name: 'renew', description: '在当前话题创建并绑定新 Session' },
   { name: 'history', description: '显示当前话题的 Session 历史' },
   { name: 'export', description: '导出当前 Session 的逻辑日志' },
@@ -117,9 +142,10 @@ const renewHandler: CommandDefinition['handler'] = invocation => {
 }
 
 const READY_HANDLERS: Readonly<Record<string, CommandDefinition['handler']>> = {
+  help: readyHandler('help', supportedCommandHelp()),
   health: healthHandler,
   status: readyHandler('status', 'Session 状态已读取。'),
-  'work-dir': readyHandler('work-dir', '工作目录已读取。'),
+  workspace: readyHandler('workspace', '工作目录已读取。'),
   renew: renewHandler,
   history: readyHandler('history', 'Session 历史已读取。'),
   export: readyHandler('export', '导出已请求。'),
@@ -189,6 +215,8 @@ export class RouteOperationQueue {
 
 export type CommandCardKind =
   | 'success'
+  | 'help'
+  | 'context-error'
   | 'input-error'
   | 'unknown'
   | 'unbound'
@@ -216,6 +244,8 @@ export function commandResultCardKind(result: CommandResult): CommandCardKind {
 
 const CARD_TITLES: Record<CommandCardKind, string> = {
   success: '✅ 命令执行完成',
+  help: '📖 斜杠命令帮助',
+  'context-error': '⚠️ 使用场景不匹配',
   'input-error': '⚠️ 命令格式不正确',
   unknown: '❓ 未知命令',
   unbound: '🔗 尚未绑定会话',

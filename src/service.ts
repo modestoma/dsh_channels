@@ -37,7 +37,7 @@ import { buildCard, buildInterruptionCard } from './cards.ts'
 import type { CardState } from './cards.ts'
 import {
   armRenewCommand, buildCommandResultCard, commandResultCardKind, isSupportedCommand, parseSlashCommand,
-  mountChannelCommands, registerRenewCommand, RouteOperationQueue, supportedCommandList,
+  mountChannelCommands, registerRenewCommand, RouteOperationQueue, supportedCommandHelp, supportedCommandList,
 } from './commands.ts'
 import type { CommandCardState } from './commands.ts'
 import {
@@ -539,6 +539,54 @@ export class FeishuService {
       return
     }
 
+    if (parsed.name === 'help') {
+      if (parsed.rawInput.trim() !== '') {
+        await this.sendCommandCard(msg, {
+          kind: 'input-error', command: parsed.name, text: '用法错误：/help 不接受参数。',
+        })
+        return
+      }
+      await this.withCommandReaction(msg, async () => {
+        await this.sendCommandCard(msg, { kind: 'help', text: supportedCommandHelp() })
+      })
+      return
+    }
+
+    if (parsed.name === 'userid' || parsed.name === 'groupid') {
+      if (msg.chatType === 'group'
+        && msg.threadId === undefined
+        && this.config.requireMention
+        && !msg.mentionedBot) {
+        return
+      }
+      if (parsed.rawInput.trim() !== '') {
+        await this.sendCommandCard(msg, {
+          kind: 'input-error', command: parsed.name,
+          text: `用法错误：/${parsed.name} 不接受参数。`,
+        }, { createThread: false })
+        return
+      }
+      const expectedChatType = parsed.name === 'userid' ? 'p2p' : 'group'
+      if (msg.chatType !== expectedChatType) {
+        await this.sendCommandCard(msg, {
+          kind: 'context-error', command: parsed.name,
+          text: parsed.name === 'userid'
+            ? '命令 /userid 仅支持在私聊中使用。'
+            : '命令 /groupid 仅支持在群聊中使用。',
+        }, { createThread: false })
+        return
+      }
+      await this.withCommandReaction(msg, async () => {
+        await this.sendCommandCard(msg, {
+          kind: 'success', command: parsed.name,
+          text: parsed.name === 'userid'
+            ? `当前用户 ID：\`${msg.senderId}\``
+            : `当前群组 ID：\`${msg.chatId}\``,
+        }, { createThread: false })
+      })
+      return
+    }
+
     const expiredRoute = msg.threadId === undefined ? undefined : this.lookupExpiredRoute(msg.threadId)
     if (expiredRoute !== undefined) {
       if (parsed.name === 'health') {
@@ -630,7 +678,7 @@ export class FeishuService {
               )
           let execution
           try {
-            execution = await this.ctx.commands.execute(live.agent, line, controller.signal)
+            execution = await this.ctx.commands.execute(live.agent, line, [], controller.signal)
           } finally {
             this.commandControllers.delete(controller)
             disarmRenew?.()
@@ -674,7 +722,7 @@ export class FeishuService {
             }))
             return
           }
-          if (parsed.name === 'work-dir' && result.kind === 'success') {
+          if (parsed.name === 'workspace' && result.kind === 'success') {
             const resolved = resolveWorkDir(live.agent.session.header.cwd, current.workspacePath)
             if (resolved.kind === 'success') {
               await this.sendStandaloneCard(msg, buildWorkDirCard(current.sessionId, resolved.path))
@@ -774,8 +822,12 @@ export class FeishuService {
   }
 
   /** Standalone, non-streaming result card with a non-threaded fallback. */
-  private async sendCommandCard(msg: NormalizedMessage, state: CommandCardState): Promise<void> {
-    await this.sendStandaloneCard(msg, buildCommandResultCard(state))
+  private async sendCommandCard(
+    msg: NormalizedMessage,
+    state: CommandCardState,
+    options: { createThread?: boolean } = {},
+  ): Promise<void> {
+    await this.sendStandaloneCard(msg, buildCommandResultCard(state), options)
   }
 
   /** Reject a post-TTL topic message without creating or resuming an Agent. */
@@ -806,12 +858,26 @@ export class FeishuService {
   }
 
   /** Shared delivery policy for command-plane cards. */
-  private async sendStandaloneCard(msg: NormalizedMessage, card: object): Promise<void> {
+  private async sendStandaloneCard(
+    msg: NormalizedMessage,
+    card: object,
+    options: { createThread?: boolean } = {},
+  ): Promise<void> {
     const channel = this.channel
     if (!this.started || channel === undefined) return
+    const createThread = options.createThread ?? true
     try {
-      await channel.send(msg.chatId, { card }, { replyTo: msg.messageId, replyInThread: true })
+      await channel.send(msg.chatId, { card }, createThread
+        ? { replyTo: msg.messageId, replyInThread: true }
+        : { replyTo: msg.messageId })
     } catch (error) {
+      if (!createThread) {
+        this.ctx.logger?.warn?.(
+          'dsh-channels: direct command result delivery failed for message %s: %s',
+          msg.messageId, String(error),
+        )
+        return
+      }
       try {
         await channel.send(msg.chatId, { card }, { replyTo: msg.messageId })
       } catch (fallbackError) {

@@ -2,29 +2,50 @@ import { Context } from '@deepseek-ai/cordis'
 import { describe, expect, it, vi } from 'vitest'
 import {
   armRenewCommand, buildCommandResultCard, commandResultCardKind, mountChannelCommands, parseSlashCommand,
-  registerChannelCommands, RouteOperationQueue, supportedCommandList,
+  registerChannelCommands, RouteOperationQueue, supportedCommandHelp, supportedCommandList,
 } from '../src/commands.ts'
 import type { AgentContext } from '../src/dsh-types.ts'
 import { makeAgent, makeAgentContext, makeCommandRuntime, makeSession } from './helpers.ts'
 
 describe('slash command primitives', () => {
   it('parses the Harness command grammar and preserves raw input', () => {
-    expect(parseSlashCommand('/work-dir  now ')).toEqual({ name: 'work-dir', rawInput: '  now ' })
+    expect(parseSlashCommand('/workspace  now ')).toEqual({ name: 'workspace', rawInput: '  now ' })
     expect(parseSlashCommand('/health')).toEqual({ name: 'health', rawInput: '' })
     expect(parseSlashCommand('/Health')).toBeUndefined()
     expect(parseSlashCommand('/1health')).toBeUndefined()
     expect(parseSlashCommand('/health!')).toBeUndefined()
   })
 
+  it('lists the private user-id and group-id commands in help', () => {
+    expect(supportedCommandList()).toContain('/userid')
+    expect(supportedCommandList()).toContain('/groupid')
+    expect(supportedCommandHelp()).toContain('**/userid** — 在私聊中显示当前用户 ID')
+    expect(supportedCommandHelp()).toContain('**/groupid** — 在群聊中显示当前群组 ID')
+  })
+
   it('registers only channel-scoped definitions and leaves compact global', async () => {
     const commands = makeCommandRuntime()
     registerChannelCommands(commands)
     expect([...commands.definitions.keys()].sort()).toEqual([
-      'export', 'health', 'history', 'renew', 'status', 'work-dir',
+      'export', 'health', 'help', 'history', 'renew', 'status', 'workspace',
     ])
     expect(commands.definitions.has('compact')).toBe(false)
 
     const agent = makeAgent(makeSession(), {}, makeAgentContext(commands))
+
+    expect(await commands.definitions.get('help')!.handler({
+      commandId: 'cmd-test' as never,
+      agent,
+      rawInput: '',
+      signal: new AbortController().signal,
+    })).toEqual({ kind: 'success', text: supportedCommandHelp() })
+    expect(await commands.definitions.get('help')!.handler({
+      commandId: 'cmd-test' as never,
+      agent,
+      rawInput: ' extra',
+      signal: new AbortController().signal,
+    })).toEqual({ kind: 'error', text: '用法错误：/help 不接受参数。' })
+
     expect(await commands.definitions.get('health')!.handler({
       commandId: 'cmd-test' as never,
       agent,
@@ -43,12 +64,12 @@ describe('slash command primitives', () => {
       rawInput: '',
       signal: new AbortController().signal,
     })).toEqual({ kind: 'success', text: 'Session 状态已读取。' })
-    expect(await commands.definitions.get('work-dir')!.handler({
+    expect(await commands.definitions.get('workspace')!.handler({
       commandId: 'cmd-test' as never,
       agent,
       rawInput: ' extra',
       signal: new AbortController().signal,
-    })).toEqual({ kind: 'error', text: '用法错误：/work-dir 不接受参数。' })
+    })).toEqual({ kind: 'error', text: '用法错误：/workspace 不接受参数。' })
     expect(await commands.definitions.get('history')!.handler({
       commandId: 'cmd-test' as never,
       agent,
@@ -86,7 +107,7 @@ describe('slash command primitives', () => {
 
     await mountChannelCommands(bareAgentCtx as unknown as AgentContext)
     expect([...commands.definitions.keys()].sort()).toEqual([
-      'export', 'health', 'history', 'renew', 'status', 'work-dir',
+      'export', 'health', 'help', 'history', 'renew', 'status', 'workspace',
     ])
 
     await ctx.fiber.dispose()
