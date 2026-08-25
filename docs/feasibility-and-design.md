@@ -18,10 +18,10 @@
 | 9 | 私聊：用户 × 机器人 = 一个工作区 | ✅ | DSH 工作区=磁盘目录：`<data>/p2p/<open_id>/`，`ctx.workspaceRegistry.create(path, title)` |
 | 10 | 群聊：用户 × 群 = 一个工作区（同群不同用户互不影响） | ✅ | `<data>/groups/<chat_id>/<open_id>/`，session 以 `meta.cwd` 落盘归属该工作区 |
 | 11 | 流式卡片（card schema 2.0），500ms 刷新 | ✅ | `msg_type: "interactive"` 卡片 2.0 JSON；`im.v1.message.patch` 整体替换卡片。单条消息更新限频 **5 QPS**（官方文档），2 QPS（500ms）安全 |
-| 12 | 折叠面板：带边框、默认折叠、标题三态、右侧箭头随折叠翻转 | ✅ | 卡片 2.0 原生组件 `collapsible_panel`：`border`、`expanded: false`、`header.title`、`icon` + `icon_expanded_angle: 180`（展开时箭头旋转向上） |
+| 12 | 折叠面板：带边框、默认折叠、成功三态与失败终态、右侧箭头随折叠翻转 | ✅ | 卡片 2.0 原生组件 `collapsible_panel`：`border`、`expanded: false`、`header.title`、`icon` + `icon_expanded_angle: 180`（展开时箭头旋转向上） |
 | 13 | 正文富文本 | ✅ | 卡片 2.0 `markdown` 组件（lark markdown 子集） |
 | 14 | session 信息两行小字 | ✅ | `note` 组件 + `img` 图标；数据来自 DSH：session id、usage（input/output/cacheRead/cacheWrite）、`ctx.tokenMeter` 上下文压力、模型/推理强度 |
-| 15 | 流式结束：移除 Typing、改回 DONE 表情 | ✅ | `im.v1.message.reaction.delete`（用 create 返回的 reaction_id）+ create `emoji_type: "DONE"`（官方内置表情） |
+| 15 | 流式结束：移除 Typing；成功改为 DONE，失败改为 No | ✅ | 读取 Harness `turn/end.reason`；`kind: error` 渲染结构化错误并 create `emoji_type: "No"`，其余终态 create `emoji_type: "DONE"` |
 
 **结论：第一版可以实现，全部使用飞书官方 SDK，无需任何非官方接口或 hack。**
 
@@ -64,10 +64,10 @@
                         │   │    (assistant/chunk:        │
                         │   │     文本 + reasoning 增量)  │
                         │   ├─ 500ms 节流 → patch 卡片    │
-                        │   └─ whenIdle → 终态 + DONE     │
+                        │   └─ turn/end → 成功 DONE / 失败 No │
                         │                               │
                         │  ReactionController            │
-                        │   └─ Typing 添加/移除、DONE 添加 │
+                        │   └─ Typing 添加/移除、DONE/No 添加 │
                         └───────────────┬───────────────┘
                                         │ ctx.agents / ctx.workspaceRegistry
                                         │ ctx.tokenMeter / ctx.storageDomain
@@ -91,7 +91,7 @@
 1. 收到事件 → 异步 `reaction.create("Typing")`（非阻塞，记录 reaction_id）。
 2. 确定工作区目录（不存在则 mkdir + `workspaceRegistry.create`）。
 3. 通过 `im.message.reply(message_id, { reply_in_thread: true, msg_type: "interactive", content: 卡片初始 JSON })` 创建话题并发出卡片第一帧（折叠面板标题“推理中”），拿到 `thread_id` + `message_id`。
-4. `ctx.agents.create({ sessionId: <uuid>, meta: { cwd: 工作区目录 }, agentOptions: { provider, model, maxTokens }, setup: 安装 effort 等 })`；`setup` 中注入首个 user 消息（`seed` 或创建后 `followup`）。
+4. `ctx.agents.create({ sessionId: <uuid>, meta: { cwd: 工作区目录 }, agentOptions: { provider, model, maxTokens }, setup: 安装 reasoning effort / preset 等 })`；`setup` 中注入首个 user 消息（`seed` 或创建后 `followup`）。
 5. 持久化 `thread_id → sessionId` 映射。
 
 **话题内续聊（无需 @）：**
@@ -107,8 +107,8 @@
 - **活动状态两行**（互相独立、互不顶替）：**状态行**折叠 `tool-workflow/run-start / agent-start / agent-end / run-end`（workflow 进度：完成数/总数、阶段、活动成员、结束原因），run 结束转为 `结束（完成）` 并**保留到最终卡片**（后续工具调用/正文不顶掉）；子代理完成后汇总为 `子代理完成：a、b` 同样留在最终卡片；**工具行**显示父会话当前 `tool/call`（subagent 取 description、workflow 取 meta.name），`tool/result` 即清、最终卡片收起。两行可同屏（如 `🧵 工作流 xxx 结束（完成）` + `🔧 调用工具：bash`）；无正文输出的等待期以 `statusRefreshMs`（默认 5s）慢心跳刷新“已运行 Ns”计时——进入 subagent / workflow 时卡片不再静默等待。
 - **子代理进度（跨会话映射）**：子代理是独立 session（header `parentSession` 指向主会话、`origin: 'subagent'`），其 `subagent/descriptor`（label）、`tool/call`（当前工具）、`turn/end`（结束移除）经全局 `session/event` 总线折叠进主卡片的同一状态行；workflow 成员经 `tool-workflow/agent-start` 的 `childId` 登记在 run 折叠里、跳过通用子代理折叠以免重复。**只显示状态不显示输出**：子代理正文是父模型的中间产物（工具契约“You receive its result, not its intermediate steps”），绝不进卡片正文。
 - 500ms 节流器（仅内容变化时 patch），拼接卡片 2.0 JSON 全量 `im.v1.message.patch`。
-- 折叠面板标题三态：首个 reasoning 增量前“推理中”；推理结束、正文开始后“回复中”；`agent.whenIdle()` 后“回复结束”。
-- 终态：`reaction.delete(Typing)` → `reaction.create("DONE")`。
+- 折叠面板成功三态：首个 reasoning 增量前“推理中”；推理结束、正文开始后“回复中”；成功 `turn/end` 后“回复结束”。失败 `turn/end` 则进入“回复失败”。
+- 终态：`turn/end.reason.kind === "error"` 时卡片进入「回复失败」并展示 `error.message` / `error.code`，再执行 `reaction.delete(Typing)` → `reaction.create("No")`；其他终态进入「回复结束」并添加 `DONE`。每轮模型头与 usage 单独折叠，失败发生在 `request/header` 前时不显示上一轮的模型、推理强度或缓存命中。
 
 ### 3.3 卡片 JSON（卡片 JSON 2.0 结构）
 

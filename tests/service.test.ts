@@ -17,7 +17,7 @@ import type { AgentHandle, ApprovalOutcome, CordisPluginRuntime, SessionId } fro
 import type { RouteRecord } from '../src/domain.ts'
 import type { SessionExportBuilder } from '../src/session-export.ts'
 import {
-  makeHostContext, makeChannel, makeMessage, makeAgentPresets, makeSession, makeAgent,
+  dispatchAgentRequest, makeHostContext, makeChannel, makeMessage, makeAgentPresets, makeSession, makeAgent,
 } from './helpers.ts'
 import type { FakeAgentPresets, FakeAgentPresetsOptions, FakeAgentsOptions } from './helpers.ts'
 
@@ -1282,7 +1282,7 @@ describe('FeishuService', () => {
   })
 
   it('creates a topic + session for a p2p message: Typing reaction, workspace dir, route persisted', async () => {
-    const h = await setup()
+    const h = await setup({ reasoningEffort: 'tiny' }, {}, { reasoningEffort: 'high' })
     const msg = makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', mentionedBot: false, content: '你好呀' })
     await h.onMessage(msg)
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
@@ -1299,7 +1299,15 @@ describe('FeishuService', () => {
     const created = h.ctxState.agents.created[0]!
     const workspacePath = path.join(h.config.baseDir, 'p2p', 'ou_alice')
     expect(created.options.meta?.cwd).toBe(workspacePath)
-    expect(created.options.agentOptions).toMatchObject({ provider: 'deepseek-official', model: 'deepseek-v4-flash' })
+    expect(created.options.agentOptions).toEqual({
+      provider: 'deepseek-official',
+      model: 'deepseek-v4-flash',
+    })
+    await expect(dispatchAgentRequest(created.setupCtx, {
+      provider: 'deepseek-official',
+      model: 'deepseek-v4-flash',
+      reasoningEffort: 'high',
+    })).resolves.toMatchObject({ reasoningEffort: 'tiny' })
 
     // Workspace registered and session attached.
     expect(h.ctxState.workspaces.workspaces.get(workspacePath)).toBeDefined()
@@ -1503,8 +1511,8 @@ describe('FeishuService', () => {
     await service2.shutdown()
   })
 
-  it('borrows a live agent owned elsewhere instead of cold-resuming it', async () => {
-    const h = await setup()
+  it('borrows a live agent, prepends the configured effort, and releases only that policy', async () => {
+    const h = await setup({ reasoningEffort: 'tiny' })
     await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: 'hello' }))
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
     const sessionId = h.ctxState.agents.created[0]!.options.sessionId
@@ -1513,6 +1521,10 @@ describe('FeishuService', () => {
     // The session stays live under a foreign owner (e.g. the web UI's
     // api-remote resolver resumed it right after the restart).
     const foreignAgent = makeAgent(makeSession(sessionId))
+    foreignAgent.ctx.on('agent/request', async (_payload, next) => ({
+      ...(await next()),
+      reasoningEffort: 'high',
+    }))
     const foreignDispose = vi.fn(async () => {})
     h.ctxState.agents.liveAgents.set(sessionId, { agent: foreignAgent, dispose: foreignDispose })
 
@@ -1528,6 +1540,9 @@ describe('FeishuService', () => {
     expect(h.ctxState.agents.resumed).toHaveLength(0)
     const calls = mock(foreignAgent.followup).mock.calls
     expect((calls[0]?.[0] as { content: Array<{ text: string }> }).content[0]?.text).toBe('还在吗')
+    await expect(dispatchAgentRequest(foreignAgent.ctx, {
+      provider: 'deepseek-official', model: 'deepseek-v4-flash',
+    })).resolves.toMatchObject({ reasoningEffort: 'tiny' })
 
     // The reply card still lands in the topic as usual.
     const sends = channel2.sent as Array<{ options?: { replyInThread?: boolean } }>
@@ -1536,6 +1551,9 @@ describe('FeishuService', () => {
     // Borrowed ≠ owned: shutdown must not dispose the foreign owner's agent.
     await service2.shutdown()
     expect(foreignDispose).not.toHaveBeenCalled()
+    await expect(dispatchAgentRequest(foreignAgent.ctx, {
+      provider: 'deepseek-official', model: 'deepseek-v4-flash',
+    })).resolves.toMatchObject({ reasoningEffort: 'high' })
   })
 
   it('borrows the live winner when a concurrent cold resume wins the race', async () => {
@@ -1612,6 +1630,72 @@ describe('FeishuService', () => {
     await waitUntil(() => expect(h.channel.updated.length).toBeGreaterThan(0))
     const update = h.channel.updated[0] as { card: object }
     expect(JSON.stringify(update.card)).toContain('会话创建失败')
+  })
+
+  it('routes a failed follow-up to a failure card and No without reusing the prior effort', async () => {
+    const h = await setup()
+    const first = makeMessage({
+      chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice',
+      messageId: 'om_first_trigger', content: '第一轮',
+    })
+    await h.onMessage(first)
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    const listener = h.ctxState.sessionListeners[0]!
+    listener(agent.session, {
+      type: 'request/header', seq: 1,
+      data: { header: { config: {
+        provider: 'deepseek-official', model: 'deepseek-v4-flash-vision-exp', reasoningEffort: 'high',
+      } } },
+    })
+    listener(agent.session, {
+      type: 'assistant/message', seq: 2,
+      data: {
+        turn: 1, step: 1, message: {},
+        usage: { inputTokens: 91, outputTokens: 89, cacheReadTokens: 20 },
+      },
+    })
+    listener(agent.session, {
+      type: 'turn/end', seq: 3, data: { turn: 1, reason: { kind: 'completed' } },
+    })
+    await waitUntil(() => expect(h.channel.reactions).toContainEqual({
+      messageId: 'om_first_trigger', emojiType: 'DONE',
+    }))
+
+    const second = makeMessage({
+      chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice',
+      threadId: 'omt_1', messageId: 'om_failed_trigger', content: '第二轮',
+    })
+    await h.onMessage(second)
+    await waitUntil(() => expect(h.channel.sent.length).toBeGreaterThanOrEqual(2))
+
+    listener(agent.session, {
+      type: 'turn/end',
+      seq: 4,
+      data: {
+        turn: 2,
+        reason: {
+          kind: 'error',
+          error: {
+            message: 'does not support reasoning effort "tiny"',
+            code: 'UNSUPPORTED_REASONING_EFFORT',
+          },
+        },
+      },
+    })
+    await waitUntil(() => expect(h.channel.reactions).toContainEqual({
+      messageId: 'om_failed_trigger', emojiType: 'No',
+    }))
+
+    const failedCard = JSON.stringify((h.channel.updated.at(-1) as { card: object }).card)
+    expect(failedCard).toContain('回复失败')
+    expect(failedCard).toContain('UNSUPPORTED_REASONING_EFFORT')
+    expect(failedCard).toContain('模型 —')
+    expect(failedCard).not.toContain('(high)')
+    expect(h.channel.reactions).not.toContainEqual({
+      messageId: 'om_failed_trigger', emojiType: 'DONE',
+    })
   })
 
   it('sends oversized body segments as continuation cards inside the topic', async () => {

@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { vi } from 'vitest'
 import type {
-  Agent, AgentContext, AgentHandle, AgentOptions, AgentRegistry, ApprovalAnswererListener,
+  Agent, AgentContext, AgentHandle, AgentOptions, AgentRegistry, AgentRequestConfig, AgentRequestListener, ApprovalAnswererListener,
   CommandDefinition, CommandInvocation, CommandRuntime, EncodedImageAttachment, HostContext, Session, SessionEvent, SessionId,
   StorageDomainFacility, Workspace, WorkspaceRegistry,
 } from '../src/dsh-types.ts'
@@ -103,14 +103,43 @@ export function makeCommandRuntime(): CommandRuntime & { definitions: Map<string
   return runtime
 }
 
+const agentRequestListeners = new WeakMap<AgentContext, AgentRequestListener[]>()
+
 export function makeAgentContext(commands = makeCommandRuntime()): AgentContext {
+  const listeners: AgentRequestListener[] = []
   const ctx: AgentContext = {
     commands,
+    on(_event, listener, options) {
+      const prepend = options === true || (typeof options === 'object' && options.prepend === true)
+      if (prepend) listeners.unshift(listener)
+      else listeners.push(listener)
+      return () => {
+        const index = listeners.indexOf(listener)
+        if (index === -1) return false
+        listeners.splice(index, 1)
+        return true
+      }
+    },
     async inject(_dependencies, callback) {
       callback(ctx)
     },
   }
+  agentRequestListeners.set(ctx, listeners)
   return ctx
+}
+
+/** Run the fake Agent-scoped request waterfall in registration order. */
+export async function dispatchAgentRequest(
+  ctx: AgentContext,
+  config: AgentRequestConfig,
+): Promise<AgentRequestConfig> {
+  const listeners = agentRequestListeners.get(ctx) ?? []
+  const payload = { turn: 1, step: 0, signal: new AbortController().signal }
+  const run = (index: number): Promise<AgentRequestConfig> => {
+    const listener = listeners[index]
+    return listener === undefined ? Promise.resolve(config) : listener(payload, () => run(index + 1))
+  }
+  return run(0)
 }
 
 export function makeAgent(session: Session, options: AgentOptions = {}, ctx?: AgentContext): Agent {
@@ -270,6 +299,8 @@ export interface FakeAgentPresets {
 export interface FakeAgentPresetsOptions {
   /** Preset id the roster resolves for any request (default 'standard'). */
   defaultId?: string
+  /** Optional request default installed while the preset mounts. */
+  reasoningEffort?: string
   /** When set, `resolve()` rejects with this error. */
   failResolve?: Error
 }
@@ -292,6 +323,12 @@ export function makeAgentPresets(options: FakeAgentPresetsOptions = {}): FakeAge
     }),
     mount: vi.fn(async (agentCtx: AgentContext, id?: string) => {
       mounts.push({ agentCtx, id })
+      if (options.reasoningEffort !== undefined) {
+        agentCtx.on('agent/request', async (_payload, next) => ({
+          ...(await next()),
+          reasoningEffort: options.reasoningEffort,
+        }))
+      }
       return presetFor(id)
     }),
     mounts,

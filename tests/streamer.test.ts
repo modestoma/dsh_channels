@@ -1,6 +1,6 @@
 /**
  * TurnStreamer tests: chunk folding, 500 ms throttle, finalization and the
- * Typing → DONE reaction swap.
+ * Typing → DONE/No reaction swap.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -174,6 +174,73 @@ describe('TurnStreamer', () => {
       expect(add).toHaveBeenCalledWith('om_trigger', 'DONE')
     })
     expect(remove).not.toHaveBeenCalled()
+  })
+
+  it('renders a structured turn failure, isolates prior-turn effort, and swaps Typing→No', async () => {
+    const ch = channel()
+    const hooksInstance = hooks()
+    const streamer = new TurnStreamer(ch, 500, hooksInstance)
+    const session = makeSession('sess-failed')
+    // The preceding turn succeeded with high. The new turn fails before it can
+    // emit request/header or usage, so none of these samples belong to it.
+    ;(session.events as SessionEvent[]).push(
+      {
+        type: 'request/header',
+        seq: 1,
+        data: { header: { config: {
+          provider: 'deepseek-official',
+          model: 'deepseek-v4-flash-vision-exp',
+          reasoningEffort: 'high',
+        } } },
+      },
+      {
+        type: 'assistant/message',
+        seq: 2,
+        data: {
+          turn: 1,
+          step: 1,
+          message: {},
+          usage: { inputTokens: 91, outputTokens: 89, cacheReadTokens: 20 },
+        },
+      },
+    )
+    streamer.attach(session, 'om_card', 'om_trigger', 'react-typing')
+
+    streamer.onSessionEvent(session, {
+      type: 'turn/end',
+      seq: 3,
+      data: {
+        turn: 2,
+        reason: {
+          kind: 'error',
+          error: {
+            message: 'provider "deepseek-official" model "deepseek-v4-flash-vision-exp" does not support reasoning effort "tiny"',
+            code: 'UNSUPPORTED_REASONING_EFFORT',
+          },
+        },
+      },
+    })
+
+    const finalized = ch.updated.at(-1)!.card as {
+      body: { elements: Array<{ tag: string; content?: string; header?: { title: { content: string } } }> }
+    }
+    expect(finalized.body.elements[0]?.header?.title.content).toBe('回复失败')
+    const rendered = JSON.stringify(finalized)
+    expect(rendered).toContain('本轮运行失败')
+    expect(rendered).toContain('UNSUPPORTED_REASONING_EFFORT')
+    expect(rendered).toContain('does not support reasoning effort')
+    expect(rendered).toContain('模型 —')
+    expect(rendered).toContain('缓存命中 —')
+    expect(rendered).not.toContain('(high)')
+
+    const remove = ch.removeReaction as unknown as ReturnType<typeof vi.fn>
+    const add = ch.addReaction as unknown as ReturnType<typeof vi.fn>
+    await vi.waitFor(() => {
+      expect(remove).toHaveBeenCalledWith('om_trigger', 'react-typing')
+      expect(add).toHaveBeenCalledWith('om_trigger', 'No')
+    })
+    expect(add).not.toHaveBeenCalledWith('om_trigger', 'DONE')
+    expect(hooksInstance.onTurnFinalized).toHaveBeenCalledWith('sess-failed', 2, 'om_card')
   })
 
   it('keeps session-cumulative token figures across turns', async () => {

@@ -43,6 +43,8 @@ export const configSchema = z.object({
   provider: z.string().optional(),
   /** Model id for sessions this plugin creates (optional → deployment default). */
   model: z.string().optional(),
+  /** Exact model-advertised reasoning-effort id (optional → adapter/provider default). */
+  reasoningEffort: z.string().min(1).optional(),
   /** Output-token cap per model request (optional → adapter default). */
   maxTokens: z.number().int().positive().optional(),
   /**

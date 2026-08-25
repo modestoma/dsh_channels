@@ -21,6 +21,7 @@ describe('resolveConfig', () => {
     expect(config.threadFallback).toBe('degrade')
     expect(config.loggerLevel).toBe('info')
     expect(config.agentPreset).toBeUndefined()
+    expect(config.reasoningEffort).toBeUndefined()
   })
 
   it('accepts an optional agentPreset id', () => {
@@ -30,6 +31,20 @@ describe('resolveConfig', () => {
       agentPreset: 'channels',
     })
     expect(config.agentPreset).toBe('channels')
+  })
+
+  it('accepts a non-empty provider-owned reasoning effort id', () => {
+    const config = resolveConfig({
+      appId: 'FEISHU_APP_ID',
+      appSecret: 'FEISHU_APP_SECRET',
+      reasoningEffort: 'high',
+    })
+    expect(config.reasoningEffort).toBe('high')
+    expect(() => resolveConfig({
+      appId: 'FEISHU_APP_ID',
+      appSecret: 'FEISHU_APP_SECRET',
+      reasoningEffort: '',
+    })).toThrow(/invalid configuration/)
   })
 
   it('rejects non-identifier spellings (the schema cannot tell refs from secrets)', () => {

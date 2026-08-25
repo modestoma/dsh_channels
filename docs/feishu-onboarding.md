@@ -19,7 +19,7 @@
    |------|------|
    | `im:message`（获取与发送单聊、群组消息） | 收发消息、回复话题 |
    | `im:message.p2p_msg:readonly`（读取用户发给机器人的单聊消息） | 私聊通道 |
-   | `im:message.reactions:write_only`（发送、删除消息表情回复） | Typing / DONE 表态 |
+   | `im:message.reactions:write_only`（发送、删除消息表情回复） | Typing / DONE / No 表态 |
    | `im:message:update`（更新消息卡片） | 流式卡片刷新（patch） |
 
    > 卡片更新接口本身支持 `im:message` 一项即可，但建议把 `im:message:update` 也加上，避免组合差异。
@@ -88,6 +88,7 @@ chmod 600 $DSH_HOME/.credentials.yaml
     baseDir: './channels-data'          # 工作区根目录（相对 profile 目录）
     provider: 'deepseek-official'       # 可选，省略用部署默认
     model: 'deepseek-v4-flash'          # 可选
+    reasoningEffort: 'high'             # 可选，精确模型声明的档位 id
     refreshMs: 500                      # 卡片刷新间隔（下限 200ms）
     requireMention: true                # 普通群需 @ 机器人
     dmMode: 'open'                      # 私聊通道开关
@@ -103,6 +104,7 @@ chmod 600 $DSH_HOME/.credentials.yaml
 | `appId` / `appSecret` | 必填 | 凭据引用名（shell 标识符），经 `ctx.credentials` 解析；明文密钥会被拒绝 |
 | `baseDir` | `./channels-data` | 工作区目录树根：`p2p/<open_id>/`、`groups/<chat_id>/<open_id>/` |
 | `provider` / `model` | 部署默认 | 新建 session 的路由；省略时继承部署默认 |
+| `reasoningEffort` | 适配器/provider 默认 | 新建 session 的推理档位；必须是精确模型声明的非空 id |
 | `maxTokens` | 适配器默认 | 每次模型请求输出上限 |
 | `refreshMs` | `500` | 流式卡片刷新频率（200–10000） |
 | `dmMode` | `open` | 私聊开关 |
@@ -151,7 +153,8 @@ DSH_HOME=$DSH_HOME pnpm dsh web        # 默认 http://127.0.0.1:3080
 
 | # | 场景 | 操作 | 预期 |
 |---|------|------|------|
-| 1 | 私聊 | 给机器人发一条消息 | 消息下立刻出现 **Typing** 表情 → 以话题形式回复卡片（**推理中** 折叠面板）→ 正文流式输出（500ms 刷新，面板变 **回复中**）→ 结束变 **回复结束**、Typing 变 **DONE**；卡片底部两行 session 信息 |
+| 1 | 私聊 | 给机器人发一条消息 | 消息下立刻出现 **Typing** 表情 → 以话题形式回复卡片（**推理中** 折叠面板）→ 正文流式输出（500ms 刷新，面板变 **回复中**）→ 成功变 **回复结束**、Typing 变 **DONE**；卡片底部两行 session 信息 |
+| 1a | 错误推理强度 | 配置该模型不支持的 `reasoningEffort` 后发消息 | 卡片变 **回复失败**，显示 Harness 返回的错误消息和错误码（如 `UNSUPPORTED_REASONING_EFFORT`），Typing 变 **No**；模型/推理强度/缓存不沿用上一轮 |
 | 2 | 私聊续聊 | 在刚建的话题里直接再发消息（**不 @**） | 继续同一 session：卡片底部 session id 不变，input/output token 累计增长 |
 | 3 | 群聊 @ | 在普通群 @ 机器人发消息 | 同 #1；该消息成为新话题根 |
 | 4 | 群聊话题内 | 在上一步的话题里直接发消息（不 @） | 延续该 session，不再要求 @ |
@@ -199,7 +202,7 @@ DSH_HOME=$DSH_HOME pnpm dsh web        # 默认 http://127.0.0.1:3080
 | 折叠面板不显示 / 正文不是富文本 | 旧版卡片的两个已知问题（`icon.tag: "img"` 非法、1.0 结构 markdown 语法受限），新版插件已切 2.0 结构 + 内置 `standard_icon` 箭头：重装插件并重启 dsh |
 | 审批卡不出现 | 确认该部署启用了 HITL：启动日志应有「HITL 审批应答已就绪」；若显示「主机未挂载 approval 服务」则该部署不会派发审批请求；另外确认当前会话的审批策略不是 `never`（`/permission danger-full-access` 会关闭审批） |
 | 审批卡点击无反应 | 未订阅 **card.action.trigger** 回调（或订阅后未重新发布版本），见 §1 第 4 步；按 §5.0 重新核对 |
-| 错误码 `231001` / `231002` | 表态表情失败：表情名（`Typing`/`DONE`）必须一字不差；机器人需在会话内 |
+| 错误码 `231001` / `231002` | 表态表情失败：表情名（`Typing`/`DONE`/`No`）必须一字不差；机器人需在会话内 |
 
 ## 7. 改代码 → 生效的循环
 

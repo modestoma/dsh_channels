@@ -19,6 +19,7 @@ import { ApprovalAnswerer } from './approvals.ts'
 import type { ApprovalRoute } from './approvals.ts'
 import type {
   Agent,
+  AgentContext,
   AgentHandle,
   CommandInvocation,
   CommandResult,
@@ -56,6 +57,7 @@ import {
 } from './session-commands.ts'
 import { foldAll, measureSessionContext } from './stats.ts'
 import type { ContextMeasurement, ContextServices } from './stats.ts'
+import { installReasoningEffortOverride } from './reasoning-effort.ts'
 import { createLogicalSessionExport } from './session-export.ts'
 import type { SessionExportBuilder } from './session-export.ts'
 import { ACTIVITY_BUILD_MARKER, TurnStreamer } from './streamer.ts'
@@ -103,11 +105,11 @@ interface RenewAdmission {
 /**
  * Wrap a live agent owned by someone else (web UI api-remote resolver, a
  * previous plugin instance, a won cold-resume race). The borrow is fully
- * deliverable through `followup`, but `dispose` is a no-op — the real owner
- * retains the lifecycle, and shutting the plugin down must never kill it.
+ * deliverable through `followup`; disposal releases only the channel-owned
+ * scoped policy and never the foreign Agent itself.
  */
-function borrowLiveAgent(agent: Agent): LiveAgent {
-  return { agent, handle: { agent, dispose: async () => {} } }
+function borrowLiveAgent(agent: Agent, release: () => void = () => {}): LiveAgent {
+  return { agent, handle: { agent, dispose: async () => { release() } } }
 }
 
 /** What `agents.create`/`resume` need to compose one agent from a preset. */
@@ -351,6 +353,11 @@ export class FeishuService {
     )
     console.info('[dsh-channels] feishu long connection established, bot open_id:', channel.botOpenId())
     console.info('[dsh-channels] activity build:', ACTIVITY_BUILD_MARKER)
+    console.info('[dsh-channels] model request overrides:', {
+      provider: this.config.provider ?? 'deployment-default',
+      model: this.config.model ?? 'deployment-default',
+      reasoningEffort: this.config.reasoningEffort ?? 'adapter-default',
+    })
     const approvalMounted = this.ctx.get?.('approval') !== undefined
     console.info(
       approvalMounted
@@ -1302,6 +1309,11 @@ export class FeishuService {
     return options
   }
 
+  /** Pin this channel's configured effort outside every other request wrapper. */
+  private mountReasoningEffort(agentCtx: AgentContext): () => void {
+    return installReasoningEffortOverride(agentCtx, this.config.reasoningEffort)
+  }
+
   /**
    * Resolve the agent-preset composition for sessions this plugin creates or
    * resumes.
@@ -1334,16 +1346,28 @@ export class FeishuService {
     const presets = this.ctx.get?.('agentPresets') as AgentPresets | undefined
     if (presets === undefined) {
       return {
-        setup: mountChannelCommands,
+        setup: async (agentCtx) => {
+          this.mountReasoningEffort(agentCtx)
+          await mountChannelCommands(agentCtx)
+        },
       }
     }
     if (requestedPreset === undefined && !useRosterDefault) {
-      return { setup: mountChannelCommands }
+      return {
+        setup: async (agentCtx) => {
+          this.mountReasoningEffort(agentCtx)
+          await mountChannelCommands(agentCtx)
+        },
+      }
     }
     const resolved = await presets.resolve(requestedPreset)
     return {
       agentPreset: resolved.id,
       setup: async (agentCtx) => {
+        // `prepend` is essential: standing preset listeners may have been
+        // mounted before this Agent existed, so setup registration order alone
+        // cannot guarantee that the explicit channel value wins.
+        this.mountReasoningEffort(agentCtx)
         await presets.mount(agentCtx, resolved.id)
         await mountChannelCommands(agentCtx)
       },
@@ -1600,7 +1624,11 @@ export class FeishuService {
     // the live agent instead: `followup` delivery works identically and the
     // owning side keeps the dispose responsibility.
     const foreign = this.ctx.agents.get(record.sessionId as SessionId)
-    if (foreign !== undefined) return borrowLiveAgent(foreign)
+    if (foreign !== undefined) {
+      const borrowed = borrowLiveAgent(foreign, this.mountReasoningEffort(foreign.ctx))
+      this.live.set(record.sessionId, borrowed)
+      return borrowed
+    }
 
     let pending = this.pendingResume.get(record.sessionId)
     if (pending === undefined) {
@@ -1631,7 +1659,11 @@ export class FeishuService {
           // while our resume was in flight. Borrow the winner instead of
           // failing the turn with "cannot prepare … while it is live".
           const winner = this.ctx.agents.get(record.sessionId as SessionId)
-          if (winner !== undefined) return borrowLiveAgent(winner)
+          if (winner !== undefined) {
+            const borrowed = borrowLiveAgent(winner, this.mountReasoningEffort(winner.ctx))
+            this.live.set(record.sessionId, borrowed)
+            return borrowed
+          }
           throw error
         })
         .finally(() => {

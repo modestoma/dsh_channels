@@ -8,7 +8,7 @@
  *
  * Layout (top → bottom), panel card (default):
  *  1. `collapsible_panel` — bordered, default-collapsed reasoning panel. The
- *     header title carries the three phases (推理中 / 回复中 / 回复结束) and a
+ *     header title carries the four phases (推理中 / 回复中 / 回复结束 / 回复失败) and a
  *     right-aligned built-in chevron (`standard_icon`, no upload needed) that
  *     rotates 180° when expanded (`icon_expanded_angle`).
  *  2. optional `markdown` in `notation` size — the delegation status line
@@ -44,12 +44,13 @@
  * @module dsh-channels/cards
  */
 
-export type PanelPhase = 'thinking' | 'replying' | 'done'
+export type PanelPhase = 'thinking' | 'replying' | 'done' | 'error'
 
 export const PANEL_TITLES: Record<PanelPhase, string> = {
   thinking: '推理中',
   replying: '回复中',
   done: '回复结束',
+  error: '回复失败',
 }
 
 /** Built-in icon token for the fold-panel chevron (from the official component docs). */
@@ -77,15 +78,15 @@ export interface CardStats {
   inputTokens: number
   /** Cumulative output tokens of the whole session. */
   outputTokens: number
-  /** Cache hit ratio of the latest provider sample, 0–1; undefined → `—`. */
+  /** Cache hit ratio of the current turn's latest provider sample, 0–1; undefined → `—`. */
   cacheHitPct?: number
   /** Latest provider-reported prompt pressure in tokens; undefined → `—`. */
   contextTokens?: number
   /** Model context window in tokens; undefined → `—`. */
   contextWindow?: number
-  /** Model id (latest request header). */
+  /** Model id (current turn's latest request header). */
   model?: string
-  /** Reasoning effort (latest request header). */
+  /** Reasoning effort (current turn's latest request header). */
   effort?: string
 }
 
@@ -223,7 +224,7 @@ function reasoningPlaceholder(phase: PanelPhase): string {
 }
 
 function bodyPlaceholder(phase: PanelPhase): string {
-  return phase === 'done' ? '*（本次无正文输出）*' : '*正在生成…*'
+  return phase === 'done' || phase === 'error' ? '*（本次无正文输出）*' : '*正在生成…*'
 }
 
 /** Continuation header: `📄 回复分段 {n} · {phase}` (or 续上一条卡片 without a number). */
@@ -370,15 +371,15 @@ export function buildInterruptionCard(options: CardOptions = {}): object {
 /**
  * Largest body prefix (char count) whose card renders ≤ `CARD_TARGET_BYTES`
  * with reasoning minimized — i.e. the body gets the full card budget. The
- * probe renders at phase `done`, the worst case (its panel/segment header
+ * probe renders at phase `error`, the worst case (its panel/segment header
  * titles are the longest), so a frozen segment can never outgrow the budget
- * merely by the phase flipping 回复中 → 回复结束. Stats growth between the
+ * merely by the phase flipping 回复中 → 回复失败. Stats growth between the
  * split and the final patch consumes the 2 KB redundancy (`CARD_MAX_BYTES` −
  * `CARD_TARGET_BYTES`).
  */
 function largestBodyPrefix(state: CardState, options: CardOptions): number {
   const text = state.body
-  const render = (content: string) => assemble('done', '', content, state.stats, options, state.status, state.tool)
+  const render = (content: string) => assemble('error', '', content, state.stats, options, state.status, state.tool)
   if (cardJsonBytes(render(text)) <= CARD_TARGET_BYTES) return text.length
   let lo = 0
   let hi = text.length

@@ -21,11 +21,11 @@
  *     …) into the same topic; the stream then keeps flowing into the newest
  *     card. Reasoning is never segmented — it stays on card 1 and is clipped
  *     to the leftover budget (body has priority).
- *  4. `turnEnded(turn)` — finalize every segment card (`回复结束`) and request
- *     the Typing → DONE reaction swap on the triggering message.
+ *  4. `turnEnded(turn)` — finalize every segment card (`回复结束` / `回复失败`)
+ *     and request the Typing → DONE/No reaction swap on the triggering message.
  *
  * The first visible text delta flips the panel title 推理中 → 回复中; the
- * final patch flips it to 回复结束. Patching is throttled to `refreshMs` and
+ * final patch flips it to 回复结束 or 回复失败. Patching is throttled to `refreshMs` and
  * only runs when the content actually changed. Segment sends are serialized
  * per session so cards arrive in order.
  *
@@ -37,19 +37,19 @@
  * @module dsh-channels/streamer
  */
 
-import type { Session, SessionEvent } from './dsh-types.ts'
+import type { Session, SessionEvent, TurnEndReason } from './dsh-types.ts'
 import { buildCard, segmentCardContent } from './cards.ts'
 import type { CardState, PanelPhase } from './cards.ts'
 import type { FeishuChannel } from './feishu-channel.ts'
 import { cacheHitPct, foldAll, foldEvent } from './stats.ts'
-import type { StatsFold } from './stats.ts'
+import type { HeaderSample, StatsFold, UsageSample } from './stats.ts'
 
 /**
  * Compact build marker printed by the service at startup so a deployment's
  * console can confirm which build of the activity status line is loaded.
  * Bump on every behavior change to this feature.
  */
-export const ACTIVITY_BUILD_MARKER = 'activity-status-v3'
+export const ACTIVITY_BUILD_MARKER = 'activity-status-v5'
 
 /** How a segment card reached Feishu. */
 export interface SegmentDelivery {
@@ -125,12 +125,18 @@ interface SegmentCard {
 interface TurnState {
   /** Turn number once known; undefined until the first `step/start`. */
   turn: number | undefined
-  /** Message whose reaction carries Typing → DONE. */
+  /** Message whose reaction carries Typing → DONE/No. */
   triggerMessageId: string
   /** Reaction id of the Typing reaction (undefined when the add failed). */
   reactionId: string | undefined
   phase: PanelPhase
   reasoning: string
+  /** Request header produced during THIS turn; never inherited from history. */
+  header: HeaderSample | undefined
+  /** Provider usage produced during THIS turn; never inherited from history. */
+  lastUsage: UsageSample | undefined
+  /** Structured terminal failure for this turn, when `turn/end.kind=error`. */
+  failure: { message: string; code?: string } | undefined
   /** Segment cards in order; `cards[0]` is the attached reply card. */
   cards: SegmentCard[]
   dirty: boolean
@@ -286,6 +292,9 @@ export class TurnStreamer {
       reactionId,
       phase: 'thinking',
       reasoning: '',
+      header: undefined,
+      lastUsage: undefined,
+      failure: undefined,
       cards: [{
         messageId: cardMessageId,
         body: '',
@@ -400,6 +409,30 @@ export class TurnStreamer {
         }
         break
       }
+      case 'assistant/message': {
+        if (state.turn === undefined) state.turn = event.data.turn
+        if (event.data.usage !== undefined) {
+          state.lastUsage = {
+            usage: event.data.usage,
+            turn: event.data.turn,
+            step: event.data.step,
+          }
+          this.markDirty(session.id, state)
+        }
+        break
+      }
+      case 'request/header': {
+        const config = event.data.header.config
+        // Parse this exact event instead of copying the session fold's latest
+        // sample, so malformed/current events can never expose prior history.
+        state.header = {
+          provider: typeof config.provider === 'string' ? config.provider : '',
+          model: typeof config.model === 'string' ? config.model : '',
+          effort: typeof config.reasoningEffort === 'string' ? config.reasoningEffort : undefined,
+        }
+        this.markDirty(session.id, state)
+        break
+      }
       case 'tool/call': {
         if (state.turn === undefined) state.turn = event.data.turn
         state.toolActivity = {
@@ -470,7 +503,7 @@ export class TurnStreamer {
         // The ended turn belongs to the front state: assign it if a turn was
         // rejected/emptied before any step started.
         if (state.turn === undefined) state.turn = event.data.turn
-        this.finalize(session.id, state)
+        this.finalize(session.id, state, turnFailure(event.data.reason))
         break
       }
       default:
@@ -491,10 +524,10 @@ export class TurnStreamer {
     }, wait)
   }
 
-  private statsFor(sessionId: string): CardState['stats'] {
+  private statsFor(sessionId: string, state: TurnState): CardState['stats'] {
     const fold = this.folds.get(sessionId)
-    const lastUsage = fold?.lastUsage
-    const header = fold?.lastHeader
+    const lastUsage = state.lastUsage
+    const header = state.header
     const cached = this.contextCache.get(sessionId)
     const session = this.sessions.get(sessionId)
     let context = cached
@@ -512,7 +545,10 @@ export class TurnStreamer {
       outputTokens: fold?.totals.outputTokens ?? 0,
       cacheHitPct: cacheHitPct(lastUsage),
       contextTokens: context?.contextTokens,
-      contextWindow: context?.contextWindow,
+      // The context-token count is session-wide, but the model window belongs
+      // to the current request. Suppress it when this turn failed before a
+      // request header was emitted, just like model/effort/cache.
+      contextWindow: header === undefined ? undefined : context?.contextWindow,
       model: header?.model,
       effort: header?.effort,
     }
@@ -594,6 +630,10 @@ export class TurnStreamer {
    * the delegation status; only the tool line disappears.
    */
   private delegationLine(state: TurnState, now: number): string {
+    if (state.failure !== undefined) {
+      const suffix = state.failure.code === undefined ? '' : ` · ${state.failure.code}`
+      return clipActivity(`🔴 本轮运行失败${suffix}`)
+    }
     if (state.finalized) return this.settledLine(state)
 
     let latest: WorkflowRun | undefined
@@ -725,7 +765,7 @@ export class TurnStreamer {
       body,
       status: state.status,
       tool: state.tool,
-      stats: this.statsFor(sessionId),
+      stats: this.statsFor(sessionId, state),
     }
   }
 
@@ -890,10 +930,31 @@ export class TurnStreamer {
     }
   }
 
-  private finalize(sessionId: string, state: TurnState): void {
+  private finalize(
+    sessionId: string,
+    state: TurnState,
+    failure: { message: string; code?: string } | undefined,
+  ): void {
     if (state.finalized) return
     state.finalized = true
-    state.phase = 'done'
+    state.failure = failure
+    state.phase = failure === undefined ? 'done' : 'error'
+    if (failure !== undefined) {
+      const code = failure.code === undefined ? '' : `\n\n错误码：\`${failure.code}\``
+      const notice = `❌ **本轮运行失败**\n\n${failure.message}${code}`
+      const tail = state.cards[state.cards.length - 1]
+      if (tail !== undefined) {
+        if (tail.mode === 'text' || tail.failed) {
+          // An already-delivered plain-text fallback cannot be patched, and a
+          // permanently failed card cannot surface new content. Put the
+          // terminal diagnostic in its own continuation card instead.
+          state.cards.push(this.freshSegment(notice))
+        } else {
+          tail.body = tail.body.trim() === '' ? notice : `${tail.body}\n\n---\n\n${notice}`
+          tail.dirty = true
+        }
+      }
+    }
     if (state.timer !== undefined) {
       clearTimeout(state.timer)
       state.timer = undefined
@@ -911,14 +972,14 @@ export class TurnStreamer {
     this.splitOverflow(sessionId, state)
 
     // Final patches with the settled content: every patchable card flips to
-    // 回复结束 (backoff is bypassed once so the final state always lands;
+    // 回复结束 / 回复失败 (backoff is bypassed once so the final state always lands;
     // late-arriving sends are patched when they resolve).
     for (const [index] of state.cards.entries()) {
       this.patchCard(sessionId, state, index, true, false)
     }
 
-    // Reaction swap: Typing → DONE on the triggering message.
-    void this.swapReaction(state)
+    // Reaction swap: Typing → DONE on success, Typing → No on failure.
+    void this.swapReaction(state, failure !== undefined)
 
     // Prune the finalized state lazily (kept until the next attach so the
     // front-scan skips it, then removed).
@@ -932,15 +993,26 @@ export class TurnStreamer {
     this.hooks.onTurnFinalized(sessionId, state.turn ?? 0, state.cards[0]?.messageId ?? '')
   }
 
-  private async swapReaction(state: TurnState): Promise<void> {
+  private async swapReaction(state: TurnState, failed: boolean): Promise<void> {
     try {
       if (state.reactionId !== undefined) {
         await this.channel.removeReaction(state.triggerMessageId, state.reactionId)
       }
-      await this.channel.addReaction(state.triggerMessageId, 'DONE')
+      await this.channel.addReaction(state.triggerMessageId, failed ? 'No' : 'DONE')
     } catch (error) {
       // Reaction failures are cosmetic: never surface them to the user.
       this.hooks.onError(state.triggerMessageId, error)
     }
   }
+}
+
+/** Extract the user-visible failure from the current Harness turn-end union. */
+function turnFailure(reason: TurnEndReason): { message: string; code?: string } | undefined {
+  if (typeof reason !== 'object' || reason === null || reason.kind !== 'error') return undefined
+  const error = reason.error
+  const message = typeof error?.message === 'string' && error.message !== ''
+    ? error.message
+    : '模型请求失败'
+  const code = typeof error?.code === 'string' && error.code !== '' ? error.code : undefined
+  return { message, code }
 }

@@ -133,9 +133,29 @@ export interface StepEndEvent extends SessionEventEnvelope {
   data: { turn: number; step: number }
 }
 
+/** Serializable model failure carried by a failed Harness turn. */
+export interface TurnFailure {
+  message: string
+  code: string
+  [key: string]: unknown
+}
+
+/**
+ * Why a Harness turn ended. String reasons remain accepted for compatibility
+ * with older persisted fixtures; current Harness emits the structured union.
+ */
+export type TurnEndReason =
+  | string
+  | { kind: 'completed' }
+  | { kind: 'aborted'; reason: unknown }
+  | { kind: 'blocked' }
+  | { kind: 'error'; error: TurnFailure }
+  | { kind: 'max-tokens' }
+  | { kind: 'interrupted' }
+
 export interface TurnEndEvent extends SessionEventEnvelope {
   type: 'turn/end'
-  data: { turn: number; reason: string }
+  data: { turn: number; reason: TurnEndReason }
 }
 
 export interface RequestHeaderEvent extends SessionEventEnvelope {
@@ -328,6 +348,26 @@ export interface AgentOptions {
   maxTokens?: number
 }
 
+/** Exact model-call configuration exposed by the Agent-scoped request waterfall. */
+export interface AgentRequestConfig {
+  provider: string
+  model: string
+  reasoningEffort?: string
+  maxTokens?: number
+  [key: string]: unknown
+}
+
+/** Agent-scoped request override installed before the first prompt assembly. */
+export type AgentRequestListener = (
+  payload: { turn: number; step: number; signal: AbortSignal },
+  next: () => Promise<AgentRequestConfig>,
+) => Promise<AgentRequestConfig>
+
+/** Cordis listener placement used to make an explicit channel override outermost. */
+export interface AgentRequestListenerOptions {
+  prepend?: boolean
+}
+
 // ---- Human-command surface ---------------------------------------------
 
 export interface CommandInputDescriptor {
@@ -384,6 +424,12 @@ export interface CommandRuntime {
 /** Agent-scoped Cordis context slice used to register scoped commands. */
 export interface AgentContext {
   commands: CommandRuntime
+  /** Register an Agent-scoped model-call override. */
+  on(
+    event: 'agent/request',
+    listener: AgentRequestListener,
+    options?: boolean | AgentRequestListenerOptions,
+  ): () => boolean
   /** Mount a child plugin only after its declared Host services are available. */
   inject(
     dependencies: readonly string[],

@@ -70,7 +70,7 @@ describe('buildCard', () => {
   })
 
   it('switches the panel title by phase', () => {
-    for (const phase of ['thinking', 'replying', 'done'] as const) {
+    for (const phase of ['thinking', 'replying', 'done', 'error'] as const) {
       const panel = elements({ phase })[0]
       expect(panel?.header.title.content).toBe(PANEL_TITLES[phase])
     }
