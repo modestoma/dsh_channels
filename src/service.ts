@@ -37,10 +37,10 @@ import type {
 import { buildCard, buildInterruptionCard } from './cards.ts'
 import type { CardState } from './cards.ts'
 import {
-  armRenewCommand, buildCommandResultCard, commandResultCardKind, isSupportedCommand, parseSlashCommand,
-  mountChannelCommands, registerRenewCommand, RouteOperationQueue, supportedCommandHelp, supportedCommandList,
+  armEffortCommand, armRenewCommand, buildCommandResultCard, commandResultCardKind, isSupportedCommand, parseSlashCommand,
+  mountChannelCommands, registerEffortCommand, registerRenewCommand, RouteOperationQueue, supportedCommandHelp, supportedCommandList,
 } from './commands.ts'
-import type { CommandCardState } from './commands.ts'
+import type { CommandCardState, EffortCommandAction } from './commands.ts'
 import {
   appendSessionHistory, chatRouteKey, feishuDomain, normalizeRouteRecord,
 } from './domain.ts'
@@ -58,6 +58,7 @@ import {
 import { foldAll, measureSessionContext } from './stats.ts'
 import type { ContextMeasurement, ContextServices } from './stats.ts'
 import { installReasoningEffortOverride } from './reasoning-effort.ts'
+import type { ReasoningEffortController } from './reasoning-effort.ts'
 import { createLogicalSessionExport } from './session-export.ts'
 import type { SessionExportBuilder } from './session-export.ts'
 import { ACTIVITY_BUILD_MARKER, TurnStreamer } from './streamer.ts'
@@ -100,6 +101,11 @@ interface RenewAdmission {
   route: RouteRecord
   live: LiveAgent
   commit?: RenewCommit
+}
+
+interface EffortAdmission {
+  live: LiveAgent
+  controller: ReasoningEffortController
 }
 
 /**
@@ -192,6 +198,7 @@ export class FeishuService {
   /** Thread ids retired by TTL; retained so later messages cannot fork context. */
   private readonly expiredRouteCache = new Map<string, ExpiredRouteRecord>()
   private readonly live = new Map<string, LiveAgent>()
+  private readonly reasoningEfforts = new WeakMap<AgentContext, ReasoningEffortController>()
   private readonly pendingResume = new Map<string, Promise<LiveAgent>>()
   /**
    * chat-scoped key → in-flight session establishment. Concurrent first
@@ -653,13 +660,17 @@ export class FeishuService {
         try {
           const live = await this.ensureLiveAgent(current)
           let definition = this.ctx.commands.find(live.agent, parsed.name)
-          let unregisterBorrowedRenew: (() => void) | undefined
+          let unregisterBorrowedCommand: (() => void) | undefined
           if (definition === undefined && parsed.name === 'renew') {
-            unregisterBorrowedRenew = registerRenewCommand(live.agent.ctx.commands)
+            unregisterBorrowedCommand = registerRenewCommand(live.agent.ctx.commands)
+            definition = this.ctx.commands.find(live.agent, parsed.name)
+          }
+          if (definition === undefined && parsed.name === 'effort') {
+            unregisterBorrowedCommand = registerEffortCommand(live.agent.ctx.commands)
             definition = this.ctx.commands.find(live.agent, parsed.name)
           }
           if (definition === undefined) {
-            unregisterBorrowedRenew?.()
+            unregisterBorrowedCommand?.()
             const text = parsed.name === 'compact'
               ? '当前部署未挂载 Harness 原生 /compact 命令。'
               : `当前 Session 未挂载 /${parsed.name} 命令。`
@@ -677,11 +688,20 @@ export class FeishuService {
           const renewAdmission: RenewAdmission | undefined = parsed.name === 'renew'
             ? { route: current, live }
             : undefined
+          const effortAdmission: EffortAdmission | undefined = parsed.name === 'effort'
+            ? { live, controller: this.requireReasoningEffort(live.agent) }
+            : undefined
           const disarmRenew = renewAdmission === undefined
             ? undefined
             : armRenewCommand(
                 controller.signal,
                 invocation => this.runRenewCommand(invocation, renewAdmission),
+              )
+          const disarmEffort = effortAdmission === undefined
+            ? undefined
+            : armEffortCommand(
+                controller.signal,
+                (invocation, action) => this.runEffortCommand(invocation, action, effortAdmission),
               )
           let execution
           try {
@@ -689,7 +709,8 @@ export class FeishuService {
           } finally {
             this.commandControllers.delete(controller)
             disarmRenew?.()
-            unregisterBorrowedRenew?.()
+            disarmEffort?.()
+            unregisterBorrowedCommand?.()
             if (renewAdmission !== undefined) {
               if (renewAdmission.commit !== undefined) {
                 await this.releaseRenewedAgent(renewAdmission.commit)
@@ -705,6 +726,7 @@ export class FeishuService {
             return
           }
           const result = execution.result
+          if (parsed.name === 'effort') effortAdmission?.controller.sync(live.agent.session.events)
           if (parsed.name === 'renew' && result.kind === 'success' && renewAdmission?.commit !== undefined) {
             await this.sendStandaloneCard(msg, buildRenewCard({
               previousSessionId: renewAdmission.commit.previous.sessionId,
@@ -1309,9 +1331,25 @@ export class FeishuService {
     return options
   }
 
-  /** Pin this channel's configured effort outside every other request wrapper. */
-  private mountReasoningEffort(agentCtx: AgentContext): () => void {
-    return installReasoningEffortOverride(agentCtx, this.config.reasoningEffort)
+  /** Mount one mutable Session-aware effort policy outside every other request wrapper. */
+  private mountReasoningEffort(agentCtx: AgentContext, session?: Session): () => void {
+    const controller = installReasoningEffortOverride(agentCtx, this.config.reasoningEffort)
+    if (session !== undefined) controller.sync(session.events)
+    this.reasoningEfforts.set(agentCtx, controller)
+    return () => {
+      controller.dispose()
+      if (this.reasoningEfforts.get(agentCtx) === controller) this.reasoningEfforts.delete(agentCtx)
+    }
+  }
+
+  /** Resolve and synchronize the policy composed for this exact Agent scope. */
+  private requireReasoningEffort(agent: Agent): ReasoningEffortController {
+    const controller = this.reasoningEfforts.get(agent.ctx)
+    if (controller === undefined) {
+      throw new Error('dsh-channels: reasoning-effort policy is not mounted for this Agent')
+    }
+    controller.sync(agent.session.events)
+    return controller
   }
 
   /**
@@ -1411,6 +1449,33 @@ export class FeishuService {
     }
   }
 
+  /** Authorized Session-level `/effort` view/switch operation. */
+  private runEffortCommand(
+    invocation: CommandInvocation,
+    action: EffortCommandAction,
+    admission: EffortAdmission,
+  ): CommandResult {
+    if (admission.live.agent !== invocation.agent) {
+      return { kind: 'error', text: '/effort 只能通过已授权的飞书话题执行。' }
+    }
+    const state = admission.controller.state
+    if (action.kind === 'show') {
+      if (state.source === 'session') {
+        return { kind: 'success', text: `当前 Session 推理强度：\`${state.effective}\`（Session 覆盖）。` }
+      }
+      if (state.source === 'config') {
+        return { kind: 'success', text: `当前 Session 推理强度：\`${state.effective}\`（配置默认）。` }
+      }
+      return { kind: 'success', text: '当前 Session 未设置推理强度覆盖，使用模型适配器/provider 默认。' }
+    }
+    if (action.kind === 'reset') {
+      return state.configured === undefined
+        ? { kind: 'success', text: '已恢复模型适配器/provider 默认推理强度。' }
+        : { kind: 'success', text: `已恢复配置默认推理强度：\`${state.configured}\`。` }
+    }
+    return { kind: 'success', text: `当前 Session 推理强度已切换为：\`${action.value}\`。` }
+  }
+
   /** Create, workspace-attach, and atomically publish one renewed route. */
   private async commitRenew(record: RouteRecord, oldLive: LiveAgent): Promise<RenewCommit> {
     const sessionId = randomUUID() as SessionId
@@ -1433,6 +1498,7 @@ export class FeishuService {
         agentOptions: { ...oldLive.agent.options },
         setup: composition.setup,
       })
+      this.requireReasoningEffort(newHandle.agent)
       await workspace.attachSession(sessionId)
       attached = true
       const createdAt = newHandle.agent.session.header.createdAt
@@ -1542,6 +1608,7 @@ export class FeishuService {
         agentOptions: this.agentOptions(),
         setup: composition.setup,
       })
+      this.requireReasoningEffort(handle.agent)
     } catch (error) {
       // The card lands in a final failure state — no repair needed later.
       void this.clearInflight(sent.messageId)
@@ -1625,7 +1692,7 @@ export class FeishuService {
     // owning side keeps the dispose responsibility.
     const foreign = this.ctx.agents.get(record.sessionId as SessionId)
     if (foreign !== undefined) {
-      const borrowed = borrowLiveAgent(foreign, this.mountReasoningEffort(foreign.ctx))
+      const borrowed = borrowLiveAgent(foreign, this.mountReasoningEffort(foreign.ctx, foreign.session))
       this.live.set(record.sessionId, borrowed)
       return borrowed
     }
@@ -1650,6 +1717,7 @@ export class FeishuService {
             void handle.dispose().catch(() => {})
             throw new Error('dsh-channels: session resume aborted by shutdown')
           }
+          this.requireReasoningEffort(handle.agent)
           const liveAgent: LiveAgent = { agent: handle.agent, handle }
           this.live.set(record.sessionId, liveAgent)
           return liveAgent
@@ -1660,7 +1728,7 @@ export class FeishuService {
           // failing the turn with "cannot prepare … while it is live".
           const winner = this.ctx.agents.get(record.sessionId as SessionId)
           if (winner !== undefined) {
-            const borrowed = borrowLiveAgent(winner, this.mountReasoningEffort(winner.ctx))
+            const borrowed = borrowLiveAgent(winner, this.mountReasoningEffort(winner.ctx, winner.session))
             this.live.set(record.sessionId, borrowed)
             return borrowed
           }

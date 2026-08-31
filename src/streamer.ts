@@ -49,7 +49,7 @@ import type { HeaderSample, StatsFold, UsageSample } from './stats.ts'
  * console can confirm which build of the activity status line is loaded.
  * Bump on every behavior change to this feature.
  */
-export const ACTIVITY_BUILD_MARKER = 'activity-status-v5'
+export const ACTIVITY_BUILD_MARKER = 'activity-status-v6'
 
 /** How a segment card reached Feishu. */
 export interface SegmentDelivery {

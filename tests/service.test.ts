@@ -412,6 +412,91 @@ describe('FeishuService', () => {
     expect(h.channel.sent).toHaveLength(2)
   })
 
+  it('switches, reports, and resets reasoning effort within the current Session', async () => {
+    const h = await setup({ reasoningEffort: 'high' })
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_effort', senderId: 'ou_owner',
+      messageId: 'om_effort_start', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const created = h.ctxState.agents.created[0]!
+    const agent = created.handle.agent
+    const request = () => dispatchAgentRequest(created.setupCtx, {
+      provider: 'deepseek-official', model: 'deepseek-v4-flash',
+    })
+    await expect(request()).resolves.toMatchObject({ reasoningEffort: 'high' })
+
+    const command = async (messageId: string, content: string) => {
+      const before = agent.session.events.length
+      await h.onMessage(makeMessage({
+        chatType: 'group', chatId: 'oc_effort', senderId: 'ou_owner', threadId: 'omt_1',
+        mentionedBot: false, messageId, content,
+      }))
+      await waitUntil(() => expect(agent.session.events.length).toBe(before + 2))
+    }
+
+    await command('om_effort_tiny', '/effort tiny')
+    await expect(request()).resolves.toMatchObject({ reasoningEffort: 'tiny' })
+    expect(agent.session.events.slice(-2)).toMatchObject([
+      { type: 'command/run', data: { name: 'effort', args: ' tiny' } },
+      { type: 'command/done', data: { kind: 'success' } },
+    ])
+
+    await command('om_effort_show', '/effort')
+    expect(JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)).toContain('tiny')
+    await expect(request()).resolves.toMatchObject({ reasoningEffort: 'tiny' })
+
+    // Provider-owned ids stay opaque here; unsupported values fail on the next model turn.
+    await command('om_effort_opaque', '/effort 123456')
+    await expect(request()).resolves.toMatchObject({ reasoningEffort: '123456' })
+
+    await command('om_effort_bad', '/effort tiny high')
+    expect(agent.session.events.at(-1)).toMatchObject({
+      type: 'command/done', data: { kind: 'error' },
+    })
+    await expect(request()).resolves.toMatchObject({ reasoningEffort: '123456' })
+
+    await command('om_effort_reset', '/effort reset')
+    await expect(request()).resolves.toMatchObject({ reasoningEffort: 'high' })
+    expect(JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)).toContain('配置默认')
+  })
+
+  it('restores a successful Session effort override after restart', async () => {
+    const agentsOptions: FakeAgentsOptions = {}
+    const h = await setup({ reasoningEffort: 'high' }, {}, undefined, agentsOptions)
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_effort_restore', senderId: 'ou_owner',
+      messageId: 'om_effort_restore_start', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const original = h.ctxState.agents.created[0]!.handle.agent
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_effort_restore', senderId: 'ou_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_effort_restore_set', content: '/effort tiny',
+    }))
+    await waitUntil(() => expect(original.session.events).toHaveLength(2))
+    agentsOptions.resumeSession = original.session
+    await h.service.shutdown()
+
+    const channel2 = makeChannel()
+    const service2 = new FeishuService(h.ctxState.ctx, h.config, () => channel2)
+    await service2.start()
+    const registrations = (channel2.onMessage as unknown as ReturnType<typeof vi.fn>).mock.calls
+    const onMessage = registrations.at(-1)?.[0] as (msg: NormalizedMessage) => Promise<void> | undefined
+    await onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_effort_restore', senderId: 'ou_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_effort_restore_show', content: '/effort',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.resumed).toHaveLength(1))
+    const resumed = h.ctxState.agents.resumed[0]!
+    await waitUntil(() => expect(resumed.handle.agent.session.events).toHaveLength(4))
+    expect(JSON.stringify((channel2.sent.at(-1) as { input: object }).input)).toContain('tiny')
+    await expect(dispatchAgentRequest(resumed.setupCtx, {
+      provider: 'deepseek-official', model: 'deepseek-v4-flash',
+    })).resolves.toMatchObject({ reasoningEffort: 'tiny' })
+    await service2.shutdown()
+  })
+
   it('executes routed /health through the command lifecycle and sends the health card', async () => {
     const h = await setup({}, {
       connectionStatus: { state: 'connected', lastConnectTime: 100, reconnectAttempts: 0 },

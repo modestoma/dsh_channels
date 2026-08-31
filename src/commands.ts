@@ -18,6 +18,7 @@ export const CHANNEL_COMMAND_NAMES = [
   'health',
   'status',
   'workspace',
+  'effort',
   'renew',
   'history',
   'export',
@@ -30,6 +31,7 @@ export const SUPPORTED_COMMAND_NAMES = [
   'health',
   'status',
   'workspace',
+  'effort',
   'compact',
   'renew',
   'history',
@@ -71,6 +73,7 @@ const SUPPORTED_COMMAND_DESCRIPTIONS: Readonly<Record<SupportedCommandName, stri
   health: '显示 Harness 与飞书通道健康状态',
   status: '显示当前 Session 状态与性能指标',
   workspace: '显示当前 Session 工作目录',
+  effort: '查看或切换当前 Session 推理强度',
   compact: '压缩当前 Session 上下文',
   renew: '在当前话题创建并绑定新 Session',
   history: '显示当前话题的 Session 历史',
@@ -89,6 +92,7 @@ const DESCRIPTORS: ReadonlyArray<CommandDescriptor> = [
   { name: 'health', description: '显示 Harness 与飞书通道健康状态' },
   { name: 'status', description: '显示当前 Session 状态与性能指标' },
   { name: 'workspace', description: '显示当前 Session 工作目录' },
+  { name: 'effort', description: '查看或切换当前 Session 推理强度', input: { hint: '[id|reset]' } },
   { name: 'renew', description: '在当前话题创建并绑定新 Session' },
   { name: 'history', description: '显示当前话题的 Session 历史' },
   { name: 'export', description: '导出当前 Session 的逻辑日志' },
@@ -122,8 +126,45 @@ const healthHandler: CommandDefinition['handler'] = ({ rawInput }): CommandResul
 type RenewOperation = (invocation: Parameters<CommandDefinition['handler']>[0]) =>
   ReturnType<CommandDefinition['handler']>
 
+export type EffortCommandAction =
+  | { readonly kind: 'show' }
+  | { readonly kind: 'set'; readonly value: string }
+  | { readonly kind: 'reset' }
+
+type EffortOperation = (
+  invocation: Parameters<CommandDefinition['handler']>[0],
+  action: EffortCommandAction,
+) => ReturnType<CommandDefinition['handler']>
+
 /** Per-execution authority: handlers stay instance-neutral when an Agent is borrowed. */
 const RENEW_OPERATIONS = new WeakMap<AbortSignal, RenewOperation>()
+const EFFORT_OPERATIONS = new WeakMap<AbortSignal, EffortOperation>()
+
+function parseEffortAction(rawInput: string): EffortCommandAction | undefined {
+  const value = rawInput.trim()
+  if (value === '') return { kind: 'show' }
+  if (/\s/u.test(value)) return undefined
+  return value === 'reset' ? { kind: 'reset' } : { kind: 'set', value }
+}
+
+const effortHandler: CommandDefinition['handler'] = invocation => {
+  const action = parseEffortAction(invocation.rawInput)
+  if (action === undefined) {
+    return { kind: 'error', text: '用法错误：/effort [档位-id|reset]。' }
+  }
+  if (action.kind !== 'show' && (
+    invocation.agent.status !== 'idle'
+    || invocation.agent.inbox.nextTurn.length > 0
+    || invocation.agent.inbox.nextStep.length > 0
+  )) {
+    return { kind: 'error', text: '当前 Session 正忙或仍有排队消息，暂时不能切换推理强度。' }
+  }
+  const operation = EFFORT_OPERATIONS.get(invocation.signal)
+  if (operation === undefined) {
+    return { kind: 'error', text: '/effort 只能通过已授权的飞书话题执行。' }
+  }
+  return operation(invocation, action)
+}
 
 const renewHandler: CommandDefinition['handler'] = invocation => {
   if (invocation.rawInput.trim() !== '') {
@@ -146,6 +187,7 @@ const READY_HANDLERS: Readonly<Record<string, CommandDefinition['handler']>> = {
   health: healthHandler,
   status: readyHandler('status', 'Session 状态已读取。'),
   workspace: readyHandler('workspace', '工作目录已读取。'),
+  effort: effortHandler,
   renew: renewHandler,
   history: readyHandler('history', 'Session 历史已读取。'),
   export: readyHandler('export', '导出已请求。'),
@@ -157,10 +199,22 @@ export function armRenewCommand(signal: AbortSignal, operation: RenewOperation):
   return () => { RENEW_OPERATIONS.delete(signal) }
 }
 
+/** Arm exactly one Feishu-issued `/effort` execution, then return its disarmer. */
+export function armEffortCommand(signal: AbortSignal, operation: EffortOperation): () => void {
+  EFFORT_OPERATIONS.set(signal, operation)
+  return () => { EFFORT_OPERATIONS.delete(signal) }
+}
+
 /** Install only `/renew` into a borrowed Agent scope that lacks channel commands. */
 export function registerRenewCommand(commands: CommandRuntime): () => void {
   const descriptor = DESCRIPTORS.find(entry => entry.name === 'renew')!
   return commands.register({ ...descriptor, handler: renewHandler })
+}
+
+/** Install only `/effort` into a borrowed Agent scope that lacks channel commands. */
+export function registerEffortCommand(commands: CommandRuntime): () => void {
+  const descriptor = DESCRIPTORS.find(entry => entry.name === 'effort')!
+  return commands.register({ ...descriptor, handler: effortHandler })
 }
 
 /**

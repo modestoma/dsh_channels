@@ -1,6 +1,6 @@
 # 飞书斜杠命令实施任务与验收计划
 
-> 状态：实施中（SC-01 至 SC-10 已完成）
+> 状态：实施中（SC-01 至 SC-10 及 Session `/effort` 增量已完成）
 > 范围：仅修改 `dsh_channels` 插件；不修改 DeepSeek Harness
 > 目标：在飞书消息进入模型之前识别并执行人类命令，命令输入和直接结果不进入模型上下文
 
@@ -16,6 +16,7 @@
 | `/health` | 显示 Harness 组合状态和飞书 WebSocket 通道状态；允许在尚未绑定 Session 的私聊或群聊中使用 |
 | `/status` | 显示当前 Session 的模型、推理强度、token、上下文、缓存、LLM/工具耗时和吞吐指标 |
 | `/workspace` | 显示当前 Session 绑定的工作区绝对路径 |
+| `/effort [档位-id\|reset]` | 查看或切换当前 Session 推理强度；成功选择随 Session 日志恢复 |
 | `/compact` | 调用 Harness 已注册的原生 `/compact`，显示压缩前后上下文占用和文本条形图 |
 | `/renew` | 在当前飞书话题中创建并绑定新 Session，复用原工作区，保留旧 Session |
 | `/history` | 显示当前话题绑定过的历史 Session；默认展示最近 20 条并标记当前项 |
@@ -23,8 +24,8 @@
 
 明确排除：
 
-- 不提供 `/model list`、`/model <name>`、`/effort list` 或 `/effort <name>`。
-- `/status` 只读取并显示模型和推理强度，不改变 Session 配置。
+- 不提供 `/model list`、`/model <name>` 或 `/effort list`；`/status` 仍只读。
+- `/effort <档位-id>` 将不透明 id 写入当前 Session 的后续请求；`/effort reset` 恢复频道配置默认。插件不预判 provider 是否支持该 id。
 - 不修改 Harness，不新增 Host 服务或修改 Web UI。
 - `/export` 不追求 Web 导出 ZIP 的完整语义：不递归包含子代理 Session，不收集附件，不复制持久化后端的原始物理文件。
 - 不将斜杠命令作为普通用户消息传给模型，也不让未知命令退化为模型输入。
@@ -39,7 +40,7 @@
 4. 除全局快速返回的 `/help`、`/userid`、`/groupid` 外，有 Session 的命令通过 `ctx.commands.execute(agent, line, signal)` 执行，以保留 Harness 的 `command/run`、`command/done` 生命周期记录。
 5. Harness 未注册的命令返回明确错误和当前支持的命令列表，不调用 `agent.followup()`。
 6. 命令结果使用独立、非流式的飞书结果卡；`/userid`、`/groupid` 使用普通回复，不设置 `reply_in_thread`，其余命令保持话题回复；命令执行期间沿用 Typing → DONE 表态，但不创建模型 turn。
-7. 同一路由上的普通消息、`/compact`、`/renew` 和 `/export` 必须串行准入，避免路由切换、压缩和普通 turn 互相穿插。
+7. 同一路由上的普通消息、`/effort`、`/compact`、`/renew` 和 `/export` 必须串行准入，避免配置切换、路由切换、压缩和普通 turn 互相穿插。
 
 ### 2.2 身份与信息边界
 
@@ -55,6 +56,7 @@
 ### 2.3 修改型命令的准入
 
 - `/compact` 沿用 Harness 原生命令的 idle/busy 判定。
+- `/effort` 查询可随时执行；切换/reset 仅在 Agent idle 且 inbox 为空时执行。只有成功配对的 `command/run` / `command/done` 才进入恢复折叠，失败或未完成命令不改变选择。
 - `/renew` 仅在旧 Agent 为 `idle` 且 next-turn/next-step inbox 均为空时执行；否则保持原绑定不变并返回明确错误。
 - `/renew` 创建新 Session 和提交新路由期间，当前路由保持互斥；提交失败时销毁未发布或未绑定的新 Agent，旧路由继续有效。
 - `/renew` 的 `command/done` 仍写入旧 Session。只有 `ctx.commands.execute()` 完成后，插件才可释放自己持有的旧 Agent handle；释放 live Agent 不得删除其持久化 Session。

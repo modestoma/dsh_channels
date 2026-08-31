@@ -1,7 +1,7 @@
 import { Context } from '@deepseek-ai/cordis'
 import { describe, expect, it, vi } from 'vitest'
 import {
-  armRenewCommand, buildCommandResultCard, commandResultCardKind, mountChannelCommands, parseSlashCommand,
+  armEffortCommand, armRenewCommand, buildCommandResultCard, commandResultCardKind, mountChannelCommands, parseSlashCommand,
   registerChannelCommands, RouteOperationQueue, supportedCommandHelp, supportedCommandList,
 } from '../src/commands.ts'
 import type { AgentContext } from '../src/dsh-types.ts'
@@ -27,7 +27,7 @@ describe('slash command primitives', () => {
     const commands = makeCommandRuntime()
     registerChannelCommands(commands)
     expect([...commands.definitions.keys()].sort()).toEqual([
-      'export', 'health', 'help', 'history', 'renew', 'status', 'workspace',
+      'effort', 'export', 'health', 'help', 'history', 'renew', 'status', 'workspace',
     ])
     expect(commands.definitions.has('compact')).toBe(false)
 
@@ -107,7 +107,7 @@ describe('slash command primitives', () => {
 
     await mountChannelCommands(bareAgentCtx as unknown as AgentContext)
     expect([...commands.definitions.keys()].sort()).toEqual([
-      'export', 'health', 'help', 'history', 'renew', 'status', 'workspace',
+      'effort', 'export', 'health', 'help', 'history', 'renew', 'status', 'workspace',
     ])
 
     await ctx.fiber.dispose()
@@ -159,6 +159,35 @@ describe('slash command primitives', () => {
     expect(await handler(invocation)).toMatchObject({ kind: 'error', text: expect.stringContaining('正忙') })
     expect(busyOperation).not.toHaveBeenCalled()
     disarmBusy()
+  })
+
+  it('parses /effort as one opaque id, supports query/reset, and rejects busy switches', async () => {
+    const commands = makeCommandRuntime()
+    registerChannelCommands(commands)
+    const agent = makeAgent(makeSession(), {}, makeAgentContext(commands))
+    const signal = new AbortController().signal
+    const handler = commands.definitions.get('effort')!.handler
+    expect(await handler({
+      commandId: 'cmd-effort-unarmed' as never, agent, rawInput: ' tiny', signal,
+    })).toMatchObject({ kind: 'error', text: expect.stringContaining('已授权') })
+    const operation = vi.fn((_invocation, action) => ({
+      kind: 'success' as const,
+      text: JSON.stringify(action),
+    }))
+    const disarm = armEffortCommand(signal, operation)
+    const invoke = (rawInput: string) => handler({
+      commandId: 'cmd-effort' as never, agent, rawInput, signal,
+    })
+
+    expect(await invoke('')).toMatchObject({ text: '{"kind":"show"}' })
+    expect(await invoke(' tiny ')).toMatchObject({ text: '{"kind":"set","value":"tiny"}' })
+    expect(await invoke(' reset')).toMatchObject({ text: '{"kind":"reset"}' })
+    expect(await invoke('tiny high')).toMatchObject({ kind: 'error', text: expect.stringContaining('用法错误') })
+
+    Object.defineProperty(agent, 'status', { value: 'running', configurable: true })
+    expect(await invoke('max')).toMatchObject({ kind: 'error', text: expect.stringContaining('正忙') })
+    expect(await invoke('')).toMatchObject({ kind: 'success' })
+    disarm()
   })
 
   it('serializes operations per route without poisoning the queue after failure', async () => {

@@ -161,6 +161,8 @@ export interface FakeAgentsOptions {
   /** Runs immediately before a failing `resume()` rejects (race seam: lets a
    *  test register the "winner" agent the way a concurrent cold resume would). */
   onFailResume?: (options: Parameters<AgentRegistry['resume']>[0]) => void
+  /** Optional durable Session snapshot returned by the next fake resume. */
+  resumeSession?: Session
 }
 
 export function makeAgentRegistry(fail: FakeAgentsOptions = {}): {
@@ -196,7 +198,7 @@ export function makeAgentRegistry(fail: FakeAgentsOptions = {}): {
       }
       const setupCtx = makeAgentContext()
       await options.setup?.(setupCtx)
-      const session = makeSession(options.resumeSessionId)
+      const session = fail.resumeSession ?? makeSession(options.resumeSessionId)
       const agent = makeAgent(session, options.agentOptions, setupCtx)
       const handle: AgentHandle = { agent, dispose: vi.fn(async () => { liveAgents.delete(options.resumeSessionId) }) }
       liveAgents.set(options.resumeSessionId, handle)

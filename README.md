@@ -19,6 +19,7 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 - `/health`：显示 Harness 与飞书通道健康状态，无需绑定 Session
 - `/status`：显示当前 Session 状态与性能指标
 - `/workspace`：显示当前 Session 工作目录
+- `/effort`：查看当前 Session 推理强度；`/effort <档位-id>` 切换，`/effort reset` 恢复配置默认
 - `/compact`：调用 Harness 原生命令压缩当前 Session 上下文
 - `/renew`：在当前话题创建并绑定新 Session
 - `/history`：显示当前话题的 Session 历史
@@ -86,7 +87,9 @@ DSH_HOME=$DSH_HOME pnpm dsh plugin --profile web add link:/path/to/dsh_channels
     loggerLevel: 'info'
 ```
 
-`reasoningEffort` 会在每个新建、恢复或借用 Agent 的作用域内以 `prepend` 外层覆盖 `agent/request`，因此胜过已存在的模型选择与 provider 默认；借用外部 Agent 时，插件关闭只移除这条频道策略，不销毁外部 Agent。它是适配器拥有的不透明 id（常见如 `off`、`low`、`high`、`max`），必须与该精确模型声明的档位一致；不受支持的值会在 provider 网络请求前被 Harness 拒绝。省略时保留模型选择/适配器/provider 默认。
+`reasoningEffort` 是每个 Session 的初始/重置默认值，并在新建、恢复或借用 Agent 的作用域内以 `prepend` 外层覆盖 `agent/request`，因此胜过已存在的模型选择与 provider 默认；借用外部 Agent 时，插件关闭只移除这条频道策略，不销毁外部 Agent。话题所有者可用 `/effort <档位-id>` 覆盖当前 Session，`/effort` 查看生效来源，`/effort reset` 恢复该配置值（未配置时恢复模型适配器/provider 默认）。成功选择由 Session 自带的 `command/run` / `command/done` 日志恢复，重启后仍生效；新建 Session 不继承旧 Session 的覆盖。
+
+推理档位是适配器拥有的不透明 id（常见如 `off`、`low`、`high`、`max`），命令不会猜测或预校验 provider 的能力；不受支持的值会在下一次模型请求前被 Harness 拒绝，并按失败终态显示错误。
 
 从旧版手写 Loader 行迁移时，删除原来的 `insert` / `id: channels` 条目；不要让旧行与 bundle 提供的 `id: dsh-channels` 同时存在，否则会启动两个插件实例。
 

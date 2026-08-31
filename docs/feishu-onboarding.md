@@ -104,7 +104,7 @@ chmod 600 $DSH_HOME/.credentials.yaml
 | `appId` / `appSecret` | 必填 | 凭据引用名（shell 标识符），经 `ctx.credentials` 解析；明文密钥会被拒绝 |
 | `baseDir` | `./channels-data` | 工作区目录树根：`p2p/<open_id>/`、`groups/<chat_id>/<open_id>/` |
 | `provider` / `model` | 部署默认 | 新建 session 的路由；省略时继承部署默认 |
-| `reasoningEffort` | 适配器/provider 默认 | 新建 session 的推理档位；必须是精确模型声明的非空 id |
+| `reasoningEffort` | 适配器/provider 默认 | Session 初始/重置推理档位；可在话题内用 `/effort` 覆盖 |
 | `maxTokens` | 适配器默认 | 每次模型请求输出上限 |
 | `refreshMs` | `500` | 流式卡片刷新频率（200–10000） |
 | `dmMode` | `open` | 私聊开关 |
@@ -155,6 +155,7 @@ DSH_HOME=$DSH_HOME pnpm dsh web        # 默认 http://127.0.0.1:3080
 |---|------|------|------|
 | 1 | 私聊 | 给机器人发一条消息 | 消息下立刻出现 **Typing** 表情 → 以话题形式回复卡片（**推理中** 折叠面板）→ 正文流式输出（500ms 刷新，面板变 **回复中**）→ 成功变 **回复结束**、Typing 变 **DONE**；卡片底部两行 session 信息 |
 | 1a | 错误推理强度 | 配置该模型不支持的 `reasoningEffort` 后发消息 | 卡片变 **回复失败**，显示 Harness 返回的错误消息和错误码（如 `UNSUPPORTED_REASONING_EFFORT`），Typing 变 **No**；模型/推理强度/缓存不沿用上一轮 |
+| 1b | Session 推理强度切换 | 话题内依次执行 `/effort`、`/effort tiny`、发普通消息、重启后续聊、`/effort reset` | 首次显示配置来源；切换后下一轮请求使用 `tiny`，重启恢复后仍保持；reset 后恢复配置值。若模型不支持 `tiny`，下一轮按 1a 失败，不会静默回退 |
 | 2 | 私聊续聊 | 在刚建的话题里直接再发消息（**不 @**） | 继续同一 session：卡片底部 session id 不变，input/output token 累计增长 |
 | 3 | 群聊 @ | 在普通群 @ 机器人发消息 | 同 #1；该消息成为新话题根 |
 | 4 | 群聊话题内 | 在上一步的话题里直接发消息（不 @） | 延续该 session，不再要求 @ |
