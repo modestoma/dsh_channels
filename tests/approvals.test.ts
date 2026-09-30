@@ -265,3 +265,21 @@ describe('ApprovalAnswerer', () => {
     expect(answerer.pendingCount()).toBe(0)
   })
 })
+
+describe('ApprovalAnswerer display reason', () => {
+  it('prefers the localized displayReason over the audit reason', async () => {
+    const { answerer, channel } = makeEnv()
+    const request = makeRequest('sess-display', {
+      reason: 'audit-trail reason',
+      displayReason: { en: 'English display', zh: '中文展示文本' },
+    })
+    const pending = answerer.onRequest(request, async () => 'unavailable')
+    await vi.waitFor(() => expect(channel.sent).toHaveLength(1))
+    const card = (channel.sent[0] as { input: { card: object } }).input.card
+    const json = JSON.stringify(card)
+    expect(json).toContain('中文展示文本')
+    expect(json).not.toContain('audit-trail reason')
+    answerer.dispose()
+    await pending
+  })
+})
