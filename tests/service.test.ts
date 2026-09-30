@@ -13,11 +13,11 @@ import { FeishuService } from '../src/service.ts'
 import type { FeishuConfig } from '../src/config.ts'
 import type { CardActionEvent, ChannelFactory, FeishuChannel, NormalizedMessage } from '../src/feishu-channel.ts'
 import { CordisFiberState } from '../src/dsh-types.ts'
-import type { AgentHandle, ApprovalOutcome, CordisPluginRuntime, SessionId } from '../src/dsh-types.ts'
+import type { AgentHandle, ApprovalOutcome, CordisPluginRuntime, SessionId, SessionProjections } from '../src/dsh-types.ts'
 import type { RouteRecord } from '../src/domain.ts'
 import type { SessionExportBuilder } from '../src/session-export.ts'
 import {
-  dispatchAgentRequest, makeHostContext, makeChannel, makeMessage, makeAgentPresets, makeSession, makeAgent,
+  dispatchAgentRequest, makeHostContext, makeChannel, makeMessage, makeAgentPresets, makeSession, makeAgent, sessionEvents,
 } from './helpers.ts'
 import type { FakeAgentPresets, FakeAgentPresetsOptions, FakeAgentsOptions } from './helpers.ts'
 
@@ -40,6 +40,12 @@ function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
     // surviving, and GC tests opt in with explicit TTLs.
     routeTtlMs: 0,
     approvalTimeoutMs: 300_000,
+    questionTimeoutMs: 300_000,
+    allowPermissionSwitch: false,
+    // Onboarding is opt-in per test: it adds a card that would shift send counts.
+    welcomeOnboarding: false,
+    acceptImages: true,
+    maxImagesPerMessage: 4,
     ...partial,
   }
 }
@@ -66,6 +72,7 @@ async function setup(
   presetOptions?: FakeAgentPresetsOptions,
   agentsOptions: FakeAgentsOptions = {},
   sessionExportBuilder?: SessionExportBuilder,
+  projections?: SessionProjections,
 ): Promise<Harness> {
   const config = makeConfig(partial)
   const channel = makeChannel(channelOptions)
@@ -73,6 +80,7 @@ async function setup(
     undefined,
     presetOptions === undefined ? undefined : makeAgentPresets(presetOptions),
     agentsOptions,
+    projections,
   )
   const factoryCalls: unknown[] = []
   const factory: ChannelFactory = options => {
@@ -408,7 +416,7 @@ describe('FeishuService', () => {
       agent, '/status', [], expect.any(AbortSignal),
     )
     expect(mock(agent.followup)).not.toHaveBeenCalled()
-    expect(agent.session.events.map(event => event.type)).toEqual(['command/run', 'command/done'])
+    expect(sessionEvents(agent.session).map(event => event.type)).toEqual(['command/run', 'command/done'])
     expect(h.channel.sent).toHaveLength(2)
   })
 
@@ -427,17 +435,17 @@ describe('FeishuService', () => {
     await expect(request()).resolves.toMatchObject({ reasoningEffort: 'high' })
 
     const command = async (messageId: string, content: string) => {
-      const before = agent.session.events.length
+      const before = sessionEvents(agent.session).length
       await h.onMessage(makeMessage({
         chatType: 'group', chatId: 'oc_effort', senderId: 'ou_owner', threadId: 'omt_1',
         mentionedBot: false, messageId, content,
       }))
-      await waitUntil(() => expect(agent.session.events.length).toBe(before + 2))
+      await waitUntil(() => expect(sessionEvents(agent.session).length).toBe(before + 2))
     }
 
     await command('om_effort_tiny', '/effort tiny')
     await expect(request()).resolves.toMatchObject({ reasoningEffort: 'tiny' })
-    expect(agent.session.events.slice(-2)).toMatchObject([
+    expect(sessionEvents(agent.session).slice(-2)).toMatchObject([
       { type: 'command/run', data: { name: 'effort', args: ' tiny' } },
       { type: 'command/done', data: { kind: 'success' } },
     ])
@@ -451,7 +459,7 @@ describe('FeishuService', () => {
     await expect(request()).resolves.toMatchObject({ reasoningEffort: '123456' })
 
     await command('om_effort_bad', '/effort tiny high')
-    expect(agent.session.events.at(-1)).toMatchObject({
+    expect(sessionEvents(agent.session).at(-1)).toMatchObject({
       type: 'command/done', data: { kind: 'error' },
     })
     await expect(request()).resolves.toMatchObject({ reasoningEffort: '123456' })
@@ -474,7 +482,7 @@ describe('FeishuService', () => {
       chatType: 'group', chatId: 'oc_effort_restore', senderId: 'ou_owner', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_effort_restore_set', content: '/effort tiny',
     }))
-    await waitUntil(() => expect(original.session.events).toHaveLength(2))
+    await waitUntil(() => expect(sessionEvents(original.session)).toHaveLength(2))
     agentsOptions.resumeSession = original.session
     await h.service.shutdown()
 
@@ -489,7 +497,7 @@ describe('FeishuService', () => {
     }))
     await waitUntil(() => expect(h.ctxState.agents.resumed).toHaveLength(1))
     const resumed = h.ctxState.agents.resumed[0]!
-    await waitUntil(() => expect(resumed.handle.agent.session.events).toHaveLength(4))
+    await waitUntil(() => expect(sessionEvents(resumed.handle.agent.session)).toHaveLength(4))
     expect(JSON.stringify((channel2.sent.at(-1) as { input: object }).input)).toContain('tiny')
     await expect(dispatchAgentRequest(resumed.setupCtx, {
       provider: 'deepseek-official', model: 'deepseek-v4-flash',
@@ -515,7 +523,7 @@ describe('FeishuService', () => {
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
 
-    expect(agent.session.events.map(event => event.type)).toEqual(['command/run', 'command/done'])
+    expect(sessionEvents(agent.session).map(event => event.type)).toEqual(['command/run', 'command/done'])
     expect(mock(agent.followup)).not.toHaveBeenCalled()
     expect(JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)).toContain('整体结论：**healthy**')
   })
@@ -538,7 +546,7 @@ describe('FeishuService', () => {
 
     expect(mock(h.ctxState.ctx.commands.execute)).not.toHaveBeenCalled()
     expect(h.ctxState.agents.resumed).toHaveLength(0)
-    expect(agent.session.events).toHaveLength(0)
+    expect(sessionEvents(agent.session)).toHaveLength(0)
     const json = JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)
     expect(json).toContain('无权操作此会话')
     expect(json).not.toContain(route.sessionId)
@@ -551,17 +559,18 @@ describe('FeishuService', () => {
     }))
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
     const agent = h.ctxState.agents.created[0]!.handle.agent
-    const events = agent.session.events as unknown as Array<Record<string, unknown>>
+    const events = sessionEvents(agent.session) as unknown as Array<Record<string, unknown>>
     events.push(
       { type: 'request/header', seq: 1, time: 100, data: { header: { config: {
         provider: 'deepseek-official', model: 'deepseek-v4-pro', reasoningEffort: 'high',
       } } } },
       { type: 'step/start', seq: 2, time: 1_000, data: { turn: 1, step: 1 } },
-      { type: 'assistant/chunk', seq: 3, time: 1_400, data: {
-        turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: 'a' },
-      } },
-      { type: 'assistant/message', seq: 4, time: 2_400, data: {
-        turn: 1, step: 1, message: {}, usage: { inputTokens: 100, outputTokens: 20, cacheReadTokens: 900 },
+      // The live stream is embedded in the settlement since session format v2
+      // (there is no durable `assistant/chunk` event any more).
+      { type: 'assistant/message', seq: 3, time: 2_400, data: {
+        turn: 1, step: 1, message: {},
+        stream: [{ type: 'text-chunks', time0: 1_400, index: 0, dt: [], texts: ['a'] }],
+        usage: { inputTokens: 100, outputTokens: 20, cacheReadTokens: 900 },
       } },
       { type: 'tool/call', seq: 5, time: 2_500, data: {
         turn: 1, step: 1, callId: 'call-1', name: 'bash', arguments: '{"secret":"value"}',
@@ -591,7 +600,7 @@ describe('FeishuService', () => {
     expect(json).not.toContain('secret')
     expect(json).not.toContain('private-output')
     expect(mock(agent.followup)).not.toHaveBeenCalled()
-    expect(agent.session.events.slice(-2).map(event => event.type)).toEqual(['command/run', 'command/done'])
+    expect(sessionEvents(agent.session).slice(-2).map(event => event.type)).toEqual(['command/run', 'command/done'])
   })
 
   it('returns /workspace only when Session header and route agree', async () => {
@@ -655,7 +664,7 @@ describe('FeishuService', () => {
     }))
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
     const agent = h.ctxState.agents.created[0]!.handle.agent
-    ;(agent.session.events as unknown as Array<Record<string, unknown>>).push({
+    ;(sessionEvents(agent.session) as unknown as Array<Record<string, unknown>>).push({
       type: 'request/header', seq: 1, time: 1,
       data: { header: { config: { provider: 'deepseek-official', model: 'deepseek-v4-pro' } } },
     })
@@ -672,7 +681,7 @@ describe('FeishuService', () => {
     expect(json).toContain('███░░░░░░░')
     expect(json).toContain('60,160 tokens')
     expect(mock(agent.followup)).not.toHaveBeenCalled()
-    expect(agent.session.events.slice(-2).map(event => event.type)).toEqual(['command/run', 'command/done'])
+    expect(sessionEvents(agent.session).slice(-2).map(event => event.type)).toEqual(['command/run', 'command/done'])
   })
 
   it('renders a native no-history /compact as a zero-release comparison', async () => {
@@ -741,7 +750,7 @@ describe('FeishuService', () => {
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
 
     expect(JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)).toContain('未挂载 Harness 原生 /compact')
-    expect(agent.session.events).toHaveLength(0)
+    expect(sessionEvents(agent.session)).toHaveLength(0)
   })
 
   it('renews the topic atomically, preserves history, and routes the next message only to the new Session', async () => {
@@ -754,10 +763,10 @@ describe('FeishuService', () => {
     const old = h.ctxState.agents.created[0]!
     let disposedAfterCommandDone = false
     mock(old.handle.dispose).mockImplementationOnce(async () => {
-      disposedAfterCommandDone = old.handle.agent.session.events.at(-1)?.type === 'command/done'
+      disposedAfterCommandDone = sessionEvents(old.handle.agent.session).at(-1)?.type === 'command/done'
       h.ctxState.agents.liveAgents.delete(old.options.sessionId)
     })
-    ;(old.handle.agent.session.events as unknown as Array<Record<string, unknown>>).push({
+    ;(sessionEvents(old.handle.agent.session) as unknown as Array<Record<string, unknown>>).push({
       type: 'agent-preset/selected', seq: 0, time: 1, data: { agentPreset: 'minimal' },
     })
 
@@ -780,10 +789,10 @@ describe('FeishuService', () => {
     expect(renewed.options.agentOptions).toEqual(old.handle.agent.options)
     expect(mock(old.handle.dispose)).toHaveBeenCalledTimes(1)
     expect(disposedAfterCommandDone).toBe(true)
-    expect(old.handle.agent.session.events.slice(-2).map(event => event.type)).toEqual([
+    expect(sessionEvents(old.handle.agent.session).slice(-2).map(event => event.type)).toEqual([
       'command/run', 'command/done',
     ])
-    expect(old.handle.agent.session.events.at(-1)).toMatchObject({
+    expect(sessionEvents(old.handle.agent.session).at(-1)).toMatchObject({
       type: 'command/done', data: { kind: 'success' },
     })
     const workspace = h.ctxState.workspaces.workspaces.get(route.workspacePath)!
@@ -819,13 +828,13 @@ describe('FeishuService', () => {
         chatType: 'group', chatId: 'oc_renew_busy', senderId: 'ou_owner', threadId: 'omt_1',
         mentionedBot: false, content: '/renew',
       }))
-      await waitUntil(() => expect(agent.session.events.at(-1)).toMatchObject({
+      await waitUntil(() => expect(sessionEvents(agent.session).at(-1)).toMatchObject({
         type: 'command/done', data: { kind: 'error' },
       }))
 
       expect(h.ctxState.agents.created).toHaveLength(1)
       expect(JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)).toContain('会话正忙')
-      expect(agent.session.events.at(-1)).toMatchObject({
+      expect(sessionEvents(agent.session).at(-1)).toMatchObject({
         type: 'command/done', data: { kind: 'error' },
       })
       expect(mock(h.ctxState.agents.created[0]!.handle.dispose)).not.toHaveBeenCalled()
@@ -846,7 +855,7 @@ describe('FeishuService', () => {
       chatType: 'group', chatId: 'oc_renew_create_fail', senderId: 'ou_owner', threadId: 'omt_1',
       mentionedBot: false, content: '/renew',
     }))
-    await waitUntil(() => expect(old.handle.agent.session.events.at(-1)).toMatchObject({
+    await waitUntil(() => expect(sessionEvents(old.handle.agent.session).at(-1)).toMatchObject({
       type: 'command/done', data: { kind: 'error' },
     }))
 
@@ -854,7 +863,7 @@ describe('FeishuService', () => {
     expect(route.sessionId).toBe(old.options.sessionId)
     expect(h.ctxState.agents.created).toHaveLength(1)
     expect(mock(old.handle.dispose)).not.toHaveBeenCalled()
-    expect(old.handle.agent.session.events.at(-1)).toMatchObject({
+    expect(sessionEvents(old.handle.agent.session).at(-1)).toMatchObject({
       type: 'command/done', data: { kind: 'error' },
     })
     expect(JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)).toContain('原 Session 仍保持绑定')
@@ -971,7 +980,7 @@ describe('FeishuService', () => {
       chatType: 'group', chatId: 'oc_history', senderId: 'ou_owner', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_history_before_restart', content: '/history',
     }))
-    await waitUntil(() => expect(current.handle.agent.session.events.at(-1)).toMatchObject({
+    await waitUntil(() => expect(sessionEvents(current.handle.agent.session).at(-1)).toMatchObject({
       type: 'command/done', data: { kind: 'success' },
     }))
 
@@ -1013,7 +1022,7 @@ describe('FeishuService', () => {
     }))
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
     const agent = h.ctxState.agents.created[0]!.handle.agent
-    ;(agent.session.events as unknown as Array<Record<string, unknown>>).push({
+    ;(sessionEvents(agent.session) as unknown as Array<Record<string, unknown>>).push({
       type: 'turn/end', seq: 41, time: 1_000, data: { turn: 1, reason: 'complete' },
     })
     mock(agent.followup).mockClear()
@@ -1046,7 +1055,7 @@ describe('FeishuService', () => {
       includes: { descendants: false, attachments: false, rawArtifacts: false },
       session: { id: agent.session.id, header: agent.session.header },
     })
-    expect(lines.slice(1)).toEqual(agent.session.events)
+    expect(lines.slice(1)).toEqual(sessionEvents(agent.session))
     expect(lines.slice(-2).map(event => event.type)).toEqual(['command/run', 'command/done'])
     expect(lines.at(-1)).toMatchObject({ type: 'command/done', data: { kind: 'success' } })
     expect(mock(agent.followup)).not.toHaveBeenCalled()
@@ -1065,7 +1074,7 @@ describe('FeishuService', () => {
       chatType: 'group', chatId: 'oc_export_args', senderId: 'ou_owner', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_export_args', content: '/export extra',
     }))
-    await waitUntil(() => expect(agent.session.events.at(-1)).toMatchObject({
+    await waitUntil(() => expect(sessionEvents(agent.session).at(-1)).toMatchObject({
       type: 'command/done', data: { kind: 'error' },
     }))
 
@@ -1090,7 +1099,7 @@ describe('FeishuService', () => {
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
 
     expect(mock(h.ctxState.ctx.commands.execute)).not.toHaveBeenCalled()
-    expect(agent.session.events).toHaveLength(0)
+    expect(sessionEvents(agent.session)).toHaveLength(0)
     expect((h.channel.sent as Array<{ input: object }>).some(entry => 'file' in entry.input)).toBe(false)
     const card = JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)
     expect(card).toContain('无权操作此会话')
@@ -1114,7 +1123,7 @@ describe('FeishuService', () => {
     }))
     await waitUntil(() => expect(buildFailure).toHaveBeenCalledTimes(1))
 
-    expect(agent.session.events.slice(-2).map(event => event.type)).toEqual(['command/run', 'command/done'])
+    expect(sessionEvents(agent.session).slice(-2).map(event => event.type)).toEqual(['command/run', 'command/done'])
     expect((h.channel.sent as Array<{ input: object }>).some(entry => 'file' in entry.input)).toBe(false)
     const card = JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)
     expect(card).toContain('导出失败，未交付文件')
@@ -1791,10 +1800,7 @@ describe('FeishuService', () => {
     const agent = h.ctxState.agents.created[0]!.handle.agent
     const listener = h.ctxState.sessionListeners[0]!
     const huge = 'x'.repeat(30_000)
-    listener(agent.session, {
-      type: 'assistant/chunk', seq: 1,
-      data: { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: huge } },
-    })
+    h.ctxState.assistantStreamListeners[0]!({ agent, frame: { type: 'chunk', attemptId: 'attempt-1', revision: 1, index: 0, time: 1, chunk: { type: 'text-delta', index: 0, text: huge } } })
     listener(agent.session, { type: 'turn/end', seq: 2, data: { turn: 1, reason: 'stop' } })
 
     await waitUntil(() => expect(h.channel.sent.length).toBeGreaterThanOrEqual(2))
@@ -1820,10 +1826,7 @@ describe('FeishuService', () => {
     }
 
     const listener = h.ctxState.sessionListeners[0]!
-    listener(agent.session, {
-      type: 'assistant/chunk', seq: 1,
-      data: { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: 'x'.repeat(30_000) } },
-    })
+    h.ctxState.assistantStreamListeners[0]!({ agent, frame: { type: 'chunk', attemptId: 'attempt-1', revision: 1, index: 0, time: 1, chunk: { type: 'text-delta', index: 0, text: 'x'.repeat(30_000) } } })
     listener(agent.session, { type: 'turn/end', seq: 2, data: { turn: 1, reason: 'stop' } })
 
     await waitUntil(() => expect(h.channel.sent.length).toBeGreaterThanOrEqual(2))
@@ -1896,12 +1899,7 @@ describe('FeishuService', () => {
     await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: '长文' }))
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
     const agent = h.ctxState.agents.created[0]!.handle.agent
-    const listener = h.ctxState.sessionListeners[0]!
-
-    listener(agent.session, {
-      type: 'assistant/chunk', seq: 1,
-      data: { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: 'x'.repeat(30_000) } },
-    })
+    h.ctxState.assistantStreamListeners[0]!({ agent, frame: { type: 'chunk', attemptId: 'attempt-1', revision: 1, index: 0, time: 1, chunk: { type: 'text-delta', index: 0, text: 'x'.repeat(30_000) } } })
     await waitUntil(() => {
       const entries = inflightEntries(h)
       expect(entries).toHaveLength(1)
@@ -1990,11 +1988,7 @@ describe('FeishuService', () => {
       if ('card' in input && h.channel.sent.length > 0) throw new Error('card rejected (230099)')
       return originalSend(chatId, input, options)
     }
-    const listener = h.ctxState.sessionListeners[0]!
-    listener(agent.session, {
-      type: 'assistant/chunk', seq: 1,
-      data: { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: 'x'.repeat(30_000) } },
-    })
+        h.ctxState.assistantStreamListeners[0]!({ agent, frame: { type: 'chunk', attemptId: 'attempt-1', revision: 1, index: 0, time: 1, chunk: { type: 'text-delta', index: 0, text: 'x'.repeat(30_000) } } })
     await waitUntil(() => expect(h.channel.sent.length).toBeGreaterThanOrEqual(2))
     await waitUntil(() => {
       const entries = inflightEntries(h)
@@ -2541,5 +2535,520 @@ describe('HITL approval wiring', () => {
     await waitUntil(() => expect(h.channel.sent.length).toBe(2))
     await h.service.shutdown()
     await expect(pending).resolves.toBe('cancelled')
+  })
+})
+
+describe('/stop, structured questions, and host projections', () => {
+  it('registers a prepend user-questions answerer and routes card actions to it', async () => {
+    const h = await setup()
+    expect(h.ctxState.questionListeners).toHaveLength(1)
+    expect(h.ctxState.questionListeners[0]!.options).toEqual({ prepend: true })
+    expect(h.channel.cardActionHandlers).toHaveLength(1)
+    await h.service.shutdown()
+  })
+
+  it('answers a routed session\'s ask_user_question through a card, owner-gated', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_questions', senderId: 'ou_owner', content: '问一下',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    const { listener } = h.ctxState.questionListeners[0]!
+    const next = vi.fn(async () => ({ answers: [] }))
+    const pending = listener({
+      questions: [{
+        id: 'q1', question: '今天吃什么？',
+        options: [{ label: '面' }, { label: '饭' }],
+      }],
+      agent,
+    }, next)
+
+    await waitUntil(() => expect(h.channel.sent.some(s =>
+      'card' in ((s as { input: object }).input)
+      && JSON.stringify(((s as { input: { card: object } }).input.card)).includes('需要你的回答'),
+    )).toBe(true))
+    const index = h.channel.sent.findIndex(s =>
+      'card' in ((s as { input: object }).input)
+      && JSON.stringify(((s as { input: { card: object } }).input.card)).includes('需要你的回答'),
+    )
+    const messageId = `om_${index + 1}`
+    const card = (h.channel.sent[index] as { input: { card: object } }).input.card
+    const button = (card as { body: { elements: Array<Record<string, unknown>> } }).body.elements
+      .find(element => element.tag === 'button'
+        && (element.text as { content?: string } | undefined)?.content === '面')
+    expect(button).toBeDefined()
+    expect(next).not.toHaveBeenCalled()
+
+    // A stranger's click is ignored (and notes the owner-only rule).
+    const value = (button!.behaviors as Array<{ value: unknown }>)[0]!.value
+    await h.channel.fireCardAction({
+      messageId, chatId: 'oc_questions',
+      operator: { openId: 'ou_stranger' },
+      action: { value, tag: 'button' },
+    })
+    await flush()
+    expect(h.channel.updated.some(update =>
+      (update as { messageId: string }).messageId === messageId
+      && JSON.stringify((update as { card: object }).card).includes('仅发起该会话的用户'),
+    )).toBe(true)
+
+    await h.channel.fireCardAction({
+      messageId, chatId: 'oc_questions',
+      operator: { openId: 'ou_owner' },
+      action: { value, tag: 'button' },
+    })
+    await expect(pending).resolves.toEqual({ answers: [{ id: 'q1', selected: ['面'] }] })
+    await waitUntil(() => expect(h.channel.updated.some(update =>
+      (update as { messageId: string }).messageId === messageId
+      && JSON.stringify((update as { card: object }).card).includes('已回答'),
+    )).toBe(true))
+    await h.service.shutdown()
+  })
+
+  it('delegates user questions for sessions the channel does not route', async () => {
+    const h = await setup()
+    const { listener } = h.ctxState.questionListeners[0]!
+    const foreign = makeAgent(makeSession('sess-question-foreign'))
+    const next = vi.fn(async () => ({ answers: [{ id: 'q', selected: [] }] }))
+    await expect(listener({ questions: [{ id: 'q', question: '?', options: [{ label: 'x' }] }], agent: foreign }, next))
+      .resolves.toEqual({ answers: [{ id: 'q', selected: [] }] })
+    expect(next).toHaveBeenCalled()
+    expect(h.channel.sent).toHaveLength(0)
+    await h.service.shutdown()
+  })
+
+  it('withdraws in-flight structured questions on shutdown', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_q_shutdown', senderId: 'ou_owner', content: '先问后关',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    const { listener } = h.ctxState.questionListeners[0]!
+    const pending = listener({
+      questions: [{ id: 'q1', question: '继续吗？', options: [{ label: '是' }, { label: '否' }] }],
+      agent,
+    }, vi.fn(async () => ({ answers: [] })))
+    await waitUntil(() => expect(h.channel.sent.length).toBe(2))
+    await h.service.shutdown()
+    await expect(pending).rejects.toThrow('插件已关闭')
+  })
+
+  it('cancels the running turn on /stop without starting a model turn', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_stop', senderId: 'ou_owner', messageId: 'om_stop_start', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    const cancel = vi.fn()
+    ;(agent as unknown as { status: string }).status = 'running'
+    ;(agent as unknown as { cancel: unknown }).cancel = cancel
+    mock(agent.followup).mockClear()
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_stop', senderId: 'ou_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_stop_command', content: '/stop',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
+
+    expect(cancel).toHaveBeenCalledWith({ kind: 'user' })
+    const json = JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)
+    expect(json).toContain('已请求停止当前回合')
+    expect(mock(agent.followup)).not.toHaveBeenCalled()
+    // `/stop` is channel-plane: it must not cold-resume anything either.
+    expect(h.ctxState.agents.resumed).toHaveLength(0)
+    await h.service.shutdown()
+  })
+
+  it('reports /stop as a no-op when no turn is running', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_stop_idle', senderId: 'ou_owner', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    const cancel = vi.fn()
+    ;(agent as unknown as { cancel: unknown }).cancel = cancel
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_stop_idle', senderId: 'ou_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_stop_idle_command', content: '/stop',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
+    expect(JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)).toContain('当前没有正在运行的回合')
+    await h.service.shutdown()
+  })
+
+  it('renders card tokens from host projections when mounted', async () => {
+    const projections: SessionProjections = {
+      stateOf: (_session, key) => {
+        if (key === 'tokenUsage') {
+          return {
+            totals: { uncachedInputTokens: 4_242, outputTokens: 777, cacheReadTokens: 0, cacheWriteTokens: 0 },
+            last: { turn: 1, step: 1, buckets: { uncachedInputTokens: 4_242, outputTokens: 777, cacheReadTokens: 0, cacheWriteTokens: 0 } },
+          }
+        }
+        if (key === 'contextPressure') return { contextWindow: 64_000 }
+        return undefined
+      },
+    }
+    const h = await setup({}, {}, undefined, {}, undefined, projections)
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_proj', senderId: 'ou_owner', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    // The window is turn-scoped on the card: a request header must exist for
+    // this turn before the model line is rendered at all.
+    h.ctxState.sessionListeners[0]!(agent.session, {
+      type: 'request/header', seq: 1,
+      data: { header: { config: { provider: 'deepseek-official', model: 'deepseek-v4-pro' } } },
+    })
+    h.ctxState.assistantStreamListeners[0]!({
+      agent,
+      frame: {
+        type: 'chunk', attemptId: 'a1', revision: 1, index: 0, time: 1,
+        chunk: { type: 'text-delta', index: 0, text: 'hi' },
+      },
+    })
+    await waitUntil(() => {
+      const json = JSON.stringify(h.channel.updated.map(update => (update as { card: object }).card))
+      expect(json).toContain('4,242')
+      expect(json).toContain('777')
+      expect(json).toContain('64,000')
+    })
+    await h.service.shutdown()
+  })
+
+  it('drives the streamed card from agent/assistant-stream events', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_stream', senderId: 'ou_owner', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    h.ctxState.assistantStreamListeners[0]!({
+      agent,
+      frame: {
+        type: 'chunk', attemptId: 'a1', revision: 1, index: 0, time: 1,
+        chunk: { type: 'text-delta', index: 0, text: '流式正文' },
+      },
+    })
+    await waitUntil(() => {
+      const json = JSON.stringify(h.channel.updated.map(update => (update as { card: object }).card))
+      expect(json).toContain('流式正文')
+    })
+    await h.service.shutdown()
+  })
+})
+
+describe('command registry dispatch', () => {
+  it('resolves the /new alias to /renew end to end', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_alias', senderId: 'ou_owner',
+      messageId: 'om_alias_start', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const old = h.ctxState.agents.created[0]!
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_alias', senderId: 'ou_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_alias_new', content: '/new',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
+
+    const renewed = h.ctxState.agents.created[1]!
+    const route = h.ctxState.domain.raw.table('routes').get('omt_1') as RouteRecord
+    expect(route.sessionId).toBe(renewed.options.sessionId)
+    // The alias executes the canonical command on the agent plane.
+    expect(sessionEvents(old.handle.agent.session).slice(-2).map(event => event.type))
+      .toEqual(['command/run', 'command/done'])
+    expect(JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)).toContain('Session 已续建')
+    await h.service.shutdown()
+  })
+
+  it('rejects an unknown command with the registry-derived supported list', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_unknown', senderId: 'ou_owner', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_unknown', senderId: 'ou_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_unknown_cmd', content: '/nope',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
+    const json = JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)
+    expect(json).toContain('未找到命令 /nope')
+    expect(json).toContain('/userid')
+    await h.service.shutdown()
+  })
+})
+
+describe('free-text question answers', () => {
+  it('routes a plain reply into a pending structured question', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_qtext', senderId: 'ou_owner', content: '问一下',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    const { listener } = h.ctxState.questionListeners[0]!
+    const pending = listener({
+      questions: [{ id: 'q1', question: '自由文本？' }],
+      agent,
+    }, vi.fn(async () => ({ answers: [] })))
+    await waitUntil(() => expect(h.channel.sent.length).toBe(2))
+    mock(agent.followup).mockClear()
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_qtext', senderId: 'ou_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_qtext_answer', content: '这是答案',
+    }))
+    await expect(pending).resolves.toEqual({
+      answers: [{ id: 'q1', selected: [], custom: '这是答案' }],
+    })
+    // The answer is acknowledged without starting a model turn.
+    expect(mock(agent.followup)).not.toHaveBeenCalled()
+    await waitUntil(() => expect(JSON.stringify(
+      (h.channel.sent.at(-1) as { input: object }).input,
+    )).toContain('已记录你的文字回答'))
+    await h.service.shutdown()
+  })
+})
+
+describe('/permissions and /status extras', () => {
+  it('shows the current permission preset and the catalog read-only by default', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_perm', senderId: 'ou_owner', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_perm', senderId: 'ou_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_perm_view', content: '/permissions',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
+    const json = JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)
+    expect(json).toContain('当前权限预设')
+    expect(json).toContain('standard')
+    expect(json).toContain('read-only')
+    expect(json).toContain('仅支持查看')
+
+    // Switching is refused while the deployment keeps the gate closed.
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_perm', senderId: 'ou_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_perm_set', content: '/permissions read-only',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(3))
+    expect(JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)).toContain('未开启飞书侧权限切换')
+    expect(h.ctxState.permissions.set).not.toHaveBeenCalled()
+    await h.service.shutdown()
+  })
+
+  it('switches the permission preset when the deployment opts in', async () => {
+    const h = await setup({ allowPermissionSwitch: true })
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_perm_on', senderId: 'ou_owner', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_perm_on', senderId: 'ou_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_perm_switch', content: '/permissions read-only',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
+    expect(h.ctxState.permissions.set).toHaveBeenCalledWith(agent.session, 'read-only')
+    expect(JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)).toContain('权限预设已切换')
+    await h.service.shutdown()
+  })
+
+  it('renders permission/workspace/uptime extras on /status', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_status_extra', senderId: 'ou_owner', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const route = h.ctxState.domain.raw.table('routes').get('omt_1') as RouteRecord | undefined
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_status_extra', senderId: 'ou_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_status_extra', content: '/status',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
+    const json = JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)
+    expect(json).toContain('权限预设')
+    expect(json).toContain('工作区')
+    expect(json).toContain('插件运行时长')
+    expect(route?.workspacePath).toBeDefined()
+    await h.service.shutdown()
+  })
+})
+
+describe('first-contact onboarding', () => {
+  it('sends the onboarding card once per private chat and persists it', async () => {
+    const h = await setup({ welcomeOnboarding: true })
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_welcome', senderId: 'ou_new', messageId: 'om_w1', content: '你好',
+    }))
+    await waitUntil(() => expect(h.channel.sent.length).toBeGreaterThanOrEqual(2))
+
+    const welcomes = () => h.channel.sent.filter(entry =>
+      JSON.stringify((entry as { input: object }).input).includes('欢迎使用飞书 DSH'))
+    expect(welcomes()).toHaveLength(1)
+    const global = h.ctxState.domain.raw.global.get() as { welcomedChats?: string[] }
+    expect(global.welcomedChats).toContain('oc_welcome')
+
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_welcome', senderId: 'ou_new', threadId: 'omt_1',
+      messageId: 'om_w2', content: '再来一条',
+    }))
+    await waitUntil(() => expect(h.channel.sent.length).toBeGreaterThanOrEqual(3))
+    expect(welcomes()).toHaveLength(1)
+    await h.service.shutdown()
+  })
+})
+
+describe('/model', () => {
+  it('shows the current model and the advertised catalog', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_model_view', senderId: 'ou_owner', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    ;(sessionEvents(agent.session) as unknown as Array<Record<string, unknown>>).push({
+      type: 'request/header', seq: 1, time: 1,
+      data: { header: { config: { provider: 'deepseek-official', model: 'deepseek-v4-flash' } } },
+    })
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_model_view', senderId: 'ou_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_model_view', content: '/model',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
+    const json = JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)
+    expect(json).toContain('当前模型')
+    expect(json).toContain('deepseek-v4-flash')
+    expect(json).toContain('deepseek-v4-pro')
+    await h.service.shutdown()
+  })
+
+  it('switches the model for subsequent requests', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_model_set', senderId: 'ou_owner', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const created = h.ctxState.agents.created[0]!
+    const agent = created.handle.agent
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_model_set', senderId: 'ou_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_model_set', content: '/model deepseek-v4-pro',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
+    expect(JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)).toContain('已切换为')
+    expect(sessionEvents(agent.session).slice(-2).map(event => event.type))
+      .toEqual(['command/run', 'command/done'])
+
+    // The persisted policy reaches the next model request.
+    await expect(dispatchAgentRequest(created.setupCtx, { provider: 'deepseek-official', model: 'deepseek-v4-flash' }))
+      .resolves.toMatchObject({ model: 'deepseek-v4-pro' })
+    await h.service.shutdown()
+  })
+
+  it('rejects a model the provider does not advertise', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_model_bad', senderId: 'ou_owner', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    ;(sessionEvents(agent.session) as unknown as Array<Record<string, unknown>>).push({
+      type: 'request/header', seq: 1, time: 1,
+      data: { header: { config: { provider: 'deepseek-official', model: 'deepseek-v4-flash' } } },
+    })
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_model_bad', senderId: 'ou_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_model_bad', content: '/model nope-model',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
+    const json = JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)
+    expect(json).toContain('未提供模型')
+    expect(json).toContain('deepseek-v4-pro')
+    await h.service.shutdown()
+  })
+})
+
+describe('inbound images', () => {
+  it('forwards an inbound image into the model message', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_image', senderId: 'ou_owner', messageId: 'om_image',
+      content: '看这张图',
+      resources: [{ type: 'image', fileKey: 'img_1' }] as never,
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+
+    expect(h.ctxState.attachments.saveImages).toHaveBeenCalledTimes(1)
+    const message = mock(agent.followup).mock.calls[0]![0] as {
+      content: Array<{ type: string; attachment?: unknown; text?: string }>
+    }
+    expect(message.content).toEqual([
+      { type: 'text', text: '看这张图' },
+      { type: 'image', attachment: { id: 'att_1' } },
+    ])
+    await h.service.shutdown()
+  })
+})
+
+describe('/history enrichment', () => {
+  it('annotates history entries with host titles', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_hist', senderId: 'ou_owner', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_hist', senderId: 'ou_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_hist', content: '/history',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
+    const json = JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)
+    expect(json).toContain('Session 历史')
+    expect(json).toContain('测试标题')
+    expect(h.ctxState.sessionQuery.readTitleSnapshots).toHaveBeenCalled()
+    await h.service.shutdown()
+  })
+
+  it('still renders history when the title lookup fails', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_hist_fail', senderId: 'ou_owner', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    h.ctxState.sessionQuery.readTitleSnapshots.mockRejectedValueOnce(new Error('query unavailable'))
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_hist_fail', senderId: 'ou_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_hist_fail', content: '/history',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
+    const json = JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)
+    expect(json).toContain('Session 历史')
+    expect(json).not.toContain('测试标题')
+    const warnings = mock(h.ctxState.ctx.logger?.warn).mock.calls.flat().join(' ')
+    expect(warnings).toContain('session title lookup failed')
+    await h.service.shutdown()
   })
 })

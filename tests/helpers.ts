@@ -10,8 +10,9 @@ import path from 'node:path'
 import { vi } from 'vitest'
 import type {
   Agent, AgentContext, AgentHandle, AgentOptions, AgentRegistry, AgentRequestConfig, AgentRequestListener, ApprovalAnswererListener,
-  CommandDefinition, CommandInvocation, CommandRuntime, EncodedImageAttachment, HostContext, Session, SessionEvent, SessionId,
-  StorageDomainFacility, Workspace, WorkspaceRegistry,
+  AssistantStreamPayload, CommandDefinition, CommandInvocation, CommandRuntime, EncodedImageAttachment, HostContext,
+  PermissionPresets, Session, SessionEvent, SessionId, SessionProjections, StorageDomainFacility, UserQuestionAnswererListener,
+  Workspace, WorkspaceRegistry,
 } from '../src/dsh-types.ts'
 import type {
   CardActionEvent, FeishuChannel, FeishuConnectionStatus, NormalizedMessage, SendResult,
@@ -23,7 +24,10 @@ export function makeSession(
   cwd?: string,
   agentPreset?: string,
 ): Session {
-  return {
+  // Test sessions keep the raw log locally (so tests can append/inspect) and
+  // expose it only through the DSH 0.2.0 range reader the plugin consumes.
+  const log: SessionEvent[] = []
+  const session = {
     id: id as SessionId,
     header: {
       version: 0,
@@ -32,9 +36,27 @@ export function makeSession(
       ...(cwd === undefined ? {} : { cwd }),
       ...(agentPreset === undefined ? {} : { agentPreset }),
     },
-    events: [],
+    events: log,
     firstLiveSeq: 0,
+    snapshotEvents: (fromSeq = 0, toSeqExclusive = log.length) => log.slice(fromSeq, toSeqExclusive),
+    requestHeader: () => {
+      for (let index = log.length - 1; index >= 0; index -= 1) {
+        const event = log[index]
+        if (event?.type === 'request/header') return event.data.header
+      }
+      return undefined
+    },
   }
+  return session as unknown as Session
+}
+
+/**
+ * Test-only raw log view of a fake Session. Production code reads the log
+ * through `snapshotEvents()`; tests keep direct array access for assertions
+ * and synthetic appends.
+ */
+export function sessionEvents(session: Session): SessionEvent[] {
+  return (session as unknown as { events: SessionEvent[] }).events
 }
 
 export function makeCommandRuntime(): CommandRuntime & { definitions: Map<string, CommandDefinition> } {
@@ -75,7 +97,7 @@ export function makeCommandRuntime(): CommandRuntime & { definitions: Map<string
       const definition = runtime.find(agent, name)
       if (definition === undefined) return undefined
       const commandId = `cmd-test-${++commandSeq}` as CommandInvocation['commandId']
-      const events = agent.session.events as unknown as Array<{ seq: number; type: string; data: Record<string, unknown> }>
+      const events = sessionEvents(agent.session) as unknown as Array<{ seq: number; type: string; data: Record<string, unknown> }>
       events.push({
         seq: events.length,
         type: 'command/run',
@@ -341,6 +363,7 @@ export function makeHostContext(
   credentialValues?: Record<string, string>,
   agentPresets?: FakeAgentPresets,
   agentsOptions: FakeAgentsOptions = {},
+  projections?: SessionProjections,
 ): {
   ctx: HostContext
   agents: ReturnType<typeof makeAgentRegistry>
@@ -348,15 +371,43 @@ export function makeHostContext(
   domain: ReturnType<typeof makeDomain>
   credentials: { resolve: ReturnType<typeof vi.fn>; values: Record<string, string> }
   sessionListeners: Array<(session: Session, event: SessionEvent) => void>
+  assistantStreamListeners: Array<(payload: AssistantStreamPayload) => void>
   approvalListeners: Array<{ listener: ApprovalAnswererListener; options: { prepend?: boolean } | undefined }>
+  questionListeners: Array<{ listener: UserQuestionAnswererListener; options: { prepend?: boolean } | undefined }>
+  permissions: PermissionPresets & { set: ReturnType<typeof vi.fn>; preset: string }
+  attachments: { saveImages: ReturnType<typeof vi.fn> }
+  sessionQuery: { readTitleSnapshots: ReturnType<typeof vi.fn> }
 } {
   const agents = makeAgentRegistry(agentsOptions)
   const workspaces = makeWorkspaceRegistry()
   const domain = makeDomain()
   const sessionListeners: Array<(session: Session, event: SessionEvent) => void> = []
+  const assistantStreamListeners: Array<(payload: AssistantStreamPayload) => void> = []
   const approvalListeners: Array<{ listener: ApprovalAnswererListener; options: { prepend?: boolean } | undefined }> = []
+  const questionListeners: Array<{ listener: UserQuestionAnswererListener; options: { prepend?: boolean } | undefined }> = []
   const tokenMeter = { measure: () => ({ totalTokens: 1234 }) }
-  const llm = { resolveModelInfo: vi.fn(async () => ({ context: { contextWindow: 128000 } })) }
+  const permissions = {
+    preset: 'standard',
+    catalog: () => ({
+      options: [
+        { value: 'read-only', name: 'Read only' },
+        { value: 'standard', name: 'Standard' },
+      ],
+      defaultOptions: [{ value: 'standard', name: 'Standard' }],
+      defaultPreset: 'standard',
+    }),
+    current: () => permissions.preset,
+    optionOf: (name: string) => ({ value: name, name }),
+    set: vi.fn((_session: Session, name: string) => { permissions.preset = name }),
+  }
+  const llm = {
+    resolveModelInfo: vi.fn(async () => ({ context: { contextWindow: 128000 } })),
+    listProviders: vi.fn(() => [{ id: 'deepseek-official', name: 'DeepSeek' }]),
+    listModels: vi.fn(async () => [
+      { provider: 'deepseek-official', id: 'deepseek-v4-flash', name: 'Flash' },
+      { provider: 'deepseek-official', id: 'deepseek-v4-pro', name: 'Pro' },
+    ]),
+  }
   const commands = makeCommandRuntime()
   const credentials = {
     values: {
@@ -369,15 +420,28 @@ export function makeHostContext(
       return value === undefined ? undefined : { value, source: 'file' }
     }),
   }
+  const attachments = { saveImages: vi.fn(async (inputs: readonly unknown[]) => inputs.map((_input, index) => ({ id: `att_${index + 1}` }))) }
+  const sessionQuery = {
+    readTitleSnapshots: vi.fn(async (ids: readonly string[]) => ids.map(sessionId => ({
+      sessionId,
+      status: 'fulfilled' as const,
+      value: { title: { title: '测试标题', updatedAt: 1 } },
+    }))),
+  }
   const services: Record<string, unknown> = {
     agents: agents.registry,
+    attachments,
+    sessionQuery,
     commands,
     workspaceRegistry: workspaces.registry,
     storageDomain: domain.facility,
     tokenMeter,
     llm,
     credentials,
+    userQuestions: {},
+    permissionPresets: permissions,
     ...(agentPresets === undefined ? {} : { agentPresets }),
+    ...(projections === undefined ? {} : { sessionProjections: projections }),
   }
   const ctx: HostContext = {
     agents: agents.registry,
@@ -394,9 +458,16 @@ export function makeHostContext(
       if (name === 'session/event') {
         const wrapped = listener as (session: Session, event: SessionEvent) => void
         sessionListeners.push(wrapped)
+      } else if (name === 'agent/assistant-stream') {
+        assistantStreamListeners.push(listener as (payload: AssistantStreamPayload) => void)
       } else if (name === 'approval/request') {
         approvalListeners.push({
           listener: listener as ApprovalAnswererListener,
+          options: options as { prepend?: boolean } | undefined,
+        })
+      } else if (name === 'user-questions/request') {
+        questionListeners.push({
+          listener: listener as UserQuestionAnswererListener,
           options: options as { prepend?: boolean } | undefined,
         })
       }
@@ -404,11 +475,16 @@ export function makeHostContext(
     }),
     effect: vi.fn(),
   }
-  return { ctx, agents, workspaces, domain, credentials, sessionListeners, approvalListeners }
+  return {
+    ctx, agents, workspaces, domain, credentials, sessionListeners,
+    assistantStreamListeners, approvalListeners, questionListeners, permissions, attachments, sessionQuery,
+  }
 }
 
 export interface FakeChannelOptions {
   threadIdOfMessage?: (messageId: string) => Promise<string | undefined>
+  /** Inbound resource bytes returned by `downloadResource` (sync or async). */
+  downloadResource?: () => { data: Uint8Array; mediaType?: string } | Promise<{ data: Uint8Array; mediaType?: string }>
   failFirstSend?: boolean
   failReplyInThread?: boolean
   /** Reject every card send (used to exercise the plain-text fallback). */
@@ -468,6 +544,12 @@ export function makeChannel(options: FakeChannelOptions = {}): FeishuChannel & {
       removedReactions.push({ messageId, reactionId })
     }),
     threadIdOfMessage: options.threadIdOfMessage ?? (async () => `omt_${serial}`),
+    downloadResource: vi.fn(async () => (options.downloadResource === undefined
+      ? {
+          data: new Uint8Array([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]),
+          mediaType: 'image/png' as const,
+        }
+      : await options.downloadResource())),
   }
   return Object.assign(channel, {
     sent, updated, reactions, removedReactions, cardActionHandlers,
