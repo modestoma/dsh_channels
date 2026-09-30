@@ -2,8 +2,9 @@ import { Context } from '@deepseek-ai/cordis'
 import { describe, expect, it, vi } from 'vitest'
 import {
   armEffortCommand, armRenewCommand, buildCommandResultCard, commandResultCardKind, mountChannelCommands, parseSlashCommand,
-  registerChannelCommands, RouteOperationQueue, supportedCommandHelp, supportedCommandList,
+  isSupportedCommand, registerChannelCommands, RouteOperationQueue, supportedCommandHelp, supportedCommandList,
 } from '../src/commands.ts'
+import { commandSpec } from '../src/commands/registry.ts'
 import type { AgentContext } from '../src/dsh-types.ts'
 import { makeAgent, makeAgentContext, makeCommandRuntime, makeSession } from './helpers.ts'
 
@@ -23,11 +24,27 @@ describe('slash command primitives', () => {
     expect(supportedCommandHelp()).toContain('**/groupid** — 在群聊中显示当前群组 ID')
   })
 
+  it('renders help grouped by the command registry', () => {
+    const help = supportedCommandHelp()
+    for (const group of ['基础', '会话', '模型与上下文', '导出']) {
+      expect(help).toContain(`**${group}**`)
+    }
+    // The usage hint comes from the registry, not a second hand-written copy.
+    expect(help).toContain('**/effort** [id|reset] — 查看或切换当前 Session 推理强度')
+  })
+
+  it('accepts the /new alias and resolves it to /renew', () => {
+    expect(isSupportedCommand('new')).toBe(true)
+    expect(isSupportedCommand('renew')).toBe(true)
+    expect(isSupportedCommand('nope')).toBe(false)
+    expect(commandSpec('new')?.name).toBe('renew')
+  })
+
   it('registers only channel-scoped definitions and leaves compact global', async () => {
     const commands = makeCommandRuntime()
     registerChannelCommands(commands)
     expect([...commands.definitions.keys()].sort()).toEqual([
-      'effort', 'export', 'health', 'help', 'history', 'renew', 'status', 'workspace',
+      'effort', 'export', 'health', 'help', 'history', 'model', 'renew', 'status', 'workspace',
     ])
     expect(commands.definitions.has('compact')).toBe(false)
 
@@ -107,7 +124,7 @@ describe('slash command primitives', () => {
 
     await mountChannelCommands(bareAgentCtx as unknown as AgentContext)
     expect([...commands.definitions.keys()].sort()).toEqual([
-      'effort', 'export', 'health', 'help', 'history', 'renew', 'status', 'workspace',
+      'effort', 'export', 'health', 'help', 'history', 'model', 'renew', 'status', 'workspace',
     ])
 
     await ctx.fiber.dispose()

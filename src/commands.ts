@@ -12,35 +12,20 @@
 import type {
   AgentContext, CommandDefinition, CommandDescriptor, CommandResult, CommandRuntime,
 } from './dsh-types.ts'
+import { card } from './cards/primitives.ts'
 
-export const CHANNEL_COMMAND_NAMES = [
-  'help',
-  'health',
-  'status',
-  'workspace',
-  'effort',
-  'renew',
-  'history',
-  'export',
-] as const
+import {
+  CHANNEL_COMMANDS, commandNames, groupedCommandHelp, commandSpec, supportedCommandNames,
+} from './commands/registry.ts'
+import type { ChannelCommandSpec, SupportedCommandName } from './commands/registry.ts'
 
-export const SUPPORTED_COMMAND_NAMES = [
-  'help',
-  'userid',
-  'groupid',
-  'health',
-  'status',
-  'workspace',
-  'effort',
-  'compact',
-  'renew',
-  'history',
-  'export',
-] as const
+/** Canonical channel command names, in registry order (agent-scoped ones included). */
+export const CHANNEL_COMMAND_NAMES = commandNames()
 
-export type SupportedCommandName = typeof SUPPORTED_COMMAND_NAMES[number]
+/** Every typeable command name (canonical + aliases). */
+export const SUPPORTED_COMMAND_NAMES = supportedCommandNames()
 
-const SUPPORTED_NAMES = new Set<string>(SUPPORTED_COMMAND_NAMES)
+export type { SupportedCommandName }
 
 export interface ParsedSlashCommand {
   readonly name: string
@@ -58,7 +43,7 @@ export function parseSlashCommand(line: string): ParsedSlashCommand | undefined 
 }
 
 export function isSupportedCommand(name: string): name is SupportedCommandName {
-  return SUPPORTED_NAMES.has(name)
+  return commandSpec(name) !== undefined
 }
 
 /** Stable display used by unknown-command and deployment diagnostics. */
@@ -66,37 +51,20 @@ export function supportedCommandList(): string {
   return SUPPORTED_COMMAND_NAMES.map(name => `/${name}`).join('、')
 }
 
-const SUPPORTED_COMMAND_DESCRIPTIONS: Readonly<Record<SupportedCommandName, string>> = {
-  help: '显示当前支持的斜杠命令',
-  userid: '在私聊中显示当前用户 ID',
-  groupid: '在群聊中显示当前群组 ID',
-  health: '显示 Harness 与飞书通道健康状态',
-  status: '显示当前 Session 状态与性能指标',
-  workspace: '显示当前 Session 工作目录',
-  effort: '查看或切换当前 Session 推理强度',
-  compact: '压缩当前 Session 上下文',
-  renew: '在当前话题创建并绑定新 Session',
-  history: '显示当前话题的 Session 历史',
-  export: '导出当前 Session 的逻辑日志',
-}
-
-/** Markdown help generated from the canonical supported-command order. */
+/** Markdown help, grouped and generated from the command registry. */
 export function supportedCommandHelp(): string {
-  return SUPPORTED_COMMAND_NAMES
-    .map(name => `**/${name}** — ${SUPPORTED_COMMAND_DESCRIPTIONS[name]}`)
-    .join('\n')
+  return groupedCommandHelp()
 }
 
-const DESCRIPTORS: ReadonlyArray<CommandDescriptor> = [
-  { name: 'help', description: SUPPORTED_COMMAND_DESCRIPTIONS.help },
-  { name: 'health', description: '显示 Harness 与飞书通道健康状态' },
-  { name: 'status', description: '显示当前 Session 状态与性能指标' },
-  { name: 'workspace', description: '显示当前 Session 工作目录' },
-  { name: 'effort', description: '查看或切换当前 Session 推理强度', input: { hint: '[id|reset]' } },
-  { name: 'renew', description: '在当前话题创建并绑定新 Session' },
-  { name: 'history', description: '显示当前话题的 Session 历史' },
-  { name: 'export', description: '导出当前 Session 的逻辑日志' },
-]
+/** Commands registered inside each Agent scope (route-free ones are excluded). */
+const ALL_COMMANDS: readonly ChannelCommandSpec[] = CHANNEL_COMMANDS
+const AGENT_SCOPED_COMMANDS = ALL_COMMANDS.filter(spec => spec.agentScoped !== false)
+
+const DESCRIPTORS: ReadonlyArray<CommandDescriptor> = AGENT_SCOPED_COMMANDS.map(spec => ({
+  name: spec.name,
+  description: spec.description,
+  ...(spec.usage === undefined ? {} : { input: { hint: spec.usage } }),
+}))
 
 function pendingHandler(name: string): CommandDefinition['handler'] {
   return ({ rawInput }): CommandResult => {
@@ -136,9 +104,16 @@ type EffortOperation = (
   action: EffortCommandAction,
 ) => ReturnType<CommandDefinition['handler']>
 
+/** One armed `/model` execution: lists, validates, and switches models. */
+export type ModelOperation = (
+  invocation: Parameters<CommandDefinition['handler']>[0],
+  rawInput: string,
+) => ReturnType<CommandDefinition['handler']>
+
 /** Per-execution authority: handlers stay instance-neutral when an Agent is borrowed. */
 const RENEW_OPERATIONS = new WeakMap<AbortSignal, RenewOperation>()
 const EFFORT_OPERATIONS = new WeakMap<AbortSignal, EffortOperation>()
+const MODEL_OPERATIONS = new WeakMap<AbortSignal, ModelOperation>()
 
 function parseEffortAction(rawInput: string): EffortCommandAction | undefined {
   const value = rawInput.trim()
@@ -166,6 +141,23 @@ const effortHandler: CommandDefinition['handler'] = invocation => {
   return operation(invocation, action)
 }
 
+const modelHandler: CommandDefinition['handler'] = invocation => {
+  const rawInput = invocation.rawInput.trim()
+  if (/\s/u.test(rawInput)) {
+    return { kind: 'error', text: '用法错误：/model [模型-id|provider/model|reset]。' }
+  }
+  if (invocation.agent.status !== 'idle'
+    || invocation.agent.inbox.nextTurn.length > 0
+    || invocation.agent.inbox.nextStep.length > 0) {
+    return { kind: 'error', text: '当前 Session 正忙或仍有排队消息，暂时不能切换模型。' }
+  }
+  const operation = MODEL_OPERATIONS.get(invocation.signal)
+  if (operation === undefined) {
+    return { kind: 'error', text: '/model 只能通过已授权的飞书话题执行。' }
+  }
+  return operation(invocation, rawInput)
+}
+
 const renewHandler: CommandDefinition['handler'] = invocation => {
   if (invocation.rawInput.trim() !== '') {
     return { kind: 'error', text: '用法错误：/renew 不接受参数。' }
@@ -188,6 +180,7 @@ const READY_HANDLERS: Readonly<Record<string, CommandDefinition['handler']>> = {
   status: readyHandler('status', 'Session 状态已读取。'),
   workspace: readyHandler('workspace', '工作目录已读取。'),
   effort: effortHandler,
+  model: modelHandler,
   renew: renewHandler,
   history: readyHandler('history', 'Session 历史已读取。'),
   export: readyHandler('export', '导出已请求。'),
@@ -203,6 +196,18 @@ export function armRenewCommand(signal: AbortSignal, operation: RenewOperation):
 export function armEffortCommand(signal: AbortSignal, operation: EffortOperation): () => void {
   EFFORT_OPERATIONS.set(signal, operation)
   return () => { EFFORT_OPERATIONS.delete(signal) }
+}
+
+/** Arm exactly one Feishu-issued `/model` execution, then return its disarmer. */
+export function armModelCommand(signal: AbortSignal, operation: ModelOperation): () => void {
+  MODEL_OPERATIONS.set(signal, operation)
+  return () => { MODEL_OPERATIONS.delete(signal) }
+}
+
+/** Install only `/model` into a borrowed Agent scope that lacks channel commands. */
+export function registerModelCommand(commands: CommandRuntime): () => void {
+  const descriptor = DESCRIPTORS.find(entry => entry.name === 'model')!
+  return commands.register({ ...descriptor, handler: modelHandler })
 }
 
 /** Install only `/renew` into a borrowed Agent scope that lacks channel commands. */
@@ -326,5 +331,5 @@ export function buildCommandResultCard(state: CommandCardState): object {
     ].filter((value): value is string => value !== undefined).join(' · ')
     elements.push({ tag: 'markdown', content: trace, text_size: 'notation' })
   }
-  return { schema: '2.0', config: { width_mode: 'fill' }, body: { elements } }
+  return card(elements)
 }
