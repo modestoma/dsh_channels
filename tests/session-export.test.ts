@@ -7,14 +7,14 @@ import {
   LOGICAL_EXPORT_FORMAT_VERSION, serializeLogicalSession,
 } from '../src/session-export.ts'
 import type { SessionEvent } from '../src/dsh-types.ts'
-import { makeSession } from './helpers.ts'
+import { makeSession, sessionEvents } from './helpers.ts'
 
 const gunzipBuffer = promisify(gunzip)
 
 describe('logical Session export', () => {
   it('serializes a versioned manifest followed by unchanged logical events', () => {
     const session = makeSession('session-export', '/workspace/alice')
-    const events = session.events as unknown as SessionEvent[]
+    const events = sessionEvents(session) as unknown as SessionEvent[]
     events.push(
       { type: 'command/run', seq: 7, time: 100, data: {
         commandId: 'cmd-export', name: 'export', source: { kind: 'user' },
@@ -61,7 +61,7 @@ describe('logical Session export', () => {
 
   it('takes the JSONL snapshot before awaiting compression and surfaces compressor failures', async () => {
     const session = makeSession('session-snapshot')
-    const events = session.events as unknown as SessionEvent[]
+    const events = sessionEvents(session) as unknown as SessionEvent[]
     events.push({ type: 'turn/end', seq: 1, time: 1, data: { turn: 1, reason: 'complete' } } as SessionEvent)
     let compressedInput = ''
     const compress = vi.fn(async (source: Buffer) => {
@@ -83,7 +83,7 @@ describe('logical Session export', () => {
     const session = makeSession('session-circular')
     const data: Record<string, unknown> = {}
     data.self = data
-    ;(session.events as unknown as SessionEvent[]).push({
+    ;(sessionEvents(session) as unknown as SessionEvent[]).push({
       type: 'custom/event', seq: 1, time: 1, data,
     } as unknown as SessionEvent)
     expect(() => serializeLogicalSession(session)).toThrow()

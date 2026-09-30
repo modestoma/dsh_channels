@@ -9,7 +9,8 @@
  */
 
 import type {
-  LlmService, Session, SessionEvent, TokenMeter, TokenUsage,
+  AssistantStreamRecord, ContextPressureView, LlmService, Session, SessionEvent, SessionProjections, SessionStatsView,
+  TokenMeter, TokenUsage, TokenUsageView,
 } from './dsh-types.ts'
 
 export interface SessionTotals {
@@ -69,7 +70,6 @@ interface OpenStep {
   turn: number
   step: number
   startTime?: number
-  firstTokenTime?: number
 }
 
 interface PendingTool {
@@ -102,29 +102,45 @@ function eventTime(event: SessionEvent): number | undefined {
   return event.time !== undefined && Number.isFinite(event.time) ? event.time : undefined
 }
 
-function isTokenDelta(event: Extract<SessionEvent, { type: 'assistant/chunk' }>): boolean {
-  const chunk = event.data.chunk
-  switch (chunk.type) {
-    case 'text-delta':
-    case 'reasoning-delta':
-      return chunk.text !== ''
-    case 'tool-call-delta':
-      return chunk.argumentsDelta !== '' || chunk.name !== undefined
-    default:
-      return false
+/**
+ * First non-whitespace delta time inside one durable embedded assistant
+ * stream (`assistant/message.stream`). Local fallback for deployments where
+ * the host `sessionStats` projection is not mounted; the projection remains
+ * authoritative when present.
+ */
+function firstTokenTime(stream: readonly AssistantStreamRecord[] | undefined): number | undefined {
+  let best: number | undefined
+  for (const record of stream ?? []) {
+    const time0 = record.time0
+    if (typeof time0 !== 'number' || !Number.isFinite(time0)) continue
+    if (record.type !== 'text-chunks' && record.type !== 'reasoning-chunks') continue
+    const texts = record.texts
+    const hasVisible = Array.isArray(texts)
+      && texts.some(text => typeof text === 'string' && /\S/u.test(text))
+    if (hasVisible && (best === undefined || time0 < best)) best = time0
   }
+  return best
 }
 
+/**
+ * Authoritative call correlation and failure flag of one `tool/result`.
+ *
+ * DSH's `ToolResultMessage` is `{ role:'tool', source:{kind:'tool', callId},
+ * content, isError? }` and has no `tool-result` content-block type, so the
+ * message-level `source.callId` / `isError` decide; the first content block is
+ * only a legacy fallback.
+ */
 function toolResultCallId(event: Extract<SessionEvent, { type: 'tool/result' }>): string | undefined {
   const sourceId = event.data.message.source?.callId
   if (typeof sourceId === 'string' && sourceId !== '') return sourceId
-  const blockId = event.data.message.content?.find(block => block.type === 'tool-result')?.toolCallId
+  const blockId = event.data.message.content?.find(block => typeof block.toolCallId === 'string')?.toolCallId
   return typeof blockId === 'string' && blockId !== '' ? blockId : undefined
 }
 
 function toolResultFailed(event: Extract<SessionEvent, { type: 'tool/result' }>): boolean {
   if (event.data.error !== undefined) return true
-  return event.data.message.content?.some(block => block.type === 'tool-result' && block.isError === true) ?? false
+  if (event.data.message.isError === true) return true
+  return event.data.message.content?.some(block => block.isError === true) ?? false
 }
 
 function elapsed(start: number | undefined, end: number | undefined): number | undefined {
@@ -147,14 +163,6 @@ export function foldEvent(fold: StatsFold, event: SessionEvent): void {
         startTime: eventTime(event),
       }
       break
-    case 'assistant/chunk': {
-      const open = fold.openStep
-      if (open === undefined || open.firstTokenTime !== undefined
-        || open.turn !== event.data.turn || open.step !== event.data.step
-        || !isTokenDelta(event)) break
-      open.firstTokenTime = eventTime(event)
-      break
-    }
     case 'assistant/message': {
       const usage = event.data.usage
       if (usage !== undefined) {
@@ -170,14 +178,19 @@ export function foldEvent(fold: StatsFold, event: SessionEvent): void {
         fold.llmMs += llmDuration
         fold.llmSteps++
       }
-      if (open.firstTokenTime !== undefined) {
-        const ttft = elapsed(open.startTime, open.firstTokenTime)
+      // Live `assistant/chunk` events no longer exist; the first-token time is
+      // recovered from the durable embedded stream. The host `sessionStats`
+      // projection (overlaid by `applyProjectionViews`) is authoritative when
+      // mounted.
+      const firstToken = firstTokenTime(event.data.stream)
+      if (firstToken !== undefined) {
+        const ttft = elapsed(open.startTime, firstToken)
         if (ttft !== undefined) {
           fold.ttftMs += ttft
           fold.ttftSteps++
         }
         const outputTokens = usage?.outputTokens
-        const decodeDuration = elapsed(open.firstTokenTime, completedAt)
+        const decodeDuration = elapsed(firstToken, completedAt)
         if (decodeDuration !== undefined && outputTokens !== undefined
           && Number.isFinite(outputTokens) && outputTokens >= 0) {
           fold.decodeMs += decodeDuration
@@ -284,13 +297,154 @@ export interface ContextMeasurement {
 export interface ContextServices {
   tokenMeter?: TokenMeter
   llm?: LlmService
+  /** Optional projection registry; supplies the authoritative context window. */
+  projections?: SessionProjections
+}
+
+/** Projection readings for one session; every key is optional (unmounted unit). */
+export interface ProjectionViews {
+  sessionStats?: SessionStatsView
+  tokenUsage?: TokenUsageView
+  contextPressure?: ContextPressureView
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null ? value as Record<string, unknown> : undefined
+}
+
+function finiteNonNegative(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined
+}
+
+function positive(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined
+}
+
+/** Read the host projection units this plugin consumes, tolerating absence. */
+export function readProjectionViews(
+  projections: SessionProjections | undefined,
+  session: Session,
+): ProjectionViews {
+  if (projections === undefined) return {}
+  const views: ProjectionViews = {}
+  try {
+    const stats = asRecord(projections.stateOf(session, 'sessionStats'))
+    if (stats !== undefined) {
+      const parsed: SessionStatsView = {
+        turns: finiteNonNegative(stats.turns) ?? 0,
+        steps: finiteNonNegative(stats.steps) ?? 0,
+        llmMs: finiteNonNegative(stats.llmMs) ?? 0,
+        toolMs: finiteNonNegative(stats.toolMs) ?? 0,
+        ttftMs: finiteNonNegative(stats.ttftMs) ?? 0,
+        ttftSteps: finiteNonNegative(stats.ttftSteps) ?? 0,
+        decodeMs: finiteNonNegative(stats.decodeMs) ?? 0,
+        decodeTokens: finiteNonNegative(stats.decodeTokens) ?? 0,
+      }
+      views.sessionStats = parsed
+    }
+  } catch { /* a failing projection must never break the fold */ }
+  try {
+    const usage = asRecord(projections.stateOf(session, 'tokenUsage'))
+    const totals = asRecord(usage?.totals)
+    if (usage !== undefined && totals !== undefined) {
+      const buckets = (input: Record<string, unknown> | undefined) => ({
+        uncachedInputTokens: finiteNonNegative(input?.uncachedInputTokens) ?? 0,
+        outputTokens: finiteNonNegative(input?.outputTokens) ?? 0,
+        cacheReadTokens: finiteNonNegative(input?.cacheReadTokens) ?? 0,
+        cacheWriteTokens: finiteNonNegative(input?.cacheWriteTokens) ?? 0,
+      })
+      const last = asRecord(usage.last)
+      views.tokenUsage = {
+        totals: buckets(totals),
+        last: last === undefined
+          ? null
+          : {
+            turn: finiteNonNegative(last.turn) ?? 0,
+            step: finiteNonNegative(last.step) ?? 0,
+            buckets: buckets(asRecord(last.buckets)),
+          },
+      }
+    }
+  } catch { /* ignore malformed projection state */ }
+  try {
+    const pressure = asRecord(projections.stateOf(session, 'contextPressure'))
+    if (pressure !== undefined) {
+      views.contextPressure = {
+        ...(finiteNonNegative(pressure.pressureTokens) === undefined
+          ? {} : { pressureTokens: finiteNonNegative(pressure.pressureTokens) }),
+        ...(finiteNonNegative(pressure.projectedTokens) === undefined
+          ? {} : { projectedTokens: finiteNonNegative(pressure.projectedTokens) }),
+        ...(positive(pressure.contextWindow) === undefined
+          ? {} : { contextWindow: positive(pressure.contextWindow) }),
+      }
+    }
+  } catch { /* ignore malformed projection state */ }
+  return views
+}
+
+/** Map a projection token bucket into the plugin's usage vocabulary. */
+export function usageFromBuckets(buckets: TokenUsageView['totals']): TokenUsage {
+  return {
+    inputTokens: buckets.uncachedInputTokens,
+    outputTokens: buckets.outputTokens,
+    cacheReadTokens: buckets.cacheReadTokens,
+    cacheWriteTokens: buckets.cacheWriteTokens,
+  }
+}
+
+/**
+ * Overlay host projection figures onto a log fold. The host units are
+ * authoritative where mounted (they fold the same log, including the
+ * embedded streams the plugin no longer sees as live events); the log fold
+ * stays as the fallback and still owns tool-detail fields.
+ */
+export function applyProjectionViews(fold: StatsFold, views: ProjectionViews): StatsFold {
+  const stats = views.sessionStats
+  if (stats !== undefined) {
+    // Times are host-authoritative; counts (llmSteps / toolTimedCalls) stay
+    // with the fold, which sees the same boundaries.
+    fold.llmMs = stats.llmMs
+    fold.toolMs = stats.toolMs
+    fold.ttftMs = stats.ttftMs
+    fold.ttftSteps = stats.ttftSteps
+    fold.decodeMs = stats.decodeMs
+    fold.decodeTokens = stats.decodeTokens
+  }
+  const usage = views.tokenUsage
+  if (usage !== undefined) {
+    fold.totals = {
+      inputTokens: usage.totals.uncachedInputTokens,
+      outputTokens: usage.totals.outputTokens,
+      cacheReadTokens: usage.totals.cacheReadTokens,
+      cacheWriteTokens: usage.totals.cacheWriteTokens,
+      reasoningTokens: fold.totals.reasoningTokens,
+    }
+    if (usage.last !== null) {
+      fold.lastUsage = {
+        usage: usageFromBuckets(usage.last.buckets),
+        turn: usage.last.turn,
+        step: usage.last.step,
+      }
+      fold.usageSamples = Math.max(fold.usageSamples, 1)
+    }
+  }
+  return fold
+}
+
+/** Read one session's figures from the projection registry, falling back to the log fold. */
+export function foldSessionStats(
+  session: Session,
+  projections: SessionProjections | undefined,
+): StatsFold {
+  const fold = foldAll(session.snapshotEvents())
+  return applyProjectionViews(fold, readProjectionViews(projections, session))
 }
 
 /** Measure current surface pressure and resolve the latest model's context capacity. */
 export async function measureSessionContext(
   session: Session,
   services: ContextServices,
-  header = foldAll(session.events).lastHeader,
+  header = session.requestHeader?.()?.config ?? foldAll(session.snapshotEvents()).lastHeader,
 ): Promise<ContextMeasurement> {
   let contextTokens: number | undefined
   try {
@@ -301,7 +455,16 @@ export async function measureSessionContext(
   }
 
   let contextWindow: number | undefined
-  if (header !== undefined && header.provider !== '' && header.model !== '') {
+  if (services.projections !== undefined) {
+    try {
+      contextWindow = readProjectionViews(services.projections, session).contextPressure?.contextWindow
+    } catch {
+      contextWindow = undefined
+    }
+  }
+  if (contextWindow === undefined && header !== undefined
+    && typeof header.provider === 'string' && header.provider !== ''
+    && typeof header.model === 'string' && header.model !== '') {
     try {
       const resolved = await services.llm?.resolveModelInfo(header.provider, header.model)
       const window = resolved?.context?.contextWindow

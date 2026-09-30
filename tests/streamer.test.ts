@@ -7,12 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { TurnStreamer } from '../src/streamer.ts'
 import type { Session, SessionEvent, SessionId } from '../src/dsh-types.ts'
 import type { FeishuChannel } from '../src/feishu-channel.ts'
-import { makeSession } from './helpers.ts'
-
-function chunkEvent(sessionId: SessionId, type: SessionEvent['type'], data: SessionEvent['data'], seq = 1): { session: Session; event: SessionEvent } {
-  const session = makeSession(sessionId)
-  return { session, event: { type, data, seq } as SessionEvent }
-}
+import { makeSession, sessionEvents } from './helpers.ts'
 
 function channel(): FeishuChannel & { updated: Array<{ messageId: string; card: object }> } {
   const updated: Array<{ messageId: string; card: object }> = []
@@ -30,6 +25,7 @@ function channel(): FeishuChannel & { updated: Array<{ messageId: string; card: 
     addReaction: vi.fn(async () => 'react-1'),
     removeReaction: vi.fn(async () => {}),
     threadIdOfMessage: vi.fn(async () => undefined),
+    downloadResource: vi.fn(async () => ({ data: new Uint8Array(), mediaType: undefined })),
     updated,
   }
 }
@@ -71,11 +67,8 @@ describe('TurnStreamer', () => {
     streamer.attach(session, 'om_card', 'om_trigger', 'react-typing')
 
     // First mark: patch fires after the 500 ms throttle.
-    streamer.onSessionEvent(session, {
-      type: 'assistant/chunk',
-      seq: 1,
-      data: { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: '你好' } },
-    })
+    streamer.onAssistantFrame(session, { type: 'start', attemptId: 'attempt-1', revision: 1, turn: 1, step: 1 })
+    streamer.onAssistantFrame(session, { type: 'chunk', attemptId: 'attempt-1', revision: 1, index: 0, time: 1, chunk: { type: 'text-delta', index: 0, text: '你好' } })
     expect(ch.updated.length).toBe(0)
 
     await vi.advanceTimersByTimeAsync(499)
@@ -86,11 +79,8 @@ describe('TurnStreamer', () => {
     expect(markdownOf(ch.updated[0]!.card, 0)).toContain('你好')
 
     // Subsequent deltas in the same window coalesce into one patch.
-    streamer.onSessionEvent(session, {
-      type: 'assistant/chunk',
-      seq: 2,
-      data: { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: '，世界' } },
-    })
+    streamer.onAssistantFrame(session, { type: 'start', attemptId: 'attempt-1', revision: 1, turn: 1, step: 1 })
+    streamer.onAssistantFrame(session, { type: 'chunk', attemptId: 'attempt-1', revision: 1, index: 0, time: 1, chunk: { type: 'text-delta', index: 0, text: '，世界' } })
     await vi.advanceTimersByTimeAsync(500)
     expect(ch.updated.length).toBe(2)
     expect(markdownOf(ch.updated[1]!.card, 0)).toContain('你好，世界')
@@ -102,16 +92,10 @@ describe('TurnStreamer', () => {
     const session = makeSession('sess-reason')
     streamer.attach(session, 'om_card', 'om_trigger', undefined)
 
-    streamer.onSessionEvent(session, {
-      type: 'assistant/chunk',
-      seq: 1,
-      data: { turn: 1, step: 1, chunk: { type: 'reasoning-delta', index: 0, text: '先想想' } },
-    })
-    streamer.onSessionEvent(session, {
-      type: 'assistant/chunk',
-      seq: 2,
-      data: { turn: 1, step: 1, chunk: { type: 'text-delta', index: 1, text: '答' } },
-    })
+    streamer.onAssistantFrame(session, { type: 'start', attemptId: 'attempt-1', revision: 1, turn: 1, step: 1 })
+    streamer.onAssistantFrame(session, { type: 'chunk', attemptId: 'attempt-1', revision: 1, index: 0, time: 1, chunk: { type: 'reasoning-delta', index: 0, text: '先想想' } })
+    streamer.onAssistantFrame(session, { type: 'start', attemptId: 'attempt-1', revision: 1, turn: 1, step: 1 })
+    streamer.onAssistantFrame(session, { type: 'chunk', attemptId: 'attempt-1', revision: 1, index: 0, time: 1, chunk: { type: 'text-delta', index: 1, text: '答' } })
     await vi.advanceTimersByTimeAsync(500)
 
     const card = ch.updated[0]!.card as {
@@ -136,10 +120,8 @@ describe('TurnStreamer', () => {
     streamer.onSessionEvent(session, {
       type: 'step/start', seq: 1, data: { turn: 1, step: 1 },
     })
-    streamer.onSessionEvent(session, {
-      type: 'assistant/chunk', seq: 2,
-      data: { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: '完整回答' } },
-    })
+    streamer.onAssistantFrame(session, { type: 'start', attemptId: 'attempt-1', revision: 1, turn: 1, step: 1 })
+    streamer.onAssistantFrame(session, { type: 'chunk', attemptId: 'attempt-1', revision: 1, index: 0, time: 1, chunk: { type: 'text-delta', index: 0, text: '完整回答' } })
     streamer.onSessionEvent(session, {
       type: 'assistant/message', seq: 3,
       data: { turn: 1, step: 1, message: {}, usage: { inputTokens: 10, outputTokens: 5 } },
@@ -183,7 +165,7 @@ describe('TurnStreamer', () => {
     const session = makeSession('sess-failed')
     // The preceding turn succeeded with high. The new turn fails before it can
     // emit request/header or usage, so none of these samples belong to it.
-    ;(session.events as SessionEvent[]).push(
+    ;(sessionEvents(session) as SessionEvent[]).push(
       {
         type: 'request/header',
         seq: 1,
@@ -248,7 +230,7 @@ describe('TurnStreamer', () => {
     const streamer = new TurnStreamer(ch, 500, hooks())
     const session = makeSession('sess-cum')
     // Historical usage already in the log before attach.
-    ;(session.events as SessionEvent[]).push(
+    ;(sessionEvents(session) as SessionEvent[]).push(
       { type: 'assistant/message', seq: 1, data: { turn: 1, step: 1, message: {}, usage: { inputTokens: 100, outputTokens: 40 } } },
     )
     streamer.attach(session, 'om_card', 'om_trigger', undefined)
@@ -274,10 +256,8 @@ describe('TurnStreamer', () => {
     streamer.attach(session, 'om_card', 'om_trigger', undefined)
 
     const huge = 'x'.repeat(30_000)
-    streamer.onSessionEvent(session, {
-      type: 'assistant/chunk', seq: 1,
-      data: { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: huge } },
-    })
+    streamer.onAssistantFrame(session, { type: 'start', attemptId: 'attempt-1', revision: 1, turn: 1, step: 1 })
+    streamer.onAssistantFrame(session, { type: 'chunk', attemptId: 'attempt-1', revision: 1, index: 0, time: 1, chunk: { type: 'text-delta', index: 0, text: huge } })
 
     // First flush: split + continuation send issued.
     await vi.advanceTimersByTimeAsync(500)
@@ -305,10 +285,8 @@ describe('TurnStreamer', () => {
     const session = makeSession('sess-seg-done')
     streamer.attach(session, 'om_card', 'om_trigger', undefined)
 
-    streamer.onSessionEvent(session, {
-      type: 'assistant/chunk', seq: 1,
-      data: { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: 'x'.repeat(30_000) } },
-    })
+    streamer.onAssistantFrame(session, { type: 'start', attemptId: 'attempt-1', revision: 1, turn: 1, step: 1 })
+    streamer.onAssistantFrame(session, { type: 'chunk', attemptId: 'attempt-1', revision: 1, index: 0, time: 1, chunk: { type: 'text-delta', index: 0, text: 'x'.repeat(30_000) } })
     streamer.onSessionEvent(session, { type: 'turn/end', seq: 2, data: { turn: 1, reason: 'stop' } })
     await vi.advanceTimersByTimeAsync(500)
     await vi.advanceTimersByTimeAsync(500)
@@ -335,10 +313,8 @@ describe('TurnStreamer', () => {
     const table = (n: number) => `| 列${n} | 值 |\n| --- | --- |\n| 行 | ${n} |`
     const tables = Array.from({ length: 7 }, (_, i) => table(i + 1)).join('\n\n')
     const body = `开头\n\n${tables}\n\n结尾`
-    streamer.onSessionEvent(session, {
-      type: 'assistant/chunk', seq: 1,
-      data: { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: body } },
-    })
+    streamer.onAssistantFrame(session, { type: 'start', attemptId: 'attempt-1', revision: 1, turn: 1, step: 1 })
+    streamer.onAssistantFrame(session, { type: 'chunk', attemptId: 'attempt-1', revision: 1, index: 0, time: 1, chunk: { type: 'text-delta', index: 0, text: body } })
     streamer.onSessionEvent(session, { type: 'turn/end', seq: 2, data: { turn: 1, reason: 'stop' } })
     await vi.advanceTimersByTimeAsync(500)
     await vi.advanceTimersByTimeAsync(500)
@@ -370,10 +346,8 @@ describe('TurnStreamer', () => {
     const session = makeSession('sess-segdelivery')
     streamer.attach(session, 'om_main', 'om_trigger', undefined)
 
-    streamer.onSessionEvent(session, {
-      type: 'assistant/chunk', seq: 1,
-      data: { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: 'x'.repeat(30_000) } },
-    })
+    streamer.onAssistantFrame(session, { type: 'start', attemptId: 'attempt-1', revision: 1, turn: 1, step: 1 })
+    streamer.onAssistantFrame(session, { type: 'chunk', attemptId: 'attempt-1', revision: 1, index: 0, time: 1, chunk: { type: 'text-delta', index: 0, text: 'x'.repeat(30_000) } })
     await vi.advanceTimersByTimeAsync(500)
     await vi.waitFor(() => {
       expect(hooksInstance.onSegmentDelivered).toHaveBeenCalledWith('om_main', 1, 'om_seg_2', 'card')
@@ -390,10 +364,8 @@ describe('TurnStreamer', () => {
     const session = makeSession('sess-textmode')
     streamer.attach(session, 'om_card', 'om_trigger', undefined)
 
-    streamer.onSessionEvent(session, {
-      type: 'assistant/chunk', seq: 1,
-      data: { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: 'x'.repeat(30_000) } },
-    })
+    streamer.onAssistantFrame(session, { type: 'start', attemptId: 'attempt-1', revision: 1, turn: 1, step: 1 })
+    streamer.onAssistantFrame(session, { type: 'chunk', attemptId: 'attempt-1', revision: 1, index: 0, time: 1, chunk: { type: 'text-delta', index: 0, text: 'x'.repeat(30_000) } })
     await vi.advanceTimersByTimeAsync(500)
 
     // One segment delivered as plain text (fallback).
@@ -404,10 +376,8 @@ describe('TurnStreamer', () => {
 
     // More text arrives after the text-fallback delivery: it must NOT be lost
     // (it flows into a fresh segment card, never into the finished text one).
-    streamer.onSessionEvent(session, {
-      type: 'assistant/chunk', seq: 2,
-      data: { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: '后续内容' } },
-    })
+    streamer.onAssistantFrame(session, { type: 'start', attemptId: 'attempt-1', revision: 1, turn: 1, step: 1 })
+    streamer.onAssistantFrame(session, { type: 'chunk', attemptId: 'attempt-1', revision: 1, index: 0, time: 1, chunk: { type: 'text-delta', index: 0, text: '后续内容' } })
     await vi.advanceTimersByTimeAsync(500)
 
     // The follow-up content triggered its own segment send (card attempt).
@@ -428,10 +398,8 @@ describe('TurnStreamer', () => {
     // Stream deltas for ~10 s; the rejected card must be retried at most a
     // handful of times (backoff), never once per flush.
     for (let i = 0; i < 20; i++) {
-      streamer.onSessionEvent(session, {
-        type: 'assistant/chunk', seq: i + 1,
-        data: { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: `行${i}\n` } },
-      })
+      streamer.onAssistantFrame(session, { type: 'start', attemptId: 'attempt-1', revision: 1, turn: 1, step: 1 })
+    streamer.onAssistantFrame(session, { type: 'chunk', attemptId: 'attempt-1', revision: 1, index: 0, time: 1, chunk: { type: 'text-delta', index: 0, text: `行${i}\n` } })
       await vi.advanceTimersByTimeAsync(500)
     }
     const attempts = (ch.updateCard as unknown as ReturnType<typeof vi.fn>).mock.calls.length
@@ -450,10 +418,8 @@ describe('TurnStreamer', () => {
     const streamer = new TurnStreamer(ch, 500, hooksInstance)
     const session = makeSession('sess-sendfail')
     streamer.attach(session, 'om_card', 'om_trigger', undefined)
-    streamer.onSessionEvent(session, {
-      type: 'assistant/chunk', seq: 1,
-      data: { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: 'x'.repeat(30_000) } },
-    })
+    streamer.onAssistantFrame(session, { type: 'start', attemptId: 'attempt-1', revision: 1, turn: 1, step: 1 })
+    streamer.onAssistantFrame(session, { type: 'chunk', attemptId: 'attempt-1', revision: 1, index: 0, time: 1, chunk: { type: 'text-delta', index: 0, text: 'x'.repeat(30_000) } })
     await vi.advanceTimersByTimeAsync(500)
     // Retry backoffs: 1s + 2s.
     await vi.advanceTimersByTimeAsync(1_000)
@@ -572,10 +538,8 @@ describe('TurnStreamer activity status + keep-alive', () => {
       type: 'tool/result', seq: 7,
       data: { turn: 1, step: 2, message: { type: 'text', text: 'ok' } },
     })
-    streamer.onSessionEvent(session, {
-      type: 'assistant/chunk', seq: 8,
-      data: { turn: 1, step: 2, chunk: { type: 'text-delta', index: 0, text: '结论' } },
-    })
+    streamer.onAssistantFrame(session, { type: 'start', attemptId: 'attempt-1', revision: 1, turn: 1, step: 2 })
+    streamer.onAssistantFrame(session, { type: 'chunk', attemptId: 'attempt-1', revision: 1, index: 0, time: 1, chunk: { type: 'text-delta', index: 0, text: '结论' } })
     await vi.advanceTimersByTimeAsync(500)
     expect(markdownLines(headCard(ch))[0]).toContain('工作流 audit 结束（完成）')
     expect(markdownLines(headCard(ch)).join('\n')).not.toContain('调用工具')
@@ -663,10 +627,8 @@ describe('TurnStreamer activity status + keep-alive', () => {
     await vi.advanceTimersByTimeAsync(500)
     expect(markdownLines(headCard(ch))[0]).toContain('⏳ 处理中')
 
-    streamer.onSessionEvent(session, {
-      type: 'assistant/chunk', seq: 1,
-      data: { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: '答案' } },
-    })
+    streamer.onAssistantFrame(session, { type: 'start', attemptId: 'attempt-1', revision: 1, turn: 1, step: 1 })
+    streamer.onAssistantFrame(session, { type: 'chunk', attemptId: 'attempt-1', revision: 1, index: 0, time: 1, chunk: { type: 'text-delta', index: 0, text: '答案' } })
     streamer.onSessionEvent(session, { type: 'turn/end', seq: 2, data: { turn: 1, reason: 'stop' } })
     await vi.advanceTimersByTimeAsync(500)
 
@@ -700,7 +662,8 @@ describe('TurnStreamer subagent child folding', () => {
       },
       events: [],
       firstLiveSeq: 0,
-    }
+      snapshotEvents: () => [],
+    } as unknown as Session
   }
 
   function markdownLines(card: object): string[] {
@@ -786,10 +749,8 @@ describe('TurnStreamer subagent child folding', () => {
       type: 'tool/result', seq: 3,
       data: { turn: 1, step: 1, message: { type: 'text', text: 'done' } },
     })
-    streamer.onSessionEvent(session, {
-      type: 'assistant/chunk', seq: 4,
-      data: { turn: 1, step: 2, chunk: { type: 'text-delta', index: 0, text: '答案' } },
-    })
+    streamer.onAssistantFrame(session, { type: 'start', attemptId: 'attempt-1', revision: 1, turn: 1, step: 2 })
+    streamer.onAssistantFrame(session, { type: 'chunk', attemptId: 'attempt-1', revision: 1, index: 0, time: 1, chunk: { type: 'text-delta', index: 0, text: '答案' } })
     streamer.onSessionEvent(session, { type: 'turn/end', seq: 5, data: { turn: 1, reason: 'stop' } })
     await vi.advanceTimersByTimeAsync(0)
 
@@ -868,10 +829,8 @@ describe('TurnStreamer subagent child folding', () => {
     streamer.attach(session, 'om_card', 'om_trigger', undefined)
 
     // Seed one patch so the card state is observable.
-    streamer.onSessionEvent(session, {
-      type: 'assistant/chunk', seq: 1,
-      data: { turn: 1, step: 1, chunk: { type: 'reasoning-delta', index: 0, text: '想' } },
-    })
+    streamer.onAssistantFrame(session, { type: 'start', attemptId: 'attempt-1', revision: 1, turn: 1, step: 1 })
+    streamer.onAssistantFrame(session, { type: 'chunk', attemptId: 'attempt-1', revision: 1, index: 0, time: 1, chunk: { type: 'reasoning-delta', index: 0, text: '想' } })
     await vi.advanceTimersByTimeAsync(500)
     expect(activity(ch)).toContain('⏳ 处理中')
 
@@ -883,5 +842,111 @@ describe('TurnStreamer subagent child folding', () => {
     })
     await vi.advanceTimersByTimeAsync(500)
     expect(activity(ch)).not.toContain('子代理')
+  })
+})
+
+describe('TurnStreamer live assistant frames', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('streams text and reasoning deltas from agent/assistant-stream frames', async () => {
+    const ch = channel()
+    const streamer = new TurnStreamer(ch, 500, hooks())
+    const session = makeSession('sess-live')
+    streamer.attach(session, 'om_card', 'om_trigger', 'react-typing')
+
+    streamer.onAssistantFrame(session, { type: 'start', attemptId: 'a1', revision: 1, turn: 1, step: 1 })
+    streamer.onAssistantFrame(session, {
+      type: 'chunk', attemptId: 'a1', revision: 1, index: 0, time: 1,
+      chunk: { type: 'text-delta', index: 0, text: '你好' },
+    })
+    streamer.onAssistantFrame(session, {
+      type: 'chunk', attemptId: 'a1', revision: 1, index: 1, time: 2,
+      chunk: { type: 'reasoning-delta', index: 0, text: '先想想' },
+    })
+    await vi.advanceTimersByTimeAsync(500)
+
+    expect(ch.updated.length).toBe(1)
+    expect(markdownOf(ch.updated[0]!.card, 0)).toContain('你好')
+    const card = ch.updated[0]!.card as {
+      body: { elements: [{ header: { title: { content: string } }; elements: Array<{ content: string }> }] }
+    }
+    expect(card.body.elements[0].header.title.content).toBe('回复中')
+    expect(card.body.elements[0].elements[0]?.content).toContain('先想想')
+  })
+
+  it('rolls back an abandoned attempt and keeps a committed one', async () => {
+    const ch = channel()
+    const streamer = new TurnStreamer(ch, 500, hooks())
+    const session = makeSession('sess-rollback')
+    streamer.attach(session, 'om_card', 'om_trigger', undefined)
+
+    // Attempt 1 streams text, then abandons (retry / stream error): none of it
+    // is model-visible history, so the card must drop it again.
+    streamer.onAssistantFrame(session, { type: 'start', attemptId: 'a1', revision: 1, turn: 1, step: 1 })
+    streamer.onAssistantFrame(session, {
+      type: 'chunk', attemptId: 'a1', revision: 1, index: 0, time: 1,
+      chunk: { type: 'text-delta', index: 0, text: '坏答案' },
+    })
+    streamer.onAssistantFrame(session, {
+      type: 'chunk', attemptId: 'a1', revision: 1, index: 1, time: 2,
+      chunk: { type: 'reasoning-delta', index: 0, text: '坏推理' },
+    })
+    await vi.advanceTimersByTimeAsync(500)
+    expect(markdownOf(ch.updated.at(-1)!.card, 0)).toContain('坏答案')
+
+    streamer.onAssistantFrame(session, {
+      type: 'end', attemptId: 'a1', revision: 1, index: 2, outcome: { kind: 'abandoned' },
+    })
+    await vi.advanceTimersByTimeAsync(500)
+    const rolledBack = ch.updated.at(-1)!.card as {
+      body: { elements: [{ elements: Array<{ content: string }> }, { content: string }] }
+    }
+    expect(JSON.stringify(rolledBack)).not.toContain('坏答案')
+    expect(JSON.stringify(rolledBack)).not.toContain('坏推理')
+
+    // Attempt 2 commits: its text stays.
+    streamer.onAssistantFrame(session, { type: 'start', attemptId: 'a2', revision: 2, turn: 1, step: 1 })
+    streamer.onAssistantFrame(session, {
+      type: 'chunk', attemptId: 'a2', revision: 2, index: 0, time: 3,
+      chunk: { type: 'text-delta', index: 0, text: '好答案' },
+    })
+    streamer.onAssistantFrame(session, {
+      type: 'end', attemptId: 'a2', revision: 2, index: 1,
+      outcome: { kind: 'committed', eventType: 'assistant/message', seq: 9 },
+    })
+    await vi.advanceTimersByTimeAsync(500)
+    expect(markdownOf(ch.updated.at(-1)!.card, 0)).toContain('好答案')
+  })
+
+  it('prefers host projection figures for tokens, cache and window', async () => {
+    const ch = channel()
+    const hooksInstance = hooks()
+    const streamer = new TurnStreamer(ch, 500, {
+      ...hooksInstance,
+      projectStats: () => ({ inputTokens: 111, outputTokens: 22, cacheHitPct: 0.5, contextWindow: 64_000 }),
+    })
+    const session = makeSession('sess-projected')
+    streamer.attach(session, 'om_card', 'om_trigger', undefined)
+    streamer.onSessionEvent(session, {
+      type: 'request/header', seq: 1,
+      data: { header: { config: { provider: 'p', model: 'm' } } },
+    })
+    streamer.onAssistantFrame(session, { type: 'start', attemptId: 'a1', revision: 1, turn: 1, step: 1 })
+    streamer.onAssistantFrame(session, {
+      type: 'chunk', attemptId: 'a1', revision: 1, index: 0, time: 1,
+      chunk: { type: 'text-delta', index: 0, text: 'hi' },
+    })
+    await vi.advanceTimersByTimeAsync(500)
+
+    const json = JSON.stringify(ch.updated.at(-1)!.card)
+    expect(json).toContain('111')
+    expect(json).toContain('22')
+    expect(json).toContain('64,000')
   })
 })

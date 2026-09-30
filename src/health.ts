@@ -11,6 +11,7 @@
 import { CordisFiberState } from './dsh-types.ts'
 import type { CordisFiber } from './dsh-types.ts'
 import type { FeishuConnectionStatus } from './feishu-channel.ts'
+import { standaloneCard } from './cards/primitives.ts'
 
 export const HEALTH_DEPENDENCY_NAMES = [
   'agents',
@@ -124,28 +125,21 @@ export function buildHealthCard(snapshot: HealthSnapshot): object {
   const connection = snapshot.connection
   const connectionState = connection?.state ?? 'unknown'
 
-  return {
-    schema: '2.0',
-    config: { width_mode: 'fill' },
-    body: {
-      elements: [
-        { tag: 'markdown', content: `**${presentation.icon} 健康检查 · ${presentation.title}**` },
-        { tag: 'markdown', content: `整体结论：**${snapshot.level}**` },
-        { tag: 'hr' },
-        {
-          tag: 'markdown',
-          content: `**Harness fibers**\nactive ${snapshot.fibers.active} · pending ${snapshot.fibers.pending} · loading ${snapshot.fibers.loading} · failed ${snapshot.fibers.failed} · unloading ${snapshot.fibers.unloading}`,
-        },
-        { tag: 'markdown', content: `**关键依赖**\n${dependencyLine}` },
-        {
-          tag: 'markdown',
-          content: `**飞书 WebSocket**\n${connectionState} · 最近连接 ${formatTimestamp(connection?.lastConnectTime)} · 下次重连 ${formatTimestamp(connection?.nextConnectTime)} · 重连次数 ${connection?.reconnectAttempts ?? 0} · bot open_id ${snapshot.botOpenIdTail ?? '—'}`,
-        },
-        {
-          tag: 'markdown',
-          content: `**dsh-channels**\n${snapshot.started ? 'started' : 'stopped'} · 持久化路由 ${snapshot.routeCount} · live Agent ${snapshot.liveAgentCount} · in-flight turn ${snapshot.inflightTurnCount}`,
-        },
-      ],
+  return standaloneCard(`**${presentation.icon} 健康检查 · ${presentation.title}**`, [
+    { tag: 'markdown', content: `整体结论：**${snapshot.level}**` },
+    { tag: 'hr' },
+    {
+      tag: 'markdown',
+      content: `**Harness fibers**\nactive ${snapshot.fibers.active} · pending ${snapshot.fibers.pending} · loading ${snapshot.fibers.loading} · failed ${snapshot.fibers.failed} · unloading ${snapshot.fibers.unloading}`,
     },
-  }
+    { tag: 'markdown', content: `**关键依赖**\n${dependencyLine}` },
+    {
+      tag: 'markdown',
+      content: `**飞书 WebSocket**\n${connectionState} · 最近连接 ${formatTimestamp(connection?.lastConnectTime)} · 下次重连 ${formatTimestamp(connection?.nextConnectTime)} · 重连次数 ${connection?.reconnectAttempts ?? 0} · bot open_id ${snapshot.botOpenIdTail ?? '—'}`,
+    },
+    {
+      tag: 'markdown',
+      content: `**dsh-channels**\n${snapshot.started ? 'started' : 'stopped'} · 持久化路由 ${snapshot.routeCount} · live Agent ${snapshot.liveAgentCount} · in-flight turn ${snapshot.inflightTurnCount}`,
+    },
+  ])
 }

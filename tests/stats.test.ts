@@ -2,11 +2,11 @@
 
 import { describe, expect, it, vi } from 'vitest'
 import {
-  EMPTY_TOTALS, addUsage, averageDecodeTokensPerSecond, averageTtftMs,
-  cacheHitPct, foldAll, measureSessionContext,
+  EMPTY_TOTALS, addUsage, applyProjectionViews, averageDecodeTokensPerSecond, averageTtftMs,
+  cacheHitPct, foldAll, measureSessionContext, readProjectionViews, usageFromBuckets,
 } from '../src/stats.ts'
-import type { Session, SessionEvent, TokenUsage } from '../src/dsh-types.ts'
-import { makeSession } from './helpers.ts'
+import type { SessionEvent, SessionProjections, TokenUsage } from '../src/dsh-types.ts'
+import { makeSession, sessionEvents } from './helpers.ts'
 
 let seq = 0
 function at(time: number, type: string, data: unknown): SessionEvent {
@@ -55,15 +55,18 @@ describe('stats folds', () => {
   it('uses the whole-log LLM, TTFT, and decode timing definitions across steps', () => {
     const fold = foldAll([
       at(1_000, 'step/start', { turn: 1, step: 1 }),
-      at(1_800, 'assistant/chunk', { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: 'a' } }),
       at(4_800, 'assistant/message', {
-        turn: 1, step: 1, message: {}, usage: { inputTokens: 10, outputTokens: 60 },
+        turn: 1, step: 1, message: {},
+        // The settlement embeds the timed stream; time0 is the first token.
+        stream: [{ type: 'text-chunks', time0: 1_800, index: 0, dt: [], texts: ['a'] }],
+        usage: { inputTokens: 10, outputTokens: 60 },
       }),
       at(4_900, 'step/end', { turn: 1, step: 1 }),
       at(5_000, 'step/start', { turn: 1, step: 2 }),
-      at(5_500, 'assistant/chunk', { turn: 1, step: 2, chunk: { type: 'reasoning-delta', index: 0, text: 'x' } }),
       at(6_500, 'assistant/message', {
-        turn: 1, step: 2, message: {}, usage: { inputTokens: 5, outputTokens: 20 },
+        turn: 1, step: 2, message: {},
+        stream: [{ type: 'reasoning-chunks', time0: 5_500, index: 0, dt: [], texts: ['x'] }],
+        usage: { inputTokens: 5, outputTokens: 20 },
       }),
       at(6_600, 'step/end', { turn: 1, step: 2 }),
     ])
@@ -82,7 +85,11 @@ describe('stats folds', () => {
   it('counts failed/cancelled steps without fabricating timing or usage samples', () => {
     const fold = foldAll([
       at(1_000, 'step/start', { turn: 1, step: 1 }),
-      at(1_300, 'assistant/chunk', { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: 'partial' } }),
+      // A cancelled step settles as `assistant/attempt` (no surface message).
+      at(1_300, 'assistant/attempt', {
+        turn: 1, step: 1,
+        stream: [{ type: 'text-chunks', time0: 1_200, index: 0, dt: [], texts: ['partial'] }],
+      }),
       at(2_000, 'step/end', { turn: 1, step: 1 }),
       at(2_100, 'turn/end', { turn: 1, reason: 'cancelled' }),
     ])
@@ -144,10 +151,8 @@ describe('stats folds', () => {
   })
 
   it('measures tokens and model capacity while containing unavailable peers', async () => {
-    const session = {
-      ...makeSession('session-context'),
-      events: [headerEvent('provider', 'model')],
-    } satisfies Session
+    const session = makeSession('session-context')
+    sessionEvents(session).push(headerEvent('provider', 'model'))
     const tokenMeter = { measure: vi.fn(() => ({ totalTokens: 9_984 })) }
     const llm = { resolveModelInfo: vi.fn(async () => ({ context: { contextWindow: 128_000 } })) }
     await expect(measureSessionContext(session, { tokenMeter, llm })).resolves.toEqual({
@@ -169,5 +174,87 @@ describe('stats folds', () => {
     expect(addUsage(EMPTY_TOTALS, {
       inputTokens: Number.NaN, outputTokens: -2, cacheReadTokens: 7,
     })).toEqual({ ...EMPTY_TOTALS, cacheReadTokens: 7 })
+  })
+})
+
+describe('host projection overlay', () => {
+  function projectionsFor(states: Record<string, unknown>): SessionProjections {
+    return { stateOf: (_session, key) => states[key] }
+  }
+
+  it('maps host projection state and tolerates malformed/unavailable units', () => {
+    const session = makeSession('session-proj')
+    const views = readProjectionViews(projectionsFor({
+      sessionStats: {
+        turns: 2, steps: 3, llmMs: 1_500, toolMs: 200,
+        ttftMs: 300, ttftSteps: 2, decodeMs: 900, decodeTokens: 40,
+      },
+      tokenUsage: {
+        totals: { uncachedInputTokens: 4_242, outputTokens: 777, cacheReadTokens: 100, cacheWriteTokens: 7 },
+        last: { turn: 2, step: 1, buckets: { uncachedInputTokens: 42, outputTokens: 7, cacheReadTokens: 3, cacheWriteTokens: 0 } },
+      },
+      contextPressure: { contextWindow: 64_000, projectedTokens: 1_000 },
+    }), session)
+    expect(views.sessionStats).toMatchObject({ llmMs: 1_500, ttftSteps: 2, decodeTokens: 40 })
+    expect(views.tokenUsage?.totals.uncachedInputTokens).toBe(4_242)
+    expect(views.tokenUsage?.last?.turn).toBe(2)
+    expect(views.contextPressure?.contextWindow).toBe(64_000)
+
+    // A throwing registry never breaks the fold; garbage values degrade to 0.
+    expect(readProjectionViews({
+      stateOf: () => { throw new Error('projection unavailable') },
+    }, session)).toEqual({})
+    const malformed = readProjectionViews(projectionsFor({
+      tokenUsage: { totals: { uncachedInputTokens: 'nope' }, last: null },
+    }), session)
+    expect(malformed.tokenUsage?.totals.uncachedInputTokens).toBe(0)
+  })
+
+  it('overlays host times and totals onto the log fold', () => {
+    const fold = foldAll([
+      at(1_000, 'step/start', { turn: 1, step: 1 }),
+      at(2_000, 'assistant/message', {
+        turn: 1, step: 1, message: {}, usage: { inputTokens: 5, outputTokens: 6, cacheReadTokens: 1 },
+      }),
+    ])
+    expect(fold.llmMs).toBe(1_000)
+    const overlaid = applyProjectionViews(fold, {
+      sessionStats: {
+        turns: 1, steps: 1, llmMs: 4_321, toolMs: 55,
+        ttftMs: 111, ttftSteps: 1, decodeMs: 222, decodeTokens: 33,
+      },
+      tokenUsage: {
+        totals: { uncachedInputTokens: 90, outputTokens: 9, cacheReadTokens: 10, cacheWriteTokens: 1 },
+        last: { turn: 1, step: 1, buckets: { uncachedInputTokens: 90, outputTokens: 9, cacheReadTokens: 10, cacheWriteTokens: 1 } },
+      },
+    })
+    expect(overlaid.llmMs).toBe(4_321)
+    expect(overlaid.toolMs).toBe(55)
+    expect(overlaid.ttftMs).toBe(111)
+    expect(overlaid.decodeTokens).toBe(33)
+    expect(overlaid.totals).toMatchObject({ inputTokens: 90, outputTokens: 9, cacheReadTokens: 10 })
+    expect(usageFromBuckets({ uncachedInputTokens: 90, outputTokens: 9, cacheReadTokens: 10, cacheWriteTokens: 1 }))
+      .toMatchObject({ inputTokens: 90, cacheReadTokens: 10 })
+    expect(overlaid.lastUsage?.turn).toBe(1)
+  })
+
+  it('prefers the projected context window over the model-info lookup', async () => {
+    const session = makeSession('session-window')
+    const llm = { resolveModelInfo: vi.fn(async () => ({ context: { contextWindow: 128_000 } })) }
+    const tokenMeter = { measure: () => ({ totalTokens: 1_234 }) }
+    await expect(measureSessionContext(
+      session,
+      { tokenMeter, llm, projections: projectionsFor({ contextPressure: { contextWindow: 32_000 } }) },
+      { provider: 'p', model: 'm', effort: undefined },
+    )).resolves.toEqual({ contextTokens: 1_234, contextWindow: 32_000 })
+    expect(llm.resolveModelInfo).not.toHaveBeenCalled()
+
+    // Without the projection the fallback lookup still works (deployments
+    // without the token-meter projections must not regress).
+    await expect(measureSessionContext(
+      session,
+      { tokenMeter, llm },
+      { provider: 'p', model: 'm', effort: undefined },
+    )).resolves.toEqual({ contextTokens: 1_234, contextWindow: 128_000 })
   })
 })

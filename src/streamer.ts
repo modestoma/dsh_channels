@@ -37,7 +37,7 @@
  * @module dsh-channels/streamer
  */
 
-import type { Session, SessionEvent, TurnEndReason } from './dsh-types.ts'
+import type { AssistantStreamFrame, Session, SessionEvent, TurnEndReason } from './dsh-types.ts'
 import { buildCard, segmentCardContent } from './cards.ts'
 import type { CardState, PanelPhase } from './cards.ts'
 import type { FeishuChannel } from './feishu-channel.ts'
@@ -59,9 +59,23 @@ export interface SegmentDelivery {
   mode: 'card' | 'text'
 }
 
+/** Card figures read from host projections (all optional: unit may be unmounted). */
+export interface ProjectedStats {
+  inputTokens?: number
+  outputTokens?: number
+  cacheHitPct?: number
+  contextWindow?: number
+}
+
 export interface StreamerHooks {
   /** Fetch current context pressure for one session (may be expensive → cached by caller). */
   measureContext(session: Session): { contextTokens?: number; contextWindow?: number }
+  /**
+   * Host-projection-backed figures for one session. When present these win
+   * over the local incremental fold (the host units fold the durable embedded
+   * assistant streams the plugin cannot see as live events).
+   */
+  projectStats?(session: Session): ProjectedStats | undefined
   /** Resolve the session id label shown on the card. */
   sessionLabel(sessionId: string): string
   /** Log a non-fatal streaming error. */
@@ -175,6 +189,19 @@ interface TurnState {
   toolKind: string
   /** Slow keep-alive timer re-rendering the activity elapsed counter. */
   heartbeatTimer: ReturnType<typeof setTimeout> | undefined
+  /**
+   * Rollback marks for live stream attempts (`attemptId` → lengths at the
+   * attempt's `start` frame). An `abandoned` attempt's deltas never reach the
+   * durable model history, so the card must drop them again.
+   */
+  attempts: Map<string, AttemptMark>
+}
+
+/** Card/body lengths captured at one stream attempt's `start` frame. */
+interface AttemptMark {
+  cardCount: number
+  bodyLengths: number[]
+  reasoningLength: number
 }
 
 /** One live `tool-workflow/run-*` fold: run identity and member progress. */
@@ -282,7 +309,7 @@ export class TurnStreamer {
     this.sessions.set(session.id, session)
     let fold = this.folds.get(session.id)
     if (fold === undefined) {
-      fold = foldAll(session.events)
+      fold = foldAll(session.snapshotEvents())
       this.folds.set(session.id, fold)
     }
     const queue = this.bySession.get(session.id) ?? []
@@ -322,6 +349,7 @@ export class TurnStreamer {
       tool: '',
       toolKind: '',
       heartbeatTimer: undefined,
+      attempts: new Map(),
     })
     this.bySession.set(session.id, queue)
     const state = queue[queue.length - 1]!
@@ -383,29 +411,6 @@ export class TurnStreamer {
         if (state.turn === undefined) {
           state.turn = event.data.turn
           this.markDirty(session.id, state)
-        }
-        break
-      }
-      case 'assistant/chunk': {
-        const chunk = event.data.chunk
-        if (state.turn === undefined) state.turn = event.data.turn
-        switch (chunk.type) {
-          case 'text-delta': {
-            const last = state.cards[state.cards.length - 1]
-            if (last !== undefined && !last.frozen) {
-              last.body += chunk.text
-              if (state.phase === 'thinking') state.phase = 'replying'
-              this.markDirty(session.id, state)
-            }
-            break
-          }
-          case 'reasoning-delta': {
-            state.reasoning += chunk.text
-            this.markDirty(session.id, state)
-            break
-          }
-          default:
-            break
         }
         break
       }
@@ -511,6 +516,86 @@ export class TurnStreamer {
     }
   }
 
+  /**
+   * Consume one live assistant-stream frame (`agent/assistant-stream`).
+   *
+   * DSH stopped emitting durable `assistant/chunk` events (commit
+   * `f99b06eaed`), so this transient agent-scoped publication is the only
+   * live delta source. `start` records rollback marks; `end` keeps the deltas
+   * only when the attempt committed to the durable log — an `abandoned`
+   * attempt's text is not model-visible history and must leave the card again.
+   */
+  onAssistantFrame(session: Session, frame: AssistantStreamFrame): void {
+    this.sessions.set(session.id, session)
+    const state = this.front(session.id)
+    if (state === undefined || state.disposed) return
+    switch (frame.type) {
+      case 'start': {
+        state.attempts.set(frame.attemptId, this.attemptMark(state))
+        if (state.turn === undefined) state.turn = frame.turn
+        break
+      }
+      case 'chunk': {
+        const chunk = frame.chunk
+        if (chunk.type === 'text-delta') {
+          const last = state.cards[state.cards.length - 1]
+          if (last !== undefined && !last.frozen && chunk.text !== '') {
+            last.body += chunk.text
+            if (state.phase === 'thinking') state.phase = 'replying'
+            this.markDirty(session.id, state)
+          }
+        } else if (chunk.type === 'reasoning-delta' && chunk.text !== '') {
+          state.reasoning += chunk.text
+          this.markDirty(session.id, state)
+        }
+        break
+      }
+      case 'end': {
+        const mark = state.attempts.get(frame.attemptId)
+        state.attempts.delete(frame.attemptId)
+        if (frame.outcome.kind === 'abandoned' && mark !== undefined) {
+          this.rollbackAttempt(state, mark)
+          this.markDirty(session.id, state)
+        }
+        break
+      }
+    }
+  }
+
+  /** Capture the card/body lengths an attempt's deltas start from. */
+  private attemptMark(state: TurnState): AttemptMark {
+    return {
+      cardCount: state.cards.length,
+      bodyLengths: state.cards.map(card => card.body.length),
+      reasoningLength: state.reasoning.length,
+    }
+  }
+
+  /**
+   * Drop one abandoned attempt's deltas. The attempt's text is a contiguous
+   * suffix of the logical body: segments created during the attempt are
+   * removed, the segment that was last at `start` is truncated, and the
+   * reasoning tail is cut. Already-delivered plain-text segments cannot be
+   * retracted and stop the removal.
+   */
+  private rollbackAttempt(state: TurnState, mark: AttemptMark): void {
+    const lastIndex = mark.cardCount - 1
+    for (let index = state.cards.length - 1; index > lastIndex; index -= 1) {
+      const card = state.cards[index]
+      if (card === undefined) continue
+      if (card.mode === 'text' && card.messageId !== undefined) break
+      state.cards.splice(index, 1)
+    }
+    const tail = state.cards[lastIndex]
+    const length = mark.bodyLengths[lastIndex]
+    if (tail !== undefined && length !== undefined
+      && !(tail.mode === 'text' && tail.messageId !== undefined)) {
+      tail.body = tail.body.slice(0, length)
+      tail.dirty = true
+    }
+    state.reasoning = state.reasoning.slice(0, mark.reasoningLength)
+  }
+
   private markDirty(sessionId: string, state: TurnState): void {
     if (state.disposed) return
     state.dirty = true
@@ -539,16 +624,21 @@ export class TurnStreamer {
         context = cached
       }
     }
+    // Host projections are authoritative when mounted: they fold the durable
+    // embedded assistant streams the plugin can no longer see as live events.
+    const projected = session === undefined ? undefined : this.hooks.projectStats?.(session)
     return {
       sessionId: this.hooks.sessionLabel(sessionId),
-      inputTokens: fold?.totals.inputTokens ?? 0,
-      outputTokens: fold?.totals.outputTokens ?? 0,
-      cacheHitPct: cacheHitPct(lastUsage),
+      inputTokens: projected?.inputTokens ?? fold?.totals.inputTokens ?? 0,
+      outputTokens: projected?.outputTokens ?? fold?.totals.outputTokens ?? 0,
+      cacheHitPct: projected?.cacheHitPct ?? cacheHitPct(lastUsage),
       contextTokens: context?.contextTokens,
       // The context-token count is session-wide, but the model window belongs
       // to the current request. Suppress it when this turn failed before a
       // request header was emitted, just like model/effort/cache.
-      contextWindow: header === undefined ? undefined : context?.contextWindow,
+      contextWindow: header === undefined
+        ? undefined
+        : context?.contextWindow ?? projected?.contextWindow,
       model: header?.model,
       effort: header?.effort,
     }

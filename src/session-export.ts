@@ -94,7 +94,7 @@ export function serializeLogicalSession(
     },
   }
   const lines = [JSON.stringify(manifest)]
-  for (const event of session.events) lines.push(JSON.stringify(event))
+  for (const event of session.snapshotEvents()) lines.push(JSON.stringify(event))
   return Buffer.from(`${lines.join('\n')}\n`, 'utf8')
 }
 
