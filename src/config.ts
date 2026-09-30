@@ -26,6 +26,9 @@ export const DEFAULT_ROUTE_TTL_MS = 30 * 24 * 60 * 60 * 1000
 /** Default HITL approval decision window: 5 minutes per question. */
 export const DEFAULT_APPROVAL_TIMEOUT_MS = 5 * 60 * 1000
 
+/** Default structured-question window: 5 minutes per `ask_user_question` call. */
+export const DEFAULT_QUESTION_TIMEOUT_MS = 5 * 60 * 1000
+
 /** A credential reference: `FEISHU_APP_ID`-style name resolved through ctx.credentials. */
 const credentialRefSchema = z.string().regex(
   CREDENTIAL_REF_PATTERN,
@@ -97,6 +100,32 @@ export const configSchema = z.object({
    * open, so the window trades user think-time against agent stall time.
    */
   approvalTimeoutMs: z.number().int().min(10_000).max(3_600_000).default(DEFAULT_APPROVAL_TIMEOUT_MS),
+  /**
+   * Accept inbound Feishu images and forward them to the model as durable
+   * `ImageBlock`s. Requires the host attachment service; without it (or when
+   * disabled) image messages degrade to their text caption only.
+   */
+  acceptImages: z.boolean().default(true),
+  /** Maximum images forwarded from one message (excess is ignored). */
+  maxImagesPerMessage: z.number().int().min(0).max(8).default(4),
+  /**
+   * Send a one-time onboarding card on the first private message of a chat
+   * (facts + command cheat sheet). Persisted per chat; never repeats.
+   */
+  welcomeOnboarding: z.boolean().default(true),
+  /**
+   * Allow `/permissions <name>` to switch this Session's sandbox + approval
+   * preset from Feishu. Read-only `/permissions` always works; switching is
+   * security-sensitive (it can widen the sandbox), so it is off by default.
+   */
+  allowPermissionSwitch: z.boolean().default(false),
+  /**
+   * Structured-question decision window for the model's `ask_user_question`
+   * tool (`user-questions/request`). A blocking ask that gets no answer in
+   * this window fails closed with an explicit error; a host *timed* wait owns
+   * its own deadline and is left to the host signal instead.
+   */
+  questionTimeoutMs: z.number().int().min(10_000).max(3_600_000).default(DEFAULT_QUESTION_TIMEOUT_MS),
 })
 
 export type FeishuConfig = z.infer<typeof configSchema>

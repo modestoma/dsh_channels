@@ -200,6 +200,8 @@ export const feishuDomainGlobalSchema = z.object({
    *  storage written by older plugin versions still validates; the card now
    *  uses the built-in `standard_icon` chevron and never writes this. */
   chevronImgKey: z.string().optional(),
+  /** p2p chats already shown the one-time onboarding card (bounded list). */
+  welcomedChats: z.array(z.string()).optional(),
 })
 
 export type FeishuDomainGlobal = z.infer<typeof feishuDomainGlobalSchema>

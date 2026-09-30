@@ -7,6 +7,7 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 - 话题内后续消息**无需再 @**，自动延续该 session
 - 工作区归属：私聊一人一工作区；群里**每个用户各自一个工作区**（同群不同用户互不影响）
 - **HITL 审批**：当模型请求需要授权的动作（如 bash 沙箱升级 `sandbox_permissions`）时，插件监听主机 `approval/request` 事件，在同一话题里**新发一张独立审批决策卡**（✅ 允许 / ❌ 拒绝 按钮），用户点击后回填主机审批结果；超时（`approvalTimeoutMs`，默认 5 分钟）自动拒绝（fail-closed），非会话发起人点击无效
+- **结构化提问**：模型调用 `ask_user_question` 时，插件监听主机 `user-questions/request` 瀑布并发一张问答卡（每个问题一组选项按钮，多选先勾选再「提交本题选择」），答案回填给模型；主机自带的应答者只有 Web 客户端，没有本插件时纯飞书会话会以 `NO_PROVIDER` 失败。超时（`questionTimeoutMs`，默认 5 分钟）或回合取消时本轮提问失败（fail-closed）；没有可选项的问题直接提示用文字作答，**阻塞期间普通文本回复即作为该问题的自由文本答案**（同时支持多选后的自定义文本）
 - 全部基于飞书官方 SDK [`@larksuiteoapi/node-sdk`](https://www.npmjs.com/package/@larksuiteoapi/node-sdk)（WebSocket 长连接，免公网）
 
 设计与可行性论证见 [docs/feasibility-and-design.md](docs/feasibility-and-design.md)。
@@ -20,10 +21,15 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 - `/status`：显示当前 Session 状态与性能指标
 - `/workspace`：显示当前 Session 工作目录
 - `/effort`：查看当前 Session 推理强度；`/effort <档位-id>` 切换，`/effort reset` 恢复配置默认
+- `/model`：查看当前模型与该 provider 的可用模型；`/model <模型-id>`（沿用当前 provider）、`/model <provider>/<model>` 切换，`/model reset` 恢复部署默认
 - `/compact`：调用 Harness 原生命令压缩当前 Session 上下文
 - `/renew`：在当前话题创建并绑定新 Session
-- `/history`：显示当前话题的 Session 历史
+- `/stop`：中断当前正在运行的回合（不冷恢复 Session；没有运行中的回合时明确提示）
+- `/permissions`：查看当前 Session 的权限预设（沙箱 + 审批策略）与可选清单；仅在 `allowPermissionSwitch: true` 时支持 `/permissions <name>` 切换
+- `/history`：显示当前话题的 Session 历史（含 `ctx.sessionQuery` 折叠出的会话标题与 live 标记）
 - `/export`：导出当前 Session 的逻辑日志
+
+`/new` 是 `/renew` 的别名。`/help` 由命令注册表按分组生成，新增命令只需在注册表里加一行。
 
 ## 流式卡片
 
@@ -43,17 +49,47 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 
 ```
 src/
-├── index.ts           # 插件入口 apply(ctx)
-├── config.ts          # 配置 schema 与 env: 凭据解析
-├── dsh-types.ts       # DSH 宿主表面的最小类型桥（无运行时依赖）
-├── feishu-channel.ts  # 官方 SDK Channel 模块适配（可注入 stub）
-├── service.ts         # 路由 / 工作区 / session 编排
-├── approvals.ts       # HITL 审批应答器（approval/request → 决策卡）
-├── streamer.ts        # session/event → 卡片快照，500ms 节流 patch
-├── cards.ts           # 卡片 2.0 JSON 纯函数渲染（含审批决策卡）
-├── stats.ts           # session 累计 token / 缓存命中 / 上下文折叠
-├── domain.ts          # storageDomain 路由表（thread_id → sessionId）
-└── workspaces.ts      # (chat, user) → 工作区目录
+├── index.ts               # 插件入口 apply(ctx)：effect + 导出 barrel
+├── config.ts              # 配置 schema 与凭据引用校验
+├── service.ts             # FeishuService 门面：生命周期、事件接线、入站与命令编排
+├── dsh-types.ts           # 宿主类型桥 barrel → src/host/
+├── host/                  # DSH 表面（纯类型，无运行时依赖）
+│   ├── core.ts            #   身份 / LLM 消息与流 / Session 日志与事件
+│   ├── agent.ts           #   Agent、注册表、agent preset
+│   ├── commands.ts        #   ctx.commands 表面
+│   ├── interaction.ts     #   approval/request + user-questions/request
+│   └── services.ts        #   工作区 / 存储域 / 凭据 / token / llm / 投影 / HostContext
+├── cards.ts               # 卡片 barrel → src/cards/
+├── cards/                 # 卡片 2.0 JSON 渲染
+│   ├── primitives.ts      #   信封、markdown、按钮、分栏等原语
+│   ├── streaming.ts       #   流式回复卡、分段、字节/表格预算
+│   ├── approval.ts        #   审批决策卡
+│   └── question.ts        #   结构化问答卡
+├── approvals.ts           # 审批 barrel → src/interactions/
+├── questions.ts           # 问答 barrel → src/interactions/
+├── interactions/          # HITL 交互
+│   ├── pending.ts         #   待决卡共享生命周期（登记/送达/门禁/超时/settle-once）
+│   ├── approvals.ts       #   审批应答器
+│   └── questions.ts       #   结构化提问应答器
+├── session/               # 会话侧基础设施
+│   ├── routes.ts          #   路由存储 + TTL 墓碑
+│   ├── repair.ts          #   inflight 快照 + 重启修复
+│   ├── manager.ts         #   live Agent、冷恢复、preset、/renew 事务
+│   └── request-policy.ts  #   会话级 provider/model/reasoningEffort 覆盖（/model、/effort）
+├── feishu/
+│   ├── delivery.ts        # 出站投递：首帧话题卡、结果卡、分段降级、表情生命周期
+│   └── inbound-image.ts   # 入站图片：资源下载 → attachment → ImageBlock（失败降级）
+├── routing/
+│   └── inbound.ts         # 入站路由：去重、准入、路由决策树、建/续会话、首触引导
+├── commands.ts            # 斜杠命令解析、agent 作用域注册与结果卡
+├── commands/registry.ts   # 命令注册表：词表 / 准入规则 / 分组 help 的单一事实来源
+├── session-commands.ts    # /status /workspace /renew /history /compact 渲染
+├── stats.ts               # 宿主投影优先的 token / 缓存 / 上下文折叠
+├── domain.ts              # storageDomain 域声明与路由记录 schema
+├── health.ts              # 健康快照与卡片
+├── session-export.ts      # 逻辑日志导出
+├── feishu-channel.ts      # 官方 SDK Channel 适配（可注入 stub）
+└── workspaces.ts          # (chat, user) → 工作区目录
 ```
 
 ## 接入 DSH
@@ -84,6 +120,11 @@ DSH_HOME=$DSH_HOME pnpm dsh plugin --profile web add link:/path/to/dsh_channels
     threadFallback: 'degrade'           # 话题被拒时降级为会话级路由
     routeTtlMs: 2592000000              # 话题路由 30 天无活动即过期；后续消息明确拒绝，不新建 Session（0 = 关闭）
     approvalTimeoutMs: 300000           # HITL 审批决策卡等待时长（默认 5 分钟；超时自动拒绝）
+    questionTimeoutMs: 300000           # ask_user_question 问答卡等待时长（默认 5 分钟；超时本轮提问失败）
+    acceptImages: true                  # 转发飞书图片给模型（需主机 attachments 服务）
+    maxImagesPerMessage: 4              # 单条消息最多转发几张图（其余忽略，文字说明仍保留）
+    welcomeOnboarding: true             # 私聊首次触达发一张引导卡（按 chat 持久化去重）
+    allowPermissionSwitch: false        # 是否允许 /permissions <name> 从飞书侧切换权限预设（安全敏感）
     loggerLevel: 'info'
 ```
 
@@ -117,7 +158,7 @@ FEISHU_APP_SECRET: xxxxxxxx
    - `im:message`（获取与发送单聊、群组消息）
    - `im:message.p2p_msg:readonly`（读取用户发给机器人的单聊消息）
    - 事件：**接收消息 im.message.receive_v1**（含“接收群聊中 @ 机器人消息”）
-   - 回调：**卡片回传交互 card.action.trigger**（HITL 审批按钮的回传事件，同样走长连接）
+   - 回调：**卡片回传交互 card.action.trigger**（HITL 审批 / `ask_user_question` 问答按钮的回传事件，同样走长连接）
    - `im:message.reactions:write_only`（发送、删除消息表情回复）
    - `im:message:update`（更新卡片）
 3. 事件订阅方式选**长连接**（WebSocket，免公网）。
@@ -125,6 +166,8 @@ FEISHU_APP_SECRET: xxxxxxxx
 
 ## 行为与降级
 
+- **图片输入**：飞书图片（`message.resources` 中的 `image`）经通道下载 → 主机 `attachments.saveImages()` 落盘 → 作为 `ImageBlock` 进入模型消息；任何一步失败都只丢这张图，文字说明照常送达。`ctx.attachments` 未挂载或 `acceptImages: false` 时退化为纯文本。
+- **DSH 0.2.0 兼容**：会话日志读取改用 `Session.snapshotEvents()`（整段 `Session.events` getter 已被 DSH 删除）；正文/推理增量改用瞬时事件 `agent/assistant-stream`（持久化 `assistant/chunk` 已不再产生，改为把流内嵌进 `assistant/message.stream`），并处理 `abandoned` 尝试的文本回滚；卡片 token / 缓存命中 / 上下文窗口优先读宿主 `sessionProjections`（`sessionStats` / `tokenUsage` / `contextPressure`），未挂载时回退到本地增量折叠 + `llm.resolveModelInfo`。完整评估、证据与实施状态见 [docs/review-dsh-0.2.0.md](docs/review-dsh-0.2.0.md)。
 - **话题创建**：通过回复消息接口 `reply_in_thread: true`（官方文档明示的“以话题方式回复（即创建话题）”）。响应后经 `im.v1.message.get` 取回 `thread_id` 写入路由表。
 - **话题延续**：`im.message.receive_v1` 事件自带 `thread_id`，命中路由表即 `agent.followup()`，无需 @。同一 (chat, user) 的**并发首消息会被串行化**：后到的消息等待在途的会话建立完成，再按串行语义续聊同一 session 或另起新话题——不会重复建 session、覆盖路由，也不会落入“无路由、无 @”的丢弃窗口。
 - **降级（`threadFallback: 'degrade'`）**：私聊或群聊拒绝话题回复（如 230071）时，自动改为普通回复，路由键退化为 `chat:p2p:<chat_id>:<open_id>` / `chat:group:<chat_id>:<open_id>`（会话级延续）；`strict` 则直接失败。

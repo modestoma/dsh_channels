@@ -5,6 +5,7 @@
  */
 
 import path from 'node:path'
+import { standaloneCard } from './cards/primitives.ts'
 import type { RouteRecord, SessionHistoryEntry } from './domain.ts'
 import { normalizeSessionHistory } from './domain.ts'
 import type { ContextMeasurement, StatsFold, ToolEventSample } from './stats.ts'
@@ -48,23 +49,26 @@ function toolLine(sample: ToolEventSample): string {
   return `- \`${escapeInlineCode(sample.name)}\` · ${status} · ${duration}`
 }
 
-function standaloneCard(title: string, elements: object[]): object {
-  return {
-    schema: '2.0',
-    config: { width_mode: 'fill' },
-    body: {
-      elements: [
-        { tag: 'markdown', content: title },
-        ...elements,
-      ],
-    },
-  }
-}
-
 export interface SessionStatusCardInput {
   sessionId: string
   stats: StatsFold
   context: ContextMeasurement
+  /** Optional operational extras (permission preset, workspace, uptime, …). */
+  extras?: SessionStatusExtras
+}
+
+/** Operational extras appended to the `/status` card when available. */
+export interface SessionStatusExtras {
+  /** Effective permission preset of this Session (`ctx.permissionPresets`). */
+  permissionPreset?: string
+  /** Workspace directory bound to this route. */
+  workspacePath?: string
+  /** Plugin uptime in milliseconds. */
+  uptimeMs?: number
+  /** Live agent entries this channel owns/borrows. */
+  liveAgents?: number
+  /** Persisted route records. */
+  routeCount?: number
 }
 
 /** Render the complete `/status` snapshot without exposing tool arguments or results. */
@@ -109,8 +113,34 @@ export function buildSessionStatusCard(input: SessionStatusCardInput): object {
       content: `**工具调用**：累计 ${fmtCount(stats.toolCalls)} · 未完成 ${fmtCount(stats.pendingTools.size)}（${pending}）\n`
         + `**最近工具事件（最多 5 条）**\n${tools}`,
     },
+    ...statusExtrasElements(input.extras),
     { tag: 'markdown', content: input.sessionId, text_size: 'notation' },
   ])
+}
+
+/** Render the optional operational lines, omitting unavailable ones. */
+function statusExtrasElements(extras: SessionStatusExtras | undefined): object[] {
+  if (extras === undefined) return []
+  const lines: string[] = []
+  if (extras.permissionPreset !== undefined) lines.push(`**权限预设**：\`${escapeInlineCode(extras.permissionPreset)}\``)
+  if (extras.workspacePath !== undefined) lines.push(`**工作区**：\`${escapeInlineCode(extras.workspacePath)}\``)
+  if (extras.uptimeMs !== undefined) lines.push(`**插件运行时长**：${fmtUptime(extras.uptimeMs)}`)
+  if (extras.liveAgents !== undefined || extras.routeCount !== undefined) {
+    const parts: string[] = []
+    if (extras.liveAgents !== undefined) parts.push(`live Agent ${fmtCount(extras.liveAgents)}`)
+    if (extras.routeCount !== undefined) parts.push(`持久化路由 ${fmtCount(extras.routeCount)}`)
+    lines.push(`**通道**：${parts.join(' · ')}`)
+  }
+  return lines.length === 0 ? [] : [{ tag: 'markdown', content: lines.join('\n') }]
+}
+
+/** `2 小时 5 分` / `45 秒` — coarse human uptime. */
+function fmtUptime(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000))
+  if (totalSeconds < 60) return `${totalSeconds} 秒`
+  const minutes = Math.floor(totalSeconds / 60) % 60
+  const hours = Math.floor(totalSeconds / 3600)
+  return hours === 0 ? `${minutes} 分` : `${hours} 小时 ${minutes} 分`
 }
 
 export type WorkDirResolution =
@@ -194,17 +224,40 @@ export function querySessionHistory(record: RouteRecord): SessionHistoryView {
   }
 }
 
-function historyLine(item: SessionHistoryItem, index: number): string {
-  const marker = item.current ? ' · **当前**' : ''
-  return `${index + 1}. \`${escapeInlineCode(item.sessionId)}\`${marker}\n   创建时间：${new Date(item.createdAt).toISOString()}`
+/** Optional per-session facts folded from the host session query. */
+export interface SessionHistoryAnnotation {
+  /** Latest log-backed session title, when one exists. */
+  title?: string
+  /** Whether the session is currently live (held by any owner). */
+  live?: boolean
 }
 
-/** Render the newest route-local Session history, including the current marker. */
-export function buildSessionHistoryCard(record: RouteRecord): object {
+function historyLine(
+  item: SessionHistoryItem,
+  index: number,
+  annotation: SessionHistoryAnnotation | undefined,
+): string {
+  const markers = [
+    ...(item.current ? ['**当前**'] : []),
+    ...(annotation?.live === true && !item.current ? ['live'] : []),
+  ]
+  const marker = markers.length === 0 ? '' : ` · ${markers.join(' · ')}`
+  const title = annotation?.title === undefined || annotation.title === ''
+    ? ''
+    : `\n   标题：${escapeInlineCode(annotation.title)}`
+  return `${index + 1}. \`${escapeInlineCode(item.sessionId)}\`${marker}${title}\n`
+    + `   创建时间：${new Date(item.createdAt).toISOString()}`
+}
+
+/** Render the newest route-local Session history with host-query annotations. */
+export function buildSessionHistoryCard(
+  record: RouteRecord,
+  annotations: Readonly<Record<string, SessionHistoryAnnotation>> = {},
+): object {
   const view = querySessionHistory(record)
   const elements: object[] = [
     { tag: 'markdown', content: `**总数**：${fmtCount(view.total)}\n**当前 Session**：\`${escapeInlineCode(record.sessionId)}\`` },
-    { tag: 'markdown', content: view.items.map(historyLine).join('\n') },
+    { tag: 'markdown', content: view.items.map((item, index) => historyLine(item, index, annotations[item.sessionId])).join('\n') },
   ]
   if (view.hidden > 0) {
     elements.push({ tag: 'markdown', content: `另有 ${fmtCount(view.hidden)} 条未展示。`, text_size: 'notation' })
