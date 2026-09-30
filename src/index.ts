@@ -30,14 +30,16 @@ export type * from './health.ts'
 export type * from './session-commands.ts'
 export type * from './session-export.ts'
 export type * from './stats.ts'
-export type { ApprovalOutcome, ApprovalRequest, ApprovalAnswererListener } from './dsh-types.ts'
-export { buildCard, buildInterruptionCard, cardJsonBytes, CARD_MAX_BYTES, CARD_TARGET_BYTES, INTERRUPTION_NOTICE, MAX_TABLES_PER_CARD, PANEL_TITLES, PANEL_CHEVRON_TOKEN, segmentCardContent, splitBodyForCard, stripTables, tableBlocks, TRUNCATION_SUFFIX, buildApprovalCard, buildApprovalSettledCard } from './cards.ts'
+export type * from './questions.ts'
+export type { ApprovalOutcome, ApprovalRequest, ApprovalAnswererListener, AssistantStreamFrame, AskUserQuestionAnswer, AskUserQuestionAnswerItem, AskUserQuestionItem, AskUserQuestionRequestEvent, UserQuestionAnswererListener, AgentCancelCause, SessionStatsView, TokenUsageView, ContextPressureView, SessionProjections } from './dsh-types.ts'
+export { buildCard, buildInterruptionCard, cardJsonBytes, CARD_MAX_BYTES, CARD_TARGET_BYTES, INTERRUPTION_NOTICE, MAX_TABLES_PER_CARD, PANEL_TITLES, PANEL_CHEVRON_TOKEN, segmentCardContent, splitBodyForCard, stripTables, tableBlocks, TRUNCATION_SUFFIX, buildApprovalCard, buildApprovalSettledCard, buildQuestionCard, buildQuestionSettledCard, MAX_QUESTION_OPTIONS } from './cards.ts'
 export { ApprovalAnswerer } from './approvals.ts'
-export { buildCommandResultCard, CHANNEL_COMMAND_NAMES, commandResultCardKind, isSupportedCommand, parseSlashCommand, registerChannelCommands, RouteOperationQueue, SUPPORTED_COMMAND_NAMES, supportedCommandHelp, supportedCommandList } from './commands.ts'
+export { QuestionAnswerer } from './questions.ts'
+export { armModelCommand, buildCommandResultCard, CHANNEL_COMMAND_NAMES, commandResultCardKind, isSupportedCommand, parseSlashCommand, registerChannelCommands, registerModelCommand, RouteOperationQueue, SUPPORTED_COMMAND_NAMES, supportedCommandHelp, supportedCommandList } from './commands.ts'
 export { buildHealthCard, countFiberStates, foldHealthSnapshot, HEALTH_DEPENDENCY_NAMES, maskOpenIdTail } from './health.ts'
 export { buildCompactComparisonCard, buildRenewCard, buildSessionHistoryCard, buildSessionStatusCard, buildWorkDirCard, compactFailureContext, querySessionHistory, resolveWorkDir, SESSION_HISTORY_DISPLAY_LIMIT } from './session-commands.ts'
 export { createLogicalSessionExport, DSH_CHANNELS_VERSION, LOGICAL_EXPORT_FORMAT, LOGICAL_EXPORT_FORMAT_VERSION, serializeLogicalSession } from './session-export.ts'
-export { addUsage, averageDecodeTokensPerSecond, averageTtftMs, cacheHitPct, EMPTY_TOTALS, foldAll, foldEvent, measureSessionContext } from './stats.ts'
+export { addUsage, applyProjectionViews, averageDecodeTokensPerSecond, averageTtftMs, cacheHitPct, EMPTY_TOTALS, foldAll, foldEvent, foldSessionStats, measureSessionContext, readProjectionViews, usageFromBuckets } from './stats.ts'
 export { FeishuService } from './service.ts'
 export { TurnStreamer } from './streamer.ts'
 export { ensureWorkspace, workspacePathFor, workspaceTitleFor } from './workspaces.ts'
@@ -80,5 +82,5 @@ export function apply(ctx: HostContext, config?: unknown): void {
       console.error('[dsh-channels] failed to start:', error)
     })
     return () => service.shutdown()
-  })
+  }, 'dsh-channels')
 }

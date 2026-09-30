@@ -14,56 +14,58 @@
  * @module dsh-channels/service
  */
 
-import { randomUUID } from 'node:crypto'
 import { ApprovalAnswerer } from './approvals.ts'
 import type { ApprovalRoute } from './approvals.ts'
+import { QuestionAnswerer } from './questions.ts'
 import type {
-  Agent,
-  AgentContext,
-  AgentHandle,
   CommandInvocation,
   CommandResult,
-  AgentPresets,
-  AgentSetup,
   CredentialProvider,
   CordisFiber,
   HostContext,
   LlmService,
   Session,
   SessionId,
+  SessionProjections,
   TokenMeter,
-  UserMessage,
 } from './dsh-types.ts'
-import { buildCard, buildInterruptionCard } from './cards.ts'
-import type { CardState } from './cards.ts'
+import { standaloneInfoCard } from './cards.ts'
 import {
-  armEffortCommand, armRenewCommand, buildCommandResultCard, commandResultCardKind, isSupportedCommand, parseSlashCommand,
-  mountChannelCommands, registerEffortCommand, registerRenewCommand, RouteOperationQueue, supportedCommandHelp, supportedCommandList,
+  armEffortCommand, armModelCommand, armRenewCommand, registerModelCommand, commandResultCardKind, parseSlashCommand,
+  registerEffortCommand, registerRenewCommand, RouteOperationQueue, supportedCommandHelp, supportedCommandList,
 } from './commands.ts'
-import type { CommandCardState, EffortCommandAction } from './commands.ts'
-import {
-  appendSessionHistory, chatRouteKey, feishuDomain, normalizeRouteRecord,
-} from './domain.ts'
+import type { EffortCommandAction, ParsedSlashCommand } from './commands.ts'
+import { commandSpec } from './commands/registry.ts'
+import type { ChannelCommandSpec } from './commands/registry.ts'
+import type { AttachmentService, PermissionPresets, SessionQuery } from './dsh-types.ts'
+import { feishuDomain } from './domain.ts'
 import type {
   ExpiredRouteRecord, FeishuDomainGlobal, FeishuDomainHandle, InflightSnapshot, ProcessedRecord, RawDomainHandle,
   RouteRecord,
 } from './domain.ts'
+import { RouteStore } from './session/routes.ts'
+import { InflightRepair } from './session/repair.ts'
+import { SessionManager } from './session/manager.ts'
+import type { LiveAgent, RenewCommit } from './session/manager.ts'
+import { CardDelivery } from './feishu/delivery.ts'
+import { ImageIntake } from './feishu/inbound-image.ts'
+import { InboundRouter } from './routing/inbound.ts'
+import type { RequestPolicyController } from './session/request-policy.ts'
 import type { ChannelFactory, FeishuChannel, NormalizedMessage } from './feishu-channel.ts'
 import { buildHealthCard, foldHealthSnapshot, HEALTH_DEPENDENCY_NAMES } from './health.ts'
 import type { HealthDependencyName, HealthSnapshot } from './health.ts'
 import {
   buildCompactComparisonCard, buildRenewCard, buildSessionHistoryCard, buildSessionStatusCard, buildWorkDirCard,
-  compactFailureContext, resolveWorkDir,
+  compactFailureContext, resolveWorkDir, SESSION_HISTORY_DISPLAY_LIMIT,
 } from './session-commands.ts'
-import { foldAll, measureSessionContext } from './stats.ts'
+import type { SessionHistoryAnnotation } from './session-commands.ts'
+import { normalizeSessionHistory } from './domain.ts'
+import { foldSessionStats, measureSessionContext, readProjectionViews } from './stats.ts'
 import type { ContextMeasurement, ContextServices } from './stats.ts'
-import { installReasoningEffortOverride } from './reasoning-effort.ts'
-import type { ReasoningEffortController } from './reasoning-effort.ts'
 import { createLogicalSessionExport } from './session-export.ts'
 import type { SessionExportBuilder } from './session-export.ts'
 import { ACTIVITY_BUILD_MARKER, TurnStreamer } from './streamer.ts'
-import type { StreamerHooks } from './streamer.ts'
-import { ensureWorkspace, workspaceTitleFor } from './workspaces.ts'
+import type { ProjectedStats, StreamerHooks } from './streamer.ts'
 import type { FeishuConfig } from './config.ts'
 
 /** Periodic route-GC sweep cadence (a long-running instance also accumulates
@@ -74,28 +76,6 @@ const GC_SWEEP_INTERVAL_MS = 6 * 60 * 60 * 1000
  *  day is 100×+ headroom while keeping the table bounded. */
 const PROCESSED_RETENTION_MS = 24 * 60 * 60 * 1000
 
-const EXPIRED_ROUTE_TEXT = '该话题已超过路由保留时间，并已与原 Session 解绑。为避免误接续上下文，插件不会在此话题创建新 Session；请从私聊或群聊主会话发起新消息（群聊请 @ 机器人）创建新话题。'
-
-/** Build one durable user message from inbound Feishu text (no host runtime import). */
-export function feishuUserMessage(text: string): UserMessage {
-  return {
-    id: randomUUID(),
-    role: 'user',
-    content: [{ type: 'text', text }],
-    source: { kind: 'user' },
-  } as unknown as UserMessage
-}
-
-interface LiveAgent {
-  agent: Agent
-  handle: AgentHandle
-}
-
-interface RenewCommit {
-  previous: RouteRecord
-  current: RouteRecord
-  oldLive: LiveAgent
-}
 
 interface RenewAdmission {
   route: RouteRecord
@@ -105,25 +85,12 @@ interface RenewAdmission {
 
 interface EffortAdmission {
   live: LiveAgent
-  controller: ReasoningEffortController
+  controller: RequestPolicyController
 }
 
-/**
- * Wrap a live agent owned by someone else (web UI api-remote resolver, a
- * previous plugin instance, a won cold-resume race). The borrow is fully
- * deliverable through `followup`; disposal releases only the channel-owned
- * scoped policy and never the foreign Agent itself.
- */
-function borrowLiveAgent(agent: Agent, release: () => void = () => {}): LiveAgent {
-  return { agent, handle: { agent, dispose: async () => { release() } } }
-}
-
-/** What `agents.create`/`resume` need to compose one agent from a preset. */
-interface PresetComposition {
-  /** Preset id recorded on the session header meta (absent without a roster). */
-  agentPreset?: string
-  /** Mounts the resolved preset inside the agent factory's setup. */
-  setup?: AgentSetup
+interface ModelAdmission {
+  live: LiveAgent
+  controller: RequestPolicyController
 }
 
 /** Wrap the host's storage facility open behind a stable local type. */
@@ -194,46 +161,41 @@ export class FeishuService {
   private channel: FeishuChannel | undefined
   private streamer: TurnStreamer | undefined
   private domain: FeishuDomainHandle | undefined
-  private readonly routeCache = new Map<string, RouteRecord>()
-  /** Thread ids retired by TTL; retained so later messages cannot fork context. */
-  private readonly expiredRouteCache = new Map<string, ExpiredRouteRecord>()
-  private readonly live = new Map<string, LiveAgent>()
-  private readonly reasoningEfforts = new WeakMap<AgentContext, ReasoningEffortController>()
-  private readonly pendingResume = new Map<string, Promise<LiveAgent>>()
-  /**
-   * chat-scoped key → in-flight session establishment. Concurrent first
-   * messages of one (chat, user) pair all observe the same promise: they wait
-   * for the establishment to settle, then either continue the just-created
-   * session (same topic, or degraded chat route) or fall through to start
-   * their own — never racing each other into duplicate sessions, route
-   * overwrites, or the "no route, no mention" drop window.
-   */
-  private readonly establishing = new Map<string, Promise<RouteRecord>>()
+  /** Durable route store (cache + TTL retirement). */
+  private readonly routes: RouteStore
+  /** In-flight turn snapshots + startup repair. */
+  private readonly repair: InflightRepair
+  /** Outbound card delivery + reaction lifecycle. */
+  private readonly delivery: CardDelivery
+  /** Inbound image intake (Feishu resources → durable image blocks). */
+  private readonly images: ImageIntake
+  /** Inbound routing: dedup, admission, decision tree, session establishment. */
+  private readonly inbound: InboundRouter
+  /** Agent/session lifecycle: live registry, resume, presets, renew. */
+  private readonly sessions: SessionManager
   /** FIFO admission for ordinary turns and commands targeting one route. */
   private readonly routeOperations = new RouteOperationQueue()
   /** Active Host command executions, aborted before shutdown tears peers down. */
   private readonly commandControllers = new Set<AbortController>()
   /** Whole command admissions, drained before channel/storage teardown. */
   private readonly commandOperations = new Set<Promise<void>>()
-  /**
-   * In-process dedup guard: message id → accept timestamp. Set synchronously
-   * at acceptance so a same-process redelivery can never slip through the
-   * window between the persisted dedup check and its `put` landing. Removed
-   * once the durable record lands; entries whose `put` failed stay until the
-   * GC sweep prunes them (`PROCESSED_RETENTION_MS`).
-   */
-  private readonly accepted = new Map<string, number>()
   /** `<provider>/<model>` → context window (lazy async fill; sync reads). */
   private readonly contextWindows = new Map<string, number>()
   private readonly windowRequests = new Set<string>()
   private started = false
+  /** Epoch ms when `start()` completed (uptime for `/status`). */
+  private startedAt: number | undefined
   private unlisten: (() => void) | undefined
   /** Periodic route-GC timer (unref'd; only armed when `routeTtlMs > 0`). */
   private gcTimer: ReturnType<typeof setInterval> | undefined
   /** HITL approval answerer (created in `start()`). */
   private approvalAnswerer: ApprovalAnswerer | undefined
+  /** HITL structured-question answerer (`ask_user_question`). */
+  private questionAnswerer: QuestionAnswerer | undefined
   /** Disposers for the host approval waterfall listener + card actions. */
   private unlistenApproval: (() => boolean) | undefined
+  /** Disposer for the host user-questions waterfall listener. */
+  private unlistenQuestions: (() => boolean) | undefined
   private unlistenCardAction: (() => void) | undefined
 
   constructor(
@@ -246,12 +208,54 @@ export class FeishuService {
     this.config = config
     this.channelFactory = channelFactory
     this.sessionExportBuilder = sessionExportBuilder
-  }
-
-  /** The live channel (created in `start()` once credentials resolve). */
-  private requireChannel(): FeishuChannel {
-    if (this.channel === undefined) throw new Error('dsh-channels: channel not started')
-    return this.channel
+    this.routes = new RouteStore({
+      domain: () => this.domain,
+      ttlMs: () => this.config.routeTtlMs,
+      warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
+    })
+    this.repair = new InflightRepair({
+      domain: () => this.domain,
+      channel: () => this.channel,
+      ttlMs: () => this.config.routeTtlMs,
+      info: (message, ...args) => this.ctx.logger?.info?.(message, ...args),
+      warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
+    })
+    this.sessions = new SessionManager({
+      ctx: this.ctx,
+      config: this.config,
+      persistRoute: (key, record) => this.routes.put(key, record),
+      started: () => this.started,
+      detachStream: sessionId => this.streamer?.detach(sessionId),
+      warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
+    })
+    this.images = new ImageIntake({
+      enabled: () => this.config.acceptImages,
+      maxImages: () => this.config.maxImagesPerMessage,
+      channel: () => this.channel,
+      attachments: () => this.ctx.get?.('attachments') as AttachmentService | undefined,
+      warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
+    })
+    this.delivery = new CardDelivery({
+      channel: () => this.channel,
+      started: () => this.started,
+      routeForSession: sessionId => this.routes.findBySession(sessionId),
+      warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
+    })
+    this.inbound = new InboundRouter({
+      ctx: this.ctx,
+      config: this.config,
+      started: () => this.started,
+      domain: () => this.domain,
+      routes: this.routes,
+      repair: this.repair,
+      delivery: this.delivery,
+      sessions: this.sessions,
+      images: this.images,
+      queue: this.routeOperations,
+      streamer: () => this.streamer,
+      questionAnswerer: () => this.questionAnswerer,
+      commands: { handleSlash: (msg, line) => this.handleSlashMessage(msg, line) },
+    })
   }
 
   /** Wire events and open the long connection. */
@@ -274,6 +278,7 @@ export class FeishuService {
     this.channel = channel
     const hooks: StreamerHooks = {
       measureContext: session => this.measureContext(session),
+      projectStats: session => this.projectCardStats(session),
       sessionLabel: sessionId => sessionId,
       onError: (_key, error) => {
         this.ctx.logger?.warn?.('dsh-channels stream error: %s', String(error))
@@ -282,13 +287,13 @@ export class FeishuService {
         // The turn settled (final patches fired, reaction swap requested):
         // retire its repair snapshot. Kept deliberately non-awaited — repair
         // state is a safety net, never a dependency of the turn lifecycle.
-        void this.clearInflight(mainCardMessageId)
+        void this.repair.clear(mainCardMessageId)
       },
       onSegmentDelivered: (mainCardMessageId, segmentIndex, messageId, mode) => {
-        void this.recordSegmentDelivery(mainCardMessageId, segmentIndex, messageId, mode)
+        void this.repair.recordSegment(mainCardMessageId, segmentIndex, messageId, mode)
       },
       sendSegmentCard: (sessionId, segment, card, fallbackText) =>
-        this.sendSegmentCard(sessionId, segment, card, fallbackText),
+        this.delivery.segmentCard(sessionId, segment, card, fallbackText),
     }
     this.streamer = new TurnStreamer(
       channel,
@@ -298,15 +303,7 @@ export class FeishuService {
     )
 
     this.domain = await openFeishuDomain(this.ctx)
-    for (const [key, record] of this.domain.routes.entries()) {
-      this.routeCache.set(key, normalizeRouteRecord(record))
-    }
-    for (const [key, record] of this.domain.expiredRoutes.entries()) {
-      this.expiredRouteCache.set(key, record)
-      // Tombstone wins over an active row left behind by an interrupted or
-      // failed delete; expired Sessions must not remain approval-routable.
-      this.routeCache.delete(key)
-    }
+    this.routes.load()
 
     // HITL: answer the host's approval/request waterfall for sessions this
     // channel routes. `prepend` claims such requests BEFORE the web gateway's
@@ -320,15 +317,36 @@ export class FeishuService {
     }, this.config.approvalTimeoutMs)
     this.approvalAnswerer = answerer
     this.unlistenApproval = this.ctx.on('approval/request', (req, next) => answerer.onRequest(req, next), { prepend: true })
+    // Structured questions (`ask_user_question`): the host's only shipped
+    // answerer is the Web client, so a Feishu-only session would otherwise
+    // fail every ask with NO_PROVIDER.
+    const questions = new QuestionAnswerer(channel, {
+      routeFor: sessionId => this.approvalRouteFor(sessionId),
+      onError: (sessionId, error) => {
+        this.ctx.logger?.warn?.('dsh-channels question error (session %s): %s', sessionId, String(error))
+      },
+    }, this.config.questionTimeoutMs)
+    this.questionAnswerer = questions
+    this.unlistenQuestions = this.ctx.on(
+      'user-questions/request',
+      (request, next) => questions.onRequest(request, next),
+      { prepend: true },
+    )
     this.unlistenCardAction = channel.onCardAction(event => {
       answerer.onCardAction(event)
+      questions.onCardAction(event)
     })
 
     this.ctx.on('session/event', (session, event) => {
       this.streamer?.onSessionEvent(session, event)
     })
+    // DSH removed the durable `assistant/chunk` event (format v2 embeds the
+    // stream in the settlement); the live deltas arrive here instead.
+    this.ctx.on('agent/assistant-stream', ({ agent, frame }) => {
+      this.streamer?.onAssistantFrame(agent.session, frame)
+    })
     this.unlisten = channel.onMessage(message => {
-      void this.handleMessage(message).catch((error: unknown) => {
+      void this.inbound.handle(message).catch((error: unknown) => {
         this.ctx.logger?.warn?.('dsh-channels inbound error: %s', String(error))
         // User-facing safety net: never leave the user without a reply.
         void channel
@@ -338,7 +356,7 @@ export class FeishuService {
     })
     await channel.connect()
     // Repair cards a previous instance left mid-flight (best-effort, background).
-    void this.repairInflight().catch((error: unknown) => {
+    void this.repair.repairAll().catch((error: unknown) => {
       this.ctx.logger?.warn?.('dsh-channels: inflight repair failed: %s', String(error))
     })
     // Record GC: one sweep right after boot, then a slow periodic sweep.
@@ -356,10 +374,11 @@ export class FeishuService {
     this.ctx.logger?.info?.(
       'dsh-channels: feishu long connection established (bot open_id %s, %d route(s) loaded)',
       channel.botOpenId() ?? 'unknown',
-      this.routeCache.size,
+      this.routes.size(),
     )
     console.info('[dsh-channels] feishu long connection established, bot open_id:', channel.botOpenId())
     console.info('[dsh-channels] activity build:', ACTIVITY_BUILD_MARKER)
+    this.startedAt = Date.now()
     console.info('[dsh-channels] model request overrides:', {
       provider: this.config.provider ?? 'deployment-default',
       model: this.config.model ?? 'deployment-default',
@@ -370,6 +389,12 @@ export class FeishuService {
       approvalMounted
         ? `[dsh-channels] HITL 审批应答已就绪（决策卡片超时 ${this.config.approvalTimeoutMs} ms）`
         : '[dsh-channels] 主机未挂载 approval 服务，HITL 审批应答关闭',
+    )
+    const questionsMounted = this.ctx.get?.('userQuestions') !== undefined
+    console.info(
+      questionsMounted
+        ? `[dsh-channels] ask_user_question 应答已就绪（提问卡片超时 ${this.config.questionTimeoutMs} ms）`
+        : '[dsh-channels] 主机未挂载 userQuestions 服务，结构化提问应答关闭',
     )
   }
 
@@ -389,22 +414,21 @@ export class FeishuService {
     this.unlistenCardAction = undefined
     this.unlistenApproval?.()
     this.unlistenApproval = undefined
+    this.unlistenQuestions?.()
+    this.unlistenQuestions = undefined
     // Withdraw in-flight approval questions (the host settles them cancelled).
     this.approvalAnswerer?.dispose()
     this.approvalAnswerer = undefined
+    this.questionAnswerer?.dispose()
+    this.questionAnswerer = undefined
     if (this.gcTimer !== undefined) {
       clearInterval(this.gcTimer)
       this.gcTimer = undefined
     }
-    for (const { handle } of this.live.values()) {
-      await handle.dispose().catch(() => {})
-    }
-    this.live.clear()
-    this.pendingResume.clear()
-    this.establishing.clear()
+    await this.sessions.disposeAll()
     this.routeOperations.clear()
-    this.accepted.clear()
-    this.expiredRouteCache.clear()
+    this.inbound.clear()
+    this.routes.clear()
     try {
       await this.channel?.disconnect()
     } catch {
@@ -418,230 +442,65 @@ export class FeishuService {
 
   // ---- inbound routing -------------------------------------------------
 
-  private async handleMessage(msg: NormalizedMessage): Promise<void> {
-    const botId = this.requireChannel().botOpenId()
-    if (botId !== undefined && msg.senderId === botId) return
-    if (msg.chatType !== 'p2p' && msg.chatType !== 'group') return
-    const content = (msg.content ?? '').trim()
-    if (content === '') return
-
-    if (msg.chatType === 'p2p' && this.config.dmMode === 'disabled') return
-
-    // 0. Idempotency gate: Feishu redelivers un-acked events on WS reconnect.
-    //    The in-process guard closes the window between the persisted check
-    //    and its `put` landing; the durable record covers restarts. Recording
-    //    happens BEFORE any side effect so a redelivery is dropped, never
-    //    double-processed (at-most-once per message id).
-    if (this.accepted.has(msg.messageId)) return
-    if (this.domain?.processed.get(msg.messageId) !== undefined) return
-    this.accepted.set(msg.messageId, Date.now())
-    try {
-      await this.domain?.processed.put(msg.messageId, {
-        key: msg.messageId,
-        processedAt: Date.now(),
-      })
-      this.accepted.delete(msg.messageId)
-    } catch (error) {
-      // Best-effort: the memory guard still covers this process; the failed
-      // record only widens the crash window (pruned by the GC sweep later).
-      this.ctx.logger?.warn?.('dsh-channels: recording processed message %s failed: %s', msg.messageId, String(error))
-    }
-
-    // Enforce TTL at admission as well as in the periodic sweep. A message that
-    // arrives after the deadline must not get one chance to revive the route
-    // merely because the background GC has not run yet.
-    const expiredThread = msg.threadId === undefined
-      ? undefined
-      : await this.expiredRouteForThread(msg.threadId)
-
-    // Slash admission stays behind message-id dedup but ahead of every route,
-    // mention, workspace, Session, card-stream, and model side effect.
-    if (content.startsWith('/')) {
-      await this.handleSlashMessage(msg, content)
-      return
-    }
-
-    // A TTL-retired topic is permanently closed on the channel plane. Keeping
-    // a durable tombstone avoids silently forking a fresh Session in a topic
-    // whose visible history still belongs to the old Session.
-    if (expiredThread !== undefined) {
-      await this.sendExpiredRouteCard(msg)
-      return
-    }
-
-    // 1. Real topic route first (works without a mention, per product spec).
-    if (msg.threadId !== undefined) {
-      const record = this.lookupRoute(msg.threadId)
-      if (record !== undefined) {
-        await this.routeOperations.run(record.key, () => {
-          if (!this.started) return
-          return this.continueSession(msg, this.lookupRoute(record.key) ?? record)
-        })
-        return
-      }
-    }
-
-    // 2. Degraded chat-scoped route (topic-less fallback sessions).
-    const chatKey = chatRouteKey(msg.chatType, msg.chatId, msg.senderId)
-    const chatRecord = this.lookupRoute(chatKey)
-    if (chatRecord !== undefined) {
-      await this.routeOperations.run(chatRecord.key, () => {
-        if (!this.started) return
-        return this.continueSession(msg, this.lookupRoute(chatRecord.key) ?? chatRecord)
-      })
-      return
-    }
-
-    // 3. In-flight establishment for this (chat, user) pair: wait for it and
-    //    re-route with serial semantics (see the `establishing` field docs).
-    const pending = this.establishing.get(chatKey)
-    if (pending !== undefined) {
-      const record = await pending.catch(() => undefined)
-      if (record !== undefined
-        && (record.kind === 'chat' || (msg.threadId !== undefined && msg.threadId === record.key))) {
-        await this.routeOperations.run(record.key, () => {
-          if (!this.started) return
-          return this.continueSession(msg, this.lookupRoute(record.key) ?? record)
-        })
-        return
-      }
-      // Thread-scoped record but this message is not in that topic (or the
-      // establishment failed): fall through — a fresh session is what the
-      // serial order would have produced too.
-    }
-
-    // 4. New session: groups require a mention (unless disabled).
-    if (msg.chatType === 'group' && this.config.requireMention && !msg.mentionedBot) return
-
-    await this.startSession(msg, content)
-  }
-
-  /** Resolve the route visible to one command without creating a Session. */
-  private async commandRoute(msg: NormalizedMessage): Promise<RouteRecord | undefined> {
-    if (msg.threadId !== undefined) {
-      const threaded = this.lookupRoute(msg.threadId)
-      if (threaded !== undefined) return threaded
-    }
-    const chatKey = chatRouteKey(msg.chatType, msg.chatId, msg.senderId)
-    const degraded = this.lookupRoute(chatKey)
-    if (degraded !== undefined) return degraded
-    const pending = this.establishing.get(chatKey)
-    if (pending === undefined) return undefined
-    const record = await pending.catch(() => undefined)
-    if (record?.kind === 'chat') return record
-    if (record !== undefined && msg.threadId === record.key) return record
-    return undefined
-  }
-
+  
   /** Slash-command plane. Nothing in this method calls `agent.followup()`. */
+  /**
+   * Slash-command admission. The command vocabulary and its admission rules
+   * come from the command registry; nothing here calls `agent.followup()`.
+   */
   private async handleSlashMessage(msg: NormalizedMessage, line: string): Promise<void> {
     if (!this.started) return
     const parsed = parseSlashCommand(line)
     if (parsed === undefined) {
-      await this.sendCommandCard(msg, {
+      await this.delivery.commandCard(msg, {
         kind: 'input-error',
         text: '命令名必须以小写字母开头，且只能包含小写字母、数字、下划线或连字符。',
         supported: supportedCommandList(),
       })
       return
     }
-    if (!isSupportedCommand(parsed.name)) {
-      await this.sendCommandCard(msg, {
+    const spec = commandSpec(parsed.name)
+    if (spec === undefined) {
+      await this.delivery.commandCard(msg, {
         kind: 'unknown', command: parsed.name,
         text: `未找到命令 /${parsed.name}。`, supported: supportedCommandList(),
       })
       return
     }
 
-    if (parsed.name === 'help') {
-      if (parsed.rawInput.trim() !== '') {
-        await this.sendCommandCard(msg, {
-          kind: 'input-error', command: parsed.name, text: '用法错误：/help 不接受参数。',
-        })
-        return
-      }
-      await this.withCommandReaction(msg, async () => {
-        await this.sendCommandCard(msg, { kind: 'help', text: supportedCommandHelp() })
-      })
+    // Route-free commands answer without any Session work.
+    if (spec.routeFree === true) {
+      await this.runRouteFreeCommand(spec, msg, parsed)
       return
     }
 
-    if (parsed.name === 'userid' || parsed.name === 'groupid') {
-      if (msg.chatType === 'group'
-        && msg.threadId === undefined
-        && this.config.requireMention
-        && !msg.mentionedBot) {
-        return
-      }
-      if (parsed.rawInput.trim() !== '') {
-        await this.sendCommandCard(msg, {
-          kind: 'input-error', command: parsed.name,
-          text: `用法错误：/${parsed.name} 不接受参数。`,
-        }, { createThread: false })
-        return
-      }
-      const expectedChatType = parsed.name === 'userid' ? 'p2p' : 'group'
-      if (msg.chatType !== expectedChatType) {
-        await this.sendCommandCard(msg, {
-          kind: 'context-error', command: parsed.name,
-          text: parsed.name === 'userid'
-            ? '命令 /userid 仅支持在私聊中使用。'
-            : '命令 /groupid 仅支持在群聊中使用。',
-        }, { createThread: false })
-        return
-      }
-      await this.withCommandReaction(msg, async () => {
-        await this.sendCommandCard(msg, {
-          kind: 'success', command: parsed.name,
-          text: parsed.name === 'userid'
-            ? `当前用户 ID：\`${msg.senderId}\``
-            : `当前群组 ID：\`${msg.chatId}\``,
-        }, { createThread: false })
-      })
-      return
-    }
-
-    const expiredRoute = msg.threadId === undefined ? undefined : this.lookupExpiredRoute(msg.threadId)
+    // A TTL-retired topic is permanently closed except for session-optional
+    // diagnostics (`/health`).
+    const expiredRoute = msg.threadId === undefined ? undefined : this.routes.expiredRoute(msg.threadId)
     if (expiredRoute !== undefined) {
-      if (parsed.name === 'health') {
-        if (parsed.rawInput.trim() !== '') {
-          await this.sendCommandCard(msg, {
-            kind: 'input-error', command: parsed.name, text: '用法错误：/health 不接受参数。',
-          })
-          return
-        }
-        await this.withCommandReaction(msg, async () => {
-          await this.sendHealthCard(msg)
-        })
+      if (spec.sessionOptional === true) {
+        await this.runRouteFreeCommand(spec, msg, parsed)
         return
       }
-      await this.sendExpiredRouteCard(msg, parsed.name)
+      await this.delivery.expiredRouteCard(msg, parsed.name)
       return
     }
 
-    const route = await this.commandRoute(msg)
+    const route = await this.inbound.resolveRoute(msg)
     if (route === undefined) {
-      if (parsed.name !== 'health') {
-        await this.sendCommandCard(msg, {
-          kind: 'unbound', command: parsed.name,
-          text: '当前话题尚未绑定 Session。请先发送普通消息创建会话，或使用 /health 检查通道。',
-        })
+      if (spec.sessionOptional === true) {
+        await this.runRouteFreeCommand(spec, msg, parsed)
         return
       }
-      if (parsed.rawInput.trim() !== '') {
-        await this.sendCommandCard(msg, {
-          kind: 'input-error', command: parsed.name, text: '用法错误：/health 不接受参数。',
-        })
-        return
-      }
-      await this.withCommandReaction(msg, async () => {
-        await this.sendHealthCard(msg)
+      await this.delivery.commandCard(msg, {
+        kind: 'unbound', command: parsed.name,
+        text: '当前话题尚未绑定 Session。请先发送普通消息创建会话，或使用 /health 检查通道。',
       })
       return
     }
 
     if (msg.senderId !== route.senderOpenId) {
-      await this.sendCommandCard(msg, {
+      await this.delivery.commandCard(msg, {
         kind: 'forbidden', command: parsed.name, text: '无权操作此会话。',
       })
       return
@@ -649,183 +508,14 @@ export class FeishuService {
 
     const operation = this.routeOperations.run(route.key, async () => {
       if (!this.started) return
-      const current = this.lookupRoute(route.key) ?? route
+      const current = this.routes.get(route.key) ?? route
       if (msg.senderId !== current.senderOpenId) {
-        await this.sendCommandCard(msg, {
+        await this.delivery.commandCard(msg, {
           kind: 'forbidden', command: parsed.name, text: '无权操作此会话。',
         })
         return
       }
-      await this.withCommandReaction(msg, async () => {
-        try {
-          const live = await this.ensureLiveAgent(current)
-          let definition = this.ctx.commands.find(live.agent, parsed.name)
-          let unregisterBorrowedCommand: (() => void) | undefined
-          if (definition === undefined && parsed.name === 'renew') {
-            unregisterBorrowedCommand = registerRenewCommand(live.agent.ctx.commands)
-            definition = this.ctx.commands.find(live.agent, parsed.name)
-          }
-          if (definition === undefined && parsed.name === 'effort') {
-            unregisterBorrowedCommand = registerEffortCommand(live.agent.ctx.commands)
-            definition = this.ctx.commands.find(live.agent, parsed.name)
-          }
-          if (definition === undefined) {
-            unregisterBorrowedCommand?.()
-            const text = parsed.name === 'compact'
-              ? '当前部署未挂载 Harness 原生 /compact 命令。'
-              : `当前 Session 未挂载 /${parsed.name} 命令。`
-            await this.sendCommandCard(msg, {
-              kind: 'unavailable', command: parsed.name, text,
-              sessionId: current.sessionId,
-            })
-            return
-          }
-          const compactBefore = parsed.name === 'compact'
-            ? await this.measureCommandContext(live.agent.session)
-            : undefined
-          const controller = new AbortController()
-          this.commandControllers.add(controller)
-          const renewAdmission: RenewAdmission | undefined = parsed.name === 'renew'
-            ? { route: current, live }
-            : undefined
-          const effortAdmission: EffortAdmission | undefined = parsed.name === 'effort'
-            ? { live, controller: this.requireReasoningEffort(live.agent) }
-            : undefined
-          const disarmRenew = renewAdmission === undefined
-            ? undefined
-            : armRenewCommand(
-                controller.signal,
-                invocation => this.runRenewCommand(invocation, renewAdmission),
-              )
-          const disarmEffort = effortAdmission === undefined
-            ? undefined
-            : armEffortCommand(
-                controller.signal,
-                (invocation, action) => this.runEffortCommand(invocation, action, effortAdmission),
-              )
-          let execution
-          try {
-            execution = await this.ctx.commands.execute(live.agent, line, [], controller.signal)
-          } finally {
-            this.commandControllers.delete(controller)
-            disarmRenew?.()
-            disarmEffort?.()
-            unregisterBorrowedCommand?.()
-            if (renewAdmission !== undefined) {
-              if (renewAdmission.commit !== undefined) {
-                await this.releaseRenewedAgent(renewAdmission.commit)
-              }
-            }
-          }
-          if (controller.signal.aborted || !this.started) return
-          if (execution === undefined) {
-            await this.sendCommandCard(msg, {
-              kind: 'unavailable', command: parsed.name,
-              text: `当前 Session 无法执行 /${parsed.name}。`, sessionId: current.sessionId,
-            })
-            return
-          }
-          const result = execution.result
-          if (parsed.name === 'effort') effortAdmission?.controller.sync(live.agent.session.events)
-          if (parsed.name === 'renew' && result.kind === 'success' && renewAdmission?.commit !== undefined) {
-            await this.sendStandaloneCard(msg, buildRenewCard({
-              previousSessionId: renewAdmission.commit.previous.sessionId,
-              currentSessionId: renewAdmission.commit.current.sessionId,
-              workspacePath: renewAdmission.commit.current.workspacePath,
-            }))
-            return
-          }
-          if (parsed.name === 'health' && result.kind === 'success') {
-            await this.sendHealthCard(msg)
-            return
-          }
-          if (parsed.name === 'status' && result.kind === 'success') {
-            const stats = foldAll(live.agent.session.events)
-            const context = await measureSessionContext(
-              live.agent.session, this.commandContextServices(), stats.lastHeader,
-            )
-            await this.sendStandaloneCard(msg, buildSessionStatusCard({
-              sessionId: current.sessionId,
-              stats,
-              context,
-            }))
-            return
-          }
-          if (parsed.name === 'workspace' && result.kind === 'success') {
-            const resolved = resolveWorkDir(live.agent.session.header.cwd, current.workspacePath)
-            if (resolved.kind === 'success') {
-              await this.sendStandaloneCard(msg, buildWorkDirCard(current.sessionId, resolved.path))
-              return
-            }
-            if (resolved.kind === 'mismatch') {
-              this.ctx.logger?.warn?.(
-                'dsh-channels: workspace mismatch for session %s (paths redacted)', current.sessionId,
-              )
-            }
-            await this.sendCommandCard(msg, {
-              kind: 'unavailable', command: parsed.name,
-              text: resolved.text, sessionId: current.sessionId,
-            })
-            return
-          }
-          if (parsed.name === 'history' && result.kind === 'success') {
-            await this.sendStandaloneCard(msg, buildSessionHistoryCard(current))
-            return
-          }
-          if (parsed.name === 'export' && result.kind === 'success') {
-            try {
-              const file = await this.sessionExportBuilder(live.agent.session)
-              await this.requireChannel().send(msg.chatId, { file }, {
-                replyTo: msg.messageId,
-                replyInThread: true,
-              })
-            } catch (error) {
-              this.ctx.logger?.warn?.(
-                'dsh-channels: logical export delivery failed for session %s: %s',
-                current.sessionId, String(error),
-              )
-              await this.sendCommandCard(msg, {
-                kind: 'internal-error', command: parsed.name,
-                text: 'Session 逻辑日志导出失败，未交付文件；请稍后重试并查看 Harness 日志。',
-                sessionId: current.sessionId,
-              })
-            }
-            return
-          }
-          if (parsed.name === 'compact' && compactBefore !== undefined) {
-            const compactAfter = await this.measureCommandContext(live.agent.session)
-            if (result.kind === 'success') {
-              await this.sendStandaloneCard(msg, buildCompactComparisonCard({
-                sessionId: current.sessionId,
-                resultText: result.text ?? '命令已执行。',
-                before: compactBefore,
-                after: compactAfter,
-              }))
-              return
-            }
-            await this.sendCommandCard(msg, {
-              kind: commandResultCardKind(result), command: parsed.name,
-              text: `${result.text}\n\n${compactFailureContext(compactBefore, compactAfter)}`,
-              sessionId: current.sessionId,
-            })
-            return
-          }
-          await this.sendCommandCard(msg, {
-            kind: commandResultCardKind(result), command: parsed.name,
-            text: result.text ?? '命令已执行。', sessionId: current.sessionId,
-          })
-        } catch (error) {
-          this.ctx.logger?.warn?.(
-            'dsh-channels: command /%s failed for session %s: %s',
-            parsed.name, current.sessionId, String(error),
-          )
-          await this.sendCommandCard(msg, {
-            kind: 'internal-error', command: parsed.name,
-            text: '命令执行失败，请稍后重试；若持续发生，请查看 Harness 日志。',
-            sessionId: current.sessionId,
-          })
-        }
-      })
+      await this.runRouteCommand(spec, msg, parsed, current)
     })
     this.commandOperations.add(operation)
     try {
@@ -835,42 +525,432 @@ export class FeishuService {
     }
   }
 
-  /** Apply the command-only Typing → DONE reaction lifecycle. */
-  private async withCommandReaction(msg: NormalizedMessage, operation: () => Promise<void>): Promise<void> {
-    if (!this.started) return
-    const channel = this.requireChannel()
-    const reactionId = await channel.addReaction(msg.messageId, 'Typing').catch(() => undefined)
-    try {
-      await operation()
-    } finally {
-      if (reactionId !== undefined) {
-        await channel.removeReaction(msg.messageId, reactionId).catch(() => {})
-      }
-      await channel.addReaction(msg.messageId, 'DONE').catch(() => {})
-    }
-  }
-
-  /** Standalone, non-streaming result card with a non-threaded fallback. */
-  private async sendCommandCard(
+  /** Answer one command that needs no Session (help / userid / groupid / health). */
+  private async runRouteFreeCommand(
+    spec: ChannelCommandSpec,
     msg: NormalizedMessage,
-    state: CommandCardState,
-    options: { createThread?: boolean } = {},
+    parsed: ParsedSlashCommand,
   ): Promise<void> {
-    await this.sendStandaloneCard(msg, buildCommandResultCard(state), options)
-  }
-
-  /** Reject a post-TTL topic message without creating or resuming an Agent. */
-  private async sendExpiredRouteCard(msg: NormalizedMessage, command?: string): Promise<void> {
-    await this.sendCommandCard(msg, {
-      kind: 'expired',
-      ...(command === undefined ? {} : { command }),
-      text: EXPIRED_ROUTE_TEXT,
+    const createThread = spec.directReply !== true
+    if (parsed.rawInput.trim() !== '') {
+      await this.delivery.commandCard(msg, {
+        kind: 'input-error', command: spec.name, text: `用法错误：/${spec.name} 不接受参数。`,
+      }, { createThread })
+      return
+    }
+    if (spec.mentionGate === true
+      && msg.chatType === 'group'
+      && msg.threadId === undefined
+      && this.config.requireMention
+      && !msg.mentionedBot) {
+      return
+    }
+    if (spec.chatType !== undefined && msg.chatType !== spec.chatType) {
+      await this.delivery.commandCard(msg, {
+        kind: 'context-error', command: spec.name,
+        text: spec.chatType === 'p2p'
+          ? `命令 /${spec.name} 仅支持在私聊中使用。`
+          : `命令 /${spec.name} 仅支持在群聊中使用。`,
+      }, { createThread })
+      return
+    }
+    await this.delivery.withCommandReaction(msg, async () => {
+      switch (spec.name) {
+        case 'help':
+          await this.delivery.commandCard(msg, { kind: 'help', text: supportedCommandHelp() }, { createThread })
+          return
+        case 'userid':
+          await this.delivery.commandCard(msg, {
+            kind: 'success', command: spec.name, text: `当前用户 ID：\`${msg.senderId}\``,
+          }, { createThread })
+          return
+        case 'groupid':
+          await this.delivery.commandCard(msg, {
+            kind: 'success', command: spec.name, text: `当前群组 ID：\`${msg.chatId}\``,
+          }, { createThread })
+          return
+        case 'health':
+          await this.delivery.standaloneReply(msg, buildHealthCard(this.healthSnapshot()), { createThread })
+          return
+        default:
+          await this.delivery.commandCard(msg, {
+            kind: 'unavailable', command: spec.name, text: `命令 /${spec.name} 暂不可用。`,
+          }, { createThread })
+      }
     })
   }
 
-  /** Collect and send a privacy-preserving snapshot without Session I/O. */
-  private async sendHealthCard(msg: NormalizedMessage): Promise<void> {
-    await this.sendStandaloneCard(msg, buildHealthCard(this.healthSnapshot()))
+  /** Answer one route-bound command inside the per-route admission queue. */
+  private async runRouteCommand(
+    spec: ChannelCommandSpec,
+    msg: NormalizedMessage,
+    parsed: ParsedSlashCommand,
+    current: RouteRecord,
+  ): Promise<void> {
+    await this.delivery.withCommandReaction(msg, async () => {
+      try {
+        if (spec.channelPlane === true) {
+          await this.runChannelCommand(spec, msg, parsed, current)
+          return
+        }
+        await this.runAgentCommand(spec, msg, parsed, current)
+      } catch (error) {
+        this.ctx.logger?.warn?.(
+          'dsh-channels: command /%s failed for session %s: %s',
+          spec.name, current.sessionId, String(error),
+        )
+        await this.delivery.commandCard(msg, {
+          kind: 'internal-error', command: spec.name,
+          text: '命令执行失败，请稍后重试；若持续发生，请查看 Harness 日志。',
+          sessionId: current.sessionId,
+        })
+      }
+    })
+  }
+
+  /**
+   * Commands the channel answers itself. `/stop` aborts the live turn
+   * directly and deliberately never cold-resumes a Session just to cancel
+   * nothing.
+   */
+  private async runChannelCommand(
+    spec: ChannelCommandSpec,
+    msg: NormalizedMessage,
+    parsed: ParsedSlashCommand,
+    current: RouteRecord,
+  ): Promise<void> {
+    if (spec.name === 'permissions') {
+      await this.runPermissionsCommand(msg, parsed, current)
+      return
+    }
+    if (spec.name === 'stop') {
+      const agent = this.sessions.get(current.sessionId)?.agent
+        ?? this.ctx.agents.get(current.sessionId as SessionId)
+      const running = agent?.status === 'running'
+      agent?.cancel?.({ kind: 'user' })
+      await this.delivery.commandCard(msg, {
+        kind: 'success', command: 'stop', sessionId: current.sessionId,
+        text: running ? '已请求停止当前回合。' : '当前没有正在运行的回合。',
+      })
+      return
+    }
+    await this.delivery.commandCard(msg, {
+      kind: 'unavailable', command: spec.name, text: `命令 /${spec.name} 暂不可用。`,
+      sessionId: current.sessionId,
+    })
+  }
+
+  /**
+   * `/permissions`: show this Session's effective sandbox+approval preset and
+   * the selectable catalog; switch only when the deployment opted in.
+   */
+  private async runPermissionsCommand(
+    msg: NormalizedMessage,
+    parsed: ParsedSlashCommand,
+    current: RouteRecord,
+  ): Promise<void> {
+    const presets = this.ctx.get?.('permissionPresets') as PermissionPresets | undefined
+    if (presets === undefined) {
+      await this.delivery.commandCard(msg, {
+        kind: 'unavailable', command: 'permissions', sessionId: current.sessionId,
+        text: '当前部署未挂载 permissionPresets 服务，无法查看权限预设。',
+      })
+      return
+    }
+    const live = await this.sessions.ensureLive(current)
+    let active: string | undefined
+    let catalogLine = ''
+    try {
+      active = presets.current(live.agent.session)
+      const catalog = presets.catalog()
+      catalogLine = catalog.options.map(option => `\`${option.value}\``).join('、')
+    } catch {
+      active = undefined
+    }
+    const requested = parsed.rawInput.trim()
+    if (requested === '') {
+      const lines = [
+        `**当前权限预设**：${active === undefined ? '暂无数据' : `\`${active}\``}`,
+        ...(catalogLine === '' ? [] : [`**可选预设**：${catalogLine}`]),
+        ...(this.config.allowPermissionSwitch
+          ? ['使用 `/permissions <name>` 切换；切换会同时调整沙箱与审批策略。']
+          : ['当前部署未开启飞书侧切换（`allowPermissionSwitch: false`），仅支持查看。']),
+      ]
+      await this.delivery.standaloneReply(msg, standaloneInfoCard('**🔐 权限预设**', lines))
+      return
+    }
+    if (!this.config.allowPermissionSwitch) {
+      await this.delivery.commandCard(msg, {
+        kind: 'unavailable', command: 'permissions', sessionId: current.sessionId,
+        text: '当前部署未开启飞书侧权限切换，仅支持 /permissions 查看。',
+      })
+      return
+    }
+    try {
+      presets.set(live.agent.session, requested)
+      await this.delivery.standaloneReply(msg, standaloneInfoCard('**🔐 权限预设已切换**', [
+        `**当前权限预设**：\`${requested}\``,
+        '沙箱模式与审批策略已按该预设更新。',
+      ]))
+    } catch (error) {
+      this.ctx.logger?.warn?.(
+        'dsh-channels: permission switch for session %s failed: %s', current.sessionId, String(error),
+      )
+      await this.delivery.commandCard(msg, {
+        kind: 'input-error', command: 'permissions', sessionId: current.sessionId,
+        text: `未知或不可用的权限预设：\`${requested}\`。可用：${catalogLine === '' ? '暂无数据' : catalogLine}`,
+      })
+    }
+  }
+
+  /**
+   * Execute one command through the agent command plane: resolve the live
+   * agent, mount borrowed channel commands when needed, arm the channel-scoped
+   * `/renew` and `/effort` handlers, then render the settled result.
+   */
+  private async runAgentCommand(
+    spec: ChannelCommandSpec,
+    msg: NormalizedMessage,
+    parsed: ParsedSlashCommand,
+    current: RouteRecord,
+  ): Promise<void> {
+    // An alias (`/new`) resolves to this canonical spec; execute the canonical
+    // line so the agent command plane finds the registered definition.
+    const line = `/${spec.name}${parsed.rawInput}`
+    const live = await this.sessions.ensureLive(current)
+    let definition = this.ctx.commands.find(live.agent, spec.name)
+    let unregisterBorrowedCommand: (() => void) | undefined
+    if (definition === undefined && spec.name === 'renew') {
+      unregisterBorrowedCommand = registerRenewCommand(live.agent.ctx.commands)
+      definition = this.ctx.commands.find(live.agent, spec.name)
+    }
+    if (definition === undefined && spec.name === 'effort') {
+      unregisterBorrowedCommand = registerEffortCommand(live.agent.ctx.commands)
+      definition = this.ctx.commands.find(live.agent, spec.name)
+    }
+    if (definition === undefined && spec.name === 'model') {
+      unregisterBorrowedCommand = registerModelCommand(live.agent.ctx.commands)
+      definition = this.ctx.commands.find(live.agent, spec.name)
+    }
+    if (definition === undefined) {
+      unregisterBorrowedCommand?.()
+      const text = spec.name === 'compact'
+        ? '当前部署未挂载 Harness 原生 /compact 命令。'
+        : `当前 Session 未挂载 /${spec.name} 命令。`
+      await this.delivery.commandCard(msg, {
+        kind: 'unavailable', command: spec.name, text, sessionId: current.sessionId,
+      })
+      return
+    }
+    const compactBefore = spec.name === 'compact'
+      ? await this.measureCommandContext(live.agent.session)
+      : undefined
+    const controller = new AbortController()
+    this.commandControllers.add(controller)
+    const renewAdmission: RenewAdmission | undefined = spec.name === 'renew'
+      ? { route: current, live }
+      : undefined
+    const effortAdmission: EffortAdmission | undefined = spec.name === 'effort'
+      ? { live, controller: this.sessions.requestPolicy(live.agent) }
+      : undefined
+    const modelAdmission: ModelAdmission | undefined = spec.name === 'model'
+      ? { live, controller: this.sessions.requestPolicy(live.agent) }
+      : undefined
+    const disarmRenew = renewAdmission === undefined
+      ? undefined
+      : armRenewCommand(controller.signal, invocation => this.runRenewCommand(invocation, renewAdmission))
+    const disarmEffort = effortAdmission === undefined
+      ? undefined
+      : armEffortCommand(
+          controller.signal,
+          (invocation, action) => this.runEffortCommand(invocation, action, effortAdmission),
+        )
+    const disarmModel = modelAdmission === undefined
+      ? undefined
+      : armModelCommand(
+          controller.signal,
+          (invocation, rawInput) => this.runModelCommand(invocation, rawInput, modelAdmission),
+        )
+    let execution
+    try {
+      execution = await this.ctx.commands.execute(live.agent, line, [], controller.signal)
+    } finally {
+      this.commandControllers.delete(controller)
+      disarmRenew?.()
+      disarmEffort?.()
+      disarmModel?.()
+      unregisterBorrowedCommand?.()
+      if (renewAdmission?.commit !== undefined) {
+        await this.sessions.releaseRenewed(renewAdmission.commit)
+      }
+    }
+    if (controller.signal.aborted || !this.started) return
+    if (execution === undefined) {
+      await this.delivery.commandCard(msg, {
+        kind: 'unavailable', command: spec.name,
+        text: `当前 Session 无法执行 /${spec.name}。`, sessionId: current.sessionId,
+      })
+      return
+    }
+    await this.renderCommandResult({
+      spec, msg, current, live,
+      result: execution.result,
+      compactBefore,
+      renewAdmission,
+      effortAdmission,
+      modelAdmission,
+    })
+  }
+
+  /** Render one settled agent-plane command result. */
+  private async renderCommandResult(input: {
+    spec: ChannelCommandSpec
+    msg: NormalizedMessage
+    current: RouteRecord
+    live: LiveAgent
+    result: CommandResult
+    compactBefore: ContextMeasurement | undefined
+    renewAdmission: RenewAdmission | undefined
+    effortAdmission: EffortAdmission | undefined
+    modelAdmission: ModelAdmission | undefined
+  }): Promise<void> {
+    const { spec, msg, current, live, result, compactBefore, renewAdmission, effortAdmission, modelAdmission } = input
+    if (spec.name === 'effort') effortAdmission?.controller.sync(live.agent.session.snapshotEvents())
+    if (spec.name === 'model') modelAdmission?.controller.sync(live.agent.session.snapshotEvents())
+    if (spec.name === 'renew' && result.kind === 'success' && renewAdmission?.commit !== undefined) {
+      await this.delivery.standaloneReply(msg, buildRenewCard({
+        previousSessionId: renewAdmission.commit.previous.sessionId,
+        currentSessionId: renewAdmission.commit.current.sessionId,
+        workspacePath: renewAdmission.commit.current.workspacePath,
+      }))
+      return
+    }
+    if (spec.name === 'health' && result.kind === 'success') {
+      await this.delivery.standaloneReply(msg, buildHealthCard(this.healthSnapshot()))
+      return
+    }
+    if (spec.name === 'status' && result.kind === 'success') {
+      const session = live.agent.session
+      const stats = foldSessionStats(session, this.projectionRegistry())
+      const context = await measureSessionContext(
+        session, this.commandContextServices(), stats.lastHeader,
+      )
+      await this.delivery.standaloneReply(msg, buildSessionStatusCard({
+        sessionId: current.sessionId,
+        stats,
+        context,
+        extras: {
+          permissionPreset: this.permissionPresetOf(session),
+          workspacePath: current.workspacePath,
+          uptimeMs: this.startedAt === undefined ? undefined : Date.now() - this.startedAt,
+          liveAgents: this.sessions.liveCount(),
+          routeCount: this.routes.size(),
+        },
+      }))
+      return
+    }
+    if (spec.name === 'workspace' && result.kind === 'success') {
+      const resolved = resolveWorkDir(live.agent.session.header.cwd, current.workspacePath)
+      if (resolved.kind === 'success') {
+        await this.delivery.standaloneReply(msg, buildWorkDirCard(current.sessionId, resolved.path))
+        return
+      }
+      if (resolved.kind === 'mismatch') {
+        this.ctx.logger?.warn?.(
+          'dsh-channels: workspace mismatch for session %s (paths redacted)', current.sessionId,
+        )
+      }
+      await this.delivery.commandCard(msg, {
+        kind: 'unavailable', command: spec.name,
+        text: resolved.text, sessionId: current.sessionId,
+      })
+      return
+    }
+    if (spec.name === 'history' && result.kind === 'success') {
+      await this.delivery.standaloneReply(msg, buildSessionHistoryCard(
+        current, await this.sessionHistoryAnnotations(current),
+      ))
+      return
+    }
+    if (spec.name === 'export' && result.kind === 'success') {
+      try {
+        const file = await this.sessionExportBuilder(live.agent.session)
+        await this.delivery.requireChannel().send(msg.chatId, { file }, {
+          replyTo: msg.messageId,
+          replyInThread: true,
+        })
+      } catch (error) {
+        this.ctx.logger?.warn?.(
+          'dsh-channels: logical export delivery failed for session %s: %s',
+          current.sessionId, String(error),
+        )
+        await this.delivery.commandCard(msg, {
+          kind: 'internal-error', command: spec.name,
+          text: 'Session 逻辑日志导出失败，未交付文件；请稍后重试并查看 Harness 日志。',
+          sessionId: current.sessionId,
+        })
+      }
+      return
+    }
+    if (spec.name === 'compact' && compactBefore !== undefined) {
+      const compactAfter = await this.measureCommandContext(live.agent.session)
+      if (result.kind === 'success') {
+        await this.delivery.standaloneReply(msg, buildCompactComparisonCard({
+          sessionId: current.sessionId,
+          resultText: result.text ?? '命令已执行。',
+          before: compactBefore,
+          after: compactAfter,
+        }))
+        return
+      }
+      await this.delivery.commandCard(msg, {
+        kind: commandResultCardKind(result), command: spec.name,
+        text: `${result.text}\n\n${compactFailureContext(compactBefore, compactAfter)}`,
+        sessionId: current.sessionId,
+      })
+      return
+    }
+    await this.delivery.commandCard(msg, {
+      kind: commandResultCardKind(result), command: spec.name,
+      text: result.text ?? '命令已执行。', sessionId: current.sessionId,
+    })
+  }
+
+  /**
+   * Annotate a route's session history with host-query facts: the latest
+   * log-backed title per session and whether it is currently live. Both are
+   * best-effort — a missing or failing `sessionQuery` only drops the titles.
+   */
+  private async sessionHistoryAnnotations(record: RouteRecord): Promise<Record<string, SessionHistoryAnnotation>> {
+    const ids = normalizeSessionHistory(record)
+      .slice(-SESSION_HISTORY_DISPLAY_LIMIT)
+      .map(entry => entry.sessionId)
+    const annotations: Record<string, SessionHistoryAnnotation> = {}
+    for (const id of ids) {
+      annotations[id] = { live: this.sessions.get(id) !== undefined || this.ctx.agents.get(id as SessionId) !== undefined }
+    }
+    const query = this.ctx.get?.('sessionQuery') as SessionQuery | undefined
+    if (query === undefined) return annotations
+    try {
+      const results = await query.readTitleSnapshots(ids as SessionId[])
+      for (const item of results) {
+        if (item.status !== 'fulfilled' || item.value.title === undefined) continue
+        annotations[item.sessionId] = { ...annotations[item.sessionId], title: item.value.title.title }
+      }
+    } catch (error) {
+      this.ctx.logger?.warn?.('dsh-channels: session title lookup failed: %s', String(error))
+    }
+    return annotations
+  }
+
+  /** Effective permission preset of one Session, when the service is mounted. */
+  private permissionPresetOf(session: Session): string | undefined {
+    const presets = this.ctx.get?.('permissionPresets') as PermissionPresets | undefined
+    try {
+      return presets?.current(session)
+    } catch {
+      return undefined
+    }
   }
 
   /** Optional diagnostic services resolved without topology-sensitive property access. */
@@ -884,38 +964,6 @@ export class FeishuService {
   /** Exact command-time measurement shared by `/status` and `/compact`. */
   private measureCommandContext(session: Session): Promise<ContextMeasurement> {
     return measureSessionContext(session, this.commandContextServices())
-  }
-
-  /** Shared delivery policy for command-plane cards. */
-  private async sendStandaloneCard(
-    msg: NormalizedMessage,
-    card: object,
-    options: { createThread?: boolean } = {},
-  ): Promise<void> {
-    const channel = this.channel
-    if (!this.started || channel === undefined) return
-    const createThread = options.createThread ?? true
-    try {
-      await channel.send(msg.chatId, { card }, createThread
-        ? { replyTo: msg.messageId, replyInThread: true }
-        : { replyTo: msg.messageId })
-    } catch (error) {
-      if (!createThread) {
-        this.ctx.logger?.warn?.(
-          'dsh-channels: direct command result delivery failed for message %s: %s',
-          msg.messageId, String(error),
-        )
-        return
-      }
-      try {
-        await channel.send(msg.chatId, { card }, { replyTo: msg.messageId })
-      } catch (fallbackError) {
-        this.ctx.logger?.warn?.(
-          'dsh-channels: command result delivery failed for message %s: %s / %s',
-          msg.messageId, String(error), String(fallbackError),
-        )
-      }
-    }
   }
 
   /** Capture aggregate health only; raw configuration and errors are excluded. */
@@ -959,14 +1007,7 @@ export class FeishuService {
       // exposing or propagating an internal registry error to the user.
     }
 
-    let inflightTurnCount = 0
-    try {
-      if (this.domain !== undefined) {
-        for (const _entry of this.domain.inflight.entries()) inflightTurnCount++
-      }
-    } catch {
-      // The storage dependency is reported separately; never expose details.
-    }
+    const inflightTurnCount = this.repair.count()
 
     let connection
     let botOpenId: string | undefined
@@ -979,196 +1020,21 @@ export class FeishuService {
       connection,
       botOpenId,
       started: this.started,
-      routeCount: this.routeCache.size,
-      liveAgentCount: this.live.size,
+      routeCount: this.routes.size(),
+      liveAgentCount: this.sessions.liveCount(),
       inflightTurnCount,
     })
   }
 
-  private lookupRoute(key: string): RouteRecord | undefined {
-    const cached = this.routeCache.get(key)
-    if (cached !== undefined) return cached
-    const stored = this.domain?.routes.get(key)
-    if (stored === undefined) return undefined
-    const normalized = normalizeRouteRecord(stored)
-    this.routeCache.set(key, normalized)
-    return normalized
-  }
 
-  private lookupExpiredRoute(key: string): ExpiredRouteRecord | undefined {
-    const cached = this.expiredRouteCache.get(key)
-    if (cached !== undefined) return cached
-    const stored = this.domain?.expiredRoutes.get(key)
-    if (stored === undefined) return undefined
-    this.expiredRouteCache.set(key, stored)
-    return stored
-  }
 
-  /** Whether one active route has crossed the configured inactivity deadline. */
-  private routeHasExpired(record: RouteRecord, now = Date.now()): boolean {
-    return this.config.routeTtlMs > 0
-      && record.lastActivityAt < now - this.config.routeTtlMs
-  }
 
-  /**
-   * Resolve or create the persistent tombstone for a thread whose active route
-   * has crossed TTL. Tombstone publication comes first and wins even if the
-   * best-effort active-route delete fails.
-   */
-  private async expiredRouteForThread(key: string, now = Date.now()): Promise<ExpiredRouteRecord | undefined> {
-    const existing = this.lookupExpiredRoute(key)
-    if (existing !== undefined) {
-      this.routeCache.delete(key)
-      if (this.domain?.routes.get(key) !== undefined) {
-        try {
-          await this.domain.routes.delete(key)
-        } catch (error) {
-          this.ctx.logger?.warn?.('dsh-channels: deleting tombstoned route %s failed: %s', key, String(error))
-        }
-      }
-      return existing
-    }
-    const record = this.lookupRoute(key)
-    if (record === undefined || record.kind !== 'thread' || !this.routeHasExpired(record, now)) return undefined
 
-    const expired: ExpiredRouteRecord = {
-      key,
-      chatId: record.chatId,
-      chatType: record.chatType,
-      senderOpenId: record.senderOpenId,
-      expiredAt: now,
-    }
-    await this.domain?.expiredRoutes.put(key, expired)
-    this.expiredRouteCache.set(key, expired)
-    this.routeCache.delete(key)
-    try {
-      await this.domain?.routes.delete(key)
-    } catch (error) {
-      // The durable tombstone already makes expiry fail-closed. Keep serving
-      // the explicit rejection and let a later sweep retry the stale delete.
-      this.ctx.logger?.warn?.('dsh-channels: deleting retired route %s failed: %s', key, String(error))
-    }
-    return expired
-  }
 
-  private async persistRoute(key: string, record: RouteRecord): Promise<void> {
-    await this.domain?.routes.put(key, record)
-    this.routeCache.set(key, normalizeRouteRecord(record))
-  }
 
-  // ---- in-flight turn snapshots (restart repair) -------------------------
 
-  /** Write the turn's repair snapshot. Keyed by the main card message id. */
-  private async writeInflightSnapshot(snapshot: InflightSnapshot): Promise<void> {
-    await this.domain?.inflight.put(snapshot.key, snapshot)
-  }
 
-  /** Retire a snapshot (turn finalized / creation failed). Never throws. */
-  private async clearInflight(key: string): Promise<void> {
-    if (key === '') return
-    try {
-      await this.domain?.inflight.delete(key)
-    } catch (error) {
-      this.ctx.logger?.warn?.('dsh-channels: clearing inflight snapshot %s failed: %s', key, String(error))
-    }
-  }
 
-  /**
-   * Fold a resolved segment card id into the turn's snapshot (atomic
-   * read-modify-write). A missing snapshot means the turn already finalized
-   * (the finalize delete won the race) — silently skipped.
-   */
-  private async recordSegmentDelivery(
-    mainCardMessageId: string,
-    segmentIndex: number,
-    messageId: string,
-    mode: 'card' | 'text',
-  ): Promise<void> {
-    if (mainCardMessageId === '') return
-    try {
-      await this.domain?.inflight.update(mainCardMessageId, snapshot => {
-        // The snapshot starts with only the main card; segment sends are
-        // serialized in order, so a delivery for index `cards.length` is the
-        // next segment (append), anything below replaces, and a gap beyond
-        // the tail cannot happen under the serialized chain (ignored).
-        const cards = [...snapshot.cards]
-        if (segmentIndex === cards.length) {
-          cards.push({ messageId, mode })
-        } else if (segmentIndex >= 0 && segmentIndex < cards.length) {
-          cards[segmentIndex] = { messageId, mode }
-        } else {
-          return snapshot
-        }
-        return { ...snapshot, cards }
-      })
-    } catch (error) {
-      this.ctx.logger?.warn?.(
-        'dsh-channels: updating inflight snapshot %s failed: %s', mainCardMessageId, String(error),
-      )
-    }
-  }
-
-  /**
-   * Startup repair pass: settle every card a previous instance left
-   * mid-flight. Runs in the background right after the long connection is
-   * established; each snapshot is independent and best-effort.
-   *
-   * Per snapshot: patch every `card`-mode card to the terminal interrupted
-   * state (the partial body is gone with the old process; patch is full
-   * replacement), best-effort swap Typing → DONE, then delete. A failed card
-   * patch keeps the snapshot for one more attempt (capped at 2) so a
-   * transient failure at boot does not lose the repair, while a medium that
-   * permanently rejects the patch cannot trigger an endless retry loop.
-   */
-  private async repairInflight(): Promise<void> {
-    const table = this.domain?.inflight
-    if (table === undefined) return
-    const snapshots = [...table.entries()]
-    if (snapshots.length === 0) return
-    // With GC enabled, snapshots older than the TTL are the GC pass's job:
-    // repairing an ancient card would surprise the user, so repair skips
-    // them and lets the GC drop them silently (both passes run at boot).
-    const ttlMs = this.config.routeTtlMs
-    const cutoff = ttlMs === 0 ? undefined : Date.now() - ttlMs
-    const due = snapshots.filter(([, snapshot]) => cutoff === undefined || snapshot.startedAt >= cutoff)
-    if (due.length === 0) return
-    this.ctx.logger?.info?.('dsh-channels: repairing %d interrupted turn(s)', due.length)
-    for (const [key, snapshot] of due) {
-      try {
-        await this.repairSnapshot(snapshot)
-        await table.delete(key)
-        this.ctx.logger?.info?.('dsh-channels: repaired interrupted turn card %s', key)
-      } catch (error) {
-        this.ctx.logger?.warn?.('dsh-channels: repair of turn card %s failed: %s', key, String(error))
-        const attempts = snapshot.attempts + 1
-        try {
-          if (attempts >= 2) {
-            await table.delete(key)
-          } else {
-            await table.put(key, { ...snapshot, attempts })
-          }
-        } catch {
-          // The domain may already be closing (shutdown raced the repair).
-        }
-      }
-    }
-  }
-
-  /** Patch the cards of one interrupted turn to their terminal state. */
-  private async repairSnapshot(snapshot: InflightSnapshot): Promise<void> {
-    const channel = this.requireChannel()
-    for (const [index, card] of snapshot.cards.entries()) {
-      if (card.mode !== 'card') continue
-      // Full replacement: the interrupted card's streamed content lived only
-      // in the previous process. Continuation cards keep their segment header.
-      const options = index === 0 ? {} : { panel: false, segment: index + 1 }
-      await channel.updateCard(card.messageId, buildInterruptionCard(options))
-    }
-    if (snapshot.reactionId !== undefined) {
-      await channel.removeReaction(snapshot.triggerMessageId, snapshot.reactionId).catch(() => {})
-    }
-    await channel.addReaction(snapshot.triggerMessageId, 'DONE').catch(() => {})
-  }
 
   /**
    * GC pass over the routing domain. Two independent halves:
@@ -1208,9 +1074,7 @@ export class FeishuService {
         }
       }
     }
-    for (const [messageId, acceptedAt] of this.accepted) {
-      if (acceptedAt < processedCutoff) this.accepted.delete(messageId)
-    }
+    this.inbound.pruneAccepted(processedCutoff)
 
     const ttlMs = this.config.routeTtlMs
     if (ttlMs === 0) {
@@ -1227,11 +1091,10 @@ export class FeishuService {
         if (record.lastActivityAt >= cutoff) continue
         try {
           if (record.kind === 'thread') {
-            await this.expiredRouteForThread(key, now)
+            await this.routes.expireThread(key, now)
             retiredThreadRoutes++
           } else {
-            await routes.delete(key)
-            this.routeCache.delete(key)
+            await this.routes.remove(key)
           }
           removedRoutes++
         } catch (error) {
@@ -1261,16 +1124,6 @@ export class FeishuService {
     }
   }
 
-  /** Find the route record owning a session (prefers the thread route). */
-  private findRouteBySession(sessionId: string): RouteRecord | undefined {
-    let fallback: RouteRecord | undefined
-    for (const record of this.routeCache.values()) {
-      if (record.sessionId !== sessionId) continue
-      if (record.kind === 'thread') return record
-      fallback ??= record
-    }
-    return fallback
-  }
 
   /**
    * HITL answerer hook: the Feishu placement of one session's approval cards,
@@ -1278,7 +1131,7 @@ export class FeishuService {
    * then delegates to other answerers).
    */
   private approvalRouteFor(sessionId: string): ApprovalRoute | undefined {
-    const record = this.findRouteBySession(sessionId)
+    const record = this.routes.findBySession(sessionId)
     if (record === undefined) return undefined
     return {
       chatId: record.chatId,
@@ -1295,130 +1148,77 @@ export class FeishuService {
    * segment is re-delivered as a plain-text message so the content is never
    * lost — text messages carry no card constraints.
    */
-  private async sendSegmentCard(
-    sessionId: string,
-    segment: number,
-    card: object,
-    fallbackText: string,
-  ): Promise<{ messageId: string; mode: 'card' | 'text' }> {
-    const record = this.findRouteBySession(sessionId)
-    if (record === undefined) {
-      throw new Error(`dsh-channels: no route record for session ${sessionId}; segment card not sent`)
+  /** Authorized Session-level `/model` view/switch operation. */
+  private async runModelCommand(
+    invocation: CommandInvocation,
+    rawInput: string,
+    admission: ModelAdmission,
+  ): Promise<CommandResult> {
+    if (admission.live.agent !== invocation.agent) {
+      return { kind: 'error', text: '/model 只能通过已授权的飞书话题执行。' }
     }
-    const options = { replyTo: record.cardMessageId, replyInThread: record.kind === 'thread' }
+    const session = invocation.agent.session
+    const state = admission.controller.state
+    const header = session.requestHeader?.()?.config
+    const currentProvider = state.effectiveModel?.provider
+      ?? (typeof header?.provider === 'string' && header.provider !== '' ? header.provider : undefined)
+    const currentModel = state.effectiveModel?.model
+      ?? (typeof header?.model === 'string' && header.model !== '' ? header.model : undefined)
+    const source = state.modelSource === 'session'
+      ? 'Session 覆盖'
+      : state.modelSource === 'config' ? '配置默认' : '部署默认'
+
+    if (rawInput === '') {
+      const lines = [
+        `**当前模型**：${currentModel === undefined ? '尚无模型请求记录' : `\`${currentModel}\``}`
+          + `${currentProvider === undefined ? '' : `（provider \`${currentProvider}\`）`} · ${source}`,
+      ]
+      const models = await this.listModels(currentProvider)
+      if (models.length > 0) {
+        lines.push(`**可选模型（${models.length}）**：${models.slice(0, 20).map(id => `\`${id}\``).join('、')}`
+          + (models.length > 20 ? ' …' : ''))
+      } else if (currentProvider === undefined) {
+        lines.push('当前还没有模型请求记录；可先用 `/model <provider>/<model>` 指定，或先发一条普通消息。')
+      }
+      lines.push('用法：`/model <模型-id>`（沿用当前 provider）· `/model <provider>/<model>` · `/model reset`')
+      return { kind: 'success', text: lines.join('\n') }
+    }
+
+    if (rawInput === 'reset') {
+      return { kind: 'success', text: '已恢复部署默认模型（下一条消息生效）。' }
+    }
+
+    const slash = rawInput.indexOf('/')
+    const provider = slash === -1 ? currentProvider : rawInput.slice(0, slash)
+    const model = slash === -1 ? rawInput : rawInput.slice(slash + 1)
+    if (model === '' || (slash !== -1 && (provider === undefined || provider === ''))) {
+      return { kind: 'error', text: '用法错误：/model [模型-id|provider/model|reset]。' }
+    }
+    // Validate against the advertised catalog when the deployment exposes one;
+    // an unsupported value would otherwise only fail at the next request.
+    if (provider !== undefined) {
+      const models = await this.listModels(provider)
+      if (models.length > 0 && !models.includes(model)) {
+        return {
+          kind: 'error',
+          text: `provider \`${provider}\` 未提供模型 \`${model}\`。可选：${models.slice(0, 20).map(id => `\`${id}\``).join('、')}`,
+        }
+      }
+    }
+    const label = provider === undefined ? model : `${provider}/${model}`
+    return { kind: 'success', text: `当前 Session 模型已切换为 \`${label}\`（下一条消息生效）。` }
+  }
+
+  /** Model ids advertised for one provider route (empty when unavailable). */
+  private async listModels(provider: string | undefined): Promise<string[]> {
+    if (provider === undefined) return []
     try {
-      const res = await this.requireChannel().send(record.chatId, { card }, options)
-      return { messageId: res.messageId, mode: 'card' }
-    } catch (error) {
-      this.ctx.logger?.warn?.(
-        'dsh-channels: segment %d card for session %s rejected, falling back to plain text: %s',
-        segment, sessionId, String(error),
-      )
-      const res = await this.requireChannel().send(record.chatId, {
-        text: `📄 回复分段 ${segment}（卡片发送失败，已降级为纯文本）\n\n${fallbackText}`,
-      }, options)
-      return { messageId: res.messageId, mode: 'text' }
+      const llm = this.ctx.get?.('llm') as LlmService | undefined
+      const models = await llm?.listModels?.(provider)
+      return (models ?? []).map(entry => entry.id ?? entry.name ?? '').filter(id => id !== '')
+    } catch {
+      return []
     }
-  }
-
-  // ---- session lifecycle ----------------------------------------------
-
-  private agentOptions(): Record<string, unknown> {
-    const options: Record<string, unknown> = {}
-    if (this.config.provider !== undefined) options.provider = this.config.provider
-    if (this.config.model !== undefined) options.model = this.config.model
-    if (this.config.maxTokens !== undefined) options.maxTokens = this.config.maxTokens
-    return options
-  }
-
-  /** Mount one mutable Session-aware effort policy outside every other request wrapper. */
-  private mountReasoningEffort(agentCtx: AgentContext, session?: Session): () => void {
-    const controller = installReasoningEffortOverride(agentCtx, this.config.reasoningEffort)
-    if (session !== undefined) controller.sync(session.events)
-    this.reasoningEfforts.set(agentCtx, controller)
-    return () => {
-      controller.dispose()
-      if (this.reasoningEfforts.get(agentCtx) === controller) this.reasoningEfforts.delete(agentCtx)
-    }
-  }
-
-  /** Resolve and synchronize the policy composed for this exact Agent scope. */
-  private requireReasoningEffort(agent: Agent): ReasoningEffortController {
-    const controller = this.reasoningEfforts.get(agent.ctx)
-    if (controller === undefined) {
-      throw new Error('dsh-channels: reasoning-effort policy is not mounted for this Agent')
-    }
-    controller.sync(agent.session.events)
-    return controller
-  }
-
-  /**
-   * Resolve the agent-preset composition for sessions this plugin creates or
-   * resumes.
-   *
-   * `agents.create()` never applies a preset on its own — the caller composes
-   * the agent's world through the `setup` callback, which the factory awaits
-   * before publishing the session. In web-profile deployments the model-facing
-   * tools exist only inside agent presets (the host disables the tool rows at
-   * the host layer), so sessions created without mounting one reach the model
-   * with an empty tool list: the agent writes `<tool_calls>` as plain text and
-   * stops. Web-UI sessions mount the default preset via `session.create`;
-   * channels sessions must do the same through `setup`, and record the preset
-   * id on the header meta exactly like the host's own `composeAgent` does.
-   *
-   * The id resolves BEFORE the session exists because the session boundary
-   * snapshots `meta` before asynchronous setup begins. Mounting stays inside
-   * `setup`, where a failure rolls the whole creation back rather than
-   * publishing a session whose capabilities are half-installed.
-   *
-   * Deployments without a preset roster compose nothing: their tools live in
-   * the host composition and the agent already sees them.
-   */
-  private async resolvePresetComposition(
-    requestedPreset: string | undefined = this.config.agentPreset,
-    useRosterDefault = true,
-  ): Promise<PresetComposition> {
-    // Read through ctx.get (safe lookup): only the web profile ships a roster,
-    // and direct property access on a cordis context throws for services the
-    // plugin did not inject.
-    const presets = this.ctx.get?.('agentPresets') as AgentPresets | undefined
-    if (presets === undefined) {
-      return {
-        setup: async (agentCtx) => {
-          this.mountReasoningEffort(agentCtx)
-          await mountChannelCommands(agentCtx)
-        },
-      }
-    }
-    if (requestedPreset === undefined && !useRosterDefault) {
-      return {
-        setup: async (agentCtx) => {
-          this.mountReasoningEffort(agentCtx)
-          await mountChannelCommands(agentCtx)
-        },
-      }
-    }
-    const resolved = await presets.resolve(requestedPreset)
-    return {
-      agentPreset: resolved.id,
-      setup: async (agentCtx) => {
-        // `prepend` is essential: standing preset listeners may have been
-        // mounted before this Agent existed, so setup registration order alone
-        // cannot guarantee that the explicit channel value wins.
-        this.mountReasoningEffort(agentCtx)
-        await presets.mount(agentCtx, resolved.id)
-        await mountChannelCommands(agentCtx)
-      },
-    }
-  }
-
-  /** Effective preset after folding any durable runtime preset switch. */
-  private effectiveAgentPreset(session: Session): string | undefined {
-    let selected = session.header.agentPreset
-    for (const event of session.events) {
-      if (event.type === 'agent-preset/selected') selected = event.data.agentPreset
-    }
-    return selected
   }
 
   /**
@@ -1433,12 +1233,12 @@ export class FeishuService {
     if (admission.live.agent !== invocation.agent) {
       return { kind: 'error', text: '/renew 只能通过已授权的飞书话题执行。' }
     }
-    const current = this.lookupRoute(admission.route.key)
+    const current = this.routes.get(admission.route.key)
     if (current === undefined || current.sessionId !== admission.route.sessionId) {
       return { kind: 'error', text: '当前话题绑定已变化，请重试 /renew。' }
     }
     try {
-      admission.commit = await this.commitRenew(current, admission.live)
+      admission.commit = await this.sessions.renew(current, admission.live)
       return { kind: 'success', text: '新 Session 已创建并绑定。' }
     } catch (error) {
       this.ctx.logger?.warn?.(
@@ -1460,325 +1260,25 @@ export class FeishuService {
     }
     const state = admission.controller.state
     if (action.kind === 'show') {
-      if (state.source === 'session') {
-        return { kind: 'success', text: `当前 Session 推理强度：\`${state.effective}\`（Session 覆盖）。` }
+      if (state.effortSource === 'session') {
+        return { kind: 'success', text: `当前 Session 推理强度：\`${state.effectiveEffort}\`（Session 覆盖）。` }
       }
-      if (state.source === 'config') {
-        return { kind: 'success', text: `当前 Session 推理强度：\`${state.effective}\`（配置默认）。` }
+      if (state.effortSource === 'config') {
+        return { kind: 'success', text: `当前 Session 推理强度：\`${state.effectiveEffort}\`（配置默认）。` }
       }
       return { kind: 'success', text: '当前 Session 未设置推理强度覆盖，使用模型适配器/provider 默认。' }
     }
     if (action.kind === 'reset') {
-      return state.configured === undefined
+      return state.configuredEffort === undefined
         ? { kind: 'success', text: '已恢复模型适配器/provider 默认推理强度。' }
-        : { kind: 'success', text: `已恢复配置默认推理强度：\`${state.configured}\`。` }
+        : { kind: 'success', text: `已恢复配置默认推理强度：\`${state.configuredEffort}\`。` }
     }
     return { kind: 'success', text: `当前 Session 推理强度已切换为：\`${action.value}\`。` }
   }
 
-  /** Create, workspace-attach, and atomically publish one renewed route. */
-  private async commitRenew(record: RouteRecord, oldLive: LiveAgent): Promise<RenewCommit> {
-    const sessionId = randomUUID() as SessionId
-    const preset = this.effectiveAgentPreset(oldLive.agent.session)
-    const composition = await this.resolvePresetComposition(preset, false)
-    const workspace = await this.ctx.workspaceRegistry.create(
-      record.workspacePath,
-      workspaceTitleFor(record.chatType, record.chatId, record.senderOpenId),
-    )
-
-    let newHandle: AgentHandle | undefined
-    let attached = false
-    try {
-      newHandle = await this.ctx.agents.create({
-        sessionId,
-        meta: {
-          cwd: record.workspacePath,
-          ...(composition.agentPreset === undefined ? {} : { agentPreset: composition.agentPreset }),
-        },
-        agentOptions: { ...oldLive.agent.options },
-        setup: composition.setup,
-      })
-      this.requireReasoningEffort(newHandle.agent)
-      await workspace.attachSession(sessionId)
-      attached = true
-      const createdAt = newHandle.agent.session.header.createdAt
-
-      const current: RouteRecord = {
-        ...record,
-        sessionId,
-        sessionHistory: appendSessionHistory(record, sessionId, createdAt),
-        lastActivityAt: Date.now(),
-      }
-      await this.persistRoute(record.key, current)
-      this.live.set(sessionId, { agent: newHandle.agent, handle: newHandle })
-      return { previous: record, current, oldLive }
-    } catch (error) {
-      if (attached) {
-        await Promise.resolve(workspace.detachSession(sessionId)).catch((detachError: unknown) => {
-          this.ctx.logger?.warn?.(
-            'dsh-channels: rolling back workspace attachment for session %s failed: %s',
-            sessionId, String(detachError),
-          )
-        })
-      }
-      await newHandle?.dispose().catch(() => {})
-      throw error
-    }
-  }
-
-  /** Release only this plugin's old handle, after `command/done` has landed. */
-  private async releaseRenewedAgent(commit: RenewCommit): Promise<void> {
-    const oldSessionId = commit.previous.sessionId
-    if (this.live.get(oldSessionId) === commit.oldLive) {
-      this.live.delete(oldSessionId)
-      this.streamer?.detach(oldSessionId)
-    }
-    try {
-      await commit.oldLive.handle.dispose()
-    } catch (error) {
-      this.ctx.logger?.warn?.(
-        'dsh-channels: releasing renewed session %s handle failed: %s',
-        oldSessionId, String(error),
-      )
-    }
-  }
-
-  /**
-   * Serialize session establishment per (chat, user) pair. The promise is
-   * registered under the chat-scoped key SYNCHRONOUSLY (the key is known
-   * before any network op), so concurrent first messages all observe the same
-   * in-flight establishment instead of racing each other. The entry lives
-   * exactly as long as the establishment; waiters holding the promise still
-   * see the settled record after the entry is gone.
-   */
-  private startSession(msg: NormalizedMessage, content: string): Promise<RouteRecord> {
-    const chatKey = chatRouteKey(msg.chatType, msg.chatId, msg.senderId)
-    const existing = this.establishing.get(chatKey)
-    if (existing !== undefined) return existing
-    const promise = this.establishSession(msg, content, chatKey)
-    this.establishing.set(chatKey, promise)
-    void promise.then(
-      () => { this.establishing.delete(chatKey) },
-      () => { this.establishing.delete(chatKey) },
-    )
-    return promise
-  }
-
-  private async establishSession(msg: NormalizedMessage, content: string, chatKey: string): Promise<RouteRecord> {
-    // 1. "Typing" reaction immediately (id captured for the swap).
-    const typingPromise = this.requireChannel().addReaction(msg.messageId, 'Typing').catch(() => undefined)
-
-    // 2. Workspace directory for this (user × chat) pair.
-    const workspace = await ensureWorkspace(
-      this.ctx, this.config.baseDir, msg.chatType, msg.chatId, msg.senderId,
-    )
-
-    const sessionId = randomUUID() as SessionId
-    const initialStats = { sessionId, inputTokens: 0, outputTokens: 0 }
-
-    // 3. First card frame — also creates the topic (reply_in_thread).
-    const sent = await this.sendReplyCard(msg, this.initialCard(sessionId))
-    const typingId = await typingPromise
-
-    // 3.5 Repair snapshot FIRST (before the route record and the agent):
-    // the crash window between the two writes then degrades to an orphan
-    // snapshot — which startup repair handles safely — instead of a zombie
-    // streaming card with no snapshot at all.
-    await this.writeInflightSnapshot({
-      key: sent.messageId,
-      sessionId,
-      chatId: msg.chatId,
-      triggerMessageId: msg.messageId,
-      reactionId: typingId,
-      cards: [{ messageId: sent.messageId, mode: 'card' }],
-      startedAt: Date.now(),
-      attempts: 0,
-    })
-
-    // 4. Create the agent/session bound to the workspace directory.
-    let handle: AgentHandle
-    try {
-      const composition = await this.resolvePresetComposition()
-      handle = await this.ctx.agents.create({
-        sessionId,
-        meta: {
-          cwd: workspace.path,
-          ...(composition.agentPreset === undefined ? {} : { agentPreset: composition.agentPreset }),
-        },
-        agentOptions: this.agentOptions(),
-        setup: composition.setup,
-      })
-      this.requireReasoningEffort(handle.agent)
-    } catch (error) {
-      // The card lands in a final failure state — no repair needed later.
-      void this.clearInflight(sent.messageId)
-      await this.requireChannel().updateCard(sent.messageId, buildCard({
-        phase: 'done',
-        reasoning: '',
-        body: `会话创建失败：${String(error)}`,
-        stats: { ...initialStats },
-      })).catch(() => {})
-      throw error
-    }
-    this.live.set(sessionId, { agent: handle.agent, handle })
-    void Promise.resolve(workspace.attachSession(sessionId)).catch(error => {
-      this.ctx.logger?.warn?.(
-        'dsh-channels: attaching initial session %s to workspace failed: %s',
-        sessionId, String(error),
-      )
-    })
-
-    // 5. Persist the route (thread-scoped, or degraded chat-scoped).
-    const key = sent.degraded || sent.threadId === undefined ? chatKey : sent.threadId
-    const createdAt = handle.agent.session.header.createdAt
-    const record: RouteRecord = {
-      key,
-      kind: sent.degraded || sent.threadId === undefined ? 'chat' : 'thread',
-      sessionId,
-      chatId: msg.chatId,
-      chatType: msg.chatType,
-      senderOpenId: msg.senderId,
-      workspacePath: workspace.path,
-      cardMessageId: sent.messageId,
-      createdAt,
-      lastActivityAt: createdAt,
-      sessionHistory: [{ sessionId, createdAt }],
-    }
-    await this.persistRoute(key, record)
-
-    // 6. Stream into the card and hand the message to the driver.
-    this.streamer?.attach(handle.agent.session, sent.messageId, msg.messageId, typingId)
-    handle.agent.followup(feishuUserMessage(content))
-    return record
-  }
-
-  private async continueSession(msg: NormalizedMessage, record: RouteRecord): Promise<void> {
-    const typingPromise = this.requireChannel().addReaction(msg.messageId, 'Typing').catch(() => undefined)
-    const live = await this.ensureLiveAgent(record)
-
-    const sent = await this.sendReplyCard(msg, this.initialCard(record.sessionId as SessionId))
-    const typingId = await typingPromise
-
-    // Repair snapshot first — same crash-window reasoning as `startSession`.
-    await this.writeInflightSnapshot({
-      key: sent.messageId,
-      sessionId: record.sessionId,
-      chatId: msg.chatId,
-      triggerMessageId: msg.messageId,
-      reactionId: typingId,
-      cards: [{ messageId: sent.messageId, mode: 'card' }],
-      startedAt: Date.now(),
-      attempts: 0,
-    })
-
-    await this.persistRoute(record.key, {
-      ...record,
-      cardMessageId: sent.messageId,
-      lastActivityAt: Date.now(),
-    })
-    this.streamer?.attach(live.agent.session, sent.messageId, msg.messageId, typingId)
-    live.agent.followup(feishuUserMessage(msg.content))
-  }
-
-  private async ensureLiveAgent(record: RouteRecord): Promise<LiveAgent> {
-    const live = this.live.get(record.sessionId)
-    if (live !== undefined) return live
-
-    // The session may already be live under another owner — the web UI's
-    // api-remote resolver, a previous plugin instance whose shutdown is still
-    // draining, or a concurrent cold resume that won the race. `agents.resume`
-    // refuses a live session ("cannot prepare … while it is live"), so BORROW
-    // the live agent instead: `followup` delivery works identically and the
-    // owning side keeps the dispose responsibility.
-    const foreign = this.ctx.agents.get(record.sessionId as SessionId)
-    if (foreign !== undefined) {
-      const borrowed = borrowLiveAgent(foreign, this.mountReasoningEffort(foreign.ctx, foreign.session))
-      this.live.set(record.sessionId, borrowed)
-      return borrowed
-    }
-
-    let pending = this.pendingResume.get(record.sessionId)
-    if (pending === undefined) {
-      // Compose the resumed world from the same preset resolution as creation
-      // (config override or roster default). A session persisted before this
-      // fix has no preset recorded on its header; re-resolving here is what
-      // repairs it on the first resume after a restart.
-      pending = this.resolvePresetComposition()
-        .then(composition => this.ctx.agents.resume({
-          resumeSessionId: record.sessionId as SessionId,
-          agentOptions: this.agentOptions(),
-          setup: composition.setup,
-        }))
-        .then(handle => {
-          if (!this.started) {
-            // Shutdown raced this in-flight resume: dispose the just-published
-            // agent so it cannot leak into the live registry of the next
-            // instance (whose every resume would then fail as "while it is live").
-            void handle.dispose().catch(() => {})
-            throw new Error('dsh-channels: session resume aborted by shutdown')
-          }
-          this.requireReasoningEffort(handle.agent)
-          const liveAgent: LiveAgent = { agent: handle.agent, handle }
-          this.live.set(record.sessionId, liveAgent)
-          return liveAgent
-        })
-        .catch((error: unknown) => {
-          // Lost a cold-resume race: another owner published the session
-          // while our resume was in flight. Borrow the winner instead of
-          // failing the turn with "cannot prepare … while it is live".
-          const winner = this.ctx.agents.get(record.sessionId as SessionId)
-          if (winner !== undefined) {
-            const borrowed = borrowLiveAgent(winner, this.mountReasoningEffort(winner.ctx, winner.session))
-            this.live.set(record.sessionId, borrowed)
-            return borrowed
-          }
-          throw error
-        })
-        .finally(() => {
-          this.pendingResume.delete(record.sessionId)
-        })
-      this.pendingResume.set(record.sessionId, pending)
-    }
-    return await pending
-  }
-
   // ---- outbound helpers ------------------------------------------------
 
-  private initialCard(sessionId: SessionId): object {
-    const state: CardState = {
-      phase: 'thinking',
-      reasoning: '',
-      body: '',
-      stats: { sessionId, inputTokens: 0, outputTokens: 0 },
-    }
-    return buildCard(state)
-  }
-
-  /**
-   * Reply with the first card frame. Prefers topic replies (`reply_in_thread`)
-   * — the documented way a bot creates a topic — and falls back to a plain
-   * reply when Feishu refuses (degraded chat-scoped routing).
-   */
-  private async sendReplyCard(
-    msg: NormalizedMessage,
-    card: object,
-  ): Promise<{ messageId: string; threadId?: string; degraded: boolean }> {
-    try {
-      const res = await this.requireChannel().send(
-        msg.chatId,
-        { card },
-        { replyTo: msg.messageId, replyInThread: true },
-      )
-      const threadId = await this.requireChannel().threadIdOfMessage(res.messageId).catch(() => undefined)
-      return { messageId: res.messageId, threadId, degraded: false }
-    } catch (error) {
-      if (this.config.threadFallback === 'strict') throw error
-      const res = await this.requireChannel().send(msg.chatId, { card }, { replyTo: msg.messageId })
-      return { messageId: res.messageId, degraded: true }
-    }
-  }
-
-  /** Context pressure for the card's second info line (synchronous fold). */
+  /** Context pressure for the card's second info line (synchronous reads only). */
   private measureContext(session: Session): { contextTokens?: number; contextWindow?: number } {
     let contextTokens: number | undefined
     try {
@@ -1790,19 +1290,22 @@ export class FeishuService {
       contextTokens = undefined
     }
 
-    let contextWindow: number | undefined
-    try {
-      const headers = session.events.filter(event => event.type === 'request/header')
-      const last = headers.at(-1)
-      if (last !== undefined && last.type === 'request/header') {
-        const config = last.data.header?.config as { provider?: unknown; model?: unknown } | undefined
-        if (typeof config?.provider === 'string' && typeof config.model === 'string') {
-          const routeKey = `${config.provider}/${config.model}`
+    // The route-capacity window is published by the host's `contextPressure`
+    // projection; the old request/header scan + resolveModelInfo call stays as
+    // a fallback for deployments without the projection registry.
+    let contextWindow = readProjectionViews(this.projectionRegistry(), session).contextPressure?.contextWindow
+    if (contextWindow === undefined) {
+      try {
+        const header = session.requestHeader?.()?.config
+        const provider = typeof header?.provider === 'string' ? header.provider : undefined
+        const model = typeof header?.model === 'string' ? header.model : undefined
+        if (provider !== undefined && provider !== '' && model !== undefined && model !== '') {
+          const routeKey = `${provider}/${model}`
           contextWindow = this.contextWindows.get(routeKey)
           if (contextWindow === undefined && !this.windowRequests.has(routeKey)) {
             this.windowRequests.add(routeKey)
             const llm = this.ctx.get?.('llm') as LlmService | undefined
-            void llm?.resolveModelInfo(config.provider, config.model)
+            void llm?.resolveModelInfo(provider, model)
               .then(info => {
                 if (info?.context?.contextWindow !== undefined) {
                   this.contextWindows.set(routeKey, info.context.contextWindow)
@@ -1811,11 +1314,38 @@ export class FeishuService {
               .catch(() => {})
           }
         }
+      } catch {
+        contextWindow = undefined
       }
-    } catch {
-      contextWindow = undefined
     }
 
     return { contextTokens, contextWindow }
+  }
+
+  /** Host projection registry, when this deployment mounts one. */
+  private projectionRegistry(): SessionProjections | undefined {
+    return this.ctx.get?.('sessionProjections') as SessionProjections | undefined
+  }
+
+  /** Card figures from host projections (token totals / cache hit / window). */
+  private projectCardStats(session: Session): ProjectedStats | undefined {
+    const views = readProjectionViews(this.projectionRegistry(), session)
+    const usage = views.tokenUsage
+    const pressure = views.contextPressure
+    if (usage === undefined && pressure === undefined) return undefined
+    const last = usage?.last?.buckets
+    const hit = last === undefined ? undefined : last.cacheReadTokens
+    const uncached = last === undefined ? undefined : last.uncachedInputTokens
+    const cacheHit = hit !== undefined && uncached !== undefined && hit + uncached > 0
+      ? hit / (hit + uncached)
+      : undefined
+    return {
+      ...(usage === undefined ? {} : {
+        inputTokens: usage.totals.uncachedInputTokens,
+        outputTokens: usage.totals.outputTokens,
+      }),
+      ...(cacheHit === undefined ? {} : { cacheHitPct: cacheHit }),
+      ...(pressure?.contextWindow === undefined ? {} : { contextWindow: pressure.contextWindow }),
+    }
   }
 }
