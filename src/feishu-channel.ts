@@ -63,6 +63,15 @@ export interface FeishuChannel {
   removeReaction(messageId: string, reactionId: string): Promise<void>
   /** Fetch the thread id of a sent message (undefined when not a topic message). */
   threadIdOfMessage(messageId: string): Promise<string | undefined>
+  /** Download one inbound message resource (image bytes + sniffed media type). */
+  downloadResource(messageId: string, fileKey: string, type: 'image'): Promise<DownloadedResource>
+}
+
+/** Bytes of one inbound Feishu resource plus their detected media type. */
+export interface DownloadedResource {
+  data: Uint8Array
+  /** `image/png`-style type; undefined when the bytes match no known format. */
+  mediaType?: string
 }
 
 export interface ChannelConnectOptions {
@@ -143,6 +152,32 @@ class LarkChannelAdapter implements FeishuChannel {
     const res = await this.channel.rawClient.im.v1.message.get({ path: { message_id: messageId } })
     return res?.data?.items?.[0]?.thread_id
   }
+
+  async downloadResource(messageId: string, fileKey: string, type: 'image'): Promise<DownloadedResource> {
+    const response = await this.channel.rawClient.im.v1.messageResource.get({
+      params: { type },
+      path: { message_id: messageId, file_key: fileKey },
+    }) as unknown as { getReadableStream(): AsyncIterable<Uint8Array | Buffer> }
+    const chunks: Buffer[] = []
+    for await (const chunk of response.getReadableStream()) {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+    }
+    const data = new Uint8Array(Buffer.concat(chunks))
+    return { data, mediaType: sniffImageMediaType(data) }
+  }
+}
+
+/**
+ * Detect the raster format from magic bytes. Feishu's resource download does
+ * not hand back a media type, and DSH validates the declared type against the
+ * decoded bytes, so the plugin sniffs instead of trusting the file name.
+ */
+export function sniffImageMediaType(data: Uint8Array): 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif' | undefined {
+  if (data.length >= 8 && data[0] === 0x89 && data[1] === 0x50 && data[2] === 0x4E && data[3] === 0x47) return 'image/png'
+  if (data.length >= 3 && data[0] === 0xFF && data[1] === 0xD8 && data[2] === 0xFF) return 'image/jpeg'
+  if (data.length >= 12 && data[8] === 0x57 && data[9] === 0x45 && data[10] === 0x42 && data[11] === 0x50) return 'image/webp'
+  if (data.length >= 6 && data[0] === 0x47 && data[1] === 0x49 && data[2] === 0x46) return 'image/gif'
+  return undefined
 }
 
 const LOGGER_LEVELS: Record<ChannelConnectOptions['loggerLevel'], LoggerLevel> = {
