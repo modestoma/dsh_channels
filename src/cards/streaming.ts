@@ -2,6 +2,12 @@
  * Streaming reply card: reasoning panel, activity lines, body segmentation
  * and the byte/table budgets that keep one card inside Feishu's limits.
  *
+ * Two independent budgets: the reply body segments across cards at
+ * `CARD_TARGET_BYTES` (never splitting reasoning), while the reasoning fold
+ * panel is a fixed `REASONING_MAX_BYTES` (5 KB) window — clipped from the tail
+ * with a truncation marker and never traded against the body in either
+ * direction.
+ *
  * @module dsh-channels/cards/streaming
  */
 
@@ -21,6 +27,25 @@ export const PANEL_CHEVRON_TOKEN = 'down-small-ccm_outlined'
 export const CARD_MAX_BYTES = 30_000
 /** Target budget per card — 2 KB below the hard cap as headroom. */
 export const CARD_TARGET_BYTES = 28_000
+/**
+ * Hard byte cap for the reasoning fold panel's markdown (5 KB, JSON-escaped
+ * UTF-8, including the truncation marker). The panel is clipped against this
+ * alone — never against the card — so it neither competes with nor is squeezed
+ * by the reply body: the visible reasoning window is identical whether the
+ * answer is one line or a full 28 KB segment. Measured at the cap: ≈4.96 K
+ * ASCII chars, ≈1.65 K CJK chars, ≈2.5 K emoji. The panel element's own
+ * wrapper (border, header, chevron) is charged separately — see
+ * `CARD_PANEL_RESERVE_BYTES`.
+ */
+export const REASONING_MAX_BYTES = 5_000
+/**
+ * Bytes held back from the card target for the fold panel as a whole, so a
+ * segmented card's body plus its panel stay inside `CARD_TARGET_BYTES`.
+ * `REASONING_MAX_BYTES` caps the panel's markdown; the element wrapper around
+ * it (border, header, chevron icon, `elements` array) measures a further 315 B
+ * at the worst phase, and this reserve covers that with headroom.
+ */
+export const CARD_PANEL_RESERVE_BYTES = 5_500
 /**
  * Feishu hard-limits the number of markdown tables a single card may contain
  * (API error 11310 "card table number over limit"; verified on device: the
@@ -248,18 +273,18 @@ function assemble(
 }
 
 /**
- * Fit `text` into a byte budget: return `text` unchanged when the rendered
- * card already fits; otherwise binary-search the longest prefix that still
- * fits once `suffix` is appended. The result is guaranteed to render within
- * `budget`.
+ * Fit `text` into a byte budget measured by `render`: return `text` unchanged
+ * when it already fits; otherwise binary-search the longest prefix that still
+ * fits once `suffix` is appended. The result is guaranteed to satisfy the
+ * same measurement within `budget`.
  */
-function clipText(text: string, suffix: string, render: (content: string) => object, budget: number): string {
-  if (cardJsonBytes(render(text)) <= budget) return text
+function clipText(text: string, suffix: string, render: (content: string) => number, budget: number): string {
+  if (render(text) <= budget) return text
   let lo = 0
   let hi = text.length
   while (lo < hi) {
     const mid = Math.ceil((lo + hi) / 2)
-    if (cardJsonBytes(render(text.slice(0, mid) + suffix)) <= budget) {
+    if (render(text.slice(0, mid) + suffix) <= budget) {
       lo = mid
     } else {
       hi = mid - 1
@@ -268,35 +293,61 @@ function clipText(text: string, suffix: string, render: (content: string) => obj
   return text.slice(0, lo) + suffix
 }
 
-/** JSON-escaped UTF-8 size of the truncation marker — reserved so clips can
- *  never push a card past the hard cap. */
-const SUFFIX_JSON_BYTES = new TextEncoder().encode(JSON.stringify(TRUNCATION_SUFFIX)).length
+/** JSON-escaped UTF-8 size of a string — the metric Feishu's card cap counts. */
+function jsonBytes(text: string): number {
+  return new TextEncoder().encode(JSON.stringify(text)).length
+}
 
 /**
- * Build one card. Budget priority: the body wins.
+ * JSON-escaped UTF-8 size of the fold panel's markdown, as rendered by one
+ * assembled card. Reasoning is budgeted against THIS rather than against the
+ * whole card: a card-wide budget makes the panel collapse to the bare
+ * truncation marker as soon as the reply body grows, so the visible reasoning
+ * window would depend on how long the answer is.
+ */
+function panelMarkdownBytes(render: (reasoning: string) => object): (content: string) => number {
+  return content => {
+    const elements = (render(content) as { body?: { elements?: Array<{ elements?: Array<{ content?: string }> }> } })
+      .body?.elements
+    return jsonBytes(elements?.[0]?.elements?.[0]?.content ?? '')
+  }
+}
+
+/** JSON-escaped UTF-8 size of the truncation marker — reserved so clips can
+ *  never push a card past its budget. */
+const SUFFIX_JSON_BYTES = jsonBytes(TRUNCATION_SUFFIX)
+
+/**
+ * Build one card.
  *
- * - Reasoning is clipped so the card stays ≤ `CARD_TARGET_BYTES` while it
- *   streams — it yields space to the growing body. Only when the body alone
- *   already drifts past the target (stats growth between the split and the
- *   final patch) does the reasoning budget relax to the hard cap, keeping the
- *   card sendable.
- * - The body is clipped only when it alone would exceed `CARD_MAX_BYTES`, the
- *   point where Feishu rejects the whole card. The streamer pre-splits with
- *   `segmentCardContent` (probed at the worst-case phase), so a live stream
- *   never reaches this: it is a pure guard for direct callers.
+ * - Reasoning is clipped so its markdown stays within `REASONING_MAX_BYTES`
+ *   (including the truncation marker): a fixed, self-contained budget that
+ *   neither grants space to nor borrows space from the body, so the visible
+ *   reasoning window is the same whether the reply is one line or a 28 KB
+ *   segment.
+ * - The body gets whatever is left of `CARD_MAX_BYTES` once the clipped
+ *   reasoning is accounted for, which keeps the total under Feishu's hard cap.
+ *   The streamer pre-splits with `segmentCardContent` (probed at the
+ *   worst-case phase), so a live stream never reaches this clip: it is a pure
+ *   guard for direct callers.
  *
- * Guarantee: the returned card is always ≤ `CARD_MAX_BYTES`; it is ≤
- * `CARD_TARGET_BYTES` whenever the body fits the target budget.
+ * Guarantee: the returned card is always ≤ `CARD_MAX_BYTES`, and its panel is
+ * always ≤ `REASONING_MAX_BYTES`.
  */
 export function buildCard(state: CardState, options: CardOptions = {}): object {
   const render = (reasoning: string, body: string) =>
     assemble(state.phase, reasoning, body, state.stats, options, state.status, state.tool)
 
-  const body = clipText(state.body, TRUNCATION_SUFFIX, content => render('', content), CARD_MAX_BYTES - SUFFIX_JSON_BYTES)
-  const reasoningBudget = cardJsonBytes(render('', body)) <= CARD_TARGET_BYTES
-    ? CARD_TARGET_BYTES
-    : CARD_MAX_BYTES - SUFFIX_JSON_BYTES
-  const reasoning = clipText(state.reasoning, TRUNCATION_SUFFIX, content => render(content, body), reasoningBudget)
+  // 1. The panel, against its own budget. The panel markdown (and therefore the
+  //    visible reasoning window) does not depend on the body, the phase title,
+  //    or the info lines — only on the reasoning text and this cap.
+  const panelBytes = panelMarkdownBytes(content => render(content, ''))
+  const reasoning = clipText(state.reasoning, TRUNCATION_SUFFIX, panelBytes, REASONING_MAX_BYTES)
+
+  // 2. The body, against what is left of the hard cap once the panel's real
+  //    bytes are counted. The suffix reserve keeps a clipped body sendable.
+  const body = clipText(state.body, TRUNCATION_SUFFIX, content => cardJsonBytes(render('', content)),
+    CARD_MAX_BYTES - panelBytes(reasoning) - SUFFIX_JSON_BYTES)
   return render(reasoning, body)
 }
 
@@ -330,23 +381,28 @@ export function buildInterruptionCard(options: CardOptions = {}): object {
 }
 
 /**
- * Largest body prefix (char count) whose card renders ≤ `CARD_TARGET_BYTES`
- * with reasoning minimized — i.e. the body gets the full card budget. The
- * probe renders at phase `error`, the worst case (its panel/segment header
- * titles are the longest), so a frozen segment can never outgrow the budget
- * merely by the phase flipping 回复中 → 回复失败. Stats growth between the
- * split and the final patch consumes the 2 KB redundancy (`CARD_MAX_BYTES` −
- * `CARD_TARGET_BYTES`).
+ * Largest body prefix (char count) whose card renders within `CARD_TARGET_BYTES`
+ * minus `CARD_PANEL_RESERVE_BYTES`, reserving the panel's whole footprint for
+ * the reasoning that travels with the segment. `segmentCardContent` only ever
+ * segments bodies, so reasoning is never a segment budget input by construction
+ * — but the panel still occupies the card, so its cap is held back. The probe renders
+ * at phase `error`, the worst case (its segment header title is the longest),
+ * so a frozen segment can never outgrow the budget merely by the phase flipping
+ * 回复中 → 回复失败; stats growth between the split and the final patch consumes
+ * the 2 KB redundancy (`CARD_MAX_BYTES` − `CARD_TARGET_BYTES`).
  */
 function largestBodyPrefix(state: CardState, options: CardOptions): number {
   const text = state.body
-  const render = (content: string) => assemble('error', '', content, state.stats, options, state.status, state.tool)
-  if (cardJsonBytes(render(text)) <= CARD_TARGET_BYTES) return text.length
+  const budget = CARD_TARGET_BYTES - CARD_PANEL_RESERVE_BYTES
+  // `panel: false` keeps the reserved panel cap out of the measurement itself.
+  const render = (content: string) =>
+    assemble('error', '', content, state.stats, { ...options, panel: false }, state.status, state.tool)
+  if (cardJsonBytes(render(text)) <= budget) return text.length
   let lo = 0
   let hi = text.length
   while (lo < hi) {
     const mid = Math.ceil((lo + hi) / 2)
-    if (cardJsonBytes(render(text.slice(0, mid))) <= CARD_TARGET_BYTES) {
+    if (cardJsonBytes(render(text.slice(0, mid))) <= budget) {
       lo = mid
     } else {
       hi = mid - 1

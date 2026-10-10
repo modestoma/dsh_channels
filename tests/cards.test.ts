@@ -5,9 +5,11 @@
 import { describe, expect, it } from 'vitest'
 import {
   CARD_MAX_BYTES,
+  CARD_PANEL_RESERVE_BYTES,
   CARD_TARGET_BYTES,
   PANEL_CHEVRON_TOKEN,
   PANEL_TITLES,
+  REASONING_MAX_BYTES,
   TRUNCATION_SUFFIX,
   buildApprovalCard,
   buildApprovalSettledCard,
@@ -19,6 +21,11 @@ import {
   tableBlocks,
 } from '../src/cards.ts'
 import type { ApprovalQuestion, CardState } from '../src/cards.ts'
+
+/** JSON-escaped UTF-8 size of a string; the metric `clipText` budgets with. */
+function escapedJsonBytes(text: string): number {
+  return new TextEncoder().encode(JSON.stringify(text)).length
+}
 
 function baseState(partial: Partial<CardState> = {}): CardState {
   return {
@@ -218,6 +225,74 @@ describe('card budget (28 KB target, 30 KB cap)', () => {
     expect(list[0]?.text_size).toBe('notation')
     expect(list[0]?.content).toBe('📄 回复分段 2 · 回复中')
     expect(list[2]?.content).toBe('分段正文')
+  })
+})
+
+describe('reasoning panel budget (5 KB cap)', () => {
+  /** The rendered fold-panel markdown of a built card. */
+  function panelMarkdown(card: object): string {
+    const list = (card as unknown as CardShape).body.elements
+    return list[0]?.elements[0]?.content ?? ''
+  }
+
+  it('reserves the panel wrapper on top of the markdown cap', () => {
+    // REASONING_MAX_BYTES caps the panel markdown; the element wrapper (border,
+    // header, chevron, nested array) measures ~315 B more, so the segment
+    // budget holds back a larger reserve.
+    expect(REASONING_MAX_BYTES).toBe(5_000)
+    expect(CARD_PANEL_RESERVE_BYTES).toBeGreaterThan(REASONING_MAX_BYTES)
+    expect(CARD_PANEL_RESERVE_BYTES).toBeLessThan(CARD_TARGET_BYTES - 20_000)
+  })
+
+  it('passes reasoning inside the cap through untouched', () => {
+    const reasoning = '推'.repeat(1_600)
+    const card = buildCard(baseState({ phase: 'replying', reasoning }))
+
+    expect(panelMarkdown(card)).toBe(reasoning)
+    expect(escapedJsonBytes(reasoning)).toBeLessThanOrEqual(REASONING_MAX_BYTES)
+  })
+
+  it('clips overflowing reasoning to the cap and marks it', () => {
+    // Visible windows at the cap: ASCII ≈4.96 K chars, CJK ≈1.65 K, 🤔 ≈2.5 K.
+    for (const [chunk, minChars] of [['r', 4_000], ['推', 1_500], ['🤔', 2_400]] as const) {
+      const panel = panelMarkdown(buildCard(baseState({ phase: 'replying', reasoning: chunk.repeat(20_000) })))
+      expect(panel.endsWith(TRUNCATION_SUFFIX)).toBe(true)
+      expect(panel).toContain(chunk)
+      expect(escapedJsonBytes(panel)).toBeLessThanOrEqual(REASONING_MAX_BYTES)
+      // The window stays useful instead of collapsing to the bare marker.
+      expect(panel.replace(TRUNCATION_SUFFIX, '').length).toBeGreaterThanOrEqual(minChars)
+    }
+  })
+
+  it('holds the same reasoning window for a tiny and a maxed-out body', () => {
+    const reasoning = 'r'.repeat(40_000)
+    const small = buildCard(baseState({ reasoning, body: '答' }))
+    const large = buildCard(baseState({ reasoning, body: 'b'.repeat(20_000) }))
+
+    // The panel neither yields space to the growing body nor borrows any: the
+    // old card-wide budget shrank the panel to the marker as the body grew.
+    expect(panelMarkdown(small)).toBe(panelMarkdown(large))
+    expect(panelMarkdown(large)).toContain('r'.repeat(4_000))
+    expect(cardJsonBytes(small)).toBeLessThanOrEqual(CARD_TARGET_BYTES)
+    expect(cardJsonBytes(large)).toBeLessThanOrEqual(CARD_MAX_BYTES)
+  })
+
+  it('keeps a frozen segment inside the target once the panel travels with it', () => {
+    const split = segmentCardContent(baseState({ body: 'x'.repeat(200_000) }))
+    const frozen = buildCard(baseState({ body: split.head, reasoning: '推'.repeat(40_000) }))
+
+    expect(split.tail).not.toBe('')
+    // The segment budget reserves the panel cap, so body + clipped panel fit.
+    expect(cardJsonBytes(frozen)).toBeLessThanOrEqual(CARD_TARGET_BYTES)
+  })
+
+  it('still clips a pathological body to the hard cap with a full panel', () => {
+    const card = buildCard(baseState({ body: 'y'.repeat(300_000), reasoning: 'r'.repeat(40_000) }))
+    const body = (card as unknown as CardShape).body.elements[2]?.content ?? ''
+
+    expect(body).toContain('已截断')
+    expect(escapedJsonBytes(panelMarkdown(card))).toBeLessThanOrEqual(REASONING_MAX_BYTES)
+    expect(cardJsonBytes(card)).toBeLessThanOrEqual(CARD_MAX_BYTES)
   })
 })
 
