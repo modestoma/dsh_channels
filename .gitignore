@@ -3,3 +3,4 @@ node_modules/
 .pnpm-store/
 channels-data/
 *.tsbuildinfo
+.DS_Store
