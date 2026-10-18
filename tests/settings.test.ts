@@ -18,6 +18,7 @@ import type { HealthSnapshot } from '../src/health.ts'
 import type { FeishuChannel } from '../src/feishu-channel.ts'
 import {
   CONFIG_ROUTE,
+  CREDENTIALS_ROUTE,
   EDITABLE_KEYS,
   PANEL_ROUTE,
   RECONNECT_ROUTE,
@@ -78,7 +79,14 @@ class FakeTarget implements SettingsTarget {
   runningFlag = true
   restarting = false
   startErrorText: string | undefined
-  credentials = { appId: true, appSecret: true }
+  credentialInfo: {
+    appId: { configured: boolean; writable: boolean; source?: string }
+    appSecret: { configured: boolean; writable: boolean; source?: string }
+  } = {
+    appId: { configured: true, writable: true, source: 'file' },
+    appSecret: { configured: true, writable: true, source: 'file' },
+  }
+  credentialCalls: Array<{ field: string; value?: string }> = []
   applied: Partial<FeishuConfig> | undefined
   restartCalls = 0
   failRestart: string | undefined
@@ -113,8 +121,21 @@ class FakeTarget implements SettingsTarget {
     this.running = { ...this.config }
   }
 
-  async credentialStates(): Promise<{ appId: boolean; appSecret: boolean }> {
-    return this.credentials
+  async credentialStates(): Promise<{
+    appId: { configured: boolean; writable: boolean; source?: string }
+    appSecret: { configured: boolean; writable: boolean; source?: string }
+  }> {
+    return this.credentialInfo
+  }
+
+  async setCredential(field: 'appId' | 'appSecret', value: string): Promise<void> {
+    this.credentialCalls.push({ field, value })
+    this.credentialInfo[field] = { configured: true, writable: true, source: 'file' }
+  }
+
+  async clearCredential(field: 'appId' | 'appSecret'): Promise<void> {
+    this.credentialCalls.push({ field })
+    this.credentialInfo[field] = { configured: false, writable: true }
   }
 }
 
@@ -226,7 +247,7 @@ describe('SettingsSurface', () => {
     expect(panel.config.overlay).toEqual({ dmMode: 'disabled' })
     expect(panel.config.effective.dmMode).toBe('disabled')
     expect(panel.config.base.dmMode).toBe('open')
-    expect(panel.config.credentials.appId).toEqual({ ref: 'FEISHU_APP_ID', configured: true })
+    expect(panel.config.credentials.appId).toEqual({ ref: 'FEISHU_APP_ID', configured: true, writable: true, source: 'file' })
     expect(panel.config.fields).toHaveLength(EDITABLE_KEYS.length)
     expect(panel.config.restartPendingKeys).toEqual([])
   })
@@ -288,6 +309,82 @@ describe('SettingsSurface', () => {
     const success = await surface.reconnect()
     expect(success.ok).toBe(true)
     expect(target.restartCalls).toBe(2)
+  })
+})
+
+describe('SettingsSurface credentials', () => {
+  it('writes provided values through the seam and asks for reconnect while running', async () => {
+    const { surface, target } = makeSurface()
+    const result = await surface.saveCredentials({ appId: ' cli_new ', appSecret: 'secret_new' })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.reconnect).toBe('pending')
+    expect(target.credentialCalls).toEqual([
+      { field: 'appId', value: 'cli_new' },
+      { field: 'appSecret', value: 'secret_new' },
+    ])
+    expect(result.panel.config.credentials.appId.configured).toBe(true)
+    expect(target.restartCalls).toBe(0)
+  })
+
+  it('rejects empty, non-string, and oversized values with per-field issues', async () => {
+    const { surface, target } = makeSurface()
+    const none = await surface.saveCredentials({})
+    expect(none.ok).toBe(false)
+
+    const invalid = await surface.saveCredentials({
+      appId: '   ',
+      appSecret: 42 as unknown as string,
+    })
+    expect(invalid.ok).toBe(false)
+    if (invalid.ok) return
+    expect(invalid.issues?.map(issue => issue.key)).toEqual(expect.arrayContaining(['appId', 'appSecret']))
+
+    const oversized = await surface.saveCredentials({ appId: 'x'.repeat(600) })
+    expect(oversized.ok).toBe(false)
+    expect(target.credentialCalls).toEqual([])
+  })
+
+  it('auto-reconnects when stopped and reports a failed retry as a warning', async () => {
+    const stopped = makeSurface()
+    stopped.target.runningFlag = false
+    const result = await stopped.surface.saveCredentials({ appId: 'cli_new', appSecret: 'secret_new' })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.reconnect).toBe('auto')
+    expect(result.autoReconnectError).toBeUndefined()
+    expect(stopped.target.restartCalls).toBe(1)
+
+    const failing = makeSurface()
+    failing.target.runningFlag = false
+    failing.target.failRestart = 'handshake refused'
+    const failed = await failing.surface.saveCredentials({ appId: 'cli_new', appSecret: 'secret_new' })
+    expect(failed.ok).toBe(true)
+    if (!failed.ok) return
+    expect(failed.autoReconnectError).toContain('handshake refused')
+  })
+
+  it('clears a stored credential and reports pending / not-needed', async () => {
+    const running = makeSurface()
+    const pending = await running.surface.clearCredential('appSecret')
+    expect(pending.ok).toBe(true)
+    if (!pending.ok) return
+    expect(pending.reconnect).toBe('pending')
+    expect(running.target.credentialCalls).toEqual([{ field: 'appSecret' }])
+    expect(pending.panel.config.credentials.appSecret.configured).toBe(false)
+
+    const stopped = makeSurface()
+    stopped.target.runningFlag = false
+    const notNeeded = await stopped.surface.clearCredential('appId')
+    expect(notNeeded.ok).toBe(true)
+    if (!notNeeded.ok) return
+    expect(notNeeded.reconnect).toBe('not-needed')
+    expect(stopped.target.restartCalls).toBe(0)
+  })
+
+  it('refuses unknown credential fields', async () => {
+    const result = await makeSurface().surface.clearCredential('nope' as 'appId')
+    expect(result.ok).toBe(false)
   })
 })
 
@@ -440,6 +537,52 @@ describe('settings routes', () => {
   })
 })
 
+  it('writes and removes credentials via PUT / DELETE with the same guards', async () => {
+    const { surface } = makeSurface()
+    const { server, routes } = makeWebServer()
+    registerSettingsRoutes(server, surface)
+
+    const crossSite = await call(routes, CREDENTIALS_ROUTE, makeRequest({
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', origin: 'https://evil.example', host: '127.0.0.1:52555' },
+      body: JSON.stringify({ appId: 'cli_x' }),
+    }))
+    expect(crossSite.status).toBe(403)
+
+    const saved = await call(routes, CREDENTIALS_ROUTE, makeRequest({
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', host: '127.0.0.1:52555' },
+      body: JSON.stringify({ appId: 'cli_x' }),
+    }))
+    expect(saved.status).toBe(200)
+    expect(JSON.parse(saved.body).ok).toBe(true)
+
+    const invalid = await call(routes, CREDENTIALS_ROUTE, makeRequest({
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', host: 'h' },
+      body: JSON.stringify({ appId: '   ' }),
+    }))
+    expect(invalid.status).toBe(400)
+
+    const badField = await call(routes, CREDENTIALS_ROUTE, makeRequest({
+      method: 'DELETE',
+      headers: { 'content-type': 'application/json', host: 'h' },
+      body: JSON.stringify({ field: 'nope' }),
+    }))
+    expect(badField.status).toBe(400)
+
+    const removed = await call(routes, CREDENTIALS_ROUTE, makeRequest({
+      method: 'DELETE',
+      headers: { 'content-type': 'application/json', host: 'h' },
+      body: JSON.stringify({ field: 'appSecret' }),
+    }))
+    expect(removed.status).toBe(200)
+    expect(JSON.parse(removed.body).ok).toBe(true)
+
+    const notAllowed = await call(routes, CREDENTIALS_ROUTE, makeRequest({ method: 'GET' }))
+    expect(notAllowed.status).toBe(405)
+  })
+
 describe('apply() web wiring', () => {
   it('mounts the panel routes through an optional webServer and boots the channel', async () => {
     const { apply } = await import('../src/index.ts')
@@ -473,6 +616,7 @@ describe('apply() web wiring', () => {
     expect(routes.has(PANEL_ROUTE)).toBe(true)
     expect(routes.has(STATUS_ROUTE)).toBe(true)
     expect(routes.has(CONFIG_ROUTE)).toBe(true)
+    expect(routes.has(CREDENTIALS_ROUTE)).toBe(true)
     expect(routes.has(RECONNECT_ROUTE)).toBe(true)
 
     const panel = await call(routes, PANEL_ROUTE, makeRequest())
@@ -495,8 +639,13 @@ describe('apply() web wiring', () => {
   })
 })
 
-describe('FeishuService settings integration', () => {  function harness(overlay: Record<string, unknown> = {}): {
+describe('FeishuService settings integration', () => {
+  function harness(
+    overlay: Record<string, unknown> = {},
+    credentialValues?: Record<string, string>,
+  ): {
     ctx: HostContext
+    credentials: ReturnType<typeof makeHostContext>['credentials']
     channel: FeishuChannel
     config: FeishuConfig
     store: OverlayStore
@@ -504,8 +653,10 @@ describe('FeishuService settings integration', () => {  function harness(overlay
   } {
     const file = tempOverlayFile()
     if (Object.keys(overlay).length > 0) writeFileSync(file, JSON.stringify(overlay))
+    const hostState = makeHostContext(credentialValues)
     return {
-      ctx: makeHostContext().ctx,
+      ctx: hostState.ctx,
+      credentials: hostState.credentials,
       channel: makeChannel(),
       config: makeConfig(),
       store: new OverlayStore(file),
@@ -530,7 +681,7 @@ describe('FeishuService settings integration', () => {  function harness(overlay
     expect(service.startError()).toBeUndefined()
     expect(service.health().level).toBe('degraded') // fake channel exposes no connection status
 
-    expect(await service.credentialStates()).toEqual({ appId: true, appSecret: true })
+    expect(await service.credentialStates()).toMatchObject({ appId: { configured: true }, appSecret: { configured: true } })
     await service.shutdown()
   })
 
@@ -595,5 +746,41 @@ describe('FeishuService settings integration', () => {  function harness(overlay
     expect(service.configSnapshot().requireMention).toBe(true)
     expect(service.configSnapshot().provider).toBe('deepseek-official')
     await service.shutdown()
+  })
+
+  it('credential writes enable a channel that failed to boot without credentials', async () => {
+    const h = harness({}, {})
+    const service = new FeishuService(h.ctx, h.config, () => h.channel, undefined, h.store)
+    const surface = new SettingsSurface(service, h.store)
+    await expect(service.boot()).rejects.toThrow(/not configured/)
+    expect(service.isRunning()).toBe(false)
+
+    const saved = await surface.saveCredentials({ appId: 'cli_new', appSecret: 'secret_new' })
+    expect(saved.ok).toBe(true)
+    if (!saved.ok) return
+    expect(saved.reconnect).toBe('auto')
+    expect(saved.panel.status.running).toBe(true)
+    expect(saved.panel.config.credentials.appId.configured).toBe(true)
+    expect(h.credentials.values.FEISHU_APP_ID).toBe('cli_new')
+    expect(h.credentials.values.FEISHU_APP_SECRET).toBe('secret_new')
+
+    const cleared = await surface.clearCredential('appSecret')
+    expect(cleared.ok).toBe(true)
+    if (!cleared.ok) return
+    expect(cleared.reconnect).toBe('pending')
+    expect(h.credentials.values.FEISHU_APP_SECRET).toBeUndefined()
+    await service.shutdown()
+  })
+
+  it('reports a read-only credentials provider instead of silently dropping writes', async () => {
+    const h = harness()
+    const readOnly = { ...h.credentials, set: undefined, unset: undefined }
+    const ctx = {
+      ...h.ctx,
+      get: (name: string) => (name === 'credentials' ? readOnly : h.ctx.get?.(name)),
+    } as unknown as HostContext
+    const service = new FeishuService(ctx, h.config, () => h.channel, undefined, h.store)
+    await expect(service.setCredential('appId', 'cli_x')).rejects.toThrow(/不可写/)
+    await expect(service.clearCredential('appSecret')).rejects.toThrow(/不支持移除/)
   })
 })

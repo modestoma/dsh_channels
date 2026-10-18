@@ -14,13 +14,15 @@ import { PANEL_COPY } from '../settings/contract.ts'
 import type {
   ChannelStatusWire,
   ConfigValue,
+  CredentialField,
+  CredentialRefWire,
   EditableFieldWire,
   EditableKey,
   EditableValues,
   FieldIssueWire,
   PanelWire,
 } from '../settings/contract.ts'
-import { clearConfig, fetchPanel, fetchStatus, reconnect, saveConfig } from './api.ts'
+import { clearConfig, clearCredential, fetchPanel, fetchStatus, reconnect, saveConfig, saveCredentials } from './api.ts'
 
 /** Owner props handed to a `settings.section` contribution (unused beyond parity). */
 export interface FeishuChannelsSectionProps {
@@ -261,33 +263,109 @@ function StatusCard(props: {
   )
 }
 
+/** Credential editor: writes through the Host credentials seam, never echoes values. */
+function CredentialsCard(props: {
+  panel: PanelWire
+  appId: string
+  appSecret: string
+  issues: FieldIssueWire[]
+  busy: string | null
+  onAppIdChange: (value: string) => void
+  onAppSecretChange: (value: string) => void
+  onSave: () => void
+  onClear: (field: CredentialField) => void
+}) {
+  const { panel, appId, appSecret, issues, busy, onAppIdChange, onAppSecretChange, onSave, onClear } = props
+  const appIdState = panel.config.credentials.appId
+  const appSecretState = panel.config.credentials.appSecret
+  const writable = appIdState.writable || appSecretState.writable
+  const disabled = busy !== null || !writable
+  const pending = appId.trim() !== '' || appSecret.trim() !== ''
+
+  const row = (
+    field: CredentialField,
+    label: string,
+    state: CredentialRefWire,
+    value: string,
+    type: 'text' | 'password',
+    placeholder: string,
+    onChange: (next: string) => void,
+  ): JSX.Element => {
+    const issue = issues.find(item => item.key === field)
+    const inputClass = `dsh-channels-cfg__input${issue === undefined ? '' : ' dsh-channels-cfg__input--invalid'}`
+    return (
+      <div className="dsh-channels-cfg__field" key={field}>
+        <div className="dsh-channels-cfg__labelRow">
+          <span className="dsh-channels-cfg__label">{label}</span>
+          <span className={`dsh-channels-cfg__badge dsh-channels-cfg__badge--${state.configured ? 'ok' : 'bad'}`}>
+            {state.configured ? PANEL_COPY.credentialConfigured : PANEL_COPY.credentialMissing}
+          </span>
+        </div>
+        <div className="dsh-channels-cfg__cred">
+          <input
+            type={type}
+            className={inputClass}
+            value={value}
+            placeholder={placeholder}
+            autoComplete="new-password"
+            disabled={disabled}
+            onChange={event => onChange(event.target.value)}
+          />
+          {state.configured
+            ? (
+                <button
+                  type="button"
+                  className="dsh-channels-cfg__btn"
+                  disabled={disabled}
+                  onClick={() => onClear(field)}
+                >
+                  {busy === 'credentials-clear' ? PANEL_COPY.removingCredential : PANEL_COPY.removeCredential}
+                </button>
+              )
+            : null}
+        </div>
+        <span className="dsh-channels-cfg__help">
+          {PANEL_COPY.credentialsRef}：<span className="dsh-channels-cfg__mono">{state.ref}</span>
+          {state.source === undefined ? '' : `（来源：${state.source}）`}
+        </span>
+        {issue === undefined ? null : <span className="dsh-channels-cfg__fieldError">{issue.message}</span>}
+      </div>
+    )
+  }
+
+  return (
+    <section className="dsh-channels-cfg__card">
+      <div className="dsh-channels-cfg__cardHead">
+        <span className="dsh-channels-cfg__cardTitle">{PANEL_COPY.credentialsCard}</span>
+        <span className="dsh-channels-cfg__cardMeta">DSH 凭据库</span>
+      </div>
+      {row('appId', PANEL_COPY.appIdLabel, appIdState, appId, 'text', PANEL_COPY.appIdPlaceholder, onAppIdChange)}
+      {row('appSecret', PANEL_COPY.appSecretLabel, appSecretState, appSecret, 'password', PANEL_COPY.appSecretPlaceholder, onAppSecretChange)}
+      {writable ? null : <span className="dsh-channels-cfg__fieldError">{PANEL_COPY.credentialReadOnly}</span>}
+      <div className="dsh-channels-cfg__footer">
+        <button
+          type="button"
+          className="dsh-channels-cfg__btn dsh-channels-cfg__btn--primary"
+          onClick={onSave}
+          disabled={disabled || !pending}
+        >
+          {busy === 'credentials' ? PANEL_COPY.savingCredentials : PANEL_COPY.saveCredentials}
+        </button>
+        <span className="dsh-channels-cfg__spacer" />
+        <span className="dsh-channels-cfg__help">{PANEL_COPY.credentialsHelp}</span>
+      </div>
+    </section>
+  )
+}
+
 /** Read-only card: credentials, storage layer, and advanced limits. */
 function AdvancedCard(props: { panel: PanelWire }) {
   const { panel } = props
-  const { credentials, readOnly } = panel.config
+  const { readOnly } = panel.config
   return (
     <section className="dsh-channels-cfg__card">
       <div className="dsh-channels-cfg__cardHead">
         <span className="dsh-channels-cfg__cardTitle">{PANEL_COPY.advancedCard}</span>
-      </div>
-      <div className="dsh-channels-cfg__creds">
-        <div className="dsh-channels-cfg__cred">
-          <span className="dsh-channels-cfg__label">飞书 App ID</span>
-          <span className="dsh-channels-cfg__mono">{credentials.appId.ref}</span>
-          <span className={`dsh-channels-cfg__badge dsh-channels-cfg__badge--${credentials.appId.configured ? 'ok' : 'bad'}`}>
-            {credentials.appId.configured ? '凭据已配置' : '凭据未配置'}
-          </span>
-        </div>
-        <div className="dsh-channels-cfg__cred">
-          <span className="dsh-channels-cfg__label">飞书 App Secret</span>
-          <span className="dsh-channels-cfg__mono">{credentials.appSecret.ref}</span>
-          <span className={`dsh-channels-cfg__badge dsh-channels-cfg__badge--${credentials.appSecret.configured ? 'ok' : 'bad'}`}>
-            {credentials.appSecret.configured ? '凭据已配置' : '凭据未配置'}
-          </span>
-        </div>
-        <span className="dsh-channels-cfg__help">
-          凭据按引用名在 $DSH_HOME/.credentials.yaml 或环境变量里解析；修改引用名请编辑 profile 配置后重启 DSH。
-        </span>
       </div>
       <div className="dsh-channels-cfg__readOnly">
         {readOnly.map(field => (
@@ -316,9 +394,11 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
   const [load, setLoad] = useState<LoadState>({ phase: 'loading' })
   const [draft, setDraft] = useState<EditableValues>({})
   const [notice, setNotice] = useState<Notice | null>(null)
-  const [busy, setBusy] = useState<'save' | 'clear' | 'reconnect' | null>(null)
+  const [busy, setBusy] = useState<'save' | 'clear' | 'reconnect' | 'credentials' | 'credentials-clear' | null>(null)
   const [status, setStatus] = useState<ChannelStatusWire | null>(null)
   const [pollError, setPollError] = useState<string | null>(null)
+  const [appIdInput, setAppIdInput] = useState('')
+  const [appSecretInput, setAppSecretInput] = useState('')
   const panel = load.phase === 'ready' ? load.panel : null
   const currentStatus = status ?? panel?.status ?? null
 
@@ -330,6 +410,8 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
       setLoad({ phase: 'ready', panel: next })
       setStatus(next.status)
       setDraft({})
+      setAppIdInput('')
+      setAppSecretInput('')
     } catch (error) {
       setLoad({ phase: 'error', message: messageOf(error) })
     }
@@ -446,6 +528,66 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
     }
   }, [refreshStatus])
 
+  const onSaveCredentials = useCallback(async (): Promise<void> => {
+    const values: { appId?: string; appSecret?: string } = {}
+    if (appIdInput.trim() !== '') values.appId = appIdInput
+    if (appSecretInput.trim() !== '') values.appSecret = appSecretInput
+    if (values.appId === undefined && values.appSecret === undefined) return
+    setBusy('credentials')
+    setNotice(null)
+    try {
+      const result = await saveCredentials(values)
+      if (!result.ok) {
+        setNotice({ kind: 'error', text: result.error, issues: result.issues })
+        return
+      }
+      setLoad({ phase: 'ready', panel: result.panel })
+      setStatus(result.panel.status)
+      setAppIdInput('')
+      setAppSecretInput('')
+      const base = result.reconnect === 'pending'
+        ? PANEL_COPY.credentialSavedPending
+        : result.reconnect === 'auto'
+          ? PANEL_COPY.credentialSavedReconnected
+          : PANEL_COPY.credentialSaved
+      setNotice({
+        kind: result.autoReconnectError === undefined ? 'ok' : 'error',
+        text: result.autoReconnectError === undefined ? base : `${base}；自动重连失败：${result.autoReconnectError}`,
+      })
+    } catch (error) {
+      setNotice({ kind: 'error', text: messageOf(error) })
+    } finally {
+      setBusy(null)
+    }
+  }, [appIdInput, appSecretInput])
+
+  const onClearCredential = useCallback(async (field: CredentialField): Promise<void> => {
+    const label = field === 'appId' ? PANEL_COPY.appIdLabel : PANEL_COPY.appSecretLabel
+    const confirmed = typeof window.confirm === 'function'
+      ? window.confirm(`确定移除已存储的 ${label}？`)
+      : true
+    if (!confirmed) return
+    setBusy('credentials-clear')
+    setNotice(null)
+    try {
+      const result = await clearCredential(field)
+      if (!result.ok) {
+        setNotice({ kind: 'error', text: result.error, issues: result.issues })
+        return
+      }
+      setLoad({ phase: 'ready', panel: result.panel })
+      setStatus(result.panel.status)
+      setNotice({
+        kind: 'ok',
+        text: result.reconnect === 'pending' ? PANEL_COPY.credentialRemovedPending : PANEL_COPY.credentialRemoved,
+      })
+    } catch (error) {
+      setNotice({ kind: 'error', text: messageOf(error) })
+    } finally {
+      setBusy(null)
+    }
+  }, [])
+
   const groupedFields = useMemo(() => {
     if (panel === null) return []
     return GROUP_ORDER.map(group => ({
@@ -492,6 +634,22 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
             <div className={`dsh-channels-cfg__notice dsh-channels-cfg__notice--${notice.kind === 'ok' ? 'ok' : 'error'}`}>
               <span>{notice.text}</span>
             </div>
+          )}
+
+      {panel === null
+        ? null
+        : (
+            <CredentialsCard
+              panel={panel}
+              appId={appIdInput}
+              appSecret={appSecretInput}
+              issues={issues}
+              busy={busy}
+              onAppIdChange={setAppIdInput}
+              onAppSecretChange={setAppSecretInput}
+              onSave={() => { void onSaveCredentials() }}
+              onClear={field => { void onClearCredential(field) }}
+            />
           )}
 
       {panel === null

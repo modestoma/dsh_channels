@@ -20,6 +20,7 @@ import { QuestionAnswerer } from './questions.ts'
 import type {
   CommandInvocation,
   CommandResult,
+  CredentialInfo,
   CredentialProvider,
   CordisFiber,
   HostContext,
@@ -369,26 +370,71 @@ export class FeishuService {
   /** Aggregate health used by `/health` and the Web settings panel. */
   health(): HealthSnapshot { return this.healthSnapshot() }
 
-  /** Whether each configured credential reference currently resolves (no values returned). */
-  async credentialStates(): Promise<{ appId: boolean; appSecret: boolean }> {
-    const provider = this.ctx.get?.('credentials') as CredentialProvider | undefined
-    const configured = async (ref: string): Promise<boolean> => {
+  /**
+   * Credential facts for the two Feishu refs. Values are never returned:
+   * `describe()` reports presence/source/writability only.
+   */
+  async credentialStates(): Promise<{ appId: CredentialInfo; appSecret: CredentialInfo }> {
+    const provider = this.credentialProvider()
+    const read = async (ref: string): Promise<CredentialInfo> => {
       try {
         if (provider?.describe !== undefined) {
           const info = await provider.describe(ref)
-          return info?.configured === true
+          return {
+            configured: info?.configured === true,
+            writable: info?.writable !== false && provider.set !== undefined,
+            ...(info?.source === undefined ? {} : { source: info.source }),
+          }
         }
         if (provider === undefined) {
           const ambient = process.env[ref]
-          return ambient !== undefined && ambient !== ''
+          return { configured: ambient !== undefined && ambient !== '', writable: false }
         }
-        return (await provider.resolve(ref)) !== undefined
+        return { configured: (await provider.resolve(ref)) !== undefined, writable: provider.set !== undefined }
       } catch {
-        return false
+        return { configured: false, writable: false }
       }
     }
-    const [appId, appSecret] = await Promise.all([configured(this.config.appId), configured(this.config.appSecret)])
+    const [appId, appSecret] = await Promise.all([read(this.config.appId), read(this.config.appSecret)])
     return { appId, appSecret }
+  }
+
+  /** The host credentials seam, when mounted. */
+  private credentialProvider(): CredentialProvider | undefined {
+    return this.ctx.get?.('credentials') as CredentialProvider | undefined
+  }
+
+  /** Store one Feishu credential value through the host seam; the value is never logged. */
+  async setCredential(field: 'appId' | 'appSecret', value: string): Promise<void> {
+    const provider = this.credentialProvider()
+    if (provider?.set === undefined) {
+      throw new Error('主机的凭据服务不可写（未挂载 credentials.set，或当前提供方只读）')
+    }
+    const ref = this.credentialRef(field)
+    try {
+      await provider.set(ref, value)
+    } catch (error) {
+      throw new Error(`写入凭据引用 ${ref} 失败：${messageOf(error)}`)
+    }
+  }
+
+  /** Remove the stored value of one Feishu credential reference. */
+  async clearCredential(field: 'appId' | 'appSecret'): Promise<void> {
+    const provider = this.credentialProvider()
+    if (provider?.unset === undefined) {
+      throw new Error('主机的凭据服务不支持移除凭据')
+    }
+    const ref = this.credentialRef(field)
+    try {
+      await provider.unset(ref)
+    } catch (error) {
+      throw new Error(`移除凭据引用 ${ref} 失败：${messageOf(error)}`)
+    }
+  }
+
+  /** The overlay-independent ref name backing one editable credential slot. */
+  private credentialRef(field: 'appId' | 'appSecret'): string {
+    return field === 'appId' ? this.config.appId : this.config.appSecret
   }
 
   /** Wire events and open the long connection. */

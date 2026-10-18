@@ -1,17 +1,19 @@
 /**
- * Web 设置面板的 HTTP 路由：status / panel / config(PUT,DELETE) / reconnect。
+ * Web 设置面板的 HTTP 路由：status / panel / config(PUT,DELETE) /
+ * credentials(PUT,DELETE) / reconnect。
  *
  * 路由注册进宿主可选的 `webServer` 服务（headless profile 没有它时面板自然
  * 不存在，飞书通道不受影响）。写操作额外做同源校验 —— 本机非回环绑定下
- * 防止跨站页面改写插件配置；读取不敏感，保持只读 GET。
+ * 防止跨站页面改写插件配置；读取不敏感，保持只读 GET。凭据值只走写路径，
+ * 响应永远不包含它们。
  *
  * @module dsh-channels/settings/routes
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { HostContext } from '../dsh-types.ts'
-import { CONFIG_ROUTE, PANEL_ROUTE, RECONNECT_ROUTE, STATUS_ROUTE } from './contract.ts'
-import type { EditableValues } from './contract.ts'
+import { CONFIG_ROUTE, CREDENTIALS_ROUTE, PANEL_ROUTE, RECONNECT_ROUTE, STATUS_ROUTE } from './contract.ts'
+import type { CredentialField, EditableValues, SaveCredentialsRequest } from './contract.ts'
 import type { SettingsSurface } from './surface.ts'
 
 /** The narrow `ctx.webServer` surface this module registers into. */
@@ -187,6 +189,47 @@ export function registerSettingsRoutes(server: HostWebServer, surface: SettingsS
           return
         }
         const result = await surface.save(values as EditableValues)
+        sendJson(res, result.ok ? 200 : 400, result)
+      }),
+    }),
+    server.register({
+      kind: 'exact',
+      path: CREDENTIALS_ROUTE,
+      handler: guarded(async (req, res) => {
+        if (!allowOnly(req, res, ['PUT', 'DELETE'])) return
+        if (!isSameOriginRequest(req)) {
+          forbiddenWrite(res)
+          return
+        }
+        let body: unknown
+        try {
+          body = await readJsonBody(req)
+        } catch (error) {
+          if (error instanceof HttpError) {
+            sendJson(res, error.status, { ok: false, error: error.message })
+            return
+          }
+          throw error
+        }
+        const payload = body as { appId?: unknown; appSecret?: unknown; field?: unknown } | null
+        if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
+          sendJson(res, 400, { ok: false, error: '请求体必须是 JSON 对象' })
+          return
+        }
+        if (methodOf(req) === 'DELETE') {
+          const field = payload.field
+          if (field !== 'appId' && field !== 'appSecret') {
+            sendJson(res, 400, { ok: false, error: 'field 必须是 appId 或 appSecret' })
+            return
+          }
+          const result = await surface.clearCredential(field as CredentialField)
+          sendJson(res, result.ok ? 200 : 400, result)
+          return
+        }
+        const values: SaveCredentialsRequest = {}
+        if (payload.appId !== undefined) values.appId = payload.appId as string
+        if (payload.appSecret !== undefined) values.appSecret = payload.appSecret as string
+        const result = await surface.saveCredentials(values)
         sendJson(res, result.ok ? 200 : 400, result)
       }),
     }),

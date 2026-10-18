@@ -5,14 +5,18 @@
  * @module dsh-channels/client/api
  */
 
-import { CONFIG_ROUTE, PANEL_ROUTE, RECONNECT_ROUTE, STATUS_ROUTE } from '../settings/contract.ts'
+import { CONFIG_ROUTE, CREDENTIALS_ROUTE, PANEL_ROUTE, RECONNECT_ROUTE, STATUS_ROUTE } from '../settings/contract.ts'
 import type {
   ChannelStatusWire,
   ClearConfigResponse,
+  ClearCredentialResponse,
+  CredentialField,
   EditableValues,
   PanelWire,
   ReconnectResponse,
   SaveConfigResponse,
+  SaveCredentialsRequest,
+  SaveCredentialsResponse,
 } from '../settings/contract.ts'
 
 function messageOf(error: unknown): string {
@@ -106,4 +110,42 @@ export async function reconnect(): Promise<ReconnectResponse> {
     }
   }
   return JSON.parse(text) as ReconnectResponse
+}
+
+/** Store provided credential values (the request/response never carry stored values). */
+export async function saveCredentials(values: SaveCredentialsRequest): Promise<SaveCredentialsResponse> {
+  const response = await request(CREDENTIALS_ROUTE, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(values),
+  })
+  const text = await response.text()
+  if (response.status === 400) {
+    try {
+      return JSON.parse(text) as SaveCredentialsResponse
+    } catch {
+      return { ok: false, error: errorFromBody(response.status, text) }
+    }
+  }
+  if (!response.ok) throw new Error(errorFromBody(response.status, text))
+  return JSON.parse(text) as SaveCredentialsResponse
+}
+
+/** Remove the stored value behind one credential reference. */
+export async function clearCredential(field: CredentialField): Promise<ClearCredentialResponse> {
+  const response = await request(CREDENTIALS_ROUTE, {
+    method: 'DELETE',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ field }),
+  })
+  const text = await response.text()
+  if (response.status === 400) {
+    try {
+      return JSON.parse(text) as ClearCredentialResponse
+    } catch {
+      return { ok: false, error: errorFromBody(response.status, text) }
+    }
+  }
+  if (!response.ok) throw new Error(errorFromBody(response.status, text))
+  return JSON.parse(text) as ClearCredentialResponse
 }

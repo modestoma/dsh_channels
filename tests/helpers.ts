@@ -369,7 +369,13 @@ export function makeHostContext(
   agents: ReturnType<typeof makeAgentRegistry>
   workspaces: ReturnType<typeof makeWorkspaceRegistry>
   domain: ReturnType<typeof makeDomain>
-  credentials: { resolve: ReturnType<typeof vi.fn>; values: Record<string, string> }
+  credentials: {
+    resolve: ReturnType<typeof vi.fn>
+    describe: ReturnType<typeof vi.fn>
+    set: ReturnType<typeof vi.fn>
+    unset: ReturnType<typeof vi.fn>
+    values: Record<string, string>
+  }
   sessionListeners: Array<(session: Session, event: SessionEvent) => void>
   assistantStreamListeners: Array<(payload: AssistantStreamPayload) => void>
   approvalListeners: Array<{ listener: ApprovalAnswererListener; options: { prepend?: boolean } | undefined }>
@@ -414,10 +420,21 @@ export function makeHostContext(
       ...(credentialValues === undefined
         ? { FEISHU_APP_ID: 'cli_test_app', FEISHU_APP_SECRET: 'test_secret' }
         : credentialValues),
-    },
+    } as Record<string, string>,
     resolve: vi.fn(async (ref: string) => {
       const value = credentials.values[ref]
       return value === undefined ? undefined : { value, source: 'file' }
+    }),
+    describe: vi.fn(async (ref: string) => ({
+      configured: credentials.values[ref] !== undefined,
+      writable: true,
+      source: credentials.values[ref] === undefined ? undefined : 'file',
+    })),
+    set: vi.fn(async (ref: string, value: string) => {
+      credentials.values[ref] = value
+    }),
+    unset: vi.fn(async (ref: string) => {
+      delete credentials.values[ref]
     }),
   }
   const attachments = { saveImages: vi.fn(async (inputs: readonly unknown[]) => inputs.map((_input, index) => ({ id: `att_${index + 1}` }))) }

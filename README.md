@@ -50,11 +50,13 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 
 包内含可选的浏览器半区（`lib/client.js`，DSH client module）：在 Web/桌面端 **设置** 导航注册「飞书渠道」分区。宿主没有 `webServer` 服务（headless profile）时不加载面板，飞书通道本身不受影响。
 
-![设置 → 飞书渠道：连接状态卡与常用配置表单](docs/assets/web-settings-panel.png)
+![设置 → 飞书渠道：连接状态、飞书应用凭据与常用配置](docs/assets/web-settings-panel.png)
 
 > 截图为验证实例（mock 飞书通道、未登录账号）中的面板；「运行中 · 降级」来自该验证 profile 里其它仍在加载的插件 fiber，正常部署通常显示「运行中 · 健康」。
 
 **连接状态**：健康徽标（健康 / 降级 / 异常）、飞书长连接状态、Bot open_id 尾号、运行时长、话题路由数 / 活动会话 / 在途回复、最近一次启动失败原因；每 5 秒自动刷新，也可手动刷新或**重启飞书连接**（会断开当前长连接并中断进行中的回复）。
+
+**飞书应用凭据**：在「飞书应用凭据」卡片里填写 **App ID / App Secret** 并保存，值经宿主 `ctx.credentials` 写入 DSH 凭据库（默认 `$DSH_HOME/.credentials.yaml` 的 `refs:` 段，仍遵循凭据层的解析优先级），面板只显示「已配置 / 未配置」与来源，**永不回显已存值**。保存时：通道运行中 → 提示重启飞书连接后生效；通道已停止（例如首次配置前启动失败）→ 自动重试连接，失败原因显示在状态卡。已存值可以单独「移除已存值」；卡片下方显示的是凭据**引用名**（profile 配置里的 `appId` / `appSecret`），换引用名仍需改 profile 配置。
 
 **常用配置**：表单由 Host 下发的字段描述通用渲染，保存时用与 Loader 相同的 zod schema 校验，只提交改动过的字段：
 
@@ -70,9 +72,9 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 
 ![保存后提示需重启飞书连接](docs/assets/web-settings-restart-pending.png)
 
-**配置层级**：`configSchema` 默认值 < profile `cordis.patch.yml` 的 `config` < Web 面板覆盖。面板只把可编辑字段写入 `$DSH_HOME/dsh-channels/settings.json`（可用配置项 `settingsFile` 改路径）；「清除 Web 覆盖」删除该文件并回落到 profile 配置。`appId` / `appSecret`（凭据引用）、`baseDir`、超时、路由 TTL 等只读展示；改凭据引用请编辑 profile 配置后重启 DSH。
+**配置层级**：`configSchema` 默认值 < profile `cordis.patch.yml` 的 `config` < Web 面板覆盖。面板只把可编辑字段写入 `$DSH_HOME/dsh-channels/settings.json`（可用配置项 `settingsFile` 改路径）；「清除 Web 覆盖」删除该文件并回落到 profile 配置。`baseDir`、超时、路由 TTL 等只读展示；凭据**值**在「飞书应用凭据」卡片编辑，凭据**引用名**（`appId` / `appSecret` 配置项）仍由 profile 配置决定。
 
-**安全边界**：面板路由与其他本机 DSH 路由一样**不带鉴权**；写操作（PUT / DELETE / POST）额外校验 `Origin` 与 `Host` 同源，拒绝跨站页面改写配置。不要把 DSH Web 服务绑定到不可信网络。
+**安全边界**：面板路由与其他本机 DSH 路由一样**不带鉴权**；写操作（PUT / DELETE / POST）额外校验 `Origin` 与 `Host` 同源，拒绝跨站页面改写配置或凭据。凭据值只走写路径、响应永不回显，也不会写进 Web 覆盖文件。不要把 DSH Web 服务绑定到不可信网络。
 
 **构建**：DSH 只加载已构建的浏览器 bundle，改了 `src/client/` 或 `src/settings/contract.ts` 后需要重新构建并重启应用：
 
@@ -193,6 +195,8 @@ FEISHU_APP_ID: cli_xxxxxxxx
 FEISHU_APP_SECRET: xxxxxxxx
 ```
 
+也可以不手改文件：安装并在 Web 面板里打开 **设置 → 飞书渠道**，在「飞书应用凭据」卡片填入 App ID / App Secret 保存即可（值同样写进该凭据库）。
+
 文件必须仅属主可读（dsh 强制校验，否则拒绝启动）：`chmod 600 $DSH_HOME/.credentials.yaml`。解析优先级：进程环境变量 > `.credentials.yaml` > `<cwd>/.env` > `$DSH_HOME/.env`（由 `dsh-credentials-local` 提供，热加载）。配置里只写引用名，明文密钥会被 schema 拒绝。凭据改动后重启 dsh 生效。
 
 验证组合（不启动服务）：`DSH_HOME=$DSH_HOME pnpm dsh web --dump-config | grep dsh-channels`
@@ -243,7 +247,7 @@ FEISHU_APP_SECRET: xxxxxxxx
 - 重启修复会**全量替换**中断的卡片：旧进程里已流出的部分正文随之消失（本地没有副本，patch 是全量语义）；修复是一次性 + 一次重试，不再无限重试。
 - 路由 GC 是 TTL 兜底：未监听飞书“群解散/话题删除”事件做主动清理；真实话题过期后写入持久化墓碑，用户回来会收到明确拒绝，不会在旧话题中误建新 Session。
 - 消息去重是**至多一次**语义：接受后、副作用完成前崩溃的极小窗口内，重投消息会被丢弃——中断修复卡提示“请重新发送消息”，用户重发即可（新 message id 正常处理）。
-- Web 面板不做凭据编辑：`appId` / `appSecret` 只展示引用名与是否已配置，改引用名仍需编辑 profile 配置并重启 DSH。
+- Web 面板编辑的是当前凭据**引用名**背后的值（profile 配置 `appId` / `appSecret` 指向的 ref）；更换引用名仍需编辑 profile 配置并重启 DSH。凭据提供方只读时面板会禁用输入并提示。
 - Web 面板的模型字段是自由文本（无 provider/model 下拉目录），填错会在下一次模型请求时由 Host 按现有链路报错；「重启飞书连接」会中断进行中的回复。
 - 持久化盘点与全部缺口状态见 [docs/persistence.md](docs/persistence.md)。
 

@@ -19,7 +19,9 @@ import {
 import type {
   ChannelStatusWire,
   ClearConfigResponse,
+  ClearCredentialResponse,
   ConfigValue,
+  CredentialField,
   CredentialRefWire,
   EditableFieldWire,
   EditableKey,
@@ -30,6 +32,8 @@ import type {
   ReadOnlyFieldWire,
   ReconnectResponse,
   SaveConfigResponse,
+  SaveCredentialsRequest,
+  SaveCredentialsResponse,
 } from './contract.ts'
 import {
   parseOverlay,
@@ -50,7 +54,16 @@ export interface SettingsTarget {
   runningConfigSnapshot(): FeishuConfig | undefined
   applyOverlay(overlay: Partial<FeishuConfig>): void
   restart(): Promise<void>
-  credentialStates(): Promise<{ appId: boolean; appSecret: boolean }>
+  credentialStates(): Promise<{ appId: CredentialInfo; appSecret: CredentialInfo }>
+  setCredential(field: CredentialField, value: string): Promise<void>
+  clearCredential(field: CredentialField): Promise<void>
+}
+
+/** Presence/source/writability facts returned by the credentials seam. */
+export interface CredentialInfo {
+  configured: boolean
+  writable?: boolean
+  source?: string
 }
 
 const RESTART_SET = new Set<string>(RESTART_KEYS)
@@ -152,6 +165,19 @@ function formatOptional(value: string | number | undefined, suffix = ''): string
   return value === undefined ? '未设置' : `${value}${suffix}`
 }
 
+/** Credential values are opaque strings; trim, cap length, reject control chars. */
+const MAX_CREDENTIAL_LENGTH = 512
+
+export function normalizeCredentialValue(raw: unknown): { ok: true; value: string } | { ok: false; message: string } {
+  if (typeof raw !== 'string') return { ok: false, message: '必须是字符串' }
+  const value = raw.trim()
+  if (value === '') return { ok: false, message: '不能为空' }
+  if (value.length > MAX_CREDENTIAL_LENGTH) return { ok: false, message: `长度不得超过 ${MAX_CREDENTIAL_LENGTH}` }
+  // eslint-disable-next-line no-control-regex
+  if (/[\u0000-\u001f\u007f]/.test(value)) return { ok: false, message: '包含非法控制字符' }
+  return { ok: true, value }
+}
+
 /** Build the read-only advanced card from the effective config. */
 export function readOnlyFields(config: FeishuConfig): ReadOnlyFieldWire[] {
   return [
@@ -218,15 +244,24 @@ export class SettingsSurface {
       ? RESTART_KEYS.filter(key => effective[key] !== running[key])
       : []
 
-    let credentialStates = { appId: false, appSecret: false }
+    let credentialStates: { appId: CredentialInfo; appSecret: CredentialInfo } = {
+      appId: { configured: false, writable: false },
+      appSecret: { configured: false, writable: false },
+    }
     try {
       credentialStates = await this.target.credentialStates()
     } catch (error) {
       this.logger?.warn?.('dsh-channels: 凭据状态读取失败：%s', messageOf(error))
     }
+    const toWire = (ref: string, state: CredentialInfo): CredentialRefWire => ({
+      ref,
+      configured: state.configured,
+      writable: state.writable === true,
+      ...(state.source === undefined ? {} : { source: state.source }),
+    })
     const credentials: PanelConfigWire['credentials'] = {
-      appId: { ref: effective.appId, configured: credentialStates.appId },
-      appSecret: { ref: effective.appSecret, configured: credentialStates.appSecret },
+      appId: toWire(effective.appId, credentialStates.appId),
+      appSecret: toWire(effective.appSecret, credentialStates.appSecret),
     }
 
     return {
@@ -294,6 +329,69 @@ export class SettingsSurface {
     }
     this.target.applyOverlay({})
     return { ok: true, panel: await this.panel() }
+  }
+
+  /** Write provided credential values through the host seam (never echoed back). */
+  async saveCredentials(values: SaveCredentialsRequest): Promise<SaveCredentialsResponse> {
+    const writes: Array<{ field: CredentialField; value: string }> = []
+    const issues: FieldIssueWire[] = []
+    for (const field of ['appId', 'appSecret'] as const) {
+      const raw = values[field]
+      if (raw === undefined) continue
+      const normalized = normalizeCredentialValue(raw)
+      if (!normalized.ok) {
+        issues.push({ key: field, message: normalized.message })
+        continue
+      }
+      writes.push({ field, value: normalized.value })
+    }
+    if (issues.length > 0) return { ok: false, error: '凭据校验失败', issues }
+    if (writes.length === 0) return { ok: false, error: '请至少填写一项凭据（App ID 或 App Secret）' }
+
+    try {
+      for (const write of writes) await this.target.setCredential(write.field, write.value)
+    } catch (error) {
+      return { ok: false, error: messageOf(error) }
+    }
+    return this.finishCredentialChange('save')
+  }
+
+  /** Remove the stored value behind one credential reference. */
+  async clearCredential(field: CredentialField): Promise<ClearCredentialResponse> {
+    if (field !== 'appId' && field !== 'appSecret') {
+      return { ok: false, error: '未知的凭据字段' }
+    }
+    try {
+      await this.target.clearCredential(field)
+    } catch (error) {
+      return { ok: false, error: messageOf(error) }
+    }
+    return this.finishCredentialChange('clear')
+  }
+
+  /**
+   * Credential values are resolved on connect. When the channel is stopped,
+   * retry immediately (nothing to interrupt); when it is running, ask the user
+   * to reconnect. A failed retry still reports the save as successful.
+   */
+  private async finishCredentialChange(kind: 'save' | 'clear'): Promise<SaveCredentialsResponse> {
+    if (this.target.isRunning()) {
+      return { ok: true, panel: await this.panel(), reconnect: 'pending' }
+    }
+    if (kind === 'clear') {
+      return { ok: true, panel: await this.panel(), reconnect: 'not-needed' }
+    }
+    try {
+      await this.target.restart()
+      return { ok: true, panel: await this.panel(), reconnect: 'auto' }
+    } catch (error) {
+      return {
+        ok: true,
+        panel: await this.panel(),
+        reconnect: 'auto',
+        autoReconnectError: messageOf(error),
+      }
+    }
   }
 
   /** Close and reopen the Feishu long connection with the latest config. */

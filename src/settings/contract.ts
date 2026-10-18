@@ -11,6 +11,7 @@
 export const STATUS_ROUTE = '/dsh-channels/status'
 export const PANEL_ROUTE = '/dsh-channels/panel'
 export const CONFIG_ROUTE = '/dsh-channels/config'
+export const CREDENTIALS_ROUTE = '/dsh-channels/credentials'
 export const RECONNECT_ROUTE = '/dsh-channels/reconnect'
 
 /**
@@ -18,8 +19,9 @@ export const RECONNECT_ROUTE = '/dsh-channels/reconnect'
  * 覆盖值写进 `$DSH_HOME/dsh-channels/settings.json`，优先级高于 profile
  * 的 `cordis.patch.yml`（见 README「Web 设置面板」）。
  *
- * 刻意不包含 `appId` / `appSecret`（凭据引用，改动语义是重连/重新解析凭据，
- * 留在 profile 文件里编辑）与 `baseDir`（已有工作区路径不可迁移）。
+ * 刻意不包含 `appId` / `appSecret`：它们是**凭据引用名**，面板改为直接
+ * 编辑引用背后的值（`PUT /dsh-channels/credentials`，经 DSH 凭据服务写入），
+ * 因此不会落进覆盖层文件。`baseDir` 同样不可覆盖（已有工作区路径不可迁移）。
  */
 export const EDITABLE_KEYS = [
   // 行为
@@ -92,11 +94,18 @@ export interface ReadOnlyFieldWire {
   help?: string
 }
 
-/** One credential reference plus whether the Host can currently resolve it. */
+/** One credential reference plus its Host-side state (values never cross the wire). */
 export interface CredentialRefWire {
   ref: string
   configured: boolean
+  /** false when the mounted credentials provider cannot store values. */
+  writable: boolean
+  /** Where the configured value comes from (e.g. `file`), when the provider reports it. */
+  source?: string
 }
+
+/** The two credential slots the panel may write. */
+export type CredentialField = 'appId' | 'appSecret'
 
 /** Official-SDK WebSocket lifecycle snapshot (structural copy, no SDK import on the wire). */
 export interface ConnectionWire {
@@ -178,13 +187,62 @@ export type ClearConfigResponse =
   | { ok: true; panel: PanelWire }
   | { ok: false; error: string }
 
+/** `PUT /dsh-channels/credentials` body: only provided, non-empty values are written. */
+export interface SaveCredentialsRequest {
+  appId?: string
+  appSecret?: string
+}
+
+/** `DELETE /dsh-channels/credentials` body. */
+export interface ClearCredentialRequest {
+  field: CredentialField
+}
+
+/** How a saved credential reached the running channel. */
+export type CredentialReconnectState = 'auto' | 'pending' | 'not-needed'
+
+export interface CredentialsSavedPayload {
+  panel: PanelWire
+  reconnect: CredentialReconnectState
+  /** Set when the automatic reconnect after a save failed (the value is still saved). */
+  autoReconnectError?: string
+}
+
+/** Credential write/remove responses (values never appear in either direction). */
+export type SaveCredentialsResponse =
+  | ({ ok: true } & CredentialsSavedPayload)
+  | { ok: false; error: string; issues?: FieldIssueWire[] }
+
+export type ClearCredentialResponse =
+  | ({ ok: true } & CredentialsSavedPayload)
+  | { ok: false; error: string; issues?: FieldIssueWire[] }
+
 /** Display labels for the panel header/cards (kept on the wire so the client owns no copy). */
 export const PANEL_COPY = {
   title: '飞书渠道',
-  description: '飞书长连接状态与常用配置。改动保存后写入本机覆盖文件；标注「需重连」的项需重启飞书连接生效。',
+  description: '飞书长连接状态、应用凭据与常用配置。凭据写入 DSH 凭据库且不回显；标注「需重连」的项需重启飞书连接生效。',
   statusCard: '连接状态',
+  credentialsCard: '飞书应用凭据',
   configCard: '常用配置',
   advancedCard: '只读与高级信息',
+  appIdLabel: '飞书 App ID',
+  appSecretLabel: '飞书 App Secret',
+  credentialsHelp: '值通过 DSH 凭据服务写入本机凭据库；面板只显示是否已配置，永不回显已存值。留空表示保持当前值。',
+  credentialsRef: '凭据引用',
+  saveCredentials: '保存凭据',
+  savingCredentials: '保存中…',
+  credentialSaved: '凭据已保存',
+  credentialSavedReconnected: '凭据已保存，已自动重连飞书通道',
+  credentialSavedPending: '凭据已保存，重启飞书连接后生效',
+  credentialRemoved: '已移除存储的凭据',
+  credentialRemovedPending: '已移除存储的凭据，重启飞书连接后生效',
+  removeCredential: '移除已存值',
+  removingCredential: '移除中…',
+  credentialConfigured: '已配置',
+  credentialMissing: '未配置',
+  credentialReadOnly: '当前凭据存储不可写',
+  appIdPlaceholder: '输入 App ID（cli_…）',
+  appSecretPlaceholder: '输入 App Secret',
   save: '保存配置',
   saving: '保存中…',
   clear: '清除 Web 覆盖',

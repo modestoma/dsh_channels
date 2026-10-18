@@ -64,6 +64,7 @@ select.dsh-channels-cfg__input{appearance:auto;cursor:pointer}
 .dsh-channels-cfg__mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}
 .dsh-channels-cfg__creds{display:flex;flex-direction:column;gap:6px}
 .dsh-channels-cfg__cred{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.dsh-channels-cfg__cred .dsh-channels-cfg__input{flex:1 1 240px;min-width:0;width:auto}
 .dsh-channels-cfg__error{padding:10px 12px;border:1px solid var(--dsw-alias-state-danger-primary,#c62828);border-radius:10px;color:var(--dsw-alias-state-danger-primary,#c62828);font-size:12px;line-height:18px;display:flex;flex-direction:column;gap:8px}
 .dsh-channels-cfg__loading{padding:16px 0;color:var(--dsw-alias-label-tertiary,#8a8f98);font-size:12px}
 .dsh-channels-cfg__issues{margin:0;padding-left:18px}

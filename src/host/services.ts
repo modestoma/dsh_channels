@@ -38,18 +38,29 @@ export interface ResolvedCredential {
   source: string
 }
 
+/** Presence/writability facts for one credential reference (never the value). */
+export interface CredentialInfo {
+  configured: boolean
+  writable?: boolean
+  source?: string
+}
+
 /**
  * The host credentials seam (`@deepseek-ai/dsh-credentials`): resolves a
  * reference per call with the provider's layer precedence
- * (env > $DSH_HOME/.credentials.yaml > .env fallbacks).
+ * (env > $DSH_HOME/.credentials.yaml > .env fallbacks), and can store a value
+ * for a reference through the same seam (the Web panel's credential editor).
+ * Every member beyond the read path is optional so embedded/test hosts can
+ * supply only what they support.
  */
 export interface CredentialProvider {
   resolve(ref: string): Promise<ResolvedCredential | undefined>
-  /**
-   * Presence check without revealing the value (the host's `credentials.describe`).
-   * Optional so embedded/test hosts can supply only `resolve`.
-   */
-  describe?(ref: string): Promise<{ configured: boolean } | undefined>
+  /** Presence check without revealing the value (the host's `credentials.describe`). */
+  describe?(ref: string): Promise<CredentialInfo | undefined>
+  /** Store a value for the reference; stored values outrank environment fallbacks. */
+  set?(ref: string, value: string): Promise<void>
+  /** Remove the stored value (environment fallbacks then apply again). */
+  unset?(ref: string): Promise<void>
 }
 
 export interface TokenMeasurement {
