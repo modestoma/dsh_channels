@@ -9,6 +9,7 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 - **HITL 审批**：当模型请求需要授权的动作（如 bash 沙箱升级 `sandbox_permissions`）时，插件监听主机 `approval/request` 事件，在同一话题里**新发一张独立审批决策卡**（✅ 允许 / ❌ 拒绝 按钮），用户点击后回填主机审批结果；超时（`approvalTimeoutMs`，默认 5 分钟）自动拒绝（fail-closed），非会话发起人点击无效
 - **结构化提问**：模型调用 `ask_user_question` 时，插件监听主机 `user-questions/request` 瀑布并发一张问答卡（每个问题一组选项按钮，多选先勾选再「提交本题选择」），答案回填给模型；主机自带的应答者只有 Web 客户端，没有本插件时纯飞书会话会以 `NO_PROVIDER` 失败。超时（`questionTimeoutMs`，默认 5 分钟）或回合取消时本轮提问失败（fail-closed）；没有可选项的问题直接提示用文字作答，**阻塞期间普通文本回复即作为该问题的自由文本答案**（同时支持多选后的自定义文本）
 - 全部基于飞书官方 SDK [`@larksuiteoapi/node-sdk`](https://www.npmjs.com/package/@larksuiteoapi/node-sdk)（WebSocket 长连接，免公网）
+- **Web 设置面板**：Web/桌面端 **设置 → 飞书渠道** 查看连接状态、编辑常用配置（保存写入本机覆盖文件，部分字段需重启连接生效）；详见下文「Web 设置面板」章节
 
 设计与可行性论证见 [docs/feasibility-and-design.md](docs/feasibility-and-design.md)。
 
@@ -44,6 +45,41 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 4. **session 信息**（两行小字）：
    - `🔑 {session id} · ⬆ input token {input} · ⬇ output token {output}`（session 累计口径）
    - `🧠 模型 {model}({effort}) · ⚡ 缓存命中 {cache} · 📊 上下文 {tokens}/{window}`（模型、推理强度、缓存命中按**当前轮次**；若本轮在请求头产生前失败则显示 `—`，不会沿用上一轮）
+
+## Web 设置面板（设置 → 飞书渠道）
+
+包内含可选的浏览器半区（`lib/client.js`，DSH client module）：在 Web/桌面端 **设置** 导航注册「飞书渠道」分区。宿主没有 `webServer` 服务（headless profile）时不加载面板，飞书通道本身不受影响。
+
+![设置 → 飞书渠道：连接状态卡与常用配置表单](docs/assets/web-settings-panel.png)
+
+> 截图为验证实例（mock 飞书通道、未登录账号）中的面板；「运行中 · 降级」来自该验证 profile 里其它仍在加载的插件 fiber，正常部署通常显示「运行中 · 健康」。
+
+**连接状态**：健康徽标（健康 / 降级 / 异常）、飞书长连接状态、Bot open_id 尾号、运行时长、话题路由数 / 活动会话 / 在途回复、最近一次启动失败原因；每 5 秒自动刷新，也可手动刷新或**重启飞书连接**（会断开当前长连接并中断进行中的回复）。
+
+**常用配置**：表单由 Host 下发的字段描述通用渲染，保存时用与 Loader 相同的 zod schema 校验，只提交改动过的字段：
+
+| 分组 | 字段 | 生效方式 |
+| --- | --- | --- |
+| 行为 | `dmMode`、`requireMention` | 需重启连接 |
+| 行为 | `threadFallback`、`welcomeOnboarding`、`allowPermissionSwitch` | 立即生效 |
+| 内容与图片 | `acceptImages`、`maxImagesPerMessage` | 立即生效 |
+| 模型 | `provider`、`model`、`reasoningEffort`、`agentPreset` | 立即生效（后续回合/新会话使用） |
+| 流式卡片 | `refreshMs`、`statusRefreshMs`、`loggerLevel` | 需重启连接 |
+
+保存只改动了「需重连」字段时，面板会列出待生效项并提供一键重连：
+
+![保存后提示需重启飞书连接](docs/assets/web-settings-restart-pending.png)
+
+**配置层级**：`configSchema` 默认值 < profile `cordis.patch.yml` 的 `config` < Web 面板覆盖。面板只把可编辑字段写入 `$DSH_HOME/dsh-channels/settings.json`（可用配置项 `settingsFile` 改路径）；「清除 Web 覆盖」删除该文件并回落到 profile 配置。`appId` / `appSecret`（凭据引用）、`baseDir`、超时、路由 TTL 等只读展示；改凭据引用请编辑 profile 配置后重启 DSH。
+
+**安全边界**：面板路由与其他本机 DSH 路由一样**不带鉴权**；写操作（PUT / DELETE / POST）额外校验 `Origin` 与 `Host` 同源，拒绝跨站页面改写配置。不要把 DSH Web 服务绑定到不可信网络。
+
+**构建**：DSH 只加载已构建的浏览器 bundle，改了 `src/client/` 或 `src/settings/contract.ts` 后需要重新构建并重启应用：
+
+```bash
+pnpm build:client      # 产出 lib/client.js
+pnpm verify:client     # 用 __ModuleLoader__ shim 做 loader 冒烟
+```
 
 ## 目录结构
 
@@ -89,8 +125,20 @@ src/
 ├── health.ts              # 健康快照与卡片
 ├── session-export.ts      # 逻辑日志导出
 ├── feishu-channel.ts      # 官方 SDK Channel 适配（可注入 stub）
+├── client/                # 浏览器半区：设置 →「飞书渠道」页面（构建到 lib/client.js）
+│   ├── index.ts           #   client 插件入口：settings.section 注册 + 样式
+│   ├── panel.tsx          #   状态卡 + 通用配置表单 + 只读信息
+│   ├── api.ts             #   同源 /dsh-channels/* 请求封装
+│   └── styles.ts          #   语义 token 样式（注入一次）
+├── settings/              # Web 设置面板 Host 半区
+│   ├── contract.ts        #   双端共享 wire 类型 / 字段清单 / 路由常量
+│   ├── overlay.ts         #   settings.json 读写、校验、合并
+│   ├── surface.ts         #   状态 / 面板视图模型 + 保存 / 清除 / 重连
+│   └── routes.ts          #   HTTP 路由 + 同源写保护
 └── workspaces.ts          # (chat, user) → 工作区目录
 ```
+
+`lib/client.js` 是构建产物（`pnpm build:client`），`scripts/verify-client-loader.mjs` 用官方 client-module loader 的 shim 做冒烟。
 
 ## 接入 DSH
 
@@ -100,6 +148,8 @@ src/
 # 在 deepseek-harness 仓库内：把本地 checkout 链接进 web profile
 DSH_HOME=$DSH_HOME pnpm dsh plugin --profile web add link:/path/to/dsh_channels
 ```
+
+浏览器半区（设置 →「飞书渠道」页面）需要先构建：在插件仓库执行 `pnpm build:client` 产出 `lib/client.js`，再重启 dsh（桌面端重启应用，`dsh web` 重启服务并刷新页面）。DSH 只加载已构建产物，直接改 `src/client/` 不会生效；没有 web 载体的 profile 不注册面板，飞书通道照常运行。
 
 包内的 `cordis.patch.yml` 会自动把 `dsh-channels` 加入 Loader；profile 只需在 `$DSH_HOME/profiles/web/cordis.patch.yml` 中按稳定 id 提供该实例的配置：
 
@@ -126,6 +176,7 @@ DSH_HOME=$DSH_HOME pnpm dsh plugin --profile web add link:/path/to/dsh_channels
     welcomeOnboarding: true             # 私聊首次触达发一张引导卡（按 chat 持久化去重）
     allowPermissionSwitch: false        # 是否允许 /permissions <name> 从飞书侧切换权限预设（安全敏感）
     loggerLevel: 'info'
+    # settingsFile: '/custom/path/settings.json'  # 可选：Web 面板覆盖文件路径（默认 $DSH_HOME/dsh-channels/settings.json）
 ```
 
 `reasoningEffort` 是每个 Session 的初始/重置默认值，并在新建、恢复或借用 Agent 的作用域内以 `prepend` 外层覆盖 `agent/request`，因此胜过已存在的模型选择与 provider 默认；借用外部 Agent 时，插件关闭只移除这条频道策略，不销毁外部 Agent。话题所有者可用 `/effort <档位-id>` 覆盖当前 Session，`/effort` 查看生效来源，`/effort reset` 恢复该配置值（未配置时恢复模型适配器/provider 默认）。成功选择由 Session 自带的 `command/run` / `command/done` 日志恢复，重启后仍生效；新建 Session 不继承旧 Session 的覆盖。
@@ -191,14 +242,19 @@ FEISHU_APP_SECRET: xxxxxxxx
 - 重启修复会**全量替换**中断的卡片：旧进程里已流出的部分正文随之消失（本地没有副本，patch 是全量语义）；修复是一次性 + 一次重试，不再无限重试。
 - 路由 GC 是 TTL 兜底：未监听飞书“群解散/话题删除”事件做主动清理；真实话题过期后写入持久化墓碑，用户回来会收到明确拒绝，不会在旧话题中误建新 Session。
 - 消息去重是**至多一次**语义：接受后、副作用完成前崩溃的极小窗口内，重投消息会被丢弃——中断修复卡提示“请重新发送消息”，用户重发即可（新 message id 正常处理）。
+- Web 面板不做凭据编辑：`appId` / `appSecret` 只展示引用名与是否已配置，改引用名仍需编辑 profile 配置并重启 DSH。
+- Web 面板的模型字段是自由文本（无 provider/model 下拉目录），填错会在下一次模型请求时由 Host 按现有链路报错；「重启飞书连接」会中断进行中的回复。
 - 持久化盘点与全部缺口状态见 [docs/persistence.md](docs/persistence.md)。
 
 ## 开发
 
 ```bash
 pnpm install --store-dir ./.pnpm-store   # 受限环境；正常环境直接 pnpm install
-pnpm typecheck
+pnpm typecheck        # Host（tsconfig.json）+ Client（tsconfig.client.json）两套
 pnpm test
+pnpm build:client     # → lib/client.js
+pnpm verify:client    # client loader 冒烟
+pnpm check            # 以上全部
 ```
 
-测试以 stub 替换官方 SDK 与 DSH 宿主服务，无需真实凭据。
+测试以 stub 替换官方 SDK 与 DSH 宿主服务，无需真实凭据。`tests/settings.test.ts` 覆盖：覆盖层 schema/层级、面板视图模型、HTTP 路由（含同源写保护）、`apply()` 的 webServer 接线，以及 `FeishuService` 的覆盖加载 / 热更新 / 重启 / 启动失败记录。
