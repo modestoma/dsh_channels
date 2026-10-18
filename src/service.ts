@@ -67,6 +67,7 @@ import type { SessionExportBuilder } from './session-export.ts'
 import { ACTIVITY_BUILD_MARKER, TurnStreamer } from './streamer.ts'
 import type { ProjectedStats, StreamerHooks } from './streamer.ts'
 import type { FeishuConfig } from './config.ts'
+import type { OverlayStore } from './settings/overlay.ts'
 
 /** Periodic route-GC sweep cadence (a long-running instance also accumulates
  *  dead records; TTL semantics make 6 h granularity more than sufficient). */
@@ -153,9 +154,19 @@ async function resolveCredentialRef(ctx: HostContext, ref: string): Promise<stri
   )
 }
 
+/** Best-effort human-readable error text for the settings panel. */
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
 export class FeishuService {
   private readonly ctx: HostContext
+  /** Live config object. Mutated in place — collaborators captured this reference. */
   private readonly config: FeishuConfig
+  /** Loader/profile-provided config, the layer below the Web overlay. */
+  private readonly baseConfig: FeishuConfig
+  /** Web overlay store (`$DSH_HOME/dsh-channels/settings.json`), when mounted. */
+  private readonly overlay: OverlayStore | undefined
   private readonly channelFactory: ChannelFactory
   private readonly sessionExportBuilder: SessionExportBuilder
   private channel: FeishuChannel | undefined
@@ -185,6 +196,12 @@ export class FeishuService {
   private started = false
   /** Epoch ms when `start()` completed (uptime for `/status`). */
   private startedAt: number | undefined
+  /** Last failed `boot()` message, surfaced in the Web settings panel. */
+  private lastStartError: string | undefined
+  /** Effective config captured at the last successful connect (restart-pending diff). */
+  private runningConfig: FeishuConfig | undefined
+  /** Guards overlapping panel-triggered reconnects. */
+  private restarting = false
   private unlisten: (() => void) | undefined
   /** Periodic route-GC timer (unref'd; only armed when `routeTtlMs > 0`). */
   private gcTimer: ReturnType<typeof setInterval> | undefined
@@ -203,9 +220,12 @@ export class FeishuService {
     config: FeishuConfig,
     channelFactory: ChannelFactory,
     sessionExportBuilder: SessionExportBuilder = createLogicalSessionExport,
+    overlay?: OverlayStore,
   ) {
     this.ctx = ctx
     this.config = config
+    this.baseConfig = { ...config }
+    this.overlay = overlay
     this.channelFactory = channelFactory
     this.sessionExportBuilder = sessionExportBuilder
     this.routes = new RouteStore({
@@ -256,6 +276,119 @@ export class FeishuService {
       questionAnswerer: () => this.questionAnswerer,
       commands: { handleSlash: (msg, line) => this.handleSlashMessage(msg, line) },
     })
+  }
+
+  // ---- lifecycle / Web settings panel ----------------------------------
+
+  /**
+   * Load the Web overlay, then open the channel. Startup errors are recorded
+   * for the settings panel and the partial service is torn down before the
+   * error is rethrown (the plugin fiber still fails the same way).
+   */
+  async boot(): Promise<void> {
+    try {
+      await this.loadOverlay()
+      await this.start()
+      this.lastStartError = undefined
+      this.runningConfig = { ...this.config }
+    } catch (error) {
+      this.lastStartError = messageOf(error)
+      try {
+        await this.shutdown()
+      } catch {
+        // The original startup error is the useful one.
+      }
+      throw error
+    }
+  }
+
+  /** Re-read the Web overlay over the profile config (no channel touch). */
+  private async loadOverlay(): Promise<void> {
+    const overlay = this.overlay === undefined ? {} : await this.overlay.load()
+    this.replaceConfig({ ...this.baseConfig, ...overlay })
+  }
+
+  /**
+   * Replace every own key of the live config object. `Object.assign` alone
+   * would keep stale overlay-only keys (e.g. `provider`) when the next layer
+   * no longer defines them; collaborators hold this object identity, so the
+   * mutation must happen in place.
+   */
+  private replaceConfig(next: FeishuConfig): void {
+    const live = this.config as unknown as Record<string, unknown>
+    for (const key of Object.keys(live)) delete live[key]
+    Object.assign(live, next)
+  }
+
+  /**
+   * Apply an already-validated overlay over the profile config. Fields read
+   * per event/turn take effect immediately; `RESTART_KEYS` need `restart()`.
+   */
+  applyOverlay(overlay: Partial<FeishuConfig>): void {
+    this.replaceConfig({ ...this.baseConfig, ...overlay })
+  }
+
+  /** Tear the connection down and bring it back with the latest config. */
+  async restart(): Promise<void> {
+    if (this.restarting) throw new Error('飞书连接正在重启，请稍候再试')
+    this.restarting = true
+    try {
+      await this.shutdown()
+      await this.loadOverlay()
+      await this.start()
+      this.lastStartError = undefined
+      this.runningConfig = { ...this.config }
+    } catch (error) {
+      this.lastStartError = messageOf(error)
+      // `start()` flips `started` before wiring; a failed reconnect must not
+      // leave the panel claiming a live connection.
+      try {
+        await this.shutdown()
+      } catch {
+        // The restart error is the useful one.
+      }
+      throw error
+    } finally {
+      this.restarting = false
+    }
+  }
+
+  isRunning(): boolean { return this.started }
+  isRestarting(): boolean { return this.restarting }
+  startedAtMs(): number | undefined { return this.startedAt }
+  uptimeMs(): number | undefined {
+    return this.startedAt === undefined || !this.started ? undefined : Math.max(0, Date.now() - this.startedAt)
+  }
+  startError(): string | undefined { return this.lastStartError }
+  configSnapshot(): FeishuConfig { return { ...this.config } }
+  baseConfigSnapshot(): FeishuConfig { return { ...this.baseConfig } }
+  runningConfigSnapshot(): FeishuConfig | undefined {
+    return this.runningConfig === undefined ? undefined : { ...this.runningConfig }
+  }
+
+  /** Aggregate health used by `/health` and the Web settings panel. */
+  health(): HealthSnapshot { return this.healthSnapshot() }
+
+  /** Whether each configured credential reference currently resolves (no values returned). */
+  async credentialStates(): Promise<{ appId: boolean; appSecret: boolean }> {
+    const provider = this.ctx.get?.('credentials') as CredentialProvider | undefined
+    const configured = async (ref: string): Promise<boolean> => {
+      try {
+        if (provider?.describe !== undefined) {
+          const info = await provider.describe(ref)
+          return info?.configured === true
+        }
+        if (provider === undefined) {
+          const ambient = process.env[ref]
+          return ambient !== undefined && ambient !== ''
+        }
+        return (await provider.resolve(ref)) !== undefined
+      } catch {
+        return false
+      }
+    }
+    const [appId, appSecret] = await Promise.all([configured(this.config.appId), configured(this.config.appSecret)])
+    return { appId, appSecret }
   }
 
   /** Wire events and open the long connection. */
@@ -438,6 +571,7 @@ export class FeishuService {
     this.streamer = undefined
     await this.domain?.close()
     this.domain = undefined
+    this.runningConfig = undefined
   }
 
   // ---- inbound routing -------------------------------------------------

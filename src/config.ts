@@ -42,6 +42,13 @@ export const configSchema = z.object({
   appSecret: credentialRefSchema,
   /** Root directory for per-(user, chat) workspace directories. */
   baseDir: z.string().default('./channels-data'),
+  /**
+   * Optional path of the Web settings overlay (default
+   * `$DSH_HOME/dsh-channels/settings.json`). The Web panel writes only
+   * editable fields there; this path is for embedded hosts, tests, or users
+   * who want multiple instances with different overlays.
+   */
+  settingsFile: z.string().min(1).optional(),
   /** LLM provider route for sessions this plugin creates (optional → deployment default). */
   provider: z.string().optional(),
   /** Model id for sessions this plugin creates (optional → deployment default). */

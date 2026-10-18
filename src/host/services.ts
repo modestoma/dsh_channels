@@ -45,6 +45,11 @@ export interface ResolvedCredential {
  */
 export interface CredentialProvider {
   resolve(ref: string): Promise<ResolvedCredential | undefined>
+  /**
+   * Presence check without revealing the value (the host's `credentials.describe`).
+   * Optional so embedded/test hosts can supply only `resolve`.
+   */
+  describe?(ref: string): Promise<{ configured: boolean } | undefined>
 }
 
 export interface TokenMeasurement {

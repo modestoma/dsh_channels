@@ -19,6 +19,9 @@ import { configSchema, resolveConfig } from './config.ts'
 import type { FeishuConfig } from './config.ts'
 import { defaultChannelFactory } from './feishu-channel.ts'
 import type { ChannelFactory } from './feishu-channel.ts'
+import { OverlayStore, defaultOverlayPath } from './settings/overlay.ts'
+import { mountSettingsRoutes } from './settings/routes.ts'
+import { SettingsSurface } from './settings/surface.ts'
 
 export type * from './config.ts'
 export type * from './cards.ts'
@@ -31,6 +34,13 @@ export type * from './session-commands.ts'
 export type * from './session-export.ts'
 export type * from './stats.ts'
 export type * from './questions.ts'
+export type * from './settings/contract.ts'
+export { CONFIG_ROUTE, EDITABLE_KEYS, PANEL_COPY, PANEL_ROUTE, RECONNECT_ROUTE, RESTART_KEYS, STATUS_ROUTE } from './settings/contract.ts'
+export { defaultOverlayPath, mergeOverlay, normalizeOverlay, OverlayStore, parseOverlay, pickEditable, resolveDshHome } from './settings/overlay.ts'
+export { FIELD_DESCRIPTORS, readOnlyFields, SettingsSurface } from './settings/surface.ts'
+export type { SettingsTarget } from './settings/surface.ts'
+export { isSameOriginRequest, mountSettingsRoutes, registerSettingsRoutes } from './settings/routes.ts'
+export type { HostWebServer } from './settings/routes.ts'
 export type { ApprovalOutcome, ApprovalRequest, ApprovalAnswererListener, AssistantStreamFrame, AskUserQuestionAnswer, AskUserQuestionAnswerItem, AskUserQuestionItem, AskUserQuestionRequestEvent, UserQuestionAnswererListener, AgentCancelCause, SessionStatsView, TokenUsageView, ContextPressureView, SessionProjections } from './dsh-types.ts'
 export { buildCard, buildInterruptionCard, cardJsonBytes, CARD_MAX_BYTES, CARD_TARGET_BYTES, CARD_PANEL_RESERVE_BYTES, REASONING_MAX_BYTES, INTERRUPTION_NOTICE, MAX_TABLES_PER_CARD, PANEL_TITLES, PANEL_CHEVRON_TOKEN, segmentCardContent, splitBodyForCard, stripTables, tableBlocks, TRUNCATION_SUFFIX, buildApprovalCard, buildApprovalSettledCard, buildQuestionCard, buildQuestionSettledCard, MAX_QUESTION_OPTIONS } from './cards.ts'
 export { ApprovalAnswerer } from './approvals.ts'
@@ -84,9 +94,18 @@ export function apply(ctx: HostContext, config?: unknown): void {
   const resolved = resolveConfig(config)
   const factory: ChannelFactory = (config as FeishuPluginOptions | undefined)?.channelFactory
     ?? defaultChannelFactory
-  const service = new FeishuService(ctx, resolved, factory)
+  // Web settings overlay (optional file; degrades to "no overrides").
+  const overlay = new OverlayStore(
+    resolved.settingsFile ?? defaultOverlayPath(),
+    { warn: (message, ...args) => ctx.logger?.warn?.(message, ...args) },
+  )
+  const service = new FeishuService(ctx, resolved, factory, undefined, overlay)
+  // Settings routes ride the host's web server when this deployment has one.
+  mountSettingsRoutes(ctx, new SettingsSurface(service, overlay, {
+    warn: (message, ...args) => ctx.logger?.warn?.(message, ...args),
+  }))
   ctx.effect(() => {
-    void service.start().catch((error: unknown) => {
+    void service.boot().catch((error: unknown) => {
       ctx.logger?.error?.('dsh-channels failed to start: %s', String(error))
       // Critical lifecycle line duplicated to the console: cordis logger
       // messages emitted before a web exporter attaches are buffered and may
