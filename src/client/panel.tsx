@@ -36,8 +36,9 @@ type LoadState =
 
 type Notice = { kind: 'ok' | 'error'; text: string; issues?: FieldIssueWire[] }
 
-const GROUP_ORDER = ['behavior', 'content', 'model', 'streaming'] as const
+const GROUP_ORDER = ['workspace', 'behavior', 'content', 'model', 'streaming'] as const
 const GROUP_LABELS: Record<(typeof GROUP_ORDER)[number], string> = {
+  workspace: '工作区与文件',
   behavior: '行为',
   content: '内容与图片',
   model: '模型',
@@ -137,8 +138,9 @@ function FieldRow(props: {
   const { field, value, issues, onChange } = props
   const issue = issues.find(item => item.key === field.key)
   const inputClass = `dsh-channels-cfg__input${issue === undefined ? '' : ' dsh-channels-cfg__input--invalid'}`
+  const fieldClass = `dsh-channels-cfg__field${field.wide === true ? ' dsh-channels-cfg__field--wide' : ''}`
   return (
-    <div className="dsh-channels-cfg__field">
+    <div className={fieldClass}>
       <div className="dsh-channels-cfg__labelRow">
         <span className="dsh-channels-cfg__label">{field.label}</span>
         {field.restartRequired ? <span className="dsh-channels-cfg__tag dsh-channels-cfg__tag--restart">{PANEL_COPY.restartTag}</span> : null}

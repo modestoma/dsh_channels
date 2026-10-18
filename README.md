@@ -62,21 +62,24 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 
 | 分组 | 字段 | 生效方式 |
 | --- | --- | --- |
+| 工作区与文件 | `baseDir` | 立即生效（只影响之后新建的会话/工作区；已有会话不迁移） |
 | 行为 | `dmMode`、`requireMention` | 需重启连接 |
 | 行为 | `threadFallback`、`welcomeOnboarding`、`allowPermissionSwitch` | 立即生效 |
 | 内容与图片 | `acceptImages`、`maxImagesPerMessage` | 立即生效 |
 | 模型 | `provider`、`model`、`reasoningEffort`、`agentPreset` | 立即生效（后续回合/新会话使用） |
 | 流式卡片 | `refreshMs`、`statusRefreshMs`、`loggerLevel` | 需重启连接 |
 
+`baseDir` 是**模型/工具产生文件的落点**（每个「用户 × 聊天」一个工作区：私聊 `<baseDir>/p2p/<open_id>/`，群聊 `<baseDir>/groups/<chat_id>/<open_id>/`）。面板里只接受**绝对路径**（`~` 开头按家目录展开，拒绝文件系统根目录），保存时会创建并校验该目录，不可用时当场报错，不会等到飞书里提示「会话创建失败」。已有 Session / 工作区不会被迁移，因此切到新目录后旧话题继续用旧工作区（话题内 `/renew` 也一样），只有之后新开的话题/会话使用新目录。
+
 保存只改动了「需重连」字段时，面板会列出待生效项并提供一键重连：
 
 ![保存后提示需重启飞书连接](docs/assets/web-settings-restart-pending.png)
 
-**配置层级**：`configSchema` 默认值 < profile `cordis.patch.yml` 的 `config` < Web 面板覆盖。面板只把可编辑字段写入 `$DSH_HOME/dsh-channels/settings.json`（可用配置项 `settingsFile` 改路径）；「清除 Web 覆盖」删除该文件并回落到 profile 配置。`baseDir`、超时、路由 TTL 等只读展示；凭据**值**在「飞书应用凭据」卡片编辑，凭据**引用名**（`appId` / `appSecret` 配置项）仍由 profile 配置决定。
+**配置层级**：`configSchema` 默认值 < profile `cordis.patch.yml` 的 `config` < Web 面板覆盖。面板只把可编辑字段写入 `$DSH_HOME/dsh-channels/settings.json`（可用配置项 `settingsFile` 改路径）；「清除 Web 覆盖」删除该文件并回落到 profile 配置。`baseDir` 可在面板编辑（绝对路径；只影响之后新建的会话）；超时、路由 TTL 等仍只读展示。凭据**值**在「飞书应用凭据」卡片编辑，凭据**引用名**（`appId` / `appSecret` 配置项）仍由 profile 配置决定。
 
 **为什么落在插件自己的文件而不是 profile 的 `cordis.patch.yml`？** DSH 提供官方 `ctx.configEditor.edit()`，可以安全写 profile patch（完整 Config 校验、保留注释与 `!!js`、原子替换、失败回滚、与 HMR 串行）；但它是「完整配置编辑」通道——本插件的 Config 是 zod，没有 schemastery `.volatile()` 标记，普通字段写入会触发 Loader 重载插件，等于每次保存都断开并重连飞书；而且该服务只在有 `profileContext` 的启动器（桌面端 / `dsh web`）存在。`$DSH_HOME/<plugin>/` 是 DSH 插件保存运行时数据的惯例（如 dsh-pet 的 `$DSH_HOME/dsh-pet/`），因此面板偏好写入 `$DSH_HOME/dsh-channels/settings.json`：保存即生效（需重连字段除外）、可一键清除回退、不依赖 `profileContext`；profile 的 `cordis.patch.yml` 继续作为部署级基础配置层。若将来要求「所有配置统一进 profile」，迁移路径是改用 `ctx.configEditor.edit()` 并接受保存触发插件重载。
 
-**安全边界**：面板路由与其他本机 DSH 路由一样**不带鉴权**；写操作（PUT / DELETE / POST）额外校验 `Origin` 与 `Host` 同源，拒绝跨站页面改写配置或凭据。凭据值只走写路径、响应永不回显，也不会写进 Web 覆盖文件。不要把 DSH Web 服务绑定到不可信网络。
+**安全边界**：面板路由与其他本机 DSH 路由一样**不带鉴权**；写操作（PUT / DELETE / POST）额外校验 `Origin` 与 `Host` 同源，拒绝跨站页面改写配置或凭据。凭据值只走写路径、响应永不回显，也不会写进 Web 覆盖文件。`baseDir` 可写意味着同源页面能改变模型文件的落点（面板已拒绝文件系统根目录），不要把 DSH Web 服务绑定到不可信网络。
 
 **构建**：DSH 只加载已构建的浏览器 bundle，改了 `src/client/` 或 `src/settings/contract.ts` 后需要重新构建并重启应用：
 
@@ -163,7 +166,7 @@ DSH_HOME=$DSH_HOME pnpm dsh plugin --profile web add link:/path/to/dsh_channels
   config:
     appId: 'FEISHU_APP_ID'              # 凭据引用名（非密钥本身），经 ctx.credentials 解析
     appSecret: 'FEISHU_APP_SECRET'
-    baseDir: './channels-data'          # 工作区根目录（按 私聊/群聊/用户 组织）
+    baseDir: './channels-data'          # 工作区根目录（按 私聊/群聊/用户 组织；可在 Web 面板覆盖，面板要求绝对路径）
     provider: 'deepseek-official'       # 可选：省略则用部署默认
     model: 'deepseek-v4-flash'          # 可选
     reasoningEffort: 'high'             # 可选：模型声明的精确档位 id；省略则用适配器/provider 默认

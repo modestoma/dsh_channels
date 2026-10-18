@@ -40,8 +40,16 @@ export const configSchema = z.object({
   appId: credentialRefSchema,
   /** Feishu app secret credential reference (e.g. `FEISHU_APP_SECRET`). */
   appSecret: credentialRefSchema,
-  /** Root directory for per-(user, chat) workspace directories. */
-  baseDir: z.string().default('./channels-data'),
+  /**
+   * Root directory for per-(user, chat) workspace directories — the filesystem
+   * root where files produced by channel sessions land. Read per session
+   * establishment, so editing it only affects sessions created afterwards
+   * (existing workspaces are never migrated). The Web settings panel may
+   * override it, but only with an absolute path (`~` expanded) — the relative
+   * default below is kept for profile-level compatibility and resolves
+   * against the host process cwd.
+   */
+  baseDir: z.string().min(1).default('./channels-data'),
   /**
    * Optional path of the Web settings overlay (default
    * `$DSH_HOME/dsh-channels/settings.json`). The Web panel writes only

@@ -2,8 +2,10 @@
  * Web 设置面板的 Host 视图模型：把 `FeishuService` 的运行时事实、覆盖层与
  * 字段描述组装成 wire 数据，并处理保存/清除/重连三个动作。
  *
- * 这一层不碰 HTTP（见 `routes.ts`），也不碰 fs 细节（见 `overlay.ts`），
- * 因此可以只用假 target 做单测。
+ * 这一层不碰 HTTP（见 `routes.ts`），也不碰 fs 细节（见 `overlay.ts`）；
+ * 唯一的文件系统动作是保存 `baseDir` 时通过 `workspaces.ts` 创建并检查
+ * 工作区根目录，这样不可用的路径在保存时就暴露，而不是等到飞书里提示
+ * 「会话创建失败」。因此可以只用假 target 做单测。
  *
  * @module dsh-channels/settings/surface
  */
@@ -11,6 +13,7 @@
 import { DSH_CHANNELS_VERSION } from '../session-export.ts'
 import type { FeishuConfig } from '../config.ts'
 import type { HealthSnapshot } from '../health.ts'
+import { prepareWorkspaceBaseDir } from '../workspaces.ts'
 import {
   EDITABLE_KEYS,
   PANEL_COPY,
@@ -96,7 +99,13 @@ const SELECT_OPTIONS: Partial<Record<EditableKey, ReadonlyArray<{ value: string;
 }
 
 /** Panel copy per editable key: label, help, and (for numbers) bounds. */
-const FIELD_META: Record<EditableKey, { label: string; help: string; min?: number; max?: number; step?: number; placeholder?: string }> = {
+const FIELD_META: Record<EditableKey, { label: string; help: string; min?: number; max?: number; step?: number; placeholder?: string; wide?: boolean }> = {
+  baseDir: {
+    label: '工作区根目录（文件落点）',
+    help: '模型/工具产生的文件默认写在每个（用户 × 聊天）的工作区里：私聊 <baseDir>/p2p/<open_id>/，群聊 <baseDir>/groups/<chat_id>/<open_id>/。必须是绝对路径（~ 开头按家目录展开），保存时会创建该目录；只影响之后新建立的工作区 —— 已有话题即使 /renew 也沿用原工作区，旧文件不会迁移。',
+    placeholder: '/Users/you/.dsh/dsh-channels/workspaces',
+    wide: true,
+  },
   dmMode: { label: '私聊模式', help: '禁用后私聊消息不再触发会话；群聊与已绑定话题不受影响。' },
   requireMention: { label: '普通群需 @ 机器人', help: '已绑定的主题内始终不需要 @；关闭后普通群的每条消息都会触发。' },
   threadFallback: { label: '话题被拒时的兜底', help: 'degrade 降级为会话级路由；strict 直接让回复失败。' },
@@ -114,6 +123,7 @@ const FIELD_META: Record<EditableKey, { label: string; help: string; min?: numbe
 }
 
 const GROUP_OF: Record<EditableKey, EditableFieldWire['group']> = {
+  baseDir: 'workspace',
   dmMode: 'behavior',
   requireMention: 'behavior',
   threadFallback: 'behavior',
@@ -145,6 +155,7 @@ export const FIELD_DESCRIPTORS: readonly EditableFieldWire[] = EDITABLE_KEYS.map
     ...(meta.max === undefined ? {} : { max: meta.max }),
     ...(meta.step === undefined ? {} : { step: meta.step }),
     ...(meta.placeholder === undefined ? {} : { placeholder: meta.placeholder }),
+    ...(meta.wide === undefined ? {} : { wide: meta.wide }),
     restartRequired: RESTART_SET.has(key),
   }
 })
@@ -181,7 +192,6 @@ export function normalizeCredentialValue(raw: unknown): { ok: true; value: strin
 /** Build the read-only advanced card from the effective config. */
 export function readOnlyFields(config: FeishuConfig): ReadOnlyFieldWire[] {
   return [
-    { key: 'baseDir', label: '工作区根目录', value: config.baseDir, help: '新会话的工作区目录；已有会话不迁移。' },
     { key: 'routeTtlMs', label: '话题路由过期', value: formatDays(config.routeTtlMs), help: '超期话题的后续消息会被明确拒绝，而不是新建 Context-free Session。' },
     { key: 'approvalTimeoutMs', label: '审批卡片等待', value: formatSeconds(config.approvalTimeoutMs) },
     { key: 'questionTimeoutMs', label: '提问卡片等待', value: formatSeconds(config.questionTimeoutMs) },
@@ -306,6 +316,21 @@ export class SettingsSurface {
         message: issue.message,
       }))
       return { ok: false, error: '配置校验失败', issues }
+    }
+
+    // A workspace root typed into the panel must be usable right now: create
+    // and probe it before anything is persisted, so a typo (or a path that is
+    // an existing file / unwritable) fails here rather than as a session
+    // creation failure card inside Feishu.
+    if (parsed.patch.baseDir !== undefined) {
+      const problem = await prepareWorkspaceBaseDir(parsed.patch.baseDir)
+      if (problem !== undefined) {
+        return {
+          ok: false,
+          error: '工作区目录不可用',
+          issues: [{ key: 'baseDir', message: problem }],
+        }
+      }
     }
 
     let merged: OverlayPatch

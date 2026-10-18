@@ -38,6 +38,7 @@ const CSS = `
 .dsh-channels-cfg__btn--danger{color:var(--dsw-alias-state-danger-primary,#c62828);border-color:currentColor}
 .dsh-channels-cfg__grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px 20px;align-items:start}
 .dsh-channels-cfg__field{display:flex;flex-direction:column;gap:4px;min-width:0}
+.dsh-channels-cfg__field--wide{grid-column:1/-1}
 .dsh-channels-cfg__labelRow{display:flex;align-items:center;gap:6px;flex-wrap:wrap;min-width:0}
 .dsh-channels-cfg__label{font-size:12px;color:var(--dsw-alias-label-secondary,#5c6169)}
 .dsh-channels-cfg__tag{display:inline-flex;align-items:center;padding:0 5px;border-radius:4px;border:1px dashed currentColor;font-size:11px;line-height:16px;color:var(--dsw-alias-label-tertiary,#8a8f98);white-space:nowrap}

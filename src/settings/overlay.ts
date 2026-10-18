@@ -2,8 +2,9 @@
  * Web 面板覆盖层：`$DSH_HOME/dsh-channels/settings.json` 的读写、schema 校验与合并。
  *
  * 设计取舍：
- *  - 覆盖层只存 Web 面板可编辑的字段（`EDITABLE_KEYS`），凭据引用与 baseDir
- *    刻意不可覆盖 —— 前者变动等于换凭据，后者会让已有工作区路径失配。
+ *  - 覆盖层只存 Web 面板可编辑的字段（`EDITABLE_KEYS`），凭据引用刻意不可
+ *    覆盖（变动等于换凭据）；`baseDir` 可覆盖，但走 `workspaces.ts` 的严格
+ *    规范化（绝对路径 / `~` 展开 / 拒绝根目录），不接受相对路径。
  *  - 文件损坏/字段过期时**降级为空覆盖**并告警，绝不阻止飞书通道启动；
  *    面板保存时则由 zod 完整校验后整体落盘。
  *  - 写入走同目录临时文件 + rename，避免半截文件。
@@ -17,6 +18,7 @@ import { dirname, join } from 'node:path'
 import type { z } from 'zod'
 import { configSchema } from '../config.ts'
 import type { FeishuConfig } from '../config.ts'
+import { normalizeWorkspaceBaseDir } from '../workspaces.ts'
 import { EDITABLE_KEYS } from './contract.ts'
 import type { ConfigValue, EditableKey } from './contract.ts'
 
@@ -45,6 +47,14 @@ export function parseOverlay(raw: unknown): { ok: true; patch: OverlayPatch } | 
     if (!Object.hasOwn(source, key)) continue
     const value = source[key]
     if (value === undefined) continue
+    // `baseDir` needs location semantics the shared string schema cannot
+    // express (absolute only, `~` expansion, no filesystem root).
+    if (key === 'baseDir') {
+      const checked = normalizeWorkspaceBaseDir(value)
+      if (!checked.ok) issues.push({ path: key, message: checked.message })
+      else patch[key] = checked.value
+      continue
+    }
     const parsed = shape[key]!.safeParse(value)
     if (!parsed.success) {
       issues.push({ path: key, message: parsed.error.issues[0]?.message ?? '非法值' })

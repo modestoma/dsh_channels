@@ -3,8 +3,8 @@
  * routes, and FeishuService config hot-apply / reconnect integration.
  */
 
-import { mkdtempSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { mkdtempSync, statSync, writeFileSync } from 'node:fs'
+import { homedir, tmpdir } from 'node:os'
 import path from 'node:path'
 import { Readable } from 'node:stream'
 import type { IncomingMessage, ServerResponse } from 'node:http'
@@ -43,6 +43,7 @@ import {
 import type { SettingsTarget } from '../src/settings/surface.ts'
 import { isSameOriginRequest, registerSettingsRoutes } from '../src/settings/routes.ts'
 import type { HostWebServer } from '../src/settings/routes.ts'
+import { normalizeWorkspaceBaseDir, prepareWorkspaceBaseDir } from '../src/workspaces.ts'
 import { makeChannel, makeHostContext } from './helpers.ts'
 
 function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
@@ -175,8 +176,48 @@ describe('overlay paths and validation', () => {
     expect(bad.issues.map(issue => issue.path)).toEqual(expect.arrayContaining(['dmMode', 'refreshMs']))
   })
 
-  it('merges over the profile config and keeps empty optional text out of the overlay', () => {
-    const base = makeConfig({ provider: 'deepseek-official' })
+  it('accepts only absolute workspace roots and expands ~ for the panel', () => {
+    const absolute = parseOverlay({ baseDir: '/tmp/dsh-channels-ws/' })
+    expect(absolute.ok).toBe(true)
+    if (!absolute.ok) return
+    expect(absolute.patch.baseDir).toBe('/tmp/dsh-channels-ws')
+
+    const home = parseOverlay({ baseDir: '~/channels-data' })
+    expect(home.ok).toBe(true)
+    if (!home.ok) return
+    expect(home.patch.baseDir).toBe(path.join(homedir(), 'channels-data'))
+
+    for (const raw of ['./channels-data', 'channels-data', '   ', '/', 42]) {
+      const parsed = parseOverlay({ baseDir: raw })
+      expect(parsed.ok).toBe(false)
+      if (parsed.ok) return
+      expect(parsed.issues.map(issue => issue.path)).toContain('baseDir')
+    }
+  })
+
+  it('normalizes workspace roots with a pinned home directory and rejects hostile values', () => {
+    expect(normalizeWorkspaceBaseDir('/data/ws/', '/home/tester')).toEqual({ ok: true, value: '/data/ws' })
+    expect(normalizeWorkspaceBaseDir('~', '/home/tester')).toEqual({ ok: true, value: '/home/tester' })
+    expect(normalizeWorkspaceBaseDir('~/ws', '/home/tester'))
+      .toEqual({ ok: true, value: path.join('/home/tester', 'ws') })
+    expect(normalizeWorkspaceBaseDir('ws', '/home/tester').ok).toBe(false)
+    expect(normalizeWorkspaceBaseDir('/', '/home/tester').ok).toBe(false)
+    expect(normalizeWorkspaceBaseDir(' /ws/\u0000 ', '/home/tester').ok).toBe(false)
+    expect(normalizeWorkspaceBaseDir(42, '/home/tester').ok).toBe(false)
+  })
+
+  it('creates the workspace root on save and refuses an unusable directory', async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'dsh-channels-prepare-'))
+    const nested = path.join(root, 'nested', 'workspaces')
+    await expect(prepareWorkspaceBaseDir(nested)).resolves.toBeUndefined()
+    expect(statSync(nested).isDirectory()).toBe(true)
+
+    const occupied = path.join(root, 'not-a-dir')
+    writeFileSync(occupied, 'x')
+    await expect(prepareWorkspaceBaseDir(occupied)).resolves.toMatch(/不是目录|无法创建工作区目录/)
+  })
+
+  it('merges over the profile config and keeps empty optional text out of the overlay', () => {    const base = makeConfig({ provider: 'deepseek-official' })
     const merged = mergeOverlay(base, normalizeOverlay({ provider: '', dmMode: 'disabled' }))
     expect(merged.provider).toBe('deepseek-official')
     expect(merged.dmMode).toBe('disabled')
@@ -228,6 +269,19 @@ describe('field descriptors', () => {
     const byKey = new Map(fields.map(field => [field.key, field.value]))
     expect(byKey.get('maxTokens')).toBe('4096 tokens')
     expect(byKey.get('routeTtlMs')).toBe('关闭（不过期）')
+    expect(byKey.has('baseDir')).toBe(false)
+  })
+
+  it('exposes the workspace root as an editable full-width path field', () => {
+    const baseDir = FIELD_DESCRIPTORS.find(field => field.key === 'baseDir')
+    expect(baseDir).toMatchObject({
+      kind: 'text',
+      group: 'workspace',
+      restartRequired: false,
+      wide: true,
+    })
+    expect(baseDir?.label).toContain('工作区')
+    expect(baseDir?.help).toContain('绝对路径')
   })
 })
 
@@ -299,6 +353,36 @@ describe('SettingsSurface', () => {
     expect(invalid.ok).toBe(false)
     if (invalid.ok) return
     expect(invalid.issues?.map(issue => issue.key)).toEqual(expect.arrayContaining(['dmMode', 'refreshMs']))
+    await expect(store.load()).resolves.toEqual({})
+  })
+
+  it('saves an absolute baseDir, applies it live, and needs no reconnect', async () => {
+    const { surface, target, store } = makeSurface()
+    const next = mkdtempSync(path.join(tmpdir(), 'dsh-channels-ws-next-'))
+    const result = await surface.save({ baseDir: next })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.panel.config.effective.baseDir).toBe(next)
+    expect(result.panel.config.overriddenKeys).toEqual(['baseDir'])
+    expect(result.panel.config.restartPendingKeys).toEqual([])
+    expect(target.applied).toEqual({ baseDir: next })
+    await expect(store.load()).resolves.toEqual({ baseDir: next })
+  })
+
+  it('rejects an unusable baseDir without persisting anything', async () => {
+    const { surface, store } = makeSurface()
+    const relative = await surface.save({ baseDir: './channels-data' })
+    expect(relative.ok).toBe(false)
+    if (relative.ok) return
+    expect(relative.issues?.map(issue => issue.key)).toEqual(['baseDir'])
+
+    const occupied = path.join(mkdtempSync(path.join(tmpdir(), 'dsh-channels-ws-file-')), 'file')
+    writeFileSync(occupied, 'x')
+    const existingFile = await surface.save({ baseDir: occupied })
+    expect(existingFile.ok).toBe(false)
+    if (existingFile.ok) return
+    expect(existingFile.issues?.[0]?.message).toMatch(/不是目录|无法创建工作区目录/)
+
     await expect(store.load()).resolves.toEqual({})
   })
 
@@ -762,6 +846,25 @@ describe('FeishuService settings integration', () => {
     service.applyOverlay({})
     expect(service.configSnapshot().requireMention).toBe(true)
     expect(service.configSnapshot().provider).toBe('deepseek-official')
+    await service.shutdown()
+  })
+
+  it('hot-applies a panel baseDir for sessions created afterwards without a reconnect', async () => {
+    const h = harness()
+    const service = new FeishuService(h.ctx, h.config, () => h.channel, undefined, h.store)
+    await service.boot()
+    const surface = new SettingsSurface(service, h.store)
+    const original = h.config.baseDir
+    const next = mkdtempSync(path.join(tmpdir(), 'dsh-channels-ws-hot-'))
+    const saved = await surface.save({ baseDir: next })
+    expect(saved.ok).toBe(true)
+    if (!saved.ok) return
+    expect(saved.panel.config.effective.baseDir).toBe(next)
+    expect(saved.panel.config.restartPendingKeys).toEqual([])
+    expect(service.configSnapshot().baseDir).toBe(next)
+    // The connection-scoped snapshot keeps the old value; that must not count
+    // as restart-pending because baseDir is read per session establishment.
+    expect(service.runningConfigSnapshot()?.baseDir).toBe(original)
     await service.shutdown()
   })
 

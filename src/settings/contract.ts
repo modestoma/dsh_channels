@@ -21,9 +21,15 @@ export const RECONNECT_ROUTE = '/dsh-channels/reconnect'
  *
  * 刻意不包含 `appId` / `appSecret`：它们是**凭据引用名**，面板改为直接
  * 编辑引用背后的值（`PUT /dsh-channels/credentials`，经 DSH 凭据服务写入），
- * 因此不会落进覆盖层文件。`baseDir` 同样不可覆盖（已有工作区路径不可迁移）。
+ * 因此不会落进覆盖层文件。
+ *
+ * `baseDir`（工作区根目录 = 模型/工具产生文件的落点）可覆盖，但面板只接受
+ * **绝对路径**（`~` 会展开）；已有 Session / 工作区不迁移，只影响之后新建的
+ * 会话。校验与保存时建目录见 `src/workspaces.ts`。
  */
 export const EDITABLE_KEYS = [
+  // 工作区
+  'baseDir',
   // 行为
   'dmMode',
   'requireMention',
@@ -64,7 +70,7 @@ export type RestartKey = (typeof RESTART_KEYS)[number]
 export type FieldKind = 'boolean' | 'number' | 'text' | 'select'
 
 /** Field groups map one-to-one onto panel cards. */
-export type FieldGroup = 'behavior' | 'content' | 'model' | 'streaming'
+export type FieldGroup = 'workspace' | 'behavior' | 'content' | 'model' | 'streaming'
 
 /** One editable row, fully described by the Host so the client stays schema-free. */
 export interface EditableFieldWire {
@@ -78,6 +84,8 @@ export interface EditableFieldWire {
   max?: number
   step?: number
   placeholder?: string
+  /** Render across the whole form width (long paths). */
+  wide?: boolean
   /** 保存后需重连飞书通道才生效。 */
   restartRequired: boolean
 }

@@ -6,7 +6,7 @@
 |---|---|---|
 | 会话本体（事件日志 + header） | 宿主 `dsh-session-persistence` | `$DSH_HOME/sessions/<workspace>/<sessionId>/session.jsonl.zstd` |
 | 插件自有状态 | 插件 → `ctx.storageDomain` | 域 `channels_routes`，JSON 后端为 `$DSH_HOME/storages/channels_routes.json` |
-| 工作区 | 磁盘目录 + 宿主 registry | `<baseDir>/p2p|groups/...`，注册表 `$DSH_HOME/storages/workspace.json` |
+| 工作区 | 磁盘目录 + 宿主 registry | `<baseDir>/p2p|groups/...`（`baseDir` 可在 Web 面板配置），注册表 `$DSH_HOME/storages/workspace.json` |
 
 ## 一、已持久化的内容
 

@@ -85,7 +85,7 @@ chmod 600 $DSH_HOME/.credentials.yaml
   config:
     appId: 'FEISHU_APP_ID'              # 凭据引用名（密钥在 .credentials.yaml）
     appSecret: 'FEISHU_APP_SECRET'
-    baseDir: './channels-data'          # 工作区根目录（相对 profile 目录）
+    baseDir: './channels-data'          # 工作区根目录（相对路径按 dsh 进程 cwd 解析；可在 Web 面板覆盖为绝对路径）
     provider: 'deepseek-official'       # 可选，省略用部署默认
     model: 'deepseek-v4-flash'          # 可选
     reasoningEffort: 'high'             # 可选，精确模型声明的档位 id
@@ -102,7 +102,7 @@ chmod 600 $DSH_HOME/.credentials.yaml
 | 配置项 | 默认 | 说明 |
 |--------|------|------|
 | `appId` / `appSecret` | 必填 | 凭据引用名（shell 标识符），经 `ctx.credentials` 解析；明文密钥会被拒绝 |
-| `baseDir` | `./channels-data` | 工作区目录树根：`p2p/<open_id>/`、`groups/<chat_id>/<open_id>/` |
+| `baseDir` | `./channels-data` | 工作区目录树根：`p2p/<open_id>/`、`groups/<chat_id>/<open_id>/`（模型/工具产生文件的落点）；Web 面板可覆盖，只接受绝对路径，`~` 展开，保存时创建并校验目录，只影响之后新建的会话 |
 | `provider` / `model` | 部署默认 | 新建 session 的路由；省略时继承部署默认 |
 | `reasoningEffort` | 适配器/provider 默认 | Session 初始/重置推理档位；可在话题内用 `/effort` 覆盖 |
 | `maxTokens` | 适配器默认 | 每次模型请求输出上限 |
