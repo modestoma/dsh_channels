@@ -1,36 +1,29 @@
 import { defineConfig } from 'tsdown'
 
-const PACKAGE_NAME = 'dsh-channels'
-
 /**
- * Client half build: one closure-factory bundle registered through
- * `window.__ModuleLoader__`, exactly like the first-party client modules.
- * React (and its JSX runtime) stay external — the web shell's frozen
- * PLATFORM_MODULES table answers them; everything else is inlined.
+ * Host half build: emit `lib/index.js` so an installed package (a profile's
+ * `node_modules/dsh-channels`) runs as plain ESM. The Loader imports the
+ * package entry with Node's default type stripping, which rejects TypeScript
+ * parameter properties; shipping the built host is also what other DSH plugins
+ * (dsh-pet, dsh-balance) do.
  *
- * The Bundle must already exist at load time: DSH consumes the built
- * `lib/client.js`, never the TypeScript source.
+ * Runtime deps stay external — the consuming profile resolves them through
+ * the package's own `node_modules`.
  */
 export default defineConfig({
-  name: `${PACKAGE_NAME}/client`,
-  entry: { client: 'src/client/index.ts' },
-  tsconfig: 'tsconfig.client.json',
+  name: 'dsh-channels/host',
+  entry: { index: 'src/index.ts' },
+  tsconfig: 'tsconfig.json',
   outDir: 'lib',
-  format: 'cjs',
-  platform: 'browser',
-  target: 'es2022',
+  format: 'esm',
+  platform: 'node',
+  target: 'es2023',
   fixedExtension: false,
   dts: false,
   clean: false,
   sourcemap: true,
   external: [
-    'react',
-    'react/jsx-runtime',
+    '@larksuiteoapi/node-sdk',
+    'zod',
   ],
-  outputOptions: {
-    entryFileNames: 'client.js',
-    banner: `window.__ModuleLoader__.load({ id: ${JSON.stringify(PACKAGE_NAME)}, factory: (require) => {`,
-    footer: 'return module.exports; } });',
-    intro: 'var module = { exports: {} }; var exports = module.exports;',
-  },
 })

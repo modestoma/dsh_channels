@@ -3,10 +3,13 @@
   "version": "0.1.0",
   "description": "DeepSeek Harness (DSH) 飞书渠道插件：一个 dsh 实例对应一个飞书机器人，私聊/群聊/话题群 @ 触发会话，话题绑定 session，卡片 2.0 流式回复；Web 设置里提供「飞书渠道」状态与常用配置面板",
   "type": "module",
-  "main": "src/index.ts",
+  "main": "lib/index.js",
   "types": "src/index.ts",
   "exports": {
-    ".": "./src/index.ts",
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./lib/index.js"
+    },
     "./client": {
       "types": "./src/client/index.ts",
       "default": "./lib/client.js"
@@ -32,9 +35,12 @@
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.client.json",
     "test": "vitest run",
     "test:watch": "vitest",
-    "build:client": "tsdown",
+    "build:host": "tsdown --config tsdown.config.ts",
+    "build:client": "tsdown --config tsdown.client.config.ts",
+    "build": "pnpm build:host && pnpm build:client",
+    "verify:host": "node scripts/verify-host-loader.mjs",
     "verify:client": "node scripts/verify-client-loader.mjs",
-    "check": "pnpm typecheck && pnpm test && pnpm build:client && pnpm verify:client"
+    "check": "pnpm typecheck && pnpm test && pnpm build && pnpm verify:host && pnpm verify:client"
   },
   "keywords": [
     "deepseek-harness",

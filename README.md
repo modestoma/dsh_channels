@@ -77,8 +77,9 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 **构建**：DSH 只加载已构建的浏览器 bundle，改了 `src/client/` 或 `src/settings/contract.ts` 后需要重新构建并重启应用：
 
 ```bash
-pnpm build:client      # 产出 lib/client.js
-pnpm verify:client     # 用 __ModuleLoader__ shim 做 loader 冒烟
+pnpm build            # 产出 lib/index.js（Host 入口）与 lib/client.js（浏览器半区）
+pnpm verify:host      # 以纯 ESM 导入 Host bundle，检查 Cordis 插件面
+pnpm verify:client    # 用 __ModuleLoader__ shim 做 loader 冒烟
 ```
 
 ## 目录结构
@@ -138,7 +139,7 @@ src/
 └── workspaces.ts          # (chat, user) → 工作区目录
 ```
 
-`lib/client.js` 是构建产物（`pnpm build:client`），`scripts/verify-client-loader.mjs` 用官方 client-module loader 的 shim 做冒烟。
+`lib/index.js` 与 `lib/client.js` 是构建产物（`pnpm build`）：前者是安装后 profile 直接加载的 Host 入口（普通 ESM，不依赖 TypeScript 运行时转换），后者是设置面板的浏览器 bundle。`scripts/verify-host-loader.mjs` / `scripts/verify-client-loader.mjs` 分别做冒烟。
 
 ## 接入 DSH
 
@@ -149,7 +150,7 @@ src/
 DSH_HOME=$DSH_HOME pnpm dsh plugin --profile web add link:/path/to/dsh_channels
 ```
 
-浏览器半区（设置 →「飞书渠道」页面）需要先构建：在插件仓库执行 `pnpm build:client` 产出 `lib/client.js`，再重启 dsh（桌面端重启应用，`dsh web` 重启服务并刷新页面）。DSH 只加载已构建产物，直接改 `src/client/` 不会生效；没有 web 载体的 profile 不注册面板，飞书通道照常运行。
+安装前先构建：在插件仓库执行 `pnpm build`——Host 入口是 `lib/index.js`（profile 直接以 ESM 加载，不经过 TypeScript strip；`package.json` 的 `main` 指向它），设置面板是 `lib/client.js`。构建后重启 dsh（桌面端重启应用，`dsh web` 重启服务并刷新页面）。DSH 只加载已构建产物，直接改 `src/` 不会生效；没有 web 载体的 profile 不注册面板，飞书通道照常运行。
 
 包内的 `cordis.patch.yml` 会自动把 `dsh-channels` 加入 Loader；profile 只需在 `$DSH_HOME/profiles/web/cordis.patch.yml` 中按稳定 id 提供该实例的配置：
 
@@ -252,7 +253,8 @@ FEISHU_APP_SECRET: xxxxxxxx
 pnpm install --store-dir ./.pnpm-store   # 受限环境；正常环境直接 pnpm install
 pnpm typecheck        # Host（tsconfig.json）+ Client（tsconfig.client.json）两套
 pnpm test
-pnpm build:client     # → lib/client.js
+pnpm build            # → lib/index.js（Host）+ lib/client.js（浏览器半区）
+pnpm verify:host      # Host bundle 以纯 ESM 导入加载
 pnpm verify:client    # client loader 冒烟
 pnpm check            # 以上全部
 ```
