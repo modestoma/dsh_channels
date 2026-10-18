@@ -313,16 +313,20 @@ export function makeDomain(): { facility: StorageDomainFacility; raw: RawDomainH
   return { facility, raw }
 }
 
-/** One fake preset roster entry (`resolve`/`mount` vi.fn's + call log). */
+/** One fake preset roster entry (`resolve`/`mount`/`list` vi.fn's + call log). */
 export interface FakeAgentPresets {
   resolve: ReturnType<typeof vi.fn>
   mount: ReturnType<typeof vi.fn>
+  list: ReturnType<typeof vi.fn>
+  defaultId: string
   mounts: Array<{ agentCtx: AgentContext; id?: string }>
 }
 
 export interface FakeAgentPresetsOptions {
   /** Preset id the roster resolves for any request (default 'standard'). */
   defaultId?: string
+  /** Rows `list()` returns (default: one entry for the default preset). */
+  roster?: ReadonlyArray<{ id: string; name?: string; description?: string; broken?: string }>
   /** Optional request default installed while the preset mounts. */
   reasoningEffort?: string
   /** When set, `resolve()` rejects with this error. */
@@ -330,15 +334,17 @@ export interface FakeAgentPresetsOptions {
 }
 
 /**
- * Fake host roster: `resolve(id)` answers `{ id: id ?? defaultId, path }` and
- * `mount` records `(agentCtx, id)` calls, mirroring the real service's
- * contract closely enough for the plugin's composition flow.
+ * Fake host roster: `resolve(id)` answers `{ id: id ?? defaultId, path }`,
+ * `mount` records `(agentCtx, id)` calls, and `list` reports the roster rows,
+ * mirroring the real service's contract closely enough for the plugin's
+ * composition and settings-catalog flows.
  */
 export function makeAgentPresets(options: FakeAgentPresetsOptions = {}): FakeAgentPresets {
   const mounts: Array<{ agentCtx: AgentContext; id?: string }> = []
+  const defaultId = options.defaultId ?? 'standard'
   const presetFor = (id: string | undefined) => ({
-    id: id ?? options.defaultId ?? 'standard',
-    path: `/presets/${id ?? options.defaultId ?? 'standard'}`,
+    id: id ?? defaultId,
+    path: `/presets/${id ?? defaultId}`,
   })
   return {
     resolve: vi.fn(async (id?: string) => {
@@ -355,6 +361,8 @@ export function makeAgentPresets(options: FakeAgentPresetsOptions = {}): FakeAge
       }
       return presetFor(id)
     }),
+    list: vi.fn(async () => options.roster ?? [{ id: defaultId }]),
+    defaultId,
     mounts,
   }
 }

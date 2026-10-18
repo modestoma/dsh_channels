@@ -5,8 +5,9 @@
  * @module dsh-channels/client/api
  */
 
-import { CONFIG_ROUTE, CREDENTIALS_ROUTE, PANEL_ROUTE, RECONNECT_ROUTE, STATUS_ROUTE } from '../settings/contract.ts'
+import { CATALOG_ROUTE, CONFIG_ROUTE, CREDENTIALS_ROUTE, PANEL_ROUTE, RECONNECT_ROUTE, STATUS_ROUTE } from '../settings/contract.ts'
 import type {
+  CatalogWire,
   ChannelStatusWire,
   ClearConfigResponse,
   ClearCredentialResponse,
@@ -61,6 +62,19 @@ export async function fetchPanel(): Promise<PanelWire> {
 /** Status-only payload polled while the page is open. */
 export async function fetchStatus(): Promise<ChannelStatusWire> {
   return readJson<ChannelStatusWire>(await request(STATUS_ROUTE))
+}
+
+/**
+ * Model-selector catalog for one route: providers, the provider's models, the
+ * model's reasoning efforts, and the preset roster. The client re-queries it
+ * whenever the draft provider/model changes.
+ */
+export async function fetchCatalog(provider?: string, model?: string): Promise<CatalogWire> {
+  const params = new URLSearchParams()
+  if (provider !== undefined && provider !== '') params.set('provider', provider)
+  if (model !== undefined && model !== '') params.set('model', model)
+  const query = params.toString()
+  return readJson<CatalogWire>(await request(query === '' ? CATALOG_ROUTE : `${CATALOG_ROUTE}?${query}`))
 }
 
 /** Persist a partial edit. Validation failures come back as `{ok:false}`. */

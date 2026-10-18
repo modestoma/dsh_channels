@@ -66,8 +66,10 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 | 行为 | `dmMode`、`requireMention` | 需重启连接 |
 | 行为 | `threadFallback`、`welcomeOnboarding`、`allowPermissionSwitch` | 立即生效 |
 | 内容与图片 | `acceptImages`、`maxImagesPerMessage` | 立即生效 |
-| 模型 | `provider`、`model`、`reasoningEffort`、`agentPreset` | 立即生效（后续回合/新会话使用） |
+| 模型 | `provider`、`model`、`reasoningEffort`、`agentPreset` | 新会话生效（已有会话的模型/预设创建时已固定） |
 | 流式卡片 | `refreshMs`、`statusRefreshMs`、`loggerLevel` | 需重启连接 |
+
+**模型选择器**：模型与推理在面板里是**独立的一张卡片**（不再放在「常用配置」下）：宿主 LLM 服务可用时，`provider` / `model` / `reasoningEffort` 与 `agentPreset` 渲染为**下拉选择**而不是手填：provider 来自 `ctx.llm.listProviders()`，model 来自所选 provider 的 `listModels()`，推理档位来自 `resolveModelInfo(provider, model).reasoning.efforts`，Agent 预设来自 `agentPresets.list()`。每个选择器的首项是「留空 = 部署默认 / 适配器默认 / roster 默认」，有部署默认模型（`agentDefaultModel`）或 roster 默认预设时会在标签里带上具体值。选择按依赖级联：先选 provider 才会加载 model，选了 model 才会加载推理档位；宿主暂时无法枚举的项（服务未挂载、适配器查询失败/超时）自动退回原来的自由文本框，已保存但当前列表里没有的值会作为「当前配置，不在宿主机列表中」选项保留，不会在打开面板时被静默改掉。级联查询走只读的 `GET /dsh-channels/catalog?provider=…&model=…`（Host 侧短 TTL 缓存，单次查询 4 秒上限）。`provider` 与 `model` 在宿主侧是一条完整的请求路由，因此面板保存时要求**两者同时设置或同时留空**，不允许只选一半。
 
 `baseDir` 是**模型/工具产生文件的落点**（每个「用户 × 聊天」一个工作区：私聊 `<baseDir>/p2p/<open_id>/`，群聊 `<baseDir>/groups/<chat_id>/<open_id>/`）。面板里只接受**绝对路径**（`~` 开头按家目录展开，拒绝文件系统根目录），保存时会创建并校验该目录，不可用时当场报错，不会等到飞书里提示「会话创建失败」。已有 Session / 工作区不会被迁移，因此切到新目录后旧话题继续用旧工作区（话题内 `/renew` 也一样），只有之后新开的话题/会话使用新目录。
 
@@ -135,12 +137,14 @@ src/
 ├── feishu-channel.ts      # 官方 SDK Channel 适配（可注入 stub）
 ├── client/                # 浏览器半区：设置 →「飞书渠道」页面（构建到 lib/client.js）
 │   ├── index.ts           #   client 插件入口：settings.section 注册 + 样式
-│   ├── panel.tsx          #   状态卡 + 通用配置表单 + 只读信息
+│   ├── panel.tsx          #   状态卡 + 模型卡 + 通用配置表单 + 只读信息
+│   ├── catalog.ts         #   选择器目录折叠：Host 字段 + 实时目录 → 表单字段
 │   ├── api.ts             #   同源 /dsh-channels/* 请求封装
 │   └── styles.ts          #   语义 token 样式（注入一次）
 ├── settings/              # Web 设置面板 Host 半区
 │   ├── contract.ts        #   双端共享 wire 类型 / 字段清单 / 路由常量
 │   ├── overlay.ts         #   settings.json 读写、校验、合并
+│   ├── catalog.ts         #   宿主选择目录：provider/model/推理档位/preset
 │   ├── surface.ts         #   状态 / 面板视图模型 + 保存 / 清除 / 重连
 │   └── routes.ts          #   HTTP 路由 + 同源写保护
 └── workspaces.ts          # (chat, user) → 工作区目录
@@ -253,7 +257,7 @@ FEISHU_APP_SECRET: xxxxxxxx
 - 路由 GC 是 TTL 兜底：未监听飞书“群解散/话题删除”事件做主动清理；真实话题过期后写入持久化墓碑，用户回来会收到明确拒绝，不会在旧话题中误建新 Session。
 - 消息去重是**至多一次**语义：接受后、副作用完成前崩溃的极小窗口内，重投消息会被丢弃——中断修复卡提示“请重新发送消息”，用户重发即可（新 message id 正常处理）。
 - Web 面板编辑的是当前凭据**引用名**背后的值（profile 配置 `appId` / `appSecret` 指向的 ref）；更换引用名仍需编辑 profile 配置并重启 DSH。凭据提供方只读时面板会禁用输入并提示。
-- Web 面板的模型字段是自由文本（无 provider/model 下拉目录），填错会在下一次模型请求时由 Host 按现有链路报错；「重启飞书连接」会中断进行中的回复。
+- Web 面板的模型字段优先渲染为宿主目录驱动的下拉（provider → model → 推理档位）；宿主没有 LLM 服务或目录查询失败时退回自由文本，手填错误仍会在下一次模型请求时由 Host 报错；「重启飞书连接」会中断进行中的回复。
 - 持久化盘点与全部缺口状态见 [docs/persistence.md](docs/persistence.md)。
 
 ## 开发
@@ -268,4 +272,4 @@ pnpm verify:client    # client loader 冒烟
 pnpm check            # 以上全部
 ```
 
-测试以 stub 替换官方 SDK 与 DSH 宿主服务，无需真实凭据。`tests/settings.test.ts` 覆盖：覆盖层 schema/层级、面板视图模型、HTTP 路由（含同源写保护）、`apply()` 的 webServer 接线，以及 `FeishuService` 的覆盖加载 / 热更新 / 重启 / 启动失败记录。
+测试以 stub 替换官方 SDK 与 DSH 宿主服务，无需真实凭据。`tests/settings.test.ts` 覆盖：覆盖层 schema/层级、面板视图模型、HTTP 路由（含同源写保护）、`apply()` 的 webServer 接线、模型选择器的宿主目录与降级行为；`tests/client-catalog.test.ts` 覆盖浏览器半区的目录折叠（含依赖项解禁回归）；以及 `FeishuService` 的覆盖加载 / 热更新 / 重启 / 启动失败记录。

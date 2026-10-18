@@ -1,18 +1,19 @@
 /**
- * Web 设置面板的 HTTP 路由：status / panel / config(PUT,DELETE) /
+ * Web 设置面板的 HTTP 路由：status / panel / catalog / config(PUT,DELETE) /
  * credentials(PUT,DELETE) / reconnect。
  *
  * 路由注册进宿主可选的 `webServer` 服务（headless profile 没有它时面板自然
  * 不存在，飞书通道不受影响）。写操作额外做同源校验 —— 本机非回环绑定下
  * 防止跨站页面改写插件配置；读取不敏感，保持只读 GET。凭据值只走写路径，
- * 响应永远不包含它们。
+ * 响应永远不包含它们。`catalog` 只读宿主 LLM / preset roster 的枚举结果，
+ * 用于面板的 provider → model → 推理档位级联选择。
  *
  * @module dsh-channels/settings/routes
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { HostContext } from '../dsh-types.ts'
-import { CONFIG_ROUTE, CREDENTIALS_ROUTE, PANEL_ROUTE, RECONNECT_ROUTE, STATUS_ROUTE } from './contract.ts'
+import { CATALOG_ROUTE, CONFIG_ROUTE, CREDENTIALS_ROUTE, PANEL_ROUTE, RECONNECT_ROUTE, STATUS_ROUTE } from './contract.ts'
 import type { CredentialField, EditableValues, SaveCredentialsRequest } from './contract.ts'
 import type { SettingsSurface } from './surface.ts'
 
@@ -157,6 +158,23 @@ export function registerSettingsRoutes(server: HostWebServer, surface: SettingsS
           return
         }
         sendJson(res, 200, await surface.panel())
+      }),
+    }),
+    server.register({
+      kind: 'exact',
+      path: CATALOG_ROUTE,
+      handler: guarded(async (req, res) => {
+        if (!allowOnly(req, res, ['GET', 'HEAD'])) return
+        if (methodOf(req) === 'HEAD') {
+          res.writeHead(200, { 'cache-control': 'no-store' })
+          res.end()
+          return
+        }
+        const url = new URL(req.url ?? '/', 'http://dsh.local')
+        sendJson(res, 200, await surface.catalogFor(
+          url.searchParams.get('provider') ?? undefined,
+          url.searchParams.get('model') ?? undefined,
+        ))
       }),
     }),
     server.register({

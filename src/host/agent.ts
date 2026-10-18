@@ -122,6 +122,12 @@ export interface AgentRegistry {
 export interface AgentPreset {
   readonly id: string
   readonly path?: string
+  /** Display metadata published by a user-authored preset declaration. */
+  readonly name?: string
+  readonly description?: string
+  readonly order?: number
+  /** Why this preset cannot compose a session; absent when it can. */
+  readonly broken?: string
 }
 
 /**
@@ -136,6 +142,11 @@ export interface AgentPreset {
  */
 export interface AgentPresets {
   /**
+   * Default preset id for a session that names none. Absent on roster
+   * implementations that do not publish their default.
+   */
+  readonly defaultId?: string
+  /**
    * Resolve one preset by id; `undefined` resolves the roster default.
    * Resolves BEFORE the session exists so the header meta can record it.
    * @throws when no configured root supplies that id.
@@ -148,5 +159,7 @@ export interface AgentPresets {
    * @returns the composed preset.
    */
   mount(agentCtx: AgentContext, id?: string): Promise<AgentPreset>
+  /** Every declared preset, including activation diagnostics, when exposed. */
+  list?(): Promise<readonly AgentPreset[]>
 }
 

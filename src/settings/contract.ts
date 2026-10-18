@@ -13,6 +13,8 @@ export const PANEL_ROUTE = '/dsh-channels/panel'
 export const CONFIG_ROUTE = '/dsh-channels/config'
 export const CREDENTIALS_ROUTE = '/dsh-channels/credentials'
 export const RECONNECT_ROUTE = '/dsh-channels/reconnect'
+/** 模型/推理档位/预设选择器的宿主目录（provider → model → effort 级联刷新）。 */
+export const CATALOG_ROUTE = '/dsh-channels/catalog'
 
 /**
  * 可由 Web 面板覆盖的配置项。全部是 `src/config.ts` 里已存在的字段；
@@ -72,6 +74,12 @@ export type FieldKind = 'boolean' | 'number' | 'text' | 'select'
 /** Field groups map one-to-one onto panel cards. */
 export type FieldGroup = 'workspace' | 'behavior' | 'content' | 'model' | 'streaming'
 
+/** One selectable value rendered by the generic form. */
+export interface FieldOptionWire {
+  value: string
+  label: string
+}
+
 /** One editable row, fully described by the Host so the client stays schema-free. */
 export interface EditableFieldWire {
   key: EditableKey
@@ -79,7 +87,9 @@ export interface EditableFieldWire {
   kind: FieldKind
   group: FieldGroup
   help?: string
-  options?: ReadonlyArray<{ value: string; label: string }>
+  options?: readonly FieldOptionWire[]
+  /** Selector is not editable yet (e.g. pick the provider before the model). */
+  disabled?: boolean
   min?: number
   max?: number
   step?: number
@@ -88,6 +98,36 @@ export interface EditableFieldWire {
   wide?: boolean
   /** 保存后需重连飞书通道才生效。 */
   restartRequired: boolean
+}
+
+/**
+ * One selector group resolved from live host services. `selectable: false`
+ * means the host could not enumerate values (service absent / lookup failed),
+ * so the field falls back to the free-text control with the same key.
+ */
+export interface SelectCatalogWire {
+  selectable: boolean
+  /** Rendered in order; the leading `''` entry is the inherit/clear choice. */
+  options: FieldOptionWire[]
+  disabled?: boolean
+  /** Host-side explanation shown instead of the static field help. */
+  help?: string
+}
+
+/** `GET /dsh-channels/catalog` payload: the model-facing selector catalog. */
+export interface CatalogWire {
+  provider: SelectCatalogWire
+  model: SelectCatalogWire
+  reasoningEffort: SelectCatalogWire
+  agentPreset: SelectCatalogWire
+  /** Deployment default selection, when the host exposes `agentDefaultModel`. */
+  deploymentDefault?: {
+    provider?: string
+    model?: string
+    reasoningEffort?: string
+  }
+  /** Roster default preset id, when the host exposes the preset roster. */
+  defaultPresetId?: string
 }
 
 /** Values the panel may submit. Empty strings for optional text fields clear the override. */
@@ -233,6 +273,8 @@ export const PANEL_COPY = {
   description: '飞书长连接状态、应用凭据与常用配置。凭据写入 DSH 凭据库且不回显；标注「需重连」的项需重启飞书连接生效。',
   statusCard: '连接状态',
   credentialsCard: '飞书应用凭据',
+  modelCard: '模型与推理',
+  modelCardHelp: '模型服务商、模型 id、推理档位与新会话的 Agent 预设。下拉选项来自宿主机实时目录；保存后对新会话生效。',
   configCard: '常用配置',
   advancedCard: '只读与高级信息',
   appIdLabel: '飞书 App ID',
@@ -254,6 +296,9 @@ export const PANEL_COPY = {
   appIdPlaceholder: '输入 App ID（cli_…）',
   appSecretPlaceholder: '输入 App Secret',
   save: '保存配置',
+  saveAll: '保存全部配置',
+  saveModel: '保存模型配置',
+  modelActionsHint: '只保存模型与推理字段',
   saving: '保存中…',
   clear: '清除 Web 覆盖',
   clearing: '清除中…',
@@ -264,7 +309,11 @@ export const PANEL_COPY = {
   loading: '加载中…',
   loadFailed: '设置面板加载失败',
   saved: '已保存',
+  savedModel: '模型配置已保存',
   cleared: '已清除 Web 覆盖，恢复为 profile 配置',
+  catalogFailed: '模型目录加载失败，已退回手填。',
+  catalogLoading: '正在读取宿主机选项…',
+  catalogUnavailable: '宿主机未提供可选项，请手填。',
   noOverrides: '当前没有 Web 覆盖',
   overridden: 'Web 覆盖',
   inherited: '继承 profile',

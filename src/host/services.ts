@@ -77,6 +77,23 @@ export interface LlmProviderInfo {
   name: string
 }
 
+/** One adapter-owned reasoning effort advertised for an exact model route. */
+export interface LlmReasoningEffortInfo {
+  /** Opaque stable id accepted by model requests. */
+  id: string
+  /** Human-readable effort name for selectors. */
+  name: string
+  description?: string
+}
+
+/** Selectable reasoning efforts for one exact provider/model route. */
+export interface LlmModelReasoningInfo {
+  /** Supported efforts from least to greatest. */
+  efforts: readonly LlmReasoningEffortInfo[]
+  /** Adapter-configured default effort; absent means the provider default. */
+  defaultEffort?: string
+}
+
 export interface LlmModelInfo {
   /** Provider route that owns this entry. */
   provider?: string
@@ -86,6 +103,8 @@ export interface LlmModelInfo {
   name?: string
   description?: string
   context?: { contextWindow: number }
+  /** Adapter-owned reasoning levels, when `resolveModelInfo` reports them. */
+  reasoning?: LlmModelReasoningInfo
 }
 
 export interface LlmService {
@@ -94,6 +113,15 @@ export interface LlmService {
   listProviders?(): readonly LlmProviderInfo[]
   /** Models advertised for one provider route. */
   listModels?(provider: string): Promise<readonly LlmModelInfo[]>
+}
+
+/**
+ * Deployment default model selection (`@deepseek-ai/dsh-agent-default-model`).
+ * Web UI and headless entry points read it before creating an Agent; the
+ * settings panel only reads it to label the "inherit" choice.
+ */
+export interface AgentDefaultModel {
+  currentSelection(): { provider: string; model: string; reasoningEffort?: string }
 }
 
 // ---- Session projections -------------------------------------------------

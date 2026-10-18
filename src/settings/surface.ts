@@ -20,6 +20,7 @@ import {
   RESTART_KEYS,
 } from './contract.ts'
 import type {
+  CatalogWire,
   ChannelStatusWire,
   ClearConfigResponse,
   ClearCredentialResponse,
@@ -30,6 +31,7 @@ import type {
   EditableKey,
   EditableValues,
   FieldIssueWire,
+  FieldOptionWire,
   PanelConfigWire,
   PanelWire,
   ReadOnlyFieldWire,
@@ -43,6 +45,7 @@ import {
   pickEditable,
 } from './overlay.ts'
 import type { OverlayLogger, OverlayPatch, OverlayStore } from './overlay.ts'
+import type { SettingsCatalog } from './catalog.ts'
 
 /** The slice of `FeishuService` the panel needs (structural, easy to fake). */
 export interface SettingsTarget {
@@ -160,6 +163,79 @@ export const FIELD_DESCRIPTORS: readonly EditableFieldWire[] = EDITABLE_KEYS.map
   }
 })
 
+/** Keys whose options are resolved from the live host catalog at panel time. */
+type CatalogKey = 'provider' | 'model' | 'reasoningEffort' | 'agentPreset'
+
+const CATALOG_KEYS = new Set<EditableKey>(['provider', 'model', 'reasoningEffort', 'agentPreset'])
+
+function isCatalogKey(key: EditableKey): key is CatalogKey {
+  return CATALOG_KEYS.has(key)
+}
+
+/** Every group switched off: the form keeps its free-text controls. */
+export function emptyCatalog(): CatalogWire {
+  const none = { selectable: false, options: [] as FieldOptionWire[] }
+  return {
+    provider: { ...none },
+    model: { ...none },
+    reasoningEffort: { ...none },
+    agentPreset: { ...none },
+  }
+}
+
+/** Longest accepted catalog query value; anything longer is treated as absent. */
+const MAX_CATALOG_QUERY_LENGTH = 200
+
+/** Trim one provider/model query value, dropping empty, hostile, or oversized input. */
+function cleanCatalogQuery(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined
+  const trimmed = value.trim()
+  if (trimmed === '' || trimmed.length > MAX_CATALOG_QUERY_LENGTH) return undefined
+  // eslint-disable-next-line no-control-regex
+  if (/[\u0000-\u001f\u007f]/.test(trimmed)) return undefined
+  return trimmed
+}
+
+/**
+ * Attach the live catalog to the four selector fields. A configured value the
+ * host no longer advertises stays visible as an extra option so opening the
+ * panel never silently rewrites the effective config.
+ */
+export function applyCatalog(
+  fields: readonly EditableFieldWire[],
+  catalog: CatalogWire,
+  current: Partial<Record<CatalogKey, ConfigValue | undefined>>,
+): EditableFieldWire[] {
+  return fields.map((field) => {
+    if (!isCatalogKey(field.key)) return field
+    const selector = catalog[field.key]
+    if (!selector.selectable) return field
+    const value = current[field.key]
+    const options = typeof value === 'string' && value !== ''
+      && !selector.options.some(option => option.value === value)
+      ? withCurrentOption(selector.options, value)
+      : [...selector.options]
+    const next: EditableFieldWire = {
+      ...field,
+      kind: 'select',
+      options,
+    }
+    if (selector.disabled === true) next.disabled = true
+    if (selector.help !== undefined) next.help = selector.help
+    return next
+  })
+}
+
+/** Keep the leading inherit option first, then surface the unlisted current value. */
+function withCurrentOption(
+  options: readonly FieldOptionWire[],
+  value: string,
+): FieldOptionWire[] {
+  const [inherit, ...rest] = options
+  const extra: FieldOptionWire = { value, label: `${value}（当前配置，不在宿主机列表中）` }
+  return inherit === undefined ? [extra] : [inherit, extra, ...rest]
+}
+
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
@@ -230,18 +306,37 @@ function buildStatus(target: SettingsTarget, overlayPath: string): ChannelStatus
 
 /**
  * Stateful panel facade over one service + one overlay file. All mutations are
- * validated here; the HTTP layer only parses the transport.
+ * validated here; the HTTP layer only parses the transport. The optional
+ * [`SettingsCatalog`] turns the four model selectors into host-driven choice
+ * lists; without it (headless tests, host without LLM services) they stay
+ * free-text controls.
  */
 export class SettingsSurface {
   constructor(
     private readonly target: SettingsTarget,
     private readonly store: OverlayStore,
     private readonly logger?: OverlayLogger,
+    private readonly catalog?: SettingsCatalog,
   ) {}
 
   /** Wire status only (used by the client's 5 s poll). */
   async status(): Promise<ChannelStatusWire> {
     return buildStatus(this.target, this.store.file)
+  }
+
+  /**
+   * Resolve the selector catalog for one route (the client re-queries it when
+   * the draft provider/model changes). A broken lookup degrades to the
+   * free-text form instead of failing the panel.
+   */
+  async catalogFor(provider?: string, model?: string): Promise<CatalogWire> {
+    if (this.catalog === undefined) return emptyCatalog()
+    try {
+      return await this.catalog.catalog(cleanCatalogQuery(provider), cleanCatalogQuery(model))
+    } catch (error) {
+      this.logger?.warn?.('dsh-channels: 选择目录加载失败：%s', messageOf(error))
+      return emptyCatalog()
+    }
   }
 
   /** Status + editable config with provenance + read-only facts. */
@@ -254,6 +349,13 @@ export class SettingsSurface {
     const restartPendingKeys = this.target.isRunning() && running !== undefined
       ? RESTART_KEYS.filter(key => effective[key] !== running[key])
       : []
+    const catalog = await this.catalogFor(effective.provider, effective.model)
+    const fields = applyCatalog(FIELD_DESCRIPTORS, catalog, {
+      provider: effective.provider,
+      model: effective.model,
+      reasoningEffort: effective.reasoningEffort,
+      agentPreset: effective.agentPreset,
+    })
 
     let credentialStates: { appId: CredentialInfo; appSecret: CredentialInfo } = {
       appId: { configured: false, writable: false },
@@ -283,7 +385,7 @@ export class SettingsSurface {
         overlay: overlay as EditableValues,
         overriddenKeys,
         restartPendingKeys,
-        fields: [...FIELD_DESCRIPTORS],
+        fields,
         readOnly: readOnlyFields(effective),
         credentials,
       },
@@ -338,6 +440,29 @@ export class SettingsSurface {
       merged = { ...await this.store.load() }
       for (const key of clearedKeys) delete merged[key]
       Object.assign(merged, parsed.patch)
+    } catch (error) {
+      return { ok: false, error: `写入覆盖配置失败：${messageOf(error)}` }
+    }
+
+    // The host resolves a request route as a provider/model PAIR: a lone
+    // provider (or lone model) leaves the session without a complete route,
+    // so an edit to either side must end with both set or both cleared.
+    if (values.provider !== undefined || values.model !== undefined) {
+      const prospective = { ...this.target.baseConfigSnapshot(), ...merged }
+      const hasProvider = (prospective.provider ?? '') !== ''
+      const hasModel = (prospective.model ?? '') !== ''
+      if (hasProvider !== hasModel) {
+        return {
+          ok: false,
+          error: '模型服务商与模型 id 必须同时配置，或都留空沿用部署默认',
+          issues: [hasProvider
+            ? { key: 'model', message: '已选择模型服务商，还需要选择模型 id（或把两者都留空）' }
+            : { key: 'provider', message: '已选择模型 id，还需要选择模型服务商（或把两者都留空）' }],
+        }
+      }
+    }
+
+    try {
       await this.store.save(merged)
     } catch (error) {
       return { ok: false, error: `写入覆盖配置失败：${messageOf(error)}` }

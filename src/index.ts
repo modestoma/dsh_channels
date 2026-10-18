@@ -22,6 +22,7 @@ import type { ChannelFactory } from './feishu-channel.ts'
 import { OverlayStore, defaultOverlayPath } from './settings/overlay.ts'
 import { mountSettingsRoutes } from './settings/routes.ts'
 import { SettingsSurface } from './settings/surface.ts'
+import { createHostCatalog } from './settings/catalog.ts'
 
 export type * from './config.ts'
 export type * from './cards.ts'
@@ -35,10 +36,12 @@ export type * from './session-export.ts'
 export type * from './stats.ts'
 export type * from './questions.ts'
 export type * from './settings/contract.ts'
-export { CONFIG_ROUTE, CREDENTIALS_ROUTE, EDITABLE_KEYS, PANEL_COPY, PANEL_ROUTE, RECONNECT_ROUTE, RESTART_KEYS, STATUS_ROUTE } from './settings/contract.ts'
+export { CATALOG_ROUTE, CONFIG_ROUTE, CREDENTIALS_ROUTE, EDITABLE_KEYS, PANEL_COPY, PANEL_ROUTE, RECONNECT_ROUTE, RESTART_KEYS, STATUS_ROUTE } from './settings/contract.ts'
 export { defaultOverlayPath, mergeOverlay, normalizeOverlay, OverlayStore, parseOverlay, pickEditable, resolveDshHome } from './settings/overlay.ts'
-export { FIELD_DESCRIPTORS, normalizeCredentialValue, readOnlyFields, SettingsSurface } from './settings/surface.ts'
+export { applyCatalog, emptyCatalog, FIELD_DESCRIPTORS, normalizeCredentialValue, readOnlyFields, SettingsSurface } from './settings/surface.ts'
 export type { SettingsTarget } from './settings/surface.ts'
+export { createHostCatalog } from './settings/catalog.ts'
+export type { CatalogWarn, SettingsCatalog } from './settings/catalog.ts'
 export { isSameOriginRequest, mountSettingsRoutes, registerSettingsRoutes } from './settings/routes.ts'
 export type { HostWebServer } from './settings/routes.ts'
 export type { ApprovalOutcome, ApprovalRequest, ApprovalAnswererListener, AssistantStreamFrame, AskUserQuestionAnswer, AskUserQuestionAnswerItem, AskUserQuestionItem, AskUserQuestionRequestEvent, UserQuestionAnswererListener, AgentCancelCause, SessionStatsView, TokenUsageView, ContextPressureView, SessionProjections } from './dsh-types.ts'
@@ -101,9 +104,9 @@ export function apply(ctx: HostContext, config?: unknown): void {
   )
   const service = new FeishuService(ctx, resolved, factory, undefined, overlay)
   // Settings routes ride the host's web server when this deployment has one.
-  mountSettingsRoutes(ctx, new SettingsSurface(service, overlay, {
-    warn: (message, ...args) => ctx.logger?.warn?.(message, ...args),
-  }))
+  // The catalog resolves the panel's model selectors from live host services.
+  const warn = (message: string, ...args: unknown[]): void => { ctx.logger?.warn?.(message, ...args) }
+  mountSettingsRoutes(ctx, new SettingsSurface(service, overlay, { warn }, createHostCatalog(ctx, warn)))
   ctx.effect(() => {
     void service.boot().catch((error: unknown) => {
       ctx.logger?.error?.('dsh-channels failed to start: %s', String(error))

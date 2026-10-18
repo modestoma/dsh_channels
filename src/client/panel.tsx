@@ -9,9 +9,10 @@
  * @module dsh-channels/client/panel
  */
 
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { PANEL_COPY } from '../settings/contract.ts'
 import type {
+  CatalogWire,
   ChannelStatusWire,
   ConfigValue,
   CredentialField,
@@ -22,7 +23,8 @@ import type {
   FieldIssueWire,
   PanelWire,
 } from '../settings/contract.ts'
-import { clearConfig, clearCredential, fetchPanel, fetchStatus, reconnect, saveConfig, saveCredentials } from './api.ts'
+import { clearConfig, clearCredential, fetchCatalog, fetchPanel, fetchStatus, reconnect, saveConfig, saveCredentials } from './api.ts'
+import { CATALOG_KEYS, applyCatalogFields, catalogFromFields } from './catalog.ts'
 
 /** Owner props handed to a `settings.section` contribution (unused beyond parity). */
 export interface FeishuChannelsSectionProps {
@@ -96,11 +98,16 @@ function numericDraft(field: EditableFieldWire, raw: ConfigValue | undefined): n
   return Number.isFinite(parsed) ? parsed : undefined
 }
 
-function validateDraft(panel: PanelWire, draft: EditableValues): { values: EditableValues; issues: FieldIssueWire[] } {
+function validateDraft(
+  panel: PanelWire,
+  draft: EditableValues,
+  only?: ReadonlySet<EditableKey>,
+): { values: EditableValues; issues: FieldIssueWire[] } {
   const values: EditableValues = {}
   const issues: FieldIssueWire[] = []
   for (const field of panel.config.fields) {
     if (!(field.key in draft)) continue
+    if (only !== undefined && !only.has(field.key)) continue
     const raw = draft[field.key]
     if (field.kind === 'number') {
       const parsed = numericDraft(field, raw)
@@ -163,6 +170,7 @@ function FieldRow(props: {
             <select
               className={inputClass}
               value={String(value ?? '')}
+              disabled={field.disabled === true}
               onChange={event => onChange(field.key, event.target.value)}
             >
               {(field.options ?? []).map(option => (
@@ -408,6 +416,9 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
   const [pollError, setPollError] = useState<string | null>(null)
   const [appIdInput, setAppIdInput] = useState('')
   const [appSecretInput, setAppSecretInput] = useState('')
+  const [catalog, setCatalog] = useState<CatalogWire | null>(null)
+  const [catalogBusy, setCatalogBusy] = useState(false)
+  const catalogTicket = useRef(0)
   const panel = load.phase === 'ready' ? load.panel : null
   const currentStatus = status ?? panel?.status ?? null
 
@@ -430,6 +441,17 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
     void loadPanel()
   }, [loadPanel])
 
+  // The Host panel payload already carries options resolved for the effective
+  // route; re-seed the local catalog whenever a fresh panel arrives (load/save).
+  useEffect(() => {
+    if (panel === null) {
+      setCatalog(null)
+      return
+    }
+    setCatalog(catalogFromFields(panel.config.fields))
+    setCatalogBusy(false)
+  }, [panel])
+
   useEffect(() => {
     if (load.phase !== 'ready') return undefined
     let cancelled = false
@@ -450,10 +472,80 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
     }
   }, [load.phase])
 
-  const updateDraft = useCallback((key: EditableKey, value: ConfigValue) => {
-    setDraft(previous => ({ ...previous, [key]: value }))
-    setNotice(null)
+  /** Fetch the selector catalog for a draft route (latest request wins). */
+  const refreshCatalog = useCallback(async (provider: string, model: string): Promise<void> => {
+    catalogTicket.current += 1
+    const ticket = catalogTicket.current
+    setCatalogBusy(true)
+    try {
+      const next = await fetchCatalog(provider, model)
+      if (catalogTicket.current === ticket) setCatalog(next)
+    } catch {
+      if (catalogTicket.current !== ticket) return
+      // Never keep another route's options: degrade the dependent fields to the
+      // free-text controls instead of offering stale values.
+      setCatalog(previous => previous === null ? null : {
+        provider: previous.provider,
+        model: { selectable: false, options: [] },
+        reasoningEffort: { selectable: false, options: [] },
+        agentPreset: previous.agentPreset,
+      })
+      setNotice({ kind: 'error', text: PANEL_COPY.catalogFailed })
+    } finally {
+      if (catalogTicket.current === ticket) setCatalogBusy(false)
+    }
   }, [])
+
+  /** Current form values, used to keep unlisted configured values visible. */
+  const currentValues = useMemo(() => {
+    if (panel === null) return {}
+    const valueOf = (key: EditableKey): string | undefined => {
+      const raw = draft[key] ?? effectiveValue(panel, key)
+      return typeof raw === 'string' && raw !== '' ? raw : undefined
+    }
+    return {
+      provider: valueOf('provider'),
+      model: valueOf('model'),
+      reasoningEffort: valueOf('reasoningEffort'),
+      agentPreset: valueOf('agentPreset'),
+    }
+  }, [draft, panel])
+
+  const renderedFields = useMemo(
+    () => applyCatalogFields(panel?.config.fields ?? [], catalog, currentValues),
+    [panel, catalog, currentValues],
+  )
+
+  /** Whether one selector currently renders as a dropdown for this form. */
+  const isSelectField = useCallback(
+    (key: EditableKey): boolean => renderedFields.some(field => field.key === key && field.kind === 'select'),
+    [renderedFields],
+  )
+
+  const updateDraft = useCallback((key: EditableKey, value: ConfigValue) => {
+    if (panel === null) return
+    const providerNow = String(draft.provider ?? effectiveValue(panel, 'provider') ?? '')
+    setNotice(null)
+    if (key === 'provider') {
+      // Changing the provider invalidates the model/effort below it. When the
+      // selected provider is the configured one, keep showing its configured
+      // model; otherwise fall back to the inherit choice.
+      const nextProvider = String(value ?? '')
+      const configuredProvider = String(effectiveValue(panel, 'provider') ?? '')
+      const keepModel = nextProvider === configuredProvider
+        ? String(effectiveValue(panel, 'model') ?? '')
+        : ''
+      setDraft(previous => ({ ...previous, provider: value, model: '', reasoningEffort: '' }))
+      if (catalog !== null && isSelectField('provider')) void refreshCatalog(nextProvider, keepModel)
+      return
+    }
+    if (key === 'model') {
+      setDraft(previous => ({ ...previous, model: value, reasoningEffort: '' }))
+      if (catalog !== null && isSelectField('model')) void refreshCatalog(providerNow, String(value ?? ''))
+      return
+    }
+    setDraft(previous => ({ ...previous, [key]: value }))
+  }, [catalog, draft.provider, isSelectField, panel, refreshCatalog])
 
   const refreshStatus = useCallback(async (): Promise<void> => {
     try {
@@ -465,13 +557,20 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
     }
   }, [])
 
-  const onSave = useCallback(async (): Promise<void> => {
+  /**
+   * Save one scope of the form. The global footer saves every draft key; the
+   * model card's own button saves only the four model-facing keys, so editing
+   * the model does not require scrolling to the bottom.
+   */
+  const onSave = useCallback(async (scope?: 'model'): Promise<void> => {
     if (panel === null) return
-    const { values, issues } = validateDraft(panel, draft)
+    const only = scope === 'model' ? new Set<EditableKey>(CATALOG_KEYS) : undefined
+    const { values, issues } = validateDraft(panel, draft, only)
     if (issues.length > 0) {
       setNotice({ kind: 'error', text: '请先修正标红的配置项', issues })
       return
     }
+    if (Object.keys(values).length === 0) return
     setBusy('save')
     setNotice(null)
     try {
@@ -485,8 +584,16 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
       const cleared = result.clearedKeys.length === 0
         ? ''
         : `；已清除覆盖：${result.clearedKeys.map(key => fieldLabel(result.panel.config.fields, key)).join('、')}`
-      setNotice({ kind: 'ok', text: `${PANEL_COPY.saved}${cleared}` })
-      setDraft({})
+      setNotice({
+        kind: 'ok',
+        text: `${scope === 'model' ? PANEL_COPY.savedModel : PANEL_COPY.saved}${cleared}`,
+      })
+      setDraft((previous) => {
+        if (scope !== 'model') return {}
+        const next = { ...previous }
+        for (const key of CATALOG_KEYS) delete next[key]
+        return next
+      })
     } catch (error) {
       setNotice({ kind: 'error', text: messageOf(error) })
     } finally {
@@ -602,11 +709,17 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
     return GROUP_ORDER.map(group => ({
       group,
       label: GROUP_LABELS[group],
-      fields: panel.config.fields.filter(field => field.group === group),
+      fields: renderedFields.filter(field => field.group === group),
     })).filter(entry => entry.fields.length > 0)
-  }, [panel])
+  }, [panel, renderedFields])
+
+  // Model selection owns its own card: it depends on live host services and is
+  // the part users change most often, so it should not sit inside 常用配置.
+  const modelEntries = groupedFields.filter(entry => entry.group === 'model')
+  const configEntries = groupedFields.filter(entry => entry.group !== 'model')
 
   const dirty = Object.keys(draft).length > 0
+  const modelDirty = CATALOG_KEYS.some(key => draft[key] !== undefined)
   const issues = notice?.kind === 'error' ? notice.issues ?? [] : []
 
   if (load.phase === 'loading') {
@@ -683,6 +796,46 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
                       </button>
                     </div>
                   )}
+              {modelEntries.length === 0
+                ? null
+                : (
+                    <section className="dsh-channels-cfg__card">
+                      <div className="dsh-channels-cfg__cardHead">
+                        <span className="dsh-channels-cfg__cardTitle">{PANEL_COPY.modelCard}</span>
+                        <span className="dsh-channels-cfg__cardMeta">
+                          {catalogBusy ? PANEL_COPY.catalogLoading : '选项来自宿主机目录'}
+                        </span>
+                      </div>
+                      <span className="dsh-channels-cfg__help">{PANEL_COPY.modelCardHelp}</span>
+                      {modelEntries.map(entry => (
+                        <div className="dsh-channels-cfg__grid" key={entry.group}>
+                          {entry.fields.map(field => (
+                            <FieldRow
+                              key={field.key}
+                              field={field}
+                              value={draft[field.key] ?? effectiveValue(panel, field.key)}
+                              issues={issues}
+                              onChange={updateDraft}
+                            />
+                          ))}
+                        </div>
+                      ))}
+                      <div className="dsh-channels-cfg__footer">
+                        <button
+                          type="button"
+                          className="dsh-channels-cfg__btn dsh-channels-cfg__btn--primary"
+                          onClick={() => { void onSave('model') }}
+                          disabled={!modelDirty || busy !== null}
+                        >
+                          {busy === 'save' ? PANEL_COPY.saving : PANEL_COPY.saveModel}
+                        </button>
+                        <span className="dsh-channels-cfg__spacer" />
+                        <span className="dsh-channels-cfg__help">
+                          {modelDirty ? '有未保存的模型修改' : PANEL_COPY.modelActionsHint}
+                        </span>
+                      </div>
+                    </section>
+                  )}
               <section className="dsh-channels-cfg__card">
                 <div className="dsh-channels-cfg__cardHead">
                   <span className="dsh-channels-cfg__cardTitle">{PANEL_COPY.configCard}</span>
@@ -692,7 +845,7 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
                       : `${PANEL_COPY.overridden} ${panel.config.overriddenKeys.length} 项`}
                   </span>
                 </div>
-                {groupedFields.map(entry => (
+                {configEntries.map(entry => (
                   <div key={entry.group}>
                     <div className="dsh-channels-cfg__cardHead">
                       <span className="dsh-channels-cfg__cardTitle">{entry.label}</span>
@@ -710,30 +863,30 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
                     </div>
                   </div>
                 ))}
-                <div className="dsh-channels-cfg__footer">
-                  <button
-                    type="button"
-                    className="dsh-channels-cfg__btn dsh-channels-cfg__btn--primary"
-                    onClick={() => { void onSave() }}
-                    disabled={!dirty || busy !== null}
-                  >
-                    {busy === 'save' ? PANEL_COPY.saving : PANEL_COPY.save}
-                  </button>
-                  <button
-                    type="button"
-                    className="dsh-channels-cfg__btn"
-                    onClick={() => { void onClear() }}
-                    disabled={panel.config.overriddenKeys.length === 0 || busy !== null}
-                    title={panel.config.overriddenKeys.length === 0 ? PANEL_COPY.noOverrides : undefined}
-                  >
-                    {busy === 'clear' ? PANEL_COPY.clearing : PANEL_COPY.clear}
-                  </button>
-                  <span className="dsh-channels-cfg__spacer" />
-                  <span className="dsh-channels-cfg__help">
-                    {dirty ? '有未保存的修改' : '只保存改动过的字段'}
-                  </span>
-                </div>
               </section>
+              <div className="dsh-channels-cfg__footer">
+                <button
+                  type="button"
+                  className="dsh-channels-cfg__btn dsh-channels-cfg__btn--primary"
+                  onClick={() => { void onSave() }}
+                  disabled={!dirty || busy !== null}
+                >
+                  {busy === 'save' ? PANEL_COPY.saving : PANEL_COPY.saveAll}
+                </button>
+                <button
+                  type="button"
+                  className="dsh-channels-cfg__btn"
+                  onClick={() => { void onClear() }}
+                  disabled={panel.config.overriddenKeys.length === 0 || busy !== null}
+                  title={panel.config.overriddenKeys.length === 0 ? PANEL_COPY.noOverrides : undefined}
+                >
+                  {busy === 'clear' ? PANEL_COPY.clearing : PANEL_COPY.clear}
+                </button>
+                <span className="dsh-channels-cfg__spacer" />
+                <span className="dsh-channels-cfg__help">
+                  {dirty ? '有未保存的修改' : '只保存改动过的字段'}
+                </span>
+              </div>
               <AdvancedCard panel={panel} />
             </>
           )}

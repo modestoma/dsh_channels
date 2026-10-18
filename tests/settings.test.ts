@@ -11,12 +11,13 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { describe, expect, it, vi } from 'vitest'
 import { resolveConfig } from '../src/config.ts'
 import type { FeishuConfig } from '../src/config.ts'
-import type { HostContext } from '../src/dsh-types.ts'
+import type { AgentPreset, HostContext, LlmModelInfo, LlmService } from '../src/dsh-types.ts'
 import { FeishuService } from '../src/service.ts'
 import { HEALTH_DEPENDENCY_NAMES } from '../src/health.ts'
 import type { HealthSnapshot } from '../src/health.ts'
 import type { FeishuChannel } from '../src/feishu-channel.ts'
 import {
+  CATALOG_ROUTE,
   CONFIG_ROUTE,
   CREDENTIALS_ROUTE,
   EDITABLE_KEYS,
@@ -25,7 +26,7 @@ import {
   RESTART_KEYS,
   STATUS_ROUTE,
 } from '../src/settings/contract.ts'
-import type { EditableValues } from '../src/settings/contract.ts'
+import type { CatalogWire, EditableValues } from '../src/settings/contract.ts'
 import {
   OverlayStore,
   defaultOverlayPath,
@@ -38,9 +39,12 @@ import {
 import {
   FIELD_DESCRIPTORS,
   SettingsSurface,
+  emptyCatalog,
   readOnlyFields,
 } from '../src/settings/surface.ts'
 import type { SettingsTarget } from '../src/settings/surface.ts'
+import { createHostCatalog } from '../src/settings/catalog.ts'
+import type { SettingsCatalog } from '../src/settings/catalog.ts'
 import { isSameOriginRequest, registerSettingsRoutes } from '../src/settings/routes.ts'
 import type { HostWebServer } from '../src/settings/routes.ts'
 import { normalizeWorkspaceBaseDir, prepareWorkspaceBaseDir } from '../src/workspaces.ts'
@@ -143,7 +147,7 @@ class FakeTarget implements SettingsTarget {
   }
 }
 
-function makeSurface(partial: Partial<FeishuConfig> = {}): {
+function makeSurface(partial: Partial<FeishuConfig> = {}, catalog?: SettingsCatalog): {
   surface: SettingsSurface
   target: FakeTarget
   store: OverlayStore
@@ -152,7 +156,7 @@ function makeSurface(partial: Partial<FeishuConfig> = {}): {
   const file = tempOverlayFile()
   const target = new FakeTarget(makeConfig(partial))
   const store = new OverlayStore(file)
-  return { surface: new SettingsSurface(target, store), target, store, file }
+  return { surface: new SettingsSurface(target, store, undefined, catalog), target, store, file }
 }
 
 describe('overlay paths and validation', () => {
@@ -285,6 +289,283 @@ describe('field descriptors', () => {
   })
 })
 
+/** A complete catalog as the Host would resolve it for one configured route. */
+const SAMPLE_CATALOG: CatalogWire = {
+  provider: {
+    selectable: true,
+    options: [
+      { value: '', label: '留空 = 部署默认（deepseek-account）' },
+      { value: 'deepseek-account', label: 'DeepSeek（deepseek-account）' },
+    ],
+  },
+  model: {
+    selectable: true,
+    options: [
+      { value: '', label: '留空 = 部署默认（deepseek-flash）' },
+      { value: 'deepseek-flash', label: 'deepseek-flash' },
+      { value: 'deepseek-pro', label: 'deepseek-pro' },
+    ],
+  },
+  reasoningEffort: {
+    selectable: true,
+    options: [
+      { value: '', label: '留空 = 适配器默认（max）' },
+      { value: 'low', label: 'low' },
+      { value: 'max', label: 'max' },
+    ],
+  },
+  agentPreset: {
+    selectable: true,
+    options: [
+      { value: '', label: '留空 = roster 默认（standard）' },
+      { value: 'standard', label: '标准（standard）' },
+    ],
+  },
+  deploymentDefault: { provider: 'deepseek-account', model: 'deepseek-flash', reasoningEffort: 'max' },
+  defaultPresetId: 'standard',
+}
+
+function makeCatalog(wire: CatalogWire = SAMPLE_CATALOG): {
+  catalog: SettingsCatalog
+  calls: Array<{ provider?: string; model?: string }>
+} {
+  const calls: Array<{ provider?: string; model?: string }> = []
+  return {
+    calls,
+    catalog: {
+      async catalog(provider?: string, model?: string): Promise<CatalogWire> {
+        calls.push({ provider, model })
+        return structuredClone(wire)
+      },
+    },
+  }
+}
+
+interface CatalogHostOptions {
+  providers?: readonly { id: string; name: string }[]
+  models?: readonly LlmModelInfo[]
+  modelInfo?: LlmModelInfo | Error
+  presets?: readonly AgentPreset[] | Error
+  defaultPresetId?: string
+  deployment?: { provider: string; model: string; reasoningEffort?: string }
+}
+
+/** Minimal host context carrying only what createHostCatalog reads. */
+function makeCatalogHost(options: CatalogHostOptions = {}): HostContext {
+  const llm: LlmService = {
+    async resolveModelInfo(): Promise<LlmModelInfo> {
+      const info = options.modelInfo
+      if (info instanceof Error) throw info
+      return info ?? {
+        provider: 'deepseek-account',
+        id: 'deepseek-flash',
+        name: 'DeepSeek Flash',
+        context: { contextWindow: 128_000 },
+      }
+    },
+    ...(options.providers === undefined ? {} : { listProviders: () => options.providers! }),
+    listModels: async () => options.models ?? [],
+  }
+  const services: Record<string, unknown> = {}
+  const presetRows = options.presets
+  if (presetRows !== undefined) {
+    services.agentPresets = {
+      defaultId: options.defaultPresetId,
+      resolve: async (id?: string) => ({ id: id ?? 'standard' }),
+      mount: async () => ({ id: 'standard' }),
+      list: async () => {
+        if (presetRows instanceof Error) throw presetRows
+        return presetRows
+      },
+    }
+  }
+  if (options.deployment !== undefined) {
+    services.agentDefaultModel = { currentSelection: () => options.deployment }
+  }
+  return {
+    llm,
+    get: (name: string) => services[name],
+  } as unknown as HostContext
+}
+
+describe('host selector catalog', () => {
+  it('maps live providers, models, efforts, presets, and deployment defaults', async () => {
+    const warnings: string[] = []
+    const ctx = makeCatalogHost({
+      providers: [{ id: 'deepseek-account', name: 'DeepSeek' }],
+      models: [
+        { provider: 'deepseek-account', id: 'deepseek-flash', name: 'deepseek-flash' },
+        { provider: 'deepseek-account', id: 'deepseek-pro', name: 'Pro' },
+      ],
+      modelInfo: {
+        provider: 'deepseek-account',
+        id: 'deepseek-flash',
+        name: 'DeepSeek Flash',
+        reasoning: {
+          efforts: [{ id: 'low', name: 'Low' }, { id: 'max', name: 'Max' }],
+          defaultEffort: 'max',
+        },
+      },
+      presets: [
+        { id: 'standard', name: '标准' },
+        { id: 'minimal' },
+        { id: 'broken', broken: '缺少插件' },
+      ],
+      defaultPresetId: 'standard',
+      deployment: { provider: 'deepseek-account', model: 'deepseek-flash', reasoningEffort: 'max' },
+    })
+    const wire = await createHostCatalog(ctx, message => { warnings.push(message) })
+      .catalog('deepseek-account', 'deepseek-flash')
+
+    expect(wire.provider.selectable).toBe(true)
+    expect(wire.provider.options.map(option => option.value)).toEqual(['', 'deepseek-account'])
+    expect(wire.provider.options[1]?.label).toBe('DeepSeek（deepseek-account）')
+    expect(wire.provider.options[0]?.label).toContain('deepseek-account')
+
+    expect(wire.model.selectable).toBe(true)
+    expect(wire.model.options.map(option => option.value)).toEqual(['', 'deepseek-flash', 'deepseek-pro'])
+    expect(wire.model.options[2]?.label).toBe('Pro（deepseek-pro）')
+
+    expect(wire.reasoningEffort.selectable).toBe(true)
+    expect(wire.reasoningEffort.options.map(option => option.value)).toEqual(['', 'low', 'max'])
+    expect(wire.reasoningEffort.options[0]?.label).toContain('max')
+
+    expect(wire.agentPreset.selectable).toBe(true)
+    expect(wire.agentPreset.options.map(option => option.value)).toEqual(['', 'standard', 'minimal', 'broken'])
+    expect(wire.agentPreset.options[0]?.label).toContain('standard')
+    expect(wire.agentPreset.options.find(option => option.value === 'broken')?.label).toContain('不可用')
+
+    expect(wire.deploymentDefault).toEqual({
+      provider: 'deepseek-account',
+      model: 'deepseek-flash',
+      reasoningEffort: 'max',
+    })
+    expect(wire.defaultPresetId).toBe('standard')
+    expect(warnings).toEqual([])
+  })
+
+  it('shows the model selector disabled until a provider is chosen', async () => {
+    const ctx = makeCatalogHost({
+      providers: [{ id: 'deepseek-account', name: 'DeepSeek' }],
+      models: [{ provider: 'deepseek-account', id: 'deepseek-flash', name: 'deepseek-flash' }],
+      deployment: { provider: 'deepseek-account', model: 'deepseek-flash' },
+    })
+    const wire = await createHostCatalog(ctx).catalog()
+    expect(wire.provider.selectable).toBe(true)
+    expect(wire.model.selectable).toBe(true)
+    expect(wire.model.disabled).toBe(true)
+    expect(wire.model.options.map(option => option.value)).toEqual([''])
+    expect(wire.model.options[0]?.label).toContain('deepseek-flash')
+    expect(wire.reasoningEffort.disabled).toBe(true)
+  })
+
+  it('disables reasoning effort when the model declares no levels', async () => {
+    const ctx = makeCatalogHost({
+      providers: [{ id: 'p', name: 'P' }],
+      models: [{ provider: 'p', id: 'm', name: 'm' }],
+      modelInfo: { provider: 'p', id: 'm', name: 'm' },
+    })
+    const wire = await createHostCatalog(ctx).catalog('p', 'm')
+    expect(wire.reasoningEffort.selectable).toBe(true)
+    expect(wire.reasoningEffort.disabled).toBe(true)
+    expect(wire.reasoningEffort.options).toHaveLength(1)
+    expect(wire.reasoningEffort.help).toContain('推理档位')
+  })
+
+  it('keeps provider/model selects degraded independently and warns on failed lookups', async () => {
+    const warnings: string[] = []
+    const ctx = makeCatalogHost({
+      models: [{ provider: 'p', id: 'm', name: 'm' }],
+      modelInfo: new Error('adapter down'),
+      presets: new Error('roster down'),
+    })
+    const wire = await createHostCatalog(ctx, (message, ...args) => { warnings.push([message, ...args].join(' ')) })
+      .catalog('p', 'm')
+    expect(wire.provider.selectable).toBe(false)
+    expect(wire.model.selectable).toBe(true)
+    expect(wire.reasoningEffort.selectable).toBe(false)
+    expect(wire.agentPreset.selectable).toBe(false)
+    expect(warnings.some(message => message.includes('model-info'))).toBe(true)
+    expect(warnings.some(message => message.includes('presets'))).toBe(true)
+  })
+
+  it('labels the inherit choices plainly without a deployment default', async () => {
+    const ctx = makeCatalogHost({
+      providers: [{ id: 'p', name: 'P' }],
+      models: [{ provider: 'p', id: 'm', name: 'm' }],
+    })
+    const wire = await createHostCatalog(ctx).catalog('p', 'm')
+    expect(wire.provider.options[0]?.label).toBe('留空 = 部署默认')
+    expect(wire.deploymentDefault).toBeUndefined()
+    expect(wire.agentPreset.selectable).toBe(false)
+  })
+})
+
+describe('settings panel selector catalog', () => {
+  it('renders the four model fields as host-driven selects', async () => {
+    const fake = makeCatalog()
+    const { surface } = makeSurface({ provider: 'deepseek-account', model: 'deepseek-flash' }, fake.catalog)
+    const panel = await surface.panel()
+    const byKey = new Map(panel.config.fields.map(field => [field.key, field]))
+    for (const key of ['provider', 'model', 'reasoningEffort', 'agentPreset'] as const) {
+      expect(byKey.get(key)?.kind).toBe('select')
+      expect(byKey.get(key)?.options?.[0]?.value).toBe('')
+    }
+    expect(fake.calls).toEqual([{ provider: 'deepseek-account', model: 'deepseek-flash' }])
+  })
+
+  it('keeps an unlisted configured value visible as an extra option', async () => {
+    const fake = makeCatalog()
+    const { surface } = makeSurface({
+      provider: 'legacy-provider',
+      model: 'legacy-model',
+      reasoningEffort: 'high',
+      agentPreset: 'legacy-preset',
+    }, fake.catalog)
+    const panel = await surface.panel()
+    const byKey = new Map(panel.config.fields.map(field => [field.key, field]))
+    expect(byKey.get('provider')?.options?.map(option => option.value))
+      .toEqual(['', 'legacy-provider', 'deepseek-account'])
+    expect(byKey.get('provider')?.options?.[1]?.label).toContain('当前配置')
+    expect(byKey.get('model')?.options?.map(option => option.value))
+      .toEqual(['', 'legacy-model', 'deepseek-flash', 'deepseek-pro'])
+    expect(byKey.get('reasoningEffort')?.options?.map(option => option.value))
+      .toEqual(['', 'high', 'low', 'max'])
+    expect(byKey.get('agentPreset')?.options?.map(option => option.value))
+      .toEqual(['', 'legacy-preset', 'standard'])
+  })
+
+  it('keeps the free-text controls when the host exposes no catalog', async () => {
+    const { surface } = makeSurface()
+    const panel = await surface.panel()
+    const byKey = new Map(panel.config.fields.map(field => [field.key, field]))
+    for (const key of ['provider', 'model', 'reasoningEffort', 'agentPreset'] as const) {
+      expect(byKey.get(key)?.kind).toBe('text')
+    }
+  })
+
+  it('sanitizes catalog queries and degrades a failing lookup', async () => {
+    const calls: Array<{ provider?: string; model?: string }> = []
+    const ok = makeSurface({}, {
+      async catalog(provider?: string, model?: string): Promise<CatalogWire> {
+        calls.push({ provider, model })
+        return SAMPLE_CATALOG
+      },
+    })
+    await ok.surface.catalogFor('   ', 'x'.repeat(500))
+    expect(calls[0]).toEqual({ provider: undefined, model: undefined })
+    await ok.surface.catalogFor('provider\u0001', 'model')
+    expect(calls[1]).toEqual({ provider: undefined, model: 'model' })
+
+    const broken = makeSurface({}, {
+      async catalog(): Promise<CatalogWire> {
+        throw new Error('catalog down')
+      },
+    })
+    await expect(broken.surface.catalogFor('p', 'm')).resolves.toEqual(emptyCatalog())
+  })
+})
+
 describe('SettingsSurface', () => {
   it('builds the panel with provenance, credentials, and read-only facts', async () => {
     const file = tempOverlayFile()
@@ -342,6 +623,29 @@ describe('SettingsSurface', () => {
     await expect(store.load()).resolves.toEqual({ requireMention: false, maxImagesPerMessage: 2 })
     expect(target.applied).toEqual({ requireMention: false, maxImagesPerMessage: 2 })
     expect(result.panel.config.overriddenKeys).toEqual(['requireMention', 'maxImagesPerMessage'])
+  })
+
+  it('refuses a half-configured model override', async () => {
+    const { surface, store } = makeSurface()
+    const providerOnly = await surface.save({ provider: 'deepseek-account' })
+    expect(providerOnly.ok).toBe(false)
+    if (providerOnly.ok) return
+    expect(providerOnly.issues?.map(issue => issue.key)).toEqual(['model'])
+
+    const modelOnly = await surface.save({ model: 'deepseek-flash' })
+    expect(modelOnly.ok).toBe(false)
+    if (modelOnly.ok) return
+    expect(modelOnly.issues?.map(issue => issue.key)).toEqual(['provider'])
+
+    await expect(store.load()).resolves.toEqual({})
+
+    const pair = await surface.save({ provider: 'deepseek-account', model: 'deepseek-flash' })
+    expect(pair.ok).toBe(true)
+    await expect(store.load()).resolves.toEqual({ provider: 'deepseek-account', model: 'deepseek-flash' })
+
+    const cleared = await surface.save({ provider: '', model: '' })
+    expect(cleared.ok).toBe(true)
+    await expect(store.load()).resolves.toEqual({})
   })
 
   it('rejects unknown keys and invalid values with per-field issues', async () => {
@@ -581,6 +885,29 @@ describe('settings routes', () => {
     expect(notAllowed.headers.allow).toBe('GET, HEAD')
   })
 
+  it('serves the selector catalog over GET and rejects writes', async () => {
+    const fake = makeCatalog()
+    const { surface } = makeSurface({ provider: 'deepseek-account', model: 'deepseek-flash' }, fake.catalog)
+    const { server, routes } = makeWebServer()
+    registerSettingsRoutes(server, surface)
+
+    const catalog = await call(routes, CATALOG_ROUTE, makeRequest({
+      url: `${CATALOG_ROUTE}?provider=deepseek-account&model=deepseek-flash`,
+    }))
+    expect(catalog.status).toBe(200)
+    const body = JSON.parse(catalog.body) as CatalogWire
+    expect(body.provider.selectable).toBe(true)
+    expect(fake.calls).toEqual([{ provider: 'deepseek-account', model: 'deepseek-flash' }])
+
+    const head = await call(routes, CATALOG_ROUTE, makeRequest({ method: 'HEAD', url: CATALOG_ROUTE }))
+    expect(head.status).toBe(200)
+    expect(head.body).toBe('')
+
+    const post = await call(routes, CATALOG_ROUTE, makeRequest({ method: 'POST', url: CATALOG_ROUTE }))
+    expect(post.status).toBe(405)
+    expect(post.headers.allow).toBe('GET, HEAD')
+  })
+
   it('writes config via PUT and enforces same-origin + JSON', async () => {
     const { surface, store } = makeSurface()
     const { server, routes } = makeWebServer()
@@ -716,13 +1043,20 @@ describe('apply() web wiring', () => {
 
     expect(routes.has(PANEL_ROUTE)).toBe(true)
     expect(routes.has(STATUS_ROUTE)).toBe(true)
+    expect(routes.has(CATALOG_ROUTE)).toBe(true)
     expect(routes.has(CONFIG_ROUTE)).toBe(true)
     expect(routes.has(CREDENTIALS_ROUTE)).toBe(true)
     expect(routes.has(RECONNECT_ROUTE)).toBe(true)
 
     const panel = await call(routes, PANEL_ROUTE, makeRequest())
     expect(panel.status).toBe(200)
-    expect(JSON.parse(panel.body).config.fields).toHaveLength(EDITABLE_KEYS.length)
+    const panelBody = JSON.parse(panel.body)
+    expect(panelBody.config.fields).toHaveLength(EDITABLE_KEYS.length)
+    // The live host catalog turns the provider field into a select (the fake
+    // host context advertises one provider); model stays free text until a
+    // provider is configured.
+    const providerField = panelBody.config.fields.find((field: { key: string }) => field.key === 'provider')
+    expect(providerField.kind).toBe('select')
 
     await vi.waitFor(async () => {
       const status = await call(routes, STATUS_ROUTE, makeRequest())
