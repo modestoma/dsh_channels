@@ -211,6 +211,7 @@ function buildStatus(target: SettingsTarget, overlayPath: string): ChannelStatus
     liveAgentCount: health.liveAgentCount,
     inflightTurnCount: health.inflightTurnCount,
     ...(target.startError() === undefined ? {} : { lastStartError: target.startError() }),
+    reasons: health.reasons,
     version: DSH_CHANNELS_VERSION,
     overlayPath,
     busy: target.isRestarting(),

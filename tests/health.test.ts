@@ -42,6 +42,79 @@ describe('health snapshot', () => {
     }).level).toBe(level)
   })
 
+  it('explains a degraded level with the host-wide pending plugin names', () => {
+    const snapshot = foldHealthSnapshot({
+      fibers: [
+        { state: CordisFiberState.ACTIVE, name: 'channels' },
+        { state: CordisFiberState.PENDING, name: 'dsh-experimental-inspector' },
+      ],
+      dependencies: dependencies(),
+      connection: { state: 'connected', reconnectAttempts: 0 },
+      started: true,
+      routeCount: 0,
+      liveAgentCount: 0,
+      inflightTurnCount: 0,
+    })
+    expect(snapshot.level).toBe('degraded')
+    expect(snapshot.reasons).toEqual([
+      '宿主其它插件仍有 1 个入口在等待依赖或加载/卸载（与飞书通道无关）：dsh-experimental-inspector',
+    ])
+    expect(snapshot.inactiveFibers).toEqual([{ state: 'pending', label: 'dsh-experimental-inspector' }])
+    expect(snapshot.inactiveTotal).toBe(1)
+  })
+
+  it('keeps healthy snapshots reason-free and caps the listed inactive fibers', () => {
+    const healthy = foldHealthSnapshot({
+      fibers: [{ state: CordisFiberState.ACTIVE, name: 'channels' }],
+      dependencies: dependencies(),
+      connection: { state: 'connected', reconnectAttempts: 0 },
+      started: true,
+      routeCount: 0,
+      liveAgentCount: 0,
+      inflightTurnCount: 0,
+    })
+    expect(healthy.reasons).toEqual([])
+    expect(healthy.inactiveFibers).toEqual([])
+
+    const pendingFibers = Array.from({ length: 20 }, (_, index) => ({
+      state: CordisFiberState.PENDING,
+      name: `plugin-${index}`,
+    }))
+    const busy = foldHealthSnapshot({
+      fibers: pendingFibers,
+      dependencies: dependencies(),
+      connection: { state: 'connected', reconnectAttempts: 0 },
+      started: true,
+      routeCount: 0,
+      liveAgentCount: 0,
+      inflightTurnCount: 0,
+    })
+    expect(busy.inactiveFibers).toHaveLength(12)
+    expect(busy.inactiveTotal).toBe(20)
+    expect(busy.reasons[0]).toContain('仍有 20 个入口')
+    expect(busy.reasons[0]).toContain('等 20 个')
+  })
+
+  it('lists connection, dependency, and failure causes for unhealthy states', () => {
+    const snapshot = foldHealthSnapshot({
+      fibers: [
+        { state: CordisFiberState.FAILED, name: 'broken-plugin' },
+      ],
+      dependencies: dependencies('commands'),
+      connection: { state: 'failed', reconnectAttempts: 3 },
+      started: true,
+      routeCount: 0,
+      liveAgentCount: 0,
+      inflightTurnCount: 0,
+    })
+    expect(snapshot.level).toBe('unhealthy')
+    expect(snapshot.reasons).toEqual(expect.arrayContaining([
+      '主机服务未就绪：commands',
+      '飞书长连接失败',
+      '插件加载失败 1 个：broken-plugin',
+    ]))
+  })
+
   it('renders aggregate state without the full open_id, errors, or credential values', () => {
     const snapshot = foldHealthSnapshot({
       fibers: [{ state: CordisFiberState.ACTIVE }],

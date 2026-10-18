@@ -244,6 +244,13 @@ function StatusCard(props: {
           </div>
         ))}
       </div>
+      {status.reasons.length === 0
+        ? null
+        : (
+            <span className={`dsh-channels-cfg__help${status.level === 'unhealthy' ? ' dsh-channels-cfg__reasonBad' : ''}`}>
+              健康判定：{status.reasons.join('；')}
+            </span>
+          )}
       {pollError === null ? null : <span className="dsh-channels-cfg__fieldError">状态刷新失败：{pollError}</span>}
       <div className="dsh-channels-cfg__actions">
         <button type="button" className="dsh-channels-cfg__btn" onClick={onRefresh} disabled={busy !== null}>

@@ -128,6 +128,8 @@ export interface ChannelStatusWire {
   inflightTurnCount: number
   /** 最近一次启动失败的原因（成功后清空）。 */
   lastStartError?: string
+  /** 健康判定的原因说明（空数组 = 健康）；由 Host 的 health 折叠给出。 */
+  reasons: string[]
   /** 面板显示的所有键值对来源版本。 */
   version: string
   /** Web 覆盖文件绝对路径（用户可直接编辑）。 */

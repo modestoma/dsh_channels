@@ -68,6 +68,9 @@ function healthySnapshot(partial: Partial<HealthSnapshot> = {}): HealthSnapshot 
     routeCount: 2,
     liveAgentCount: 1,
     inflightTurnCount: 0,
+    inactiveFibers: [],
+    inactiveTotal: 0,
+    reasons: [],
     ...partial,
   }
 }
@@ -250,6 +253,20 @@ describe('SettingsSurface', () => {
     expect(panel.config.credentials.appId).toEqual({ ref: 'FEISHU_APP_ID', configured: true, writable: true, source: 'file' })
     expect(panel.config.fields).toHaveLength(EDITABLE_KEYS.length)
     expect(panel.config.restartPendingKeys).toEqual([])
+    expect(panel.status.reasons).toEqual([])
+  })
+
+  it('surfaces the health reasons that explain a degraded level', async () => {
+    const { surface, target } = makeSurface()
+    target.healthState = healthySnapshot({
+      level: 'degraded',
+      reasons: ['宿主其它插件仍有 2 个入口在等待依赖或加载/卸载（与飞书通道无关）：a、b'],
+    })
+    const panel = await surface.panel()
+    expect(panel.status.level).toBe('degraded')
+    expect(panel.status.reasons).toEqual([
+      '宿主其它插件仍有 2 个入口在等待依赖或加载/卸载（与飞书通道无关）：a、b',
+    ])
   })
 
   it('reports restart-pending keys when the live connection predates the edit', async () => {

@@ -44,6 +44,7 @@ const CSS = `
 .dsh-channels-cfg__tag--override{color:var(--dsw-alias-state-business-primary,#0a67d3);border-style:solid}
 .dsh-channels-cfg__tag--restart{color:var(--dsw-alias-state-warning-primary,#a15c00)}
 .dsh-channels-cfg__help{color:var(--dsw-alias-label-tertiary,#8a8f98);font-size:11px;line-height:16px}
+.dsh-channels-cfg__reasonBad{color:var(--dsw-alias-state-danger-primary,#c62828)}
 .dsh-channels-cfg__input{box-sizing:border-box;width:100%;min-height:28px;padding:3px 10px;border:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.12));border-radius:8px;background:var(--dsw-alias-bg-layer-1,transparent);color:inherit;font:inherit;font-size:13px;outline:none}
 .dsh-channels-cfg__input:focus{border-color:var(--dsw-alias-state-business-primary,#0a67d3)}
 .dsh-channels-cfg__input--invalid{border-color:var(--dsw-alias-state-danger-primary,#c62828)}

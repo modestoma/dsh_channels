@@ -236,6 +236,8 @@ export type CordisFiberState = typeof CordisFiberState[keyof typeof CordisFiberS
 
 export interface CordisFiber {
   readonly state: CordisFiberState
+  /** Best-effort plugin display name (`fiber.name`), used only for health diagnostics. */
+  readonly name?: string
 }
 
 export interface CordisPluginRuntime {

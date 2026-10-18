@@ -34,6 +34,18 @@ export interface FiberHealthCounts {
   unloading: number
 }
 
+/** States that make the Fold report something other than healthy. */
+export type FiberIssueState = 'pending' | 'loading' | 'unloading' | 'failed'
+
+/** One non-active fiber with a best-effort plugin name (no errors/stacks). */
+export interface FiberHealthIssue {
+  state: FiberIssueState
+  label: string
+}
+
+/** Upper bound on the diagnostic list; counts still include every fiber. */
+const MAX_INACTIVE_FIBERS = 12
+
 export interface HealthSnapshotInput {
   fibers: Iterable<CordisFiber>
   dependencies: Readonly<Record<HealthDependencyName, boolean>>
@@ -50,19 +62,69 @@ export interface HealthSnapshot extends Omit<HealthSnapshotInput, 'fibers' | 'bo
   fibers: FiberHealthCounts
   /** Masked display only; the complete open_id never crosses this boundary. */
   botOpenIdTail?: string
+  /** Non-active plugin fibers (capped at MAX_INACTIVE_FIBERS), diagnostics only. */
+  inactiveFibers: FiberHealthIssue[]
+  /** Total non-active fibers, including those beyond the capped list. */
+  inactiveTotal: number
+  /** Human-readable explanation of `level`; empty when healthy. */
+  reasons: string[]
+}
+
+/** Best-effort label for a fiber: Cordis exposes the plugin display name on the fiber. */
+function fiberLabel(fiber: CordisFiber): string {
+  const name = fiber.name?.trim()
+  return name !== undefined && name !== '' ? name : '(未命名插件)'
+}
+
+/** One pass over the fiber table: state counts plus the non-active diagnostics. */
+function foldFiberStates(fibers: Iterable<CordisFiber>): {
+  counts: FiberHealthCounts
+  inactive: FiberHealthIssue[]
+  inactiveTotal: number
+} {
+  const counts: FiberHealthCounts = { active: 0, pending: 0, loading: 0, failed: 0, unloading: 0 }
+  const inactive: FiberHealthIssue[] = []
+  let inactiveTotal = 0
+  for (const fiber of fibers) {
+    const issueState: FiberIssueState | undefined =
+      fiber.state === CordisFiberState.PENDING ? 'pending'
+        : fiber.state === CordisFiberState.LOADING ? 'loading'
+          : fiber.state === CordisFiberState.UNLOADING ? 'unloading'
+            : fiber.state === CordisFiberState.FAILED ? 'failed'
+              : undefined
+    if (fiber.state === CordisFiberState.ACTIVE) {
+      counts.active++
+      continue
+    }
+    if (issueState === undefined) continue // disposed fibers are not health signals
+    counts[issueState === 'pending' ? 'pending' : issueState === 'loading' ? 'loading' : issueState === 'unloading' ? 'unloading' : 'failed']++
+    inactiveTotal++
+    if (inactive.length < MAX_INACTIVE_FIBERS) inactive.push({ state: issueState, label: fiberLabel(fiber) })
+  }
+  return { counts, inactive, inactiveTotal }
 }
 
 /** Fold every non-disposed Cordis fiber into the five product-facing states. */
 export function countFiberStates(fibers: Iterable<CordisFiber>): FiberHealthCounts {
-  const counts: FiberHealthCounts = { active: 0, pending: 0, loading: 0, failed: 0, unloading: 0 }
-  for (const fiber of fibers) {
-    if (fiber.state === CordisFiberState.ACTIVE) counts.active++
-    else if (fiber.state === CordisFiberState.PENDING) counts.pending++
-    else if (fiber.state === CordisFiberState.LOADING) counts.loading++
-    else if (fiber.state === CordisFiberState.FAILED) counts.failed++
-    else if (fiber.state === CordisFiberState.UNLOADING) counts.unloading++
+  return foldFiberStates(fibers).counts
+}
+
+/** Human-readable connection state for diagnostics (keeps raw states visible). */
+function connectionReason(state: string | undefined): string {
+  switch (state) {
+    case 'connected': return '已连接'
+    case 'connecting': return '连接中'
+    case 'reconnecting': return '重连中'
+    case 'failed': return '连接失败'
+    case 'idle': return '空闲（未连接）'
+    default: return state ?? '未知'
   }
-  return counts
+}
+
+function labelList(labels: readonly string[], total: number, max = 6): string {
+  if (labels.length === 0) return ''
+  const shown = labels.slice(0, max).join('、')
+  return total > Math.min(labels.length, max) ? `${shown} 等 ${total} 个` : shown
 }
 
 /** Reveal only the final four characters, and nothing for unusually short ids. */
@@ -73,8 +135,9 @@ export function maskOpenIdTail(openId?: string): string | undefined {
 
 /** One deterministic fold owns both the snapshot and its overall conclusion. */
 export function foldHealthSnapshot(input: HealthSnapshotInput): HealthSnapshot {
-  const fibers = countFiberStates(input.fibers)
-  const dependencyMissing = HEALTH_DEPENDENCY_NAMES.some(name => !input.dependencies[name])
+  const { counts: fibers, inactive, inactiveTotal } = foldFiberStates(input.fibers)
+  const missingDependencies = HEALTH_DEPENDENCY_NAMES.filter(name => !input.dependencies[name])
+  const dependencyMissing = missingDependencies.length > 0
   const connectionState = input.connection?.state
 
   let level: HealthLevel
@@ -91,6 +154,28 @@ export function foldHealthSnapshot(input: HealthSnapshotInput): HealthSnapshot {
     level = 'healthy'
   }
 
+  const reasons: string[] = []
+  if (!input.started) reasons.push('飞书通道尚未启动')
+  if (dependencyMissing) reasons.push(`主机服务未就绪：${missingDependencies.join('、')}`)
+  if (input.connection === undefined) reasons.push('飞书长连接尚未建立')
+  else if (connectionState === 'failed') reasons.push('飞书长连接失败')
+  else if (connectionState !== 'connected') reasons.push(`飞书长连接状态：${connectionReason(connectionState)}`)
+
+  const failedLabels = inactive.filter(issue => issue.state === 'failed').map(issue => issue.label)
+  if (fibers.failed > 0) {
+    reasons.push(`插件加载失败 ${fibers.failed} 个${failedLabels.length === 0 ? '' : `：${labelList(failedLabels, fibers.failed)}`}`)
+  }
+  const stalled = fibers.pending + fibers.loading + fibers.unloading
+  if (stalled > 0) {
+    const stalledLabels = inactive
+      .filter(issue => issue.state === 'pending' || issue.state === 'loading' || issue.state === 'unloading')
+      .map(issue => issue.label)
+    reasons.push(
+      `宿主其它插件仍有 ${stalled} 个入口在等待依赖或加载/卸载（与飞书通道无关）`
+      + (stalledLabels.length === 0 ? '' : `：${labelList(stalledLabels, stalled)}`),
+    )
+  }
+
   return {
     level,
     fibers,
@@ -101,6 +186,9 @@ export function foldHealthSnapshot(input: HealthSnapshotInput): HealthSnapshot {
     routeCount: input.routeCount,
     liveAgentCount: input.liveAgentCount,
     inflightTurnCount: input.inflightTurnCount,
+    inactiveFibers: inactive,
+    inactiveTotal,
+    reasons,
   }
 }
 
