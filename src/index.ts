@@ -15,7 +15,7 @@
 
 import type { HostContext } from './dsh-types.ts'
 import { FeishuService } from './service.ts'
-import { resolveConfig } from './config.ts'
+import { configSchema, resolveConfig } from './config.ts'
 import type { FeishuConfig } from './config.ts'
 import { defaultChannelFactory } from './feishu-channel.ts'
 import type { ChannelFactory } from './feishu-channel.ts'
@@ -57,6 +57,18 @@ export const name = 'channels'
  * every dsh-base profile.
  */
 export const inject = ['agents', 'commands', 'workspaceRegistry', 'storageDomain', 'credentials', 'llm', 'tokenMeter'] as const
+
+/**
+ * Cordis Standard Schema declaration for the plugin config.
+ *
+ * The loader validates (and default-fills) the raw composition config through
+ * `Config['~standard'].validate()` *before* `apply()` runs, so a malformed
+ * `cordis.patch.yml` entry fails at load time with a cordis `ValidationError`
+ * instead of surfacing from inside the async service start. `apply()` keeps
+ * its `resolveConfig()` fallback for direct invocation (unit tests, embedded
+ * hosts) where config has not been pre-validated.
+ */
+export const Config = configSchema
 
 export interface FeishuPluginOptions extends FeishuConfig {
   /** Test seam: substitute a channel implementation. */
