@@ -17,7 +17,11 @@ import { RouteOperationQueue } from '../commands.ts'
 import { chatRouteKey } from '../domain.ts'
 import type { FeishuDomainHandle, RouteRecord } from '../domain.ts'
 import type { CardDelivery } from '../feishu/delivery.ts'
-import { AttachmentIntake, hasAttachmentPayload } from '../feishu/inbound-attachments.ts'
+import {
+  adoptPendingAttachments, hasAttachmentPayload, pendingAttachmentsDir, prepareAttachmentsRoot,
+  sessionAttachmentsDir,
+} from '../feishu/inbound-attachments.ts'
+import { AttachmentIntake } from '../feishu/inbound-attachments.ts'
 import type { AttachmentArchiveResult, AttachmentFailure } from '../feishu/inbound-attachments.ts'
 import type { NormalizedMessage } from '../feishu-channel.ts'
 import type { QuestionAnswerer } from '../interactions/questions.ts'
@@ -314,7 +318,14 @@ export class InboundRouter {
         ?? (await ensureWorkspace(
           this.ctx, this.config.baseDir, msg.chatType, msg.chatId, msg.senderId,
         )).path
-      return await this.attachments.archive(msg, workspacePath)
+      await prepareAttachmentsRoot(workspacePath)
+      // Attachments belong to the conversation that received them: an existing
+      // route has a Session directory, while a not-yet-created Session stages
+      // files in _pending/ until establishment adopts them.
+      const directory = record === undefined
+        ? pendingAttachmentsDir(workspacePath)
+        : sessionAttachmentsDir(workspacePath, record.sessionId)
+      return await this.attachments.archive(msg, directory)
     })
   }
   /**
@@ -392,6 +403,10 @@ export class InboundRouter {
     )
 
     const sessionId = randomUUID() as SessionId
+    // Attachments received before this Session existed belong to it.
+    await adoptPendingAttachments(workspace.path, sessionId).catch((error: unknown) => {
+      this.ctx.logger?.warn?.('dsh-channels: adopting pending attachments failed: %s', String(error))
+    })
     const initialStats = { sessionId, inputTokens: 0, outputTokens: 0 }
 
     // 3. First card frame — also creates the topic (reply_in_thread).

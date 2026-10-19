@@ -3005,7 +3005,7 @@ describe('inbound attachments', () => {
       .map(([, value]) => value)[0]!
     const sections = promptSectionsOf(h.ctxState.agents.created[0]!.setupCtx)
     const guidance = sections.find(section => section.name === FEISHU_ATTACHMENTS_SECTION)
-    expect(guidance?.text).toContain(`${record.workspacePath}/attachments/`)
+    expect(guidance?.text).toContain(`${record.workspacePath}/attachments/${record.sessionId}`)
     await h.service.shutdown()
   })
 
@@ -3019,7 +3019,7 @@ describe('inbound attachments', () => {
       resources: [{ type: 'image', fileKey: 'img_1' }] as never,
     }))
 
-    const dir = path.join(h.config.baseDir, 'groups', 'oc_image', 'ou_owner', 'attachments')
+    const dir = path.join(h.config.baseDir, 'groups', 'oc_image', 'ou_owner', 'attachments', '_pending')
     const finalFiles = () => readdirSync(dir).filter(name => !name.startsWith('.tmp-'))
     await waitUntil(() => expect(finalFiles()).toHaveLength(1))
     const [name] = finalFiles()
@@ -3040,9 +3040,9 @@ describe('inbound attachments', () => {
       content: '<file key="file_1" name="report.pdf"/>',
       resources: [{ type: 'file', fileKey: 'file_1', fileName: 'report.pdf' }] as never,
     }))
-    const dir = path.join(h.config.baseDir, 'groups', chatId, senderId, 'attachments')
-    await waitUntil(() => expect(readdirSync(dir).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1))
-    expect(readdirSync(dir).filter(name => !name.startsWith('.tmp-'))[0]).toMatch(/report\.pdf$/)
+    const pending = path.join(h.config.baseDir, 'groups', chatId, senderId, 'attachments', '_pending')
+    await waitUntil(() => expect(readdirSync(pending).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1))
+    expect(readdirSync(pending).filter(name => !name.startsWith('.tmp-'))[0]).toMatch(/report\.pdf$/)
     expect(h.ctxState.agents.created).toHaveLength(0)
 
     await h.onMessage(makeMessage({
@@ -3050,6 +3050,12 @@ describe('inbound attachments', () => {
       content: '看 report.pdf 的第一页',
     }))
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const record = [...(h.ctxState.domain.raw.table('routes').entries() as Iterable<[string, RouteRecord]>)]
+      .map(([, value]) => value)[0]!
+    const sessionDir = path.join(h.config.baseDir, 'groups', chatId, senderId, 'attachments', record.sessionId)
+    await waitUntil(() => expect(readdirSync(sessionDir).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1))
+    expect(readdirSync(sessionDir).filter(name => !name.startsWith('.tmp-'))[0]).toMatch(/report\.pdf$/)
+    expect(readdirSync(pending)).toEqual([])
     const agent = h.ctxState.agents.created[0]!.handle.agent
     const message = mock(agent.followup).mock.calls[0]![0] as { content: Array<{ type: string; text?: string }> }
     expect(message.content).toEqual([{ type: 'text', text: '看 report.pdf 的第一页' }])
@@ -3063,7 +3069,7 @@ describe('inbound attachments', () => {
       content: '<forwarded_messages>\n[alice] 明天评审\n</forwarded_messages>',
       rawContentType: 'merge_forward',
     }))
-    const dir = path.join(h.config.baseDir, 'groups', 'oc_forward', 'ou_owner', 'attachments')
+    const dir = path.join(h.config.baseDir, 'groups', 'oc_forward', 'ou_owner', 'attachments', '_pending')
     await waitUntil(() => expect(readdirSync(dir)).toHaveLength(1))
     const [name] = readdirSync(dir)
     expect(name).toMatch(/-forwarded-record\.txt$/)
@@ -3090,13 +3096,58 @@ describe('inbound attachments', () => {
       chatType: 'group', chatId: 'oc_post_file', senderId: 'ou_owner', messageId: 'om_post_file',
       rawContentType: 'post', content: '看一下这个文件的内容', raw,
     }))
-    const dir = path.join(h.config.baseDir, 'groups', 'oc_post_file', 'ou_owner', 'attachments')
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const record = [...(h.ctxState.domain.raw.table('routes').entries() as Iterable<[string, RouteRecord]>)]
+      .map(([, value]) => value)[0]!
+    const dir = path.join(h.config.baseDir, 'groups', 'oc_post_file', 'ou_owner', 'attachments', record.sessionId)
     await waitUntil(() => expect(readdirSync(dir).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1))
     expect(readdirSync(dir)[0]).toMatch(/-bugreport-2025-11-04-141749\.zip$/)
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
     const agent = h.ctxState.agents.created[0]!.handle.agent
     const message = mock(agent.followup).mock.calls[0]![0] as { content: Array<{ type: string; text?: string }> }
     expect(message.content).toEqual([{ type: 'text', text: '看一下这个文件的内容' }])
+    await h.service.shutdown()
+  })
+
+  it('keeps attachments isolated per Session inside one workspace', async () => {
+    const h = await setup()
+    const chatId = 'oc_iso'
+    const senderId = 'ou_owner'
+    const routes = () => [...(h.ctxState.domain.raw.table('routes').entries() as Iterable<[string, RouteRecord]>)]
+      .map(([, value]) => value)
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId, senderId, messageId: 'om_iso_a', content: '开始 A',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const routeA = routes()[0]!
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId, senderId, threadId: routeA.key, mentionedBot: false,
+      messageId: 'om_iso_a_img', content: '![image](img_a)',
+      resources: [{ type: 'image', fileKey: 'img_a' }] as never,
+    }))
+    const dirA = path.join(h.config.baseDir, 'groups', chatId, senderId, 'attachments', routeA.sessionId)
+    await waitUntil(() => expect(readdirSync(dirA).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1))
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId, senderId, messageId: 'om_iso_b', content: '开始 B',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
+    const routeB = routes().find(route => route.sessionId !== routeA.sessionId)!
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId, senderId, threadId: routeB.key, mentionedBot: false,
+      messageId: 'om_iso_b_img', content: '![image](img_b)',
+      resources: [{ type: 'image', fileKey: 'img_b' }] as never,
+    }))
+    const dirB = path.join(h.config.baseDir, 'groups', chatId, senderId, 'attachments', routeB.sessionId)
+    await waitUntil(() => expect(readdirSync(dirB).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1))
+
+    expect(routeA.sessionId).not.toBe(routeB.sessionId)
+    expect(readdirSync(dirA).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1)
+    expect(readdirSync(dirB).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1)
+    const guidanceB = promptSectionsOf(h.ctxState.agents.created[1]!.setupCtx)
+      .find(section => section.name === FEISHU_ATTACHMENTS_SECTION)?.text ?? ''
+    expect(guidanceB).toContain(dirB)
+    expect(guidanceB).not.toContain(dirA)
     await h.service.shutdown()
   })
 
@@ -3140,7 +3191,9 @@ describe('inbound attachments', () => {
     const agent = h.ctxState.agents.created[0]!.handle.agent
     const message = mock(agent.followup).mock.calls[0]![0] as { content: Array<{ type: string; text?: string }> }
     expect(message.content).toEqual([{ type: 'text', text: '看这张图 里有什么' }])
-    const dir = path.join(h.config.baseDir, 'groups', 'oc_caption', 'ou_owner', 'attachments')
+    const record = [...(h.ctxState.domain.raw.table('routes').entries() as Iterable<[string, RouteRecord]>)]
+      .map(([, value]) => value)[0]!
+    const dir = path.join(h.config.baseDir, 'groups', 'oc_caption', 'ou_owner', 'attachments', record.sessionId)
     await waitUntil(() => expect(readdirSync(dir).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1))
     await h.service.shutdown()
   })

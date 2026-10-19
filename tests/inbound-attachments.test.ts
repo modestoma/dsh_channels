@@ -4,13 +4,14 @@
  * per-attachment failure containment.
  */
 
-import { existsSync, mkdtempSync, readdirSync, readFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import {
-  ATTACHMENTS_DIR, AttachmentIntake, attachmentResources, compactTimestamp, describeFailure,
-  hasAttachmentPayload, postAttachedFiles, sanitizeFileName, stripAttachmentPlaceholders,
+  adoptPendingAttachments, ATTACHMENTS_DIR, AttachmentIntake, attachmentResources, attachmentsRoot,
+  compactTimestamp, describeFailure, hasAttachmentPayload, legacyAttachmentsDir, pendingAttachmentsDir,
+  postAttachedFiles, prepareAttachmentsRoot, sanitizeFileName, sessionAttachmentsDir, stripAttachmentPlaceholders,
 } from '../src/feishu/inbound-attachments.ts'
 import { FEISHU_ATTACHMENTS_SECTION, attachmentsGuidance } from '../src/feishu/agent-context.ts'
 import type { FeishuChannel } from '../src/feishu-channel.ts'
@@ -50,7 +51,7 @@ describe('attachment intake', () => {
     }), workspace)
 
     expect(result).toEqual({ saved: 1, failed: 0, failures: [], attachmentOnly: true, text: '' })
-    const dir = path.join(workspace, ATTACHMENTS_DIR)
+    const dir = workspace
     const files = readdirSync(dir)
     expect(files).toHaveLength(1)
     expect(files[0]).toMatch(/^20261018-120000-image\.png$/)
@@ -73,9 +74,9 @@ describe('attachment intake', () => {
     }), workspace)
 
     expect(result.saved).toBe(1)
-    const [name] = readdirSync(path.join(workspace, ATTACHMENTS_DIR))
+    const [name] = readdirSync(workspace)
     expect(name).toBe('20261018-120000-report_.pdf')
-    expect(readFileSync(path.join(workspace, ATTACHMENTS_DIR, name!))).toEqual(Buffer.from(payload))
+    expect(readFileSync(path.join(workspace, name!))).toEqual(Buffer.from(payload))
   })
 
   it('archives an expanded merged-forward record as text and strips its placeholder', async () => {
@@ -88,7 +89,7 @@ describe('attachment intake', () => {
     }), workspace)
 
     expect(result).toEqual({ saved: 1, failed: 0, failures: [], attachmentOnly: true, text: '' })
-    const dir = path.join(workspace, ATTACHMENTS_DIR)
+    const dir = workspace
     const [name] = readdirSync(dir)
     expect(name).toBe('20261018-120000-forwarded-record.txt')
     expect(readFileSync(path.join(dir, name!), 'utf8')).toContain('明天评审')
@@ -120,8 +121,8 @@ describe('attachment intake', () => {
     expect(result.attachmentOnly).toBe(true)
     expect(result.text).toBe('')
     expect(result.failures).toEqual([{ name: '会话记录', reason: '会话记录为空（机器人可能缺少源消息的读取权限）' }])
-    expect(existsSync(path.join(workspace, ATTACHMENTS_DIR))).toBe(true)
-    expect(readdirSync(path.join(workspace, ATTACHMENTS_DIR))).toEqual([])
+    expect(existsSync(workspace)).toBe(true)
+    expect(readdirSync(workspace)).toEqual([])
     expect((channel as unknown as { reactions: unknown[] }).reactions).toEqual([
       { messageId: 'om_forward_empty', emojiType: 'No' },
     ])
@@ -130,14 +131,15 @@ describe('attachment intake', () => {
   it('does nothing when archiving is disabled, keeping mixed text', async () => {
     const workspace = makeWorkspace()
     const { intake, channel } = makeIntake({ enabled: false })
+    const target = path.join(workspace, 'disabled-target')
     const result = await intake.archive(makeMessage({
       messageId: 'om_disabled',
       content: '说明 ![image](img_1)',
       resources: [{ type: 'image', fileKey: 'img_1' }] as never,
-    }), workspace)
+    }), target)
 
     expect(result).toEqual({ saved: 0, failed: 0, failures: [], attachmentOnly: false, text: '说明' })
-    expect(existsSync(path.join(workspace, ATTACHMENTS_DIR))).toBe(false)
+    expect(existsSync(target)).toBe(false)
     expect((channel as unknown as { reactions: unknown[] }).reactions).toEqual([])
   })
 
@@ -159,7 +161,7 @@ describe('attachment intake', () => {
     expect(result.attachmentOnly).toBe(true)
     expect(result.text).toBe('')
     expect(result.failures).toEqual([{ name: '图片', reason: 'download failed' }])
-    const dir = path.join(workspace, ATTACHMENTS_DIR)
+    const dir = workspace
     expect(readdirSync(dir)).toEqual([])
     expect(warn).toHaveBeenCalled()
     expect((channel as unknown as { reactions: unknown[] }).reactions).toEqual([
@@ -180,7 +182,7 @@ describe('attachment intake', () => {
     }), workspace)
 
     expect(result.saved).toBe(2)
-    expect(readdirSync(path.join(workspace, ATTACHMENTS_DIR)).sort()).toEqual([
+    expect(readdirSync(workspace).sort()).toEqual([
       '20261018-120000-same-2.txt',
       '20261018-120000-same.txt',
     ])
@@ -198,15 +200,16 @@ describe('attachment intake', () => {
 })
 
 describe('agent guidance', () => {
-  it('names the attachments directory and appends the absolute archive path', () => {
-    expect(attachmentsGuidance()).toContain('`attachments/`')
-    const withPath = attachmentsGuidance('/tmp/feishu-ws')
-    expect(withPath).toContain('/tmp/feishu-ws/attachments/')
+  it('points the Agent at its per-session attachment directory', () => {
+    expect(attachmentsGuidance()).toContain('private attachment directory')
+    const withPath = attachmentsGuidance('/tmp/feishu-ws/attachments/session-1')
+    expect(withPath).toContain('/tmp/feishu-ws/attachments/session-1')
+    expect(withPath).toContain('Sibling directories')
     expect(FEISHU_ATTACHMENTS_SECTION).toBe('dsh-channels:feishu-attachments')
   })
 
-  it('escapes backticks in a hostile workspace path', () => {
-    expect(attachmentsGuidance('/tmp/a`b')).toContain("/tmp/a'b/attachments/")
+  it('escapes backticks in a hostile directory path', () => {
+    expect(attachmentsGuidance('/tmp/a`b/attachments/session-1')).toContain("/tmp/a'b/attachments/session-1")
   })
 })
 
@@ -240,7 +243,7 @@ describe('rich-text post attachments', () => {
     expect(result.failures).toEqual([])
     expect(result.attachmentOnly).toBe(false)
     expect(result.text).toBe('看一下这个文件的内容')
-    const [name] = readdirSync(path.join(workspace, ATTACHMENTS_DIR))
+    const [name] = readdirSync(workspace)
     expect(name).toMatch(/-bugreport-2025-11-04-141749\.zip$/)
   })
 
@@ -276,7 +279,7 @@ describe('rich-text post attachments', () => {
     }), workspace)
     expect(result.failed).toBe(1)
     expect(result.failures).toEqual([{ name: 'logs', reason: '飞书文件夹消息暂不支持下载' }])
-    expect(readdirSync(path.join(workspace, ATTACHMENTS_DIR))).toEqual([])
+    expect(readdirSync(workspace)).toEqual([])
   })
 
   it('parses only post payloads that actually carry files', () => {
@@ -312,6 +315,44 @@ describe('rich-text post attachments', () => {
     expect(describeFailure(new Error('Request failed with status code 403')))
       .toContain('无权限')
     expect(describeFailure(new Error('boom'))).toBe('boom')
+  })
+})
+
+describe('per-session attachment isolation', () => {
+  it('derives session and pending directories from one workspace root', () => {
+    const workspace = makeWorkspace()
+    const root = attachmentsRoot(workspace)
+    expect(root).toBe(path.join(workspace, ATTACHMENTS_DIR))
+    expect(sessionAttachmentsDir(workspace, 'session-abc')).toBe(path.join(root, 'session-abc'))
+    expect(pendingAttachmentsDir(workspace)).toBe(path.join(root, '_pending'))
+    expect(sessionAttachmentsDir(workspace, '../../evil id')).toBe(path.join(root, '_.._evil_id'))
+  })
+
+  it('moves legacy flat files into _legacy exactly once', async () => {
+    const workspace = makeWorkspace()
+    mkdirSync(path.join(workspace, ATTACHMENTS_DIR), { recursive: true })
+    writeFileSync(path.join(workspace, ATTACHMENTS_DIR, 'old.bin'), 'legacy')
+    await prepareAttachmentsRoot(workspace)
+    await prepareAttachmentsRoot(workspace)
+
+    expect(readdirSync(path.join(workspace, ATTACHMENTS_DIR))).not.toContain('old.bin')
+    expect(readdirSync(legacyAttachmentsDir(workspace))).toEqual(['old.bin'])
+  })
+
+  it('adopts staged pending files into one session directory', async () => {
+    const workspace = makeWorkspace()
+    const pending = pendingAttachmentsDir(workspace)
+    mkdirSync(pending, { recursive: true })
+    writeFileSync(path.join(pending, 'a.zip'), 'a')
+    writeFileSync(path.join(pending, 'b.zip'), 'b')
+
+    expect(await adoptPendingAttachments(workspace, 'session-one')).toBe(2)
+    expect(readdirSync(sessionAttachmentsDir(workspace, 'session-one')).sort()).toEqual(['a.zip', 'b.zip'])
+    expect(readdirSync(pending)).toEqual([])
+
+    // A second session adopts nothing; the first keeps its own files.
+    expect(await adoptPendingAttachments(workspace, 'session-two')).toBe(0)
+    expect(existsSync(sessionAttachmentsDir(workspace, 'session-two'))).toBe(false)
   })
 })
 
