@@ -15,6 +15,8 @@ export const CREDENTIALS_ROUTE = '/dsh-channels/credentials'
 export const RECONNECT_ROUTE = '/dsh-channels/reconnect'
 /** 模型/推理档位/预设选择器的宿主目录（provider → model → effort 级联刷新）。 */
 export const CATALOG_ROUTE = '/dsh-channels/catalog'
+/** 手动执行一次过期工作区清理（POST，无请求体）。 */
+export const CLEANUP_ROUTE = '/dsh-channels/cleanup'
 
 /**
  * 可由 Web 面板覆盖的配置项。全部是 `src/config.ts` 里已存在的字段；
@@ -32,6 +34,8 @@ export const CATALOG_ROUTE = '/dsh-channels/catalog'
 export const EDITABLE_KEYS = [
   // 工作区
   'baseDir',
+  'workspaceRetention',
+  'workspaceRetentionAuto',
   // 行为
   'dmMode',
   'requireMention',
@@ -39,8 +43,7 @@ export const EDITABLE_KEYS = [
   'welcomeOnboarding',
   'allowPermissionSwitch',
   // 内容
-  'acceptImages',
-  'maxImagesPerMessage',
+  'acceptAttachments',
   // 模型
   'provider',
   'model',
@@ -209,7 +212,46 @@ export interface PanelConfigWire {
 export interface PanelWire {
   status: ChannelStatusWire
   config: PanelConfigWire
+  cleanup: CleanupPreviewWire
 }
+
+/**
+ * What the workspace-retention cleanup would delete right now. Counts are
+ * zero and `error` is set when the Host cannot compute the preview (for
+ * example the cleanup seam is unavailable); the panel stays usable.
+ */
+export interface CleanupPreviewWire {
+  /** Effective `workspaceRetention` value (`off` / `7d` / `30d` / `90d` / `180d`). */
+  retention: string
+  /** Retention threshold in milliseconds; absent when `retention` is `off`. */
+  thresholdMs?: number
+  /** Periodic cleanup runs at startup and once per day. */
+  auto: boolean
+  /** Plugin-created workspaces under the current baseDir. */
+  workspaces: number
+  /** Workspaces older than the threshold (the deletable set). */
+  candidates: number
+  /** Total bytes currently occupied by the candidates. */
+  candidateBytes: number
+  /** Why the preview could not be computed (counts are zero then). */
+  error?: string
+}
+
+/** Outcome of one manual cleanup run (partial failures do not abort the run). */
+export interface CleanupRunWire {
+  ok: boolean
+  deletedWorkspaces: number
+  retiredRoutes: number
+  freedBytes: number
+  /** One `path: message` line per workspace that could not be deleted. */
+  failures: string[]
+  error?: string
+}
+
+/** `POST /dsh-channels/cleanup` response. */
+export type CleanupResponse =
+  | { ok: true; panel: PanelWire; result: CleanupRunWire }
+  | { ok: false; error: string }
 
 /** `PUT /dsh-channels/config` body. */
 export interface SaveConfigRequest {
@@ -324,4 +366,27 @@ export const PANEL_COPY = {
   notRunning: '未运行',
   version: '插件版本',
   overlayPath: '覆盖文件',
+  cleanupCard: '工作区清理',
+  cleanupCardHelp: '删除超过保留期且不再活跃的飞书工作区目录；只会删除本插件在「工作区根目录」下创建的目录，DSH 会话日志不删除。删除不可恢复：相关旧话题会失效并提示已过期，工作区列表记录同步移除。',
+  cleanupRetention: '保留期',
+  cleanupAutoLabel: '自动清理',
+  cleanupCandidates: '可清理工作区',
+  cleanupCandidateBytes: '预计释放空间',
+  cleanupRetentionOff: '关闭（不删除）',
+  cleanupAutoOn: '已开启（启动时 + 每天一次）',
+  cleanupAutoOff: '已关闭（仅手动执行）',
+  cleanupAutoInactive: '未执行（保留期为关闭）',
+  cleanupNow: '立即清理',
+  cleanupRunning: '清理中…',
+  cleanupConfirm: '确定清理过期工作区吗？该操作不可恢复，会删除这些工作区内的全部文件（包括 attachments/ 附件）。',
+  cleanupConfirmHint: '删除前会再次确认；保留期为「关闭」或没有过期工作区时按钮不可用。',
+  cleanupDisabledOff: '保留策略为「关闭」：请先在「常用配置 → 工作区与文件」中选择保留天数。',
+  cleanupDisabledEmpty: '没有超过保留期的过期工作区。',
+  cleanupPreviewFailed: '无法读取清理预览',
+  cleanupDone: '清理完成',
+  cleanupFailed: '清理失败',
+  cleanupDeleted: '已删除工作区',
+  cleanupRetired: '已清理话题路由',
+  cleanupFreed: '释放空间',
+  cleanupFailures: '以下工作区未能删除：',
 } as const

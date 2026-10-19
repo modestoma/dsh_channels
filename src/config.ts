@@ -13,6 +13,7 @@
  */
 
 import { z } from 'zod'
+import { WORKSPACE_RETENTION_VALUES } from './cleanup.ts'
 
 export const FEISHU_LOGGER_LEVELS = ['debug', 'info', 'warn', 'error'] as const
 export type FeishuLoggerLevel = (typeof FEISHU_LOGGER_LEVELS)[number]
@@ -116,13 +117,27 @@ export const configSchema = z.object({
    */
   approvalTimeoutMs: z.number().int().min(10_000).max(3_600_000).default(DEFAULT_APPROVAL_TIMEOUT_MS),
   /**
-   * Accept inbound Feishu images and forward them to the model as durable
-   * `ImageBlock`s. Requires the host attachment service; without it (or when
-   * disabled) image messages degrade to their text caption only.
+   * Accept inbound Feishu images, files, and merged-forward chat records and
+   * save them below `<workspace>/attachments/`. Nothing is forwarded to the
+   * model automatically: the Agent reads whichever attachment the
+   * conversation needs with its ordinary filesystem tools. Disabled keeps
+   * attachment messages inert (no save, no turn).
    */
-  acceptImages: z.boolean().default(true),
-  /** Maximum images forwarded from one message (excess is ignored). */
-  maxImagesPerMessage: z.number().int().min(0).max(8).default(4),
+  acceptAttachments: z.boolean().default(true),
+  /**
+   * Delete the workspace directories of stale conversations. `off` (default)
+   * never deletes; `7d`/`30d`/`90d`/`180d` remove plugin-created workspaces
+   * whose last activity is older than the threshold. The managed Web panel
+   * exposes this as a select, previews the candidates, and can run one
+   * cleanup manually. DSH Session logs are never deleted.
+   */
+  workspaceRetention: z.enum(WORKSPACE_RETENTION_VALUES).default('off'),
+  /**
+   * Run the workspace-retention cleanup at startup and once per day. Off by
+   * default: deletion is irreversible, so it stays an explicit opt-in even
+   * when a retention threshold is configured.
+   */
+  workspaceRetentionAuto: z.boolean().default(false),
   /**
    * Send a one-time onboarding card on the first private message of a chat
    * (facts + command cheat sheet). Persisted per chat; never repeats.

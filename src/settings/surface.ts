@@ -1,6 +1,6 @@
 /**
  * Web 设置面板的 Host 视图模型：把 `FeishuService` 的运行时事实、覆盖层与
- * 字段描述组装成 wire 数据，并处理保存/清除/重连三个动作。
+ * 字段描述组装成 wire 数据，并处理保存/清除/重连/清理四个动作。
  *
  * 这一层不碰 HTTP（见 `routes.ts`），也不碰 fs 细节（见 `overlay.ts`）；
  * 唯一的文件系统动作是保存 `baseDir` 时通过 `workspaces.ts` 创建并检查
@@ -22,6 +22,9 @@ import {
 import type {
   CatalogWire,
   ChannelStatusWire,
+  CleanupPreviewWire,
+  CleanupResponse,
+  CleanupRunWire,
   ClearConfigResponse,
   ClearCredentialResponse,
   ConfigValue,
@@ -63,6 +66,10 @@ export interface SettingsTarget {
   credentialStates(): Promise<{ appId: CredentialInfo; appSecret: CredentialInfo }>
   setCredential(field: CredentialField, value: string): Promise<void>
   clearCredential(field: CredentialField): Promise<void>
+  /** What the workspace-retention cleanup would delete right now (read-only scan). */
+  cleanupPreview(): Promise<CleanupPreviewWire>
+  /** Run the workspace cleanup once; partial failures are reported per workspace. */
+  runWorkspaceCleanup(): Promise<CleanupRunWire>
 }
 
 /** Presence/source/writability facts returned by the credentials seam. */
@@ -81,7 +88,8 @@ const BOOLEAN_KEYS = new Set<EditableKey>([
   'requireMention',
   'welcomeOnboarding',
   'allowPermissionSwitch',
-  'acceptImages',
+  'acceptAttachments',
+  'workspaceRetentionAuto',
 ])
 
 const SELECT_OPTIONS: Partial<Record<EditableKey, ReadonlyArray<{ value: string; label: string }>>> = {
@@ -92,6 +100,13 @@ const SELECT_OPTIONS: Partial<Record<EditableKey, ReadonlyArray<{ value: string;
   threadFallback: [
     { value: 'degrade', label: '话题被拒时降级为会话级' },
     { value: 'strict', label: '话题被拒时直接失败' },
+  ],
+  workspaceRetention: [
+    { value: 'off', label: '关闭（不删除）' },
+    { value: '7d', label: '7 天' },
+    { value: '30d', label: '30 天' },
+    { value: '90d', label: '90 天' },
+    { value: '180d', label: '180 天' },
   ],
   loggerLevel: [
     { value: 'debug', label: 'debug' },
@@ -114,8 +129,9 @@ const FIELD_META: Record<EditableKey, { label: string; help: string; min?: numbe
   threadFallback: { label: '话题被拒时的兜底', help: 'degrade 降级为会话级路由；strict 直接让回复失败。' },
   welcomeOnboarding: { label: '首次私聊引导卡', help: '每个私聊会话第一次触达时发送一张命令与用法引导卡，只发一次。' },
   allowPermissionSwitch: { label: '允许飞书侧切换权限预设', help: '安全敏感：开启后话题所有者可用 /permissions 切换沙箱与审批预设。' },
-  acceptImages: { label: '接收并转发图片', help: '把飞书图片作为 ImageBlock 转发给模型；需要主机 attachments 服务。' },
-  maxImagesPerMessage: { label: '单条消息图片上限', help: '多出的图片忽略；0 表示不转发任何图片。', min: 0, max: 8, step: 1 },
+  acceptAttachments: { label: '接收并保存附件', help: '接收飞书图片、文件与合并转发记录，保存到工作区的 attachments/ 目录；模型不会自动读取，需要时用文件工具自行查看。关闭后附件消息不保存、不触发回复。' },
+  workspaceRetention: { label: '过期工作区保留期', help: '超过所选天数没有活动的飞书工作区会进入下方「工作区清理」列表；「关闭」表示永不删除。DSH 会话日志不受影响。' },
+  workspaceRetentionAuto: { label: '自动执行工作区清理', help: '开启后插件在启动时及每天执行一次过期工作区清理；关闭时只能在下方卡片手动清理。开启前请确认保留期已设置。' },
   provider: { label: '模型服务商', help: '留空 = 使用部署默认；例如 deepseek-official。', placeholder: '留空 = 部署默认' },
   model: { label: '模型 id', help: '留空 = 使用部署默认；例如 deepseek-v4-flash。', placeholder: '留空 = 部署默认' },
   reasoningEffort: { label: '推理档位', help: '模型声明的精确档位 id（如 high / max）；留空 = 适配器默认。', placeholder: '留空 = 适配器默认' },
@@ -127,13 +143,14 @@ const FIELD_META: Record<EditableKey, { label: string; help: string; min?: numbe
 
 const GROUP_OF: Record<EditableKey, EditableFieldWire['group']> = {
   baseDir: 'workspace',
+  workspaceRetention: 'workspace',
+  workspaceRetentionAuto: 'workspace',
   dmMode: 'behavior',
   requireMention: 'behavior',
   threadFallback: 'behavior',
   welcomeOnboarding: 'behavior',
   allowPermissionSwitch: 'behavior',
-  acceptImages: 'content',
-  maxImagesPerMessage: 'content',
+  acceptAttachments: 'content',
   provider: 'model',
   model: 'model',
   reasoningEffort: 'model',
@@ -377,6 +394,23 @@ export class SettingsSurface {
       appSecret: toWire(effective.appSecret, credentialStates.appSecret),
     }
 
+    // The cleanup preview is derived from live workspace/route state; a broken
+    // seam must not break the whole panel, so it degrades to zero counts + error.
+    let cleanup: CleanupPreviewWire
+    try {
+      cleanup = await this.target.cleanupPreview()
+    } catch (error) {
+      this.logger?.warn?.('dsh-channels: 工作区清理预览失败：%s', messageOf(error))
+      cleanup = {
+        retention: effective.workspaceRetention,
+        auto: effective.workspaceRetentionAuto,
+        workspaces: 0,
+        candidates: 0,
+        candidateBytes: 0,
+        error: messageOf(error),
+      }
+    }
+
     return {
       status: buildStatus(this.target, this.store.file),
       config: {
@@ -389,6 +423,7 @@ export class SettingsSurface {
         readOnly: readOnlyFields(effective),
         credentials,
       },
+      cleanup,
     }
   }
 
@@ -553,6 +588,21 @@ export class SettingsSurface {
       return { ok: false, error: `重连失败：${messageOf(error)}` }
     }
     return { ok: true, panel: await this.panel() }
+  }
+
+  /**
+   * Run the workspace-retention cleanup once. Irreversible deletions are the
+   * target's responsibility; the surface only reports the outcome and returns
+   * a refreshed panel (its cleanup preview then reflects the remaining workspaces).
+   */
+  async runCleanup(): Promise<CleanupResponse> {
+    let result: CleanupRunWire
+    try {
+      result = await this.target.runWorkspaceCleanup()
+    } catch (error) {
+      return { ok: false, error: `清理失败：${messageOf(error)}` }
+    }
+    return { ok: true, result, panel: await this.panel() }
   }
 }
 

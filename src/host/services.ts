@@ -23,6 +23,10 @@ export interface Workspace {
 
 export interface WorkspaceRegistry {
   create(path: string, title?: string): Promise<Workspace>
+  /** Every workspace currently registered with the host. */
+  list(): Workspace[]
+  /** Unregister one workspace record (the directory itself is the caller's concern). */
+  delete(id: string): Promise<boolean>
 }
 
 // ---- Storage / token-meter / llm / credentials surface ------------------
@@ -196,29 +200,6 @@ export type SessionTitleObservationResult =
  */
 export interface SessionQuery {
   readTitleSnapshots(sessionIds: readonly SessionId[]): Promise<readonly SessionTitleObservationResult[]>
-}
-
-// ---- Attachments ---------------------------------------------------------
-
-/** Raster media types accepted by the attachment service. */
-export type ImageMediaType = 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif'
-
-/** One encoded image handed to the attachment service. */
-export interface SaveImageAttachment {
-  data: Uint8Array
-  mediaType: ImageMediaType
-  name?: string
-}
-
-/** Opaque durable image reference (owned by the attachment service). */
-export type ImageAttachmentRef = { readonly [key: string]: unknown }
-
-/**
- * The host attachment service (`ctx.attachments`): durably commits image
- * bytes and returns the reference a model-visible `ImageBlock` carries.
- */
-export interface AttachmentService {
-  saveImages(inputs: readonly SaveImageAttachment[]): Promise<readonly ImageAttachmentRef[]>
 }
 
 // ---- Permission presets --------------------------------------------------

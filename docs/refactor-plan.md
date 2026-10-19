@@ -44,7 +44,8 @@ src/
 | 首触引导卡 | ✅ | 私聊首次触达一张，`welcomedChats` 持久化去重，`welcomeOnboarding` 可关 |
 | 问答卡自由文本回答 | ✅ | 无选项问题直接开放答题；阻塞期间普通文本回复即答案（`custom`） |
 | `/model` 查看与切换 | ✅ | `session/request-policy.ts` 统一 provider/model/effort；`ctx.llm.listModels` 校验；经 `command/run` 持久化 |
-| 图片输入 | ✅ | `feishu/inbound-image.ts`：资源下载 → `ctx.attachments.saveImages` → `ImageBlock`；逐图失败降级；`acceptImages`/`maxImagesPerMessage` 可配 |
+| 附件输入 | ✅ | `feishu/inbound-attachments.ts`：图片/文件流式落盘到工作区 `attachments/`、合并转发记录转存 `.txt`；不触发模型，Agent 用工具按需读取；`acceptAttachments` 可配 |
+| 工作区清理 | ✅ | `cleanup.ts` 纯策略 + 设置面板卡片：`workspaceRetention`（off/7/30/90/180 天）+ 手动/每日清理，删除插件工作区并把路由退休为墓碑，Session 日志保留 |
 
 ## 验证基线
 

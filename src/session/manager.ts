@@ -27,6 +27,7 @@ import type { FeishuConfig } from '../config.ts'
 import { mountChannelCommands } from '../commands.ts'
 import { appendSessionHistory } from '../domain.ts'
 import type { RouteRecord } from '../domain.ts'
+import { mountChannelGuidance } from '../feishu/agent-context.ts'
 import { installRequestPolicy } from './request-policy.ts'
 import type { RequestPolicyController } from './request-policy.ts'
 import { workspaceTitleFor } from '../workspaces.ts'
@@ -110,7 +111,7 @@ export class SessionManager {
     cwd: string,
     agentOptions: Record<string, unknown> = this.agentOptions(),
   ): Promise<AgentHandle> {
-    const composition = await this.presetComposition()
+    const composition = await this.presetComposition(undefined, true, cwd)
     const handle = await this.deps.ctx.agents.create({
       sessionId,
       meta: {
@@ -169,7 +170,7 @@ export class SessionManager {
       // (config override or roster default). A session persisted before the
       // preset fix has no preset recorded on its header; re-resolving here is
       // what repairs it on the first resume after a restart.
-      const composition = await this.presetComposition()
+      const composition = await this.presetComposition(undefined, true, record.workspacePath)
       const handle = await this.deps.ctx.agents.resume({
         resumeSessionId: sessionId,
         agentOptions: this.agentOptions(),
@@ -224,7 +225,7 @@ export class SessionManager {
   async renew(record: RouteRecord, oldLive: LiveAgent): Promise<RenewCommit> {
     const sessionId = randomUUID() as SessionId
     const preset = this.effectivePreset(oldLive.agent.session)
-    const composition = await this.presetComposition(preset, false)
+    const composition = await this.presetComposition(preset, false, record.workspacePath)
     const workspace = await this.deps.ctx.workspaceRegistry.create(
       record.workspacePath,
       workspaceTitleFor(record.chatType, record.chatId, record.senderOpenId),
@@ -305,6 +306,7 @@ export class SessionManager {
   private async presetComposition(
     requestedPreset: string | undefined = this.deps.config.agentPreset,
     useRosterDefault = true,
+    workspacePath?: string,
   ): Promise<PresetComposition> {
     // Read through ctx.get (safe lookup): only the web profile ships a roster,
     // and direct property access on a cordis context throws for services the
@@ -316,6 +318,7 @@ export class SessionManager {
       // cannot guarantee that the explicit channel value wins.
       this.mountRequestPolicy(agentCtx)
       await mountChannelCommands(agentCtx)
+      await mountChannelGuidance(agentCtx, workspacePath)
     }
     if (presets === undefined || (requestedPreset === undefined && !useRosterDefault)) {
       return { setup: channelCommandsOnly }
@@ -327,6 +330,7 @@ export class SessionManager {
         this.mountRequestPolicy(agentCtx)
         await presets.mount(agentCtx, resolved.id)
         await mountChannelCommands(agentCtx)
+        await mountChannelGuidance(agentCtx, workspacePath)
       },
     }
   }

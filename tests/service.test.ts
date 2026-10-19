@@ -3,7 +3,7 @@
  * topic replies, degradation, and lazy resume.
  */
 
-import { mkdtempSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
@@ -15,9 +15,10 @@ import type { CardActionEvent, ChannelFactory, FeishuChannel, NormalizedMessage 
 import { CordisFiberState } from '../src/dsh-types.ts'
 import type { AgentHandle, ApprovalOutcome, CordisPluginRuntime, SessionId, SessionProjections } from '../src/dsh-types.ts'
 import type { RouteRecord } from '../src/domain.ts'
+import { FEISHU_ATTACHMENTS_SECTION } from '../src/feishu/agent-context.ts'
 import type { SessionExportBuilder } from '../src/session-export.ts'
 import {
-  dispatchAgentRequest, makeHostContext, makeChannel, makeMessage, makeAgentPresets, makeSession, makeAgent, sessionEvents,
+  dispatchAgentRequest, makeHostContext, makeChannel, makeMessage, makeAgentPresets, makeSession, makeAgent, promptSectionsOf, sessionEvents,
 } from './helpers.ts'
 import type { FakeAgentPresets, FakeAgentPresetsOptions, FakeAgentsOptions } from './helpers.ts'
 
@@ -44,8 +45,9 @@ function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
     allowPermissionSwitch: false,
     // Onboarding is opt-in per test: it adds a card that would shift send counts.
     welcomeOnboarding: false,
-    acceptImages: true,
-    maxImagesPerMessage: 4,
+    acceptAttachments: true,
+    workspaceRetention: 'off',
+    workspaceRetentionAuto: false,
     ...partial,
   }
 }
@@ -2988,25 +2990,176 @@ describe('/model', () => {
   })
 })
 
-describe('inbound images', () => {
-  it('forwards an inbound image into the model message', async () => {
+describe('inbound attachments', () => {
+  it('registers the attachment guidance with the session workspace path', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_guide', senderId: 'ou_owner',
+      messageId: 'om_guide', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const record = [...(h.ctxState.domain.raw.table('routes').entries() as Iterable<[string, RouteRecord]>)]
+      .map(([, value]) => value)[0]!
+    const sections = promptSectionsOf(h.ctxState.agents.created[0]!.setupCtx)
+    const guidance = sections.find(section => section.name === FEISHU_ATTACHMENTS_SECTION)
+    expect(guidance?.text).toContain(`${record.workspacePath}/attachments/`)
+    await h.service.shutdown()
+  })
+
+  it('archives an image-only message into the workspace without starting a turn', async () => {
+    const h = await setup({}, {
+      downloadResource: () => [new Uint8Array([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])],
+    })
+    await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_image', senderId: 'ou_owner', messageId: 'om_image',
-      content: '看这张图',
+      content: '![image](img_1)',
+      resources: [{ type: 'image', fileKey: 'img_1' }] as never,
+    }))
+
+    const dir = path.join(h.config.baseDir, 'groups', 'oc_image', 'ou_owner', 'attachments')
+    const finalFiles = () => readdirSync(dir).filter(name => !name.startsWith('.tmp-'))
+    await waitUntil(() => expect(finalFiles()).toHaveLength(1))
+    const [name] = finalFiles()
+    expect(name).toMatch(/\.png$/)
+    expect(h.ctxState.agents.created).toHaveLength(0)
+    expect(h.channel.reactions).toEqual([{ messageId: 'om_image', emojiType: 'DONE' }])
+    await h.service.shutdown()
+  })
+
+  it('archives a file message and keeps a following caption as the only prompt text', async () => {
+    const h = await setup({}, {
+      downloadResource: (_messageId, fileKey) => [new TextEncoder().encode(`bytes:${fileKey}`)],
+    })
+    const chatId = 'oc_file_chat'
+    const senderId = 'ou_owner'
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId, senderId, messageId: 'om_file',
+      content: '<file key="file_1" name="report.pdf"/>',
+      resources: [{ type: 'file', fileKey: 'file_1', fileName: 'report.pdf' }] as never,
+    }))
+    const dir = path.join(h.config.baseDir, 'groups', chatId, senderId, 'attachments')
+    await waitUntil(() => expect(readdirSync(dir).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1))
+    expect(readdirSync(dir).filter(name => !name.startsWith('.tmp-'))[0]).toMatch(/report\.pdf$/)
+    expect(h.ctxState.agents.created).toHaveLength(0)
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId, senderId, messageId: 'om_prompt',
+      content: '看 report.pdf 的第一页',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    const message = mock(agent.followup).mock.calls[0]![0] as { content: Array<{ type: string; text?: string }> }
+    expect(message.content).toEqual([{ type: 'text', text: '看 report.pdf 的第一页' }])
+    await h.service.shutdown()
+  })
+
+  it('archives an expanded merged-forward record as text', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_forward', senderId: 'ou_owner', messageId: 'om_forward',
+      content: '<forwarded_messages>\n[alice] 明天评审\n</forwarded_messages>',
+      rawContentType: 'merge_forward',
+    }))
+    const dir = path.join(h.config.baseDir, 'groups', 'oc_forward', 'ou_owner', 'attachments')
+    await waitUntil(() => expect(readdirSync(dir)).toHaveLength(1))
+    const [name] = readdirSync(dir)
+    expect(name).toMatch(/-forwarded-record\.txt$/)
+    expect(readFileSync(path.join(dir, name!), 'utf8')).toContain('明天评审')
+    expect(h.ctxState.agents.created).toHaveLength(0)
+    await h.service.shutdown()
+  })
+
+  it('turns an image with a caption into one prompt carrying only the caption', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_caption', senderId: 'ou_owner', messageId: 'om_caption',
+      content: '看这张图 ![image](img_1) 里有什么',
       resources: [{ type: 'image', fileKey: 'img_1' }] as never,
     }))
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
     const agent = h.ctxState.agents.created[0]!.handle.agent
+    const message = mock(agent.followup).mock.calls[0]![0] as { content: Array<{ type: string; text?: string }> }
+    expect(message.content).toEqual([{ type: 'text', text: '看这张图 里有什么' }])
+    const dir = path.join(h.config.baseDir, 'groups', 'oc_caption', 'ou_owner', 'attachments')
+    await waitUntil(() => expect(readdirSync(dir).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1))
+    await h.service.shutdown()
+  })
+})
 
-    expect(h.ctxState.attachments.saveImages).toHaveBeenCalledTimes(1)
-    const message = mock(agent.followup).mock.calls[0]![0] as {
-      content: Array<{ type: string; attachment?: unknown; text?: string }>
+describe('workspace retention cleanup', () => {
+  const STALE = 10 * 24 * 60 * 60 * 1000
+
+  it('previews and deletes a stale workspace while retiring its route', async () => {
+    const h = await setup({ workspaceRetention: '7d' })
+    const dir = path.join(h.config.baseDir, 'groups', 'oc_stale', 'ou_old')
+    mkdirSync(path.join(dir, 'attachments'), { recursive: true })
+    writeFileSync(path.join(dir, 'attachments', 'old.txt'), 'stale bytes')
+    const old = new Date(Date.now() - STALE)
+    utimesSync(dir, old, old)
+    await h.ctxState.workspaces.registry.create(dir, '飞书群聊 · oc_stale · ou_old')
+    const record: RouteRecord = {
+      key: 'omt_stale',
+      kind: 'thread',
+      sessionId: 'session-stale',
+      chatId: 'oc_stale',
+      chatType: 'group',
+      senderOpenId: 'ou_old',
+      workspacePath: dir,
+      cardMessageId: 'om_stale_card',
+      createdAt: old.getTime(),
+      lastActivityAt: old.getTime(),
+      sessionHistory: [{ sessionId: 'session-stale', createdAt: old.getTime() }],
     }
-    expect(message.content).toEqual([
-      { type: 'text', text: '看这张图' },
-      { type: 'image', attachment: { id: 'att_1' } },
-    ])
+    await h.ctxState.domain.raw.table('routes').put('omt_stale', record)
+
+    const preview = await h.service.cleanupPreview()
+    expect(preview.retention).toBe('7d')
+    expect(preview.workspaces).toBe(1)
+    expect(preview.candidates).toBe(1)
+    expect(preview.candidateBytes).toBeGreaterThan(0)
+
+    const result = await h.service.runWorkspaceCleanup()
+    expect(result.ok).toBe(true)
+    expect(result.deletedWorkspaces).toBe(1)
+    expect(result.retiredRoutes).toBe(1)
+    expect(result.freedBytes).toBeGreaterThan(0)
+    expect(existsSync(dir)).toBe(false)
+    expect(h.ctxState.workspaces.workspaces.size).toBe(0)
+    expect(h.ctxState.domain.raw.table('routes').get('omt_stale')).toBeUndefined()
+    expect(h.ctxState.domain.raw.table('expired_routes').get('omt_stale')).toMatchObject({
+      workspacePath: dir,
+    })
+    await h.service.shutdown()
+  })
+
+  it('never offers a workspace whose session is still live', async () => {
+    const h = await setup({ workspaceRetention: '7d' })
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_live_ws', senderId: 'ou_owner',
+      messageId: 'om_live_ws', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const record = [...(h.ctxState.domain.raw.table('routes').entries() as Iterable<[string, RouteRecord]>)]
+      .map(([, value]) => value)[0]!
+    const old = new Date(Date.now() - STALE)
+    utimesSync(record.workspacePath, old, old)
+
+    const preview = await h.service.cleanupPreview()
+    expect(preview.candidates).toBe(0)
+    const result = await h.service.runWorkspaceCleanup()
+    expect(result.deletedWorkspaces).toBe(0)
+    expect(existsSync(record.workspacePath)).toBe(true)
+    await h.service.shutdown()
+  })
+
+  it('refuses to run while retention is off', async () => {
+    const h = await setup({ workspaceRetention: 'off' })
+    const preview = await h.service.cleanupPreview()
+    expect(preview.candidates).toBe(0)
+    expect(preview.thresholdMs).toBeUndefined()
+    const result = await h.service.runWorkspaceCleanup()
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain('off')
     await h.service.shutdown()
   })
 })

@@ -44,8 +44,24 @@ export interface AgentRequestListenerOptions {
 }
 
 
+/** One ordered system-prompt section the plugin contributes to an Agent scope. */
+export interface PromptSection {
+  readonly name: string
+  readonly order: number
+  readonly text: string
+  readonly interpolate?: boolean
+  readonly complete?: boolean
+}
+
+/** The Agent-scoped slice of the host `systemPrompt` registry. */
+export interface SystemPromptRuntime {
+  section(section: PromptSection): () => void
+}
+
 export interface AgentContext {
   commands: CommandRuntime
+  /** Present inside a setup scope that injected `systemPrompt`. */
+  systemPrompt?: SystemPromptRuntime
   /** Register an Agent-scoped model-call override. */
   on(
     event: 'agent/request',

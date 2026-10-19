@@ -130,13 +130,25 @@ export class RouteStore {
     }
     const record = this.get(key)
     if (record === undefined || record.kind !== 'thread' || !this.hasExpired(record, now)) return undefined
+    return await this.retire(key, now)
+  }
 
+  /**
+   * Retire one active thread route into a persistent tombstone regardless of
+   * the configured TTL. Used by the workspace-retention cleanup, which may
+   * close topics earlier than the route TTL.
+   */
+  async retire(key: string, now = Date.now()): Promise<ExpiredRouteRecord | undefined> {
+    const record = this.get(key)
+    if (record === undefined) return this.expiredRoute(key)
     const tombstone: ExpiredRouteRecord = {
       key,
       chatId: record.chatId,
       chatType: record.chatType,
       senderOpenId: record.senderOpenId,
       expiredAt: now,
+      workspacePath: record.workspacePath,
+      lastActivityAt: record.lastActivityAt,
     }
     await this.deps.domain()?.expiredRoutes.put(key, tombstone)
     this.expired.set(key, tombstone)

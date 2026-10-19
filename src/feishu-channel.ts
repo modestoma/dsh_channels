@@ -63,16 +63,20 @@ export interface FeishuChannel {
   removeReaction(messageId: string, reactionId: string): Promise<void>
   /** Fetch the thread id of a sent message (undefined when not a topic message). */
   threadIdOfMessage(messageId: string): Promise<string | undefined>
-  /** Download one inbound message resource (image bytes + sniffed media type). */
-  downloadResource(messageId: string, fileKey: string, type: 'image'): Promise<DownloadedResource>
+  /**
+   * Stream one inbound message resource. Files and images share the same
+   * download endpoint; only the `type` query differs. The stream is bounded
+   * chunk-by-chunk so arbitrarily large files never have to fit in memory.
+   */
+  downloadResource(
+    messageId: string,
+    fileKey: string,
+    type: 'image' | 'file',
+  ): Promise<ResourceChunkStream>
 }
 
-/** Bytes of one inbound Feishu resource plus their detected media type. */
-export interface DownloadedResource {
-  data: Uint8Array
-  /** `image/png`-style type; undefined when the bytes match no known format. */
-  mediaType?: string
-}
+/** Ordered byte chunks of one inbound resource. */
+export type ResourceChunkStream = AsyncIterable<Uint8Array>
 
 export interface ChannelConnectOptions {
   appId: string
@@ -153,17 +157,23 @@ class LarkChannelAdapter implements FeishuChannel {
     return res?.data?.items?.[0]?.thread_id
   }
 
-  async downloadResource(messageId: string, fileKey: string, type: 'image'): Promise<DownloadedResource> {
+  async downloadResource(
+    messageId: string,
+    fileKey: string,
+    type: 'image' | 'file',
+  ): Promise<ResourceChunkStream> {
     const response = await this.channel.rawClient.im.v1.messageResource.get({
       params: { type },
       path: { message_id: messageId, file_key: fileKey },
     }) as unknown as { getReadableStream(): AsyncIterable<Uint8Array | Buffer> }
-    const chunks: Buffer[] = []
-    for await (const chunk of response.getReadableStream()) {
-      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+    const source = response.getReadableStream()
+    return {
+      async *[Symbol.asyncIterator]() {
+        for await (const chunk of source) {
+          yield Buffer.isBuffer(chunk) ? new Uint8Array(chunk) : chunk
+        }
+      },
     }
-    const data = new Uint8Array(Buffer.concat(chunks))
-    return { data, mediaType: sniffImageMediaType(data) }
   }
 }
 

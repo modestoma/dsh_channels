@@ -11,7 +11,7 @@ import { vi } from 'vitest'
 import type {
   Agent, AgentContext, AgentHandle, AgentOptions, AgentRegistry, AgentRequestConfig, AgentRequestListener, ApprovalAnswererListener,
   AssistantStreamPayload, CommandDefinition, CommandInvocation, CommandRuntime, EncodedImageAttachment, HostContext,
-  PermissionPresets, Session, SessionEvent, SessionId, SessionProjections, StorageDomainFacility, UserQuestionAnswererListener,
+  PermissionPresets, PromptSection, Session, SessionEvent, SessionId, SessionProjections, StorageDomainFacility, UserQuestionAnswererListener,
   Workspace, WorkspaceRegistry,
 } from '../src/dsh-types.ts'
 import type {
@@ -127,10 +127,27 @@ export function makeCommandRuntime(): CommandRuntime & { definitions: Map<string
 
 const agentRequestListeners = new WeakMap<AgentContext, AgentRequestListener[]>()
 
+const agentPromptSections = new WeakMap<AgentContext, PromptSection[]>()
+
+/** Prompt sections registered through one fake Agent context. */
+export function promptSectionsOf(ctx: AgentContext): readonly PromptSection[] {
+  return agentPromptSections.get(ctx) ?? []
+}
+
 export function makeAgentContext(commands = makeCommandRuntime()): AgentContext {
   const listeners: AgentRequestListener[] = []
+  const sections: PromptSection[] = []
   const ctx: AgentContext = {
     commands,
+    systemPrompt: {
+      section(section) {
+        sections.push(section)
+        return () => {
+          const index = sections.indexOf(section)
+          if (index !== -1) sections.splice(index, 1)
+        }
+      },
+    },
     on(_event, listener, options) {
       const prepend = options === true || (typeof options === 'object' && options.prepend === true)
       if (prepend) listeners.unshift(listener)
@@ -147,6 +164,7 @@ export function makeAgentContext(commands = makeCommandRuntime()): AgentContext 
     },
   }
   agentRequestListeners.set(ctx, listeners)
+  agentPromptSections.set(ctx, sections)
   return ctx
 }
 
@@ -249,6 +267,17 @@ export function makeWorkspaceRegistry(): { registry: WorkspaceRegistry; workspac
       }
       workspaces.set(dir, workspace)
       return workspace
+    },
+    list() {
+      return [...workspaces.values()]
+    },
+    async delete(id: string) {
+      for (const [path, workspace] of workspaces) {
+        if (workspace.id !== id) continue
+        workspaces.delete(path)
+        return true
+      }
+      return false
     },
   }
   return { registry, workspaces }
@@ -389,7 +418,6 @@ export function makeHostContext(
   approvalListeners: Array<{ listener: ApprovalAnswererListener; options: { prepend?: boolean } | undefined }>
   questionListeners: Array<{ listener: UserQuestionAnswererListener; options: { prepend?: boolean } | undefined }>
   permissions: PermissionPresets & { set: ReturnType<typeof vi.fn>; preset: string }
-  attachments: { saveImages: ReturnType<typeof vi.fn> }
   sessionQuery: { readTitleSnapshots: ReturnType<typeof vi.fn> }
 } {
   const agents = makeAgentRegistry(agentsOptions)
@@ -445,7 +473,6 @@ export function makeHostContext(
       delete credentials.values[ref]
     }),
   }
-  const attachments = { saveImages: vi.fn(async (inputs: readonly unknown[]) => inputs.map((_input, index) => ({ id: `att_${index + 1}` }))) }
   const sessionQuery = {
     readTitleSnapshots: vi.fn(async (ids: readonly string[]) => ids.map(sessionId => ({
       sessionId,
@@ -455,7 +482,6 @@ export function makeHostContext(
   }
   const services: Record<string, unknown> = {
     agents: agents.registry,
-    attachments,
     sessionQuery,
     commands,
     workspaceRegistry: workspaces.registry,
@@ -502,14 +528,18 @@ export function makeHostContext(
   }
   return {
     ctx, agents, workspaces, domain, credentials, sessionListeners,
-    assistantStreamListeners, approvalListeners, questionListeners, permissions, attachments, sessionQuery,
+    assistantStreamListeners, approvalListeners, questionListeners, permissions, sessionQuery,
   }
 }
 
 export interface FakeChannelOptions {
   threadIdOfMessage?: (messageId: string) => Promise<string | undefined>
-  /** Inbound resource bytes returned by `downloadResource` (sync or async). */
-  downloadResource?: () => { data: Uint8Array; mediaType?: string } | Promise<{ data: Uint8Array; mediaType?: string }>
+  /** Resource chunks returned by `downloadResource` (one message's payload). */
+  downloadResource?: (
+    messageId: string,
+    fileKey: string,
+    type: 'image' | 'file',
+  ) => Uint8Array[] | Promise<Uint8Array[]>
   failFirstSend?: boolean
   failReplyInThread?: boolean
   /** Reject every card send (used to exercise the plain-text fallback). */
@@ -569,12 +599,14 @@ export function makeChannel(options: FakeChannelOptions = {}): FeishuChannel & {
       removedReactions.push({ messageId, reactionId })
     }),
     threadIdOfMessage: options.threadIdOfMessage ?? (async () => `omt_${serial}`),
-    downloadResource: vi.fn(async () => (options.downloadResource === undefined
-      ? {
-          data: new Uint8Array([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]),
-          mediaType: 'image/png' as const,
-        }
-      : await options.downloadResource())),
+    downloadResource: vi.fn(async (messageId: string, fileKey: string, type: 'image' | 'file') => {
+      const chunks = options.downloadResource === undefined
+        ? [new Uint8Array([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])]
+        : await options.downloadResource(messageId, fileKey, type)
+      return (async function* (): AsyncGenerator<Uint8Array> {
+        for (const chunk of chunks) yield chunk
+      })()
+    }),
   }
   return Object.assign(channel, {
     sent, updated, reactions, removedReactions, cardActionHandlers,

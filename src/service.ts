@@ -14,6 +14,8 @@
  * @module dsh-channels/service
  */
 
+import { lstat, readdir, realpath, rm } from 'node:fs/promises'
+import path from 'node:path'
 import { ApprovalAnswerer } from './approvals.ts'
 import type { ApprovalRoute } from './approvals.ts'
 import { QuestionAnswerer } from './questions.ts'
@@ -29,6 +31,7 @@ import type {
   SessionId,
   SessionProjections,
   TokenMeter,
+  Workspace,
 } from './dsh-types.ts'
 import { standaloneInfoCard } from './cards.ts'
 import {
@@ -38,8 +41,12 @@ import {
 import type { EffortCommandAction, ParsedSlashCommand } from './commands.ts'
 import { commandSpec } from './commands/registry.ts'
 import type { ChannelCommandSpec } from './commands/registry.ts'
-import type { AttachmentService, PermissionPresets, SessionQuery } from './dsh-types.ts'
+import type { PermissionPresets, SessionQuery } from './dsh-types.ts'
 import { feishuDomain } from './domain.ts'
+import {
+  applyWorkspaceCleanup, isPathInside, planWorkspaceCleanup, retentionMs,
+} from './cleanup.ts'
+import type { CleanupDeps, WorkspaceStats } from './cleanup.ts'
 import type {
   ExpiredRouteRecord, FeishuDomainGlobal, FeishuDomainHandle, InflightSnapshot, ProcessedRecord, RawDomainHandle,
   RouteRecord,
@@ -49,7 +56,7 @@ import { InflightRepair } from './session/repair.ts'
 import { SessionManager } from './session/manager.ts'
 import type { LiveAgent, RenewCommit } from './session/manager.ts'
 import { CardDelivery } from './feishu/delivery.ts'
-import { ImageIntake } from './feishu/inbound-image.ts'
+import { AttachmentIntake } from './feishu/inbound-attachments.ts'
 import { InboundRouter } from './routing/inbound.ts'
 import type { RequestPolicyController } from './session/request-policy.ts'
 import type { ChannelFactory, FeishuChannel, NormalizedMessage } from './feishu-channel.ts'
@@ -77,6 +84,9 @@ const GC_SWEEP_INTERVAL_MS = 6 * 60 * 60 * 1000
 /** Dedup-record retention: Feishu redelivery windows are minutes-scale, so a
  *  day is 100×+ headroom while keeping the table bounded. */
 const PROCESSED_RETENTION_MS = 24 * 60 * 60 * 1000
+
+/** Workspace-retention sweep cadence when automatic cleanup is enabled. */
+const RETENTION_SWEEP_INTERVAL_MS = 24 * 60 * 60 * 1000
 
 
 interface RenewAdmission {
@@ -160,6 +170,52 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
+/**
+ * Measure one workspace directory for the cleanup preview: total regular-file
+ * bytes and file count. Symlinks are never followed; unreadable entries are
+ * skipped so a permission problem cannot fail the whole pass.
+ */
+async function measureWorkspace(dir: string): Promise<WorkspaceStats | undefined> {
+  let info
+  try {
+    info = await lstat(dir)
+  } catch {
+    return undefined
+  }
+  if (!info.isDirectory()) return undefined
+  let bytes = 0
+  let files = 0
+  const pending = [dir]
+  while (pending.length > 0) {
+    const current = pending.pop()!
+    let entries
+    try {
+      entries = await readdir(current, { withFileTypes: true })
+    } catch {
+      continue
+    }
+    for (const entry of entries) {
+      const child = path.join(current, entry.name)
+      if (entry.isSymbolicLink()) continue
+      if (entry.isDirectory()) {
+        pending.push(child)
+        continue
+      }
+      if (!entry.isFile()) continue
+      try {
+        const stat = await lstat(child)
+        if (stat.isFile()) {
+          bytes += stat.size
+          files += 1
+        }
+      } catch {
+        // The directory changed while walking it; the byte total is advisory.
+      }
+    }
+  }
+  return { mtimeMs: info.mtimeMs, bytes, files }
+}
+
 export class FeishuService {
   private readonly ctx: HostContext
   /** Live config object. Mutated in place — collaborators captured this reference. */
@@ -179,8 +235,8 @@ export class FeishuService {
   private readonly repair: InflightRepair
   /** Outbound card delivery + reaction lifecycle. */
   private readonly delivery: CardDelivery
-  /** Inbound image intake (Feishu resources → durable image blocks). */
-  private readonly images: ImageIntake
+  /** Inbound attachment archival (Feishu resources → workspace files). */
+  private readonly attachments: AttachmentIntake
   /** Inbound routing: dedup, admission, decision tree, session establishment. */
   private readonly inbound: InboundRouter
   /** Agent/session lifecycle: live registry, resume, presets, renew. */
@@ -206,6 +262,10 @@ export class FeishuService {
   private unlisten: (() => void) | undefined
   /** Periodic route-GC timer (unref'd; only armed when `routeTtlMs > 0`). */
   private gcTimer: ReturnType<typeof setInterval> | undefined
+  /** Periodic workspace-retention timer (only armed when auto cleanup is on). */
+  private retentionTimer: ReturnType<typeof setInterval> | undefined
+  /** Guards overlapping cleanup passes (panel button / daily timer). */
+  private cleanupRunning = false
   /** HITL approval answerer (created in `start()`). */
   private approvalAnswerer: ApprovalAnswerer | undefined
   /** HITL structured-question answerer (`ask_user_question`). */
@@ -249,11 +309,9 @@ export class FeishuService {
       detachStream: sessionId => this.streamer?.detach(sessionId),
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
     })
-    this.images = new ImageIntake({
-      enabled: () => this.config.acceptImages,
-      maxImages: () => this.config.maxImagesPerMessage,
+    this.attachments = new AttachmentIntake({
+      enabled: () => this.config.acceptAttachments,
       channel: () => this.channel,
-      attachments: () => this.ctx.get?.('attachments') as AttachmentService | undefined,
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
     })
     this.delivery = new CardDelivery({
@@ -271,7 +329,7 @@ export class FeishuService {
       repair: this.repair,
       delivery: this.delivery,
       sessions: this.sessions,
-      images: this.images,
+      attachments: this.attachments,
       queue: this.routeOperations,
       streamer: () => this.streamer,
       questionAnswerer: () => this.questionAnswerer,
@@ -327,6 +385,7 @@ export class FeishuService {
    */
   applyOverlay(overlay: Partial<FeishuConfig>): void {
     this.replaceConfig({ ...this.baseConfig, ...overlay })
+    this.refreshRetentionTimer()
   }
 
   /** Tear the connection down and bring it back with the latest config. */
@@ -365,6 +424,174 @@ export class FeishuService {
   baseConfigSnapshot(): FeishuConfig { return { ...this.baseConfig } }
   runningConfigSnapshot(): FeishuConfig | undefined {
     return this.runningConfig === undefined ? undefined : { ...this.runningConfig }
+  }
+
+  // ---- workspace retention cleanup -------------------------------------
+
+  /**
+   * Workspace-retention preview for the Web panel: how many plugin-created
+   * workspaces exist, how many are past the configured window, and their
+   * measured footprint. Never deletes anything.
+   */
+  async cleanupPreview(): Promise<{
+    retention: string
+    thresholdMs?: number
+    auto: boolean
+    workspaces: number
+    candidates: number
+    candidateBytes: number
+    error?: string
+  }> {
+    const retention = this.config.workspaceRetention
+    const window = retentionMs(retention)
+    const base = {
+      retention,
+      ...(window === undefined ? {} : { thresholdMs: window }),
+      auto: this.config.workspaceRetentionAuto,
+    }
+    try {
+      const workspaces = this.ctx.workspaceRegistry.list().filter(workspace => this.isPluginWorkspace(workspace))
+      const plan = await planWorkspaceCleanup(this.cleanupDeps())
+      return {
+        ...base,
+        workspaces: workspaces.length,
+        candidates: plan?.candidates.length ?? 0,
+        candidateBytes: plan?.candidates.reduce((total, candidate) => total + candidate.bytes, 0) ?? 0,
+      }
+    } catch (error) {
+      return { ...base, workspaces: 0, candidates: 0, candidateBytes: 0, error: messageOf(error) }
+    }
+  }
+
+  /**
+   * Delete every stale plugin workspace the configured retention allows.
+   * Routes bound to a removed workspace are retired first (thread routes leave
+   * a tombstone), so an old topic fails with the explicit expired card instead
+   * of resuming into a missing directory. DSH Session logs are not touched.
+   */
+  async runWorkspaceCleanup(): Promise<{
+    ok: boolean
+    deletedWorkspaces: number
+    retiredRoutes: number
+    freedBytes: number
+    failures: string[]
+    error?: string
+  }> {
+    const empty = { ok: false, deletedWorkspaces: 0, retiredRoutes: 0, freedBytes: 0, failures: [] as string[] }
+    if (retentionMs(this.config.workspaceRetention) === undefined) {
+      return { ...empty, error: '未启用工作区清理阈值（workspaceRetention 为 off）' }
+    }
+    if (this.cleanupRunning) return { ...empty, error: '工作区清理正在进行中，请稍候' }
+    this.cleanupRunning = true
+    try {
+      const deps = this.cleanupDeps()
+      const plan = await planWorkspaceCleanup(deps)
+      if (plan === undefined) return { ...empty, error: '工作区清理不可用：baseDir 配置无效' }
+      const outcome = await applyWorkspaceCleanup(deps, plan)
+      this.ctx.logger?.info?.(
+        'dsh-channels: workspace cleanup removed %d workspace(s), retired %d route(s), freed %d bytes',
+        outcome.deletedWorkspaces, outcome.retiredRoutes, outcome.freedBytes,
+      )
+      return {
+        ok: true,
+        deletedWorkspaces: outcome.deletedWorkspaces,
+        retiredRoutes: outcome.retiredRoutes,
+        freedBytes: outcome.freedBytes,
+        failures: outcome.failures.map(failure => `${failure.path}: ${failure.message}`),
+      }
+    } catch (error) {
+      return { ...empty, error: messageOf(error) }
+    } finally {
+      this.cleanupRunning = false
+    }
+  }
+
+  /** Whether one registry workspace was created by this plugin inside `baseDir`. */
+  private isPluginWorkspace(workspace: Workspace): boolean {
+    const pluginTitle = workspace.title.startsWith('飞书私聊 ·') || workspace.title.startsWith('飞书群聊 ·')
+    return pluginTitle && isPathInside(path.resolve(this.config.baseDir), workspace.path)
+  }
+
+  /** Effect seams for the cleanup policy module (all I/O stays here). */
+  private cleanupDeps(): CleanupDeps {
+    const baseDir = path.resolve(this.config.baseDir)
+    return {
+      baseDir,
+      retention: this.config.workspaceRetention,
+      listWorkspaces: () => this.ctx.workspaceRegistry.list(),
+      activeRoutes: () => [...(this.domain?.routes.entries() ?? [])].map(([key, record]) => ({
+        key,
+        kind: record.kind,
+        workspacePath: record.workspacePath,
+        sessionId: record.sessionId,
+        lastActivityAt: record.lastActivityAt,
+      })),
+      tombstones: () => [...(this.domain?.expiredRoutes.entries() ?? [])].map(([key, record]) => ({
+        key,
+        ...(record.workspacePath === undefined ? {} : { workspacePath: record.workspacePath }),
+        expiredAt: record.expiredAt,
+        ...(record.lastActivityAt === undefined ? {} : { lastActivityAt: record.lastActivityAt }),
+      })),
+      isLive: sessionId => this.sessions.get(sessionId) !== undefined
+        || this.ctx.agents.get(sessionId as SessionId) !== undefined,
+      statWorkspace: workspacePath => measureWorkspace(workspacePath),
+      removeWorkspace: async workspace => {
+        const target = path.resolve(workspace.path)
+        if (!isPathInside(baseDir, target)) {
+          throw new Error(`refusing to delete a path outside baseDir (${target})`)
+        }
+        // Re-verify the physical path: a symlinked ancestor inside baseDir
+        // must not let the recursive delete escape it.
+        try {
+          const [physicalBase, physicalTarget] = await Promise.all([realpath(baseDir), realpath(target)])
+          if (!isPathInside(physicalBase, physicalTarget)) {
+            throw new Error(`refusing to delete a symlink escape outside baseDir (${physicalTarget})`)
+          }
+        } catch (error) {
+          if (error instanceof Error && error.message.startsWith('refusing to delete a symlink escape')) throw error
+          // A missing workspace is already effectively removed (rm is idempotent).
+        }
+        await rm(target, { recursive: true, force: true })
+        try {
+          await this.ctx.workspaceRegistry.delete(workspace.id)
+        } catch (error) {
+          this.ctx.logger?.warn?.(
+            'dsh-channels: unregistering cleaned workspace %s failed: %s', workspace.path, String(error),
+          )
+        }
+      },
+      retireRoute: async route => {
+        if (route.kind === 'thread') await this.routes.retire(route.key)
+        else await this.routes.remove(route.key)
+      },
+      warn: message => this.ctx.logger?.warn?.(message),
+    }
+  }
+
+  /**
+   * (Re)arm the daily retention timer to match the live config. `runNow`
+   * performs one pass immediately; it is only used at startup so saving any
+   * unrelated setting can never trigger a surprise deletion pass.
+   */
+  private refreshRetentionTimer(runNow = false): void {
+    if (this.retentionTimer !== undefined) {
+      clearInterval(this.retentionTimer)
+      this.retentionTimer = undefined
+    }
+    if (!this.started
+      || !this.config.workspaceRetentionAuto
+      || retentionMs(this.config.workspaceRetention) === undefined) return
+    const sweep = (): void => {
+      void this.runWorkspaceCleanup().then(result => {
+        if (!result.ok && result.error !== '工作区清理正在进行中，请稍候') {
+          this.ctx.logger?.warn?.('dsh-channels: automatic workspace cleanup failed: %s', result.error)
+        }
+      })
+    }
+    if (runNow) sweep()
+    const timer = setInterval(sweep, RETENTION_SWEEP_INTERVAL_MS)
+    timer.unref?.()
+    this.retentionTimer = timer
   }
 
   /** Aggregate health used by `/health` and the Web settings panel. */
@@ -550,6 +777,8 @@ export class FeishuService {
     }, GC_SWEEP_INTERVAL_MS)
     timer.unref?.()
     this.gcTimer = timer
+    // Workspace retention: opt-in automatic cleanup (default off).
+    this.refreshRetentionTimer(true)
     this.ctx.logger?.info?.(
       'dsh-channels: feishu long connection established (bot open_id %s, %d route(s) loaded)',
       channel.botOpenId() ?? 'unknown',
@@ -603,6 +832,10 @@ export class FeishuService {
     if (this.gcTimer !== undefined) {
       clearInterval(this.gcTimer)
       this.gcTimer = undefined
+    }
+    if (this.retentionTimer !== undefined) {
+      clearInterval(this.retentionTimer)
+      this.retentionTimer = undefined
     }
     await this.sessions.disposeAll()
     this.routeOperations.clear()

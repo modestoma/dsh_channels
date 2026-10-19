@@ -77,6 +77,51 @@ describe('expired route tombstone', () => {
       expiredAt: 300,
     })
   })
+
+  it('accepts the workspace metadata added for stale-workspace cleanup', () => {
+    expect(expiredRouteRecordSchema.parse({
+      key: 'omt_expired',
+      chatId: 'oc_chat',
+      chatType: 'group',
+      senderOpenId: 'ou_owner',
+      expiredAt: 300,
+      workspacePath: '/workspace/owner',
+      lastActivityAt: 250,
+    })).toEqual({
+      key: 'omt_expired',
+      chatId: 'oc_chat',
+      chatType: 'group',
+      senderOpenId: 'ou_owner',
+      expiredAt: 300,
+      workspacePath: '/workspace/owner',
+      lastActivityAt: 250,
+    })
+  })
+
+  it('still parses legacy tombstones without the cleanup metadata', () => {
+    const legacy = expiredRouteRecordSchema.parse({
+      key: 'omt_expired',
+      chatId: 'oc_chat',
+      chatType: 'p2p',
+      senderOpenId: 'ou_owner',
+      expiredAt: 300,
+    })
+    expect(legacy.workspacePath).toBeUndefined()
+    expect(legacy.lastActivityAt).toBeUndefined()
+  })
+
+  it('rejects malformed cleanup metadata in a tombstone', () => {
+    const base = {
+      key: 'omt_expired',
+      chatId: 'oc_chat',
+      chatType: 'group',
+      senderOpenId: 'ou_owner',
+      expiredAt: 300,
+    }
+    expect(() => expiredRouteRecordSchema.parse({ ...base, workspacePath: '' })).toThrow()
+    expect(() => expiredRouteRecordSchema.parse({ ...base, lastActivityAt: -1 })).toThrow()
+    expect(() => expiredRouteRecordSchema.parse({ ...base, lastActivityAt: 1.5 })).toThrow()
+  })
 })
 
 describe('storage domain descriptor', () => {

@@ -68,6 +68,13 @@ export const expiredRouteRecordSchema = z.object({
   senderOpenId: z.string().min(1),
   /** Epoch ms when the route was retired. */
   expiredAt: z.number().int().nonnegative(),
+  /** Workspace the retired route belonged to; absent in tombstones written by
+   *  older plugin versions, so the field must stay optional. */
+  workspacePath: z.string().min(1).optional(),
+  /** Epoch ms of the last activity through the route before retirement.
+   *  Optional for the same legacy-compatibility reason; consumers fall back to
+   *  `expiredAt` when it is absent. */
+  lastActivityAt: z.number().int().nonnegative().optional(),
 })
 
 export type ExpiredRouteRecord = z.infer<typeof expiredRouteRecordSchema>

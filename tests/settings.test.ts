@@ -18,6 +18,7 @@ import type { HealthSnapshot } from '../src/health.ts'
 import type { FeishuChannel } from '../src/feishu-channel.ts'
 import {
   CATALOG_ROUTE,
+  CLEANUP_ROUTE,
   CONFIG_ROUTE,
   CREDENTIALS_ROUTE,
   EDITABLE_KEYS,
@@ -26,7 +27,7 @@ import {
   RESTART_KEYS,
   STATUS_ROUTE,
 } from '../src/settings/contract.ts'
-import type { CatalogWire, EditableValues } from '../src/settings/contract.ts'
+import type { CatalogWire, CleanupPreviewWire, CleanupRunWire, EditableValues } from '../src/settings/contract.ts'
 import {
   OverlayStore,
   defaultOverlayPath,
@@ -99,6 +100,24 @@ class FakeTarget implements SettingsTarget {
   restartCalls = 0
   failRestart: string | undefined
   healthState = healthySnapshot()
+  cleanupState: CleanupPreviewWire = {
+    retention: 'off',
+    auto: false,
+    workspaces: 0,
+    candidates: 0,
+    candidateBytes: 0,
+  }
+  cleanupRun: CleanupRunWire = {
+    ok: true,
+    deletedWorkspaces: 0,
+    retiredRoutes: 0,
+    freedBytes: 0,
+    failures: [],
+  }
+  failCleanupPreview: string | undefined
+  failCleanupRun: string | undefined
+  cleanupPreviewCalls = 0
+  cleanupRunCalls = 0
 
   constructor(config: FeishuConfig) {
     this.base = { ...config }
@@ -144,6 +163,18 @@ class FakeTarget implements SettingsTarget {
   async clearCredential(field: 'appId' | 'appSecret'): Promise<void> {
     this.credentialCalls.push({ field })
     this.credentialInfo[field] = { configured: false, writable: true }
+  }
+
+  async cleanupPreview(): Promise<CleanupPreviewWire> {
+    this.cleanupPreviewCalls++
+    if (this.failCleanupPreview !== undefined) throw new Error(this.failCleanupPreview)
+    return { ...this.cleanupState }
+  }
+
+  async runWorkspaceCleanup(): Promise<CleanupRunWire> {
+    this.cleanupRunCalls++
+    if (this.failCleanupRun !== undefined) throw new Error(this.failCleanupRun)
+    return { ...this.cleanupRun, failures: [...this.cleanupRun.failures] }
   }
 }
 
@@ -286,6 +317,35 @@ describe('field descriptors', () => {
     })
     expect(baseDir?.label).toContain('工作区')
     expect(baseDir?.help).toContain('绝对路径')
+  })
+
+  it('describes the retention select and attachment toggle instead of the old image keys', () => {
+    const keys = EDITABLE_KEYS as readonly string[]
+    expect(keys).not.toContain('acceptImages')
+    expect(keys).not.toContain('maxImagesPerMessage')
+
+    const byKey = new Map(FIELD_DESCRIPTORS.map(field => [field.key, field]))
+    const retention = byKey.get('workspaceRetention')
+    expect(retention).toMatchObject({
+      key: 'workspaceRetention',
+      kind: 'select',
+      group: 'workspace',
+      restartRequired: false,
+    })
+    expect(retention?.options?.map(option => option.value)).toEqual(['off', '7d', '30d', '90d', '180d'])
+    expect(retention?.options?.find(option => option.value === 'off')?.label).toContain('关闭')
+    expect(retention?.options?.find(option => option.value === '30d')?.label).toBe('30 天')
+
+    expect(byKey.get('workspaceRetentionAuto')).toMatchObject({
+      kind: 'boolean',
+      group: 'workspace',
+      restartRequired: false,
+    })
+    expect(byKey.get('acceptAttachments')).toMatchObject({
+      kind: 'boolean',
+      group: 'content',
+      restartRequired: false,
+    })
   })
 })
 
@@ -616,13 +676,46 @@ describe('SettingsSurface', () => {
 
   it('saves validated values, applies them live, and persists the overlay', async () => {
     const { surface, target, store } = makeSurface()
-    const result = await surface.save({ requireMention: false, maxImagesPerMessage: 2, provider: '' })
+    const result = await surface.save({ requireMention: false, acceptAttachments: false, provider: '' })
     expect(result.ok).toBe(true)
     if (!result.ok) return
     expect(result.clearedKeys).toEqual(['provider'])
-    await expect(store.load()).resolves.toEqual({ requireMention: false, maxImagesPerMessage: 2 })
-    expect(target.applied).toEqual({ requireMention: false, maxImagesPerMessage: 2 })
-    expect(result.panel.config.overriddenKeys).toEqual(['requireMention', 'maxImagesPerMessage'])
+    await expect(store.load()).resolves.toEqual({ requireMention: false, acceptAttachments: false })
+    expect(target.applied).toEqual({ requireMention: false, acceptAttachments: false })
+    expect(result.panel.config.overriddenKeys).toEqual(['requireMention', 'acceptAttachments'])
+  })
+
+  it('saves the workspace retention fields and the attachment toggle', async () => {
+    const { surface, target, store } = makeSurface()
+    const result = await surface.save({
+      workspaceRetention: '30d',
+      workspaceRetentionAuto: true,
+      acceptAttachments: false,
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    const saved = { workspaceRetention: '30d', workspaceRetentionAuto: true, acceptAttachments: false }
+    await expect(store.load()).resolves.toEqual(saved)
+    expect(target.applied).toEqual(saved)
+    expect(result.panel.config.effective.workspaceRetention).toBe('30d')
+    expect(result.panel.config.effective.workspaceRetentionAuto).toBe(true)
+    expect(result.panel.config.overriddenKeys).toEqual(['workspaceRetention', 'workspaceRetentionAuto', 'acceptAttachments'])
+
+    const invalid = await surface.save({ workspaceRetention: '1d' } as unknown as EditableValues)
+    expect(invalid.ok).toBe(false)
+    if (invalid.ok) return
+    expect(invalid.issues?.map(issue => issue.key)).toContain('workspaceRetention')
+  })
+
+  it('rejects the removed image keys as unknown configuration', async () => {
+    const { surface, store } = makeSurface()
+    for (const legacy of [{ acceptImages: true }, { maxImagesPerMessage: 2 }]) {
+      const result = await surface.save(legacy as unknown as EditableValues)
+      expect(result.ok).toBe(false)
+      if (result.ok) return
+      expect(result.error).toContain('未知配置项')
+    }
+    await expect(store.load()).resolves.toEqual({})
   })
 
   it('refuses a half-configured model override', async () => {
@@ -714,6 +807,76 @@ describe('SettingsSurface', () => {
     const success = await surface.reconnect()
     expect(success.ok).toBe(true)
     expect(target.restartCalls).toBe(2)
+  })
+})
+
+describe('SettingsSurface workspace cleanup', () => {
+  const DAY = 86_400_000
+
+  it('carries the cleanup preview into the panel', async () => {
+    const { surface, target } = makeSurface()
+    target.cleanupState = {
+      retention: '30d',
+      thresholdMs: 30 * DAY,
+      auto: true,
+      workspaces: 6,
+      candidates: 2,
+      candidateBytes: 8 * 1024 * 1024,
+    }
+    const panel = await surface.panel()
+    expect(panel.cleanup).toEqual(target.cleanupState)
+    expect(target.cleanupPreviewCalls).toBe(1)
+  })
+
+  it('degrades a failed preview to zero counts and the effective retention', async () => {
+    const { surface, target } = makeSurface({ workspaceRetention: '7d', workspaceRetentionAuto: true })
+    target.failCleanupPreview = 'workspace scan failed'
+    const panel = await surface.panel()
+    expect(panel.cleanup).toMatchObject({
+      retention: '7d',
+      auto: true,
+      workspaces: 0,
+      candidates: 0,
+      candidateBytes: 0,
+    })
+    expect(panel.cleanup.error).toContain('workspace scan failed')
+    expect(panel.config.overriddenKeys).toEqual([])
+  })
+
+  it('runs the cleanup once and returns the refreshed panel', async () => {
+    const { surface, target } = makeSurface({ workspaceRetention: '30d' })
+    target.cleanupState = {
+      retention: '30d',
+      thresholdMs: 30 * DAY,
+      auto: false,
+      workspaces: 4,
+      candidates: 3,
+      candidateBytes: 10_240,
+    }
+    target.cleanupRun = {
+      ok: true,
+      deletedWorkspaces: 3,
+      retiredRoutes: 5,
+      freedBytes: 10_240,
+      failures: ['/ws/one: EBUSY'],
+    }
+    const result = await surface.runCleanup()
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.result).toEqual(target.cleanupRun)
+    expect(target.cleanupRunCalls).toBe(1)
+    expect(result.panel.cleanup).toEqual(target.cleanupState)
+    expect(result.panel.config.effective.workspaceRetention).toBe('30d')
+  })
+
+  it('reports a crashed cleanup run as a failure without a panel', async () => {
+    const { surface, target } = makeSurface()
+    target.failCleanupRun = 'permission denied'
+    const result = await surface.runCleanup()
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error).toContain('permission denied')
+    expect(target.cleanupRunCalls).toBe(1)
   })
 })
 
@@ -963,6 +1126,37 @@ describe('settings routes', () => {
     const failed = await call(routes, RECONNECT_ROUTE, makeRequest({ method: 'POST', headers: { host: 'h' } }))
     expect(failed.status).toBe(500)
   })
+
+  it('runs the workspace cleanup via POST with the same guards', async () => {
+    const { surface, target } = makeSurface()
+    target.cleanupState = { retention: '30d', thresholdMs: 30 * 86_400_000, auto: false, workspaces: 2, candidates: 1, candidateBytes: 512 }
+    target.cleanupRun = { ok: true, deletedWorkspaces: 1, retiredRoutes: 2, freedBytes: 512, failures: [] }
+    const { server, routes } = makeWebServer()
+    registerSettingsRoutes(server, surface)
+
+    const crossSite = await call(routes, CLEANUP_ROUTE, makeRequest({
+      method: 'POST',
+      headers: { origin: 'https://evil.example', host: '127.0.0.1:52555' },
+    }))
+    expect(crossSite.status).toBe(403)
+    expect(target.cleanupRunCalls).toBe(0)
+
+    const notAllowed = await call(routes, CLEANUP_ROUTE, makeRequest({ method: 'GET' }))
+    expect(notAllowed.status).toBe(405)
+    expect(notAllowed.headers.allow).toBe('POST')
+
+    const ok = await call(routes, CLEANUP_ROUTE, makeRequest({ method: 'POST', headers: { host: 'h' } }))
+    expect(ok.status).toBe(200)
+    const body = JSON.parse(ok.body)
+    expect(body.ok).toBe(true)
+    expect(body.result).toEqual(target.cleanupRun)
+    expect(body.panel.cleanup).toEqual(target.cleanupState)
+
+    target.failCleanupRun = 'disk unavailable'
+    const failed = await call(routes, CLEANUP_ROUTE, makeRequest({ method: 'POST', headers: { host: 'h' } }))
+    expect(failed.status).toBe(500)
+    expect(JSON.parse(failed.body).error).toContain('disk unavailable')
+  })
 })
 
   it('writes and removes credentials via PUT / DELETE with the same guards', async () => {
@@ -1047,6 +1241,7 @@ describe('apply() web wiring', () => {
     expect(routes.has(CONFIG_ROUTE)).toBe(true)
     expect(routes.has(CREDENTIALS_ROUTE)).toBe(true)
     expect(routes.has(RECONNECT_ROUTE)).toBe(true)
+    expect(routes.has(CLEANUP_ROUTE)).toBe(true)
 
     const panel = await call(routes, PANEL_ROUTE, makeRequest())
     expect(panel.status).toBe(200)

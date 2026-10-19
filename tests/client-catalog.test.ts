@@ -149,4 +149,28 @@ describe('applyCatalogFields', () => {
     const fields = applyCatalogFields([...initialFields(), baseDir], PROVIDER_CHOSEN, {})
     expect(fields.find(field => field.key === 'baseDir')).toEqual(baseDir)
   })
+
+  it('passes the workspace-retention and attachment controls through unchanged', () => {
+    const retention = makeField('workspaceRetention', {
+      kind: 'select',
+      group: 'workspace',
+      options: [
+        { value: 'off', label: '关闭（不删除）' },
+        { value: '7d', label: '7 天' },
+        { value: '30d', label: '30 天' },
+        { value: '90d', label: '90 天' },
+        { value: '180d', label: '180 天' },
+      ],
+    })
+    const retentionAuto = makeField('workspaceRetentionAuto', { kind: 'boolean', group: 'workspace' })
+    const attachments = makeField('acceptAttachments', { kind: 'boolean', group: 'content' })
+    const fields = applyCatalogFields(
+      [...initialFields(), retention, retentionAuto, attachments],
+      PROVIDER_CHOSEN,
+      {},
+    )
+    expect(fields.find(field => field.key === 'workspaceRetention')).toEqual(retention)
+    expect(fields.find(field => field.key === 'workspaceRetentionAuto')).toEqual(retentionAuto)
+    expect(fields.find(field => field.key === 'acceptAttachments')).toEqual(attachments)
+  })
 })

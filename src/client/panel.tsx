@@ -14,6 +14,8 @@ import { PANEL_COPY } from '../settings/contract.ts'
 import type {
   CatalogWire,
   ChannelStatusWire,
+  CleanupPreviewWire,
+  CleanupRunWire,
   ConfigValue,
   CredentialField,
   CredentialRefWire,
@@ -23,7 +25,7 @@ import type {
   FieldIssueWire,
   PanelWire,
 } from '../settings/contract.ts'
-import { clearConfig, clearCredential, fetchCatalog, fetchPanel, fetchStatus, reconnect, saveConfig, saveCredentials } from './api.ts'
+import { clearConfig, clearCredential, fetchCatalog, fetchPanel, fetchStatus, reconnect, runCleanup, saveConfig, saveCredentials } from './api.ts'
 import { CATALOG_KEYS, applyCatalogFields, catalogFromFields } from './catalog.ts'
 
 /** Owner props handed to a `settings.section` contribution (unused beyond parity). */
@@ -38,17 +40,41 @@ type LoadState =
 
 type Notice = { kind: 'ok' | 'error'; text: string; issues?: FieldIssueWire[] }
 
+/** One in-flight panel mutation (only one button is disabled at a time). */
+type BusyAction = 'save' | 'clear' | 'reconnect' | 'credentials' | 'credentials-clear' | 'cleanup'
+
 const GROUP_ORDER = ['workspace', 'behavior', 'content', 'model', 'streaming'] as const
 const GROUP_LABELS: Record<(typeof GROUP_ORDER)[number], string> = {
   workspace: '工作区与文件',
   behavior: '行为',
-  content: '内容与图片',
+  content: '内容与附件',
   model: '模型',
   streaming: '流式卡片',
 }
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+/** Human-readable byte size for the cleanup preview/result (base-2 units). */
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  let value = bytes
+  let unit = 0
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024
+    unit += 1
+  }
+  const digits = unit === 0 || value >= 10 ? 0 : 1
+  return `${value.toFixed(digits)} ${units[unit] ?? 'B'}`
+}
+
+/** Display label for the effective retention value, reusing the Host field options. */
+function retentionLabel(panel: PanelWire, cleanup: CleanupPreviewWire): string {
+  const field = panel.config.fields.find(item => item.key === 'workspaceRetention')
+  return field?.options?.find(option => option.value === cleanup.retention)?.label
+    ?? (cleanup.retention === 'off' ? PANEL_COPY.cleanupRetentionOff : cleanup.retention)
 }
 
 function formatUptime(ms: number | undefined): string {
@@ -406,18 +432,112 @@ function AdvancedCard(props: { panel: PanelWire }) {
   )
 }
 
+/** Workspace cleanup card: deletion preview + the irreversible manual action. */
+function CleanupCard(props: {
+  panel: PanelWire
+  cleanup: CleanupPreviewWire
+  busy: BusyAction | null
+  result: CleanupRunWire | null
+  error: string | null
+  onRun: () => void
+}) {
+  const { panel, cleanup, busy, result, error, onRun } = props
+  const autoText = cleanup.retention === 'off'
+    ? PANEL_COPY.cleanupAutoInactive
+    : cleanup.auto ? PANEL_COPY.cleanupAutoOn : PANEL_COPY.cleanupAutoOff
+  const blocked = cleanup.error !== undefined
+    ? `${PANEL_COPY.cleanupPreviewFailed}：${cleanup.error}`
+    : cleanup.retention === 'off'
+      ? PANEL_COPY.cleanupDisabledOff
+      : cleanup.candidates === 0
+        ? PANEL_COPY.cleanupDisabledEmpty
+        : null
+  const facts = [
+    { label: PANEL_COPY.cleanupRetention, value: retentionLabel(panel, cleanup) },
+    { label: PANEL_COPY.cleanupAutoLabel, value: autoText },
+    { label: PANEL_COPY.cleanupCandidates, value: `${cleanup.candidates} / ${cleanup.workspaces} 个` },
+    { label: PANEL_COPY.cleanupCandidateBytes, value: formatBytes(cleanup.candidateBytes) },
+  ]
+  const running = busy === 'cleanup'
+  const failed = result !== null && (!result.ok || error !== null)
+  return (
+    <section className="dsh-channels-cfg__card">
+      <div className="dsh-channels-cfg__cardHead">
+        <span className="dsh-channels-cfg__cardTitle">{PANEL_COPY.cleanupCard}</span>
+        <span className="dsh-channels-cfg__cardMeta">{retentionLabel(panel, cleanup)}</span>
+      </div>
+      <span className="dsh-channels-cfg__help">{PANEL_COPY.cleanupCardHelp}</span>
+      <div className="dsh-channels-cfg__facts">
+        {facts.map(fact => (
+          <div className="dsh-channels-cfg__fact" key={fact.label}>
+            <span className="dsh-channels-cfg__factLabel">{fact.label}</span>
+            <span className="dsh-channels-cfg__factValue">{fact.value}</span>
+          </div>
+        ))}
+      </div>
+      {blocked === null ? null : <span className="dsh-channels-cfg__help">{blocked}</span>}
+      {result === null
+        ? null
+        : (
+            <div className={`dsh-channels-cfg__notice dsh-channels-cfg__notice--${failed ? 'error' : 'ok'}`}>
+              {result.ok
+                ? (
+                    <span>
+                      {PANEL_COPY.cleanupDone}：{PANEL_COPY.cleanupDeleted} {result.deletedWorkspaces} 个，
+                      {PANEL_COPY.cleanupRetired} {result.retiredRoutes} 条，
+                      {PANEL_COPY.cleanupFreed} {formatBytes(result.freedBytes)}。
+                    </span>
+                  )
+                : (
+                    <span>
+                      {PANEL_COPY.cleanupFailed}
+                      {result.error === undefined ? '' : `：${result.error}`}
+                    </span>
+                  )}
+              {result.failures.length === 0
+                ? null
+                : (
+                    <>
+                      <span>{PANEL_COPY.cleanupFailures}</span>
+                      <ul className="dsh-channels-cfg__issues">
+                        {result.failures.map((failure, index) => (
+                          <li key={`${index}-${failure}`} className="dsh-channels-cfg__mono">{failure}</li>
+                        ))}
+                      </ul>
+                    </>
+                  )}
+            </div>
+          )}
+      {error === null ? null : <span className="dsh-channels-cfg__fieldError">{error}</span>}
+      <div className="dsh-channels-cfg__actions">
+        <button
+          type="button"
+          className="dsh-channels-cfg__btn dsh-channels-cfg__btn--danger"
+          onClick={onRun}
+          disabled={running || busy !== null || blocked !== null}
+        >
+          {running ? PANEL_COPY.cleanupRunning : PANEL_COPY.cleanupNow}
+        </button>
+        <span className="dsh-channels-cfg__help">{PANEL_COPY.cleanupConfirmHint}</span>
+      </div>
+    </section>
+  )
+}
+
 /** The settings.section page: status card + generic config form + read-only facts. */
 export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.Element {
   const [load, setLoad] = useState<LoadState>({ phase: 'loading' })
   const [draft, setDraft] = useState<EditableValues>({})
   const [notice, setNotice] = useState<Notice | null>(null)
-  const [busy, setBusy] = useState<'save' | 'clear' | 'reconnect' | 'credentials' | 'credentials-clear' | null>(null)
+  const [busy, setBusy] = useState<BusyAction | null>(null)
   const [status, setStatus] = useState<ChannelStatusWire | null>(null)
   const [pollError, setPollError] = useState<string | null>(null)
   const [appIdInput, setAppIdInput] = useState('')
   const [appSecretInput, setAppSecretInput] = useState('')
   const [catalog, setCatalog] = useState<CatalogWire | null>(null)
   const [catalogBusy, setCatalogBusy] = useState(false)
+  const [cleanupResult, setCleanupResult] = useState<CleanupRunWire | null>(null)
+  const [cleanupError, setCleanupError] = useState<string | null>(null)
   const catalogTicket = useRef(0)
   const panel = load.phase === 'ready' ? load.panel : null
   const currentStatus = status ?? panel?.status ?? null
@@ -425,6 +545,8 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
   const loadPanel = useCallback(async (): Promise<void> => {
     setLoad({ phase: 'loading' })
     setNotice(null)
+    setCleanupResult(null)
+    setCleanupError(null)
     try {
       const next = await fetchPanel()
       setLoad({ phase: 'ready', panel: next })
@@ -581,6 +703,8 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
       }
       setLoad({ phase: 'ready', panel: result.panel })
       setStatus(result.panel.status)
+      setCleanupResult(null)
+      setCleanupError(null)
       const cleared = result.clearedKeys.length === 0
         ? ''
         : `；已清除覆盖：${result.clearedKeys.map(key => fieldLabel(result.panel.config.fields, key)).join('、')}`
@@ -613,6 +737,8 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
       setLoad({ phase: 'ready', panel: result.panel })
       setStatus(result.panel.status)
       setDraft({})
+      setCleanupResult(null)
+      setCleanupError(null)
       setNotice({ kind: 'ok', text: PANEL_COPY.cleared })
     } catch (error) {
       setNotice({ kind: 'error', text: messageOf(error) })
@@ -643,6 +769,40 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
       setBusy(null)
     }
   }, [refreshStatus])
+
+  /**
+   * Delete stale workspaces after an explicit confirmation. The Host refreshes
+   * the panel in the same response, so the preview counts update immediately;
+   * partial failures stay visible in the card instead of being swallowed.
+   */
+  const onRunCleanup = useCallback(async (): Promise<void> => {
+    if (panel === null) return
+    const { cleanup } = panel
+    const confirmed = typeof window.confirm === 'function'
+      ? window.confirm(
+        `${PANEL_COPY.cleanupConfirm}\n本次将删除 ${cleanup.candidates} 个工作区，预计释放 ${formatBytes(cleanup.candidateBytes)}。`,
+      )
+      : true
+    if (!confirmed) return
+    setBusy('cleanup')
+    setNotice(null)
+    setCleanupResult(null)
+    setCleanupError(null)
+    try {
+      const response = await runCleanup()
+      if (!response.ok) {
+        setCleanupError(response.error)
+        return
+      }
+      setLoad({ phase: 'ready', panel: response.panel })
+      setStatus(response.panel.status)
+      setCleanupResult(response.result)
+    } catch (error) {
+      setCleanupError(messageOf(error))
+    } finally {
+      setBusy(null)
+    }
+  }, [panel])
 
   const onSaveCredentials = useCallback(async (): Promise<void> => {
     const values: { appId?: string; appSecret?: string } = {}
@@ -887,6 +1047,14 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
                   {dirty ? '有未保存的修改' : '只保存改动过的字段'}
                 </span>
               </div>
+              <CleanupCard
+                panel={panel}
+                cleanup={panel.cleanup}
+                busy={busy}
+                result={cleanupResult}
+                error={cleanupError}
+                onRun={() => { void onRunCleanup() }}
+              />
               <AdvancedCard panel={panel} />
             </>
           )}

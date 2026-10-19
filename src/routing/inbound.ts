@@ -10,14 +10,15 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import type { AgentHandle, ContentBlock, HostContext, SessionId, UserMessage } from '../dsh-types.ts'
+import type { AgentHandle, HostContext, SessionId, UserMessage } from '../dsh-types.ts'
 import type { FeishuConfig } from '../config.ts'
 import { buildCard, buildOnboardingCard, initialStreamingCard } from '../cards.ts'
 import { RouteOperationQueue } from '../commands.ts'
 import { chatRouteKey } from '../domain.ts'
 import type { FeishuDomainHandle, RouteRecord } from '../domain.ts'
 import type { CardDelivery } from '../feishu/delivery.ts'
-import type { ImageIntake } from '../feishu/inbound-image.ts'
+import { AttachmentIntake } from '../feishu/inbound-attachments.ts'
+import type { AttachmentArchiveResult } from '../feishu/inbound-attachments.ts'
 import type { NormalizedMessage } from '../feishu-channel.ts'
 import type { QuestionAnswerer } from '../interactions/questions.ts'
 import type { InflightRepair } from '../session/repair.ts'
@@ -41,7 +42,7 @@ export interface InboundDeps {
   repair: InflightRepair
   delivery: CardDelivery
   sessions: SessionManager
-  images: ImageIntake
+  attachments: AttachmentIntake
   /** Shared per-route FIFO admission (commands and turns must not interleave). */
   queue: RouteOperationQueue
   streamer(): TurnStreamer | undefined
@@ -49,16 +50,12 @@ export interface InboundDeps {
   commands: CommandPlanePort
 }
 
-/** Build one durable user message from inbound Feishu text (+ optional images). */
-export function feishuUserMessage(text: string, images: readonly ContentBlock[] = []): UserMessage {
-  const content: ContentBlock[] = [
-    ...(text.trim() === '' ? [] : [{ type: 'text', text } as ContentBlock]),
-    ...images,
-  ]
+/** Build one durable user message from inbound Feishu text. */
+export function feishuUserMessage(text: string): UserMessage {
   return {
     id: randomUUID(),
     role: 'user',
-    content: content.length === 0 ? [{ type: 'text', text: '' }] : content,
+    content: [{ type: 'text', text }],
     source: { kind: 'user' },
   } as unknown as UserMessage
 }
@@ -89,7 +86,7 @@ export class InboundRouter {
   private get repair(): InflightRepair { return this.deps.repair }
   private get delivery(): CardDelivery { return this.deps.delivery }
   private get sessions(): SessionManager { return this.deps.sessions }
-  private get images(): ImageIntake { return this.deps.images }
+  private get attachments(): AttachmentIntake { return this.deps.attachments }
   private get routeOperations(): RouteOperationQueue { return this.deps.queue }
   private get streamer(): TurnStreamer | undefined { return this.deps.streamer() }
   private get questionAnswerer(): QuestionAnswerer | undefined { return this.deps.questionAnswerer() }
@@ -134,7 +131,7 @@ export class InboundRouter {
     const botId = this.delivery.requireChannel().botOpenId()
     if (botId !== undefined && msg.senderId === botId) return
     if (msg.chatType !== 'p2p' && msg.chatType !== 'group') return
-    const content = (msg.content ?? '').trim()
+    let content = (msg.content ?? '').trim()
     if (content === '') return
 
     if (msg.chatType === 'p2p' && this.config.dmMode === 'disabled') return
@@ -181,6 +178,16 @@ export class InboundRouter {
       return
     }
 
+    // Attachments are archived before session work: an attachment-only message
+    // produces no model turn, and a caption mixed with attachments keeps only
+    // the caption as the prompt. The Agent reads the files on demand later.
+    const archived = await this.archiveAttachments(msg)
+    if (archived !== undefined) {
+      if (archived.attachmentOnly) return
+      content = archived.text
+      if (content === '') return
+    }
+
     // A session blocked on `ask_user_question` has no other use for an inbound
     // text message: the next reply becomes the free-text answer.
     if (await this.tryAnswerPendingQuestion(msg, content)) return
@@ -191,7 +198,7 @@ export class InboundRouter {
       if (record !== undefined) {
         await this.routeOperations.run(record.key, () => {
           if (!this.started) return
-          return this.continueSession(msg, this.routes.get(record.key) ?? record)
+          return this.continueSession(msg, this.routes.get(record.key) ?? record, content)
         })
         return
       }
@@ -203,7 +210,7 @@ export class InboundRouter {
     if (chatRecord !== undefined) {
       await this.routeOperations.run(chatRecord.key, () => {
         if (!this.started) return
-        return this.continueSession(msg, this.routes.get(chatRecord.key) ?? chatRecord)
+        return this.continueSession(msg, this.routes.get(chatRecord.key) ?? chatRecord, content)
       })
       return
     }
@@ -217,7 +224,7 @@ export class InboundRouter {
         && (record.kind === 'chat' || (msg.threadId !== undefined && msg.threadId === record.key))) {
         await this.routeOperations.run(record.key, () => {
           if (!this.started) return
-          return this.continueSession(msg, this.routes.get(record.key) ?? record)
+          return this.continueSession(msg, this.routes.get(record.key) ?? record, content)
         })
         return
       }
@@ -230,6 +237,40 @@ export class InboundRouter {
     if (msg.chatType === 'group' && this.config.requireMention && !msg.mentionedBot) return
 
     await this.startSession(msg, content)
+  }
+
+  /**
+   * Archive the attachment payload of one message, if any. Returns `undefined`
+   * when the message carries no archivable payload; otherwise the archive
+   * result whose `text` is the remaining prompt (possibly empty).
+   *
+   * Runs inside the same per-route FIFO as turns so a caption sent right after
+   * a file is queued behind the file's download instead of racing it.
+   */
+  private async archiveAttachments(msg: NormalizedMessage): Promise<AttachmentArchiveResult | undefined> {
+    const hasResources = (msg.resources ?? []).some(
+      resource => resource.type === 'image' || resource.type === 'file',
+    )
+    if (!hasResources && msg.rawContentType !== 'merge_forward') return undefined
+
+    const threadRecord = msg.threadId === undefined ? undefined : this.routes.get(msg.threadId)
+    const chatKey = chatRouteKey(msg.chatType, msg.chatId, msg.senderId)
+    const record = threadRecord ?? this.routes.get(chatKey)
+    // A brand-new group conversation still needs a mention; a topic the bot
+    // already owns does not.
+    if (record === undefined && msg.chatType === 'group'
+      && this.config.requireMention && !msg.mentionedBot) {
+      return { saved: 0, failed: 0, attachmentOnly: true, text: '' }
+    }
+
+    return await this.routeOperations.run(record?.key ?? chatKey, async () => {
+      if (!this.started) return { saved: 0, failed: 0, attachmentOnly: true, text: '' }
+      const workspacePath = record?.workspacePath
+        ?? (await ensureWorkspace(
+          this.ctx, this.config.baseDir, msg.chatType, msg.chatId, msg.senderId,
+        )).path
+      return await this.attachments.archive(msg, workspacePath)
+    })
   }
   /**
    * Consume one plain reply as an `ask_user_question` free-text answer.
@@ -368,10 +409,10 @@ export class InboundRouter {
 
     // 6. Stream into the card and hand the message to the driver.
     this.streamer?.attach(handle.agent.session, sent.messageId, msg.messageId, typingId)
-    handle.agent.followup(feishuUserMessage(content, await this.images.blocksFor(msg)))
+    handle.agent.followup(feishuUserMessage(content))
     return record
   }
-  private async continueSession(msg: NormalizedMessage, record: RouteRecord): Promise<void> {
+  private async continueSession(msg: NormalizedMessage, record: RouteRecord, content: string): Promise<void> {
     const typingPromise = this.delivery.requireChannel().addReaction(msg.messageId, 'Typing').catch(() => undefined)
     const live = await this.sessions.ensureLive(record)
 
@@ -396,6 +437,6 @@ export class InboundRouter {
       lastActivityAt: Date.now(),
     })
     this.streamer?.attach(live.agent.session, sent.messageId, msg.messageId, typingId)
-    live.agent.followup(feishuUserMessage(msg.content, await this.images.blocksFor(msg)))
+    live.agent.followup(feishuUserMessage(content))
   }
 }
