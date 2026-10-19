@@ -57,7 +57,7 @@ export { createLogicalSessionExport, DSH_CHANNELS_VERSION, LOGICAL_EXPORT_FORMAT
 export { addUsage, applyProjectionViews, averageDecodeTokensPerSecond, averageTtftMs, cacheHitPct, EMPTY_TOTALS, foldAll, foldEvent, foldSessionStats, measureSessionContext, readProjectionViews, usageFromBuckets } from './stats.ts'
 export { FeishuService } from './service.ts'
 export { TurnStreamer } from './streamer.ts'
-export { ensureWorkspace, workspacePathFor, workspaceTitleFor } from './workspaces.ts'
+export { ensureWorkspace, stagingPathFor, topicTokenFor, workspacePathFor, workspaceTitleFor } from './workspaces.ts'
 export { accessGroupRecordSchema, accessRequestRecordSchema, accessUserRecordSchema, appendSessionHistory, chatRouteKey, expiredRouteRecordSchema, feishuDomain, normalizeRouteRecord, normalizeSessionHistory, routeRecordSchema, sessionHistoryEntrySchema, inflightSnapshotSchema, processedRecordSchema } from './domain.ts'
 
 /** Cordis function-plugin name. */

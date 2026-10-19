@@ -144,7 +144,7 @@ const SELECT_OPTIONS: Partial<Record<EditableKey, ReadonlyArray<{ value: string;
 const FIELD_META: Record<EditableKey, { label: string; help: string; min?: number; max?: number; step?: number; placeholder?: string; wide?: boolean }> = {
   baseDir: {
     label: '工作区根目录（文件落点）',
-    help: '模型/工具产生的文件默认写在每个（用户 × 聊天）的工作区里：私聊 <baseDir>/p2p/<open_id>/，群聊 <baseDir>/groups/<chat_id>/<open_id>/。必须是绝对路径（~ 开头按家目录展开），保存时会创建该目录；只影响之后新建立的工作区 —— 已有话题即使 /renew 也沿用原工作区，旧文件不会迁移。',
+    help: '每个飞书话题拥有独立工作区：私聊 <baseDir>/p2p/<open_id>/<topic>/，群聊 <baseDir>/groups/<chat_id>/<open_id>/<topic>/（topic 来自话题 id）。必须是绝对路径（~ 开头按家目录展开），保存时会创建该目录；只影响之后新建立的工作区 —— 已有话题即使 /renew 也沿用原工作区，旧文件不会迁移。',
     placeholder: '/Users/you/.dsh/dsh-channels/workspaces',
     wide: true,
   },

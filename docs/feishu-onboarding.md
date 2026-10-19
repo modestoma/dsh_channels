@@ -107,7 +107,7 @@ chmod 600 $DSH_HOME/.credentials.yaml
 | 配置项 | 默认 | 说明 |
 |--------|------|------|
 | `appId` / `appSecret` | 必填 | 凭据引用名（shell 标识符），经 `ctx.credentials` 解析；明文密钥会被拒绝 |
-| `baseDir` | `./channels-data` | 工作区目录树根：`p2p/<open_id>/`、`groups/<chat_id>/<open_id>/`（模型/工具产生文件的落点）；Web 面板可覆盖，只接受绝对路径，`~` 展开，保存时创建并校验目录，只影响之后新建的会话 |
+| `baseDir` | `./channels-data` | 工作区目录树根：每个话题一个独立工作区，`p2p/<open_id>/<topic>/`、`groups/<chat_id>/<open_id>/<topic>/`（模型/工具产生文件的落点）；Web 面板可覆盖，只接受绝对路径，`~` 展开，保存时创建并校验目录，只影响之后新建的话题 |
 | `provider` / `model` | 部署默认 | 新建 session 的路由；省略时继承部署默认 |
 | `reasoningEffort` | 适配器/provider 默认 | Session 初始/重置推理档位；可在话题内用 `/effort` 覆盖 |
 | `maxTokens` | 适配器默认 | 每次模型请求输出上限 |
@@ -189,7 +189,7 @@ DSH_HOME=$DSH_HOME pnpm dsh web        # 默认 http://127.0.0.1:3080
 | 2 | 私聊续聊 | 在刚建的话题里直接再发消息（**不 @**） | 继续同一 session：卡片底部 session id 不变，input/output token 累计增长 |
 | 3 | 群聊 @ | 在普通群 @ 机器人发消息 | 同 #1；该消息成为新话题根 |
 | 4 | 群聊话题内 | 在上一步的话题里直接发消息（不 @） | 延续该 session，不再要求 @ |
-| 5 | 同群第二个用户 | 换另一个人 @ 机器人 | 新话题 + 新 session；dsh 工作区列表中出现**独立的第二个工作区**（`groups/<chat_id>/<用户 open_id>/`） |
+| 5 | 同群第二个用户 | 换另一个人 @ 机器人 | 新话题 + 新 session；dsh 工作区列表中出现**独立的第二个工作区**（`groups/<chat_id>/<用户 open_id>/<topic>/`），与原用户的话题工作区互不可见 |
 | 6 | 话题群 | 在话题群某话题中 @ 机器人 | 机器人直接在该话题内回复卡片（不新建话题） |
 | 7 | 折叠面板 | 点面板标题 | 展开推理内容，右侧箭头翻转向上；再点收起 |
 | 8 | 重启恢复 | 重启 dsh 后在旧话题里发消息 | 机器人懒恢复原 session，token 统计继续累计 |
@@ -220,9 +220,11 @@ DSH_HOME=$DSH_HOME pnpm dsh web        # 默认 http://127.0.0.1:3080
 打开 dsh Web GUI → 工作区列表，应看到：
 
 ```
-飞书私聊 · ou_xxx          （对应 <baseDir>/p2p/ou_xxx/）
-飞书群聊 · oc_yyy · ou_xxx （对应 <baseDir>/groups/oc_yyy/ou_xxx/）
+飞书私聊 · ou_xxx · omt_xxx          （对应 <baseDir>/p2p/ou_xxx/omt_xxx/）
+飞书群聊 · oc_yyy · ou_xxx · omt_xxx （对应 <baseDir>/groups/oc_yyy/ou_xxx/omt_xxx/）
 ```
+
+每个新话题会创建新的工作区目录；同一话题内 `/renew` 仍复用该工作区。
 
 ## 6. 常见问题排查
 

@@ -9,9 +9,9 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import {
-  adoptPendingAttachments, ATTACHMENTS_DIR, AttachmentIntake, attachmentResources, attachmentsRoot,
-  compactTimestamp, describeFailure, hasAttachmentPayload, legacyAttachmentsDir, pendingAttachmentsDir,
-  postAttachedFiles, prepareAttachmentsRoot, sanitizeFileName, sessionAttachmentsDir, stripAttachmentPlaceholders,
+  adoptStagedAttachments, ATTACHMENTS_DIR, AttachmentIntake, attachmentResources, attachmentsDir,
+  compactTimestamp, describeFailure, hasAttachmentPayload, postAttachedFiles, sanitizeFileName,
+  stripAttachmentPlaceholders,
 } from '../src/feishu/inbound-attachments.ts'
 import { FEISHU_ATTACHMENTS_SECTION, attachmentsGuidance } from '../src/feishu/agent-context.ts'
 import type { FeishuChannel } from '../src/feishu-channel.ts'
@@ -200,16 +200,16 @@ describe('attachment intake', () => {
 })
 
 describe('agent guidance', () => {
-  it('points the Agent at its per-session attachment directory', () => {
-    expect(attachmentsGuidance()).toContain('private attachment directory')
-    const withPath = attachmentsGuidance('/tmp/feishu-ws/attachments/session-1')
-    expect(withPath).toContain('/tmp/feishu-ws/attachments/session-1')
-    expect(withPath).toContain('Sibling directories')
+  it('points the Agent at its conversation attachment directory', () => {
+    expect(attachmentsGuidance()).toContain('own attachments directory')
+    const withPath = attachmentsGuidance('/tmp/feishu-ws/topic-1/attachments')
+    expect(withPath).toContain('/tmp/feishu-ws/topic-1/attachments')
+    expect(withPath).toContain('separate workspaces')
     expect(FEISHU_ATTACHMENTS_SECTION).toBe('dsh-channels:feishu-attachments')
   })
 
   it('escapes backticks in a hostile directory path', () => {
-    expect(attachmentsGuidance('/tmp/a`b/attachments/session-1')).toContain("/tmp/a'b/attachments/session-1")
+    expect(attachmentsGuidance('/tmp/a`b/topic/attachments')).toContain("/tmp/a'b/topic/attachments")
   })
 })
 
@@ -318,41 +318,28 @@ describe('rich-text post attachments', () => {
   })
 })
 
-describe('per-session attachment isolation', () => {
-  it('derives session and pending directories from one workspace root', () => {
+describe('topic workspace attachments', () => {
+  it('derives the attachments directory from one topic workspace', () => {
     const workspace = makeWorkspace()
-    const root = attachmentsRoot(workspace)
-    expect(root).toBe(path.join(workspace, ATTACHMENTS_DIR))
-    expect(sessionAttachmentsDir(workspace, 'session-abc')).toBe(path.join(root, 'session-abc'))
-    expect(pendingAttachmentsDir(workspace)).toBe(path.join(root, '_pending'))
-    expect(sessionAttachmentsDir(workspace, '../../evil id')).toBe(path.join(root, '_.._evil_id'))
+    expect(attachmentsDir(workspace)).toBe(path.join(workspace, ATTACHMENTS_DIR))
+    expect(ATTACHMENTS_DIR).toBe('attachments')
   })
 
-  it('moves legacy flat files into _legacy exactly once', async () => {
+  it('adopts staged files into the topic workspace exactly once', async () => {
     const workspace = makeWorkspace()
-    mkdirSync(path.join(workspace, ATTACHMENTS_DIR), { recursive: true })
-    writeFileSync(path.join(workspace, ATTACHMENTS_DIR, 'old.bin'), 'legacy')
-    await prepareAttachmentsRoot(workspace)
-    await prepareAttachmentsRoot(workspace)
+    const staging = path.join(workspace, 'staging')
+    mkdirSync(staging, { recursive: true })
+    writeFileSync(path.join(staging, 'a.zip'), 'a')
+    writeFileSync(path.join(staging, 'b.zip'), 'b')
+    writeFileSync(path.join(staging, '.hidden'), 'ignored')
 
-    expect(readdirSync(path.join(workspace, ATTACHMENTS_DIR))).not.toContain('old.bin')
-    expect(readdirSync(legacyAttachmentsDir(workspace))).toEqual(['old.bin'])
-  })
+    expect(await adoptStagedAttachments(staging, workspace)).toBe(2)
+    expect(readdirSync(attachmentsDir(workspace)).sort()).toEqual(['a.zip', 'b.zip'])
+    expect(readdirSync(staging)).toEqual(['.hidden'])
 
-  it('adopts staged pending files into one session directory', async () => {
-    const workspace = makeWorkspace()
-    const pending = pendingAttachmentsDir(workspace)
-    mkdirSync(pending, { recursive: true })
-    writeFileSync(path.join(pending, 'a.zip'), 'a')
-    writeFileSync(path.join(pending, 'b.zip'), 'b')
-
-    expect(await adoptPendingAttachments(workspace, 'session-one')).toBe(2)
-    expect(readdirSync(sessionAttachmentsDir(workspace, 'session-one')).sort()).toEqual(['a.zip', 'b.zip'])
-    expect(readdirSync(pending)).toEqual([])
-
-    // A second session adopts nothing; the first keeps its own files.
-    expect(await adoptPendingAttachments(workspace, 'session-two')).toBe(0)
-    expect(existsSync(sessionAttachmentsDir(workspace, 'session-two'))).toBe(false)
+    // Nothing left to adopt on the next attempt.
+    expect(await adoptStagedAttachments(staging, workspace)).toBe(0)
+    expect(await adoptStagedAttachments(path.join(workspace, 'missing'), workspace)).toBe(0)
   })
 })
 

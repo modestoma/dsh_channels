@@ -1,8 +1,13 @@
 /**
  * Workspace directory resolution: one DSH workspace per (user × chat).
  *
- * - p2p:    `<baseDir>/p2p/<open_id>/`           (the user's private workspace)
- * - group:  `<baseDir>/groups/<chat_id>/<open_id>/` (per-user workspace inside a group)
+ * Every Feishu topic gets its own workspace, grouped by the (chat, user) pair:
+ * - p2p:    `<baseDir>/p2p/<open_id>/<topic>/`
+ * - group:  `<baseDir>/groups/<chat_id>/<open_id>/<topic>/`
+ *
+ * Attachments received before a topic exists are staged below
+ * `<baseDir>/_staging/<chatType>/<chat_id>/<open_id>/` and adopted into the
+ * topic workspace once its first Session is created.
  *
  * Feishu ids (`ou_…`, `oc_…`) are safe path segments, but they are validated
  * anyway so a hostile id can never escape `baseDir`.
@@ -105,8 +110,47 @@ export function safeSegment(raw: string, what: string): string {
   return segment
 }
 
-/** Deterministic workspace directory for one (chat, user) pair. */
+/**
+ * Stable, filesystem-safe token for one Feishu conversation: a real topic uses
+ * its thread id, while a degraded chat-scoped conversation uses the Session id
+ * that owns it (there is no topic boundary to key on).
+ */
+export function topicTokenFor(
+  routeKey: string,
+  kind: 'thread' | 'chat',
+  sessionId: string,
+): string {
+  return kind === 'thread' ? safeSegment(routeKey, 'route key') : safeSegment(sessionId, 'session id')
+}
+
+/**
+ * Deterministic workspace directory for one Feishu topic: every route gets its
+ * own workspace below its (user × chat) grouping directory.
+ *
+ * - p2p:   `<baseDir>/p2p/<open_id>/<topic>/`
+ * - group: `<baseDir>/groups/<chat_id>/<open_id>/<topic>/`
+ */
 export function workspacePathFor(
+  baseDir: string,
+  chatType: 'p2p' | 'group',
+  chatId: string,
+  senderOpenId: string,
+  topicToken: string,
+): string {
+  const chat = safeSegment(chatId, 'chatId')
+  const user = safeSegment(senderOpenId, 'senderOpenId')
+  const topic = safeSegment(topicToken, 'topic token')
+  return chatType === 'p2p'
+    ? path.join(baseDir, 'p2p', user, topic)
+    : path.join(baseDir, 'groups', chat, user, topic)
+}
+
+/**
+ * Staging directory for attachments that arrive before their topic (and so
+ * its workspace) exists. Not a registered workspace: files move into the real
+ * workspace as soon as the first Session of that topic is created.
+ */
+export function stagingPathFor(
   baseDir: string,
   chatType: 'p2p' | 'group',
   chatId: string,
@@ -114,21 +158,25 @@ export function workspacePathFor(
 ): string {
   const chat = safeSegment(chatId, 'chatId')
   const user = safeSegment(senderOpenId, 'senderOpenId')
-  return chatType === 'p2p'
-    ? path.join(baseDir, 'p2p', user)
-    : path.join(baseDir, 'groups', chat, user)
+  return path.join(baseDir, '_staging', chatType, chat, user)
 }
 
 /** Human-friendly workspace title shown in the DSH workspace list. */
-export function workspaceTitleFor(chatType: 'p2p' | 'group', chatId: string, senderOpenId: string): string {
-  return chatType === 'p2p'
+export function workspaceTitleFor(
+  chatType: 'p2p' | 'group',
+  chatId: string,
+  senderOpenId: string,
+  topicToken?: string,
+): string {
+  const base = chatType === 'p2p'
     ? `飞书私聊 · ${senderOpenId}`
     : `飞书群聊 · ${chatId} · ${senderOpenId}`
+  return topicToken === undefined ? base : `${base} · ${topicToken}`
 }
 
 /**
- * Ensure the workspace directory exists and is registered with the host's
- * workspace registry. Idempotent: repeated calls return the same record.
+ * Ensure one topic's workspace directory exists and is registered with the
+ * host's workspace registry. Idempotent: repeated calls return the same record.
  */
 export async function ensureWorkspace(
   ctx: HostContext,
@@ -136,8 +184,12 @@ export async function ensureWorkspace(
   chatType: 'p2p' | 'group',
   chatId: string,
   senderOpenId: string,
+  topicToken: string,
 ): Promise<Workspace> {
-  const dir = workspacePathFor(baseDir, chatType, chatId, senderOpenId)
+  const dir = workspacePathFor(baseDir, chatType, chatId, senderOpenId, topicToken)
   await mkdir(dir, { recursive: true })
-  return ctx.workspaceRegistry.create(dir, workspaceTitleFor(chatType, chatId, senderOpenId))
+  return ctx.workspaceRegistry.create(
+    dir,
+    workspaceTitleFor(chatType, chatId, senderOpenId, topicToken),
+  )
 }

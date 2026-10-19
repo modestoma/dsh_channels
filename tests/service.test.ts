@@ -1396,7 +1396,7 @@ describe('FeishuService', () => {
     // Agent created with the workspace directory.
     expect(h.ctxState.agents.created).toHaveLength(1)
     const created = h.ctxState.agents.created[0]!
-    const workspacePath = path.join(h.config.baseDir, 'p2p', 'ou_alice')
+    const workspacePath = path.join(h.config.baseDir, 'p2p', 'ou_alice', 'omt_1')
     expect(created.options.meta?.cwd).toBe(workspacePath)
     expect(created.options.agentOptions).toEqual({
       provider: 'deepseek-official',
@@ -1530,10 +1530,13 @@ describe('FeishuService', () => {
     await h.onMessage(makeMessage({ chatType: 'group', chatId: 'oc_grp', senderId: 'ou_alice', content: 'a' }))
     await h.onMessage(makeMessage({ chatType: 'group', chatId: 'oc_grp', senderId: 'ou_bob', threadId: 'omt_2', content: 'b' }))
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
-    const aliceDir = path.join(h.config.baseDir, 'groups', 'oc_grp', 'ou_alice')
-    const bobDir = path.join(h.config.baseDir, 'groups', 'oc_grp', 'ou_bob')
-    const cwds = h.ctxState.agents.created.map(entry => entry.options.meta?.cwd).sort()
-    expect(cwds).toEqual([aliceDir, bobDir].sort())
+    const cwds = h.ctxState.agents.created.map(entry => entry.options.meta?.cwd as string)
+    expect(cwds).toHaveLength(2)
+    const aliceDir = cwds.find(cwd => cwd.includes(`${path.sep}ou_alice${path.sep}`))!
+    const bobDir = cwds.find(cwd => cwd.includes(`${path.sep}ou_bob${path.sep}`))!
+    expect(path.dirname(aliceDir)).toBe(path.join(h.config.baseDir, 'groups', 'oc_grp', 'ou_alice'))
+    expect(path.dirname(bobDir)).toBe(path.join(h.config.baseDir, 'groups', 'oc_grp', 'ou_bob'))
+    expect(aliceDir).not.toBe(bobDir)
   })
 
   it('ignores messages from the bot itself and empty content', async () => {
@@ -3005,7 +3008,7 @@ describe('inbound attachments', () => {
       .map(([, value]) => value)[0]!
     const sections = promptSectionsOf(h.ctxState.agents.created[0]!.setupCtx)
     const guidance = sections.find(section => section.name === FEISHU_ATTACHMENTS_SECTION)
-    expect(guidance?.text).toContain(`${record.workspacePath}/attachments/${record.sessionId}`)
+    expect(guidance?.text).toContain(`${record.workspacePath}/attachments`)
     await h.service.shutdown()
   })
 
@@ -3019,7 +3022,7 @@ describe('inbound attachments', () => {
       resources: [{ type: 'image', fileKey: 'img_1' }] as never,
     }))
 
-    const dir = path.join(h.config.baseDir, 'groups', 'oc_image', 'ou_owner', 'attachments', '_pending')
+    const dir = path.join(h.config.baseDir, '_staging', 'group', 'oc_image', 'ou_owner')
     const finalFiles = () => readdirSync(dir).filter(name => !name.startsWith('.tmp-'))
     await waitUntil(() => expect(finalFiles()).toHaveLength(1))
     const [name] = finalFiles()
@@ -3040,9 +3043,9 @@ describe('inbound attachments', () => {
       content: '<file key="file_1" name="report.pdf"/>',
       resources: [{ type: 'file', fileKey: 'file_1', fileName: 'report.pdf' }] as never,
     }))
-    const pending = path.join(h.config.baseDir, 'groups', chatId, senderId, 'attachments', '_pending')
-    await waitUntil(() => expect(readdirSync(pending).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1))
-    expect(readdirSync(pending).filter(name => !name.startsWith('.tmp-'))[0]).toMatch(/report\.pdf$/)
+    const staging = path.join(h.config.baseDir, '_staging', 'group', chatId, senderId)
+    await waitUntil(() => expect(readdirSync(staging).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1))
+    expect(readdirSync(staging).filter(name => !name.startsWith('.tmp-'))[0]).toMatch(/report\.pdf$/)
     expect(h.ctxState.agents.created).toHaveLength(0)
 
     await h.onMessage(makeMessage({
@@ -3052,10 +3055,10 @@ describe('inbound attachments', () => {
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
     const record = [...(h.ctxState.domain.raw.table('routes').entries() as Iterable<[string, RouteRecord]>)]
       .map(([, value]) => value)[0]!
-    const sessionDir = path.join(h.config.baseDir, 'groups', chatId, senderId, 'attachments', record.sessionId)
-    await waitUntil(() => expect(readdirSync(sessionDir).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1))
-    expect(readdirSync(sessionDir).filter(name => !name.startsWith('.tmp-'))[0]).toMatch(/report\.pdf$/)
-    expect(readdirSync(pending)).toEqual([])
+    const workspaceAttachments = path.join(record.workspacePath, 'attachments')
+    await waitUntil(() => expect(readdirSync(workspaceAttachments).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1))
+    expect(readdirSync(workspaceAttachments).filter(name => !name.startsWith('.tmp-'))[0]).toMatch(/report\.pdf$/)
+    expect(readdirSync(staging)).toEqual([])
     const agent = h.ctxState.agents.created[0]!.handle.agent
     const message = mock(agent.followup).mock.calls[0]![0] as { content: Array<{ type: string; text?: string }> }
     expect(message.content).toEqual([{ type: 'text', text: '看 report.pdf 的第一页' }])
@@ -3069,7 +3072,7 @@ describe('inbound attachments', () => {
       content: '<forwarded_messages>\n[alice] 明天评审\n</forwarded_messages>',
       rawContentType: 'merge_forward',
     }))
-    const dir = path.join(h.config.baseDir, 'groups', 'oc_forward', 'ou_owner', 'attachments', '_pending')
+    const dir = path.join(h.config.baseDir, '_staging', 'group', 'oc_forward', 'ou_owner')
     await waitUntil(() => expect(readdirSync(dir)).toHaveLength(1))
     const [name] = readdirSync(dir)
     expect(name).toMatch(/-forwarded-record\.txt$/)
@@ -3099,7 +3102,7 @@ describe('inbound attachments', () => {
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
     const record = [...(h.ctxState.domain.raw.table('routes').entries() as Iterable<[string, RouteRecord]>)]
       .map(([, value]) => value)[0]!
-    const dir = path.join(h.config.baseDir, 'groups', 'oc_post_file', 'ou_owner', 'attachments', record.sessionId)
+    const dir = path.join(record.workspacePath, 'attachments')
     await waitUntil(() => expect(readdirSync(dir).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1))
     expect(readdirSync(dir)[0]).toMatch(/-bugreport-2025-11-04-141749\.zip$/)
     const agent = h.ctxState.agents.created[0]!.handle.agent
@@ -3108,7 +3111,7 @@ describe('inbound attachments', () => {
     await h.service.shutdown()
   })
 
-  it('keeps attachments isolated per Session inside one workspace', async () => {
+  it('gives every new topic its own workspace and attachments directory', async () => {
     const h = await setup()
     const chatId = 'oc_iso'
     const senderId = 'ou_owner'
@@ -3125,7 +3128,7 @@ describe('inbound attachments', () => {
       messageId: 'om_iso_a_img', content: '![image](img_a)',
       resources: [{ type: 'image', fileKey: 'img_a' }] as never,
     }))
-    const dirA = path.join(h.config.baseDir, 'groups', chatId, senderId, 'attachments', routeA.sessionId)
+    const dirA = path.join(routeA.workspacePath, 'attachments')
     await waitUntil(() => expect(readdirSync(dirA).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1))
 
     await h.onMessage(makeMessage({
@@ -3138,12 +3141,16 @@ describe('inbound attachments', () => {
       messageId: 'om_iso_b_img', content: '![image](img_b)',
       resources: [{ type: 'image', fileKey: 'img_b' }] as never,
     }))
-    const dirB = path.join(h.config.baseDir, 'groups', chatId, senderId, 'attachments', routeB.sessionId)
+    const dirB = path.join(routeB.workspacePath, 'attachments')
     await waitUntil(() => expect(readdirSync(dirB).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1))
 
-    expect(routeA.sessionId).not.toBe(routeB.sessionId)
+    // Each topic owns a fresh workspace named after its thread id.
+    expect(routeB.workspacePath).not.toBe(routeA.workspacePath)
+    expect(path.basename(routeA.workspacePath)).toBe(routeA.key)
+    expect(path.basename(routeB.workspacePath)).toBe(routeB.key)
     expect(readdirSync(dirA).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1)
     expect(readdirSync(dirB).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1)
+
     const guidanceB = promptSectionsOf(h.ctxState.agents.created[1]!.setupCtx)
       .find(section => section.name === FEISHU_ATTACHMENTS_SECTION)?.text ?? ''
     expect(guidanceB).toContain(dirB)
@@ -3193,7 +3200,7 @@ describe('inbound attachments', () => {
     expect(message.content).toEqual([{ type: 'text', text: '看这张图 里有什么' }])
     const record = [...(h.ctxState.domain.raw.table('routes').entries() as Iterable<[string, RouteRecord]>)]
       .map(([, value]) => value)[0]!
-    const dir = path.join(h.config.baseDir, 'groups', 'oc_caption', 'ou_owner', 'attachments', record.sessionId)
+    const dir = path.join(record.workspacePath, 'attachments')
     await waitUntil(() => expect(readdirSync(dir).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1))
     await h.service.shutdown()
   })

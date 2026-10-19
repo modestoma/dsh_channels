@@ -29,98 +29,38 @@ import { sniffImageMediaType } from '../feishu-channel.ts'
 /** Workspace subdirectory that holds every archived attachment. */
 export const ATTACHMENTS_DIR = 'attachments'
 
-/** Root below `<workspace>/attachments/` that holds files not yet bound to a session. */
-const PENDING_DIR = '_pending'
-
-/** Root below `<workspace>/attachments/` that holds pre-isolation flat attachments. */
-const LEGACY_DIR = '_legacy'
-
-/** Marker proving the one-time legacy migration already ran for one workspace. */
-const LEGACY_MARKER = '.legacy-migrated'
-
-/** `<workspace>/attachments` directory. */
-export function attachmentsRoot(workspacePath: string): string {
+/** `<workspace>/attachments` directory of one topic workspace. */
+export function attachmentsDir(workspacePath: string): string {
   return path.join(workspacePath, ATTACHMENTS_DIR)
 }
 
-/** Private attachment directory of one Session. */
-export function sessionAttachmentsDir(workspacePath: string, sessionId: string): string {
-  return path.join(attachmentsRoot(workspacePath), safeDirectoryName(sessionId))
-}
-
-/** Staging directory for attachments received before their Session exists. */
-export function pendingAttachmentsDir(workspacePath: string): string {
-  return path.join(attachmentsRoot(workspacePath), PENDING_DIR)
-}
-
-/** Directory that keeps flat attachments written before per-session isolation. */
-export function legacyAttachmentsDir(workspacePath: string): string {
-  return path.join(attachmentsRoot(workspacePath), LEGACY_DIR)
-}
-
-/** Filesystem-safe single segment for a Session id (Feishu ids are opaque). */
-function safeDirectoryName(raw: string): string {
-  const cleaned = raw.replace(/[^A-Za-z0-9._-]/gu, '_').replace(/^[.]+/u, '')
-  return cleaned === '' ? 'session' : cleaned.slice(0, 120)
-}
-
 /**
- * Prepare the attachment root for one workspace and run the one-time migration
- * of pre-isolation flat files into `_legacy/`. Files already in a session or
- * pending directory are untouched. Best-effort: a migration failure leaves the
- * files in place and is reported to the caller through the thrown error.
- */
-export async function prepareAttachmentsRoot(workspacePath: string): Promise<string> {
-  const root = attachmentsRoot(workspacePath)
-  await mkdir(root, { recursive: true })
-  const marker = path.join(root, LEGACY_MARKER)
-  try {
-    await stat(marker)
-  } catch {
-    const legacy = legacyAttachmentsDir(workspacePath)
-    let entries: Array<{ name: string; isFile(): boolean }> = []
-    try {
-      entries = await readdir(root, { withFileTypes: true })
-    } catch {
-      entries = []
-    }
-    const legacyFiles = entries.filter(entry => entry.isFile() && !entry.name.startsWith('.'))
-    if (legacyFiles.length > 0) {
-      await mkdir(legacy, { recursive: true })
-      for (const entry of legacyFiles) {
-        const destination = await uniqueName(legacy, entry.name)
-        await rename(path.join(root, entry.name), path.join(legacy, destination)).catch(() => undefined)
-      }
-    }
-    await writeFile(marker, '', { encoding: 'utf8', mode: 0o600 })
-  }
-  return root
-}
-
-/**
- * Move every staged (`_pending/`) file into one Session's private directory.
- * Called when the Session is created (fresh topic) or resumed, so attachments
- * received before the conversation existed still belong to it.
+ * Move every staged attachment into one topic workspace. Staging holds files
+ * received before their topic (and therefore its workspace) existed; they
+ * belong to the first Session created for that topic. Best-effort per file.
  *
  * @returns how many files were adopted.
  */
-export async function adoptPendingAttachments(workspacePath: string, sessionId: string): Promise<number> {
-  const pending = pendingAttachmentsDir(workspacePath)
+export async function adoptStagedAttachments(stagingDir: string, workspacePath: string): Promise<number> {
   let entries: Array<{ name: string; isFile(): boolean }>
   try {
-    entries = await readdir(pending, { withFileTypes: true })
+    entries = await readdir(stagingDir, { withFileTypes: true })
   } catch {
     return 0
   }
   const files = entries.filter(entry => entry.isFile() && !entry.name.startsWith('.'))
   if (files.length === 0) return 0
-  const target = sessionAttachmentsDir(workspacePath, sessionId)
-  await mkdir(target, { recursive: true })
+  const target = attachmentsDir(workspacePath)
+  try {
+    await mkdir(target, { recursive: true })
+  } catch {
+    return 0
+  }
   let adopted = 0
   for (const entry of files) {
     const destination = await uniqueName(target, entry.name)
     try {
-      await rename(path.join(pending, entry.name), path.join(target, destination))
+      await rename(path.join(stagingDir, entry.name), path.join(target, destination))
       adopted += 1
     } catch {
       // Leave the staged file for the next attempt; never block the turn.

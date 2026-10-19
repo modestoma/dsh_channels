@@ -10,7 +10,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import type { AgentHandle, HostContext, SessionId, UserMessage } from '../dsh-types.ts'
+import type { AgentHandle, HostContext, SessionId, UserMessage, Workspace } from '../dsh-types.ts'
 import type { FeishuConfig } from '../config.ts'
 import { buildCard, buildOnboardingCard, initialStreamingCard } from '../cards.ts'
 import { RouteOperationQueue } from '../commands.ts'
@@ -18,8 +18,7 @@ import { chatRouteKey } from '../domain.ts'
 import type { FeishuDomainHandle, RouteRecord } from '../domain.ts'
 import type { CardDelivery } from '../feishu/delivery.ts'
 import {
-  adoptPendingAttachments, hasAttachmentPayload, pendingAttachmentsDir, prepareAttachmentsRoot,
-  sessionAttachmentsDir,
+  adoptStagedAttachments, attachmentsDir, hasAttachmentPayload,
 } from '../feishu/inbound-attachments.ts'
 import { AttachmentIntake } from '../feishu/inbound-attachments.ts'
 import type { AttachmentArchiveResult, AttachmentFailure } from '../feishu/inbound-attachments.ts'
@@ -29,7 +28,7 @@ import type { InflightRepair } from '../session/repair.ts'
 import type { SessionManager } from '../session/manager.ts'
 import type { RouteStore } from '../session/routes.ts'
 import type { TurnStreamer } from '../streamer.ts'
-import { ensureWorkspace } from '../workspaces.ts'
+import { ensureWorkspace, stagingPathFor, topicTokenFor } from '../workspaces.ts'
 
 /** The command plane the inbound router delegates admission-time work to. */
 export interface CommandPlanePort {
@@ -314,17 +313,12 @@ export class InboundRouter {
 
     return await this.routeOperations.run(record?.key ?? chatKey, async () => {
       if (!this.started) return { saved: 0, failed: 0, failures: [], attachmentOnly: true, text: '' }
-      const workspacePath = record?.workspacePath
-        ?? (await ensureWorkspace(
-          this.ctx, this.config.baseDir, msg.chatType, msg.chatId, msg.senderId,
-        )).path
-      await prepareAttachmentsRoot(workspacePath)
-      // Attachments belong to the conversation that received them: an existing
-      // route has a Session directory, while a not-yet-created Session stages
-      // files in _pending/ until establishment adopts them.
+      // An existing topic has a workspace already; a conversation without one
+      // stages files below baseDir until its first Session creates the topic
+      // workspace and adopts them.
       const directory = record === undefined
-        ? pendingAttachmentsDir(workspacePath)
-        : sessionAttachmentsDir(workspacePath, record.sessionId)
+        ? stagingPathFor(this.config.baseDir, msg.chatType, msg.chatId, msg.senderId)
+        : attachmentsDir(record.workspacePath)
       return await this.attachments.archive(msg, directory)
     })
   }
@@ -397,21 +391,38 @@ export class InboundRouter {
     // 1. "Typing" reaction immediately (id captured for the swap).
     const typingPromise = this.delivery.requireChannel().addReaction(msg.messageId, 'Typing').catch(() => undefined)
 
-    // 2. Workspace directory for this (user × chat) pair.
-    const workspace = await ensureWorkspace(
-      this.ctx, this.config.baseDir, msg.chatType, msg.chatId, msg.senderId,
-    )
-
     const sessionId = randomUUID() as SessionId
-    // Attachments received before this Session existed belong to it.
-    await adoptPendingAttachments(workspace.path, sessionId).catch((error: unknown) => {
-      this.ctx.logger?.warn?.('dsh-channels: adopting pending attachments failed: %s', String(error))
-    })
     const initialStats = { sessionId, inputTokens: 0, outputTokens: 0 }
 
-    // 3. First card frame — also creates the topic (reply_in_thread).
+    // 2. First card frame — also creates the topic (reply_in_thread). The
+    //    topic identity is only known after Feishu answers, and it decides the
+    //    workspace: every new topic gets its own directory.
     const sent = await this.delivery.replyFirstCard(msg, initialStreamingCard(sessionId))
     const typingId = await typingPromise
+    const key = sent.degraded || sent.threadId === undefined ? chatKey : sent.threadId
+    const kind = sent.degraded || sent.threadId === undefined ? 'chat' : 'thread'
+
+    // 3. Workspace for this topic, then adopt attachments staged before it.
+    let workspace: Workspace
+    try {
+      workspace = await ensureWorkspace(
+        this.ctx, this.config.baseDir, msg.chatType, msg.chatId, msg.senderId,
+        topicTokenFor(key, kind, sessionId),
+      )
+      await adoptStagedAttachments(
+        stagingPathFor(this.config.baseDir, msg.chatType, msg.chatId, msg.senderId),
+        workspace.path,
+      )
+    } catch (error) {
+      void this.repair.clear(sent.messageId)
+      await this.delivery.requireChannel().updateCard(sent.messageId, buildCard({
+        phase: 'done',
+        reasoning: '',
+        body: `会话创建失败：${String(error)}`,
+        stats: { ...initialStats },
+      })).catch(() => {})
+      throw error
+    }
 
     // 3.5 Repair snapshot FIRST (before the route record and the agent):
     // the crash window between the two writes then degrades to an orphan
@@ -451,11 +462,10 @@ export class InboundRouter {
     })
 
     // 5. Persist the route (thread-scoped, or degraded chat-scoped).
-    const key = sent.degraded || sent.threadId === undefined ? chatKey : sent.threadId
     const createdAt = handle.agent.session.header.createdAt
     const record: RouteRecord = {
       key,
-      kind: sent.degraded || sent.threadId === undefined ? 'chat' : 'thread',
+      kind,
       sessionId,
       chatId: msg.chatId,
       chatType: msg.chatType,
@@ -477,6 +487,14 @@ export class InboundRouter {
     // Defence in depth: every current caller checks this first, but a future
     // call path must not be able to continue another user's Session.
     if (!this.access.ownsRoute(msg, record)) return
+    // Files staged before this conversation's topic existed follow its next
+    // turn (for example a file sent in the chat before the first prompt).
+    await adoptStagedAttachments(
+      stagingPathFor(this.config.baseDir, msg.chatType, msg.chatId, msg.senderId),
+      record.workspacePath,
+    ).catch((error: unknown) => {
+      this.ctx.logger?.warn?.('dsh-channels: adopting staged attachments failed: %s', String(error))
+    })
     const typingPromise = this.delivery.requireChannel().addReaction(msg.messageId, 'Typing').catch(() => undefined)
     const live = await this.sessions.ensureLive(record)
 

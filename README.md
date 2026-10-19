@@ -5,8 +5,8 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 - 对话入口：私聊、群聊 @ 机器人、话题群 @ 机器人
 - 收到触发消息：立刻加 **“Typing”** 表情 → 以话题形式回复（**创建话题**）→ 绑定 DSH session → 卡片 2.0 **流式回复** → 成功时更新为 **“DONE”**，失败时更新为 **“No”**
 - 话题内后续消息**无需再 @**，自动延续该 session
-- 工作区归属：私聊一人一工作区；群里**每个用户各自一个工作区**（同群不同用户互不影响）
-- **附件落盘（按会话隔离）**：飞书图片、文件（含富文本消息中附带、普通消息里看不到的 `files`）、合并转发的聊天记录由插件流式保存到**当前 Session 私有目录** `<workspace>/attachments/<session-id>/`（只发附件、不带说明的消息不触发模型请求）；Agent 用 `read_image` / `read` / `bash` 按需读取，未引用的附件不消耗 token，其它会话的附件不会被列进本会话
+- 工作区归属：**每个话题一个独立工作区**（按用户 × 聊天的上层目录分组，同群不同用户互不影响）；话题之间不共享文件
+- **附件落盘（话题工作区内）**：飞书图片、文件（含富文本消息中附带、普通消息里看不到的 `files`）、合并转发的聊天记录由插件流式保存到**当前话题工作区的 `attachments/`**（只发附件、不带说明的消息不触发模型请求）；Agent 用 `read_image` / `read` / `bash` 按需读取，未引用的附件不消耗 token。每个话题独立工作区，因此其它话题的附件不会出现在本话题
 - **HITL 审批**：当模型请求需要授权的动作（如 bash 沙箱升级 `sandbox_permissions`）时，插件监听主机 `approval/request` 事件，在同一话题里**新发一张独立审批决策卡**（✅ 允许 / ❌ 拒绝 按钮），用户点击后回填主机审批结果；超时（`approvalTimeoutMs`，默认 5 分钟）自动拒绝（fail-closed），非会话发起人点击无效
 - **结构化提问**：模型调用 `ask_user_question` 时，插件监听主机 `user-questions/request` 瀑布并发一张问答卡（每个问题一组选项按钮，多选先勾选再「提交本题选择」），答案回填给模型；主机自带的应答者只有 Web 客户端，没有本插件时纯飞书会话会以 `NO_PROVIDER` 失败。超时（`questionTimeoutMs`，默认 5 分钟）或回合取消时本轮提问失败（fail-closed）；没有可选项的问题直接提示用文字作答，**阻塞期间普通文本回复即作为该问题的自由文本答案**（同时支持多选后的自定义文本）
 - **准入与授权（默认开启）**：**管理员不受白名单限制**（私聊、任意群聊——包括尚未授权的群——都能直接发起会话）；其他人私聊只收到一条固定提示（`/userid` 例外），群聊需要「群已授权 + 用户在全局白名单」两层同时命中。机器人被拉进群后私聊管理员发**群信息卡**（未授权群附授权按钮，用于放行白名单用户）；已授权群里未授权用户 @ 会触发用户授权卡。授权入口：飞书 `/auth` 命令、授权卡、Web 设置面板；管理员 open_id 在面板配置（私聊 `/userid` 获取）
@@ -76,7 +76,7 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 
 **模型选择器**：模型与推理在面板里是**独立的一张卡片**（不再放在「常用配置」下）：宿主 LLM 服务可用时，`provider` / `model` / `reasoningEffort` 与 `agentPreset` 渲染为**下拉选择**而不是手填：provider 来自 `ctx.llm.listProviders()`，model 来自所选 provider 的 `listModels()`，推理档位来自 `resolveModelInfo(provider, model).reasoning.efforts`，Agent 预设来自 `agentPresets.list()`。每个选择器的首项是「留空 = 部署默认 / 适配器默认 / roster 默认」，有部署默认模型（`agentDefaultModel`）或 roster 默认预设时会在标签里带上具体值。选择按依赖级联：先选 provider 才会加载 model，选了 model 才会加载推理档位；宿主暂时无法枚举的项（服务未挂载、适配器查询失败/超时）自动退回原来的自由文本框，已保存但当前列表里没有的值会作为「当前配置，不在宿主机列表中」选项保留，不会在打开面板时被静默改掉。级联查询走只读的 `GET /dsh-channels/catalog?provider=…&model=…`（Host 侧短 TTL 缓存，单次查询 4 秒上限）。`provider` 与 `model` 在宿主侧是一条完整的请求路由，因此面板保存时要求**两者同时设置或同时留空**，不允许只选一半。
 
-`baseDir` 是**模型/工具产生文件的落点**（每个「用户 × 聊天」一个工作区：私聊 `<baseDir>/p2p/<open_id>/`，群聊 `<baseDir>/groups/<chat_id>/<open_id>/`）。面板里只接受**绝对路径**（`~` 开头按家目录展开，拒绝文件系统根目录），保存时会创建并校验该目录，不可用时当场报错，不会等到飞书里提示「会话创建失败」。已有 Session / 工作区不会被迁移，因此切到新目录后旧话题继续用旧工作区（话题内 `/renew` 也一样），只有之后新开的话题/会话使用新目录。
+`baseDir` 是**模型/工具产生文件的落点**：**每个飞书话题拥有一个独立工作区**（私聊 `<baseDir>/p2p/<open_id>/<topic>/`，群聊 `<baseDir>/groups/<chat_id>/<open_id>/<topic>/`，topic 来自话题 id；无话题的降级会话用 session id）。面板里只接受**绝对路径**（`~` 开头按家目录展开，拒绝文件系统根目录），保存时会创建并校验该目录，不可用时当场报错，不会等到飞书里提示「会话创建失败」。已有 Session / 工作区不会被迁移，因此切到新目录后旧话题继续用旧工作区（话题内 `/renew` 也一样），只有之后新开的话题使用新目录。
 
 **工作区清理**：设置面板新增「工作区清理」卡片，用于回收长期不用的飞书工作区。保留期可选 `off / 7 天 / 30 天 / 90 天 / 180 天`（默认 `off`）；卡片实时预览「插件工作区总数 / 可清理数量 / 预计释放空间」，点「立即清理」需二次确认；也可开启 `workspaceRetentionAuto` 在启动后与每日自动执行一次。清理动作只针对 `<baseDir>` 下由本插件创建（标题以 `飞书私聊 ·` / `飞书群聊 ·` 开头）的工作区：删除目录、注销 workspace registry，并把仍指向它的活跃路由退休为墓碑（该旧话题收到消息会明确提示「话题已过期」，不会恢复到一个已删除的目录）。**Harness Session 日志与事件记录不删除**；删除不可恢复，`off` 时按钮禁用。
 
@@ -159,7 +159,7 @@ src/
 │   ├── catalog.ts         #   宿主选择目录：provider/model/推理档位/preset
 │   ├── surface.ts         #   状态 / 面板视图模型 + 保存 / 清除 / 重连
 │   └── routes.ts          #   HTTP 路由 + 同源写保护
-└── workspaces.ts          # (chat, user) → 工作区目录
+└── workspaces.ts          # 话题 → 独立工作区目录 + 附件 staging 目录
 ```
 
 `lib/index.js` 与 `lib/client.js` 是构建产物（`pnpm build`）：前者是安装后 profile 直接加载的 Host 入口（普通 ESM，不依赖 TypeScript 运行时转换），后者是设置面板的浏览器 bundle。`scripts/verify-host-loader.mjs` / `scripts/verify-client-loader.mjs` 分别做冒烟。
@@ -249,7 +249,7 @@ FEISHU_APP_SECRET: xxxxxxxx
 
 ## 行为与降级
 
-- **附件输入（图片 / 文件 / 会话记录，按会话隔离）**：飞书图片和文件经通道**流式**写入当前 **Session 的私有目录** `<workspace>/attachments/<session-id>/`（文件名前缀为收到时间 `YYYYMMDD-HHmmss-`），合并转发的聊天记录原样保存为 `*-forwarded-record.txt`。Session 建立之前收到的附件先落到 `attachments/_pending/`，在该 Session 创建/恢复时自动迁入其私有目录；`/renew` 会新建 Session，因此也开启一个新的附件目录。旧版直接写在 `attachments/` 根下的文件会在首次归档时一次性移入 `attachments/_legacy/`（不自动参与新会话）。除独立图片/文件消息外，**富文本（post）消息附带在 `files` 数组里的文件也会被恢复并落盘**——官方 SDK 的 post 归一化只遍历正文元素、会丢弃 `files`，插件通过原始事件补回。**只发附件（不带说明）的消息不触发模型请求**；插件在 agent 作用域注册一段 system prompt，说明附件目录约定，Agent 需要时用 `read_image` / `read` / `bash` 按需读取（未被引用的附件零 token）。写入成功给消息加 `DONE` 表情、全部失败加 `No`；失败时额外回一条**纯文字提示**（不是卡片），列出附件名与原因（例如资源已过期、文件夹消息暂不支持），避免 Agent 静默读到旧附件。**超过 100 MB 的文件也能保存**：飞书资源接口拒绝单次超过 100 MB 的完整下载（错误 234037），但对 `Range` 请求返回 206，插件因此先探测总大小、再按 32 MiB 分块下载，超大文件（已验证 294 MB）同样能落盘。单条附件失败只影响该附件，不阻塞其它附件。`acceptAttachments: false` 时附件消息保持惰性（不落盘、不触发）。附件数量不设插件侧上限，文件大小也仅受飞书平台上传限制（下载通过分块 Range 绕过单次响应上限），磁盘增长由「工作区清理」面板兜底；超大文件下载耗时较长，会占用该话题的处理队列。
+- **附件输入（图片 / 文件 / 会话记录，话题工作区内）**：飞书图片和文件经通道**流式**写入当前话题工作区的 `attachments/`（文件名前缀为收到时间 `YYYYMMDD-HHmmss-`），合并转发的聊天记录原样保存为 `*-forwarded-record.txt`。话题建立之前收到的附件先落到 `<baseDir>/_staging/<chatType>/<chat_id>/<open_id>/`，该话题的第一个 Session 创建时自动迁入其工作区；`/renew` 在**同一话题**内新建 Session，沿用同一工作区与附件。**每个新话题都会新建独立工作区**，因此话题之间看不到彼此的文件。旧版（共享工作区）的话题继续使用原工作区，不会自动迁移。除独立图片/文件消息外，**富文本（post）消息附带在 `files` 数组里的文件也会被恢复并落盘**——官方 SDK 的 post 归一化只遍历正文元素、会丢弃 `files`，插件通过原始事件补回。**只发附件（不带说明）的消息不触发模型请求**；插件在 agent 作用域注册一段 system prompt，说明附件目录约定，Agent 需要时用 `read_image` / `read` / `bash` 按需读取（未被引用的附件零 token）。写入成功给消息加 `DONE` 表情、全部失败加 `No`；失败时额外回一条**纯文字提示**（不是卡片），列出附件名与原因（例如资源已过期、文件夹消息暂不支持），避免 Agent 静默读到旧附件。**超过 100 MB 的文件也能保存**：飞书资源接口拒绝单次超过 100 MB 的完整下载（错误 234037），但对 `Range` 请求返回 206，插件因此先探测总大小、再按 32 MiB 分块下载，超大文件（已验证 294 MB）同样能落盘。单条附件失败只影响该附件，不阻塞其它附件。`acceptAttachments: false` 时附件消息保持惰性（不落盘、不触发）。附件数量不设插件侧上限，文件大小也仅受飞书平台上传限制（下载通过分块 Range 绕过单次响应上限），磁盘增长由「工作区清理」面板兜底；超大文件下载耗时较长，会占用该话题的处理队列。
 - **DSH 0.2.0 兼容**：会话日志读取改用 `Session.snapshotEvents()`（整段 `Session.events` getter 已被 DSH 删除）；正文/推理增量改用瞬时事件 `agent/assistant-stream`（持久化 `assistant/chunk` 已不再产生，改为把流内嵌进 `assistant/message.stream`），并处理 `abandoned` 尝试的文本回滚；卡片 token / 缓存命中 / 上下文窗口优先读宿主 `sessionProjections`（`sessionStats` / `tokenUsage` / `contextPressure`），未挂载时回退到本地增量折叠 + `llm.resolveModelInfo`。完整评估、证据与实施状态见 [docs/review-dsh-0.2.0.md](docs/review-dsh-0.2.0.md)。
 - **话题创建**：通过回复消息接口 `reply_in_thread: true`（官方文档明示的“以话题方式回复（即创建话题）”）。响应后经 `im.v1.message.get` 取回 `thread_id` 写入路由表。
 - **话题延续**：`im.message.receive_v1` 事件自带 `thread_id`，命中路由表即 `agent.followup()`，无需 @。同一 (chat, user) 的**并发首消息会被串行化**：后到的消息等待在途的会话建立完成，再按串行语义续聊同一 session 或另起新话题——不会重复建 session、覆盖路由，也不会落入“无路由、无 @”的丢弃窗口。

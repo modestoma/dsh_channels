@@ -28,7 +28,7 @@ import { mountChannelCommands } from '../commands.ts'
 import { appendSessionHistory } from '../domain.ts'
 import type { RouteRecord } from '../domain.ts'
 import { mountChannelGuidance } from '../feishu/agent-context.ts'
-import { sessionAttachmentsDir } from '../feishu/inbound-attachments.ts'
+import { attachmentsDir } from '../feishu/inbound-attachments.ts'
 import { installRequestPolicy } from './request-policy.ts'
 import type { RequestPolicyController } from './request-policy.ts'
 import { workspaceTitleFor } from '../workspaces.ts'
@@ -112,7 +112,7 @@ export class SessionManager {
     cwd: string,
     agentOptions: Record<string, unknown> = this.agentOptions(),
   ): Promise<AgentHandle> {
-    const composition = await this.presetComposition(undefined, true, sessionAttachmentsDir(cwd, sessionId))
+    const composition = await this.presetComposition(undefined, true, attachmentsDir(cwd))
     const handle = await this.deps.ctx.agents.create({
       sessionId,
       meta: {
@@ -172,7 +172,7 @@ export class SessionManager {
       // preset fix has no preset recorded on its header; re-resolving here is
       // what repairs it on the first resume after a restart.
       const composition = await this.presetComposition(
-        undefined, true, sessionAttachmentsDir(record.workspacePath, record.sessionId),
+        undefined, true, attachmentsDir(record.workspacePath),
       )
       const handle = await this.deps.ctx.agents.resume({
         resumeSessionId: sessionId,
@@ -228,10 +228,13 @@ export class SessionManager {
   async renew(record: RouteRecord, oldLive: LiveAgent): Promise<RenewCommit> {
     const sessionId = randomUUID() as SessionId
     const preset = this.effectivePreset(oldLive.agent.session)
-    const composition = await this.presetComposition(preset, false, sessionAttachmentsDir(record.workspacePath, sessionId))
+    const composition = await this.presetComposition(preset, false, attachmentsDir(record.workspacePath))
     const workspace = await this.deps.ctx.workspaceRegistry.create(
       record.workspacePath,
-      workspaceTitleFor(record.chatType, record.chatId, record.senderOpenId),
+      workspaceTitleFor(
+        record.chatType, record.chatId, record.senderOpenId,
+        record.kind === 'thread' ? record.key : record.sessionId,
+      ),
     )
 
     let newHandle: AgentHandle | undefined
