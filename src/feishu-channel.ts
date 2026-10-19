@@ -93,6 +93,74 @@ export interface FeishuChannel {
 /** Ordered byte chunks of one inbound resource. */
 export type ResourceChunkStream = AsyncIterable<Uint8Array>
 
+/**
+ * Chunk size for ranged file downloads. Feishu's message-resource endpoint
+ * rejects a single response larger than 100 MB (error 234037), but honors
+ * bounded Range requests, so large files are fetched in independent chunks.
+ */
+export const RANGE_DOWNLOAD_CHUNK_BYTES = 32 * 1024 * 1024
+
+/** Total object size from a `Content-Range: bytes start-end/total` header. */
+export function contentRangeTotal(headers: unknown): number | undefined {
+  const value = headerValue(headers, 'content-range')
+  if (value === undefined) return undefined
+  const match = /\/(\d+)\s*$/u.exec(value)
+  if (match === null) return undefined
+  const total = Number(match[1])
+  return Number.isSafeInteger(total) && total >= 0 ? total : undefined
+}
+
+/** Case-insensitive header lookup over a plain object or an AxiosHeaders-like getter. */
+function headerValue(headers: unknown, name: string): string | undefined {
+  if (headers === null || typeof headers !== 'object') return undefined
+  const record = headers as Record<string, unknown>
+  const lower = name.toLowerCase()
+  for (const key of Object.keys(record)) {
+    if (key.toLowerCase() !== lower) continue
+    const value = record[key]
+    if (typeof value === 'string') return value
+  }
+  const get = (headers as { get?: (key: string) => unknown }).get
+  if (typeof get === 'function') {
+    const value = get.call(headers, name)
+    return typeof value === 'string' ? value : undefined
+  }
+  return undefined
+}
+
+/** One bounded range request returning the response headers and byte stream. */
+export type ResourceRangeFetcher = (range: string) => Promise<{
+  headers?: unknown
+  stream: AsyncIterable<Uint8Array>
+}>
+
+/**
+ * Download one object through sequential bounded Range requests. The caller
+ * supplies the first response's total size and a fetcher for the remaining
+ * ranges; bytes are yielded as they arrive so the archive writes them
+ * straight to disk.
+ */
+export async function* downloadResourceInRanges(
+  fetchRange: ResourceRangeFetcher,
+  totalBytes: number,
+  chunkBytes = RANGE_DOWNLOAD_CHUNK_BYTES,
+): AsyncGenerator<Uint8Array> {
+  let offset = 0
+  while (offset < totalBytes) {
+    const end = Math.min(offset + chunkBytes, totalBytes) - 1
+    const response = await fetchRange(`bytes=${offset}-${end}`)
+    let received = 0
+    for await (const chunk of response.stream) {
+      received += chunk.length
+      yield chunk
+    }
+    if (received === 0) {
+      throw new Error(`dsh-channels: ranged download stalled at byte ${offset}/${totalBytes}`)
+    }
+    offset += received
+  }
+}
+
 export interface ChannelConnectOptions {
   appId: string
   appSecret: string
@@ -193,18 +261,55 @@ class LarkChannelAdapter implements FeishuChannel {
     fileKey: string,
     type: 'image' | 'file',
   ): Promise<ResourceChunkStream> {
-    const response = await this.channel.rawClient.im.v1.messageResource.get({
-      params: { type },
-      path: { message_id: messageId, file_key: fileKey },
-    }) as unknown as { getReadableStream(): AsyncIterable<Uint8Array | Buffer> }
-    const source = response.getReadableStream()
-    return {
-      async *[Symbol.asyncIterator]() {
-        for await (const chunk of source) {
-          yield Buffer.isBuffer(chunk) ? new Uint8Array(chunk) : chunk
-        }
-      },
+    if (type === 'image') {
+      // Images are platform-capped far below the download limit; one request.
+      const response = await this.rawResource(messageId, fileKey, type)
+      return chunkStream(response.stream)
     }
+    // Probe one byte to learn the total size without triggering the whole-file
+    // size check. Feishu honors a bounded Range request even when the object
+    // is larger than the API's single-response limit.
+    const probe = await this.rawResource(messageId, fileKey, type, 'bytes=0-0')
+    const total = contentRangeTotal(probe.headers)
+    if (total === undefined) {
+      // The server ignored Range and returned the whole object; use it as is.
+      return chunkStream(probe.stream)
+    }
+    ;(probe.stream as { destroy?: () => void }).destroy?.()
+    if (total === 0) {
+      return {
+        async *[Symbol.asyncIterator]() { /* empty resource */ },
+      }
+    }
+    return downloadResourceInRanges(async range => {
+      const response = await this.rawResource(messageId, fileKey, type, range)
+      return { headers: response.headers, stream: chunkStream(response.stream) }
+    }, total)
+  }
+
+  /** One message-resource GET, with an optional Range header. */
+  private async rawResource(
+    messageId: string,
+    fileKey: string,
+    type: 'image' | 'file',
+    range?: string,
+  ): Promise<{ headers: unknown; stream: AsyncIterable<Uint8Array | Buffer> }> {
+    const response = await this.channel.rawClient.im.v1.messageResource.get(
+      { params: { type }, path: { message_id: messageId, file_key: fileKey } },
+      range === undefined ? undefined : { headers: { Range: range } },
+    ) as unknown as { getReadableStream(): AsyncIterable<Uint8Array | Buffer>; headers?: unknown }
+    return { headers: response.headers, stream: response.getReadableStream() }
+  }
+}
+
+/** Wrap one Node stream as a plain byte-chunk iterable. */
+function chunkStream(source: AsyncIterable<Uint8Array | Buffer>): ResourceChunkStream {
+  return {
+    async *[Symbol.asyncIterator]() {
+      for await (const chunk of source) {
+        yield Buffer.isBuffer(chunk) ? new Uint8Array(chunk) : chunk
+      }
+    },
   }
 }
 

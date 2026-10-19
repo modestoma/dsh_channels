@@ -308,7 +308,7 @@ describe('rich-text post attachments', () => {
 
   it('maps download failures to actionable reasons', () => {
     expect(describeFailure(new Error('Request failed with status code 400')))
-      .toContain('100 MB')
+      .toContain('拒绝请求')
     expect(describeFailure(new Error('Request failed with status code 403')))
       .toContain('无权限')
     expect(describeFailure(new Error('boom'))).toBe('boom')

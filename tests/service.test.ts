@@ -3124,7 +3124,7 @@ describe('inbound attachments', () => {
       const texts = (h.channel.sent as Array<{ input: { text?: string } }>)
         .map(entry => entry.input.text)
         .filter((text): text is string => text !== undefined)
-      expect(texts.some(text => text.includes('附件保存失败') && text.includes('100 MB'))).toBe(true)
+      expect(texts.some(text => text.includes('附件保存失败') && text.includes('bugreport'))).toBe(true)
     })
     await h.service.shutdown()
   })

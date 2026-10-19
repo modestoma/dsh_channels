@@ -342,7 +342,7 @@ function resourceName(resource: AttachmentResource): string {
 export function describeFailure(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error)
   if (/status code 400|bad request/iu.test(message)) {
-    return '飞书下载接口拒绝请求（常见原因：文件超过 100 MB 下载上限）'
+    return '飞书下载接口拒绝请求（文件可能已过期、已被删除或暂不可下载）'
   }
   if (/status code 403|forbidden/iu.test(message)) return '飞书下载接口无权限'
   return message
