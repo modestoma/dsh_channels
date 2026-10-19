@@ -3,8 +3,9 @@
  * tab 导航的外壳。
  *
  * 所有 Host 交互（panel / status / catalog / config / credentials / cleanup /
- * access）都集中在这里；tab 组件只接收渲染所需的数据与回调。页面不 import
- * 任何 DSH 客户端包，只依赖 react 与 `settings.section` 槽位。
+ * access / pick-directory）都集中在这里；tab 组件只接收渲染所需的数据与
+ * 回调。页面不 import 任何 DSH 客户端包，只依赖 react 与 `settings.section`
+ * 槽位。
  *
  * @module dsh-channels/client/panel
  */
@@ -33,6 +34,7 @@ import {
   fetchCatalog,
   fetchPanel,
   fetchStatus,
+  pickDirectory as requestDirectoryPicker,
   reconnect,
   removeAccessGroup,
   removeAccessUser,
@@ -336,6 +338,27 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
     }
   }, [panel])
 
+  /**
+   * Open the host's native directory chooser (workspace root「选择目录…」) and
+   * stage the picked absolute path as a draft value. Nothing is persisted until
+   *「保存更改」; a canceled dialog is a no-op, not an error.
+   */
+  const onPickDirectory = useCallback(async (key: EditableKey): Promise<void> => {
+    setNotice(null)
+    try {
+      const result = await requestDirectoryPicker()
+      if (!result.ok) {
+        setNotice({ kind: 'error', text: result.error })
+        return
+      }
+      if ('canceled' in result) return
+      setDraft(previous => ({ ...previous, [key]: result.path }))
+      setNotice({ kind: 'ok', text: `${PANEL_COPY.directoryPicked}：${result.path}` })
+    } catch (error) {
+      setNotice({ kind: 'error', text: messageOf(error) })
+    }
+  }, [])
+
   /** Drop every Web override and return the refreshed panel. */
   const onClear = useCallback(async (): Promise<void> => {
     setBusy('clear')
@@ -634,8 +657,9 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
       onChange: updateDraft,
       onSave: () => { void onSave() },
       onDiscardTab: discardTab,
+      onPickDirectory,
     }
-  }, [busy, discardTab, dirtyCount, draft, hostBusy, issues, onSave, panel, renderedFields, updateDraft])
+  }, [busy, discardTab, dirtyCount, draft, hostBusy, issues, onPickDirectory, onSave, panel, renderedFields, updateDraft])
 
   const credentials = useMemo<CredentialsView>(() => ({
     appId: appIdInput,

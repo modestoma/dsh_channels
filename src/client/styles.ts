@@ -56,13 +56,16 @@ const CSS = `
 .dsh-channels-cfg__help{color:var(--dsw-alias-label-tertiary,#8a8f98);font-size:11px;line-height:16px}
 .dsh-channels-cfg__reasonBad{color:var(--dsw-alias-state-danger-primary,#c62828)}
 .dsh-channels-cfg__input{box-sizing:border-box;width:100%;min-height:28px;padding:3px 10px;border:1px solid var(--dsw-alias-border-l2,rgba(0,0,0,.12));border-radius:8px;background:var(--dsw-alias-bg-layer-1,transparent);color:inherit;font:inherit;font-size:13px;outline:none}
+.dsh-channels-cfg__inputRow{display:flex;align-items:center;gap:8px;min-width:0}
+.dsh-channels-cfg__inputRow .dsh-channels-cfg__input{flex:1 1 auto;width:auto;min-width:0}
+.dsh-channels-cfg__btn--browse{flex:none}
 .dsh-channels-cfg__input:focus{border-color:var(--dsw-alias-state-business-primary,#0a67d3)}
 .dsh-channels-cfg__input--invalid{border-color:var(--dsw-alias-state-danger-primary,#c62828)}
 select.dsh-channels-cfg__input{appearance:auto;cursor:pointer}
 .dsh-channels-cfg__check{display:inline-flex;align-items:center;gap:6px;min-height:28px;cursor:pointer;font-size:13px}
 .dsh-channels-cfg__checkbox{width:15px;height:15px;margin:0;accent-color:var(--dsw-alias-state-business-primary,#0a67d3);cursor:pointer}
 .dsh-channels-cfg__fieldError{color:var(--dsw-alias-state-danger-primary,#c62828);font-size:11px;line-height:16px}
-.dsh-channels-cfg__notice{display:flex;flex-direction:column;gap:2px;padding:8px 10px;border-radius:8px;font-size:12px;line-height:18px}
+.dsh-channels-cfg__notice{display:flex;flex-direction:column;gap:2px;padding:8px 10px;border-radius:8px;font-size:12px;line-height:18px;overflow-wrap:anywhere}
 .dsh-channels-cfg__notice--ok{color:var(--dsw-alias-state-business-primary,#0a7d33);background:color-mix(in srgb,currentColor 8%,transparent)}
 .dsh-channels-cfg__notice--error{color:var(--dsw-alias-state-danger-primary,#c62828);background:color-mix(in srgb,currentColor 8%,transparent)}
 .dsh-channels-cfg__banner{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:8px 10px;border-radius:8px;border:1px dashed var(--dsw-alias-state-warning-primary,#a15c00);color:var(--dsw-alias-state-warning-primary,#a15c00);font-size:12px;line-height:18px}

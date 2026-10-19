@@ -52,6 +52,7 @@ import {
 } from './overlay.ts'
 import type { OverlayLogger, OverlayPatch, OverlayStore } from './overlay.ts'
 import type { SettingsCatalog } from './catalog.ts'
+import type { SettingsDirectoryPicker } from './directory-picker.ts'
 
 /** The slice of `FeishuService` the panel needs (structural, easy to fake). */
 export interface SettingsTarget {
@@ -311,6 +312,23 @@ function withCurrentOption(
   return inherit === undefined ? [extra] : [inherit, extra, ...rest]
 }
 
+/**
+ * Mark the workspace-root field as browsable when the host can open its native
+ * directory chooser. Every other host (no `directoryPicker`, or the `browse`
+ * backend of remote/headless sessions) keeps the plain text input.
+ *
+ * @param fields - Host field descriptors after the selector catalog is applied.
+ * @param available - whether a native directory chooser can be opened.
+ * @returns the descriptors with `browse: 'directory'` on `baseDir` when usable.
+ */
+export function withDirectoryBrowse(
+  fields: readonly EditableFieldWire[],
+  available: boolean,
+): EditableFieldWire[] {
+  if (!available) return [...fields]
+  return fields.map(field => (field.key === 'baseDir' ? { ...field, browse: 'directory' } : field))
+}
+
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
@@ -456,6 +474,7 @@ export class SettingsSurface {
     private readonly store: OverlayStore,
     private readonly logger?: OverlayLogger,
     private readonly catalog?: SettingsCatalog,
+    private readonly directoryPicker?: SettingsDirectoryPicker,
   ) {}
 
   /**
@@ -514,12 +533,15 @@ export class SettingsSurface {
       ? RESTART_KEYS.filter(key => effective[key] !== running[key])
       : []
     const catalog = await this.catalogFor(effective.provider, effective.model)
-    const fields = applyCatalog(FIELD_DESCRIPTORS, catalog, {
-      provider: effective.provider,
-      model: effective.model,
-      reasoningEffort: effective.reasoningEffort,
-      agentPreset: effective.agentPreset,
-    })
+    const fields = withDirectoryBrowse(
+      applyCatalog(FIELD_DESCRIPTORS, catalog, {
+        provider: effective.provider,
+        model: effective.model,
+        reasoningEffort: effective.reasoningEffort,
+        agentPreset: effective.agentPreset,
+      }),
+      this.directoryPicker?.available === true,
+    )
 
     let credentialStates: { appId: CredentialInfo; appSecret: CredentialInfo } = {
       appId: { configured: false, writable: false },
@@ -854,6 +876,18 @@ export class SettingsSurface {
     } catch (error) {
       return { ok: false, error: messageOf(error) }
     }
+  }
+
+  /**
+   * Open the host's native directory chooser (the panel's「选择目录…」button).
+   *
+   * @param signal - caller lifetime; abort closes the OS dialog.
+   * @returns the chosen absolute path, or `null` when the operator cancels.
+   * @throws when the host provides no native directory chooser.
+   */
+  async pickDirectory(signal: AbortSignal): Promise<string | null> {
+    if (this.directoryPicker === undefined) throw new Error(PANEL_COPY.directoryPickFailed)
+    return await this.directoryPicker.pick(signal)
   }
 
   /**

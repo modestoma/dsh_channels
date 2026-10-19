@@ -27,7 +27,9 @@ import {
   CREDENTIALS_ROUTE,
   EDITABLE_KEYS,
   FIELD_GROUP_LABELS,
+  PANEL_COPY,
   PANEL_ROUTE,
+  PICK_DIRECTORY_ROUTE,
   PANEL_TABS,
   TAB_FIELD_GROUPS,
   RECONNECT_ROUTE,
@@ -60,6 +62,7 @@ import {
 import type { SettingsTarget } from '../src/settings/surface.ts'
 import { createHostCatalog } from '../src/settings/catalog.ts'
 import type { SettingsCatalog } from '../src/settings/catalog.ts'
+import type { SettingsDirectoryPicker } from '../src/settings/directory-picker.ts'
 import { isSameOriginRequest, registerSettingsRoutes } from '../src/settings/routes.ts'
 import type { HostWebServer } from '../src/settings/routes.ts'
 import { normalizeWorkspaceBaseDir, prepareWorkspaceBaseDir } from '../src/workspaces.ts'
@@ -315,7 +318,11 @@ class FakeTarget implements SettingsTarget {
   }
 }
 
-function makeSurface(partial: Partial<FeishuConfig> = {}, catalog?: SettingsCatalog): {
+function makeSurface(
+  partial: Partial<FeishuConfig> = {},
+  catalog?: SettingsCatalog,
+  directoryPicker?: SettingsDirectoryPicker,
+): {
   surface: SettingsSurface
   target: FakeTarget
   store: OverlayStore
@@ -324,7 +331,17 @@ function makeSurface(partial: Partial<FeishuConfig> = {}, catalog?: SettingsCata
   const file = tempOverlayFile()
   const target = new FakeTarget(makeConfig(partial))
   const store = new OverlayStore(file)
-  return { surface: new SettingsSurface(target, store, undefined, catalog), target, store, file }
+  return {
+    surface: new SettingsSurface(target, store, undefined, catalog, directoryPicker),
+    target,
+    store,
+    file,
+  }
+}
+
+/** Stub native directory picker whose outcome is decided per test. */
+function stubPicker(outcome: () => Promise<string | null>): SettingsDirectoryPicker {
+  return { available: true, pick: outcome }
 }
 
 describe('overlay paths and validation', () => {
@@ -831,6 +848,18 @@ describe('SettingsSurface', () => {
     expect(panel.config.fields).toHaveLength(EDITABLE_KEYS.length)
     expect(panel.config.restartPendingKeys).toEqual([])
     expect(panel.status.reasons).toEqual([])
+  })
+
+  it('marks the workspace root as browsable only when a native chooser is mounted', async () => {
+    const withPicker = makeSurface({}, undefined, stubPicker(async () => '/tmp/ws'))
+    const panelWith = await withPicker.surface.panel()
+    const base = panelWith.config.fields.find(field => field.key === 'baseDir')
+    expect(base).toMatchObject({ kind: 'text', browse: 'directory' })
+    expect(panelWith.config.fields.filter(field => field.browse !== undefined).map(field => field.key))
+      .toEqual(['baseDir'])
+
+    const withoutPicker = await makeSurface().surface.panel()
+    expect(withoutPicker.config.fields.some(field => field.browse !== undefined)).toBe(false)
   })
 
   it('derives the connecting / unconfigured phases honestly', async () => {
@@ -1373,8 +1402,10 @@ function makeRequest(options: {
 
 function makeResponse(): { res: ServerResponse; captured: CapturedResponse } {
   const captured: CapturedResponse = { status: 0, headers: {}, body: '' }
+  const listeners = new Map<string, Array<() => void>>()
   const res = {
     headersSent: false,
+    writableEnded: false,
     writeHead(status: number, headers?: Record<string, unknown>) {
       captured.status = status
       Object.assign(captured.headers, headers ?? {})
@@ -1382,8 +1413,19 @@ function makeResponse(): { res: ServerResponse; captured: CapturedResponse } {
       return res
     },
     setHeader() {},
+    on(event: string, listener: () => void) {
+      const bucket = listeners.get(event) ?? []
+      bucket.push(listener)
+      listeners.set(event, bucket)
+      return res
+    },
+    emit(event: string) {
+      for (const listener of listeners.get(event) ?? []) listener()
+      return res
+    },
     end(chunk?: unknown) {
       if (chunk !== undefined && chunk !== null) captured.body += String(chunk)
+      res.writableEnded = true
     },
   }
   return { res: res as unknown as ServerResponse, captured }
@@ -1565,6 +1607,64 @@ describe('settings routes', () => {
     const failed = await call(routes, CLEANUP_ROUTE, makeRequest({ method: 'POST', headers: { host: 'h' } }))
     expect(failed.status).toBe(500)
     expect(JSON.parse(failed.body).error).toContain('disk unavailable')
+  })
+
+  it('opens the native directory chooser and returns the picked path', async () => {
+    const { surface } = makeSurface({}, undefined, stubPicker(async () => '/Users/me/workspaces'))
+    const { server, routes } = makeWebServer()
+    registerSettingsRoutes(server, surface)
+
+    const crossSite = await call(routes, PICK_DIRECTORY_ROUTE, makeRequest({
+      method: 'POST',
+      headers: { origin: 'https://evil.example', host: '127.0.0.1:52555' },
+    }))
+    expect(crossSite.status).toBe(403)
+
+    const notAllowed = await call(routes, PICK_DIRECTORY_ROUTE, makeRequest({ method: 'GET' }))
+    expect(notAllowed.status).toBe(405)
+    expect(notAllowed.headers.allow).toBe('POST')
+
+    const picked = await call(routes, PICK_DIRECTORY_ROUTE, makeRequest({
+      method: 'POST',
+      headers: { host: '127.0.0.1:52555' },
+    }))
+    expect(picked.status).toBe(200)
+    expect(JSON.parse(picked.body)).toEqual({ ok: true, path: '/Users/me/workspaces' })
+  })
+
+  it('reports a canceled chooser as a normal outcome, and failures as JSON errors', async () => {
+    let outcome: () => Promise<string | null> = async () => null
+    const { surface } = makeSurface({}, undefined, { available: true, pick: () => outcome() })
+    const { server, routes } = makeWebServer()
+    registerSettingsRoutes(server, surface)
+
+    const canceled = await call(routes, PICK_DIRECTORY_ROUTE, makeRequest({
+      method: 'POST',
+      headers: { host: 'h' },
+    }))
+    expect(canceled.status).toBe(200)
+    expect(JSON.parse(canceled.body)).toEqual({ ok: true, canceled: true })
+
+    outcome = async () => { throw new Error('dialog failed') }
+    const failed = await call(routes, PICK_DIRECTORY_ROUTE, makeRequest({
+      method: 'POST',
+      headers: { host: 'h' },
+    }))
+    expect(failed.status).toBe(500)
+    const body = JSON.parse(failed.body) as { ok: boolean; error: string }
+    expect(body.ok).toBe(false)
+    expect(body.error).toContain('dialog failed')
+
+    // No picker seam (remote/headless host): the route still exists but refuses.
+    const headless = makeSurface()
+    const headlessServer = makeWebServer()
+    registerSettingsRoutes(headlessServer.server, headless.surface)
+    const unavailable = await call(headlessServer.routes, PICK_DIRECTORY_ROUTE, makeRequest({
+      method: 'POST',
+      headers: { host: 'h' },
+    }))
+    expect(unavailable.status).toBe(500)
+    expect(JSON.parse(unavailable.body).error).toContain(PANEL_COPY.directoryPickFailed)
   })
 
   it('serves the access snapshot and guards every whitelist write', async () => {

@@ -30,6 +30,14 @@ export const ACCESS_GROUPS_ROUTE = '/dsh-channels/access/groups'
 export const ACCESS_USERS_ROUTE = '/dsh-channels/access/users'
 /** 结算一条待处理授权申请（POST，body `{ token, decision }`）。 */
 export const ACCESS_REQUESTS_ROUTE = '/dsh-channels/access/requests'
+/**
+ * 打开宿主机的系统目录选择框（POST，无请求体），返回绝对路径。
+ *
+ * 只有宿主挂载了 `directoryPicker` 的 native 后端（桌面/本地 GUI 会话）才
+ * 会注册实际选择逻辑；远程/无头会话的 browse 后端不可用，面板不下发
+ * [`EditableFieldWire.browse`]，保留手写输入。
+ */
+export const PICK_DIRECTORY_ROUTE = '/dsh-channels/pick-directory'
 
 /**
  * 可由 Web 面板覆盖的配置项。全部是 `src/config.ts` 里已存在的字段；
@@ -120,6 +128,12 @@ export interface EditableFieldWire {
   placeholder?: string
   /** Render across the whole form width (long paths). */
   wide?: boolean
+  /**
+   * `directory`：给这个 text 字段加一个「选择目录…」按钮，点击后由 Host
+   * 打开宿主机系统目录选择框并把绝对路径写回草稿。仅当宿主提供 native
+   * 目录选择器时下发；缺省（含 browse 后端）保持纯手写输入。
+   */
+  browse?: 'directory'
   /** 保存后需重连飞书通道才生效。 */
   restartRequired: boolean
 }
@@ -373,6 +387,16 @@ export type CleanupResponse =
   | { ok: true; panel: PanelWire; result: CleanupRunWire }
   | { ok: false; error: string }
 
+/**
+ * `POST /dsh-channels/pick-directory` response. `canceled` is a normal
+ * outcome (the operator dismissed the OS dialog), not an error; `path` is an
+ * absolute directory the Host's native chooser returned.
+ */
+export type PickDirectoryResponse =
+  | { ok: true; path: string }
+  | { ok: true; canceled: true }
+  | { ok: false; error: string }
+
 /** `PUT /dsh-channels/config` body. */
 export interface SaveConfigRequest {
   values: EditableValues
@@ -555,6 +579,10 @@ export const PANEL_COPY = {
   discardTab: '放弃本页更改',
   saveHintClean: '没有未保存的更改。',
   dirtyCount: '未保存项',
+  browseDirectory: '选择目录…',
+  browsingDirectory: '选择中…',
+  directoryPicked: '已选择目录',
+  directoryPickFailed: '无法打开系统目录选择器',
   saved: '已保存',
   cleared: '已清除 Web 覆盖，恢复为 profile 配置',
   clear: '清除 Web 覆盖',

@@ -24,10 +24,16 @@ import {
   CONFIG_ROUTE,
   CREDENTIALS_ROUTE,
   PANEL_ROUTE,
+  PICK_DIRECTORY_ROUTE,
   RECONNECT_ROUTE,
   STATUS_ROUTE,
 } from './contract.ts'
-import type { CredentialField, EditableValues, SaveCredentialsRequest } from './contract.ts'
+import type {
+  CredentialField,
+  EditableValues,
+  PickDirectoryResponse,
+  SaveCredentialsRequest,
+} from './contract.ts'
 import type { SettingsSurface } from './surface.ts'
 
 /** The narrow `ctx.webServer` surface this module registers into. */
@@ -315,6 +321,45 @@ export function registerSettingsRoutes(server: HostWebServer, surface: SettingsS
         }
         const result = await surface.runCleanup()
         sendJson(res, result.ok ? 200 : 500, result)
+      }),
+    }),
+    server.register({
+      kind: 'exact',
+      path: PICK_DIRECTORY_ROUTE,
+      handler: guarded(async (req, res) => {
+        if (!allowOnly(req, res, ['POST'])) return
+        if (!isSameOriginRequest(req)) {
+          forbiddenWrite(res)
+          return
+        }
+        // The chooser is a local desktop modal: it can stay open far longer
+        // than a normal request, and the operator may close the page instead
+        // of the dialog. Abort the host picker when the response socket goes
+        // away so no orphaned modal outlives its panel.
+        const controller = new AbortController()
+        let answered = false
+        if (typeof res.on === 'function') {
+          res.on('close', () => {
+            if (!answered) controller.abort()
+          })
+        }
+        let path: string | null
+        try {
+          path = await surface.pickDirectory(controller.signal)
+        } catch (error) {
+          answered = true
+          // A request the browser already dropped has nobody left to answer.
+          if (controller.signal.aborted) {
+            res.end()
+            return
+          }
+          throw error
+        }
+        answered = true
+        const payload: PickDirectoryResponse = path === null
+          ? { ok: true, canceled: true }
+          : { ok: true, path }
+        sendJson(res, 200, payload)
       }),
     }),
     server.register({

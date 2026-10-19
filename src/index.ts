@@ -23,6 +23,7 @@ import { OverlayStore, defaultOverlayPath } from './settings/overlay.ts'
 import { mountSettingsRoutes } from './settings/routes.ts'
 import { SettingsSurface } from './settings/surface.ts'
 import { createHostCatalog } from './settings/catalog.ts'
+import { createSettingsDirectoryPicker } from './settings/directory-picker.ts'
 
 export type * from './config.ts'
 export type * from './cards.ts'
@@ -38,12 +39,15 @@ export type * from './questions.ts'
 export type * from './settings/contract.ts'
 export * from './access/index.ts'
 export type { AccessGroupRecord, AccessRequestRecord, AccessUserRecord } from './domain.ts'
-export { CATALOG_ROUTE, CLEANUP_ROUTE, CONFIG_ROUTE, CREDENTIALS_ROUTE, EDITABLE_KEYS, PANEL_COPY, PANEL_ROUTE, RECONNECT_ROUTE, RESTART_KEYS, STATUS_ROUTE } from './settings/contract.ts'
+export { CATALOG_ROUTE, CLEANUP_ROUTE, CONFIG_ROUTE, CREDENTIALS_ROUTE, EDITABLE_KEYS, PANEL_COPY, PANEL_ROUTE, PICK_DIRECTORY_ROUTE, RECONNECT_ROUTE, RESTART_KEYS, STATUS_ROUTE } from './settings/contract.ts'
+export type { PickDirectoryResponse } from './settings/contract.ts'
 export { defaultOverlayPath, mergeOverlay, normalizeOverlay, OverlayStore, parseOverlay, pickEditable, resolveDshHome } from './settings/overlay.ts'
-export { applyCatalog, emptyCatalog, FIELD_DESCRIPTORS, normalizeCredentialValue, readOnlyFields, SettingsSurface } from './settings/surface.ts'
+export { applyCatalog, emptyCatalog, FIELD_DESCRIPTORS, normalizeCredentialValue, readOnlyFields, SettingsSurface, withDirectoryBrowse } from './settings/surface.ts'
 export type { SettingsTarget } from './settings/surface.ts'
 export { createHostCatalog } from './settings/catalog.ts'
 export type { CatalogWarn, SettingsCatalog } from './settings/catalog.ts'
+export { createSettingsDirectoryPicker } from './settings/directory-picker.ts'
+export type { HostDirectoryPickerService, SettingsDirectoryPicker } from './settings/directory-picker.ts'
 export { isSameOriginRequest, mountSettingsRoutes, registerSettingsRoutes } from './settings/routes.ts'
 export type { HostWebServer } from './settings/routes.ts'
 export type { ApprovalOutcome, ApprovalRequest, ApprovalAnswererListener, AssistantStreamFrame, AskUserQuestionAnswer, AskUserQuestionAnswerItem, AskUserQuestionItem, AskUserQuestionRequestEvent, UserQuestionAnswererListener, AgentCancelCause, SessionStatsView, TokenUsageView, ContextPressureView, SessionProjections } from './dsh-types.ts'
@@ -106,9 +110,17 @@ export function apply(ctx: HostContext, config?: unknown): void {
   )
   const service = new FeishuService(ctx, resolved, factory, undefined, overlay)
   // Settings routes ride the host's web server when this deployment has one.
-  // The catalog resolves the panel's model selectors from live host services.
+  // The catalog resolves the panel's model selectors from live host services;
+  // the optional native directory picker backs the workspace-root「选择目录…」
+  // button (absent in headless/remote compositions → plain text input).
   const warn = (message: string, ...args: unknown[]): void => { ctx.logger?.warn?.(message, ...args) }
-  mountSettingsRoutes(ctx, new SettingsSurface(service, overlay, { warn }, createHostCatalog(ctx, warn)))
+  mountSettingsRoutes(ctx, new SettingsSurface(
+    service,
+    overlay,
+    { warn },
+    createHostCatalog(ctx, warn),
+    createSettingsDirectoryPicker(ctx),
+  ))
   ctx.effect(() => {
     // Boot loads the Web overlay and connects only when the Feishu application
     // credentials are complete; an incomplete configuration or a failed

@@ -8,6 +8,7 @@
  * @module dsh-channels/client/panel/shared
  */
 
+import { useState } from 'react'
 import { FIELD_GROUP_LABELS, PANEL_COPY, TAB_FIELD_GROUPS } from '../../settings/contract.ts'
 import type {
   AccessWire,
@@ -197,6 +198,58 @@ export interface FormView {
   onSave: () => void
   /** Drop only the draft keys owned by one tab. */
   onDiscardTab: (tab: PanelTabId) => void
+  /**
+   * Open the Host's native directory chooser and write the picked absolute
+   * path into the draft (not saved until「保存更改」). Absent when the Host
+   * cannot offer a native chooser.
+   */
+  onPickDirectory?: (key: EditableKey) => Promise<void>
+}
+
+/**
+ * Text input paired with the host-native「选择目录…」button. The button owns
+ * its own busy state: the OS dialog can stay open for a long time, so the
+ * rest of the form stays usable while the operator browses.
+ */
+function DirectoryTextInput(props: {
+  field: EditableFieldWire
+  value: ConfigValue | undefined
+  inputClass: string
+  disabled: boolean
+  onChange: (key: EditableKey, value: ConfigValue) => void
+  onPick: () => Promise<void>
+}): JSX.Element {
+  const { field, value, inputClass, disabled, onChange, onPick } = props
+  const [picking, setPicking] = useState(false)
+  const pick = async (): Promise<void> => {
+    setPicking(true)
+    try {
+      await onPick()
+    } finally {
+      setPicking(false)
+    }
+  }
+  return (
+    <div className="dsh-channels-cfg__inputRow">
+      <input
+        type="text"
+        className={inputClass}
+        value={String(value ?? '')}
+        placeholder={field.placeholder}
+        aria-label={field.label}
+        disabled={disabled || picking}
+        onChange={event => onChange(field.key, event.target.value)}
+      />
+      <button
+        type="button"
+        className="dsh-channels-cfg__btn dsh-channels-cfg__btn--browse"
+        disabled={disabled || picking}
+        onClick={() => { void pick() }}
+      >
+        {picking ? PANEL_COPY.browsingDirectory : PANEL_COPY.browseDirectory}
+      </button>
+    </div>
+  )
 }
 
 /** One generic form control driven by the Host field descriptor. */
@@ -206,8 +259,10 @@ export function FieldRow(props: {
   issues: FieldIssueWire[]
   disabled?: boolean
   onChange: (key: EditableKey, value: ConfigValue) => void
+  /** Present only for `field.browse === 'directory'` rows the page can serve. */
+  onPickDirectory?: () => Promise<void>
 }): JSX.Element {
-  const { field, value, issues, disabled = false, onChange } = props
+  const { field, value, issues, disabled = false, onChange, onPickDirectory } = props
   const issue = issues.find(item => item.key === field.key)
   const inputClass = `dsh-channels-cfg__input${issue === undefined ? '' : ' dsh-channels-cfg__input--invalid'}`
   const fieldClass = `dsh-channels-cfg__field${field.wide === true ? ' dsh-channels-cfg__field--wide' : ''}`
@@ -265,17 +320,28 @@ export function FieldRow(props: {
           )
         : null}
       {field.kind === 'text'
-        ? (
-            <input
-              type="text"
-              className={inputClass}
-              value={String(value ?? '')}
-              placeholder={field.placeholder}
-              aria-label={field.label}
-              disabled={disabled}
-              onChange={event => onChange(field.key, event.target.value)}
-            />
-          )
+        ? (field.browse === 'directory' && onPickDirectory !== undefined
+            ? (
+                <DirectoryTextInput
+                  field={field}
+                  value={value}
+                  inputClass={inputClass}
+                  disabled={disabled}
+                  onChange={onChange}
+                  onPick={onPickDirectory}
+                />
+              )
+            : (
+                <input
+                  type="text"
+                  className={inputClass}
+                  value={String(value ?? '')}
+                  placeholder={field.placeholder}
+                  aria-label={field.label}
+                  disabled={disabled}
+                  onChange={event => onChange(field.key, event.target.value)}
+                />
+              ))
         : null}
       {field.help === undefined ? null : <span className="dsh-channels-cfg__help">{field.help}</span>}
       {issue === undefined ? null : <span className="dsh-channels-cfg__fieldError">{issue.message}</span>}
@@ -309,16 +375,20 @@ export function FieldsCard(props: {
             <span className="dsh-channels-cfg__cardTitle">{section.label}</span>
           </div>
           <div className="dsh-channels-cfg__grid">
-            {section.fields.map(field => (
-              <FieldRow
-                key={field.key}
-                field={field}
-                value={form.draft[field.key] ?? effectiveValue(form.panel, field.key)}
-                issues={form.issues}
-                disabled={form.locked}
-                onChange={form.onChange}
-              />
-            ))}
+            {section.fields.map((field) => {
+              const onPick = form.onPickDirectory
+              return (
+                <FieldRow
+                  key={field.key}
+                  field={field}
+                  value={form.draft[field.key] ?? effectiveValue(form.panel, field.key)}
+                  issues={form.issues}
+                  disabled={form.locked}
+                  onChange={form.onChange}
+                  onPickDirectory={onPick === undefined ? undefined : () => onPick(field.key)}
+                />
+              )
+            })}
           </div>
         </div>
       ))}

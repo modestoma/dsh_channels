@@ -15,6 +15,7 @@ import {
   CONFIG_ROUTE,
   CREDENTIALS_ROUTE,
   PANEL_ROUTE,
+  PICK_DIRECTORY_ROUTE,
   RECONNECT_ROUTE,
   STATUS_ROUTE,
 } from '../settings/contract.ts'
@@ -29,6 +30,7 @@ import type {
   CredentialField,
   EditableValues,
   PanelWire,
+  PickDirectoryResponse,
   ReconnectResponse,
   SaveConfigResponse,
   SaveCredentialsRequest,
@@ -157,6 +159,24 @@ export async function runCleanup(): Promise<CleanupResponse> {
     }
   }
   return JSON.parse(text) as CleanupResponse
+}
+
+/**
+ * Ask the Host to open its native directory chooser (the panel's「选择目录…」
+ * button). The request stays open while the OS dialog does; a cancel comes back
+ * as `{ ok: true, canceled: true }`, not as an error.
+ */
+export async function pickDirectory(): Promise<PickDirectoryResponse> {
+  const response = await request(PICK_DIRECTORY_ROUTE, { method: 'POST' })
+  const text = await response.text()
+  if (!response.ok) {
+    try {
+      return JSON.parse(text) as PickDirectoryResponse
+    } catch {
+      return { ok: false, error: errorFromBody(response.status, text) }
+    }
+  }
+  return JSON.parse(text) as PickDirectoryResponse
 }
 
 /** Store provided credential values (the request/response never carry stored values). */
