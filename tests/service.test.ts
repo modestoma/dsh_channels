@@ -1396,7 +1396,7 @@ describe('FeishuService', () => {
     // Agent created with the workspace directory.
     expect(h.ctxState.agents.created).toHaveLength(1)
     const created = h.ctxState.agents.created[0]!
-    const workspacePath = path.join(h.config.baseDir, 'p2p', 'ou_alice', 'omt_1')
+    const workspacePath = path.join(h.config.baseDir, 'topics', 'p2p', 'ou_alice', 'omt_1')
     expect(created.options.meta?.cwd).toBe(workspacePath)
     expect(created.options.agentOptions).toEqual({
       provider: 'deepseek-official',
@@ -1534,8 +1534,8 @@ describe('FeishuService', () => {
     expect(cwds).toHaveLength(2)
     const aliceDir = cwds.find(cwd => cwd.includes(`${path.sep}ou_alice${path.sep}`))!
     const bobDir = cwds.find(cwd => cwd.includes(`${path.sep}ou_bob${path.sep}`))!
-    expect(path.dirname(aliceDir)).toBe(path.join(h.config.baseDir, 'groups', 'oc_grp', 'ou_alice'))
-    expect(path.dirname(bobDir)).toBe(path.join(h.config.baseDir, 'groups', 'oc_grp', 'ou_bob'))
+    expect(path.dirname(aliceDir)).toBe(path.join(h.config.baseDir, 'topics', 'groups', 'oc_grp', 'ou_alice'))
+    expect(path.dirname(bobDir)).toBe(path.join(h.config.baseDir, 'topics', 'groups', 'oc_grp', 'ou_bob'))
     expect(aliceDir).not.toBe(bobDir)
   })
 

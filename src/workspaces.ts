@@ -127,8 +127,12 @@ export function topicTokenFor(
  * Deterministic workspace directory for one Feishu topic: every route gets its
  * own workspace below its (user × chat) grouping directory.
  *
- * - p2p:   `<baseDir>/p2p/<open_id>/<topic>/`
- * - group: `<baseDir>/groups/<chat_id>/<open_id>/<topic>/`
+ * - p2p:   `<baseDir>/topics/p2p/<open_id>/<topic>/`
+ * - group: `<baseDir>/topics/groups/<chat_id>/<open_id>/<topic>/`
+ *
+ * A separate `topics/` root keeps new workspaces out of the legacy (user ×
+ * chat) workspace directories left by older versions, so cleaning one can
+ * never delete the other.
  */
 export function workspacePathFor(
   baseDir: string,
@@ -141,8 +145,8 @@ export function workspacePathFor(
   const user = safeSegment(senderOpenId, 'senderOpenId')
   const topic = safeSegment(topicToken, 'topic token')
   return chatType === 'p2p'
-    ? path.join(baseDir, 'p2p', user, topic)
-    : path.join(baseDir, 'groups', chat, user, topic)
+    ? path.join(baseDir, 'topics', 'p2p', user, topic)
+    : path.join(baseDir, 'topics', 'groups', chat, user, topic)
 }
 
 /**
