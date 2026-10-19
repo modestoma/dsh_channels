@@ -9,7 +9,8 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import {
-  ATTACHMENTS_DIR, AttachmentIntake, compactTimestamp, sanitizeFileName, stripAttachmentPlaceholders,
+  ATTACHMENTS_DIR, AttachmentIntake, attachmentResources, compactTimestamp, describeFailure,
+  hasAttachmentPayload, postAttachedFiles, sanitizeFileName, stripAttachmentPlaceholders,
 } from '../src/feishu/inbound-attachments.ts'
 import { FEISHU_ATTACHMENTS_SECTION, attachmentsGuidance } from '../src/feishu/agent-context.ts'
 import type { FeishuChannel } from '../src/feishu-channel.ts'
@@ -48,11 +49,11 @@ describe('attachment intake', () => {
       resources: [{ type: 'image', fileKey: 'img_1' }] as never,
     }), workspace)
 
-    expect(result).toEqual({ saved: 1, failed: 0, attachmentOnly: true, text: '' })
+    expect(result).toEqual({ saved: 1, failed: 0, failures: [], attachmentOnly: true, text: '' })
     const dir = path.join(workspace, ATTACHMENTS_DIR)
     const files = readdirSync(dir)
     expect(files).toHaveLength(1)
-    expect(files[0]).toMatch(/^20261018-120000-image-1\.png$/)
+    expect(files[0]).toMatch(/^20261018-120000-image\.png$/)
     expect(readFileSync(path.join(dir, files[0]!))).toEqual(Buffer.from(PNG))
     expect((channel as unknown as { reactions: unknown[] }).reactions).toEqual([
       { messageId: 'om_img', emojiType: 'DONE' },
@@ -86,7 +87,7 @@ describe('attachment intake', () => {
       rawContentType: 'merge_forward',
     }), workspace)
 
-    expect(result).toEqual({ saved: 1, failed: 0, attachmentOnly: true, text: '' })
+    expect(result).toEqual({ saved: 1, failed: 0, failures: [], attachmentOnly: true, text: '' })
     const dir = path.join(workspace, ATTACHMENTS_DIR)
     const [name] = readdirSync(dir)
     expect(name).toBe('20261018-120000-forwarded-record.txt')
@@ -114,7 +115,11 @@ describe('attachment intake', () => {
       messageId: 'om_forward_empty', content: '<forwarded_messages/>', rawContentType: 'merge_forward',
     }), workspace)
 
-    expect(result).toEqual({ saved: 0, failed: 1, attachmentOnly: true, text: '' })
+    expect(result.saved).toBe(0)
+    expect(result.failed).toBe(1)
+    expect(result.attachmentOnly).toBe(true)
+    expect(result.text).toBe('')
+    expect(result.failures).toEqual([{ name: '会话记录', reason: '会话记录为空（机器人可能缺少源消息的读取权限）' }])
     expect(existsSync(path.join(workspace, ATTACHMENTS_DIR))).toBe(true)
     expect(readdirSync(path.join(workspace, ATTACHMENTS_DIR))).toEqual([])
     expect((channel as unknown as { reactions: unknown[] }).reactions).toEqual([
@@ -131,7 +136,7 @@ describe('attachment intake', () => {
       resources: [{ type: 'image', fileKey: 'img_1' }] as never,
     }), workspace)
 
-    expect(result).toEqual({ saved: 0, failed: 0, attachmentOnly: false, text: '说明' })
+    expect(result).toEqual({ saved: 0, failed: 0, failures: [], attachmentOnly: false, text: '说明' })
     expect(existsSync(path.join(workspace, ATTACHMENTS_DIR))).toBe(false)
     expect((channel as unknown as { reactions: unknown[] }).reactions).toEqual([])
   })
@@ -149,7 +154,11 @@ describe('attachment intake', () => {
       resources: [{ type: 'image', fileKey: 'img_bad' }] as never,
     }), workspace)
 
-    expect(result).toEqual({ saved: 0, failed: 1, attachmentOnly: true, text: '' })
+    expect(result.saved).toBe(0)
+    expect(result.failed).toBe(1)
+    expect(result.attachmentOnly).toBe(true)
+    expect(result.text).toBe('')
+    expect(result.failures).toEqual([{ name: '图片', reason: 'download failed' }])
     const dir = path.join(workspace, ATTACHMENTS_DIR)
     expect(readdirSync(dir)).toEqual([])
     expect(warn).toHaveBeenCalled()
@@ -184,7 +193,7 @@ describe('attachment intake', () => {
       messageId: 'om_audio', content: '<audio key="x"/>',
       resources: [{ type: 'audio', fileKey: 'x' }] as never,
     }), workspace)
-    expect(result).toEqual({ saved: 0, failed: 0, attachmentOnly: false, text: '<audio key="x"/>' })
+    expect(result).toEqual({ saved: 0, failed: 0, failures: [], attachmentOnly: false, text: '<audio key="x"/>' })
   })
 })
 
@@ -198,6 +207,111 @@ describe('agent guidance', () => {
 
   it('escapes backticks in a hostile workspace path', () => {
     expect(attachmentsGuidance('/tmp/a`b')).toContain("/tmp/a'b/attachments/")
+  })
+})
+
+describe('rich-text post attachments', () => {
+  const postRaw = (files: unknown[], text = '看一下这个文件的内容') => ({
+    message: {
+      message_type: 'post',
+      content: JSON.stringify({
+        title: '',
+        content: [[{ tag: 'text', text, style: [] }]],
+        content_v2: [[{ tag: 'text', text, style: [] }]],
+        files,
+      }),
+    },
+  })
+
+  it('recovers files the SDK post converter drops', async () => {
+    const workspace = makeWorkspace()
+    const payload = new TextEncoder().encode('zip-bytes')
+    const { intake } = makeIntake({ channel: makeChannel({ downloadResource: () => [payload] }) })
+    const result = await intake.archive(makeMessage({
+      messageId: 'om_post_file',
+      rawContentType: 'post',
+      content: '看一下这个文件的内容',
+      raw: postRaw([{
+        file_key: 'file_v3_bugreport', file_name: 'bugreport-2025-11-04-141749.zip', is_folder: false,
+      }]),
+    }), workspace)
+
+    expect(result.saved).toBe(1)
+    expect(result.failures).toEqual([])
+    expect(result.attachmentOnly).toBe(false)
+    expect(result.text).toBe('看一下这个文件的内容')
+    const [name] = readdirSync(path.join(workspace, ATTACHMENTS_DIR))
+    expect(name).toMatch(/-bugreport-2025-11-04-141749\.zip$/)
+  })
+
+  it('treats a file-only post as attachment-only', async () => {
+    const workspace = makeWorkspace()
+    const { intake } = makeIntake({ channel: makeChannel({ downloadResource: () => [PNG] }) })
+    const result = await intake.archive(makeMessage({
+      messageId: 'om_post_only',
+      rawContentType: 'post',
+      content: '[rich text message]',
+      raw: postRaw([{ file_key: 'file_v3_only', file_name: 'only.bin' }], ''),
+    }), workspace)
+    expect(result.saved).toBe(1)
+    expect(result.attachmentOnly).toBe(true)
+    expect(result.text).toBe('')
+  })
+
+  it('reports folder attachments and locale-wrapped payloads', async () => {
+    const workspace = makeWorkspace()
+    const { intake } = makeIntake()
+    const result = await intake.archive(makeMessage({
+      messageId: 'om_post_folder',
+      rawContentType: 'post',
+      content: '[rich text message]',
+      raw: {
+        message: {
+          message_type: 'post',
+          content: JSON.stringify({
+            zh_cn: { title: '', content: [], files: [{ file_key: 'file_v3_dir', file_name: 'logs', is_folder: true }] },
+          }),
+        },
+      },
+    }), workspace)
+    expect(result.failed).toBe(1)
+    expect(result.failures).toEqual([{ name: 'logs', reason: '飞书文件夹消息暂不支持下载' }])
+    expect(readdirSync(path.join(workspace, ATTACHMENTS_DIR))).toEqual([])
+  })
+
+  it('parses only post payloads that actually carry files', () => {
+    expect(postAttachedFiles('post', postRaw([{ file_key: 'k', file_name: 'n.zip' }]))).toEqual([
+      { fileKey: 'k', fileName: 'n.zip' },
+    ])
+    expect(postAttachedFiles('post', postRaw([{ file_key: '', file_name: 'bad.zip' }]))).toEqual([])
+    expect(postAttachedFiles('text', postRaw([{ file_key: 'k' }]))).toEqual([])
+    expect(postAttachedFiles('post', undefined)).toEqual([])
+    expect(postAttachedFiles('post', { message: { content: 'not-json' } })).toEqual([])
+  })
+
+  it('merges post files with normalized resources without duplicates', () => {
+    const msg = makeMessage({
+      messageId: 'om_merge',
+      rawContentType: 'post',
+      content: '![image](img_1) 看一下',
+      raw: postRaw([
+        { file_key: 'img_1', file_name: 'ignored-by-image-resource' },
+        { file_key: 'file_v3_extra', file_name: 'extra.zip' },
+      ], '看一下'),
+      resources: [{ type: 'image', fileKey: 'img_1' }] as never,
+    })
+    const resources = attachmentResources(msg)
+    expect(resources.map(resource => resource.fileKey)).toEqual(['img_1', 'file_v3_extra'])
+    expect(hasAttachmentPayload(msg)).toBe(true)
+    expect(hasAttachmentPayload(makeMessage({ messageId: 'om_plain', content: '纯文本' }))).toBe(false)
+  })
+
+  it('maps download failures to actionable reasons', () => {
+    expect(describeFailure(new Error('Request failed with status code 400')))
+      .toContain('100 MB')
+    expect(describeFailure(new Error('Request failed with status code 403')))
+      .toContain('无权限')
+    expect(describeFailure(new Error('boom'))).toBe('boom')
   })
 })
 

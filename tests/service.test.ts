@@ -3072,6 +3072,63 @@ describe('inbound attachments', () => {
     await h.service.shutdown()
   })
 
+  it('archives a file attached to a rich-text post and then processes its caption', async () => {
+    const h = await setup({}, {
+      downloadResource: () => [new TextEncoder().encode('zip-bytes')],
+    })
+    const raw = {
+      message: {
+        message_type: 'post',
+        content: JSON.stringify({
+          title: '',
+          content: [[{ tag: 'text', text: '看一下这个文件的内容', style: [] }]],
+          files: [{ file_key: 'file_v3_bugreport', file_name: 'bugreport-2025-11-04-141749.zip', is_folder: false }],
+        }),
+      },
+    }
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_post_file', senderId: 'ou_owner', messageId: 'om_post_file',
+      rawContentType: 'post', content: '看一下这个文件的内容', raw,
+    }))
+    const dir = path.join(h.config.baseDir, 'groups', 'oc_post_file', 'ou_owner', 'attachments')
+    await waitUntil(() => expect(readdirSync(dir).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1))
+    expect(readdirSync(dir)[0]).toMatch(/-bugreport-2025-11-04-141749\.zip$/)
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    const message = mock(agent.followup).mock.calls[0]![0] as { content: Array<{ type: string; text?: string }> }
+    expect(message.content).toEqual([{ type: 'text', text: '看一下这个文件的内容' }])
+    await h.service.shutdown()
+  })
+
+  it('tells the user why an attachment could not be archived', async () => {
+    const h = await setup({}, {
+      downloadResource: () => {
+        throw new Error('Request failed with status code 400')
+      },
+    })
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_post_fail', senderId: 'ou_owner', messageId: 'om_post_fail',
+      rawContentType: 'post', content: '看一下这个文件的内容',
+      raw: {
+        message: {
+          message_type: 'post',
+          content: JSON.stringify({
+            title: '',
+            content: [[{ tag: 'text', text: '看一下这个文件的内容', style: [] }]],
+            files: [{ file_key: 'file_v3_big', file_name: 'bugreport-2025-11-04-141749.zip', is_folder: false }],
+          }),
+        },
+      },
+    }))
+    await waitUntil(() => {
+      const texts = (h.channel.sent as Array<{ input: { text?: string } }>)
+        .map(entry => entry.input.text)
+        .filter((text): text is string => text !== undefined)
+      expect(texts.some(text => text.includes('附件保存失败') && text.includes('100 MB'))).toBe(true)
+    })
+    await h.service.shutdown()
+  })
+
   it('turns an image with a caption into one prompt carrying only the caption', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({

@@ -106,6 +106,28 @@ export class CardDelivery {
   }
 
   /**
+   * Send one short plain-text notice anchored to an inbound message. Replies
+   * inside an existing topic when the message belongs to one, and never
+   * creates a topic: an attachment-only message must stay a notice, not a new
+   * conversation. Best-effort — a failed notice only warns.
+   */
+  async noticeText(msg: NormalizedMessage, text: string): Promise<void> {
+    const channel = this.deps.channel()
+    if (!this.deps.started() || channel === undefined) return
+    try {
+      await channel.send(msg.chatId, { text }, {
+        replyTo: msg.messageId,
+        ...(msg.threadId === undefined ? {} : { replyInThread: true }),
+      })
+    } catch (error) {
+      this.deps.warn(
+        'dsh-channels: attachment notice delivery failed for message %s: %s',
+        msg.messageId, String(error),
+      )
+    }
+  }
+
+  /**
    * Reply with the first card frame. Prefers topic replies (`reply_in_thread`)
    * — the documented way a bot creates a topic — and falls back to a plain
    * reply when Feishu refuses (degraded chat-scoped routing).

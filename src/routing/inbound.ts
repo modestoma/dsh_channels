@@ -17,8 +17,8 @@ import { RouteOperationQueue } from '../commands.ts'
 import { chatRouteKey } from '../domain.ts'
 import type { FeishuDomainHandle, RouteRecord } from '../domain.ts'
 import type { CardDelivery } from '../feishu/delivery.ts'
-import { AttachmentIntake } from '../feishu/inbound-attachments.ts'
-import type { AttachmentArchiveResult } from '../feishu/inbound-attachments.ts'
+import { AttachmentIntake, hasAttachmentPayload } from '../feishu/inbound-attachments.ts'
+import type { AttachmentArchiveResult, AttachmentFailure } from '../feishu/inbound-attachments.ts'
 import type { NormalizedMessage } from '../feishu-channel.ts'
 import type { QuestionAnswerer } from '../interactions/questions.ts'
 import type { InflightRepair } from '../session/repair.ts'
@@ -65,6 +65,20 @@ export interface InboundDeps {
   streamer(): TurnStreamer | undefined
   questionAnswerer(): QuestionAnswerer | undefined
   commands: CommandPlanePort
+}
+
+/**
+ * User-facing text for attachments that could not be archived. Delivered as a
+ * plain reply (never a card) so the user learns why the Agent cannot read a
+ * file instead of silently getting an answer about older attachments.
+ */
+export function buildAttachmentFailureNotice(failures: readonly AttachmentFailure[]): string {
+  const lines = failures.map(failure => `• ${failure.name}：${failure.reason}`)
+  return [
+    '⚠️ 附件保存失败，Agent 无法读取：',
+    ...lines,
+    '可尝试压缩/拆分后重发，或把文件直接放到工作区目录。',
+  ].join('\n')
 }
 
 /** Build one durable user message from inbound Feishu text. */
@@ -207,6 +221,9 @@ export class InboundRouter {
     // the caption as the prompt. The Agent reads the files on demand later.
     const archived = await this.archiveAttachments(msg)
     if (archived !== undefined) {
+      if (archived.failures.length > 0) {
+        await this.delivery.noticeText(msg, buildAttachmentFailureNotice(archived.failures))
+      }
       if (archived.attachmentOnly) return
       content = archived.text
       if (content === '') return
@@ -276,10 +293,7 @@ export class InboundRouter {
    * a file is queued behind the file's download instead of racing it.
    */
   private async archiveAttachments(msg: NormalizedMessage): Promise<AttachmentArchiveResult | undefined> {
-    const hasResources = (msg.resources ?? []).some(
-      resource => resource.type === 'image' || resource.type === 'file',
-    )
-    if (!hasResources && msg.rawContentType !== 'merge_forward') return undefined
+    if (!hasAttachmentPayload(msg)) return undefined
 
     const threadRecord = msg.threadId === undefined ? undefined : this.routes.get(msg.threadId)
     // A foreign topic must never receive this sender's attachments: the
@@ -291,11 +305,11 @@ export class InboundRouter {
     // already owns does not.
     if (record === undefined && msg.chatType === 'group'
       && this.config.requireMention && !msg.mentionedBot) {
-      return { saved: 0, failed: 0, attachmentOnly: true, text: '' }
+      return { saved: 0, failed: 0, failures: [], attachmentOnly: true, text: '' }
     }
 
     return await this.routeOperations.run(record?.key ?? chatKey, async () => {
-      if (!this.started) return { saved: 0, failed: 0, attachmentOnly: true, text: '' }
+      if (!this.started) return { saved: 0, failed: 0, failures: [], attachmentOnly: true, text: '' }
       const workspacePath = record?.workspacePath
         ?? (await ensureWorkspace(
           this.ctx, this.config.baseDir, msg.chatType, msg.chatId, msg.senderId,

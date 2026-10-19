@@ -111,6 +111,10 @@ class LarkChannelAdapter implements FeishuChannel {
       appId: options.appId,
       appSecret: options.appSecret,
       loggerLevel: LOGGER_LEVELS[options.loggerLevel],
+      // Keep the raw event body: rich-text messages attach files in a
+      // top-level `files` array the SDK normalizer drops, so the attachment
+      // intake recovers them from `msg.raw` instead.
+      includeRawEvent: true,
       policy: {
         // The plugin routes mentions itself (thread routing must work without
         // mention), so the SDK policy layer stays permissive.
