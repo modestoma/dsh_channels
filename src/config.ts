@@ -21,6 +21,10 @@ export type FeishuLoggerLevel = (typeof FEISHU_LOGGER_LEVELS)[number]
 /** Same shape as the host credentials seam's `CredentialRef` (shell identifier). */
 export const CREDENTIAL_REF_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
 
+/** Conventional credential-reference names used when the loader passes no config. */
+export const DEFAULT_APP_ID_REF = 'FEISHU_APP_ID'
+export const DEFAULT_APP_SECRET_REF = 'FEISHU_APP_SECRET'
+
 /** Default route-table GC threshold: 30 days without activity. */
 export const DEFAULT_ROUTE_TTL_MS = 30 * 24 * 60 * 60 * 1000
 
@@ -37,10 +41,10 @@ const credentialRefSchema = z.string().regex(
 )
 
 export const configSchema = z.object({
-  /** Feishu app id credential reference (e.g. `FEISHU_APP_ID`). */
-  appId: credentialRefSchema,
-  /** Feishu app secret credential reference (e.g. `FEISHU_APP_SECRET`). */
-  appSecret: credentialRefSchema,
+  /** Feishu app id credential reference (defaults to `FEISHU_APP_ID`). */
+  appId: credentialRefSchema.default(DEFAULT_APP_ID_REF),
+  /** Feishu app secret credential reference (defaults to `FEISHU_APP_SECRET`). */
+  appSecret: credentialRefSchema.default(DEFAULT_APP_SECRET_REF),
   /**
    * Root directory for per-(user, chat) workspace directories — the filesystem
    * root where files produced by channel sessions land. Read per session
@@ -187,6 +191,15 @@ export const configSchema = z.object({
 })
 
 export type FeishuConfig = z.infer<typeof configSchema>
+
+/**
+ * DSH loader-facing schema. The bundle patch inserts this plugin without a
+ * `config` object; the loader validates that row with `undefined` before the
+ * user's patch layer supplies values. Accept that absence and fill the same
+ * defaults as {@link resolveConfig}, so enabling the plugin from the Web UI
+ * cannot fail with "expected object, received undefined".
+ */
+export const pluginConfigSchema = configSchema.prefault({})
 
 /**
  * Validate the raw loader config. Values stay credential *references*; the

@@ -392,7 +392,7 @@ SDK 的 `LarkChannel` 已内置 `EventMap['botAdded']`（`im.chat.member.bot.add
 1. 装好插件、配好凭据、重启；启动日志：
    `[dsh-channels] 准入=guarded，管理员未配置：所有对话将被拒绝；私聊机器人发送 /userid 获取 open_id`
 2. 在飞书私聊机器人发 `/userid`（任何私聊发送者都可用，只回固定文本、不建会话）→ 拿到 `ou_xxx`；
-3. Web 面板「飞书渠道 → 常用配置 → 管理员」填入 `ou_xxx` 保存（立即生效）；
+3. Web 面板「飞书渠道 → 访问授权 → 管理员 open_id」填入 `ou_xxx` 保存（立即生效）；
 4. 面板状态显示管理员已配置；管理员私聊可正常对话。
 
 ### 场景 B：给非管理员开启群的访问（三种入口）
@@ -426,7 +426,7 @@ SDK 的 `LarkChannel` 已内置 `EventMap['botAdded']`（`im.chat.member.bot.add
 
 ## 7. Web 面板
 
-### 7.1 常用配置新增字段（`behavior` 组）
+### 7.1 访问授权新增字段（`access` 组）
 
 | key | kind | 说明 |
 |---|---|---|
@@ -462,7 +462,7 @@ SDK 的 `LarkChannel` 已内置 `EventMap['botAdded']`（`im.chat.member.bot.add
 UI：
 
 - 顶部警示条：`guarded` 且管理员未配置时红字提示“当前会拒绝所有对话，请先配置管理员 open_id”；
-- 「管理员」行：显示当前 open_id / 未配置（编辑仍在常用配置里）；
+- 「管理员」行：显示当前 open_id / 未配置（编辑在上方准入表单里）；
 - 「已授权群」列表：群名（未知时显示 chat_id）、来源、时间 + 移除；输入框可手填 chat_id 添加；
 - 「已授权用户」列表：昵称（未知时显示 open_id）+ 移除；输入框可手填 open_id 添加；
 - 「待处理申请」列表：群申请 / 用户申请，各带「授权」「忽略」；
@@ -504,7 +504,7 @@ UI：
 - [x] `InboundRouter` 接入 `access.admit`；话题/附件/问答/续写的 sender + chatId 校验
 - [x] 命令面准入：`/userid`、`/groupid` bootstrap 放行；`/auth` 管理员专用；其他命令（含非法/未知命令）先判准入再发卡
 - [x] `/auth` 核心子命令：`status` / `allow` / `revoke` / `list` / `user add|remove`
-- [x] Web 面板：常用配置加 `adminOpenId`；新「访问与授权」卡片（群/用户白名单增删，自动授权仍无开关）；`/dsh-channels/access*` 路由（同源写保护）
+- [x] Web 面板：「访问授权」标签页加 `adminOpenId`/准入模式；白名单卡片（群/用户增删，自动授权仍无开关）；`/dsh-channels/access*` 路由（同源写保护）
 - [x] 入群事件接线（wrapper `onBotAdded` + `getChatInfo`）：管理员私聊收群信息卡，未授权群附「授权本群 / 忽略」按钮
 - [x] 管理员引导：启动日志、`/userid` 文案、面板未配置警示
 - [x] 错误兜底文案脱敏

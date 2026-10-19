@@ -281,13 +281,21 @@ export class FeishuService {
   private started = false
   /** Epoch ms when `start()` completed (uptime for `/status`). */
   private startedAt: number | undefined
-  /** Last failed `boot()` message, surfaced in the Web settings panel. */
+  /** Last failed connection attempt, surfaced in the Web settings panel. */
   private lastStartError: string | undefined
+  /** Whether both Feishu application credentials currently resolve. */
+  private configured = false
+  /** Names of the missing credential references (never their values). */
+  private missingConfigItems: string[] = []
+  /** Guards the panel's explicit connect action (distinct from a restart). */
+  private connecting = false
   /** Effective config captured at the last successful connect (restart-pending diff). */
   private runningConfig: FeishuConfig | undefined
   /** Guards overlapping panel-triggered reconnects. */
   private restarting = false
   private unlisten: (() => void) | undefined
+  /** Disposers for host-scoped listeners registered by `start()`. */
+  private readonly unlistenHost: Array<() => boolean> = []
   /** Periodic route-GC timer (unref'd; only armed when `routeTtlMs > 0`). */
   private gcTimer: ReturnType<typeof setInterval> | undefined
   /** Periodic workspace-retention timer (only armed when auto cleanup is on). */
@@ -396,24 +404,102 @@ export class FeishuService {
   // ---- lifecycle / Web settings panel ----------------------------------
 
   /**
-   * Load the Web overlay, then open the channel. Startup errors are recorded
-   * for the settings panel and the partial service is torn down before the
-   * error is rethrown (the plugin fiber still fails the same way).
+   * Load the Web overlay and open the long connection when — and only when —
+   * the Feishu application credentials are complete.
+   *
+   * An incomplete configuration is a normal state, not an error: the plugin
+   * stays loaded so the Web settings panel can guide the user through the
+   * credentials form, and no connection is attempted. A failed connection
+   * attempt is recorded for the panel instead of failing the plugin fiber.
    */
   async boot(): Promise<void> {
+    if (this.connecting || this.restarting) return
+    // Acquire the lifecycle lock before the first await so a panel action can
+    // never interleave with the boot sequence.
+    this.connecting = true
     try {
       await this.loadOverlay()
+      await this.refreshReadiness()
+      if (!this.configured) {
+        this.lastStartError = undefined
+        this.runningConfig = undefined
+        this.ctx.logger?.info?.(
+          'dsh-channels: 飞书应用凭据未配置完整（缺少 %s），本次不连接飞书；'
+          + '请在 Web 设置面板 → 飞书渠道中配置，保存后会自动连接',
+          this.missingConfigItems.join('、'),
+        )
+        return
+      }
+      await this.openConnection()
+    } catch {
+      // Recorded in `lastStartError`; the plugin itself stays loaded.
+    } finally {
+      this.connecting = false
+    }
+  }
+
+  /**
+   * Refresh the cached configuration readiness from the credentials seam.
+   * Only presence is checked (describe/resolve), never values; the secrets
+   * themselves are resolved by `start()` when a connection is opened.
+   */
+  async refreshReadiness(): Promise<void> {
+    const states = await this.credentialStates()
+    const missing: string[] = []
+    if (!states.appId.configured) missing.push(`${this.config.appId}（飞书 App ID）`)
+    if (!states.appSecret.configured) missing.push(`${this.config.appSecret}（飞书 App Secret）`)
+    this.missingConfigItems = missing
+    this.configured = missing.length === 0
+  }
+
+  /**
+   * Open the connection with the live config. A failure tears the partial
+   * service down and records the reason for the panel before rethrowing it to
+   * the caller; the plugin fiber is never failed by a connection problem.
+   */
+  private async openConnection(): Promise<void> {
+    try {
       await this.start()
       this.lastStartError = undefined
       this.runningConfig = { ...this.config }
     } catch (error) {
       this.lastStartError = messageOf(error)
+      this.ctx.logger?.error?.('dsh-channels: 飞书连接失败：%s', String(error))
+      // Headless profiles have no settings panel; keep the failure visible on
+      // the console, symmetric with the success line at the end of `start()`.
+      console.error('[dsh-channels] feishu connection failed:', error)
       try {
         await this.shutdown()
       } catch {
-        // The original startup error is the useful one.
+        // The connection error is the useful one.
       }
       throw error
+    }
+  }
+
+  /**
+   * Panel action: open the long connection when the channel is stopped.
+   * Credentials are re-checked first — an incomplete pair throws a message the
+   * panel shows next to the credentials form instead of attempting a connect.
+   */
+  async connect(): Promise<void> {
+    if (this.started) return
+    // Boot, an explicit connect and a restart all drive the same connection
+    // wiring; serialize them instead of racing two `start()` bodies. The lock
+    // is acquired synchronously, before any await.
+    if (this.connecting || this.restarting) throw new Error('飞书连接正在连接或重启，请稍候再试')
+    this.connecting = true
+    try {
+      // A stopped channel may have been edited on disk (the overlay file is
+      // writable by hand); connecting re-reads it like a restart does.
+      await this.loadOverlay()
+      await this.refreshReadiness()
+      if (!this.configured) {
+        throw new Error(`飞书应用凭据尚未配置完整：缺少 ${this.missingConfigItems.join('、')}`)
+      }
+      await this.openConnection()
+    } finally {
+      this.connecting = false
     }
   }
 
@@ -444,26 +530,24 @@ export class FeishuService {
     this.refreshRetentionTimer()
   }
 
-  /** Tear the connection down and bring it back with the latest config. */
+  /**
+   * Tear the connection down and bring it back with the latest config. When the
+   * credentials are no longer complete the channel simply stays stopped (no
+   * error): the panel then shows the configuration guide instead of a failure.
+   */
   async restart(): Promise<void> {
-    if (this.restarting) throw new Error('飞书连接正在重启，请稍候再试')
+    if (this.restarting || this.connecting) throw new Error('飞书连接正在连接或重启，请稍候再试')
     this.restarting = true
     try {
       await this.shutdown()
       await this.loadOverlay()
-      await this.start()
-      this.lastStartError = undefined
-      this.runningConfig = { ...this.config }
-    } catch (error) {
-      this.lastStartError = messageOf(error)
-      // `start()` flips `started` before wiring; a failed reconnect must not
-      // leave the panel claiming a live connection.
-      try {
-        await this.shutdown()
-      } catch {
-        // The restart error is the useful one.
+      await this.refreshReadiness()
+      if (!this.configured) {
+        this.lastStartError = undefined
+        this.runningConfig = undefined
+        return
       }
-      throw error
+      await this.openConnection()
     } finally {
       this.restarting = false
     }
@@ -471,6 +555,12 @@ export class FeishuService {
 
   isRunning(): boolean { return this.started }
   isRestarting(): boolean { return this.restarting }
+  /** True while the panel's explicit connect action is in flight. */
+  isConnecting(): boolean { return this.connecting }
+  /** Whether both Feishu application credentials currently resolve. */
+  isConfigured(): boolean { return this.configured }
+  /** Names of the missing configuration items (never values). */
+  missingConfig(): readonly string[] { return this.missingConfigItems }
   startedAtMs(): number | undefined { return this.startedAt }
   uptimeMs(): number | undefined {
     return this.startedAt === undefined || !this.started ? undefined : Math.max(0, Date.now() - this.startedAt)
@@ -489,6 +579,9 @@ export class FeishuService {
     const admin = this.config.adminOpenId
     return {
       mode: this.config.accessMode,
+      // Whitelists live in the storage domain, which is only open while the
+      // channel runs; an unconnected panel must not present them as empty.
+      loaded: this.domain !== undefined,
       admin: {
         ...(admin === undefined ? {} : { openId: admin }),
         configured: admin !== undefined,
@@ -529,7 +622,7 @@ export class FeishuService {
     const id = this.cleanAccessTargetId(chatId)
     if (id === undefined) return { ok: false, error: 'chat_id 不合法（应为 oc_ 开头的群 ID）' }
     const admin = this.config.adminOpenId
-    if (admin === undefined) return { ok: false, error: '请先在常用配置中设置管理员 open_id' }
+    if (admin === undefined) return { ok: false, error: '请先在「访问授权」标签页设置管理员 open_id' }
     try {
       if (!this.accessStore.hasGroup(id)) {
         await this.accessStore.addGroup({
@@ -563,7 +656,7 @@ export class FeishuService {
     const id = this.cleanAccessUserId(openId)
     if (id === undefined) return { ok: false, error: 'open_id 不合法（应以 ou_ 开头）' }
     const admin = this.config.adminOpenId
-    if (admin === undefined) return { ok: false, error: '请先在常用配置中设置管理员 open_id' }
+    if (admin === undefined) return { ok: false, error: '请先在「访问授权」标签页设置管理员 open_id' }
     try {
       if (!this.accessStore.hasUser(id)) {
         await this.accessStore.addUser({
@@ -597,7 +690,7 @@ export class FeishuService {
     const requests = this.accessRequests
     if (requests === undefined) return { ok: false, error: '授权服务尚未启动' }
     const actor = this.config.adminOpenId
-    if (actor === undefined) return { ok: false, error: '请先配置管理员 open_id' }
+    if (actor === undefined) return { ok: false, error: '请先在「访问授权」标签页配置管理员 open_id' }
     try {
       const result = await requests.resolve(token, decision, actor)
       if (!result.ok) return { ok: false, error: result.error }
@@ -646,6 +739,17 @@ export class FeishuService {
       ...(window === undefined ? {} : { thresholdMs: window }),
       auto: this.config.workspaceRetentionAuto,
     }
+    if (this.domain === undefined) {
+      // No connection: routes live in the closed storage domain, so a preview
+      // would mistake every workspace for a candidate. Report why instead.
+      return {
+        ...base,
+        workspaces: 0,
+        candidates: 0,
+        candidateBytes: 0,
+        error: '飞书连接建立后即可预览和清理工作区',
+      }
+    }
     try {
       const workspaces = this.ctx.workspaceRegistry.list().filter(workspace => this.isPluginWorkspace(workspace))
       const plan = await planWorkspaceCleanup(this.cleanupDeps())
@@ -675,6 +779,12 @@ export class FeishuService {
     error?: string
   }> {
     const empty = { ok: false, deletedWorkspaces: 0, retiredRoutes: 0, freedBytes: 0, failures: [] as string[] }
+    if (this.domain === undefined) {
+      // Without the storage domain the route table is unreadable, so a cleanup
+      // could mistake live workspaces for candidates and fail to retire their
+      // routes. Refuse rather than rely on the panel disabling the button.
+      return { ...empty, error: '飞书连接建立后才能清理工作区' }
+    }
     if (retentionMs(this.config.workspaceRetention) === undefined) {
       return { ...empty, error: '未启用工作区清理阈值（workspaceRetention 为 off）' }
     }
@@ -840,6 +950,7 @@ export class FeishuService {
     } catch (error) {
       throw new Error(`写入凭据引用 ${ref} 失败：${messageOf(error)}`)
     }
+    await this.refreshReadiness()
   }
 
   /** Remove the stored value of one Feishu credential reference. */
@@ -854,6 +965,7 @@ export class FeishuService {
     } catch (error) {
       throw new Error(`移除凭据引用 ${ref} 失败：${messageOf(error)}`)
     }
+    await this.refreshReadiness()
   }
 
   /** The overlay-independent ref name backing one editable credential slot. */
@@ -957,14 +1069,14 @@ export class FeishuService {
       questions.onCardAction(event)
     })
 
-    this.ctx.on('session/event', (session, event) => {
+    this.unlistenHost.push(this.ctx.on('session/event', (session, event) => {
       this.streamer?.onSessionEvent(session, event)
-    })
+    }))
     // DSH removed the durable `assistant/chunk` event (format v2 embeds the
     // stream in the settlement); the live deltas arrive here instead.
-    this.ctx.on('agent/assistant-stream', ({ agent, frame }) => {
+    this.unlistenHost.push(this.ctx.on('agent/assistant-stream', ({ agent, frame }) => {
       this.streamer?.onAssistantFrame(agent.session, frame)
-    })
+    }))
     this.unlisten = channel.onMessage(message => {
       void this.inbound.handle(message).catch((error: unknown) => {
         this.ctx.logger?.warn?.('dsh-channels inbound error: %s', String(error))
@@ -1053,6 +1165,10 @@ export class FeishuService {
     this.unlistenApproval = undefined
     this.unlistenQuestions?.()
     this.unlistenQuestions = undefined
+    // Host-scoped listeners must be released on every teardown: a failed
+    // connect retry or a reconnect calls `start()` again, and a leaked pair
+    // would feed the same session events into the streamer twice.
+    for (const dispose of this.unlistenHost.splice(0)) dispose()
     // Withdraw in-flight approval questions (the host settles them cancelled).
     this.approvalAnswerer?.dispose()
     this.approvalAnswerer = undefined

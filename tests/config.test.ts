@@ -13,7 +13,9 @@ describe('resolveConfig', () => {
   })
 
   it('applies defaults', () => {
-    const config = resolveConfig({ appId: 'FEISHU_APP_ID', appSecret: 'FEISHU_APP_SECRET' })
+    const config = resolveConfig(undefined)
+    expect(config.appId).toBe('FEISHU_APP_ID')
+    expect(config.appSecret).toBe('FEISHU_APP_SECRET')
     expect(config.refreshMs).toBe(500)
     expect(config.baseDir).toBe('./channels-data')
     expect(config.requireMention).toBe(true)
@@ -62,8 +64,10 @@ describe('resolveConfig', () => {
     expect(() => resolveConfig({ appId: 'FEISHU-APP-ID', appSecret: 'FEISHU_APP_SECRET' })).toThrow(/invalid configuration/)
   })
 
-  it('rejects missing fields with a clear message', () => {
-    expect(() => resolveConfig({ appSecret: 'FEISHU_APP_SECRET' })).toThrow(/invalid configuration/)
+  it('defaults credential references when the loader passes no config object', () => {
+    const config = resolveConfig({})
+    expect(config.appId).toBe('FEISHU_APP_ID')
+    expect(config.appSecret).toBe('FEISHU_APP_SECRET')
   })
 
   it('defaults routeTtlMs to 30 days, accepts 0 (disabled), rejects negatives', () => {

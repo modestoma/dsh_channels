@@ -15,7 +15,7 @@
 
 import type { HostContext } from './dsh-types.ts'
 import { FeishuService } from './service.ts'
-import { configSchema, resolveConfig } from './config.ts'
+import { pluginConfigSchema, resolveConfig } from './config.ts'
 import type { FeishuConfig } from './config.ts'
 import { defaultChannelFactory } from './feishu-channel.ts'
 import type { ChannelFactory } from './feishu-channel.ts'
@@ -83,7 +83,7 @@ export const inject = ['agents', 'commands', 'workspaceRegistry', 'storageDomain
  * its `resolveConfig()` fallback for direct invocation (unit tests, embedded
  * hosts) where config has not been pre-validated.
  */
-export const Config = configSchema
+export const Config = pluginConfigSchema
 
 export interface FeishuPluginOptions extends FeishuConfig {
   /** Test seam: substitute a channel implementation. */
@@ -110,12 +110,16 @@ export function apply(ctx: HostContext, config?: unknown): void {
   const warn = (message: string, ...args: unknown[]): void => { ctx.logger?.warn?.(message, ...args) }
   mountSettingsRoutes(ctx, new SettingsSurface(service, overlay, { warn }, createHostCatalog(ctx, warn)))
   ctx.effect(() => {
+    // Boot loads the Web overlay and connects only when the Feishu application
+    // credentials are complete; an incomplete configuration or a failed
+    // connection is a panel-visible state, not a plugin failure. Only an
+    // unexpected boot error (e.g. unreadable overlay) reaches this catch.
     void service.boot().catch((error: unknown) => {
-      ctx.logger?.error?.('dsh-channels failed to start: %s', String(error))
+      ctx.logger?.error?.('dsh-channels failed to boot: %s', String(error))
       // Critical lifecycle line duplicated to the console: cordis logger
       // messages emitted before a web exporter attaches are buffered and may
       // never reach stdout, which makes real-device debugging guesswork.
-      console.error('[dsh-channels] failed to start:', error)
+      console.error('[dsh-channels] failed to boot:', error)
     })
     return () => service.shutdown()
   }, 'dsh-channels')

@@ -11,7 +11,7 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 - **结构化提问**：模型调用 `ask_user_question` 时，插件监听主机 `user-questions/request` 瀑布并发一张问答卡（每个问题一组选项按钮，多选先勾选再「提交本题选择」），答案回填给模型；主机自带的应答者只有 Web 客户端，没有本插件时纯飞书会话会以 `NO_PROVIDER` 失败。超时（`questionTimeoutMs`，默认 5 分钟）或回合取消时本轮提问失败（fail-closed）；没有可选项的问题直接提示用文字作答，**阻塞期间普通文本回复即作为该问题的自由文本答案**（同时支持多选后的自定义文本）
 - **准入与授权（默认开启）**：**管理员不受白名单限制**（私聊、任意群聊——包括尚未授权的群——都能直接发起会话）；其他人私聊只收到一条固定提示（`/userid` 例外），群聊需要「群已授权 + 用户在全局白名单」两层同时命中。机器人被拉进群后私聊管理员发**群信息卡**（未授权群附授权按钮，用于放行白名单用户）；已授权群里未授权用户 @ 会触发用户授权卡。授权入口：飞书 `/auth` 命令、授权卡、Web 设置面板；管理员 open_id 在面板配置（私聊 `/userid` 获取）
 - 全部基于飞书官方 SDK [`@larksuiteoapi/node-sdk`](https://www.npmjs.com/package/@larksuiteoapi/node-sdk)（WebSocket 长连接，免公网）
-- **Web 设置面板**：Web/桌面端 **设置 → 飞书渠道** 查看连接状态、编辑常用配置（保存写入本机覆盖文件，部分字段需重启连接生效）；详见下文「Web 设置面板」章节
+- **Web 设置面板**：Web/桌面端 **设置 → 飞书渠道**，顶部状态头 + 6 个标签页（连接 / 会话与行为 / 模型 / 工作区 / 访问授权 / 高级）；凭据不完整时插件不连接、面板显示三步引导，填写保存后自动连接（保存写入本机覆盖文件，部分字段需重连生效）；详见下文「Web 设置面板」章节
 
 设计与可行性论证见 [docs/feasibility-and-design.md](docs/feasibility-and-design.md)。
 
@@ -53,40 +53,38 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 
 包内含可选的浏览器半区（`lib/client.js`，DSH client module）：在 Web/桌面端 **设置** 导航注册「飞书渠道」分区。宿主没有 `webServer` 服务（headless profile）时不加载面板，飞书通道本身不受影响。
 
-![设置 → 飞书渠道：连接状态、飞书应用凭据与常用配置](docs/assets/web-settings-panel.png)
+**连接时机**：启用插件时**不会无条件连接飞书**。插件启动先读取 profile 配置与 Web 覆盖，再检查 `appId` / `appSecret` 两个凭据引用能否解析出值：
 
-> 截图为验证实例（mock 飞书通道、未登录账号）中的面板；「运行中 · 降级」来自该验证 profile 里其它仍在加载的插件 fiber，正常部署通常显示「运行中 · 健康」。
+- **凭据完整** → 建立飞书长连接（重启 DSH、重新加载插件时同样先检查再连接）。
+- **凭据不完整** → 插件正常加载、**不建连接**、不报错，面板显示「待配置」与三步引导；在「连接」标签页填好两项凭据并保存后自动连接。
+- **连接失败**（凭据错误、网络等）→ 记录在面板状态卡，插件保持加载；修好凭据或网络后点「重试」。
 
-**连接状态**：健康徽标（健康 / 降级 / 异常）、飞书长连接状态、Bot open_id 尾号、运行时长、话题路由数 / 活动会话 / 在途回复、最近一次启动失败原因；每 5 秒自动刷新，也可手动刷新或**重启飞书连接**（会断开当前长连接并中断进行中的回复）。徽标不是健康时会额外显示「健康判定」原因——健康等级由宿主**所有 Cordis fiber** 折叠而来，因此「降级」也可能来自其它插件入口仍在等待依赖/加载（与飞书通道无关），原因行会列出对应插件名。
+**面板结构**：顶部固定连接状态头（阶段徽标：待配置 / 未连接 / 连接中 / 已连接 / 连接失败、一句话摘要、刷新按钮），下方按标签页分区：
 
-**飞书应用凭据**：在「飞书应用凭据」卡片里填写 **App ID / App Secret** 并保存，值经宿主 `ctx.credentials` 写入 DSH 凭据库（默认 `$DSH_HOME/.credentials.yaml` 的 `refs:` 段，仍遵循凭据层的解析优先级），面板只显示「已配置 / 未配置」与来源，**永不回显已存值**。保存时：通道运行中 → 提示重启飞书连接后生效；通道已停止（例如首次配置前启动失败）→ 自动重试连接，失败原因显示在状态卡。已存值可以单独「移除已存值」；卡片下方显示的是凭据**引用名**（profile 配置里的 `appId` / `appSecret`），换引用名仍需改 profile 配置。
+| 标签页 | 内容 |
+| --- | --- |
+| 连接 | 连接状态与连接信息（长连接状态、Bot open_id、运行时长、话题路由 / 活动会话 / 在途回复）、未配置时的三步引导、飞书应用凭据、最近一次连接失败原因、需重连的待生效提醒 |
+| 会话与行为 | 私聊模式、普通群 @ 要求、话题兜底、首次私聊引导、权限切换、附件接收 |
+| 模型 | 模型服务商、模型 id、推理档位、Agent 预设（宿主目录驱动的级联下拉） |
+| 工作区 | 工作区根目录、过期工作区保留期、自动清理、「工作区清理」预览与手动执行 |
+| 访问授权 | 管理员 open_id、准入模式、申请有效期；已授权群 / 用户白名单与待处理申请 |
+| 高级 | 流式刷新 / 状态行 / SDK 日志级别、部署级只读参数、Web 覆盖文件路径与「清除 Web 覆盖」 |
 
-**常用配置**：表单由 Host 下发的字段描述通用渲染，保存时用与 Loader 相同的 zod schema 校验，只提交改动过的字段：
+**连接状态**：阶段徽标（待配置 / 未连接 / 连接中 / 已连接 / 连接失败）、飞书长连接状态、Bot open_id 尾号、运行时长、话题路由数 / 活动会话 / 在途回复、最近一次连接失败原因；每 5 秒自动刷新，也可手动刷新或**重启飞书连接**（会断开当前长连接并中断进行中的回复）。徽标不是健康时会额外显示「健康判定」原因——健康等级由宿主**所有 Cordis fiber** 折叠而来，因此「降级」也可能来自其它插件入口仍在等待依赖/加载（与飞书通道无关），原因行会列出对应插件名；「连接失败」只针对飞书连接本身，插件入口保持加载。
 
-| 分组 | 字段 | 生效方式 |
-| --- | --- | --- |
-| 工作区与文件 | `baseDir` | 立即生效（只影响之后新建的会话/工作区；已有会话不迁移） |
-| 工作区与文件 | `workspaceRetention`、`workspaceRetentionAuto` | 立即生效（清理动作由「工作区清理」卡片触发） |
-| 行为 | `dmMode`、`requireMention` | 需重启连接 |
-| 行为 | `threadFallback`、`welcomeOnboarding`、`allowPermissionSwitch` | 立即生效 |
-| 行为 | `accessMode`、`adminOpenId`、`authRequestTtlDays` | 立即生效（准入判定每次消息实时读取） |
-| 内容与附件 | `acceptAttachments` | 立即生效 |
-| 模型 | `provider`、`model`、`reasoningEffort`、`agentPreset` | 新会话生效（已有会话的模型/预设创建时已固定） |
-| 流式卡片 | `refreshMs`、`statusRefreshMs`、`loggerLevel` | 需重启连接 |
+**飞书应用凭据**：在「连接 → 飞书应用凭据」卡片里填写 **App ID / App Secret** 并保存，值经宿主 `ctx.credentials` 写入 DSH 凭据库（默认 `$DSH_HOME/.credentials.yaml` 的 `refs:` 段，仍遵循凭据层的解析优先级），面板只显示「已配置 / 未配置」与来源，**永不回显已存值**。两项齐全且通道未运行时保存后自动建立连接；已连接时保存只提示重连；只填了一项时保存成功但**不会连接**（状态保持「待配置」），补齐另一项后自动连接。已存值可以单独「移除已存值」；卡片下方显示的是凭据**引用名**（profile 配置里的 `appId` / `appSecret`），换引用名仍需改 profile 配置。
 
-**模型选择器**：模型与推理在面板里是**独立的一张卡片**（不再放在「常用配置」下）：宿主 LLM 服务可用时，`provider` / `model` / `reasoningEffort` 与 `agentPreset` 渲染为**下拉选择**而不是手填：provider 来自 `ctx.llm.listProviders()`，model 来自所选 provider 的 `listModels()`，推理档位来自 `resolveModelInfo(provider, model).reasoning.efforts`，Agent 预设来自 `agentPresets.list()`。每个选择器的首项是「留空 = 部署默认 / 适配器默认 / roster 默认」，有部署默认模型（`agentDefaultModel`）或 roster 默认预设时会在标签里带上具体值。选择按依赖级联：先选 provider 才会加载 model，选了 model 才会加载推理档位；宿主暂时无法枚举的项（服务未挂载、适配器查询失败/超时）自动退回原来的自由文本框，已保存但当前列表里没有的值会作为「当前配置，不在宿主机列表中」选项保留，不会在打开面板时被静默改掉。级联查询走只读的 `GET /dsh-channels/catalog?provider=…&model=…`（Host 侧短 TTL 缓存，单次查询 4 秒上限）。`provider` 与 `model` 在宿主侧是一条完整的请求路由，因此面板保存时要求**两者同时设置或同时留空**，不允许只选一半。
+**统一保存**：除连接类操作外，可编辑字段共用一个草稿；每个表单标签页底部是「保存更改 / 放弃更改」，只提交改动过的字段，标注「需重连」的项在下次连接时生效；保存后「连接」标签页顶部横幅列出待生效项并提供一键重连。
+
+**模型选择器**：模型与推理在面板里是**独立的「模型」标签页**：宿主 LLM 服务可用时，`provider` / `model` / `reasoningEffort` 与 `agentPreset` 渲染为**下拉选择**而不是手填：provider 来自 `ctx.llm.listProviders()`，model 来自所选 provider 的 `listModels()`，推理档位来自 `resolveModelInfo(provider, model).reasoning.efforts`，Agent 预设来自 `agentPresets.list()`。每个选择器的首项是「留空 = 部署默认 / 适配器默认 / roster 默认」，有部署默认模型（`agentDefaultModel`）或 roster 默认预设时会在标签里带上具体值。选择按依赖级联：先选 provider 才会加载 model，选了 model 才会加载推理档位；宿主暂时无法枚举的项（服务未挂载、适配器查询失败/超时）自动退回原来的自由文本框，已保存但当前列表里没有的值会作为「当前配置，不在宿主机列表中」选项保留，不会在打开面板时被静默改掉。级联查询走只读的 `GET /dsh-channels/catalog?provider=…&model=…`（Host 侧短 TTL 缓存，单次查询 4 秒上限）。`provider` 与 `model` 在宿主侧是一条完整的请求路由，因此面板保存时要求**两者同时设置或同时留空**，不允许只选一半。
 
 `baseDir` 是**模型/工具产生文件的落点**：**每个飞书话题拥有一个独立工作区**（私聊 `<baseDir>/topics/p2p/<open_id>/<topic>/`，群聊 `<baseDir>/topics/groups/<chat_id>/<open_id>/<topic>/`，topic 来自话题 id；无话题的降级会话用 session id。旧版本留下的「用户 × 聊天」共享工作区仍在原路径，与新话题工作区互不嵌套）。面板里只接受**绝对路径**（`~` 开头按家目录展开，拒绝文件系统根目录），保存时会创建并校验该目录，不可用时当场报错，不会等到飞书里提示「会话创建失败」。已有 Session / 工作区不会被迁移，因此切到新目录后旧话题继续用旧工作区（话题内 `/renew` 也一样），只有之后新开的话题使用新目录。
 
-**工作区清理**：设置面板新增「工作区清理」卡片，用于回收长期不用的飞书工作区。保留期可选 `off / 7 天 / 30 天 / 90 天 / 180 天`（默认 `off`）；卡片实时预览「插件工作区总数 / 可清理数量 / 预计释放空间」，点「立即清理」需二次确认；也可开启 `workspaceRetentionAuto` 在启动后与每日自动执行一次。清理动作只针对 `<baseDir>` 下由本插件创建（标题以 `飞书私聊 ·` / `飞书群聊 ·` 开头）的工作区：删除目录、注销 workspace registry，并把仍指向它的活跃路由退休为墓碑（该旧话题收到消息会明确提示「话题已过期」，不会恢复到一个已删除的目录）。**Harness Session 日志与事件记录不删除**；删除不可恢复，`off` 时按钮禁用。
+**工作区清理**：「工作区」标签页内提供保留期与「工作区清理」卡片，用于回收长期不用的飞书工作区。保留期可选 `off / 7 天 / 30 天 / 90 天 / 180 天`（默认 `off`）；卡片实时预览「插件工作区总数 / 可清理数量 / 预计释放空间」，点「立即清理」需二次确认；也可开启 `workspaceRetentionAuto` 在启动后与每日自动执行一次。清理动作只针对 `<baseDir>` 下由本插件创建（标题以 `飞书私聊 ·` / `飞书群聊 ·` 开头）的工作区：删除目录、注销 workspace registry，并把仍指向它的活跃路由退休为墓碑（该旧话题收到消息会明确提示「话题已过期」，不会恢复到一个已删除的目录）。**Harness Session 日志与事件记录不删除**；删除不可恢复，`off` 时按钮禁用。未建立飞书连接时（存储域未打开）预览不可用，卡片会提示先连接。
 
-**访问与授权**：面板新增「访问与授权」卡片，集中管理准入：管理员 open_id（也可在「常用配置」里编辑，`ou_` 开头，私聊 `/userid` 获取）、准入模式、授权申请有效期；「已授权群」「已授权用户」列表支持增删（群 ID 可从入群群信息卡或 `/groupid` 获得，用户 open_id 可用 `/userid` 查看）；「待处理申请」可一键授权/忽略。白名单只约束非管理员：管理员在任何私聊/群聊都直接放行。`guarded` 且管理员未配置时卡片顶部会红字提示“当前会拒绝所有对话”。授权白名单与申请记录保存在插件 `storageDomain`（`channels_routes` 域），重启后保留。
+**访问授权**：「访问授权」标签页集中管理准入：管理员 open_id（`ou_` 开头，私聊 `/userid` 获取）、准入模式、授权申请有效期；「已授权群」「已授权用户」列表支持增删（群 ID 可从入群群信息卡或 `/groupid` 获得，用户 open_id 可用 `/userid` 查看）；「待处理申请」可一键授权/忽略。白名单只约束非管理员：管理员在任何私聊/群聊都直接放行。`guarded` 且管理员未配置时标签页顶部会红字提示“当前会拒绝所有对话”。授权白名单与申请记录保存在插件 `storageDomain`（`channels_routes` 域），重启后保留；未建立飞书连接时白名单尚未加载，标签页会提示「连接建立后加载授权列表」并禁用写操作。
 
-保存只改动了「需重连」字段时，面板会列出待生效项并提供一键重连：
-
-![保存后提示需重启飞书连接](docs/assets/web-settings-restart-pending.png)
-
-**配置层级**：`configSchema` 默认值 < profile `cordis.patch.yml` 的 `config` < Web 面板覆盖。面板只把可编辑字段写入 `$DSH_HOME/dsh-channels/settings.json`（可用配置项 `settingsFile` 改路径）；「清除 Web 覆盖」删除该文件并回落到 profile 配置。`baseDir` 可在面板编辑（绝对路径；只影响之后新建的会话）；超时、路由 TTL 等仍只读展示。凭据**值**在「飞书应用凭据」卡片编辑，凭据**引用名**（`appId` / `appSecret` 配置项）仍由 profile 配置决定。
+**配置层级**：`configSchema` 默认值 < profile `cordis.patch.yml` 的 `config` < Web 面板覆盖。面板只把可编辑字段写入 `$DSH_HOME/dsh-channels/settings.json`（可用配置项 `settingsFile` 改路径）；「高级 → 清除 Web 覆盖」删除该文件并回落到 profile 配置。`baseDir` 可在「工作区」标签页编辑（绝对路径；只影响之后新建的会话）；超时、路由 TTL 等仍只读展示。凭据**值**在「连接 → 飞书应用凭据」编辑，凭据**引用名**（`appId` / `appSecret` 配置项）仍由 profile 配置决定。
 
 **为什么落在插件自己的文件而不是 profile 的 `cordis.patch.yml`？** DSH 提供官方 `ctx.configEditor.edit()`，可以安全写 profile patch（完整 Config 校验、保留注释与 `!!js`、原子替换、失败回滚、与 HMR 串行）；但它是「完整配置编辑」通道——本插件的 Config 是 zod，没有 schemastery `.volatile()` 标记，普通字段写入会触发 Loader 重载插件，等于每次保存都断开并重连飞书；而且该服务只在有 `profileContext` 的启动器（桌面端 / `dsh web`）存在。`$DSH_HOME/<plugin>/` 是 DSH 插件保存运行时数据的惯例（如 dsh-pet 的 `$DSH_HOME/dsh-pet/`），因此面板偏好写入 `$DSH_HOME/dsh-channels/settings.json`：保存即生效（需重连字段除外）、可一键清除回退、不依赖 `profileContext`；profile 的 `cordis.patch.yml` 继续作为部署级基础配置层。若将来要求「所有配置统一进 profile」，迁移路径是改用 `ctx.configEditor.edit()` 并接受保存触发插件重载。
 
@@ -149,7 +147,13 @@ src/
 ├── feishu-channel.ts      # 官方 SDK Channel 适配（可注入 stub）
 ├── client/                # 浏览器半区：设置 →「飞书渠道」页面（构建到 lib/client.js）
 │   ├── index.ts           #   client 插件入口：settings.section 注册 + 样式
-│   ├── panel.tsx          #   状态卡 + 模型卡 + 通用配置表单 + 只读信息
+│   ├── panel/             #   页面外壳 + 六个标签页
+│   │   ├── index.tsx      #     加载 / 5s 状态轮询 / 全局草稿 / catalog 级联 / 顶部状态头 / Tab
+│   │   ├── shared.tsx     #     字段渲染原语、保存栏、阶段徽标、草稿校验
+│   │   ├── connection-tab.tsx #   连接：三步引导 / 连接信息 / 待生效提醒 / 凭据卡
+│   │   ├── credentials-card.tsx  #  App ID / App Secret 编辑（不回显）
+│   │   ├── sessions-tab.tsx / model-tab.tsx / workspace-tab.tsx / access-tab.tsx / advanced-tab.tsx
+│   │   └── cleanup-card.tsx / access-card.tsx
 │   ├── catalog.ts         #   选择器目录折叠：Host 字段 + 实时目录 → 表单字段
 │   ├── api.ts             #   同源 /dsh-channels/* 请求封装
 │   └── styles.ts          #   语义 token 样式（注入一次）
@@ -184,7 +188,9 @@ DSH_HOME=$DSH_HOME pnpm dsh plugin --profile web add link:/path/to/dsh_channels
 
 npm 发行包已包含构建产物：Host 入口是 `lib/index.js`（profile 直接以 ESM 加载，不经过 TypeScript strip；`package.json` 的 `main` 指向它），设置面板是 `lib/client.js`。本地 `link:` 安装前仍必须先执行 `pnpm build`。安装或修改后重启 dsh（桌面端重启应用，`dsh web` 重启服务并刷新页面）。DSH 只加载已构建产物，直接改 `src/` 不会生效；没有 web 载体的 profile 不注册面板，飞书通道照常运行。
 
-包内的 `cordis.patch.yml` 会自动把 `@modesto_ma/dsh-channels` 加入 profile 的 bundle 列表，并提供稳定 `id: dsh-channels` 的 Loader 行；profile 只需在 `$DSH_HOME/profiles/web/cordis.patch.yml` 中按该 id 提供实例配置：
+包内的 `cordis.patch.yml` 会自动把 `@modesto_ma/dsh-channels` 加入 profile 的 bundle 列表，并提供稳定 `id: dsh-channels` 的 Loader 行；profile 可在 `$DSH_HOME/profiles/web/cordis.patch.yml` 中按该 id 提供实例配置（不提供时使用默认凭据引用名）：
+
+`appId` / `appSecret` 也各自有默认引用名 `FEISHU_APP_ID` / `FEISHU_APP_SECRET`：凭据库使用这两个名字时，bundle 行即使暂时没有 `config` 也能完成 Loader 校验并启动 Host 半侧，从而先打开设置面板补全凭据；使用自定义引用名时再按需覆盖。
 
 ```yaml
 - id: dsh-channels
@@ -231,11 +237,11 @@ FEISHU_APP_SECRET: xxxxxxxx
 
 也可以不手改文件：安装并在 Web 面板里打开 **设置 → 飞书渠道**，在「飞书应用凭据」卡片填入 App ID / App Secret 保存即可（值同样写进该凭据库）。
 
-文件必须仅属主可读（dsh 强制校验，否则拒绝启动）：`chmod 600 $DSH_HOME/.credentials.yaml`。解析优先级：进程环境变量 > `.credentials.yaml` > `<cwd>/.env` > `$DSH_HOME/.env`（由 `dsh-credentials-local` 提供，热加载）。配置里只写引用名，明文密钥会被 schema 拒绝。凭据改动后重启 dsh 生效。
+文件必须仅属主可读（dsh 强制校验，否则拒绝启动）：`chmod 600 $DSH_HOME/.credentials.yaml`。解析优先级：进程环境变量 > `.credentials.yaml` > `<cwd>/.env` > `$DSH_HOME/.env`（由 `dsh-credentials-local` 提供，热加载）。配置里只写引用名，明文密钥会被 schema 拒绝。改动凭据后：Web 面板保存会即时写入，未连接时自动建立连接、已连接时提示重连；手改 `.credentials.yaml` 由凭据层热加载，但正在运行的连接不会自动使用新值，需在面板点「重启飞书连接」。
 
 验证组合（不启动服务）：`DSH_HOME=$DSH_HOME pnpm dsh web --dump-config | grep dsh-channels`
 
-启动成功标志（控制台）：`[dsh-channels] feishu long connection established, bot open_id: ou_xxx`
+启动成功标志（控制台）：`[dsh-channels] feishu long connection established, bot open_id: ou_xxx`；凭据不完整时不会连接，日志会提示缺少的凭据引用（如 `飞书应用凭据未配置完整（缺少 FEISHU_APP_SECRET…）`），打开 Web **设置 → 飞书渠道 → 连接** 补齐即可。
 
 宿主 profile 已内置所需服务（agent-loop、llm-deepseek、session 持久化、storage-domain、workspace）；推荐确认 `dsh-token-meter` 已启用（卡片上下文占用显示）。
 
@@ -284,6 +290,7 @@ FEISHU_APP_SECRET: xxxxxxxx
 - 重启修复会**全量替换**中断的卡片：旧进程里已流出的部分正文随之消失（本地没有副本，patch 是全量语义）；修复是一次性 + 一次重试，不再无限重试。
 - 路由 GC 是 TTL 兜底：未监听飞书“群解散/话题删除”事件做主动清理；真实话题过期后写入持久化墓碑，用户回来会收到明确拒绝，不会在旧话题中误建新 Session。
 - 消息去重是**至多一次**语义：接受后、副作用完成前崩溃的极小窗口内，重投消息会被丢弃——中断修复卡提示“请重新发送消息”，用户重发即可（新 message id 正常处理）。
+- 插件启用时**不会无条件连接飞书**：只有两项凭据都能解析时才建连，凭据不完整时插件照常加载、面板显示「待配置」引导；连接失败只影响连接本身，插件入口保持加载。
 - Web 面板编辑的是当前凭据**引用名**背后的值（profile 配置 `appId` / `appSecret` 指向的 ref）；更换引用名仍需编辑 profile 配置并重启 DSH。凭据提供方只读时面板会禁用输入并提示。
 - Web 面板的模型字段优先渲染为宿主目录驱动的下拉（provider → model → 推理档位）；宿主没有 LLM 服务或目录查询失败时退回自由文本，手填错误仍会在下一次模型请求时由 Host 报错；「重启飞书连接」会中断进行中的回复。
 - 持久化盘点与全部缺口状态见 [docs/persistence.md](docs/persistence.md)。
@@ -300,4 +307,4 @@ pnpm verify:client    # client loader 冒烟
 pnpm check            # 以上全部
 ```
 
-测试以 stub 替换官方 SDK 与 DSH 宿主服务，无需真实凭据。`tests/settings.test.ts` 覆盖：覆盖层 schema/层级、面板视图模型、HTTP 路由（含同源写保护）、`apply()` 的 webServer 接线、模型选择器的宿主目录与降级行为；`tests/client-catalog.test.ts` 覆盖浏览器半区的目录折叠（含依赖项解禁回归）；以及 `FeishuService` 的覆盖加载 / 热更新 / 重启 / 启动失败记录。
+测试以 stub 替换官方 SDK 与 DSH 宿主服务，无需真实凭据。`tests/settings.test.ts` 覆盖：覆盖层 schema/层级、面板视图模型、连接阶段（待配置/未连接/已连接/失败）、凭据保存按就绪度连接、HTTP 路由（含同源写保护）、`apply()` 的 webServer 接线、模型选择器的宿主目录与降级行为；`tests/client-catalog.test.ts` 覆盖浏览器半区的目录折叠（含依赖项解禁回归）；以及 `FeishuService` 的覆盖加载 / 热更新 / 重启 / 连接失败记录 / 监听器释放。

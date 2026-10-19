@@ -52,9 +52,16 @@ describe('plugin config declaration', () => {
     expect(config).not.toHaveProperty('unknownKey')
   })
 
+  it('accepts an omitted config and fills credential-reference defaults', () => {
+    const config = resolveConfig(runtime, undefined) as FeishuConfig
+    expect(config.appId).toBe('FEISHU_APP_ID')
+    expect(config.appSecret).toBe('FEISHU_APP_SECRET')
+    expect(config.baseDir).toBe('./channels-data')
+  })
+
   it('fails config validation through the Cordis contract (ValidationError, not a service-start error)', () => {
     expect(() => resolveConfig(runtime, { appId: 'not a credential ref' })).toThrow(ValidationError)
-    expect(() => resolveConfig(runtime, { appId: 'FEISHU_APP_ID' })).toThrow(/appSecret/)
+    expect(() => resolveConfig(runtime, { appSecret: 42 })).toThrow(ValidationError)
   })
 
   it('rejects a malformed loader config before apply runs', async () => {

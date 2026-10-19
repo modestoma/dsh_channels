@@ -26,7 +26,10 @@ import {
   CONFIG_ROUTE,
   CREDENTIALS_ROUTE,
   EDITABLE_KEYS,
+  FIELD_GROUP_LABELS,
   PANEL_ROUTE,
+  PANEL_TABS,
+  TAB_FIELD_GROUPS,
   RECONNECT_ROUTE,
   RESTART_KEYS,
   STATUS_ROUTE,
@@ -109,7 +112,10 @@ class FakeTarget implements SettingsTarget {
   credentialCalls: Array<{ field: string; value?: string }> = []
   applied: Partial<FeishuConfig> | undefined
   restartCalls = 0
+  connectCalls = 0
+  connecting = false
   failRestart: string | undefined
+  failConnect: string | undefined
   healthState = healthySnapshot()
   cleanupState: CleanupPreviewWire = {
     retention: 'off',
@@ -133,6 +139,7 @@ class FakeTarget implements SettingsTarget {
   accessState: AccessWire = {
     mode: 'guarded',
     admin: { configured: false },
+    loaded: true,
     groups: [],
     users: [],
     requests: [],
@@ -152,6 +159,19 @@ class FakeTarget implements SettingsTarget {
 
   isRunning(): boolean { return this.runningFlag }
   isRestarting(): boolean { return this.restarting }
+  isConnecting(): boolean { return this.connecting }
+  /** The fake credentials never change behind the panel's back. */
+  async refreshReadiness(): Promise<void> {}
+  /** Readiness mirrors the credential states, like the real service's cache. */
+  isConfigured(): boolean {
+    return this.credentialInfo.appId.configured && this.credentialInfo.appSecret.configured
+  }
+  missingConfig(): readonly string[] {
+    const missing: string[] = []
+    if (!this.credentialInfo.appId.configured) missing.push('FEISHU_APP_ID（飞书 App ID）')
+    if (!this.credentialInfo.appSecret.configured) missing.push('FEISHU_APP_SECRET（飞书 App Secret）')
+    return missing
+  }
   health(): HealthSnapshot { return this.healthState }
   startedAtMs(): number | undefined { return 1_000 }
   uptimeMs(): number | undefined { return this.runningFlag ? 60_000 : undefined }
@@ -171,6 +191,15 @@ class FakeTarget implements SettingsTarget {
     this.restartCalls++
     if (this.failRestart !== undefined) throw new Error(this.failRestart)
     this.running = { ...this.config }
+  }
+
+  async connect(): Promise<void> {
+    this.connectCalls++
+    if (this.failConnect !== undefined) throw new Error(this.failConnect)
+    if (!this.isConfigured()) throw new Error('飞书应用凭据尚未配置完整')
+    this.runningFlag = true
+    this.running = { ...this.config }
+    this.startErrorText = undefined
   }
 
   async credentialStates(): Promise<{
@@ -427,11 +456,28 @@ describe('field descriptors', () => {
     expect(baseDir?.help).toContain('绝对路径')
   })
 
+  it('maps every editable field group onto exactly one panel tab', () => {
+    const rendered = new Set<string>()
+    for (const tab of PANEL_TABS) {
+      for (const group of TAB_FIELD_GROUPS[tab.id]) {
+        expect(rendered.has(group), `group ${group} rendered twice`).toBe(false)
+        rendered.add(group)
+      }
+    }
+    const groups = new Set(FIELD_DESCRIPTORS.map(field => field.group))
+    for (const group of groups) {
+      expect(rendered.has(group), `group ${group} has no tab`).toBe(true)
+      expect(FIELD_GROUP_LABELS[group].length).toBeGreaterThan(0)
+    }
+    // The connection tab owns credentials instead of a field group.
+    expect(TAB_FIELD_GROUPS.connection).toEqual([])
+  })
+
   it('describes the access-control fields without restarting the channel', () => {
     const byKey = new Map(FIELD_DESCRIPTORS.map(field => [field.key, field]))
     for (const key of ['adminOpenId', 'accessMode', 'authRequestTtlDays'] as const) {
       expect(EDITABLE_KEYS).toContain(key)
-      expect(byKey.get(key)).toMatchObject({ group: 'behavior', restartRequired: false })
+      expect(byKey.get(key)).toMatchObject({ group: 'access', restartRequired: false })
     }
 
     const admin = byKey.get('adminOpenId')
@@ -771,6 +817,9 @@ describe('SettingsSurface', () => {
 
     const panel = await surface.panel()
     expect(panel.status.running).toBe(true)
+    expect(panel.status.phase).toBe('connected')
+    expect(panel.status.configured).toBe(true)
+    expect(panel.status.missingConfig).toEqual([])
     expect(panel.status.connection?.state).toBe('connected')
     expect(panel.status.version.length).toBeGreaterThan(0)
     expect(panel.status.overlayPath).toBe(file)
@@ -782,6 +831,31 @@ describe('SettingsSurface', () => {
     expect(panel.config.fields).toHaveLength(EDITABLE_KEYS.length)
     expect(panel.config.restartPendingKeys).toEqual([])
     expect(panel.status.reasons).toEqual([])
+  })
+
+  it('derives the connecting / unconfigured phases honestly', async () => {
+    const connecting = makeSurface()
+    connecting.target.connecting = true
+    expect((await connecting.surface.status()).phase).toBe('connecting')
+
+    const restarting = makeSurface()
+    restarting.target.restarting = true
+    expect((await restarting.surface.status()).phase).toBe('connecting')
+
+    // Booting without credentials: in flight, but there is nothing to connect.
+    const bootingUnconfigured = makeSurface()
+    bootingUnconfigured.target.connecting = true
+    bootingUnconfigured.target.credentialInfo.appSecret = { configured: false, writable: true }
+    expect((await bootingUnconfigured.surface.status()).phase).toBe('unconfigured')
+
+    // A live socket outranks a missing credential: removing a stored value does
+    // not disconnect, so the panel keeps the connection actions available.
+    const runningWithoutCredentials = makeSurface()
+    runningWithoutCredentials.target.credentialInfo.appSecret = { configured: false, writable: true }
+    const status = await runningWithoutCredentials.surface.status()
+    expect(status.phase).toBe('connected')
+    expect(status.configured).toBe(false)
+    expect(status.missingConfig).toEqual(['FEISHU_APP_SECRET（飞书 App Secret）'])
   })
 
   it('surfaces the health reasons that explain a degraded level', async () => {
@@ -969,6 +1043,25 @@ describe('SettingsSurface', () => {
     expect(success.ok).toBe(true)
     expect(target.restartCalls).toBe(2)
   })
+
+  it('opens the first connection when stopped and refuses while unconfigured', async () => {
+    const stopped = makeSurface()
+    stopped.target.runningFlag = false
+    const connected = await stopped.surface.reconnect()
+    expect(connected.ok).toBe(true)
+    expect(stopped.target.connectCalls).toBe(1)
+    expect(stopped.target.restartCalls).toBe(0)
+
+    const unconfigured = makeSurface()
+    unconfigured.target.runningFlag = false
+    unconfigured.target.credentialInfo.appId = { configured: false, writable: true }
+    const refused = await unconfigured.surface.reconnect()
+    expect(refused.ok).toBe(false)
+    if (refused.ok) return
+    expect(refused.unconfigured).toBe(true)
+    expect(unconfigured.target.connectCalls).toBe(0)
+    expect(unconfigured.target.restartCalls).toBe(0)
+  })
 })
 
 describe('SettingsSurface workspace cleanup', () => {
@@ -1045,6 +1138,7 @@ describe('SettingsSurface access control', () => {
   const SAMPLE_ACCESS: AccessWire = {
     mode: 'guarded',
     admin: { openId: 'ou_admin', configured: true },
+    loaded: true,
     groups: [{ chatId: 'oc_team', name: '研发群', source: 'card', addedAt: 1_700_000_000_000 }],
     users: [{ openId: 'ou_alice', name: 'Alice', source: 'command', addedAt: 1_700_000_100_000 }],
     requests: [{
@@ -1073,6 +1167,7 @@ describe('SettingsSurface access control', () => {
     expect(panel.access).toEqual({
       mode: 'open',
       admin: { configured: false },
+      loaded: false,
       groups: [],
       users: [],
       requests: [],
@@ -1197,7 +1292,7 @@ describe('SettingsSurface credentials', () => {
     expect(target.credentialCalls).toEqual([])
   })
 
-  it('auto-reconnects when stopped and reports a failed retry as a warning', async () => {
+  it('connects when stopped once both credentials are complete', async () => {
     const stopped = makeSurface()
     stopped.target.runningFlag = false
     const result = await stopped.surface.saveCredentials({ appId: 'cli_new', appSecret: 'secret_new' })
@@ -1205,15 +1300,30 @@ describe('SettingsSurface credentials', () => {
     if (!result.ok) return
     expect(result.reconnect).toBe('auto')
     expect(result.autoReconnectError).toBeUndefined()
-    expect(stopped.target.restartCalls).toBe(1)
+    expect(stopped.target.connectCalls).toBe(1)
+    expect(stopped.target.restartCalls).toBe(0)
 
     const failing = makeSurface()
     failing.target.runningFlag = false
-    failing.target.failRestart = 'handshake refused'
+    failing.target.failConnect = 'handshake refused'
     const failed = await failing.surface.saveCredentials({ appId: 'cli_new', appSecret: 'secret_new' })
     expect(failed.ok).toBe(true)
     if (!failed.ok) return
     expect(failed.autoReconnectError).toContain('handshake refused')
+  })
+
+  it('stores one half of the pair without connecting until the other half exists', async () => {
+    const stopped = makeSurface()
+    stopped.target.runningFlag = false
+    stopped.target.credentialInfo.appSecret = { configured: false, writable: true }
+    const result = await stopped.surface.saveCredentials({ appId: 'cli_new' })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.reconnect).toBe('unconfigured')
+    expect(stopped.target.connectCalls).toBe(0)
+    expect(result.panel.status.phase).toBe('unconfigured')
+    expect(result.panel.status.configured).toBe(false)
+    expect(result.panel.status.missingConfig).toEqual(['FEISHU_APP_SECRET（飞书 App Secret）'])
   })
 
   it('clears a stored credential and reports pending / not-needed', async () => {
@@ -1411,6 +1521,21 @@ describe('settings routes', () => {
     expect(failed.status).toBe(500)
   })
 
+  it('rejects a connect request with 400 while the credentials are incomplete', async () => {
+    const { surface, target } = makeSurface()
+    target.runningFlag = false
+    target.credentialInfo.appSecret = { configured: false, writable: true }
+    const { server, routes } = makeWebServer()
+    registerSettingsRoutes(server, surface)
+
+    const response = await call(routes, RECONNECT_ROUTE, makeRequest({ method: 'POST', headers: { host: 'h' } }))
+    expect(response.status).toBe(400)
+    const body = JSON.parse(response.body) as { ok: boolean; unconfigured?: boolean }
+    expect(body.ok).toBe(false)
+    expect(body.unconfigured).toBe(true)
+    expect(target.connectCalls).toBe(0)
+  })
+
   it('runs the workspace cleanup via POST with the same guards', async () => {
     const { surface, target } = makeSurface()
     target.cleanupState = { retention: '30d', thresholdMs: 30 * 86_400_000, auto: false, workspaces: 2, candidates: 1, candidateBytes: 512 }
@@ -1447,6 +1572,7 @@ describe('settings routes', () => {
     target.accessState = {
       mode: 'guarded',
       admin: { openId: 'ou_admin', configured: true },
+      loaded: true,
       groups: [{ chatId: 'oc_team', name: '研发群', source: 'card', addedAt: 1_700_000_000_000 }],
       users: [],
       requests: [{
@@ -1729,18 +1855,72 @@ describe('FeishuService settings integration', () => {
     expect(service.runningConfigSnapshot()).toBeUndefined()
   })
 
-  it('records a failed boot for the panel and reports not running', async () => {    const h = harness()
+  it('records a failed connection attempt without failing the plugin boot', async () => {
+    const h = harness()
     const failing = Object.assign(makeChannel(), {
       connect: vi.fn(async () => { throw new Error('ws handshake failed') }),
     })
     const service = new FeishuService(h.ctx, h.config, () => failing, undefined, h.store)
-    await expect(service.boot()).rejects.toThrow('ws handshake failed')
+    // A connection problem must not reject `boot()`: the plugin stays loaded so
+    // the settings panel can show the error and offer a retry.
+    await service.boot()
     expect(service.isRunning()).toBe(false)
+    expect(service.isConfigured()).toBe(true)
     expect(service.startError()).toContain('ws handshake failed')
+    expect(service.missingConfig()).toEqual([])
 
     const panel = await new SettingsSurface(service, h.store).panel()
     expect(panel.status.running).toBe(false)
+    expect(panel.status.phase).toBe('error')
     expect(panel.status.lastStartError).toContain('ws handshake failed')
+  })
+
+  it('stays loaded and unconnected while the credentials are incomplete', async () => {
+    // Only the App ID exists: the plugin must load, expose the panel, and hold
+    // no connection until the pair is complete.
+    const h = harness({}, { FEISHU_APP_ID: 'cli_test_app' })
+    const calls: Array<Record<string, unknown>> = []
+    const service = new FeishuService(h.ctx, h.config, options => {
+      calls.push(options as unknown as Record<string, unknown>)
+      return h.channel
+    }, undefined, h.store)
+
+    await service.boot()
+    expect(calls).toHaveLength(0)
+    expect(service.isRunning()).toBe(false)
+    expect(service.isConfigured()).toBe(false)
+    expect(service.missingConfig()).toEqual(['FEISHU_APP_SECRET（飞书 App Secret）'])
+    expect(service.startError()).toBeUndefined()
+
+    const surface = new SettingsSurface(service, h.store)
+    const panel = await surface.panel()
+    expect(panel.status.phase).toBe('unconfigured')
+    expect(panel.status.configured).toBe(false)
+    expect(panel.status.missingConfig).toEqual(['FEISHU_APP_SECRET（飞书 App Secret）'])
+    expect(panel.status.lastStartError).toBeUndefined()
+    expect(panel.status.running).toBe(false)
+    // Unconnected the storage domain is closed: the whitelists are unknown
+    // rather than empty, and the cleanup preview explains why it is unavailable.
+    expect(panel.access.loaded).toBe(false)
+    expect(panel.cleanup.error).toContain('飞书连接建立后')
+    expect(panel.cleanup.candidates).toBe(0)
+
+    // Cleanup is refused server-side while the storage domain is closed.
+    const run = await surface.runCleanup()
+    expect(run.ok).toBe(true)
+    if (!run.ok) return
+    expect(run.result.ok).toBe(false)
+    expect(run.result.error).toContain('飞书连接建立后')
+
+    // Saving the missing secret from the panel connects immediately.
+    const saved = await surface.saveCredentials({ appSecret: 'secret' })
+    expect(saved.ok).toBe(true)
+    if (!saved.ok) return
+    expect(saved.reconnect).toBe('auto')
+    expect(service.isRunning()).toBe(true)
+    expect(service.isConfigured()).toBe(true)
+    expect(saved.panel.status.phase).toBe('connected')
+    await service.shutdown()
   })
 
   it('applies a validated overlay live, and a later apply starts from the profile base', async () => {
@@ -1776,12 +1956,16 @@ describe('FeishuService settings integration', () => {
     await service.shutdown()
   })
 
-  it('credential writes enable a channel that failed to boot without credentials', async () => {
+  it('credential writes enable a channel that booted without credentials', async () => {
     const h = harness({}, {})
     const service = new FeishuService(h.ctx, h.config, () => h.channel, undefined, h.store)
     const surface = new SettingsSurface(service, h.store)
-    await expect(service.boot()).rejects.toThrow(/not configured/)
+    // No credentials: boot succeeds (the plugin is loaded for the settings
+    // panel) but deliberately opens no connection.
+    await service.boot()
     expect(service.isRunning()).toBe(false)
+    expect(service.isConfigured()).toBe(false)
+    expect(service.startError()).toBeUndefined()
 
     const saved = await surface.saveCredentials({ appId: 'cli_new', appSecret: 'secret_new' })
     expect(saved.ok).toBe(true)
@@ -1797,6 +1981,89 @@ describe('FeishuService settings integration', () => {
     if (!cleared.ok) return
     expect(cleared.reconnect).toBe('pending')
     expect(h.credentials.values.FEISHU_APP_SECRET).toBeUndefined()
+    await service.shutdown()
+  })
+
+  it('keeps a partially configured pair unconnected through the real service', async () => {
+    const h = harness({}, { FEISHU_APP_ID: 'cli_test_app' })
+    const calls: Array<Record<string, unknown>> = []
+    const service = new FeishuService(h.ctx, h.config, options => {
+      calls.push(options as unknown as Record<string, unknown>)
+      return h.channel
+    }, undefined, h.store)
+    const surface = new SettingsSurface(service, h.store)
+    await service.boot()
+    expect(service.isRunning()).toBe(false)
+
+    // Re-saving the half that already exists leaves the pair incomplete: the
+    // value is stored, the channel stays down.
+    const saved = await surface.saveCredentials({ appId: 'cli_new' })
+    expect(saved.ok).toBe(true)
+    if (!saved.ok) return
+    expect(saved.reconnect).toBe('unconfigured')
+    expect(calls).toHaveLength(0)
+    expect(service.isRunning()).toBe(false)
+    expect(saved.panel.status.phase).toBe('unconfigured')
+    expect(service.isConfigured()).toBe(false)
+  })
+
+  it('releases host listeners on teardown so restarts never double-wire events', async () => {
+    const h = harness()
+    const originalOn = h.ctx.on
+    const disposers: Array<() => unknown> = []
+    let disposed = 0
+    const trackingOn = ((name: string, listener: unknown, options?: unknown) => {
+      const dispose = (originalOn as unknown as (n: string, l: unknown, o?: unknown) => () => unknown)(
+        name, listener, options,
+      )
+      disposers.push(dispose)
+      return () => {
+        disposed += 1
+        return dispose()
+      }
+    }) as unknown as typeof h.ctx.on
+    h.ctx.on = trackingOn
+
+    const service = new FeishuService(h.ctx, h.config, () => h.channel, undefined, h.store)
+    await service.boot()
+    const afterBoot = disposers.length
+    expect(afterBoot).toBeGreaterThanOrEqual(2)
+
+    await service.restart()
+    expect(disposers.length).toBeGreaterThan(afterBoot)
+    // The first generation of listeners was disposed by the restart teardown.
+    expect(disposed).toBeGreaterThanOrEqual(afterBoot)
+
+    const beforeShutdown = disposers.length
+    await service.shutdown()
+    expect(disposed).toBeGreaterThanOrEqual(beforeShutdown)
+  })
+
+  it('serializes concurrent connect actions', async () => {
+    const h = harness()
+    let calls = 0
+    let release: (() => void) | undefined
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const slow = Object.assign(makeChannel(), {
+      connect: vi.fn(async () => { await gate }),
+    })
+    // First factory call serves the boot; later calls return the gated channel.
+    const service = new FeishuService(h.ctx, h.config, () => {
+      calls += 1
+      return calls === 1 ? h.channel : slow
+    }, undefined, h.store)
+    await service.boot()
+    await service.shutdown()
+
+    const first = service.connect()
+    // The lifecycle lock is acquired synchronously, before the first await.
+    const second = service.connect()
+    await expect(second).rejects.toThrow(/连接|重启/)
+    expect(vi.mocked(slow.connect)).toHaveBeenCalledTimes(0)
+
+    release?.()
+    await expect(first).resolves.toBeUndefined()
+    expect(vi.mocked(slow.connect)).toHaveBeenCalledTimes(1)
     await service.shutdown()
   })
 

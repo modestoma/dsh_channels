@@ -299,7 +299,9 @@ export function registerSettingsRoutes(server: HostWebServer, surface: SettingsS
           return
         }
         const result = await surface.reconnect()
-        sendJson(res, result.ok ? 200 : 500, result)
+        // An incomplete configuration is a client-side state (the panel routes
+        // the user to the credentials form), not a server failure.
+        sendJson(res, result.ok ? 200 : (result.unconfigured === true ? 400 : 500), result)
       }),
     }),
     server.register({

@@ -84,7 +84,9 @@ FEISHU_APP_SECRET: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 chmod 600 $DSH_HOME/.credentials.yaml
 ```
 
-解析优先级（由 `dsh-credentials-local` 提供，热加载）：进程环境变量 > `.credentials.yaml` > 启动目录 `.env` > `$DSH_HOME/.env`。不想用凭据库时，直接导出环境变量也能生效。凭据改动后重启 dsh 生效。
+解析优先级（由 `dsh-credentials-local` 提供，热加载）：进程环境变量 > `.credentials.yaml` > 启动目录 `.env` > `$DSH_HOME/.env`。不想用凭据库时，直接导出环境变量也能生效。凭据改动后不必重启 dsh：面板保存会即时写入并自动连接/提示重连；手改 `.credentials.yaml` 由凭据层热加载，但运行中的连接不会自动换用新值，需在面板点「重启飞书连接」。
+
+**连接时机**：启用插件时不会无条件连接飞书。插件加载后先检查 `appId` / `appSecret` 两个凭据引用是否都能解析：都就绪才建立长连接；缺任意一项时插件照常加载（设置面板可用），状态为「待配置」且不连接；连接失败只记录在面板里，插件入口保持加载。因此可以「先装插件 → 在面板里填凭据 → 自动连接」，也可以在装插件前就把凭据写进凭据库。
 
 ### 3.2 写补丁层
 
@@ -115,7 +117,7 @@ chmod 600 $DSH_HOME/.credentials.yaml
 
 | 配置项 | 默认 | 说明 |
 |--------|------|------|
-| `appId` / `appSecret` | 必填 | 凭据引用名（shell 标识符），经 `ctx.credentials` 解析；明文密钥会被拒绝 |
+| `appId` / `appSecret` | `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | 凭据引用名（shell 标识符），经 `ctx.credentials` 解析；仅当凭据库使用其它变量名时才需要覆盖。明文密钥会被拒绝 |
 | `baseDir` | `./channels-data` | 工作区目录树根：每个话题一个独立工作区，`topics/p2p/<open_id>/<topic>/`、`topics/groups/<chat_id>/<open_id>/<topic>/`（模型/工具产生文件的落点）；Web 面板可覆盖，只接受绝对路径，`~` 展开，保存时创建并校验目录，只影响之后新建的话题 |
 | `provider` / `model` | 部署默认 | 新建 session 的路由；省略时继承部署默认 |
 | `reasoningEffort` | 适配器/provider 默认 | Session 初始/重置推理档位；可在话题内用 `/effort` 覆盖 |
@@ -135,7 +137,7 @@ chmod 600 $DSH_HOME/.credentials.yaml
 插件默认 `accessMode: 'guarded'`：**没有配置管理员时，所有对话都会被拒绝**（这是 fail-closed 的安全默认值）。初始化顺序：
 
 1. 启动 dsh 后在飞书**私聊机器人**发送 `/userid`（未配置管理员时任何私聊用户都可以用，只回固定文本，不建会话）→ 复制返回的 `ou_...`；
-2. 打开 Web **设置 → 飞书渠道 → 常用配置**，把 `ou_...` 填进「管理员 open_id」并保存（立即生效）；也可以直接写 profile 的 `adminOpenId`；
+2. 打开 Web **设置 → 飞书渠道 → 访问授权**，把 `ou_...` 填进「管理员 open_id」并保存（立即生效）；也可以直接写 profile 的 `adminOpenId`；
 3. 现在管理员私聊机器人即可正常对话。**其他用户私聊会收到一条固定提示**（“非管理员禁用私聊功能哦…”），不会建会话；
 4. **给群授权**（三种入口任选；目的是放行**非管理员**，管理员本人在任何群都能直接对话）：
    - 机器人被拉进群 → 管理员私聊收到**群信息卡**（群名/`chat_id`/成员数/邀请人）→ 点「授权本群」；
@@ -175,18 +177,20 @@ DSH_HOME=$DSH_HOME pnpm dsh web        # 默认 http://127.0.0.1:3080
 
 > 第二行只在宿主挂载了 `approval` 服务时出现；若显示 `主机未挂载 approval 服务，HITL 审批应答关闭`，说明该部署未启用 HITL（`approval/request` 事件永远不会派发），并非插件故障。
 
-**常见启动失败**：
+**未配置凭据（不是启动失败）**：日志会提示 `飞书应用凭据未配置完整（缺少 FEISHU_APP_…）`，插件照常加载但**不连接**；打开 Web **设置 → 飞书渠道 → 连接**，按三步引导填写 App ID / App Secret 并保存后自动连接。
+
+**常见连接失败**（插件保持加载，面板「连接」标签页显示原因，可重试）：
 
 | 输出 | 原因 |
 |------|------|
 | `could not resolve bot identity via /open-apis/bot/v3/info` | App ID/Secret 错误，或未开启机器人能力 |
 | `permission_denied` / `invalid tenant access token` | 同上，先核对凭证再查权限 |
-| `credential "FEISHU_APP_ID" is not configured` | `.credentials.yaml` 缺对应条目（或环境变量未导出），见 §3.1 |
+| `credential "FEISHU_APP_ID" is not configured` | 连接时解析不到凭据（例如刚手改了凭据库但面板状态尚未刷新，或环境变量缺失），见 §3.1；面板保存后会自动重连 |
 | `is readable beyond its owner (mode 644)` | `.credentials.yaml` 权限过宽，`chmod 600` 后重启 |
 | `dsh: plugin tree failed to load … dsh-channels` | 插件本身加载失败（多为 `name:` 拼写或未安装），看后续 cause |
 | 无任何 `dsh-channels` 输出 | 插件未装载：检查 `--dump-config` 是否含条目、补丁层是否用了 `insert:` 格式 |
 
-> 说明：插件内部其余日志走 dsh 的 cordis logger，web 组合下部分早期日志可能只进缓冲不落终端；上面两条**生命周期日志**（连接成功 / 启动失败）额外直接输出到控制台，联调时以它们为准。
+> 说明：插件内部其余日志走 dsh 的 cordis logger，web 组合下部分早期日志可能只进缓冲不落终端；**生命周期日志**（连接成功 / 连接失败 / 凭据未配置）额外直接输出到控制台，联调时以它们为准。
 
 ## 5. 三通道联调清单
 
@@ -242,7 +246,7 @@ DSH_HOME=$DSH_HOME pnpm dsh web        # 默认 http://127.0.0.1:3080
 | 私聊无响应 | 用户是否在应用**可用范围**内；权限 `im:message.p2p_msg:readonly` 是否随版本发布；若返回的是“非管理员禁用私聊功能哦”，说明准入生效（把该用户加入白名单或让管理员对话） |
 | 私聊提示“机器人尚未配置管理员” | `accessMode: 'guarded'` 且未配置 `adminOpenId`：按 §3.3 在面板填写管理员 open_id |
 | 机器人被拉进群但管理员没收到群信息卡 | 是否订阅 **im.chat.member.bot.added_v1** 事件并重新发布版本；群信息读取权限是否已开通（`getChatInfo` 失败只会缺群名，不影响卡片本体） |
-| 群内 @ 机器人无响应（登录台无 access 报错） | 管理员不受白名单限制，可直接对话；**非管理员**需要该群已授权且自己在用户白名单里。可用 `/auth status`（管理员）或 Web 面板「访问与授权」确认 |
+| 群内 @ 机器人无响应（登录台无 access 报错） | 管理员不受白名单限制，可直接对话；**非管理员**需要该群已授权且自己在用户白名单里。可用 `/auth status`（管理员）或 Web 面板「访问授权」标签页确认 |
 | `/auth` 无反应 | `/auth` 仅管理员可用；非管理员在群里会被静默忽略、私聊会收到固定提示 |
 | 群聊 @ 无响应 | 事件订阅是否勾选“接收群聊中 @ 机器人消息”；机器人是否在群内且未被群主禁言 |
 | 有 Typing 但无卡片 | 权限 `im:message` / `im:message:update`；卡片 2.0 需要较新的飞书客户端（升级客户端后重试） |

@@ -2,7 +2,7 @@
  * 浏览器半区的设置面板选择器目录折叠：把 Host 下发的字段描述与实时目录
  * （`/dsh-channels/catalog`）合成通用表单需要的 select 描述。
  *
- * 拆成独立模块（不含 JSX/React）以便单测；`panel.tsx` 只负责串起状态与渲染。
+ * 拆成独立模块（不含 JSX/React）以便单测；`panel/index.tsx` 只负责串起状态与渲染。
  *
  * @module dsh-channels/client/catalog
  */

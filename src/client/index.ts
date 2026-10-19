@@ -9,7 +9,7 @@
  */
 
 import { PANEL_COPY } from '../settings/contract.ts'
-import { FeishuChannelsSection } from './panel.tsx'
+import { FeishuChannelsSection } from './panel/index.tsx'
 import { installStyles } from './styles.ts'
 
 // 平台 client runtime 的最小结构声明：只声明本 bundle 用到的两个能力。

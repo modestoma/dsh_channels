@@ -23,6 +23,7 @@ import type {
   AccessMutationResponse,
   AccessWire,
   CatalogWire,
+  ChannelPhaseWire,
   ChannelStatusWire,
   CleanupPreviewWire,
   CleanupResponse,
@@ -56,10 +57,24 @@ import type { SettingsCatalog } from './catalog.ts'
 export interface SettingsTarget {
   isRunning(): boolean
   isRestarting(): boolean
+  /** True while an explicit connect action is in flight (panel button busy state). */
+  isConnecting(): boolean
   health(): HealthSnapshot
   startedAtMs(): number | undefined
   uptimeMs(): number | undefined
   startError(): string | undefined
+  /**
+   * Whether the Feishu application credentials resolve. A false value means the
+   * plugin is loaded but deliberately holds no connection: the panel guides the
+   * user through configuring credentials instead of reporting a failure.
+   */
+  isConfigured(): boolean
+  /** Human-readable names of the missing configuration items (never values). */
+  missingConfig(): readonly string[]
+  /** Re-read credential presence (the credentials store is hot-reloaded on disk). */
+  refreshReadiness(): Promise<void>
+  /** Connect with the current config; throws when credentials are incomplete or the handshake fails. */
+  connect(): Promise<void>
   configSnapshot(): FeishuConfig
   baseConfigSnapshot(): FeishuConfig
   runningConfigSnapshot(): FeishuConfig | undefined
@@ -164,7 +179,7 @@ const FIELD_META: Record<EditableKey, { label: string; help: string; min?: numbe
   },
   authRequestTtlDays: {
     label: '授权申请有效期（天）',
-    help: '入群/用户授权申请卡的有效期，1–30 天；过期后卡片需重新触发申请（也可直接在「访问与授权」面板处理）。',
+    help: '入群/用户授权申请卡的有效期，1–30 天；过期后卡片需重新触发申请（也可在本页下方「待处理申请」中处理）。',
     min: 1,
     max: 30,
     step: 1,
@@ -190,9 +205,9 @@ const GROUP_OF: Record<EditableKey, EditableFieldWire['group']> = {
   threadFallback: 'behavior',
   welcomeOnboarding: 'behavior',
   allowPermissionSwitch: 'behavior',
-  adminOpenId: 'behavior',
-  accessMode: 'behavior',
-  authRequestTtlDays: 'behavior',
+  adminOpenId: 'access',
+  accessMode: 'access',
+  authRequestTtlDays: 'access',
   acceptAttachments: 'content',
   provider: 'model',
   model: 'model',
@@ -377,12 +392,34 @@ export function readOnlyFields(config: FeishuConfig): ReadOnlyFieldWire[] {
   ]
 }
 
+/**
+ * Derive the panel phase from readiness + runtime facts. The order matters:
+ * an incomplete configuration always wins (no connection is attempted), and a
+ * failed attempt is only reported while the channel is stopped.
+ */
+function phaseOf(target: SettingsTarget): ChannelPhaseWire {
+  // A connection attempt in flight is the honest label even though `start()`
+  // flips `started` before the handshake finishes. A live connection outranks
+  // missing credentials: removing a stored value does not drop the open socket,
+  // so the panel keeps the connection actions available and flags the missing
+  // credential separately (`configured: false`).
+  if (target.isRestarting()) return 'connecting'
+  if (target.isConnecting()) return target.isConfigured() ? 'connecting' : 'unconfigured'
+  if (target.isRunning()) return 'connected'
+  if (!target.isConfigured()) return 'unconfigured'
+  if (target.startError() !== undefined) return 'error'
+  return 'idle'
+}
+
 /** Assemble the status half of the panel payload. */
 function buildStatus(target: SettingsTarget, overlayPath: string): ChannelStatusWire {
   const health = target.health()
   const connection = health.connection
   return {
     running: target.isRunning(),
+    configured: target.isConfigured(),
+    phase: phaseOf(target),
+    missingConfig: [...target.missingConfig()],
     level: health.level,
     startedAt: target.startedAtMs(),
     uptimeMs: target.uptimeMs(),
@@ -402,7 +439,7 @@ function buildStatus(target: SettingsTarget, overlayPath: string): ChannelStatus
     reasons: health.reasons,
     version: DSH_CHANNELS_VERSION,
     overlayPath,
-    busy: target.isRestarting(),
+    busy: target.isRestarting() || target.isConnecting(),
   }
 }
 
@@ -421,8 +458,32 @@ export class SettingsSurface {
     private readonly catalog?: SettingsCatalog,
   ) {}
 
+  /**
+   * Re-read credential presence. The credentials store is hot-reloaded from
+   * disk, so a value edited outside the panel becomes visible within one poll
+   * instead of only after a restart/connect.
+   */
+  private async syncReadiness(): Promise<void> {
+    try {
+      await this.target.refreshReadiness()
+    } catch (error) {
+      this.logger?.warn?.('dsh-channels: 凭据状态刷新失败：%s', messageOf(error))
+    }
+  }
+
+  /**
+   * Reject panel writes while the connection lifecycle is in flight: saving an
+   * overlay or credentials then would race `applyOverlay()`/`start()` and can
+   * record a running-config snapshot that never took effect.
+   */
+  private writeBusy(): { ok: false; error: string } | undefined {
+    if (!this.target.isRestarting() && !this.target.isConnecting()) return undefined
+    return { ok: false, error: '飞书连接正在连接或重启，请稍候再试' }
+  }
+
   /** Wire status only (used by the client's 5 s poll). */
   async status(): Promise<ChannelStatusWire> {
+    await this.syncReadiness()
     return buildStatus(this.target, this.store.file)
   }
 
@@ -443,6 +504,7 @@ export class SettingsSurface {
 
   /** Status + editable config with provenance + read-only facts. */
   async panel(): Promise<PanelWire> {
+    await this.syncReadiness()
     const base = this.target.baseConfigSnapshot()
     const effective = this.target.configSnapshot()
     const overlay = await this.store.load()
@@ -507,6 +569,7 @@ export class SettingsSurface {
       access = {
         mode: effective.accessMode,
         admin: { configured: false },
+        loaded: false,
         groups: [],
         users: [],
         requests: [],
@@ -532,6 +595,8 @@ export class SettingsSurface {
 
   /** Validate + persist a partial edit; live fields take effect immediately. */
   async save(values: EditableValues): Promise<SaveConfigResponse> {
+    const busy = this.writeBusy()
+    if (busy !== undefined) return busy
     const unknown = Object.keys(values).filter(key => !(EDITABLE_KEYS as readonly string[]).includes(key))
     if (unknown.length > 0) {
       return { ok: false, error: `未知配置项：${unknown.join(', ')}` }
@@ -611,6 +676,8 @@ export class SettingsSurface {
 
   /** Drop every Web override and fall back to the profile config. */
   async clear(): Promise<ClearConfigResponse> {
+    const busy = this.writeBusy()
+    if (busy !== undefined) return busy
     try {
       await this.store.clear()
     } catch (error) {
@@ -622,6 +689,8 @@ export class SettingsSurface {
 
   /** Write provided credential values through the host seam (never echoed back). */
   async saveCredentials(values: SaveCredentialsRequest): Promise<SaveCredentialsResponse> {
+    const busy = this.writeBusy()
+    if (busy !== undefined) return busy
     const writes: Array<{ field: CredentialField; value: string }> = []
     const issues: FieldIssueWire[] = []
     for (const field of ['appId', 'appSecret'] as const) {
@@ -647,6 +716,8 @@ export class SettingsSurface {
 
   /** Remove the stored value behind one credential reference. */
   async clearCredential(field: CredentialField): Promise<ClearCredentialResponse> {
+    const busy = this.writeBusy()
+    if (busy !== undefined) return busy
     if (field !== 'appId' && field !== 'appSecret') {
       return { ok: false, error: '未知的凭据字段' }
     }
@@ -659,36 +730,67 @@ export class SettingsSurface {
   }
 
   /**
-   * Credential values are resolved on connect. When the channel is stopped,
-   * retry immediately (nothing to interrupt); when it is running, ask the user
-   * to reconnect. A failed retry still reports the save as successful.
+   * Credential values are resolved on connect. Opening a connection is gated on
+   * readiness: saving one half of the pair stores the value but keeps the
+   * plugin idle until the other half exists. When the channel is stopped and
+   * the pair is complete, connect immediately (nothing to interrupt); when it
+   * is running, the user reconnects to pick the value up.
    */
   private async finishCredentialChange(kind: 'save' | 'clear'): Promise<SaveCredentialsResponse> {
     if (this.target.isRunning()) {
       return { ok: true, panel: await this.panel(), reconnect: 'pending' }
     }
-    if (kind === 'clear') {
-      return { ok: true, panel: await this.panel(), reconnect: 'not-needed' }
+    if (kind === 'clear' || !this.target.isConfigured()) {
+      return { ok: true, panel: await this.panel(), reconnect: kind === 'clear' ? 'not-needed' : 'unconfigured' }
     }
     try {
-      await this.target.restart()
+      await this.target.connect()
       return { ok: true, panel: await this.panel(), reconnect: 'auto' }
     } catch (error) {
+      // The value is stored, but the channel did not come up: report the
+      // failure state instead of claiming a successful connection.
       return {
         ok: true,
         panel: await this.panel(),
-        reconnect: 'auto',
+        reconnect: 'failed',
         autoReconnectError: messageOf(error),
       }
     }
   }
 
-  /** Close and reopen the Feishu long connection with the latest config. */
+  /**
+   * The panel's single connect/reconnect action: reopen a running connection,
+   * or open the first one when the channel is stopped. Credentials must be
+   * complete — otherwise the panel points the user back at the credentials form
+   * instead of surfacing a startup error.
+   */
   async reconnect(): Promise<ReconnectResponse> {
+    // Credentials may have been edited on disk since the last poll; re-check
+    // presence before refusing the action.
+    await this.syncReadiness()
+    if (!this.target.isConfigured()) {
+      return {
+        ok: false,
+        error: '飞书应用凭据尚未配置完整，请先填写 App ID 与 App Secret 并保存',
+        unconfigured: true,
+      }
+    }
+    const wasRunning = this.target.isRunning()
     try {
-      await this.target.restart()
+      if (wasRunning) await this.target.restart()
+      else await this.target.connect()
     } catch (error) {
-      return { ok: false, error: `重连失败：${messageOf(error)}` }
+      return { ok: false, error: `${wasRunning ? '重连' : '连接'}失败：${messageOf(error)}` }
+    }
+    // `restart()` intentionally does not throw when the credentials vanished;
+    // verify the connection actually exists before reporting success.
+    if (!this.target.isRunning()) {
+      return {
+        ok: false,
+        unconfigured: !this.target.isConfigured(),
+        error: this.target.startError()
+          ?? (this.target.isConfigured() ? '飞书连接未建立' : '飞书应用凭据尚未配置完整，请先填写并保存凭据'),
+      }
     }
     return { ok: true, panel: await this.panel() }
   }
@@ -760,6 +862,8 @@ export class SettingsSurface {
    * a refreshed panel (its cleanup preview then reflects the remaining workspaces).
    */
   async runCleanup(): Promise<CleanupResponse> {
+    const busy = this.writeBusy()
+    if (busy !== undefined) return busy
     let result: CleanupRunWire
     try {
       result = await this.target.runWorkspaceCleanup()
