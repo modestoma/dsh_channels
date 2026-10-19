@@ -45,7 +45,7 @@ globalThis.document = {
 await import('../lib/client.js')
 
 assert.ok(loaded, 'bundle did not call window.__ModuleLoader__.load')
-assert.equal(loaded.id, 'dsh-channels')
+assert.equal(loaded.id, '@modesto_ma/dsh-channels')
 const plugin = loaded.module
 assert.equal(typeof plugin.apply, 'function', 'bundle did not export apply()')
 assert.deepEqual(plugin.inject, ['slots'], 'bundle inject must be the slots registry')

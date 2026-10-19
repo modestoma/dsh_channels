@@ -7,6 +7,7 @@ import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 
 interface PackageManifest {
+  name: string
   files?: string[]
   dsh?: {
     bundle?: {
@@ -29,7 +30,7 @@ describe('DSH bundle manifest', () => {
     expect(readFileSync(new URL('../cordis.patch.yml', import.meta.url), 'utf8')).toBe([
       '- insert:',
       '    - id: dsh-channels',
-      '      name: dsh-channels',
+      `      name: '${manifest.name}'`,
       '',
     ].join('\n'))
   })

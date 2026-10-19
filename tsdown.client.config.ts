@@ -1,6 +1,6 @@
 import { defineConfig } from 'tsdown'
 
-const PACKAGE_NAME = 'dsh-channels'
+const PACKAGE_NAME = '@modesto_ma/dsh-channels'
 
 /**
  * Client half build: one closure-factory bundle registered through

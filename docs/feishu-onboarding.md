@@ -37,6 +37,15 @@
 
 dsh 的插件装在 **profile** 里（`$DSH_HOME/profiles/<name>/`，`$DSH_HOME` 未设置时默认 `~/.dsh`）。web 界面使用 `web` profile，首次启动自动初始化。安装命令把 pnpm 转发到 profile 目录执行：
 
+安装已发布的 npm 版本（推荐）：
+
+```bash
+cd $HARNESS
+DSH_HOME=$DSH_HOME pnpm dsh plugin --profile web add @modesto_ma/dsh-channels
+```
+
+本地 checkout 开发时：
+
 ```bash
 cd $HARNESS
 DSH_HOME=$DSH_HOME pnpm dsh plugin --profile web add "link:$PLUGIN"
@@ -44,8 +53,8 @@ DSH_HOME=$DSH_HOME pnpm dsh plugin --profile web add "link:$PLUGIN"
 
 说明：
 
-- `link:` 把本地插件 checkout 链接进 profile，不需要先发布到 npm。
-- 本包声明了 `dsh.bundle`；安装成功后，`dsh plugin` 会自动把 `dsh-channels` 加入 profile 的 bundle 列表，并由包内 `cordis.patch.yml` 提供 Loader 行。
+- npm 安装直接使用包内已构建的 `lib/index.js` 与 `lib/client.js`；`link:` 则把本地插件 checkout 链接进 profile，安装前需在插件仓库执行 `pnpm build`。
+- 本包声明了 `dsh.bundle`；安装成功后，`dsh plugin` 会自动把 `@modesto_ma/dsh-channels` 加入 profile 的 bundle 列表，并由包内 `cordis.patch.yml` 提供稳定 `id: dsh-channels` 的 Loader 行。
 - pnpm 可能输出 `[WARN] Issues with peer dependencies`（`@deepseek-ai/cordis` 由 dsh 统一提供，属预期）与 `[ERR_PNPM_IGNORED_BUILDS] Ignored build scripts: protobufjs`——**安装实际已成功**，`dsh plugin` 的非零退出码可忽略；想消除告警可在 profile 目录的 `pnpm-workspace.yaml` 加 `onlyBuiltDependencies: [protobufjs]`。
 - **改了插件代码后**：运行检查并重启 dsh 即可，不必重复安装；只有 `package.json`、bundle patch 或依赖关系发生变化时才重新执行 `add`。
 

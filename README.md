@@ -168,14 +168,23 @@ src/
 
 插件安装进 dsh 的 **profile**（`$DSH_HOME/profiles/<name>/`，未设置 `DSH_HOME` 时默认 `~/.dsh`），web 界面即 `web` profile。已在真实 dsh 上实测通过的完整流程见 [docs/feishu-onboarding.md](docs/feishu-onboarding.md)（含飞书控制台配置、逐通道联调清单与故障排查），这里给出最小步骤：
 
+安装已发布的 npm 版本（推荐）：
+
 ```bash
-# 在 deepseek-harness 仓库内：把本地 checkout 链接进 web profile
+# 在 deepseek-harness 仓库内：把 npm 包安装进 web profile
+DSH_HOME=$DSH_HOME pnpm dsh plugin --profile web add @modesto_ma/dsh-channels
+```
+
+本地 checkout 开发时：
+
+```bash
+pnpm build
 DSH_HOME=$DSH_HOME pnpm dsh plugin --profile web add link:/path/to/dsh_channels
 ```
 
-安装前先构建：在插件仓库执行 `pnpm build`——Host 入口是 `lib/index.js`（profile 直接以 ESM 加载，不经过 TypeScript strip；`package.json` 的 `main` 指向它），设置面板是 `lib/client.js`。构建后重启 dsh（桌面端重启应用，`dsh web` 重启服务并刷新页面）。DSH 只加载已构建产物，直接改 `src/` 不会生效；没有 web 载体的 profile 不注册面板，飞书通道照常运行。
+npm 发行包已包含构建产物：Host 入口是 `lib/index.js`（profile 直接以 ESM 加载，不经过 TypeScript strip；`package.json` 的 `main` 指向它），设置面板是 `lib/client.js`。本地 `link:` 安装前仍必须先执行 `pnpm build`。安装或修改后重启 dsh（桌面端重启应用，`dsh web` 重启服务并刷新页面）。DSH 只加载已构建产物，直接改 `src/` 不会生效；没有 web 载体的 profile 不注册面板，飞书通道照常运行。
 
-包内的 `cordis.patch.yml` 会自动把 `dsh-channels` 加入 Loader；profile 只需在 `$DSH_HOME/profiles/web/cordis.patch.yml` 中按稳定 id 提供该实例的配置：
+包内的 `cordis.patch.yml` 会自动把 `@modesto_ma/dsh-channels` 加入 profile 的 bundle 列表，并提供稳定 `id: dsh-channels` 的 Loader 行；profile 只需在 `$DSH_HOME/profiles/web/cordis.patch.yml` 中按该 id 提供实例配置：
 
 ```yaml
 - id: dsh-channels
