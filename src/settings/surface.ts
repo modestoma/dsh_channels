@@ -20,6 +20,8 @@ import {
   RESTART_KEYS,
 } from './contract.ts'
 import type {
+  AccessMutationResponse,
+  AccessWire,
   CatalogWire,
   ChannelStatusWire,
   CleanupPreviewWire,
@@ -70,6 +72,18 @@ export interface SettingsTarget {
   cleanupPreview(): Promise<CleanupPreviewWire>
   /** Run the workspace cleanup once; partial failures are reported per workspace. */
   runWorkspaceCleanup(): Promise<CleanupRunWire>
+  /** Current admission snapshot: mode, administrator, whitelists, pending requests. */
+  accessSnapshot(): AccessWire
+  /** Authorize one group (panel entry); resolves with the refreshed snapshot. */
+  addAccessGroup(chatId: string, name?: string): Promise<AccessMutationResponse>
+  /** Revoke one group authorization (takes effect on the next message). */
+  removeAccessGroup(chatId: string): Promise<AccessMutationResponse>
+  /** Authorize one user `open_id` (global across authorized groups). */
+  addAccessUser(openId: string, name?: string): Promise<AccessMutationResponse>
+  /** Revoke one user authorization (takes effect on the next message). */
+  removeAccessUser(openId: string): Promise<AccessMutationResponse>
+  /** Settle one pending request (panel shares this path with the Feishu DM card). */
+  resolveAccessRequest(token: string, decision: 'allow' | 'deny'): Promise<AccessMutationResponse>
 }
 
 /** Presence/source/writability facts returned by the credentials seam. */
@@ -82,7 +96,13 @@ export interface CredentialInfo {
 const RESTART_SET = new Set<string>(RESTART_KEYS)
 
 /** Optional text fields: an empty string in the panel clears the override. */
-const OPTIONAL_TEXT_KEYS = new Set<EditableKey>(['provider', 'model', 'reasoningEffort', 'agentPreset'])
+const OPTIONAL_TEXT_KEYS = new Set<EditableKey>([
+  'provider',
+  'model',
+  'reasoningEffort',
+  'agentPreset',
+  'adminOpenId',
+])
 
 const BOOLEAN_KEYS = new Set<EditableKey>([
   'requireMention',
@@ -114,6 +134,10 @@ const SELECT_OPTIONS: Partial<Record<EditableKey, ReadonlyArray<{ value: string;
     { value: 'warn', label: 'warn' },
     { value: 'error', label: 'error' },
   ],
+  accessMode: [
+    { value: 'guarded', label: '守卫模式（仅管理员与白名单）' },
+    { value: 'open', label: '开放（不安全，仅调试）' },
+  ],
 }
 
 /** Panel copy per editable key: label, help, and (for numbers) bounds. */
@@ -129,6 +153,22 @@ const FIELD_META: Record<EditableKey, { label: string; help: string; min?: numbe
   threadFallback: { label: '话题被拒时的兜底', help: 'degrade 降级为会话级路由；strict 直接让回复失败。' },
   welcomeOnboarding: { label: '首次私聊引导卡', help: '每个私聊会话第一次触达时发送一张命令与用法引导卡，只发一次。' },
   allowPermissionSwitch: { label: '允许飞书侧切换权限预设', help: '安全敏感：开启后话题所有者可用 /permissions 切换沙箱与审批预设。' },
+  adminOpenId: {
+    label: '管理员 open_id',
+    help: '唯一管理员。私聊机器人发送 /userid 获取（ou_ 开头，不是 user_id/邮箱）；留空 = 清除 Web 覆盖。guarded 模式下未配置会拒绝所有对话。',
+    placeholder: 'ou_xxx',
+  },
+  accessMode: {
+    label: '准入模式',
+    help: 'guarded（默认）：私聊仅管理员，群聊需群授权且发送者是管理员或已授权用户；open：应用可用范围内的任何人都能对话，不安全，仅调试。',
+  },
+  authRequestTtlDays: {
+    label: '授权申请有效期（天）',
+    help: '入群/用户授权申请卡的有效期，1–30 天；过期后卡片需重新触发申请（也可直接在「访问与授权」面板处理）。',
+    min: 1,
+    max: 30,
+    step: 1,
+  },
   acceptAttachments: { label: '接收并保存附件', help: '接收飞书图片、文件与合并转发记录，保存到工作区的 attachments/ 目录；模型不会自动读取，需要时用文件工具自行查看。关闭后附件消息不保存、不触发回复。' },
   workspaceRetention: { label: '过期工作区保留期', help: '超过所选天数没有活动的飞书工作区会进入下方「工作区清理」列表；「关闭」表示永不删除。DSH 会话日志不受影响。' },
   workspaceRetentionAuto: { label: '自动执行工作区清理', help: '开启后插件在启动时及每天执行一次过期工作区清理；关闭时只能在下方卡片手动清理。开启前请确认保留期已设置。' },
@@ -150,6 +190,9 @@ const GROUP_OF: Record<EditableKey, EditableFieldWire['group']> = {
   threadFallback: 'behavior',
   welcomeOnboarding: 'behavior',
   allowPermissionSwitch: 'behavior',
+  adminOpenId: 'behavior',
+  accessMode: 'behavior',
+  authRequestTtlDays: 'behavior',
   acceptAttachments: 'content',
   provider: 'model',
   model: 'model',
@@ -282,6 +325,48 @@ export function normalizeCredentialValue(raw: unknown): { ok: true; value: strin
   return { ok: true, value }
 }
 
+/** Longest accepted whitelist identifier / display name. */
+const MAX_ACCESS_VALUE_LENGTH = 128
+
+/** Feishu user open_ids (`ou_` + URL-safe id). Identity is open_id only. */
+const OPEN_ID_PATTERN = /^ou_[A-Za-z0-9_-]+$/
+
+/** Trim one whitelist identifier, rejecting empty, oversized, or hostile input. */
+export function normalizeAccessId(
+  raw: unknown,
+  label: string,
+  invalidFormat?: string,
+): { ok: true; value: string } | { ok: false; message: string } {
+  if (typeof raw !== 'string') return { ok: false, message: `${label}必须是字符串` }
+  const value = raw.trim()
+  if (value === '') return { ok: false, message: `${label}不能为空` }
+  if (value.length > MAX_ACCESS_VALUE_LENGTH) {
+    return { ok: false, message: `${label}长度不得超过 ${MAX_ACCESS_VALUE_LENGTH}` }
+  }
+  // eslint-disable-next-line no-control-regex
+  if (/[\u0000-\u001f\u007f]/.test(value)) return { ok: false, message: `${label}包含非法控制字符` }
+  if (invalidFormat !== undefined && !OPEN_ID_PATTERN.test(value)) {
+    return { ok: false, message: invalidFormat }
+  }
+  return { ok: true, value }
+}
+
+/** Optional display name: trimmed; empty means "unknown" and is dropped. */
+export function normalizeAccessName(
+  raw: unknown,
+): { ok: true; value: string | undefined } | { ok: false; message: string } {
+  if (raw === undefined || raw === null) return { ok: true, value: undefined }
+  if (typeof raw !== 'string') return { ok: false, message: '名称必须是字符串' }
+  const value = raw.trim()
+  if (value === '') return { ok: true, value: undefined }
+  if (value.length > MAX_ACCESS_VALUE_LENGTH) {
+    return { ok: false, message: `名称长度不得超过 ${MAX_ACCESS_VALUE_LENGTH}` }
+  }
+  // eslint-disable-next-line no-control-regex
+  if (/[\u0000-\u001f\u007f]/.test(value)) return { ok: false, message: '名称包含非法控制字符' }
+  return { ok: true, value }
+}
+
 /** Build the read-only advanced card from the effective config. */
 export function readOnlyFields(config: FeishuConfig): ReadOnlyFieldWire[] {
   return [
@@ -411,6 +496,23 @@ export class SettingsSurface {
       }
     }
 
+    // The access snapshot comes from in-memory maps, but a broken seam must
+    // still not take the whole panel down: degrade to an empty, fail-closed
+    // view (the whitelist mutations will report their own errors).
+    let access: AccessWire
+    try {
+      access = this.target.accessSnapshot()
+    } catch (error) {
+      this.logger?.warn?.('dsh-channels: 访问授权快照读取失败：%s', messageOf(error))
+      access = {
+        mode: effective.accessMode,
+        admin: { configured: false },
+        groups: [],
+        users: [],
+        requests: [],
+      }
+    }
+
     return {
       status: buildStatus(this.target, this.store.file),
       config: {
@@ -424,6 +526,7 @@ export class SettingsSurface {
         credentials,
       },
       cleanup,
+      access,
     }
   }
 
@@ -588,6 +691,67 @@ export class SettingsSurface {
       return { ok: false, error: `重连失败：${messageOf(error)}` }
     }
     return { ok: true, panel: await this.panel() }
+  }
+
+  /** Read the current admission snapshot (mode, administrator, whitelists, requests). */
+  async access(): Promise<AccessWire> {
+    return this.target.accessSnapshot()
+  }
+
+  /** Authorize one group from the panel. Validation happens before the write. */
+  async saveAccessGroup(chatId: unknown, name?: unknown): Promise<AccessMutationResponse> {
+    const id = normalizeAccessId(chatId, '群 chat_id')
+    if (!id.ok) return { ok: false, error: id.message }
+    const label = normalizeAccessName(name)
+    if (!label.ok) return { ok: false, error: label.message }
+    return this.mutateAccess(() => this.target.addAccessGroup(id.value, label.value))
+  }
+
+  /** Revoke one group authorization (immediate: the next message re-evaluates). */
+  async removeAccessGroup(chatId: unknown): Promise<AccessMutationResponse> {
+    const id = normalizeAccessId(chatId, '群 chat_id')
+    if (!id.ok) return { ok: false, error: id.message }
+    return this.mutateAccess(() => this.target.removeAccessGroup(id.value))
+  }
+
+  /** Authorize one user `open_id`; `ou_` prefix is required (not user_id/email). */
+  async saveAccessUser(openId: unknown, name?: unknown): Promise<AccessMutationResponse> {
+    const id = normalizeAccessId(openId, '用户 open_id', '用户 open_id 必须形如 ou_xxx（不是 user_id/邮箱）')
+    if (!id.ok) return { ok: false, error: id.message }
+    const label = normalizeAccessName(name)
+    if (!label.ok) return { ok: false, error: label.message }
+    return this.mutateAccess(() => this.target.addAccessUser(id.value, label.value))
+  }
+
+  /** Revoke one user authorization (immediate: the next message re-evaluates). */
+  async removeAccessUser(openId: unknown): Promise<AccessMutationResponse> {
+    const id = normalizeAccessId(openId, '用户 open_id', '用户 open_id 必须形如 ou_xxx（不是 user_id/邮箱）')
+    if (!id.ok) return { ok: false, error: id.message }
+    return this.mutateAccess(() => this.target.removeAccessUser(id.value))
+  }
+
+  /**
+   * Settle one pending request. Shares the target-side resolver with the DM
+   * card, so the panel and the card can never disagree on the outcome.
+   */
+  async resolveAccessRequest(token: unknown, decision: unknown): Promise<AccessMutationResponse> {
+    const normalized = normalizeAccessId(token, '申请 token')
+    if (!normalized.ok) return { ok: false, error: normalized.message }
+    if (decision !== 'allow' && decision !== 'deny') {
+      return { ok: false, error: 'decision 必须是 allow 或 deny' }
+    }
+    return this.mutateAccess(() => this.target.resolveAccessRequest(normalized.value, decision))
+  }
+
+  /** Run one whitelist mutation, folding thrown seam errors into the wire type. */
+  private async mutateAccess(
+    mutation: () => Promise<AccessMutationResponse>,
+  ): Promise<AccessMutationResponse> {
+    try {
+      return await mutation()
+    } catch (error) {
+      return { ok: false, error: messageOf(error) }
+    }
   }
 
   /**

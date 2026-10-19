@@ -17,6 +17,10 @@ import { HEALTH_DEPENDENCY_NAMES } from '../src/health.ts'
 import type { HealthSnapshot } from '../src/health.ts'
 import type { FeishuChannel } from '../src/feishu-channel.ts'
 import {
+  ACCESS_GROUPS_ROUTE,
+  ACCESS_REQUESTS_ROUTE,
+  ACCESS_ROUTE,
+  ACCESS_USERS_ROUTE,
   CATALOG_ROUTE,
   CLEANUP_ROUTE,
   CONFIG_ROUTE,
@@ -27,7 +31,14 @@ import {
   RESTART_KEYS,
   STATUS_ROUTE,
 } from '../src/settings/contract.ts'
-import type { CatalogWire, CleanupPreviewWire, CleanupRunWire, EditableValues } from '../src/settings/contract.ts'
+import type {
+  AccessMutationResponse,
+  AccessWire,
+  CatalogWire,
+  CleanupPreviewWire,
+  CleanupRunWire,
+  EditableValues,
+} from '../src/settings/contract.ts'
 import {
   OverlayStore,
   defaultOverlayPath,
@@ -118,6 +129,20 @@ class FakeTarget implements SettingsTarget {
   failCleanupRun: string | undefined
   cleanupPreviewCalls = 0
   cleanupRunCalls = 0
+  /** Admission snapshot handed to the panel (the real service keeps it in memory). */
+  accessState: AccessWire = {
+    mode: 'guarded',
+    admin: { configured: false },
+    groups: [],
+    users: [],
+    requests: [],
+  }
+  /** Every whitelist mutation the surface forwarded (asserted by the tests). */
+  accessCalls: Array<Record<string, unknown>> = []
+  /** Return one failed wire result instead of mutating (storage error path). */
+  failAccess: string | undefined
+  /** Thrown instead of returning, to exercise the surface's error folding. */
+  throwAccess: string | undefined
 
   constructor(config: FeishuConfig) {
     this.base = { ...config }
@@ -175,6 +200,89 @@ class FakeTarget implements SettingsTarget {
     this.cleanupRunCalls++
     if (this.failCleanupRun !== undefined) throw new Error(this.failCleanupRun)
     return { ...this.cleanupRun, failures: [...this.cleanupRun.failures] }
+  }
+
+  accessSnapshot(): AccessWire {
+    return structuredClone(this.accessState)
+  }
+
+  async addAccessGroup(chatId: string, name?: string): Promise<AccessMutationResponse> {
+    this.accessCalls.push({ op: 'add-group', chatId, name })
+    const failed = this.accessFailure()
+    if (failed !== undefined) return failed
+    if (!this.accessState.groups.some(group => group.chatId === chatId)) {
+      this.accessState.groups.push({
+        chatId,
+        ...(name === undefined ? {} : { name }),
+        source: 'panel',
+        addedAt: 1_700_000_000_000,
+      })
+    }
+    return { ok: true, access: this.accessSnapshot() }
+  }
+
+  async removeAccessGroup(chatId: string): Promise<AccessMutationResponse> {
+    this.accessCalls.push({ op: 'remove-group', chatId })
+    const failed = this.accessFailure()
+    if (failed !== undefined) return failed
+    this.accessState.groups = this.accessState.groups.filter(group => group.chatId !== chatId)
+    return { ok: true, access: this.accessSnapshot() }
+  }
+
+  async addAccessUser(openId: string, name?: string): Promise<AccessMutationResponse> {
+    this.accessCalls.push({ op: 'add-user', openId, name })
+    const failed = this.accessFailure()
+    if (failed !== undefined) return failed
+    if (!this.accessState.users.some(user => user.openId === openId)) {
+      this.accessState.users.push({
+        openId,
+        ...(name === undefined ? {} : { name }),
+        source: 'panel',
+        addedAt: 1_700_000_000_000,
+      })
+    }
+    return { ok: true, access: this.accessSnapshot() }
+  }
+
+  async removeAccessUser(openId: string): Promise<AccessMutationResponse> {
+    this.accessCalls.push({ op: 'remove-user', openId })
+    const failed = this.accessFailure()
+    if (failed !== undefined) return failed
+    this.accessState.users = this.accessState.users.filter(user => user.openId !== openId)
+    return { ok: true, access: this.accessSnapshot() }
+  }
+
+  async resolveAccessRequest(token: string, decision: 'allow' | 'deny'): Promise<AccessMutationResponse> {
+    this.accessCalls.push({ op: 'resolve', token, decision })
+    const failed = this.accessFailure()
+    if (failed !== undefined) return failed
+    const request = this.accessState.requests.find(item => item.token === token)
+    if (request === undefined) return { ok: false, error: '申请不存在或已结算' }
+    this.accessState.requests = this.accessState.requests.filter(item => item.token !== token)
+    if (decision === 'allow') {
+      if (request.kind === 'group') {
+        this.accessState.groups.push({
+          chatId: request.targetId,
+          ...(request.name === undefined ? {} : { name: request.name }),
+          source: 'card',
+          addedAt: 1_700_000_000_000,
+        })
+      } else {
+        this.accessState.users.push({
+          openId: request.targetId,
+          ...(request.name === undefined ? {} : { name: request.name }),
+          source: 'card',
+          addedAt: 1_700_000_000_000,
+        })
+      }
+    }
+    return { ok: true, access: this.accessSnapshot() }
+  }
+
+  private accessFailure(): { ok: false; error: string } | undefined {
+    if (this.throwAccess !== undefined) throw new Error(this.throwAccess)
+    if (this.failAccess !== undefined) return { ok: false, error: this.failAccess }
+    return undefined
   }
 }
 
@@ -317,6 +425,31 @@ describe('field descriptors', () => {
     })
     expect(baseDir?.label).toContain('工作区')
     expect(baseDir?.help).toContain('绝对路径')
+  })
+
+  it('describes the access-control fields without restarting the channel', () => {
+    const byKey = new Map(FIELD_DESCRIPTORS.map(field => [field.key, field]))
+    for (const key of ['adminOpenId', 'accessMode', 'authRequestTtlDays'] as const) {
+      expect(EDITABLE_KEYS).toContain(key)
+      expect(byKey.get(key)).toMatchObject({ group: 'behavior', restartRequired: false })
+    }
+
+    const admin = byKey.get('adminOpenId')
+    expect(admin).toMatchObject({ kind: 'text' })
+    expect(admin?.label).toContain('管理员')
+    expect(admin?.help).toContain('/userid')
+    expect(admin?.help).toContain('ou_')
+
+    const mode = byKey.get('accessMode')
+    expect(mode).toMatchObject({ kind: 'select' })
+    expect(mode?.options?.map(option => option.value)).toEqual(['guarded', 'open'])
+    expect(mode?.options?.find(option => option.value === 'guarded')?.label).toContain('守卫')
+    expect(mode?.options?.find(option => option.value === 'open')?.label).toContain('不安全')
+
+    const ttl = byKey.get('authRequestTtlDays')
+    expect(ttl).toMatchObject({ kind: 'number', min: 1, max: 30, step: 1 })
+    expect(ttl?.label).toContain('有效期')
+    expect(ttl?.help).toContain('过期')
   })
 
   it('describes the retention select and attachment toggle instead of the old image keys', () => {
@@ -741,6 +874,34 @@ describe('SettingsSurface', () => {
     await expect(store.load()).resolves.toEqual({})
   })
 
+  it('saves the access-control config and clears the administrator override', async () => {
+    const { surface, store } = makeSurface()
+    const saved = await surface.save({ adminOpenId: 'ou_admin', accessMode: 'open', authRequestTtlDays: 14 })
+    expect(saved.ok).toBe(true)
+    if (!saved.ok) return
+    await expect(store.load()).resolves.toEqual({
+      adminOpenId: 'ou_admin',
+      accessMode: 'open',
+      authRequestTtlDays: 14,
+    })
+    expect(saved.panel.config.effective.adminOpenId).toBe('ou_admin')
+    expect(saved.panel.config.effective.accessMode).toBe('open')
+    expect(saved.panel.config.effective.authRequestTtlDays).toBe(14)
+    expect(saved.panel.config.restartPendingKeys).toEqual([])
+
+    const invalid = await surface.save({ adminOpenId: 'alice', authRequestTtlDays: 0 })
+    expect(invalid.ok).toBe(false)
+    if (invalid.ok) return
+    expect(invalid.issues?.map(issue => issue.key))
+      .toEqual(expect.arrayContaining(['adminOpenId', 'authRequestTtlDays']))
+
+    const cleared = await surface.save({ adminOpenId: '' })
+    expect(cleared.ok).toBe(true)
+    const overlay = await store.load()
+    expect(overlay.adminOpenId).toBeUndefined()
+    expect(overlay.accessMode).toBe('open')
+  })
+
   it('rejects unknown keys and invalid values with per-field issues', async () => {
     const { surface, store } = makeSurface()
     const unknown = await surface.save({ nope: true } as unknown as EditableValues)
@@ -877,6 +1038,129 @@ describe('SettingsSurface workspace cleanup', () => {
     if (result.ok) return
     expect(result.error).toContain('permission denied')
     expect(target.cleanupRunCalls).toBe(1)
+  })
+})
+
+describe('SettingsSurface access control', () => {
+  const SAMPLE_ACCESS: AccessWire = {
+    mode: 'guarded',
+    admin: { openId: 'ou_admin', configured: true },
+    groups: [{ chatId: 'oc_team', name: '研发群', source: 'card', addedAt: 1_700_000_000_000 }],
+    users: [{ openId: 'ou_alice', name: 'Alice', source: 'command', addedAt: 1_700_000_100_000 }],
+    requests: [{
+      token: 'tok_1',
+      kind: 'group',
+      targetId: 'oc_new',
+      name: '新群',
+      chatId: 'oc_new',
+      createdAt: 1_700_000_200_000,
+      expiresAt: 1_700_000_800_000,
+    }],
+  }
+
+  it('carries the access snapshot into the panel', async () => {
+    const { surface, target } = makeSurface()
+    target.accessState = structuredClone(SAMPLE_ACCESS)
+    const panel = await surface.panel()
+    expect(panel.access).toEqual(SAMPLE_ACCESS)
+    await expect(surface.access()).resolves.toEqual(SAMPLE_ACCESS)
+  })
+
+  it('degrades a broken access snapshot instead of failing the panel', async () => {
+    const { surface, target } = makeSurface({ accessMode: 'open' })
+    target.accessSnapshot = () => { throw new Error('access store down') }
+    const panel = await surface.panel()
+    expect(panel.access).toEqual({
+      mode: 'open',
+      admin: { configured: false },
+      groups: [],
+      users: [],
+      requests: [],
+    })
+    await expect(surface.access()).rejects.toThrow('access store down')
+  })
+
+  it('validates and saves group and user authorizations', async () => {
+    const { surface, target } = makeSurface()
+    const group = await surface.saveAccessGroup(' oc_team ', ' 研发群 ')
+    expect(group.ok).toBe(true)
+    if (!group.ok) return
+    expect(group.access.groups).toEqual([{
+      chatId: 'oc_team',
+      name: '研发群',
+      source: 'panel',
+      addedAt: 1_700_000_000_000,
+    }])
+
+    const user = await surface.saveAccessUser(' ou_alice ', ' Alice ')
+    expect(user.ok).toBe(true)
+    if (!user.ok) return
+    expect(user.access.users).toEqual([{
+      openId: 'ou_alice',
+      name: 'Alice',
+      source: 'panel',
+      addedAt: 1_700_000_000_000,
+    }])
+    expect(target.accessCalls).toEqual([
+      { op: 'add-group', chatId: 'oc_team', name: '研发群' },
+      { op: 'add-user', openId: 'ou_alice', name: 'Alice' },
+    ])
+  })
+
+  it('rejects invalid identifiers before writing anything', async () => {
+    const { surface, target } = makeSurface()
+    for (const chatId of ['', '   ', 'x'.repeat(129), 'oc_\u0001bad', 42]) {
+      const result = await surface.saveAccessGroup(chatId)
+      expect(result.ok).toBe(false)
+    }
+    for (const openId of ['alice', 'user@example.com', 'ou_', 'ou_bad id']) {
+      const result = await surface.saveAccessUser(openId)
+      expect(result.ok).toBe(false)
+      if (result.ok) return
+      expect(result.error).toContain('ou_')
+    }
+    const badName = await surface.saveAccessUser('ou_bob', 'x'.repeat(129))
+    expect(badName.ok).toBe(false)
+    expect(target.accessCalls).toEqual([])
+  })
+
+  it('removes authorizations and resolves pending requests', async () => {
+    const { surface, target } = makeSurface()
+    target.accessState = structuredClone(SAMPLE_ACCESS)
+
+    const removedGroup = await surface.removeAccessGroup('oc_team')
+    expect(removedGroup.ok).toBe(true)
+    const removedUser = await surface.removeAccessUser('ou_alice')
+    expect(removedUser.ok).toBe(true)
+    const allowed = await surface.resolveAccessRequest('tok_1', 'allow')
+    expect(allowed.ok).toBe(true)
+    if (!allowed.ok) return
+    expect(allowed.access.requests).toEqual([])
+    expect(allowed.access.groups.map(group => group.chatId)).toEqual(['oc_new'])
+    expect(target.accessCalls).toEqual([
+      { op: 'remove-group', chatId: 'oc_team' },
+      { op: 'remove-user', openId: 'ou_alice' },
+      { op: 'resolve', token: 'tok_1', decision: 'allow' },
+    ])
+  })
+
+  it('folds target failures, thrown errors, and invalid decisions into the wire', async () => {
+    const { surface, target } = makeSurface()
+    target.failAccess = 'store unavailable'
+    await expect(surface.saveAccessGroup('oc_x')).resolves.toEqual({ ok: false, error: 'store unavailable' })
+
+    target.failAccess = undefined
+    target.throwAccess = 'domain not open'
+    await expect(surface.removeAccessUser('ou_bob')).resolves.toEqual({ ok: false, error: 'domain not open' })
+
+    target.throwAccess = undefined
+    target.accessState = structuredClone(SAMPLE_ACCESS)
+    const badDecision = await surface.resolveAccessRequest('tok_1', 'maybe')
+    expect(badDecision.ok).toBe(false)
+    const badToken = await surface.resolveAccessRequest('   ', 'allow')
+    expect(badToken.ok).toBe(false)
+    const unknownToken = await surface.resolveAccessRequest('missing', 'deny')
+    expect(unknownToken.ok).toBe(false)
   })
 })
 
@@ -1157,6 +1441,97 @@ describe('settings routes', () => {
     expect(failed.status).toBe(500)
     expect(JSON.parse(failed.body).error).toContain('disk unavailable')
   })
+
+  it('serves the access snapshot and guards every whitelist write', async () => {
+    const { surface, target } = makeSurface()
+    target.accessState = {
+      mode: 'guarded',
+      admin: { openId: 'ou_admin', configured: true },
+      groups: [{ chatId: 'oc_team', name: '研发群', source: 'card', addedAt: 1_700_000_000_000 }],
+      users: [],
+      requests: [{
+        token: 'tok_1',
+        kind: 'group',
+        targetId: 'oc_new',
+        chatId: 'oc_new',
+        createdAt: 1_700_000_200_000,
+        expiresAt: 1_700_000_800_000,
+      }],
+    }
+    const { server, routes } = makeWebServer()
+    registerSettingsRoutes(server, surface)
+
+    const read = await call(routes, ACCESS_ROUTE, makeRequest())
+    expect(read.status).toBe(200)
+    const snapshot = JSON.parse(read.body) as AccessWire
+    expect(snapshot.admin).toEqual({ openId: 'ou_admin', configured: true })
+    expect(snapshot.groups).toEqual(target.accessState.groups)
+
+    const head = await call(routes, ACCESS_ROUTE, makeRequest({ method: 'HEAD', url: ACCESS_ROUTE }))
+    expect(head.status).toBe(200)
+    expect(head.body).toBe('')
+
+    const writes: Array<{ route: string; method: string; body: Record<string, unknown> }> = [
+      { route: ACCESS_GROUPS_ROUTE, method: 'POST', body: { chatId: 'oc_team' } },
+      { route: ACCESS_GROUPS_ROUTE, method: 'DELETE', body: { chatId: 'oc_team' } },
+      { route: ACCESS_USERS_ROUTE, method: 'POST', body: { openId: 'ou_alice' } },
+      { route: ACCESS_USERS_ROUTE, method: 'DELETE', body: { openId: 'ou_alice' } },
+      { route: ACCESS_REQUESTS_ROUTE, method: 'POST', body: { token: 'tok_1', decision: 'allow' } },
+    ]
+    for (const write of writes) {
+      const crossSite = await call(routes, write.route, makeRequest({
+        method: write.method,
+        headers: { 'content-type': 'application/json', origin: 'https://evil.example', host: '127.0.0.1:52555' },
+        body: JSON.stringify(write.body),
+      }))
+      expect(crossSite.status).toBe(403)
+    }
+    expect(target.accessCalls).toEqual([])
+
+    const addedGroup = await call(routes, ACCESS_GROUPS_ROUTE, makeRequest({
+      method: 'POST',
+      headers: { 'content-type': 'application/json', host: 'h' },
+      body: JSON.stringify({ chatId: 'oc_team', name: '研发群' }),
+    }))
+    expect(addedGroup.status).toBe(200)
+    expect(JSON.parse(addedGroup.body).ok).toBe(true)
+    expect(JSON.parse(addedGroup.body).access.groups.map((group: { chatId: string }) => group.chatId))
+      .toContain('oc_team')
+
+    const invalidUser = await call(routes, ACCESS_USERS_ROUTE, makeRequest({
+      method: 'POST',
+      headers: { 'content-type': 'application/json', host: 'h' },
+      body: JSON.stringify({ openId: 'alice' }),
+    }))
+    expect(invalidUser.status).toBe(400)
+    expect(JSON.parse(invalidUser.body).error).toContain('ou_')
+
+    const removed = await call(routes, ACCESS_GROUPS_ROUTE, makeRequest({
+      method: 'DELETE',
+      headers: { 'content-type': 'application/json', host: 'h' },
+      body: JSON.stringify({ chatId: 'oc_team' }),
+    }))
+    expect(removed.status).toBe(200)
+
+    const resolved = await call(routes, ACCESS_REQUESTS_ROUTE, makeRequest({
+      method: 'POST',
+      headers: { 'content-type': 'application/json', host: 'h' },
+      body: JSON.stringify({ token: 'tok_1', decision: 'allow' }),
+    }))
+    expect(resolved.status).toBe(200)
+    expect(JSON.parse(resolved.body).access.requests).toEqual([])
+
+    const missing = await call(routes, ACCESS_GROUPS_ROUTE, makeRequest({
+      method: 'POST',
+      headers: { 'content-type': 'application/json', host: 'h' },
+      body: JSON.stringify({}),
+    }))
+    expect(missing.status).toBe(400)
+
+    const notAllowed = await call(routes, ACCESS_GROUPS_ROUTE, makeRequest({ method: 'GET' }))
+    expect(notAllowed.status).toBe(405)
+    expect(notAllowed.headers.allow).toBe('POST, DELETE')
+  })
 })
 
   it('writes and removes credentials via PUT / DELETE with the same guards', async () => {
@@ -1242,6 +1617,10 @@ describe('apply() web wiring', () => {
     expect(routes.has(CREDENTIALS_ROUTE)).toBe(true)
     expect(routes.has(RECONNECT_ROUTE)).toBe(true)
     expect(routes.has(CLEANUP_ROUTE)).toBe(true)
+    expect(routes.has(ACCESS_ROUTE)).toBe(true)
+    expect(routes.has(ACCESS_GROUPS_ROUTE)).toBe(true)
+    expect(routes.has(ACCESS_USERS_ROUTE)).toBe(true)
+    expect(routes.has(ACCESS_REQUESTS_ROUTE)).toBe(true)
 
     const panel = await call(routes, PANEL_ROUTE, makeRequest())
     expect(panel.status).toBe(200)

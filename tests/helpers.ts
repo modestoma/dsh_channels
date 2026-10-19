@@ -15,7 +15,7 @@ import type {
   Workspace, WorkspaceRegistry,
 } from '../src/dsh-types.ts'
 import type {
-  CardActionEvent, FeishuChannel, FeishuConnectionStatus, NormalizedMessage, SendResult,
+  BotAddedEvent, CardActionEvent, ChatInfo, FeishuChannel, FeishuConnectionStatus, NormalizedMessage, SendResult,
 } from '../src/feishu-channel.ts'
 import type { RawDomainHandle } from '../src/domain.ts'
 
@@ -548,6 +548,8 @@ export interface FakeChannelOptions {
   failFileSends?: boolean
   /** Official SDK WebSocket lifecycle snapshot returned by the stub. */
   connectionStatus?: FeishuConnectionStatus
+  /** Chat info returned by the `getChatInfo` stub (defaults to a group shell). */
+  chatInfo?: (chatId: string) => ChatInfo | Promise<ChatInfo>
 }
 
 export function makeChannel(options: FakeChannelOptions = {}): FeishuChannel & {
@@ -558,12 +560,16 @@ export function makeChannel(options: FakeChannelOptions = {}): FeishuChannel & {
   cardActionHandlers: Array<(event: CardActionEvent) => void | Promise<void>>
   /** Dispatch one card action through every registered handler. */
   fireCardAction: (event: CardActionEvent) => Promise<void>
+  botAddedHandlers: Array<(event: BotAddedEvent) => void | Promise<void>>
+  /** Dispatch one bot-added event through every registered handler. */
+  fireBotAdded: (event: BotAddedEvent) => Promise<void>
 } {
   const sent: Array<{ chatId: string; input: object; options?: { replyTo?: string; replyInThread?: boolean } }> = []
   const updated: Array<{ messageId: string; card: object }> = []
   const reactions: Array<{ messageId: string; emojiType: string }> = []
   const removedReactions: Array<{ messageId: string; reactionId: string }> = []
   const cardActionHandlers: Array<(event: CardActionEvent) => void | Promise<void>> = []
+  const botAddedHandlers: Array<(event: BotAddedEvent) => void | Promise<void>> = []
   let serial = 0
 
   const channel: FeishuChannel = {
@@ -571,6 +577,14 @@ export function makeChannel(options: FakeChannelOptions = {}): FeishuChannel & {
     onCardAction: vi.fn((handler: (event: CardActionEvent) => void | Promise<void>) => {
       cardActionHandlers.push(handler)
       return () => {}
+    }),
+    onBotAdded: vi.fn((handler: (event: BotAddedEvent) => void | Promise<void>) => {
+      botAddedHandlers.push(handler)
+      return () => {}
+    }),
+    getChatInfo: vi.fn(async (chatId: string): Promise<ChatInfo> => {
+      if (options.chatInfo !== undefined) return options.chatInfo(chatId)
+      return { chatId, chatType: 'group' }
     }),
     botOpenId: () => 'bot-open-id',
     getConnectionStatus: vi.fn(() => options.connectionStatus),
@@ -609,9 +623,12 @@ export function makeChannel(options: FakeChannelOptions = {}): FeishuChannel & {
     }),
   }
   return Object.assign(channel, {
-    sent, updated, reactions, removedReactions, cardActionHandlers,
+    sent, updated, reactions, removedReactions, cardActionHandlers, botAddedHandlers,
     fireCardAction: async (event: CardActionEvent) => {
       for (const handler of cardActionHandlers) await handler(event)
+    },
+    fireBotAdded: async (event: BotAddedEvent) => {
+      for (const handler of botAddedHandlers) await handler(event)
     },
   })
 }

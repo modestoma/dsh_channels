@@ -43,6 +43,9 @@ function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
     approvalTimeoutMs: 300_000,
     questionTimeoutMs: 300_000,
     allowPermissionSwitch: false,
+    // Tests exercise routing/hitl behavior; access control has its own tests.
+    accessMode: 'open',
+    authRequestTtlDays: 7,
     // Onboarding is opt-in per test: it adds a card that would shift send counts.
     welcomeOnboarding: false,
     acceptAttachments: true,

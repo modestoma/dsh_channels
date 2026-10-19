@@ -36,6 +36,8 @@ export type * from './session-export.ts'
 export type * from './stats.ts'
 export type * from './questions.ts'
 export type * from './settings/contract.ts'
+export * from './access/index.ts'
+export type { AccessGroupRecord, AccessRequestRecord, AccessUserRecord } from './domain.ts'
 export { CATALOG_ROUTE, CLEANUP_ROUTE, CONFIG_ROUTE, CREDENTIALS_ROUTE, EDITABLE_KEYS, PANEL_COPY, PANEL_ROUTE, RECONNECT_ROUTE, RESTART_KEYS, STATUS_ROUTE } from './settings/contract.ts'
 export { defaultOverlayPath, mergeOverlay, normalizeOverlay, OverlayStore, parseOverlay, pickEditable, resolveDshHome } from './settings/overlay.ts'
 export { applyCatalog, emptyCatalog, FIELD_DESCRIPTORS, normalizeCredentialValue, readOnlyFields, SettingsSurface } from './settings/surface.ts'
@@ -56,7 +58,7 @@ export { addUsage, applyProjectionViews, averageDecodeTokensPerSecond, averageTt
 export { FeishuService } from './service.ts'
 export { TurnStreamer } from './streamer.ts'
 export { ensureWorkspace, workspacePathFor, workspaceTitleFor } from './workspaces.ts'
-export { appendSessionHistory, chatRouteKey, expiredRouteRecordSchema, feishuDomain, normalizeRouteRecord, normalizeSessionHistory, routeRecordSchema, sessionHistoryEntrySchema, inflightSnapshotSchema, processedRecordSchema } from './domain.ts'
+export { accessGroupRecordSchema, accessRequestRecordSchema, accessUserRecordSchema, appendSessionHistory, chatRouteKey, expiredRouteRecordSchema, feishuDomain, normalizeRouteRecord, normalizeSessionHistory, routeRecordSchema, sessionHistoryEntrySchema, inflightSnapshotSchema, processedRecordSchema } from './domain.ts'
 
 /** Cordis function-plugin name. */
 export const name = 'channels'

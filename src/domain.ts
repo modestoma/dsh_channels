@@ -157,6 +157,82 @@ export const inflightSnapshotSchema = z.object({
 export type InflightSnapshot = z.infer<typeof inflightSnapshotSchema>
 
 /**
+ * Access-control grants (v1 format, added without a domain version bump —
+ * see the notes on `feishuDomain` below).
+ *
+ * One record per authorized group: the group gate is the first of the two
+ * independent admission gates. Inside an authorized group only the
+ * administrator and explicitly authorized users may start conversations.
+ */
+export const accessGroupRecordSchema = z.object({
+  /** Feishu chat id (`oc_...`) — also the table key. */
+  chatId: z.string().min(1),
+  /** Human-readable group name captured at authorization time (optional). */
+  name: z.string().optional(),
+  /** Which authorization entry produced this grant. */
+  source: z.enum(['command', 'card', 'panel']),
+  /** Administrator open_id that authorized it. */
+  addedBy: z.string().min(1),
+  /** Epoch ms when it was authorized. */
+  addedAt: z.number().int().nonnegative(),
+})
+
+export type AccessGroupRecord = z.infer<typeof accessGroupRecordSchema>
+
+/**
+ * One authorized user (`open_id`), global across every authorized group.
+ * Private chats are administrator-only, so this grant only affects group
+ * conversations.
+ */
+export const accessUserRecordSchema = z.object({
+  /** Feishu open id (`ou_...`) — also the table key. */
+  openId: z.string().min(1),
+  /** Display name captured when the user was authorized (optional). */
+  name: z.string().optional(),
+  /** Which authorization entry produced this grant. */
+  source: z.enum(['command', 'card', 'panel']),
+  /** Administrator open_id that authorized it. */
+  addedBy: z.string().min(1),
+  /** Epoch ms when it was authorized. */
+  addedAt: z.number().int().nonnegative(),
+})
+
+export type AccessUserRecord = z.infer<typeof accessUserRecordSchema>
+
+/**
+ * One authorization request the administrator has been (or should be) asked
+ * about. Requests are persisted so the DM card stays decidable across plugin
+ * restarts; settled records are kept as an audit trail and for request
+ * de-duplication/cooldown.
+ */
+export const accessRequestRecordSchema = z.object({
+  /** Opaque token carried by the card buttons — also the table key. */
+  token: z.string().min(1),
+  /** What is being requested. */
+  kind: z.enum(['group', 'user']),
+  /** `chat_id` for a group request; `open_id` for a user request. */
+  targetId: z.string().min(1),
+  /** Chat the request originated from, when applicable. */
+  chatId: z.string().optional(),
+  /** Group name captured for the card (group requests, or the group the user was seen in). */
+  groupName: z.string().optional(),
+  /** User who triggered a user request. */
+  requesterOpenId: z.string().optional(),
+  /** Display name of that user, when the event carried one. */
+  requesterName: z.string().optional(),
+  /** Lifecycle state; only `pending` requests accept a card action. */
+  status: z.enum(['pending', 'approved', 'denied', 'expired']),
+  /** Epoch ms when the request was created. */
+  createdAt: z.number().int().nonnegative(),
+  /** Epoch ms after which a pending request can no longer be decided. */
+  expiresAt: z.number().int().nonnegative(),
+  /** DM message id of the administrator card, once delivery succeeded. */
+  messageId: z.string().optional(),
+})
+
+export type AccessRequestRecord = z.infer<typeof accessRequestRecordSchema>
+
+/**
  * One processed inbound message, keyed by its Feishu message id. Feishu
  * redelivers un-acked events on WS reconnect, so every accepted message is
  * recorded here BEFORE its side effects begin; redeliveries then hit the
@@ -199,6 +275,18 @@ export interface FeishuDomainSpecShape {
       valueSchema: typeof expiredRouteRecordSchema
       __key?: string
     }
+    access_groups: {
+      valueSchema: typeof accessGroupRecordSchema
+      __key?: string
+    }
+    access_users: {
+      valueSchema: typeof accessUserRecordSchema
+      __key?: string
+    }
+    access_requests: {
+      valueSchema: typeof accessRequestRecordSchema
+      __key?: string
+    }
   }
 }
 
@@ -230,6 +318,9 @@ export const feishuDomain: FeishuDomainSpecShape = {
     inflight: { valueSchema: inflightSnapshotSchema },
     processed: { valueSchema: processedRecordSchema },
     expired_routes: { valueSchema: expiredRouteRecordSchema },
+    access_groups: { valueSchema: accessGroupRecordSchema },
+    access_users: { valueSchema: accessUserRecordSchema },
+    access_requests: { valueSchema: accessRequestRecordSchema },
   },
 }
 
@@ -272,12 +363,39 @@ export interface ExpiredRoutesTable {
   entries(): IterableIterator<[string, ExpiredRouteRecord]>
 }
 
+/** Normalized table handle for authorized groups (key = `chat_id`). */
+export interface AccessGroupsTable {
+  get(key: string): AccessGroupRecord | undefined
+  put(key: string, value: AccessGroupRecord): Promise<unknown> | void
+  delete(key: string): Promise<unknown> | void
+  entries(): IterableIterator<[string, AccessGroupRecord]>
+}
+
+/** Normalized table handle for authorized users (key = `open_id`). */
+export interface AccessUsersTable {
+  get(key: string): AccessUserRecord | undefined
+  put(key: string, value: AccessUserRecord): Promise<unknown> | void
+  delete(key: string): Promise<unknown> | void
+  entries(): IterableIterator<[string, AccessUserRecord]>
+}
+
+/** Normalized table handle for authorization requests (key = opaque token). */
+export interface AccessRequestsTable {
+  get(key: string): AccessRequestRecord | undefined
+  put(key: string, value: AccessRequestRecord): Promise<unknown> | void
+  delete(key: string): Promise<unknown> | void
+  entries(): IterableIterator<[string, AccessRequestRecord]>
+}
+
 /** Normalized domain handle. */
 export interface FeishuDomainHandle {
   routes: RoutesTable
   inflight: InflightTable
   processed: ProcessedTable
   expiredRoutes: ExpiredRoutesTable
+  accessGroups: AccessGroupsTable
+  accessUsers: AccessUsersTable
+  accessRequests: AccessRequestsTable
   getGlobal(): FeishuDomainGlobal
   setGlobal(value: FeishuDomainGlobal): Promise<unknown> | void
   close(): Promise<void>

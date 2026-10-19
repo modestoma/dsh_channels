@@ -72,6 +72,11 @@ export const CHANNEL_COMMANDS = [
     usage: '[name]', channelPlane: true, agentScoped: false,
   },
   {
+    name: 'auth', group: '会话', description: '查看/管理访问授权（仅管理员）',
+    usage: '[status|allow|revoke|list|user add <open_id>|user remove <open_id>]',
+    routeFree: true, channelPlane: true, agentScoped: false,
+  },
+  {
     name: 'renew', group: '会话', description: '在当前话题创建并绑定新 Session',
   },
   {

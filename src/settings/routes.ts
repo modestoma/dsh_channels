@@ -1,19 +1,32 @@
 /**
  * Web 设置面板的 HTTP 路由：status / panel / catalog / config(PUT,DELETE) /
- * credentials(PUT,DELETE) / reconnect / cleanup。
+ * credentials(PUT,DELETE) / reconnect / cleanup / access。
  *
  * 路由注册进宿主可选的 `webServer` 服务（headless profile 没有它时面板自然
  * 不存在，飞书通道不受影响）。写操作额外做同源校验 —— 本机非回环绑定下
- * 防止跨站页面改写插件配置；读取不敏感，保持只读 GET。凭据值只走写路径，
- * 响应永远不包含它们。`catalog` 只读宿主 LLM / preset roster 的枚举结果，
- * 用于面板的 provider → model → 推理档位级联选择。
+ * 防止跨站页面改写插件配置或授权白名单；读取不敏感，保持只读 GET。凭据值
+ * 只走写路径，响应永远不包含它们。`catalog` 只读宿主 LLM / preset roster 的
+ * 枚举结果，用于面板的 provider → model → 推理档位级联选择。`access` 提供
+ * 准入快照与白名单/授权申请的写入口（与飞书卡片共用同一结算函数）。
  *
  * @module dsh-channels/settings/routes
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { HostContext } from '../dsh-types.ts'
-import { CATALOG_ROUTE, CLEANUP_ROUTE, CONFIG_ROUTE, CREDENTIALS_ROUTE, PANEL_ROUTE, RECONNECT_ROUTE, STATUS_ROUTE } from './contract.ts'
+import {
+  ACCESS_GROUPS_ROUTE,
+  ACCESS_REQUESTS_ROUTE,
+  ACCESS_ROUTE,
+  ACCESS_USERS_ROUTE,
+  CATALOG_ROUTE,
+  CLEANUP_ROUTE,
+  CONFIG_ROUTE,
+  CREDENTIALS_ROUTE,
+  PANEL_ROUTE,
+  RECONNECT_ROUTE,
+  STATUS_ROUTE,
+} from './contract.ts'
 import type { CredentialField, EditableValues, SaveCredentialsRequest } from './contract.ts'
 import type { SettingsSurface } from './surface.ts'
 
@@ -106,6 +119,31 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
   } catch {
     throw new HttpError(400, '请求体不是合法 JSON')
   }
+}
+
+/**
+ * Parse one JSON-object body for an access write. HttpErrors are answered
+ * here (415/413/400); `undefined` means "already responded, stop".
+ */
+async function readAccessBody(
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<Record<string, unknown> | undefined> {
+  let body: unknown
+  try {
+    body = await readJsonBody(req)
+  } catch (error) {
+    if (error instanceof HttpError) {
+      sendJson(res, error.status, { ok: false, error: error.message })
+      return undefined
+    }
+    throw error
+  }
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+    sendJson(res, 400, { ok: false, error: '请求体必须是 JSON 对象' })
+    return undefined
+  }
+  return body as Record<string, unknown>
 }
 
 /** Wrap a handler so thrown errors become JSON instead of a dropped socket. */
@@ -275,6 +313,68 @@ export function registerSettingsRoutes(server: HostWebServer, surface: SettingsS
         }
         const result = await surface.runCleanup()
         sendJson(res, result.ok ? 200 : 500, result)
+      }),
+    }),
+    server.register({
+      kind: 'exact',
+      path: ACCESS_ROUTE,
+      handler: guarded(async (req, res) => {
+        if (!allowOnly(req, res, ['GET', 'HEAD'])) return
+        if (methodOf(req) === 'HEAD') {
+          res.writeHead(200, { 'cache-control': 'no-store' })
+          res.end()
+          return
+        }
+        sendJson(res, 200, await surface.access())
+      }),
+    }),
+    server.register({
+      kind: 'exact',
+      path: ACCESS_GROUPS_ROUTE,
+      handler: guarded(async (req, res) => {
+        if (!allowOnly(req, res, ['POST', 'DELETE'])) return
+        if (!isSameOriginRequest(req)) {
+          forbiddenWrite(res)
+          return
+        }
+        const payload = await readAccessBody(req, res)
+        if (payload === undefined) return
+        const result = methodOf(req) === 'DELETE'
+          ? await surface.removeAccessGroup(payload.chatId)
+          : await surface.saveAccessGroup(payload.chatId, payload.name)
+        sendJson(res, result.ok ? 200 : 400, result)
+      }),
+    }),
+    server.register({
+      kind: 'exact',
+      path: ACCESS_USERS_ROUTE,
+      handler: guarded(async (req, res) => {
+        if (!allowOnly(req, res, ['POST', 'DELETE'])) return
+        if (!isSameOriginRequest(req)) {
+          forbiddenWrite(res)
+          return
+        }
+        const payload = await readAccessBody(req, res)
+        if (payload === undefined) return
+        const result = methodOf(req) === 'DELETE'
+          ? await surface.removeAccessUser(payload.openId)
+          : await surface.saveAccessUser(payload.openId, payload.name)
+        sendJson(res, result.ok ? 200 : 400, result)
+      }),
+    }),
+    server.register({
+      kind: 'exact',
+      path: ACCESS_REQUESTS_ROUTE,
+      handler: guarded(async (req, res) => {
+        if (!allowOnly(req, res, ['POST'])) return
+        if (!isSameOriginRequest(req)) {
+          forbiddenWrite(res)
+          return
+        }
+        const payload = await readAccessBody(req, res)
+        if (payload === undefined) return
+        const result = await surface.resolveAccessRequest(payload.token, payload.decision)
+        sendJson(res, result.ok ? 200 : 400, result)
       }),
     }),
   ]

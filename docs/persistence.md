@@ -14,6 +14,7 @@
 2. **会话本体与事件日志**：宿主代持。插件消费的 `assistant/chunk`、`tool/call`、`tool-workflow/run-*`、`subagent/descriptor` 等全部在持久化日志里，因此 `src/stats.ts` 的 token/缓存统计不单独存，`foldAll()` 重放日志，重启后继续累计。`meta.cwd`、`agentPreset` 随 header 落盘。
 3. **工作区**：目录确定性生成、幂等 mkdir；宿主 `workspace.json` 持久化 path/title/sessionIds。
 4. **凭据**：密钥存宿主 `$DSH_HOME/.credentials.yaml`，插件只持引用名。
+5. **准入授权**（`src/domain.ts` 域 `channels_routes`，同样保持 `version: 1` 加法新增）：`access_groups` 表以 `chat_id` 保存已授权群（群名/来源/授权人/时间）；`access_users` 表以 `open_id` 保存全局用户白名单；`access_requests` 表以不透明 token 保存入群/用户授权申请（含 `messageId`，重启后旧授权卡仍可点击结算；过期状态在同一表落审计）。管理员 open_id 与准入模式属于配置层（profile + Web 覆盖），不在这三张表里。
 
 ## 二、内存态（有意不持久化）
 

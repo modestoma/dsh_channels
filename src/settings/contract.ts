@@ -17,6 +17,14 @@ export const RECONNECT_ROUTE = '/dsh-channels/reconnect'
 export const CATALOG_ROUTE = '/dsh-channels/catalog'
 /** 手动执行一次过期工作区清理（POST，无请求体）。 */
 export const CLEANUP_ROUTE = '/dsh-channels/cleanup'
+/** 访问与授权只读快照（GET/HEAD）：准入模式、管理员、群/用户白名单、待处理申请。 */
+export const ACCESS_ROUTE = '/dsh-channels/access'
+/** 群白名单增删（POST/DELETE，body `{ chatId, name? }` / `{ chatId }`）。 */
+export const ACCESS_GROUPS_ROUTE = '/dsh-channels/access/groups'
+/** 用户白名单增删（POST/DELETE，body `{ openId, name? }` / `{ openId }`）。 */
+export const ACCESS_USERS_ROUTE = '/dsh-channels/access/users'
+/** 结算一条待处理授权申请（POST，body `{ token, decision }`）。 */
+export const ACCESS_REQUESTS_ROUTE = '/dsh-channels/access/requests'
 
 /**
  * 可由 Web 面板覆盖的配置项。全部是 `src/config.ts` 里已存在的字段；
@@ -42,6 +50,10 @@ export const EDITABLE_KEYS = [
   'threadFallback',
   'welcomeOnboarding',
   'allowPermissionSwitch',
+  // 准入与授权（管理员/准入模式/申请有效期；白名单由「访问与授权」卡片管理）
+  'adminOpenId',
+  'accessMode',
+  'authRequestTtlDays',
   // 内容
   'acceptAttachments',
   // 模型
@@ -208,11 +220,77 @@ export interface PanelConfigWire {
   }
 }
 
+/** One authorized group (the first of the two admission gates). */
+export interface AccessGroupWire {
+  chatId: string
+  /** Human-readable group name captured at authorization time. */
+  name?: string
+  /** Which authorization entry produced the grant. */
+  source: 'command' | 'card' | 'panel'
+  /** Epoch ms when it was authorized. */
+  addedAt: number
+}
+
+/** One authorized user `open_id` (global across every authorized group). */
+export interface AccessUserWire {
+  openId: string
+  /** Display name captured at authorization time. */
+  name?: string
+  /** Which authorization entry produced the grant. */
+  source: 'command' | 'card' | 'panel'
+  /** Epoch ms when it was authorized. */
+  addedAt: number
+}
+
+/** One pending authorization request the panel may settle (same path as the DM card). */
+export interface AccessRequestWire {
+  /** Opaque token; never derived from the target id. */
+  token: string
+  kind: 'group' | 'user'
+  /** `chat_id` for a group request, `open_id` for a user request. */
+  targetId: string
+  /** Display name of the requested target (group name / user name), when known. */
+  name?: string
+  /** Chat the request originated from, when applicable. */
+  chatId?: string
+  /** Group name captured for the card. */
+  groupName?: string
+  /** Open_id of the user who triggered a user request. */
+  requester?: string
+  /** Epoch ms when the request was created. */
+  createdAt: number
+  /** Epoch ms after which the request can no longer be decided. */
+  expiresAt: number
+}
+
+/**
+ * `GET /dsh-channels/access` payload: admission mode, the administrator
+ * reference, both whitelists, and the still-pending authorization requests.
+ */
+export interface AccessWire {
+  mode: 'open' | 'guarded'
+  admin: {
+    openId?: string
+    /** false while guarded mode would refuse every conversation (fail closed). */
+    configured: boolean
+  }
+  groups: AccessGroupWire[]
+  users: AccessUserWire[]
+  requests: AccessRequestWire[]
+}
+
+/** Write responses for every `/dsh-channels/access*` mutation. */
+export type AccessMutationResponse =
+  | { ok: true; access: AccessWire }
+  | { ok: false; error: string }
+
 /** `GET /dsh-channels/panel` payload. */
 export interface PanelWire {
   status: ChannelStatusWire
   config: PanelConfigWire
   cleanup: CleanupPreviewWire
+  /** 访问与授权卡片的数据（准入模式、管理员、白名单、待处理申请）。 */
+  access: AccessWire
 }
 
 /**
@@ -389,4 +467,42 @@ export const PANEL_COPY = {
   cleanupRetired: '已清理话题路由',
   cleanupFreed: '释放空间',
   cleanupFailures: '以下工作区未能删除：',
+  accessCard: '访问与授权',
+  accessCardHelp: '准入采用 fail-closed：管理员不受白名单限制（私聊、任意群聊都可直接对话）；非管理员私聊会被拒绝，群聊需要「群已授权 + 用户在白名单」两层同时命中。管理员 open_id 在「常用配置 → 行为」中填写，私聊机器人发送 /userid 获取。',
+  accessModeOpenWarning: '当前准入模式为开放（open）：应用可用范围内的任何人都能开启对话。该模式不安全，仅建议调试时使用。',
+  accessAdminMissingWarning: '当前准入=guarded 但未配置管理员，所有对话都会被拒绝。请先在「常用配置 → 行为 → 管理员 open_id」填写。',
+  accessAdminLabel: '管理员',
+  accessAdminMissing: '未配置',
+  accessAdminHint: '修改管理员请到「常用配置 → 行为 → 管理员 open_id」；私聊机器人发送 /userid 可查看自己的 open_id（ou_ 开头，不是 user_id/邮箱）。',
+  accessGroupsTitle: '已授权群',
+  accessGroupsEmpty: '尚未授权任何群。机器人被拉进群后，管理员会收到带 chat_id 的群信息卡；也可在群内发送 /groupid 获取。',
+  accessUsersTitle: '已授权用户',
+  accessUsersEmpty: '尚未授权任何用户。已授权用户可在所有已授权群里与机器人对话（私聊仍只开给管理员）。',
+  accessRequestsTitle: '待处理申请',
+  accessRequestsEmpty: '没有待处理的授权申请。',
+  accessGroupChatIdPlaceholder: '群 chat_id（oc_…）',
+  accessGroupNamePlaceholder: '群名（可选）',
+  accessUserOpenIdPlaceholder: '用户 open_id（ou_…）',
+  accessUserNamePlaceholder: '昵称（可选）',
+  accessAddGroup: '添加群',
+  accessAddUser: '添加用户',
+  accessRemove: '移除',
+  accessAllow: '授权',
+  accessDeny: '忽略',
+  accessWorking: '处理中…',
+  accessSourceCommand: '对话命令',
+  accessSourceCard: '授权卡',
+  accessSourcePanel: '设置面板',
+  accessRequestGroup: '群申请',
+  accessRequestUser: '用户申请',
+  accessRequestRequester: '申请人',
+  accessRequestExpires: '有效期至',
+  accessGroupAdded: '已添加群授权',
+  accessGroupRemoved: '已移除群授权',
+  accessUserAdded: '已添加用户授权',
+  accessUserRemoved: '已移除用户授权',
+  accessRequestAllowed: '已授权',
+  accessRequestDenied: '已忽略',
+  accessHints: '三种授权入口：群内 /auth 命令、入群与用户授权卡、本面板。撤销立即生效；白名单只约束非管理员（管理员在任何私聊/群聊都直接放行），非管理员需要群和用户两层同时命中。',
+  accessChatIdHint: 'chat_id 可从入群群信息卡或群内 /groupid 获取；open_id 可私聊机器人发送 /userid 获取。',
 } as const

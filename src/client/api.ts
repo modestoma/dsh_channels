@@ -5,8 +5,22 @@
  * @module dsh-channels/client/api
  */
 
-import { CATALOG_ROUTE, CLEANUP_ROUTE, CONFIG_ROUTE, CREDENTIALS_ROUTE, PANEL_ROUTE, RECONNECT_ROUTE, STATUS_ROUTE } from '../settings/contract.ts'
+import {
+  ACCESS_GROUPS_ROUTE,
+  ACCESS_REQUESTS_ROUTE,
+  ACCESS_ROUTE,
+  ACCESS_USERS_ROUTE,
+  CATALOG_ROUTE,
+  CLEANUP_ROUTE,
+  CONFIG_ROUTE,
+  CREDENTIALS_ROUTE,
+  PANEL_ROUTE,
+  RECONNECT_ROUTE,
+  STATUS_ROUTE,
+} from '../settings/contract.ts'
 import type {
+  AccessMutationResponse,
+  AccessWire,
   CatalogWire,
   ChannelStatusWire,
   CleanupResponse,
@@ -181,4 +195,68 @@ export async function clearCredential(field: CredentialField): Promise<ClearCred
   }
   if (!response.ok) throw new Error(errorFromBody(response.status, text))
   return JSON.parse(text) as ClearCredentialResponse
+}
+
+/** Admission snapshot: mode, administrator, whitelists, pending requests. */
+export async function fetchAccess(): Promise<AccessWire> {
+  return readJson<AccessWire>(await request(ACCESS_ROUTE))
+}
+
+/** One access write: a 400 body already is the wire union; others throw. */
+async function mutateAccess(
+  path: string,
+  method: 'POST' | 'DELETE',
+  body: unknown,
+): Promise<AccessMutationResponse> {
+  const response = await request(path, {
+    method,
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  const text = await response.text()
+  if (response.status === 400) {
+    try {
+      return JSON.parse(text) as AccessMutationResponse
+    } catch {
+      return { ok: false, error: errorFromBody(response.status, text) }
+    }
+  }
+  if (!response.ok) throw new Error(errorFromBody(response.status, text))
+  return JSON.parse(text) as AccessMutationResponse
+}
+
+/** Authorize one group; resolves with the refreshed access snapshot. */
+export async function addAccessGroup(chatId: string, name?: string): Promise<AccessMutationResponse> {
+  return mutateAccess(
+    ACCESS_GROUPS_ROUTE,
+    'POST',
+    name === undefined || name === '' ? { chatId } : { chatId, name },
+  )
+}
+
+/** Revoke one group authorization (takes effect on the next message). */
+export async function removeAccessGroup(chatId: string): Promise<AccessMutationResponse> {
+  return mutateAccess(ACCESS_GROUPS_ROUTE, 'DELETE', { chatId })
+}
+
+/** Authorize one user open_id (global across authorized groups). */
+export async function addAccessUser(openId: string, name?: string): Promise<AccessMutationResponse> {
+  return mutateAccess(
+    ACCESS_USERS_ROUTE,
+    'POST',
+    name === undefined || name === '' ? { openId } : { openId, name },
+  )
+}
+
+/** Revoke one user authorization (takes effect on the next message). */
+export async function removeAccessUser(openId: string): Promise<AccessMutationResponse> {
+  return mutateAccess(ACCESS_USERS_ROUTE, 'DELETE', { openId })
+}
+
+/** Settle one pending authorization request (same resolver as the Feishu card). */
+export async function resolveAccessRequest(
+  token: string,
+  decision: 'allow' | 'deny',
+): Promise<AccessMutationResponse> {
+  return mutateAccess(ACCESS_REQUESTS_ROUTE, 'POST', { token, decision })
 }

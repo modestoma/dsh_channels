@@ -150,6 +150,34 @@ export const configSchema = z.object({
    */
   allowPermissionSwitch: z.boolean().default(false),
   /**
+   * Admission policy for inbound Feishu traffic.
+   *
+   * - `guarded` (default): only the configured administrator can talk in
+   *   private chats, and a group conversation additionally requires the group
+   *   to be authorized and the sender to be the administrator or an explicitly
+   *   authorized user.
+   * - `open`: legacy behavior — any user inside the app's availability scope
+   *   can start a conversation. Debug/compatibility only; unsafe.
+   */
+  accessMode: z.enum(['open', 'guarded']).default('guarded'),
+  /**
+   * The unique administrator's Feishu open_id (`ou_...`). Set it in the Web
+   * settings panel (or the profile config). Get it by sending `/userid` to the
+   * bot in a private chat. While `accessMode` is `guarded` and this is unset,
+   * every conversation is refused (fail closed); `/userid` and a fixed notice
+   * stay available so the deployment can be bootstrapped.
+   */
+  adminOpenId: z.string().regex(
+    /^ou_[A-Za-z0-9_-]+$/,
+    'must be a Feishu open_id such as ou_xxx (send /userid to the bot in a private chat to see it)',
+  ).optional(),
+  /**
+   * Lifetime of one pending authorization request and of the DM card that asks
+   * the administrator to approve a group or a user. Expired requests stay in
+   * the store as an audit trail but can no longer be decided.
+   */
+  authRequestTtlDays: z.number().int().min(1).max(30).default(7),
+  /**
    * Structured-question decision window for the model's `ask_user_question`
    * tool (`user-questions/request`). A blocking ask that gets no answer in
    * this window fails closed with an explicit error; a host *timed* wait owns

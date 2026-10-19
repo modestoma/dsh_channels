@@ -33,6 +33,21 @@ export interface CommandPlanePort {
   handleSlash(msg: NormalizedMessage, line: string): Promise<void>
 }
 
+/**
+ * Channel-plane admission port (structurally satisfied by the access
+ * controller). Kept as a local interface so routing has no dependency on the
+ * access module's implementation details.
+ */
+export interface InboundAccessPort {
+  /** Full admission for a non-slash message; false = handled (deny/notice). */
+  admit(msg: NormalizedMessage): Promise<boolean>
+  /**
+   * Route ownership: only the sender who created a topic may continue it.
+   * Also guards against cross-chat id confusion.
+   */
+  ownsRoute(msg: NormalizedMessage, record: RouteRecord): boolean
+}
+
 export interface InboundDeps {
   ctx: HostContext
   config: FeishuConfig
@@ -43,6 +58,8 @@ export interface InboundDeps {
   delivery: CardDelivery
   sessions: SessionManager
   attachments: AttachmentIntake
+  /** Channel-plane access control (administrator + whitelist gates). */
+  access: InboundAccessPort
   /** Shared per-route FIFO admission (commands and turns must not interleave). */
   queue: RouteOperationQueue
   streamer(): TurnStreamer | undefined
@@ -91,6 +108,7 @@ export class InboundRouter {
   private get streamer(): TurnStreamer | undefined { return this.deps.streamer() }
   private get questionAnswerer(): QuestionAnswerer | undefined { return this.deps.questionAnswerer() }
   private get domain(): FeishuDomainHandle | undefined { return this.deps.domain() }
+  private get access(): InboundAccessPort { return this.deps.access }
 
   /** Retire dedup entries older than the retention cutoff (GC sweep). */
   pruneAccepted(cutoff: number): void {
@@ -156,19 +174,25 @@ export class InboundRouter {
       this.ctx.logger?.warn?.('dsh-channels: recording processed message %s failed: %s', msg.messageId, String(error))
     }
 
+    // Slash admission stays behind message-id dedup but ahead of every route,
+    // mention, workspace, Session, card-stream, and model side effect. The
+    // command plane applies its own administrator/bootstrap rules.
+    if (content.startsWith('/')) {
+      await this.deps.commands.handleSlash(msg, content)
+      return
+    }
+
+    // Channel-plane admission (administrator / group whitelist / user
+    // whitelist). Nothing below this point may run for a denied sender: no
+    // TTL tombstone, attachment archive, workspace, Session, or model call.
+    if (!(await this.access.admit(msg))) return
+
     // Enforce TTL at admission as well as in the periodic sweep. A message that
     // arrives after the deadline must not get one chance to revive the route
     // merely because the background GC has not run yet.
     const expiredThread = msg.threadId === undefined
       ? undefined
       : await this.routes.expireThread(msg.threadId)
-
-    // Slash admission stays behind message-id dedup but ahead of every route,
-    // mention, workspace, Session, card-stream, and model side effect.
-    if (content.startsWith('/')) {
-      await this.deps.commands.handleSlash(msg, content)
-      return
-    }
 
     // A TTL-retired topic is permanently closed on the channel plane. Keeping
     // a durable tombstone avoids silently forking a fresh Session in a topic
@@ -196,6 +220,9 @@ export class InboundRouter {
     if (msg.threadId !== undefined) {
       const record = this.routes.get(msg.threadId)
       if (record !== undefined) {
+        // Only the topic creator may continue its Session (admission already
+        // passed, but another authorized user could be in the same group).
+        if (!this.access.ownsRoute(msg, record)) return
         await this.routeOperations.run(record.key, () => {
           if (!this.started) return
           return this.continueSession(msg, this.routes.get(record.key) ?? record, content)
@@ -208,6 +235,7 @@ export class InboundRouter {
     const chatKey = chatRouteKey(msg.chatType, msg.chatId, msg.senderId)
     const chatRecord = this.routes.get(chatKey)
     if (chatRecord !== undefined) {
+      if (!this.access.ownsRoute(msg, chatRecord)) return
       await this.routeOperations.run(chatRecord.key, () => {
         if (!this.started) return
         return this.continueSession(msg, this.routes.get(chatRecord.key) ?? chatRecord, content)
@@ -254,6 +282,9 @@ export class InboundRouter {
     if (!hasResources && msg.rawContentType !== 'merge_forward') return undefined
 
     const threadRecord = msg.threadId === undefined ? undefined : this.routes.get(msg.threadId)
+    // A foreign topic must never receive this sender's attachments: the
+    // archive path resolves the workspace from the route record.
+    if (threadRecord !== undefined && !this.access.ownsRoute(msg, threadRecord)) return undefined
     const chatKey = chatRouteKey(msg.chatType, msg.chatId, msg.senderId)
     const record = threadRecord ?? this.routes.get(chatKey)
     // A brand-new group conversation still needs a mention; a topic the bot
@@ -282,7 +313,8 @@ export class InboundRouter {
     const answerer = this.questionAnswerer
     if (answerer === undefined || answerer.pendingCount() === 0) return false
     const route = await this.commandRoute(msg)
-    if (route === undefined || !answerer.hasPendingFor(route.sessionId)) return false
+    if (route === undefined || !this.access.ownsRoute(msg, route)) return false
+    if (!answerer.hasPendingFor(route.sessionId)) return false
     if (!answerer.submitText(route.sessionId, content)) return false
     await this.delivery.commandCard(msg, {
       kind: 'success', command: 'ask_user_question', sessionId: route.sessionId,
@@ -413,6 +445,9 @@ export class InboundRouter {
     return record
   }
   private async continueSession(msg: NormalizedMessage, record: RouteRecord, content: string): Promise<void> {
+    // Defence in depth: every current caller checks this first, but a future
+    // call path must not be able to continue another user's Session.
+    if (!this.access.ownsRoute(msg, record)) return
     const typingPromise = this.delivery.requireChannel().addReaction(msg.messageId, 'Typing').catch(() => undefined)
     const live = await this.sessions.ensureLive(record)
 

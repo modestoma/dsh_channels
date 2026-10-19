@@ -16,6 +16,9 @@
 
 import { lstat, readdir, realpath, rm } from 'node:fs/promises'
 import path from 'node:path'
+import { AccessController } from './access/controller.ts'
+import { AccessRequests } from './access/requests.ts'
+import { AccessStore } from './access/store.ts'
 import { ApprovalAnswerer } from './approvals.ts'
 import type { ApprovalRoute } from './approvals.ts'
 import { QuestionAnswerer } from './questions.ts'
@@ -48,6 +51,7 @@ import {
 } from './cleanup.ts'
 import type { CleanupDeps, WorkspaceStats } from './cleanup.ts'
 import type {
+  AccessGroupRecord, AccessRequestRecord, AccessUserRecord,
   ExpiredRouteRecord, FeishuDomainGlobal, FeishuDomainHandle, InflightSnapshot, ProcessedRecord, RawDomainHandle,
   RouteRecord,
 } from './domain.ts'
@@ -75,6 +79,9 @@ import type { SessionExportBuilder } from './session-export.ts'
 import { ACTIVITY_BUILD_MARKER, TurnStreamer } from './streamer.ts'
 import type { ProjectedStats, StreamerHooks } from './streamer.ts'
 import type { FeishuConfig } from './config.ts'
+import type {
+  AccessMutationResponse, AccessRequestWire, AccessWire,
+} from './settings/contract.ts'
 import type { OverlayStore } from './settings/overlay.ts'
 
 /** Periodic route-GC sweep cadence (a long-running instance also accumulates
@@ -112,6 +119,9 @@ async function openFeishuDomain(ctx: HostContext): Promise<FeishuDomainHandle> {
   const inflightRaw = domain.table('inflight')
   const processedRaw = domain.table('processed')
   const expiredRoutesRaw = domain.table('expired_routes')
+  const accessGroupsRaw = domain.table('access_groups')
+  const accessUsersRaw = domain.table('access_users')
+  const accessRequestsRaw = domain.table('access_requests')
   return {
     routes: {
       get: key => table.get(key) as RouteRecord | undefined,
@@ -136,6 +146,24 @@ async function openFeishuDomain(ctx: HostContext): Promise<FeishuDomainHandle> {
       get: key => expiredRoutesRaw.get(key) as ExpiredRouteRecord | undefined,
       put: (key, value) => expiredRoutesRaw.put(key, value),
       entries: () => expiredRoutesRaw.entries() as IterableIterator<[string, ExpiredRouteRecord]>,
+    },
+    accessGroups: {
+      get: key => accessGroupsRaw.get(key) as AccessGroupRecord | undefined,
+      put: (key, value) => accessGroupsRaw.put(key, value),
+      delete: key => accessGroupsRaw.delete(key),
+      entries: () => accessGroupsRaw.entries() as IterableIterator<[string, AccessGroupRecord]>,
+    },
+    accessUsers: {
+      get: key => accessUsersRaw.get(key) as AccessUserRecord | undefined,
+      put: (key, value) => accessUsersRaw.put(key, value),
+      delete: key => accessUsersRaw.delete(key),
+      entries: () => accessUsersRaw.entries() as IterableIterator<[string, AccessUserRecord]>,
+    },
+    accessRequests: {
+      get: key => accessRequestsRaw.get(key) as AccessRequestRecord | undefined,
+      put: (key, value) => accessRequestsRaw.put(key, value),
+      delete: key => accessRequestsRaw.delete(key),
+      entries: () => accessRequestsRaw.entries() as IterableIterator<[string, AccessRequestRecord]>,
     },
     getGlobal: () => (domain.global.get() ?? {}) as FeishuDomainGlobal,
     setGlobal: value => domain.global.set(value),
@@ -275,6 +303,13 @@ export class FeishuService {
   /** Disposer for the host user-questions waterfall listener. */
   private unlistenQuestions: (() => boolean) | undefined
   private unlistenCardAction: (() => void) | undefined
+  /** Durable access-control whitelists (groups + users + authorization requests). */
+  private readonly accessStore: AccessStore
+  /** Channel-plane admission gate (administrator / group / user). */
+  private readonly accessController: AccessController
+  /** Administrator DM authorization cards + bot-added group info cards. */
+  private accessRequests: AccessRequests | undefined
+  private unlistenBotAdded: (() => void) | undefined
 
   constructor(
     ctx: HostContext,
@@ -320,6 +355,26 @@ export class FeishuService {
       routeForSession: sessionId => this.routes.findBySession(sessionId),
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
     })
+    this.accessStore = new AccessStore({
+      domain: () => this.domain,
+      warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
+    })
+    this.accessController = new AccessController({
+      config: () => this.config,
+      store: this.accessStore,
+      channel: () => this.channel,
+      warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
+      onDeniedGroup: msg => {
+        void this.accessRequests?.ensureGroupRequest(msg).catch((error: unknown) => {
+          this.ctx.logger?.warn?.('dsh-channels: group authorization request failed: %s', String(error))
+        })
+      },
+      onDeniedUser: msg => {
+        void this.accessRequests?.ensureUserRequest(msg).catch((error: unknown) => {
+          this.ctx.logger?.warn?.('dsh-channels: user authorization request failed: %s', String(error))
+        })
+      },
+    })
     this.inbound = new InboundRouter({
       ctx: this.ctx,
       config: this.config,
@@ -330,6 +385,7 @@ export class FeishuService {
       delivery: this.delivery,
       sessions: this.sessions,
       attachments: this.attachments,
+      access: this.accessController,
       queue: this.routeOperations,
       streamer: () => this.streamer,
       questionAnswerer: () => this.questionAnswerer,
@@ -424,6 +480,147 @@ export class FeishuService {
   baseConfigSnapshot(): FeishuConfig { return { ...this.baseConfig } }
   runningConfigSnapshot(): FeishuConfig | undefined {
     return this.runningConfig === undefined ? undefined : { ...this.runningConfig }
+  }
+
+  // ---- access-control panel surface ------------------------------------
+
+  /** Whitelists + pending authorization requests (read-only Web projection). */
+  accessSnapshot(): AccessWire {
+    const admin = this.config.adminOpenId
+    return {
+      mode: this.config.accessMode,
+      admin: {
+        ...(admin === undefined ? {} : { openId: admin }),
+        configured: admin !== undefined,
+      },
+      groups: this.accessStore.groupRecords().map(record => ({
+        chatId: record.chatId,
+        ...(record.name === undefined ? {} : { name: record.name }),
+        source: record.source,
+        addedAt: record.addedAt,
+      })),
+      users: this.accessStore.userRecords().map(record => ({
+        openId: record.openId,
+        ...(record.name === undefined ? {} : { name: record.name }),
+        source: record.source,
+        addedAt: record.addedAt,
+      })),
+      requests: this.accessStore.pendingRequests().map(record => {
+        const wire: AccessRequestWire = {
+          token: record.token,
+          kind: record.kind,
+          targetId: record.targetId,
+          createdAt: record.createdAt,
+          expiresAt: record.expiresAt,
+        }
+        const name = record.kind === 'group' ? record.groupName : record.requesterName
+        if (name !== undefined) wire.name = name
+        if (record.chatId !== undefined) wire.chatId = record.chatId
+        if (record.groupName !== undefined) wire.groupName = record.groupName
+        const requester = record.requesterName ?? record.requesterOpenId
+        if (requester !== undefined) wire.requester = requester
+        return wire
+      }),
+    }
+  }
+
+  /** Panel: authorize one group by id. */
+  async addAccessGroup(chatId: string, name?: string): Promise<AccessMutationResponse> {
+    const id = this.cleanAccessTargetId(chatId)
+    if (id === undefined) return { ok: false, error: 'chat_id 不合法（应为 oc_ 开头的群 ID）' }
+    const admin = this.config.adminOpenId
+    if (admin === undefined) return { ok: false, error: '请先在常用配置中设置管理员 open_id' }
+    try {
+      if (!this.accessStore.hasGroup(id)) {
+        await this.accessStore.addGroup({
+          chatId: id,
+          ...(name === undefined || name.trim() === '' ? {} : { name: name.trim() }),
+          source: 'panel',
+          addedBy: admin,
+          addedAt: Date.now(),
+        })
+      }
+      return { ok: true, access: this.accessSnapshot() }
+    } catch (error) {
+      return { ok: false, error: `写入授权失败：${messageOf(error)}` }
+    }
+  }
+
+  /** Panel: revoke one group. */
+  async removeAccessGroup(chatId: string): Promise<AccessMutationResponse> {
+    const id = this.cleanAccessTargetId(chatId)
+    if (id === undefined) return { ok: false, error: 'chat_id 不合法' }
+    try {
+      await this.accessStore.removeGroup(id)
+      return { ok: true, access: this.accessSnapshot() }
+    } catch (error) {
+      return { ok: false, error: `撤销授权失败：${messageOf(error)}` }
+    }
+  }
+
+  /** Panel: authorize one user (global across authorized groups). */
+  async addAccessUser(openId: string, name?: string): Promise<AccessMutationResponse> {
+    const id = this.cleanAccessUserId(openId)
+    if (id === undefined) return { ok: false, error: 'open_id 不合法（应以 ou_ 开头）' }
+    const admin = this.config.adminOpenId
+    if (admin === undefined) return { ok: false, error: '请先在常用配置中设置管理员 open_id' }
+    try {
+      if (!this.accessStore.hasUser(id)) {
+        await this.accessStore.addUser({
+          openId: id,
+          ...(name === undefined || name.trim() === '' ? {} : { name: name.trim() }),
+          source: 'panel',
+          addedBy: admin,
+          addedAt: Date.now(),
+        })
+      }
+      return { ok: true, access: this.accessSnapshot() }
+    } catch (error) {
+      return { ok: false, error: `写入授权失败：${messageOf(error)}` }
+    }
+  }
+
+  /** Panel: revoke one user. */
+  async removeAccessUser(openId: string): Promise<AccessMutationResponse> {
+    const id = this.cleanAccessUserId(openId)
+    if (id === undefined) return { ok: false, error: 'open_id 不合法' }
+    try {
+      await this.accessStore.removeUser(id)
+      return { ok: true, access: this.accessSnapshot() }
+    } catch (error) {
+      return { ok: false, error: `撤销授权失败：${messageOf(error)}` }
+    }
+  }
+
+  /** Panel: decide one pending authorization request (same path as the card). */
+  async resolveAccessRequest(token: string, decision: 'allow' | 'deny'): Promise<AccessMutationResponse> {
+    const requests = this.accessRequests
+    if (requests === undefined) return { ok: false, error: '授权服务尚未启动' }
+    const actor = this.config.adminOpenId
+    if (actor === undefined) return { ok: false, error: '请先配置管理员 open_id' }
+    try {
+      const result = await requests.resolve(token, decision, actor)
+      if (!result.ok) return { ok: false, error: result.error }
+      return { ok: true, access: this.accessSnapshot() }
+    } catch (error) {
+      return { ok: false, error: `处理授权申请失败：${messageOf(error)}` }
+    }
+  }
+
+  /** Trim + bound one panel-supplied identifier; rejects control characters. */
+  private cleanAccessTargetId(raw: string): string | undefined {
+    const value = raw.trim()
+    if (value === '' || value.length > 128) return undefined
+    // eslint-disable-next-line no-control-regex
+    if (/[\u0000-\u001f\u007f]/u.test(value)) return undefined
+    return value
+  }
+
+  /** Same normalization for user open_ids, which must look like ou_xxx. */
+  private cleanAccessUserId(raw: string): string | undefined {
+    const value = this.cleanAccessTargetId(raw)
+    if (value === undefined || !/^ou_[A-Za-z0-9_-]+$/u.test(value)) return undefined
+    return value
   }
 
   // ---- workspace retention cleanup -------------------------------------
@@ -710,6 +907,7 @@ export class FeishuService {
 
     this.domain = await openFeishuDomain(this.ctx)
     this.routes.load()
+    this.accessStore.load()
 
     // HITL: answer the host's approval/request waterfall for sessions this
     // channel routes. `prepend` claims such requests BEFORE the web gateway's
@@ -738,7 +936,23 @@ export class FeishuService {
       (request, next) => questions.onRequest(request, next),
       { prepend: true },
     )
+    const accessRequests = new AccessRequests({
+      config: () => this.config,
+      store: this.accessStore,
+      channel: () => this.channel,
+      warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
+    })
+    this.accessRequests = accessRequests
+    this.unlistenBotAdded = channel.onBotAdded(event => {
+      void accessRequests.handleBotAdded(event).catch((error: unknown) => {
+        this.ctx.logger?.warn?.('dsh-channels: bot-added group info card failed: %s', String(error))
+      })
+    })
+    void accessRequests.expirePending().catch((error: unknown) => {
+      this.ctx.logger?.warn?.('dsh-channels: access request expiry sweep failed: %s', String(error))
+    })
     this.unlistenCardAction = channel.onCardAction(event => {
+      void accessRequests.onCardAction(event)
       answerer.onCardAction(event)
       questions.onCardAction(event)
     })
@@ -792,6 +1006,16 @@ export class FeishuService {
       model: this.config.model ?? 'deployment-default',
       reasoningEffort: this.config.reasoningEffort ?? 'adapter-default',
     })
+    if (this.config.accessMode === 'open') {
+      console.warn('[dsh-channels] 准入=open：任何应用可用范围内的用户都可以对话（不安全，仅调试）')
+    } else if (this.config.adminOpenId === undefined) {
+      console.warn(
+        '[dsh-channels] 准入=guarded 但未配置管理员 open_id：所有对话都会被拒绝；'
+        + '私聊机器人发送 /userid 取得 open_id 后填入 Web 设置面板',
+      )
+    } else {
+      console.info('[dsh-channels] 准入=guarded，管理员已配置')
+    }
     const approvalMounted = this.ctx.get?.('approval') !== undefined
     console.info(
       approvalMounted
@@ -820,6 +1044,11 @@ export class FeishuService {
     this.unlisten = undefined
     this.unlistenCardAction?.()
     this.unlistenCardAction = undefined
+    this.unlistenBotAdded?.()
+    this.unlistenBotAdded = undefined
+    this.accessRequests?.clear()
+    this.accessRequests = undefined
+    this.accessController.clear()
     this.unlistenApproval?.()
     this.unlistenApproval = undefined
     this.unlistenQuestions?.()
@@ -841,6 +1070,7 @@ export class FeishuService {
     this.routeOperations.clear()
     this.inbound.clear()
     this.routes.clear()
+    this.accessStore.clear()
     try {
       await this.channel?.disconnect()
     } catch {
@@ -864,6 +1094,10 @@ export class FeishuService {
   private async handleSlashMessage(msg: NormalizedMessage, line: string): Promise<void> {
     if (!this.started) return
     const parsed = parseSlashCommand(line)
+    // Channel-plane command admission runs before ANY card/topic/side effect:
+    // denied senders get at most a fixed private-chat notice (or silence in
+    // groups), never an unknown-command card or a command thread.
+    if (!(await this.accessController.admitCommand(msg, parsed?.name))) return
     if (parsed === undefined) {
       await this.delivery.commandCard(msg, {
         kind: 'input-error',
@@ -878,6 +1112,14 @@ export class FeishuService {
         kind: 'unknown', command: parsed.name,
         text: `未找到命令 /${parsed.name}。`, supported: supportedCommandList(),
       })
+      return
+    }
+
+    // `/auth` is administrator-only, route-free, and handled right here so it
+    // works even inside an unauthorized group (that is the "authorize from
+    // the conversation" entry point).
+    if (spec.name === 'auth') {
+      await this.runAuthCommand(msg, parsed)
       return
     }
 
@@ -935,6 +1177,138 @@ export class FeishuService {
       await operation
     } finally {
       this.commandOperations.delete(operation)
+    }
+  }
+
+  /**
+   * `/auth`: administrator-only access management on the channel plane. It
+   * never creates a Session or resumes an Agent; every reply is a fixed card.
+   */
+  private async runAuthCommand(msg: NormalizedMessage, parsed: ParsedSlashCommand): Promise<void> {
+    if (!this.accessController.isAdmin(msg.senderId)) return
+    const direct = { createThread: false }
+    const words = parsed.rawInput.trim().split(/\s+/u).filter(word => word !== '')
+    const action = words[0] ?? 'status'
+    const now = Date.now()
+    try {
+      if (action === 'status') {
+        const groups = this.accessStore.groupRecords()
+        const users = this.accessStore.userRecords()
+        const pending = this.accessStore.pendingRequests()
+        await this.delivery.standaloneReply(msg, standaloneInfoCard('**🔐 访问授权状态**', [
+          `**准入模式**：\`${this.config.accessMode}\``,
+          `**管理员**：${this.config.adminOpenId === undefined ? '未配置' : `\`${this.config.adminOpenId}\``}`,
+          ...(msg.chatType === 'group'
+            ? [`**本群**：${this.accessStore.hasGroup(msg.chatId) ? '已授权' : '未授权'}（\`${msg.chatId}\`）`]
+            : []),
+          `**白名单**：群 ${groups.length} 个 · 用户 ${users.length} 个 · 待处理申请 ${pending.length} 个`,
+          '群授权：`/auth allow` 或 `/auth revoke`（在目标群内发）；用户授权：`/auth user add <open_id>`。',
+        ]), direct)
+        return
+      }
+      if (action === 'allow' || action === 'revoke') {
+        if (msg.chatType !== 'group') {
+          await this.delivery.commandCard(msg, {
+            kind: 'input-error', command: 'auth',
+            text: '群授权命令只能在群聊中使用：在目标群里发送 /auth allow 或 /auth revoke。',
+          }, direct)
+          return
+        }
+        if (action === 'allow') {
+          if (this.accessStore.hasGroup(msg.chatId)) {
+            await this.delivery.commandCard(msg, {
+              kind: 'success', command: 'auth', text: `本群已经授权（\`${msg.chatId}\`）。`,
+            }, direct)
+            return
+          }
+          let name: string | undefined
+          try {
+            name = (await this.channel?.getChatInfo(msg.chatId))?.name
+          } catch {
+            name = undefined
+          }
+          await this.accessStore.addGroup({
+            chatId: msg.chatId,
+            ...(name === undefined || name === '' ? {} : { name }),
+            source: 'command',
+            addedBy: msg.senderId,
+            addedAt: now,
+          })
+          await this.delivery.commandCard(msg, {
+            kind: 'success', command: 'auth',
+            text: '✅ 已授权本群。群内只有管理员与已授权用户能与我对话。',
+          }, direct)
+          return
+        }
+        const removed = await this.accessStore.removeGroup(msg.chatId)
+        await this.delivery.commandCard(msg, {
+          kind: removed ? 'success' : 'unavailable', command: 'auth',
+          text: removed ? '已撤销本群授权，立即生效。' : '本群当前未被授权。',
+        }, direct)
+        return
+      }
+      if (action === 'user') {
+        const sub = words[1]
+        const openId = words[2]
+        if ((sub !== 'add' && sub !== 'remove') || openId === undefined
+          || !/^ou_[A-Za-z0-9_-]+$/u.test(openId)) {
+          await this.delivery.commandCard(msg, {
+            kind: 'input-error', command: 'auth',
+            text: '用法：/auth user add <open_id> 或 /auth user remove <open_id>（open_id 以 ou_ 开头，可用 /userid 查看）。',
+          }, direct)
+          return
+        }
+        if (sub === 'add') {
+          if (this.accessStore.hasUser(openId)) {
+            await this.delivery.commandCard(msg, {
+              kind: 'success', command: 'auth', text: `该用户已在白名单中（\`${openId}\`）。`,
+            }, direct)
+            return
+          }
+          await this.accessStore.addUser({
+            openId, source: 'command', addedBy: msg.senderId, addedAt: now,
+          })
+          await this.delivery.commandCard(msg, {
+            kind: 'success', command: 'auth',
+            text: `✅ 已授权用户 \`${openId}\`（在所有已授权群里生效）。`,
+          }, direct)
+          return
+        }
+        const removed = await this.accessStore.removeUser(openId)
+        await this.delivery.commandCard(msg, {
+          kind: removed ? 'success' : 'unavailable', command: 'auth',
+          text: removed ? `已移除用户 \`${openId}\`，立即生效。` : `用户 \`${openId}\` 不在白名单中。`,
+        }, direct)
+        return
+      }
+      if (action === 'list') {
+        const groups = this.accessStore.groupRecords()
+        const users = this.accessStore.userRecords()
+        const pending = this.accessStore.pendingRequests()
+        const groupLines = groups.length === 0
+          ? ['（暂无）']
+          : groups.slice(0, 30).map(group => `- ${group.name ?? group.chatId} \`${group.chatId}\``)
+        const userLines = users.length === 0
+          ? ['（暂无）']
+          : users.slice(0, 30).map(user => `- ${user.name ?? user.openId} \`${user.openId}\``)
+        await this.delivery.standaloneReply(msg, standaloneInfoCard('**🔐 访问授权清单**', [
+          `**已授权群（${groups.length}）**`,
+          ...groupLines,
+          `**已授权用户（${users.length}）**`,
+          ...userLines,
+          `**待处理申请**：${pending.length} 个（可在 Web 设置面板处理）`,
+        ]), direct)
+        return
+      }
+      await this.delivery.commandCard(msg, {
+        kind: 'input-error', command: 'auth',
+        text: '用法：/auth [status|allow|revoke|list|user add <open_id>|user remove <open_id>]',
+      }, direct)
+    } catch (error) {
+      this.ctx.logger?.warn?.('dsh-channels: /auth failed: %s', String(error))
+      await this.delivery.commandCard(msg, {
+        kind: 'unavailable', command: 'auth', text: `授权操作失败：${messageOf(error)}`,
+      }, direct).catch(() => {})
     }
   }
 

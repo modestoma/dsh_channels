@@ -9,9 +9,16 @@
  */
 
 import { createLarkChannel, LoggerLevel } from '@larksuiteoapi/node-sdk'
-import type { LarkChannel, NormalizedMessage, SendResult, WSConnectionStatus } from '@larksuiteoapi/node-sdk'
+import type {
+  BotAddedEvent,
+  ChatInfo,
+  LarkChannel,
+  NormalizedMessage,
+  SendResult,
+  WSConnectionStatus,
+} from '@larksuiteoapi/node-sdk'
 
-export type { NormalizedMessage, SendResult } from '@larksuiteoapi/node-sdk'
+export type { BotAddedEvent, ChatInfo, NormalizedMessage, SendResult } from '@larksuiteoapi/node-sdk'
 export type FeishuConnectionStatus = WSConnectionStatus
 
 /** Outbound payloads used by this plugin, including Buffer-backed file upload. */
@@ -41,6 +48,14 @@ export interface FeishuChannel {
   onMessage(handler: (message: NormalizedMessage) => void | Promise<void>): () => void
   /** Bound handler for card button-callback events. */
   onCardAction(handler: (event: CardActionEvent) => void | Promise<void>): () => void
+  /**
+   * Bound handler for bot-added-to-chat events (`im.chat.member.bot.added_v1`).
+   * Requires the app to subscribe that event; without it the plugin falls
+   * back to the first denied @-mention for group information cards.
+   */
+  onBotAdded(handler: (event: BotAddedEvent) => void | Promise<void>): () => void
+  /** Chat name/owner/member count (needs chat-info read permission). */
+  getChatInfo(chatId: string): Promise<ChatInfo>
   /** Bot open_id, available after `connect()` resolves. */
   botOpenId(): string | undefined
   /** Current official-SDK WebSocket lifecycle snapshot, when initialized. */
@@ -114,6 +129,18 @@ class LarkChannelAdapter implements FeishuChannel {
 
   onCardAction(handler: (event: CardActionEvent) => void | Promise<void>): () => void {
     return this.channel.on('cardAction', handler)
+  }
+
+  onBotAdded(handler: (event: BotAddedEvent) => void | Promise<void>): () => void {
+    // The SDK event handler is synchronous; the plugin's handler is
+    // fire-and-forget (the service wraps it with its own catch/log).
+    return this.channel.on('botAdded', event => {
+      void handler(event)
+    })
+  }
+
+  async getChatInfo(chatId: string): Promise<ChatInfo> {
+    return this.channel.getChatInfo(chatId)
   }
 
   botOpenId(): string | undefined {

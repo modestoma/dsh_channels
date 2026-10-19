@@ -12,6 +12,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { PANEL_COPY } from '../settings/contract.ts'
 import type {
+  AccessGroupWire,
+  AccessRequestWire,
+  AccessUserWire,
+  AccessWire,
   CatalogWire,
   ChannelStatusWire,
   CleanupPreviewWire,
@@ -25,7 +29,22 @@ import type {
   FieldIssueWire,
   PanelWire,
 } from '../settings/contract.ts'
-import { clearConfig, clearCredential, fetchCatalog, fetchPanel, fetchStatus, reconnect, runCleanup, saveConfig, saveCredentials } from './api.ts'
+import {
+  addAccessGroup,
+  addAccessUser,
+  clearConfig,
+  clearCredential,
+  fetchCatalog,
+  fetchPanel,
+  fetchStatus,
+  reconnect,
+  removeAccessGroup,
+  removeAccessUser,
+  resolveAccessRequest,
+  runCleanup,
+  saveConfig,
+  saveCredentials,
+} from './api.ts'
 import { CATALOG_KEYS, applyCatalogFields, catalogFromFields } from './catalog.ts'
 
 /** Owner props handed to a `settings.section` contribution (unused beyond parity). */
@@ -41,7 +60,7 @@ type LoadState =
 type Notice = { kind: 'ok' | 'error'; text: string; issues?: FieldIssueWire[] }
 
 /** One in-flight panel mutation (only one button is disabled at a time). */
-type BusyAction = 'save' | 'clear' | 'reconnect' | 'credentials' | 'credentials-clear' | 'cleanup'
+type BusyAction = 'save' | 'clear' | 'reconnect' | 'credentials' | 'credentials-clear' | 'cleanup' | 'access'
 
 const GROUP_ORDER = ['workspace', 'behavior', 'content', 'model', 'streaming'] as const
 const GROUP_LABELS: Record<(typeof GROUP_ORDER)[number], string> = {
@@ -106,6 +125,29 @@ function statusBadge(status: ChannelStatusWire): { text: string; tone: 'ok' | 'w
   if (status.level === 'healthy') return { text: '运行中 · 健康', tone: 'ok' }
   if (status.level === 'degraded') return { text: '运行中 · 降级', tone: 'warn' }
   return { text: '运行中 · 异常', tone: 'bad' }
+}
+
+/** Local `YYYY-MM-DD HH:mm` rendering for authorization timestamps. */
+function formatAccessDate(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return '—'
+  const date = new Date(ms)
+  const pad = (value: number): string => String(value).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
+
+/** Which authorization entry produced one grant. */
+function accessSourceLabel(source: AccessGroupWire['source']): string {
+  switch (source) {
+    case 'command': return PANEL_COPY.accessSourceCommand
+    case 'card': return PANEL_COPY.accessSourceCard
+    default: return PANEL_COPY.accessSourcePanel
+  }
+}
+
+/** Effective access-mode label, reusing the Host field options for consistency. */
+function accessModeLabel(panel: PanelWire, mode: AccessWire['mode']): string {
+  const field = panel.config.fields.find(item => item.key === 'accessMode')
+  return field?.options?.find(option => option.value === mode)?.label ?? mode
 }
 
 function fieldLabel(fields: readonly EditableFieldWire[], key: EditableKey): string {
@@ -524,6 +566,255 @@ function CleanupCard(props: {
   )
 }
 
+/** Access card: fail-closed warning, administrator, whitelists, pending requests. */
+function AccessCard(props: {
+  panel: PanelWire
+  busy: BusyAction | null
+  notice: string | null
+  error: string | null
+  onAddGroup: (chatId: string, name: string) => Promise<boolean>
+  onRemoveGroup: (chatId: string) => void
+  onAddUser: (openId: string, name: string) => Promise<boolean>
+  onRemoveUser: (openId: string) => void
+  onResolveRequest: (token: string, decision: 'allow' | 'deny') => void
+}) {
+  const { panel, busy, notice, error, onAddGroup, onRemoveGroup, onAddUser, onRemoveUser, onResolveRequest } = props
+  const { access } = panel
+  const [groupChatId, setGroupChatId] = useState('')
+  const [groupName, setGroupName] = useState('')
+  const [userOpenId, setUserOpenId] = useState('')
+  const [userName, setUserName] = useState('')
+  const groups: readonly AccessGroupWire[] = access.groups
+  const users: readonly AccessUserWire[] = access.users
+  const requests: readonly AccessRequestWire[] = access.requests
+  const working = busy === 'access'
+  const disabled = busy !== null
+
+  const submitGroup = async (): Promise<void> => {
+    if (groupChatId.trim() === '') return
+    if (await onAddGroup(groupChatId, groupName)) {
+      setGroupChatId('')
+      setGroupName('')
+    }
+  }
+
+  const submitUser = async (): Promise<void> => {
+    if (userOpenId.trim() === '') return
+    if (await onAddUser(userOpenId, userName)) {
+      setUserOpenId('')
+      setUserName('')
+    }
+  }
+
+  return (
+    <section className="dsh-channels-cfg__card">
+      <div className="dsh-channels-cfg__cardHead">
+        <span className="dsh-channels-cfg__cardTitle">{PANEL_COPY.accessCard}</span>
+        <span className="dsh-channels-cfg__cardMeta">{accessModeLabel(panel, access.mode)}</span>
+      </div>
+      <span className="dsh-channels-cfg__help">{PANEL_COPY.accessCardHelp}</span>
+
+      {access.mode === 'guarded' && !access.admin.configured
+        ? (
+            <div className="dsh-channels-cfg__notice dsh-channels-cfg__notice--error">
+              <strong>{PANEL_COPY.accessAdminMissingWarning}</strong>
+            </div>
+          )
+        : null}
+      {access.mode === 'open'
+        ? <div className="dsh-channels-cfg__banner">{PANEL_COPY.accessModeOpenWarning}</div>
+        : null}
+
+      <div className="dsh-channels-cfg__kv">
+        <span className="dsh-channels-cfg__kvKey">{PANEL_COPY.accessAdminLabel}</span>
+        <span className={`dsh-channels-cfg__kvValue dsh-channels-cfg__mono${access.admin.configured ? '' : ' dsh-channels-cfg__reasonBad'}`}>
+          {access.admin.openId ?? PANEL_COPY.accessAdminMissing}
+        </span>
+        <span className="dsh-channels-cfg__help">{PANEL_COPY.accessAdminHint}</span>
+      </div>
+
+      <div className="dsh-channels-cfg__accessSection">
+        <div className="dsh-channels-cfg__labelRow">
+          <span className="dsh-channels-cfg__label">{PANEL_COPY.accessGroupsTitle}</span>
+          <span className="dsh-channels-cfg__cardMeta">{groups.length} 个</span>
+        </div>
+        {groups.length === 0
+          ? <span className="dsh-channels-cfg__help">{PANEL_COPY.accessGroupsEmpty}</span>
+          : (
+              <ul className="dsh-channels-cfg__accessList">
+                {groups.map(group => (
+                  <li className="dsh-channels-cfg__accessRow" key={group.chatId}>
+                    <span className="dsh-channels-cfg__accessMain">
+                      <span>{group.name ?? group.chatId}</span>
+                      <span className="dsh-channels-cfg__accessMeta">
+                        <span className="dsh-channels-cfg__mono">{group.chatId}</span>
+                        {` · ${accessSourceLabel(group.source)} · ${formatAccessDate(group.addedAt)}`}
+                      </span>
+                    </span>
+                    <button
+                      type="button"
+                      className="dsh-channels-cfg__btn"
+                      disabled={disabled}
+                      onClick={() => onRemoveGroup(group.chatId)}
+                    >
+                      {working ? PANEL_COPY.accessWorking : PANEL_COPY.accessRemove}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+        <div className="dsh-channels-cfg__accessAdd">
+          <input
+            type="text"
+            className="dsh-channels-cfg__input dsh-channels-cfg__accessInput"
+            value={groupChatId}
+            placeholder={PANEL_COPY.accessGroupChatIdPlaceholder}
+            disabled={disabled}
+            onChange={event => setGroupChatId(event.target.value)}
+          />
+          <input
+            type="text"
+            className="dsh-channels-cfg__input dsh-channels-cfg__accessInput"
+            value={groupName}
+            placeholder={PANEL_COPY.accessGroupNamePlaceholder}
+            disabled={disabled}
+            onChange={event => setGroupName(event.target.value)}
+          />
+          <button
+            type="button"
+            className="dsh-channels-cfg__btn dsh-channels-cfg__btn--primary"
+            disabled={disabled || groupChatId.trim() === ''}
+            onClick={() => { void submitGroup() }}
+          >
+            {working ? PANEL_COPY.accessWorking : PANEL_COPY.accessAddGroup}
+          </button>
+        </div>
+      </div>
+
+      <div className="dsh-channels-cfg__accessSection">
+        <div className="dsh-channels-cfg__labelRow">
+          <span className="dsh-channels-cfg__label">{PANEL_COPY.accessUsersTitle}</span>
+          <span className="dsh-channels-cfg__cardMeta">{users.length} 个</span>
+        </div>
+        {users.length === 0
+          ? <span className="dsh-channels-cfg__help">{PANEL_COPY.accessUsersEmpty}</span>
+          : (
+              <ul className="dsh-channels-cfg__accessList">
+                {users.map(user => (
+                  <li className="dsh-channels-cfg__accessRow" key={user.openId}>
+                    <span className="dsh-channels-cfg__accessMain">
+                      <span>{user.name ?? user.openId}</span>
+                      <span className="dsh-channels-cfg__accessMeta">
+                        <span className="dsh-channels-cfg__mono">{user.openId}</span>
+                        {` · ${accessSourceLabel(user.source)} · ${formatAccessDate(user.addedAt)}`}
+                      </span>
+                    </span>
+                    <button
+                      type="button"
+                      className="dsh-channels-cfg__btn"
+                      disabled={disabled}
+                      onClick={() => onRemoveUser(user.openId)}
+                    >
+                      {working ? PANEL_COPY.accessWorking : PANEL_COPY.accessRemove}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+        <div className="dsh-channels-cfg__accessAdd">
+          <input
+            type="text"
+            className="dsh-channels-cfg__input dsh-channels-cfg__accessInput"
+            value={userOpenId}
+            placeholder={PANEL_COPY.accessUserOpenIdPlaceholder}
+            disabled={disabled}
+            onChange={event => setUserOpenId(event.target.value)}
+          />
+          <input
+            type="text"
+            className="dsh-channels-cfg__input dsh-channels-cfg__accessInput"
+            value={userName}
+            placeholder={PANEL_COPY.accessUserNamePlaceholder}
+            disabled={disabled}
+            onChange={event => setUserName(event.target.value)}
+          />
+          <button
+            type="button"
+            className="dsh-channels-cfg__btn dsh-channels-cfg__btn--primary"
+            disabled={disabled || userOpenId.trim() === ''}
+            onClick={() => { void submitUser() }}
+          >
+            {working ? PANEL_COPY.accessWorking : PANEL_COPY.accessAddUser}
+          </button>
+        </div>
+      </div>
+
+      <div className="dsh-channels-cfg__accessSection">
+        <div className="dsh-channels-cfg__labelRow">
+          <span className="dsh-channels-cfg__label">{PANEL_COPY.accessRequestsTitle}</span>
+          <span className="dsh-channels-cfg__cardMeta">{requests.length} 条</span>
+        </div>
+        {requests.length === 0
+          ? <span className="dsh-channels-cfg__help">{PANEL_COPY.accessRequestsEmpty}</span>
+          : (
+              <ul className="dsh-channels-cfg__accessList">
+                {requests.map(request => (
+                  <li className="dsh-channels-cfg__accessRow" key={request.token}>
+                    <span className="dsh-channels-cfg__accessMain">
+                      <span>
+                        {request.kind === 'group' ? PANEL_COPY.accessRequestGroup : PANEL_COPY.accessRequestUser}
+                        {'：'}
+                        {request.name ?? request.targetId}
+                      </span>
+                      <span className="dsh-channels-cfg__accessMeta">
+                        <span className="dsh-channels-cfg__mono">{request.targetId}</span>
+                        {` · ${formatAccessDate(request.createdAt)} · ${PANEL_COPY.accessRequestExpires} ${formatAccessDate(request.expiresAt)}`}
+                        {request.kind === 'user' && request.requester !== undefined
+                          ? ` · ${PANEL_COPY.accessRequestRequester} ${request.requester}`
+                          : ''}
+                        {request.kind === 'user' && request.groupName !== undefined
+                          ? ` · 群 ${request.groupName}`
+                          : request.kind === 'user' && request.chatId !== undefined
+                            ? ` · 群 ${request.chatId}`
+                            : ''}
+                      </span>
+                    </span>
+                    <span className="dsh-channels-cfg__accessActions">
+                      <button
+                        type="button"
+                        className="dsh-channels-cfg__btn dsh-channels-cfg__btn--primary"
+                        disabled={disabled}
+                        onClick={() => onResolveRequest(request.token, 'allow')}
+                      >
+                        {working ? PANEL_COPY.accessWorking : PANEL_COPY.accessAllow}
+                      </button>
+                      <button
+                        type="button"
+                        className="dsh-channels-cfg__btn"
+                        disabled={disabled}
+                        onClick={() => onResolveRequest(request.token, 'deny')}
+                      >
+                        {working ? PANEL_COPY.accessWorking : PANEL_COPY.accessDeny}
+                      </button>
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
+      </div>
+
+      {notice === null ? null : (
+        <div className="dsh-channels-cfg__notice dsh-channels-cfg__notice--ok">
+          <span>{notice}</span>
+        </div>
+      )}
+      {error === null ? null : <span className="dsh-channels-cfg__fieldError">{error}</span>}
+      <span className="dsh-channels-cfg__help">{PANEL_COPY.accessHints}</span>
+      <span className="dsh-channels-cfg__help">{PANEL_COPY.accessChatIdHint}</span>
+    </section>
+  )
+}
+
 /** The settings.section page: status card + generic config form + read-only facts. */
 export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.Element {
   const [load, setLoad] = useState<LoadState>({ phase: 'loading' })
@@ -538,6 +829,8 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
   const [catalogBusy, setCatalogBusy] = useState(false)
   const [cleanupResult, setCleanupResult] = useState<CleanupRunWire | null>(null)
   const [cleanupError, setCleanupError] = useState<string | null>(null)
+  const [accessNotice, setAccessNotice] = useState<string | null>(null)
+  const [accessError, setAccessError] = useState<string | null>(null)
   const catalogTicket = useRef(0)
   const panel = load.phase === 'ready' ? load.panel : null
   const currentStatus = status ?? panel?.status ?? null
@@ -547,6 +840,8 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
     setNotice(null)
     setCleanupResult(null)
     setCleanupError(null)
+    setAccessNotice(null)
+    setAccessError(null)
     try {
       const next = await fetchPanel()
       setLoad({ phase: 'ready', panel: next })
@@ -804,6 +1099,112 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
     }
   }, [panel])
 
+  /** Replace the embedded access snapshot after a whitelist mutation. */
+  const applyAccess = useCallback((access: AccessWire): void => {
+    setLoad(previous => previous.phase === 'ready'
+      ? { phase: 'ready', panel: { ...previous.panel, access } }
+      : previous)
+  }, [])
+
+  const onAddAccessGroup = useCallback(async (chatId: string, name: string): Promise<boolean> => {
+    setBusy('access')
+    setAccessError(null)
+    setAccessNotice(null)
+    try {
+      const result = await addAccessGroup(chatId, name)
+      if (!result.ok) {
+        setAccessError(result.error)
+        return false
+      }
+      applyAccess(result.access)
+      setAccessNotice(PANEL_COPY.accessGroupAdded)
+      return true
+    } catch (error) {
+      setAccessError(messageOf(error))
+      return false
+    } finally {
+      setBusy(null)
+    }
+  }, [applyAccess])
+
+  const onRemoveAccessGroup = useCallback(async (chatId: string): Promise<void> => {
+    setBusy('access')
+    setAccessError(null)
+    setAccessNotice(null)
+    try {
+      const result = await removeAccessGroup(chatId)
+      if (!result.ok) {
+        setAccessError(result.error)
+        return
+      }
+      applyAccess(result.access)
+      setAccessNotice(PANEL_COPY.accessGroupRemoved)
+    } catch (error) {
+      setAccessError(messageOf(error))
+    } finally {
+      setBusy(null)
+    }
+  }, [applyAccess])
+
+  const onAddAccessUser = useCallback(async (openId: string, name: string): Promise<boolean> => {
+    setBusy('access')
+    setAccessError(null)
+    setAccessNotice(null)
+    try {
+      const result = await addAccessUser(openId, name)
+      if (!result.ok) {
+        setAccessError(result.error)
+        return false
+      }
+      applyAccess(result.access)
+      setAccessNotice(PANEL_COPY.accessUserAdded)
+      return true
+    } catch (error) {
+      setAccessError(messageOf(error))
+      return false
+    } finally {
+      setBusy(null)
+    }
+  }, [applyAccess])
+
+  const onRemoveAccessUser = useCallback(async (openId: string): Promise<void> => {
+    setBusy('access')
+    setAccessError(null)
+    setAccessNotice(null)
+    try {
+      const result = await removeAccessUser(openId)
+      if (!result.ok) {
+        setAccessError(result.error)
+        return
+      }
+      applyAccess(result.access)
+      setAccessNotice(PANEL_COPY.accessUserRemoved)
+    } catch (error) {
+      setAccessError(messageOf(error))
+    } finally {
+      setBusy(null)
+    }
+  }, [applyAccess])
+
+  const onResolveAccessRequest = useCallback(async (token: string, decision: 'allow' | 'deny'): Promise<void> => {
+    setBusy('access')
+    setAccessError(null)
+    setAccessNotice(null)
+    try {
+      const result = await resolveAccessRequest(token, decision)
+      if (!result.ok) {
+        setAccessError(result.error)
+        return
+      }
+      applyAccess(result.access)
+      setAccessNotice(decision === 'allow' ? PANEL_COPY.accessRequestAllowed : PANEL_COPY.accessRequestDenied)
+    } catch (error) {
+      setAccessError(messageOf(error))
+    } finally {
+      setBusy(null)
+    }
+  }, [applyAccess])
+
   const onSaveCredentials = useCallback(async (): Promise<void> => {
     const values: { appId?: string; appSecret?: string } = {}
     if (appIdInput.trim() !== '') values.appId = appIdInput
@@ -1054,6 +1455,17 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
                 result={cleanupResult}
                 error={cleanupError}
                 onRun={() => { void onRunCleanup() }}
+              />
+              <AccessCard
+                panel={panel}
+                busy={busy}
+                notice={accessNotice}
+                error={accessError}
+                onAddGroup={onAddAccessGroup}
+                onRemoveGroup={chatId => { void onRemoveAccessGroup(chatId) }}
+                onAddUser={onAddAccessUser}
+                onRemoveUser={openId => { void onRemoveAccessUser(openId) }}
+                onResolveRequest={(token, decision) => { void onResolveAccessRequest(token, decision) }}
               />
               <AdvancedCard panel={panel} />
             </>
