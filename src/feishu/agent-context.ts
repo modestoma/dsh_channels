@@ -30,7 +30,7 @@ Images, files, and forwarded chat records sent through Feishu are archived verba
 
 Attachments are never inserted into the conversation automatically. Read them only when the user's request needs them, and do not read attachments the user did not mention:
 - images: use \`read_image\` with the file path;
-- text and code: use \`read\`;
+- text and code: use \`read\` when the session mounts that tool, otherwise \`bash\` (for example \`sed -n '1,200p' <file>\`);
 - other formats (PDF, Office, archives, ...): inspect or convert them with \`bash\`.
 If the user refers to "the file/image I just sent" without a name, list the directory and pick the most recent matching attachment.`
 
