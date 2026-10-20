@@ -34,6 +34,10 @@ export const DEFAULT_APPROVAL_TIMEOUT_MS = 5 * 60 * 1000
 /** Default structured-question window: 5 minutes per `ask_user_question` call. */
 export const DEFAULT_QUESTION_TIMEOUT_MS = 5 * 60 * 1000
 
+/** Backends for inbound attachment storage, selected by `attachmentStore`. */
+export const ATTACHMENT_STORE_MODES = ['native', 'archive'] as const
+export type AttachmentStoreMode = (typeof ATTACHMENT_STORE_MODES)[number]
+
 /** A credential reference: `FEISHU_APP_ID`-style name resolved through ctx.credentials. */
 const credentialRefSchema = z.string().regex(
   CREDENTIAL_REF_PATTERN,
@@ -145,6 +149,21 @@ export const configSchema = z.object({
    * attachment messages inert (no save, no turn).
    */
   acceptAttachments: z.boolean().default(true),
+  /**
+   * Backend for inbound Feishu images and files.
+   *
+   * - `native` (default): store into the DSH native attachment library
+   *   (`ctx.attachments`) as durable `ImageBlock`/`FileBlock` references; if
+   *   the host does not mount that service, the storage layer falls back to
+   *   `archive` for that deployment.
+   * - `archive`: legacy behavior — write the resources into the topic
+   *   workspace `attachments/` directory through the existing intake.
+   *
+   * Callers that consume this switch (admission, fetch tool) are wired by the
+   * later attachment-pipeline tasks; `native_attachment_store` only provides
+   * the storage layer and its tested fallback.
+   */
+  attachmentStore: z.enum(ATTACHMENT_STORE_MODES).default('native'),
   /**
    * Delete the topic directories of stale conversations, plus legacy
    * one-workspace-per-topic directories written by older plugin versions.

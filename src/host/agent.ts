@@ -5,6 +5,7 @@
  * @module dsh-channels/host/agent
  */
 
+import type { AttachmentStore } from './attachments.ts'
 import type { CommandRuntime } from './commands.ts'
 import type { Session, SessionId, UserMessage } from './core.ts'
 
@@ -107,6 +108,15 @@ export interface AgentContext {
   systemPrompt?: SystemPromptRuntime
   /** Present inside a setup scope that injected `tools`. */
   tools?: ToolRuntime
+  /**
+   * Present inside a setup scope that injected `attachments` (the DSH native
+   * attachment store). Optional: headless or legacy hosts, and test doubles,
+   * may not mount it, so consumers resolve it through the degradation-aware
+   * helper in `src/feishu/native-attachments.ts` instead of assuming presence.
+   */
+  attachments?: AttachmentStore
+  /** Safe service lookup (returns undefined for absent services). */
+  get?(name: string): unknown
   /** Register an Agent-scoped model-call override. */
   on(
     event: 'agent/request',

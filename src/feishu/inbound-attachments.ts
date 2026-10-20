@@ -69,8 +69,12 @@ export async function adoptStagedAttachments(stagingDir: string, workspacePath: 
   return adopted
 }
 
-/** The SDK placeholder for a rich-text message that carried no visible text. */
-const EMPTY_POST_PLACEHOLDER = '[rich text message]'
+/**
+ * The SDK placeholder for a rich-text message that carried no visible text.
+ * Exported so the native storage layer classifies attachment-only messages
+ * with exactly the same rule as the workspace archive.
+ */
+export const EMPTY_POST_PLACEHOLDER = '[rich text message]'
 
 /** Placeholders the SDK leaves in normalized content for attachment payloads. */
 const IMAGE_PLACEHOLDER = /!\[image\]\([^)]*\)/gu

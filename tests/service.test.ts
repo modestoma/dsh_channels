@@ -50,6 +50,7 @@ function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
     // Onboarding is opt-in per test: it adds a card that would shift send counts.
     welcomeOnboarding: false,
     acceptAttachments: true,
+    attachmentStore: 'native',
     topicIsolation: 'auto',
     workspaceRetention: 'off',
     workspaceRetentionAuto: false,
