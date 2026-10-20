@@ -11,7 +11,9 @@
  *     lines: the delegation status line (子代理 / 工作流 progress, settled
  *     workflow outcome, heartbeat) and the tool line (the parent's in-flight
  *     tool call). The lines are INDEPENDENT — a later tool call never
- *     supersedes the settled workflow status. Subagent children live in their
+ *     supersedes the settled workflow status. The lines render only on the
+ *     card that is currently streaming, so frozen segment cards never repeat
+ *     a stale status. Subagent children live in their
  *     own sessions: their `subagent/descriptor` / `tool/call` / `turn/end`
  *     events are folded into the parent turn's status line through
  *     `session.header.parentSession` (status only — the child's text output
@@ -19,10 +21,11 @@
  *  3. When the body outgrows one card's budget, the overflow is split at a
  *     clean breakpoint and sent as a continuation segment card (segment 2, 3,
  *     …) into the same topic; the stream then keeps flowing into the newest
- *     card. Reasoning is never segmented — it stays on card 1 and is clipped
- *     to the leftover budget (body has priority).
- *  4. `turnEnded(turn)` — finalize every segment card (`回复结束` / `回复失败`)
- *     and request the Typing → DONE/No reaction swap on the triggering message.
+ *     card. Reasoning is never segmented — it stays on card 1 inside the
+ *     fold panel's own fixed window, independent of the body length.
+ *  4. `finalize(turn)` — flip every segment card to its terminal state
+ *     (`回复结束` / `回复失败`), render the settled footer on the main card and
+ *     request the Typing → DONE/No reaction swap on the triggering message.
  *
  * The first visible text delta flips the panel title 推理中 → 回复中; the
  * final patch flips it to 回复结束 or 回复失败. Patching is throttled to `refreshMs` and
@@ -38,7 +41,7 @@
  */
 
 import type { AssistantStreamFrame, Session, SessionEvent, TurnEndReason } from './dsh-types.ts'
-import { buildCard, segmentCardContent } from './cards.ts'
+import { buildCard, segmentCardContent, segmentCardOptions } from './cards.ts'
 import type { CardState, PanelPhase } from './cards.ts'
 import type { FeishuChannel } from './feishu-channel.ts'
 import { cacheHitPct, foldAll, foldEvent } from './stats.ts'
@@ -49,7 +52,7 @@ import type { HeaderSample, StatsFold, UsageSample } from './stats.ts'
  * console can confirm which build of the activity status line is loaded.
  * Bump on every behavior change to this feature.
  */
-export const ACTIVITY_BUILD_MARKER = 'activity-status-v6'
+export const ACTIVITY_BUILD_MARKER = 'activity-status-v7'
 
 /** How a segment card reached Feishu. */
 export interface SegmentDelivery {
@@ -149,8 +152,6 @@ interface TurnState {
   header: HeaderSample | undefined
   /** Provider usage produced during THIS turn; never inherited from history. */
   lastUsage: UsageSample | undefined
-  /** Structured terminal failure for this turn, when `turn/end.kind=error`. */
-  failure: { message: string; code?: string } | undefined
   /** Segment cards in order; `cards[0]` is the attached reply card. */
   cards: SegmentCard[]
   dirty: boolean
@@ -161,6 +162,12 @@ interface TurnState {
   disposed: boolean
   /** Unix ms when the turn was attached (heartbeat elapsed base). */
   turnStartedAt: number
+  /** Wall-clock start of the currently open reasoning phase (undefined = not reasoning). */
+  reasoningSince: number | undefined
+  /** Accumulated wall-clock time the turn spent reasoning, in ms. A phase
+   *  opens at the first reasoning delta and closes when the step's output ends
+   *  (first answer text or step end), so tool execution is never counted. */
+  reasoningMs: number
   /** The in-flight tool call, if any (cleared by its `tool/result`). */
   toolActivity: { name: string; label: string; since: number } | undefined
   /** Live workflow-run folds projected by the workflow tool into this session. */
@@ -202,6 +209,8 @@ interface AttemptMark {
   cardCount: number
   bodyLengths: number[]
   reasoningLength: number
+  reasoningMs: number
+  reasoningSince: number | undefined
 }
 
 /** One live `tool-workflow/run-*` fold: run identity and member progress. */
@@ -321,7 +330,6 @@ export class TurnStreamer {
       reasoning: '',
       header: undefined,
       lastUsage: undefined,
-      failure: undefined,
       cards: [{
         messageId: cardMessageId,
         body: '',
@@ -339,6 +347,8 @@ export class TurnStreamer {
       finalized: false,
       disposed: false,
       turnStartedAt: Date.now(),
+      reasoningSince: undefined,
+      reasoningMs: 0,
       toolActivity: undefined,
       workflowRuns: new Map(),
       workflowEndStatus: undefined,
@@ -531,6 +541,9 @@ export class TurnStreamer {
     if (state === undefined || state.disposed) return
     switch (frame.type) {
       case 'start': {
+        // A new step starts: close any reasoning phase the previous step left
+        // open (defensive — its `end` frame normally does this first).
+        this.closeReasoning(state)
         state.attempts.set(frame.attemptId, this.attemptMark(state))
         if (state.turn === undefined) state.turn = frame.turn
         break
@@ -538,6 +551,7 @@ export class TurnStreamer {
       case 'chunk': {
         const chunk = frame.chunk
         if (chunk.type === 'text-delta') {
+          if (chunk.text !== '') this.closeReasoning(state)
           const last = state.cards[state.cards.length - 1]
           if (last !== undefined && !last.frozen && chunk.text !== '') {
             last.body += chunk.text
@@ -545,12 +559,17 @@ export class TurnStreamer {
             this.markDirty(session.id, state)
           }
         } else if (chunk.type === 'reasoning-delta' && chunk.text !== '') {
+          if (state.reasoningSince === undefined) state.reasoningSince = Date.now()
           state.reasoning += chunk.text
           this.markDirty(session.id, state)
         }
         break
       }
       case 'end': {
+        // The step's output is complete: a reasoning phase that ended with a
+        // tool call (no answer text) stops counting here, so the tool run that
+        // follows is not miscounted as reasoning time.
+        this.closeReasoning(state)
         const mark = state.attempts.get(frame.attemptId)
         state.attempts.delete(frame.attemptId)
         if (frame.outcome.kind === 'abandoned' && mark !== undefined) {
@@ -568,7 +587,16 @@ export class TurnStreamer {
       cardCount: state.cards.length,
       bodyLengths: state.cards.map(card => card.body.length),
       reasoningLength: state.reasoning.length,
+      reasoningMs: state.reasoningMs,
+      reasoningSince: state.reasoningSince,
     }
+  }
+
+  /** Close an open reasoning phase, accumulating its wall-clock time. */
+  private closeReasoning(state: TurnState, now = Date.now()): void {
+    if (state.reasoningSince === undefined) return
+    state.reasoningMs += Math.max(0, now - state.reasoningSince)
+    state.reasoningSince = undefined
   }
 
   /**
@@ -594,6 +622,9 @@ export class TurnStreamer {
       tail.dirty = true
     }
     state.reasoning = state.reasoning.slice(0, mark.reasoningLength)
+    // The abandoned attempt's reasoning time is not part of the visible turn.
+    state.reasoningMs = mark.reasoningMs
+    state.reasoningSince = mark.reasoningSince
   }
 
   private markDirty(sessionId: string, state: TurnState): void {
@@ -641,6 +672,9 @@ export class TurnStreamer {
         : context?.contextWindow ?? projected?.contextWindow,
       model: header?.model,
       effort: header?.effort,
+      // Only a turn that actually reasoned reports a duration; a non-reasoning
+      // model leaves the field undefined (rendered as `—`).
+      reasoningMs: state.reasoning === '' ? undefined : state.reasoningMs,
     }
   }
 
@@ -717,13 +751,10 @@ export class TurnStreamer {
    *     an elapsed counter so the card never sits silently.
    * Once the turn is finalized, the line switches to the SETTLED form
    * (workflow conclusion + finished-subagent summary) — the final card keeps
-   * the delegation status; only the tool line disappears.
+   * the delegation status; only the tool line disappears. A failed turn shows
+   * its diagnostic once, in the body: the status line never repeats it.
    */
   private delegationLine(state: TurnState, now: number): string {
-    if (state.failure !== undefined) {
-      const suffix = state.failure.code === undefined ? '' : ` · ${state.failure.code}`
-      return clipActivity(`🔴 本轮运行失败${suffix}`)
-    }
     if (state.finalized) return this.settledLine(state)
 
     let latest: WorkflowRun | undefined
@@ -832,10 +863,14 @@ export class TurnStreamer {
     }, this.heartbeatMs)
   }
 
-  private cardState(sessionId: string, state: TurnState, body: string): CardState {
-    // The snapshot point recomputes (and remembers) both activity lines so
-    // every patch — including heartbeat-driven ones — carries the current
-    // status and tool call.
+  /**
+   * Snapshot one card. `active` is true for the card currently streaming:
+   * only that card renders the transient activity lines, so frozen segment
+   * cards never repeat a stale tool/delegation line. Both lines are still
+   * recomputed (and remembered) on every snapshot so heartbeat/transition
+   * logging stays accurate.
+   */
+  private cardState(sessionId: string, state: TurnState, body: string, active = true): CardState {
     const now = Date.now()
     const status = this.delegationLine(state, now)
     if (status !== state.status) {
@@ -853,8 +888,8 @@ export class TurnStreamer {
       phase: state.phase,
       reasoning: state.reasoning,
       body,
-      status: state.status,
-      tool: state.tool,
+      status: active ? state.status : '',
+      tool: active ? state.tool : '',
       stats: this.statsFor(sessionId, state),
     }
   }
@@ -882,7 +917,7 @@ export class TurnStreamer {
       const card = state.cards[index]
       if (card === undefined || card.frozen || card.mode === 'text') return
 
-      const options = index === 0 ? {} : { panel: false, segment: index + 1 }
+      const options = segmentCardOptions(index)
       const split = segmentCardContent(this.cardState(sessionId, state, card.body), options)
       if (split.head === '') {
         // Degenerate budget (cannot happen with the real fixed overhead):
@@ -944,10 +979,10 @@ export class TurnStreamer {
       let lastError: unknown
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
-          const snapshot = buildCard(this.cardState(sessionId, state, card.body), {
-            panel: false,
-            segment: index + 1,
-          })
+          const snapshot = buildCard(
+            this.cardState(sessionId, state, card.body, index === state.cards.length - 1),
+            segmentCardOptions(index),
+          )
           const delivery = await this.hooks.sendSegmentCard(sessionId, index + 1, snapshot, card.body)
           card.sending = false
           card.messageId = delivery.messageId
@@ -996,8 +1031,11 @@ export class TurnStreamer {
     if (!force && !card.dirty && !turnDirty) return
     if (!force && card.nextRetryAt > now) return
     card.dirty = false
-    const options = index === 0 ? {} : { panel: false, segment: index + 1 }
-    const snapshot = buildCard(this.cardState(sessionId, state, card.body), options)
+    const options = segmentCardOptions(index)
+    const snapshot = buildCard(
+      this.cardState(sessionId, state, card.body, index === state.cards.length - 1),
+      options,
+    )
     this.channel.updateCard(card.messageId, snapshot).catch((error: unknown) => {
       card.dirty = true
       card.failures++
@@ -1027,8 +1065,10 @@ export class TurnStreamer {
   ): void {
     if (state.finalized) return
     state.finalized = true
-    state.failure = failure
     state.phase = failure === undefined ? 'done' : 'error'
+    // A turn that ends inside a reasoning phase (e.g. no answer text) still
+    // reports the time it spent reasoning.
+    this.closeReasoning(state)
     if (failure !== undefined) {
       const code = failure.code === undefined ? '' : `\n\n错误码：\`${failure.code}\``
       const notice = `❌ **本轮运行失败**\n\n${failure.message}${code}`
@@ -1040,7 +1080,7 @@ export class TurnStreamer {
           // terminal diagnostic in its own continuation card instead.
           state.cards.push(this.freshSegment(notice))
         } else {
-          tail.body = tail.body.trim() === '' ? notice : `${tail.body}\n\n---\n\n${notice}`
+          tail.body = tail.body.trim() === '' ? notice : `${tail.body}\n\n${notice}`
           tail.dirty = true
         }
       }

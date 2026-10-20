@@ -7,5 +7,6 @@
 
 export * from './primitives.ts'
 export * from './streaming.ts'
+export * from './onboarding.ts'
 export * from './approval.ts'
 export * from './question.ts'

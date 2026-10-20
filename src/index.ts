@@ -3,8 +3,8 @@
  *
  * 一个 dsh 实例对应一个飞书机器人；用户通过私聊、群聊 @、话题群 @ 三种方式
  * 发起会话。每条触发消息：立即加 “Typing” 表情 → 以话题形式回复（创建话题）
- * → 绑定 DSH session → 卡片 2.0 流式回复（推理折叠面板 + 富文本正文 + 两行
- * session 信息，默认 500ms 刷新）→ 流式结束移除 Typing，成功更新为
+ * → 绑定 DSH session → 卡片 2.0 流式回复（推理折叠面板 + 临时活动行 +
+ * 富文本正文 + 结算页脚，默认 500ms 刷新）→ 流式结束移除 Typing，成功更新为
  * “DONE”，失败显示结构化错误并更新为 “No”。
  *
  * 工作区归属：私聊一人一工作区；群聊中每个用户在该群拥有独立工作区
@@ -53,7 +53,7 @@ export type { HostDirectoryPickerService, SettingsDirectoryPicker } from './sett
 export { isSameOriginRequest, mountSettingsRoutes, registerSettingsRoutes } from './settings/routes.ts'
 export type { HostWebServer } from './settings/routes.ts'
 export type { ApprovalOutcome, ApprovalRequest, ApprovalAnswererListener, AssistantStreamFrame, AskUserQuestionAnswer, AskUserQuestionAnswerItem, AskUserQuestionItem, AskUserQuestionRequestEvent, UserQuestionAnswererListener, AgentCancelCause, SessionStatsView, TokenUsageView, ContextPressureView, SessionProjections } from './dsh-types.ts'
-export { buildCard, buildInterruptionCard, cardJsonBytes, CARD_MAX_BYTES, CARD_TARGET_BYTES, CARD_PANEL_RESERVE_BYTES, REASONING_MAX_BYTES, INTERRUPTION_NOTICE, MAX_TABLES_PER_CARD, PANEL_TITLES, PANEL_CHEVRON_TOKEN, segmentCardContent, splitBodyForCard, stripTables, tableBlocks, TRUNCATION_SUFFIX, buildApprovalCard, buildApprovalSettledCard, buildQuestionCard, buildQuestionSettledCard, MAX_QUESTION_OPTIONS } from './cards.ts'
+export { buildCard, buildInterruptionCard, cardJsonBytes, CARD_MAX_BYTES, CARD_TARGET_BYTES, REASONING_MAX_BYTES, INTERRUPTION_NOTICE, MAX_TABLES_PER_CARD, PANEL_TITLES, PANEL_CHEVRON_TOKEN, segmentCardContent, splitBodyForCard, stripTables, tableBlocks, TRUNCATION_SUFFIX, buildApprovalCard, buildApprovalSettledCard, buildQuestionCard, buildQuestionSettledCard, MAX_QUESTION_OPTIONS } from './cards.ts'
 export { ApprovalAnswerer } from './approvals.ts'
 export { QuestionAnswerer } from './questions.ts'
 export { armModelCommand, buildCommandResultCard, CHANNEL_COMMAND_NAMES, commandResultCardKind, isSupportedCommand, parseSlashCommand, registerChannelCommands, registerModelCommand, RouteOperationQueue, SUPPORTED_COMMAND_NAMES, supportedCommandHelp, supportedCommandList } from './commands.ts'

@@ -1,15 +1,45 @@
 /**
- * Streaming reply card: reasoning panel, activity lines, body segmentation
- * and the byte/table budgets that keep one card inside Feishu's limits.
+ * Streaming reply card: the reasoning fold panel, the transient activity
+ * lines, the reply body and the settled footer — plus the byte/table budgets
+ * that keep one card inside Feishu's limits.
  *
- * Two independent budgets: the reply body segments across cards at
- * `CARD_TARGET_BYTES` (never splitting reasoning), while the reasoning fold
- * panel is a fixed `REASONING_MAX_BYTES` (5 KB) window — clipped from the tail
- * with a truncation marker and never traded against the body in either
- * direction.
+ * Composition, main card:
+ *
+ *   [fold panel] [activity status] [activity tool] [body]
+ *   [hr] [model · session · reasoning time]
+ *   [context share · input · output · cache hit]
+ *
+ * - The panel shows the reasoning behind its own window. While the turn is
+ *   still thinking it doubles as the phase indicator; once the turn settles
+ *   without any reasoning content (non-reasoning models) it is omitted
+ *   entirely instead of leaving an empty bordered box.
+ * - The two activity lines are transient: the streamer only passes them for
+ *   the card that is currently streaming, so frozen segment cards never repeat
+ *   a stale "正在调用工具" line.
+ * - The settled footer is a divider plus two notation lines and renders
+ *   exactly once: on the main card, only after the turn settles. It carries
+ *   the model/effort, session id and the turn's accumulated reasoning time
+ *   (line 1), then the context pressure with its window share plus the
+ *   input/output token counts and cache hit ratio (line 2). First frames
+ *   therefore never show a row of zeroed counters.
+ *
+ * Continuation cards (`options.segment`) carry a segment header and the body;
+ * they have no panel and no footer, so a long answer is not repeated chrome.
+ *
+ * Budgets, two independent ones:
+ * - Each card is measured as a whole: segmentation targets `CARD_TARGET_BYTES`
+ *   (main cards probe the panel at its maximum window, so reasoning that keeps
+ *   growing after the split cannot push the card over), while `CARD_MAX_BYTES`
+ *   is the platform hard cap used only by `buildCard` as an absolute guard.
+ * - The reasoning panel is a fixed `REASONING_MAX_BYTES` window, clipped from
+ *   the tail with a truncation marker. It neither competes with nor is squeezed
+ *   by the reply body: the visible reasoning window is identical whether the
+ *   answer is one line or a full segment.
  *
  * @module dsh-channels/cards/streaming
  */
+
+import { card, divider, foldPanel, markdown, note } from './primitives.ts'
 
 export type PanelPhase = 'thinking' | 'replying' | 'done' | 'error'
 
@@ -25,27 +55,17 @@ export const PANEL_CHEVRON_TOKEN = 'down-small-ccm_outlined'
 
 /** Feishu hard cap for one card message body. */
 export const CARD_MAX_BYTES = 30_000
-/** Target budget per card — 2 KB below the hard cap as headroom. */
+/** Target budget per card — 2 KB below the hard cap as headroom for the
+ *  figures that keep growing between a segment split and the final patch. */
 export const CARD_TARGET_BYTES = 28_000
 /**
- * Hard byte cap for the reasoning fold panel's markdown (5 KB, JSON-escaped
- * UTF-8, including the truncation marker). The panel is clipped against this
- * alone — never against the card — so it neither competes with nor is squeezed
- * by the reply body: the visible reasoning window is identical whether the
- * answer is one line or a full 28 KB segment. Measured at the cap: ≈4.96 K
- * ASCII chars, ≈1.65 K CJK chars, ≈2.5 K emoji. The panel element's own
- * wrapper (border, header, chevron) is charged separately — see
- * `CARD_PANEL_RESERVE_BYTES`.
+ * Cap for the reasoning fold panel's markdown (5 KB, JSON-escaped UTF-8,
+ * including the truncation marker). The panel is clipped against this alone —
+ * never against the card — so the visible reasoning window is the same whether
+ * the reply is one line or a full segment. Visible window at the cap: ≈4.96 K
+ * ASCII chars, ≈1.65 K CJK chars, ≈1.24 K emoji.
  */
 export const REASONING_MAX_BYTES = 5_000
-/**
- * Bytes held back from the card target for the fold panel as a whole, so a
- * segmented card's body plus its panel stay inside `CARD_TARGET_BYTES`.
- * `REASONING_MAX_BYTES` caps the panel's markdown; the element wrapper around
- * it (border, header, chevron icon, `elements` array) measures a further 315 B
- * at the worst phase, and this reserve covers that with headroom.
- */
-export const CARD_PANEL_RESERVE_BYTES = 5_500
 /**
  * Feishu hard-limits the number of markdown tables a single card may contain
  * (API error 11310 "card table number over limit"; verified on device: the
@@ -56,7 +76,7 @@ export const MAX_TABLES_PER_CARD = 5
 /** Appended to clipped reasoning (and, as an absolute last resort, clipped body). */
 export const TRUNCATION_SUFFIX = '\n\n…（内容过长，已截断）'
 
-/** Session-scoped figures rendered on the info lines. */
+/** Session-scoped figures rendered on the settled card's footer. */
 export interface CardStats {
   /** DSH session id. */
   sessionId: string
@@ -74,6 +94,13 @@ export interface CardStats {
   model?: string
   /** Reasoning effort (current turn's latest request header). */
   effort?: string
+  /**
+   * Accumulated wall-clock time the turn spent in reasoning phases, in ms.
+   * Each step's phase opens at its first reasoning delta and closes when that
+   * step's output ends (first answer text or step end), so tool execution time
+   * is never counted. Undefined when the turn produced no reasoning → `—`.
+   */
+  reasoningMs?: number
 }
 
 export interface CardState {
@@ -85,25 +112,27 @@ export interface CardState {
   /**
    * Transient delegation status (subagent/workflow progress, settled workflow
    * outcome, heartbeat elapsed) rendered as a notation line between the panel
-   * and the body — the FIRST of the two activity lines. Empty/undefined →
-   * omitted. Callers cap its length so it stays inside the budget headroom.
+   * and the body. The streamer only passes it for the card that is currently
+   * streaming. Empty/undefined → omitted. Callers cap its length so it stays
+   * inside the budget headroom.
    */
   status?: string
   /**
    * The parent agent's in-flight tool call, rendered as a notation line below
-   * the status line — the SECOND activity line. Independent of `status`:
-   * neither ever supersedes the other. Empty/undefined → omitted.
+   * the status line. Independent of `status`: neither ever supersedes the
+   * other. Same rule as `status` — only the actively streaming card renders it.
+   * Empty/undefined → omitted.
    */
   tool?: string
   stats: CardStats
 }
 
-/** Rendering variants. */
+/**
+ * Rendering variant. Omitted → the main card (reasoning panel + settled
+ * footer); a 1-based `segment` → a continuation card (segment header only).
+ */
 export interface CardOptions {
-  /** Render the reasoning fold panel (default `true`). Continuation segment
-   *  cards pass `false` and get a segment header instead. */
-  panel?: boolean
-  /** 1-based segment number shown in the continuation header. */
+  /** 1-based continuation segment number. */
   segment?: number
 }
 
@@ -116,10 +145,19 @@ export interface BodySplit {
   tail: string
 }
 
+const encoder = new TextEncoder()
+
 /** UTF-8 byte size of a card's JSON — the metric behind Feishu's 30 KB cap. */
-export function cardJsonBytes(card: object): number {
-  return new TextEncoder().encode(JSON.stringify(card)).length
+export function cardJsonBytes(value: object): number {
+  return encoder.encode(JSON.stringify(value)).length
 }
+
+/** JSON-escaped UTF-8 size of a string, as embedded in a card's JSON. */
+function jsonBytes(text: string): number {
+  return encoder.encode(JSON.stringify(text)).length
+}
+
+// ---- body primitives ------------------------------------------------------
 
 /** A contiguous run of markdown table lines; `end` is exclusive. */
 export interface TableBlock {
@@ -159,6 +197,41 @@ export function tableBlocks(body: string): TableBlock[] {
   return blocks
 }
 
+/** Fenced code block ranges (opening fence line through the closing line). An
+ *  unclosed fence extends to the end of the body. */
+function codeFenceBlocks(body: string): TableBlock[] {
+  const blocks: TableBlock[] = []
+  let start = -1
+  let offset = 0
+  for (const line of body.split('\n')) {
+    if (/^[ \t]*```/.test(line)) {
+      if (start < 0) {
+        start = offset
+      } else {
+        blocks.push({ start, end: offset + line.length })
+        start = -1
+      }
+    }
+    offset += line.length + 1
+  }
+  if (start >= 0) blocks.push({ start, end: body.length })
+  return blocks
+}
+
+/**
+ * Move a cut position out of any protected block (code fence or table) it
+ * lands inside: the block is kept whole on the following card. A block that
+ * starts at position 0 cannot be moved back (that would produce an empty
+ * head), so that degenerate case is left to the hard-cut escape hatch.
+ */
+function avoidProtected(blocks: TableBlock[], at: number): number {
+  for (const block of blocks) {
+    if (block.start >= at) break
+    if (at < block.end) return block.start > 0 ? block.start : at
+  }
+  return at
+}
+
 /**
  * Replace markdown table blocks with a placeholder. Used for the reasoning
  * panel, whose content is auxiliary (truncation has no impact) and is never
@@ -179,30 +252,58 @@ export function stripTables(text: string): string {
   return out
 }
 
+// ---- card content ---------------------------------------------------------
+
 function fmt(n: number): string {
   return n.toLocaleString('en-US')
 }
 
+/** Context-window share: one decimal below 10%, a whole number from 10% up. */
+function fmtContextPct(tokens: number, window: number): string {
+  const pct = (tokens / window) * 100
+  // Round first, then decide the precision, so 9.96% renders as `10%` (not
+  // `10.0%`) and agrees with the integer branch.
+  return `${Number(pct.toFixed(1)) >= 10 ? pct.toFixed(0) : pct.toFixed(1)}%`
+}
+
+/** `上下文 3,618/1,000,000 (0.4%)`; without a usable window the share is omitted. */
 function fmtContext(tokens?: number, window?: number): string {
   if (tokens === undefined) return '—'
-  if (window === undefined) return `${fmt(tokens)} tokens`
-  return `${fmt(tokens)} / ${fmt(window)}`
+  if (window === undefined || window <= 0) return `${fmt(tokens)} tokens`
+  return `${fmt(tokens)}/${fmt(window)} (${fmtContextPct(tokens, window)})`
 }
 
 function fmtCacheHit(pct?: number): string {
   return pct === undefined ? '—' : `${(pct * 100).toFixed(1)}%`
 }
 
-/** Info line 2: `icon - 模型 {model}({effort}) · icon - 缓存命中 {cache} · icon - 上下文 {context}` */
+/** `推理 3.2s` / `推理 1分5s`; `—` when the turn had no reasoning phase. */
+function fmtReasoningTime(ms?: number): string {
+  if (ms === undefined) return '—'
+  const safe = Math.max(0, ms)
+  if (safe < 60_000) return `${(safe / 1000).toFixed(1)}s`
+  const total = Math.round(safe / 1000)
+  return `${Math.floor(total / 60)}分${total % 60}s`
+}
+
+/**
+ * Settled footer, line 1: 🧠 model/effort · 🔑 session id · ⏱ reasoning time.
+ * Rendered once, after the turn settles, so live cards never flash a row of
+ * zeroed counters.
+ */
 function buildModelLine(stats: CardStats): string {
   const model = stats.model ?? '—'
   const effort = stats.effort !== undefined && stats.effort !== '' ? `(${stats.effort})` : ''
-  return `🧠 模型 ${model}${effort} · ⚡ 缓存命中 ${fmtCacheHit(stats.cacheHitPct)} · 📊 上下文 ${fmtContext(stats.contextTokens, stats.contextWindow)}`
+  return `🧠 模型 ${model}${effort} · 🔑 会话 ${stats.sessionId} · ⏱ 推理 ${fmtReasoningTime(stats.reasoningMs)}`
 }
 
-/** Info line 1: `icon - {session id} · icon - input token {input_token} · icon - output token {output_token}` */
-function buildSessionLine(stats: CardStats): string {
-  return `🔑 ${stats.sessionId} · ⬆ input token ${fmt(stats.inputTokens)} · ⬇ output token ${fmt(stats.outputTokens)}`
+/**
+ * Settled footer, line 2: 📊 context pressure (counts + share) · 📩 input
+ * tokens · 📨 output tokens · ⚡ cache hit ratio.
+ */
+function buildUsageLine(stats: CardStats): string {
+  return `📊 上下文 ${fmtContext(stats.contextTokens, stats.contextWindow)}`
+    + ` · 📩 输入 ${fmt(stats.inputTokens)} · 📨 输出 ${fmt(stats.outputTokens)} · ⚡ 缓存命中 ${fmtCacheHit(stats.cacheHitPct)}`
 }
 
 function reasoningPlaceholder(phase: PanelPhase): string {
@@ -213,142 +314,187 @@ function bodyPlaceholder(phase: PanelPhase): string {
   return phase === 'done' || phase === 'error' ? '*（本次无正文输出）*' : '*正在生成…*'
 }
 
-/** Continuation header: `📄 回复分段 {n} · {phase}` (or 续上一条卡片 without a number). */
-function segmentHeader(options: CardOptions, phase: PanelPhase): string {
-  const seg = options.segment
-  const title = seg === undefined ? '续上一条卡片' : `回复分段 ${seg}`
-  return `📄 ${title} · ${PANEL_TITLES[phase]}`
-}
-
-/** Raw card assembly — no clipping of any kind (the budget machinery wraps this). */
-function assemble(
-  phase: PanelPhase,
-  reasoning: string,
-  body: string,
-  stats: CardStats,
-  options: CardOptions,
-  status?: string,
-  tool?: string,
-): object {
-  const elements: object[] = []
-
-  if (options.panel ?? true) {
-    const panelReasoning = stripTables(reasoning)
-    elements.push({
-      tag: 'collapsible_panel',
-      expanded: false,
-      border: { color: 'grey', corner_radius: '8px' },
-      header: {
-        title: { tag: 'plain_text', content: PANEL_TITLES[phase] },
-        icon: { tag: 'standard_icon', token: PANEL_CHEVRON_TOKEN },
-        icon_position: 'right',
-        icon_expanded_angle: 180,
-      },
-      elements: [
-        { tag: 'markdown', content: panelReasoning.trim() === '' ? reasoningPlaceholder(phase) : panelReasoning },
-      ],
-    })
-  } else {
-    elements.push({ tag: 'markdown', content: segmentHeader(options, phase), text_size: 'notation' })
-  }
-
-  if (status !== undefined && status !== '') {
-    elements.push({ tag: 'markdown', content: status, text_size: 'notation' })
-  }
-  if (tool !== undefined && tool !== '') {
-    elements.push({ tag: 'markdown', content: tool, text_size: 'notation' })
-  }
-
-  elements.push({ tag: 'hr' })
-  elements.push({ tag: 'markdown', content: body.trim() === '' ? bodyPlaceholder(phase) : body })
-  elements.push({ tag: 'hr' })
-  elements.push({ tag: 'markdown', content: buildSessionLine(stats), text_size: 'notation' })
-  elements.push({ tag: 'markdown', content: buildModelLine(stats), text_size: 'notation' })
-
-  return {
-    schema: '2.0',
-    config: { width_mode: 'fill' },
-    body: { elements },
-  }
+/** The panel's markdown: stripped of tables, with a placeholder when empty. */
+function panelContent(phase: PanelPhase, reasoning: string): string {
+  const stripped = stripTables(reasoning)
+  return stripped.trim() === '' ? reasoningPlaceholder(phase) : stripped
 }
 
 /**
- * Fit `text` into a byte budget measured by `render`: return `text` unchanged
- * when it already fits; otherwise binary-search the longest prefix that still
- * fits once `suffix` is appended. The result is guaranteed to satisfy the
- * same measurement within `budget`.
+ * Whether the fold panel renders. `thinking` always does (it carries the
+ * phase indicator while the card is otherwise empty); every later phase only
+ * when there is actual reasoning to fold away — a settled non-reasoning turn
+ * gets no empty bordered box.
  */
-function clipText(text: string, suffix: string, render: (content: string) => number, budget: number): string {
-  if (render(text) <= budget) return text
+function panelShown(phase: PanelPhase, reasoning: string): boolean {
+  return phase === 'thinking' || stripTables(reasoning).trim() !== ''
+}
+
+/** Continuation header: `📄 回复分段 {n}`. */
+function segmentHeader(segment: number): string {
+  return `📄 回复分段 ${segment}`
+}
+
+/** Interruption notice header for a repaired continuation card. */
+function interruptionHeader(segment: number): string {
+  return `📄 回复分段 ${segment} · 回复中断`
+}
+
+function isSettled(phase: PanelPhase): boolean {
+  return phase === 'done' || phase === 'error'
+}
+
+/**
+ * Defensive cap on caller-supplied activity lines. The streamer already clips
+ * them to 64 chars; this bound keeps `buildCard`'s "always ≤ CARD_MAX_BYTES"
+ * guarantee even for a direct caller that passes an unbounded line.
+ */
+const ACTIVITY_LINE_MAX_CHARS = 512
+
+/** One caller-supplied notation line, defensively capped; undefined when empty. */
+function activityNote(text: string | undefined): object | undefined {
+  if (text === undefined || text === '') return undefined
+  const clipped = text.length <= ACTIVITY_LINE_MAX_CHARS
+    ? text
+    : `${text.slice(0, ACTIVITY_LINE_MAX_CHARS - 1)}…`
+  return note(clipped)
+}
+
+// ---- rendering ------------------------------------------------------------
+
+/** Render one card. `reasoning`/`body` are the already-budgeted texts. */
+function renderCard(
+  state: CardState,
+  options: CardOptions,
+  reasoning: string,
+  body: string,
+): object {
+  const segment = options.segment
+  const main = segment === undefined
+  const elements: object[] = []
+
+  if (main) {
+    if (panelShown(state.phase, reasoning)) {
+      elements.push(foldPanel(
+        PANEL_TITLES[state.phase],
+        panelContent(state.phase, reasoning),
+        PANEL_CHEVRON_TOKEN,
+      ))
+    }
+  } else {
+    elements.push(note(segmentHeader(segment)))
+  }
+
+  const statusNote = activityNote(state.status)
+  if (statusNote !== undefined) elements.push(statusNote)
+  const toolNote = activityNote(state.tool)
+  if (toolNote !== undefined) elements.push(toolNote)
+
+  elements.push(markdown(body.trim() === '' ? bodyPlaceholder(state.phase) : body))
+
+  if (main && isSettled(state.phase)) {
+    // The divider separates the answer from the turn's metadata; the two
+    // notation lines below it are the only place the settled figures appear.
+    elements.push(divider())
+    elements.push(note(buildModelLine(state.stats)))
+    elements.push(note(buildUsageLine(state.stats)))
+  }
+
+  return card(elements)
+}
+
+// ---- budgeting ------------------------------------------------------------
+
+/**
+ * Longest prefix of `text` that fits `budget` under `measure`.
+ *
+ * Returns `text` unchanged when it already fits; otherwise the longest prefix
+ * with `suffix` appended still fits, so a clipped result is guaranteed to stay
+ * within the same budget.
+ */
+function fitPrefix(
+  text: string,
+  budget: number,
+  measure: (candidate: string) => number,
+  suffix = '',
+): string {
+  if (measure(text) <= budget) return text
   let lo = 0
   let hi = text.length
   while (lo < hi) {
     const mid = Math.ceil((lo + hi) / 2)
-    if (render(text.slice(0, mid) + suffix) <= budget) {
-      lo = mid
-    } else {
-      hi = mid - 1
-    }
+    if (measure(text.slice(0, mid) + suffix) <= budget) lo = mid
+    else hi = mid - 1
   }
   return text.slice(0, lo) + suffix
 }
 
-/** JSON-escaped UTF-8 size of a string — the metric Feishu's card cap counts. */
-function jsonBytes(text: string): number {
-  return new TextEncoder().encode(JSON.stringify(text)).length
+/** Reasoning as rendered: clipped against the panel's own fixed window. */
+function budgetReasoning(state: CardState): string {
+  return fitPrefix(
+    state.reasoning,
+    REASONING_MAX_BYTES,
+    content => jsonBytes(panelContent(state.phase, content)),
+    TRUNCATION_SUFFIX,
+  )
 }
-
-/**
- * JSON-escaped UTF-8 size of the fold panel's markdown, as rendered by one
- * assembled card. Reasoning is budgeted against THIS rather than against the
- * whole card: a card-wide budget makes the panel collapse to the bare
- * truncation marker as soon as the reply body grows, so the visible reasoning
- * window would depend on how long the answer is.
- */
-function panelMarkdownBytes(render: (reasoning: string) => object): (content: string) => number {
-  return content => {
-    const elements = (render(content) as { body?: { elements?: Array<{ elements?: Array<{ content?: string }> }> } })
-      .body?.elements
-    return jsonBytes(elements?.[0]?.elements?.[0]?.content ?? '')
-  }
-}
-
-/** JSON-escaped UTF-8 size of the truncation marker — reserved so clips can
- *  never push a card past its budget. */
-const SUFFIX_JSON_BYTES = jsonBytes(TRUNCATION_SUFFIX)
 
 /**
  * Build one card.
  *
- * - Reasoning is clipped so its markdown stays within `REASONING_MAX_BYTES`
- *   (including the truncation marker): a fixed, self-contained budget that
- *   neither grants space to nor borrows space from the body, so the visible
- *   reasoning window is the same whether the reply is one line or a 28 KB
- *   segment.
- * - The body gets whatever is left of `CARD_MAX_BYTES` once the clipped
- *   reasoning is accounted for, which keeps the total under Feishu's hard cap.
- *   The streamer pre-splits with `segmentCardContent` (probed at the
- *   worst-case phase), so a live stream never reaches this clip: it is a pure
- *   guard for direct callers.
+ * The reasoning window is clipped against `REASONING_MAX_BYTES` alone, and the
+ * body is then clipped against `CARD_MAX_BYTES` measured on the card that is
+ * actually rendered — the guard exists only for direct callers and for the
+ * turn-failure notice appended to a settled body; the streamer pre-splits with
+ * `segmentCardContent`.
  *
- * Guarantee: the returned card is always ≤ `CARD_MAX_BYTES`, and its panel is
- * always ≤ `REASONING_MAX_BYTES`.
+ * Guarantee: the returned card is ≤ `CARD_MAX_BYTES`, and its panel markdown
+ * is ≤ `REASONING_MAX_BYTES`.
  */
 export function buildCard(state: CardState, options: CardOptions = {}): object {
-  const render = (reasoning: string, body: string) =>
-    assemble(state.phase, reasoning, body, state.stats, options, state.status, state.tool)
+  const reasoning = options.segment === undefined ? budgetReasoning(state) : state.reasoning
+  const body = fitPrefix(
+    state.body,
+    CARD_MAX_BYTES,
+    content => cardJsonBytes(renderCard(state, options, reasoning, content)),
+    TRUNCATION_SUFFIX,
+  )
+  return renderCard(state, options, reasoning, body)
+}
 
-  // 1. The panel, against its own budget. The panel markdown (and therefore the
-  //    visible reasoning window) does not depend on the body, the phase title,
-  //    or the info lines — only on the reasoning text and this cap.
-  const panelBytes = panelMarkdownBytes(content => render(content, ''))
-  const reasoning = clipText(state.reasoning, TRUNCATION_SUFFIX, panelBytes, REASONING_MAX_BYTES)
+/**
+ * Worst-case panel markdown: exactly `REASONING_MAX_BYTES` JSON bytes of
+ * ASCII text (the surrounding quotes cost 2 B).
+ */
+const PANEL_PROBE_MARKDOWN = 'r'.repeat(REASONING_MAX_BYTES - 2)
 
-  // 2. The body, against what is left of the hard cap once the panel's real
-  //    bytes are counted. The suffix reserve keeps a clipped body sendable.
-  const body = clipText(state.body, TRUNCATION_SUFFIX, content => cardJsonBytes(render('', content)),
-    CARD_MAX_BYTES - panelBytes(reasoning) - SUFFIX_JSON_BYTES)
-  return render(reasoning, body)
+/**
+ * Split a body so one card fits: `head` re-renders within `CARD_TARGET_BYTES`
+ * and `tail` flows into the next segment card ('' when everything fits).
+ *
+ * The probe renders the worst card this segment can ever become: the main card
+ * always budgets the panel's full window (reasoning may keep growing after the
+ * split) and its settled footer, while continuation cards have neither. The
+ * `error` phase is probed because it has the longest panel title.
+ */
+export function segmentCardContent(state: CardState, options: CardOptions = {}): BodySplit {
+  const main = options.segment === undefined
+  const probe: CardState = {
+    ...state,
+    phase: 'error',
+    reasoning: main ? PANEL_PROBE_MARKDOWN : '',
+  }
+  const limit = fitPrefix(
+    state.body,
+    CARD_TARGET_BYTES,
+    content => cardJsonBytes(renderCard(probe, options, probe.reasoning, content)),
+  ).length
+  return splitBodyForCard(state.body, limit)
+}
+
+/** Card-variant options for one segment (`0` is the main card). */
+export function segmentCardOptions(index: number): CardOptions {
+  return index === 0 ? {} : { segment: index + 1 }
 }
 
 /** Interruption notice body for cards repaired after a restart mid-turn. */
@@ -365,60 +511,19 @@ export const INTERRUPTION_NOTICE = '⚠️ 服务已重启，本次回复中断�
  */
 export function buildInterruptionCard(options: CardOptions = {}): object {
   const elements: object[] = []
-  if (options.panel === false) {
-    elements.push({
-      tag: 'markdown',
-      content: `📄 ${options.segment === undefined ? '续上一条卡片' : `回复分段 ${options.segment}`} · 回复中断`,
-      text_size: 'notation',
-    })
-  }
-  elements.push({ tag: 'markdown', content: INTERRUPTION_NOTICE })
-  return {
-    schema: '2.0',
-    config: { width_mode: 'fill' },
-    body: { elements },
-  }
-}
-
-/**
- * Largest body prefix (char count) whose card renders within `CARD_TARGET_BYTES`
- * minus `CARD_PANEL_RESERVE_BYTES`, reserving the panel's whole footprint for
- * the reasoning that travels with the segment. `segmentCardContent` only ever
- * segments bodies, so reasoning is never a segment budget input by construction
- * — but the panel still occupies the card, so its cap is held back. The probe renders
- * at phase `error`, the worst case (its segment header title is the longest),
- * so a frozen segment can never outgrow the budget merely by the phase flipping
- * 回复中 → 回复失败; stats growth between the split and the final patch consumes
- * the 2 KB redundancy (`CARD_MAX_BYTES` − `CARD_TARGET_BYTES`).
- */
-function largestBodyPrefix(state: CardState, options: CardOptions): number {
-  const text = state.body
-  const budget = CARD_TARGET_BYTES - CARD_PANEL_RESERVE_BYTES
-  // `panel: false` keeps the reserved panel cap out of the measurement itself.
-  const render = (content: string) =>
-    assemble('error', '', content, state.stats, { ...options, panel: false }, state.status, state.tool)
-  if (cardJsonBytes(render(text)) <= budget) return text.length
-  let lo = 0
-  let hi = text.length
-  while (lo < hi) {
-    const mid = Math.ceil((lo + hi) / 2)
-    if (cardJsonBytes(render(text.slice(0, mid))) <= budget) {
-      lo = mid
-    } else {
-      hi = mid - 1
-    }
-  }
-  return lo
+  if (options.segment !== undefined) elements.push(note(interruptionHeader(options.segment)))
+  elements.push(markdown(INTERRUPTION_NOTICE))
+  return card(elements)
 }
 
 /**
  * Split a body at a clean breakpoint so `head` fits one card:
  *  1. the head holds at most `maxTables` whole markdown tables — the boundary
  *     is capped at the first excess table (Feishu rejects cards with more);
- *  2. never inside a fenced code block (pull the boundary back before the fence);
- *  3. never inside a table block (a breakpoint that would land inside one is
- *     moved to its start);
- *  4. then the clean-breakpoint tiers: paragraph blank line → `#` heading line
+ *  2. never inside a fenced code block or a table block — the boundary is
+ *     pulled back to the block's start (a block beginning the body is left to
+ *     the hard-cut escape hatch);
+ *  3. then the clean-breakpoint tiers: paragraph blank line → `#` heading line
  *     → line break → hard cut as the escape hatch.
  */
 export function splitBodyForCard(body: string, maxChars: number, maxTables: number = MAX_TABLES_PER_CARD): BodySplit {
@@ -427,89 +532,38 @@ export function splitBodyForCard(body: string, maxChars: number, maxTables: numb
     return { head: body, tail: '' }
   }
 
-  let limit = maxChars
+  // Every range a cut may never land inside: fenced code blocks and tables.
+  const blocks = [...codeFenceBlocks(body), ...tables].sort((a, b) => a.start - b.start)
 
-  // 1. Table-count ceiling: the head may hold at most `maxTables` tables, so
-  //    never extend past the boundary right before the first excess table.
-  const firstExcess = tables[maxTables]
-  if (firstExcess !== undefined) {
-    limit = Math.min(limit, firstExcess.start)
-  }
-
-  // 2. Never cut inside a fenced code block straddling the ceiling.
-  const fencePattern = /^[ \t]*```[^\n]*$/gm
-  let fenceStart = -1
-  let inside = false
-  for (const match of body.matchAll(fencePattern)) {
-    const index = match.index ?? 0
-    if (!inside) {
-      if (index >= limit) break
-      inside = true
-      fenceStart = index
-    } else if (index >= limit) {
-      // The block opened before the ceiling and closes after it: move the
-      // boundary to just before the opening fence (unless it starts at 0).
-      if (fenceStart > 0) limit = fenceStart
-      break
-    } else {
-      inside = false
-    }
-  }
-  if (inside && fenceStart > 0 && fenceStart < limit) limit = fenceStart
-
-  // 3. Never cut inside a table block straddling the ceiling (pull the
-  //    boundary back to its start; a table beginning the body is left to the
-  //    hard-cut escape hatch).
-  for (const block of tables) {
-    if (block.start >= limit) break
-    if (block.end > limit) {
-      if (block.start > 0) limit = block.start
-      break
-    }
-  }
-
-  /** Move a cut position out of any table block (to just before it). */
-  const avoidTables = (at: number): number => {
-    for (const block of tables) {
-      if (block.start >= at) break
-      if (at <= block.end && block.start > 0) return block.start
-    }
-    return at
-  }
+  // 1. Table-count ceiling, then 2. pull the ceiling out of any block that
+  //    straddles it.
+  const limit = avoidProtected(blocks, Math.min(maxChars, tables[maxTables]?.start ?? body.length))
 
   const window = body.slice(0, limit)
+  // Preferred breakpoints scanning back from the ceiling; only accept one that
+  // keeps the card reasonably full, else fall through to the next tier.
+  const minFill = Math.floor(limit * 0.7)
+
   const cut = (at: number): BodySplit => ({
     head: body.slice(0, at).replace(/\s+$/u, ''),
     tail: body.slice(at).replace(/^\n+/u, ''),
   })
 
-  // Preferred breakpoints scanning back from the ceiling; only accept one that
-  // keeps the card reasonably full, else fall through to the next tier.
-  const minFill = Math.floor(limit * 0.7)
-
+  // 3. Clean-breakpoint tiers, each moved out of a protected block.
   const paragraph = window.lastIndexOf('\n\n')
-  if (paragraph >= minFill) return cut(avoidTables(paragraph + 2))
+  if (paragraph >= minFill) return cut(avoidProtected(blocks, paragraph + 2))
 
   let heading = -1
   for (const match of window.matchAll(/^#{1,6} .*$/gm)) {
     const start = match.index ?? 0
     heading = start === 0 ? 0 : start - 1
   }
-  if (heading >= minFill) return cut(avoidTables(heading))
+  if (heading >= minFill) return cut(avoidProtected(blocks, heading))
 
   const line = window.lastIndexOf('\n')
-  if (line >= minFill) return cut(avoidTables(line + 1))
+  if (line >= minFill) return cut(avoidProtected(blocks, line + 1))
 
-  return { head: body.slice(0, avoidTables(limit)), tail: body.slice(avoidTables(limit)) }
-}
-
-/**
- * How the accumulated body should be laid out for one card: everything that
- * fits (clean breakpoint) plus the remainder for the next segment card.
- * `head` re-renders within `CARD_TARGET_BYTES`; the body is never dropped.
- */
-export function segmentCardContent(state: CardState, options: CardOptions = {}): BodySplit {
-  return splitBodyForCard(state.body, largestBodyPrefix(state, options))
+  return cut(limit)
 }
 
 /**
@@ -525,39 +579,4 @@ export function initialStreamingCard(sessionId: string): object {
     stats: { sessionId, inputTokens: 0, outputTokens: 0 },
   }
   return buildCard(state)
-}
-
-/**
- * One-time onboarding card: what the bot does, how workspaces are scoped, and
- * the command cheat sheet. Sent on the first private message of a chat.
- */
-export function buildOnboardingCard(): object {
-  return {
-    schema: '2.0',
-    config: { width_mode: 'fill' },
-    body: {
-      elements: [
-        { tag: 'markdown', content: '**👋 欢迎使用飞书 DSH**' },
-        {
-          tag: 'markdown',
-          content: '直接发消息即可开始一个会话，我会在话题里流式回复；话题内继续发消息无需再 @ 我。',
-        },
-        {
-          tag: 'markdown',
-          content: '**工作区**：私聊一人一个；群里每位成员各自一个，互不影响。',
-        },
-        {
-          tag: 'markdown',
-          content: '**常用命令**：`/help` 命令列表 · `/status` 会话状态 · `/workspace` 工作目录\n'
-            + '`/effort` 推理强度 · `/model` 模型 · `/permissions` 权限预设\n'
-            + '`/new` 新建会话 · `/stop` 中断当前回合 · `/history` 历史 · `/export` 导出日志',
-        },
-        {
-          tag: 'markdown',
-          content: '需要授权或补充信息时，我会发一张卡片，点按钮或直接回复即可。',
-          text_size: 'notation',
-        },
-      ],
-    },
-  }
 }

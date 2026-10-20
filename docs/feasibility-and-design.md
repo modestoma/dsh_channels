@@ -20,7 +20,7 @@
 | 11 | 流式卡片（card schema 2.0），500ms 刷新 | ✅ | `msg_type: "interactive"` 卡片 2.0 JSON；`im.v1.message.patch` 整体替换卡片。单条消息更新限频 **5 QPS**（官方文档），2 QPS（500ms）安全 |
 | 12 | 折叠面板：带边框、默认折叠、成功三态与失败终态、右侧箭头随折叠翻转 | ✅ | 卡片 2.0 原生组件 `collapsible_panel`：`border`、`expanded: false`、`header.title`、`icon` + `icon_expanded_angle: 180`（展开时箭头旋转向上） |
 | 13 | 正文富文本 | ✅ | 卡片 2.0 `markdown` 组件（lark markdown 子集） |
-| 14 | session 信息两行小字 | ✅ | `note` 组件 + `img` 图标；数据来自 DSH：session id、usage（input/output/cacheRead/cacheWrite）、`ctx.tokenMeter` 上下文压力、模型/推理强度 |
+| 14 | 结算页脚（分割线 + 两行小字 + icon，主卡完成后一次） | ✅ | `note`（markdown + `text_size: "notation"`）两行页脚：第一行 🧠 模型/推理强度、🔑 session id、⏱ 本轮累计推理时长；第二行 📊 上下文压力（含窗口占比）、📩📨 session 累计 input/output token、⚡ 缓存命中；只在回合结束后的主卡渲染一次，首帧/流式中/续卡都没有 |
 | 15 | 流式结束：移除 Typing；成功改为 DONE，失败改为 No | ✅ | 读取 Harness `turn/end.reason`；`kind: error` 渲染结构化错误并 create `emoji_type: "No"`，其余终态 create `emoji_type: "DONE"` |
 
 **结论：第一版可以实现，全部使用飞书官方 SDK，无需任何非官方接口或 hack。**
@@ -105,11 +105,11 @@
 **流式渲染：**
 
 - 订阅 `session/event`，按 `(sessionId, turn)` 聚合：`assistant/chunk` 里 `text-delta` → 正文，`reasoning-delta` → 折叠面板内容。
-- **活动状态两行**（互相独立、互不顶替）：**状态行**折叠 `tool-workflow/run-start / agent-start / agent-end / run-end`（workflow 进度：完成数/总数、阶段、活动成员、结束原因），run 结束转为 `结束（完成）` 并**保留到最终卡片**（后续工具调用/正文不顶掉）；子代理完成后汇总为 `子代理完成：a、b` 同样留在最终卡片；**工具行**显示父会话当前 `tool/call`（subagent 取 description、workflow 取 meta.name），`tool/result` 即清、最终卡片收起。两行可同屏（如 `🧵 工作流 xxx 结束（完成）` + `🔧 调用工具：bash`）；无正文输出的等待期以 `statusRefreshMs`（默认 5s）慢心跳刷新“已运行 Ns”计时——进入 subagent / workflow 时卡片不再静默等待。
+- **活动状态两行**（**只在当前正在流式输出的那张卡上渲染**——已冻结的续卡/主卡不再重复；互相独立、互不顶替）：**状态行**折叠 `tool-workflow/run-start / agent-start / agent-end / run-end`（workflow 进度：完成数/总数、阶段、活动成员、结束原因），run 结束转为 `结束（完成）` 并**保留到最终卡片**（后续工具调用/正文不顶掉）；子代理完成后汇总为 `子代理完成：a、b` 同样留在最终卡片；**工具行**显示父会话当前 `tool/call`（subagent 取 description、workflow 取 meta.name），`tool/result` 即清、回合结束后收起（完成态只保留结算状态行：工作流结论 / 子代理完成摘要）。两行可同屏（如 `🧵 工作流 xxx 结束（完成）` + `🔧 调用工具：bash`）；无正文输出的等待期以 `statusRefreshMs`（默认 5s）慢心跳刷新“已运行 Ns”计时——进入 subagent / workflow 时卡片不再静默等待。
 - **子代理进度（跨会话映射）**：子代理是独立 session（header `parentSession` 指向主会话、`origin: 'subagent'`），其 `subagent/descriptor`（label）、`tool/call`（当前工具）、`turn/end`（结束移除）经全局 `session/event` 总线折叠进主卡片的同一状态行；workflow 成员经 `tool-workflow/agent-start` 的 `childId` 登记在 run 折叠里、跳过通用子代理折叠以免重复。**只显示状态不显示输出**：子代理正文是父模型的中间产物（工具契约“You receive its result, not its intermediate steps”），绝不进卡片正文。
 - 500ms 节流器（仅内容变化时 patch），拼接卡片 2.0 JSON 全量 `im.v1.message.patch`。
-- 折叠面板成功三态：首个 reasoning 增量前“推理中”；推理结束、正文开始后“回复中”；成功 `turn/end` 后“回复结束”。失败 `turn/end` 则进入“回复失败”。
-- 终态：`turn/end.reason.kind === "error"` 时卡片进入「回复失败」并展示 `error.message` / `error.code`，再执行 `reaction.delete(Typing)` → `reaction.create("No")`；其他终态进入「回复结束」并添加 `DONE`。每轮模型头与 usage 单独折叠，失败发生在 `request/header` 前时不显示上一轮的模型、推理强度或缓存命中。
+- 折叠面板成功三态：首个 reasoning 增量前“推理中”（此时面板兼作阶段指示灯与占位）；推理结束、正文开始后“回复中”；成功 `turn/end` 后“回复结束”。失败 `turn/end` 则进入“回复失败”。`thinking` 阶段面板始终渲染；进入 `replying` / `done` / `error` 后仅当存在推理内容才渲染——无推理的回合结算后不出现空面板。
+- 终态：`turn/end.reason.kind === "error"` 时错误只写入正文一次（`❌ **本轮运行失败**` + `error.message`，有 `error.code` 时追加 `错误码：<code>`），不再重复 🔴 状态行，再执行 `reaction.delete(Typing)` → `reaction.create("No")`；其他终态进入「回复结束」并添加 `DONE`。每轮模型头与 usage 单独折叠，失败发生在 `request/header` 前时页脚中模型/缓存命中显示 `—`、推理强度省略，不沿用上一轮；推理时长由插件按「每个 step 首个推理增量 → 该 step 输出结束（首个正文增量或 step end）」的墙钟时间跨 step 累加，工具执行时间不计入。
 
 ### 3.3 卡片 JSON（卡片 JSON 2.0 结构）
 
@@ -117,44 +117,71 @@
 > - `schema: "2.0"` 与顶层 `elements` 混用会被拒（`230099 / 200621: unknown property, property: elements`）——2.0 的组件必须在 `body` 里；
 > - 折叠面板 header 的 `icon` 只支持 `standard_icon`（图标库 token）或 `custom_icon`，`tag: "img"` 非法（面板会被客户端丢弃）；此处用内置 `down-small-ccm_outlined` 下箭头，无需上传图片。
 
+主卡（结算后）的元素顺序为 **推理折叠面板 → 可选状态行 → 可选工具行 → 正文 → 分割线 → 两行结算页脚**；正文内部（正文上下）不再使用 `hr` 分割线，正文与页脚之间有一条用于分层的 `hr`。页脚只在主卡、且只在回合结束后渲染一次：
+
 ```jsonc
 {
   "schema": "2.0",
   "config": { "width_mode": "fill" },
   "body": {
     "elements": [
-      { // 第一段：推理折叠面板
+      { // ① 推理折叠面板：thinking 阶段始终渲染（兼阶段指示灯/占位）；replying/done/error 仅在存在推理内容时渲染
         "tag": "collapsible_panel",
         "expanded": false,
         "border": { "color": "grey", "corner_radius": "8px" },
         "header": {
-          "title": { "tag": "plain_text", "content": "推理中" }, // 推理中|回复中|回复结束
+          "title": { "tag": "plain_text", "content": "回复结束" }, // 推理中|回复中|回复结束|回复失败
           "icon": { "tag": "standard_icon", "token": "down-small-ccm_outlined" }, // 折叠向下
           "icon_position": "right",
           "icon_expanded_angle": 180 // 展开时旋转 180° → 箭头向上
         },
         "elements": [ { "tag": "markdown", "content": "<推理内容>" } ]
       },
-      { "tag": "hr" },
-      { // 第二段：回复正文（富文本 markdown，2.0 全语法）
-        "tag": "markdown", "content": "<正文>"
-      },
-      { "tag": "hr" },
-      { // 第三段：session 信息，两行小字（2.0 无 note 组件 → markdown + notation 字号）
+      { // ② 可选活动行（小字）：结算状态行保留到最终卡片；工具行只在流式中出现，结算后收起
         "tag": "markdown",
         "text_size": "notation",
-        "content": "🔑 om_session_xxxx · ⬆ input token 12,345 · ⬇ output token 678"
+        "content": "🧵 工作流 audit 结束（完成） · 🤖 子代理完成：检索实现方案"
       },
-      { "tag": "markdown", "text_size": "notation",
-        "content": "🧠 模型 deepseek-v4-pro(max) · ⚡ 缓存命中 87.3% · 📊 上下文 24.1k/128k" }
+      { // ③ 正文（富文本 markdown，2.0 全语法）
+        "tag": "markdown", "content": "<正文>"
+      },
+      { "tag": "hr" }, // ④ 正文与元数据之间的分割线（仅结算后的主卡出现）
+      { // ⑤ 结算页脚第一行（小字）：模型 · 会话 · 推理时长
+        "tag": "markdown",
+        "text_size": "notation",
+        "content": "🧠 模型 deepseek-v4-pro(max) · 🔑 会话 sess-42 · ⏱ 推理 12.3s"
+      },
+      { // ⑥ 结算页脚第二行（小字）：上下文（含占比）· 输入/输出 token · 缓存命中
+        "tag": "markdown",
+        "text_size": "notation",
+        "content": "📊 上下文 24,100/128,000 (19%) · 📩 输入 12,345 · 📨 输出 678 · ⚡ 缓存命中 87.3%"
+      }
     ]
   }
 }
 ```
 
-- 第一行：`session id · input token · output token`（session 累计；可配置为按本轮回复合计）。
-- 第二行：`模型 model(effort) · 缓存命中 cacheRead/(cacheRead+input) · 上下文 pressureTokens/contextWindow`。
-- 单卡片 JSON 目标 ≤ 28 KB（飞书上限 30 KB，留 2 KB 冗余给切分后 token 数字增长）；正文超长时**自动分段投放**——在段落/标题/代码块边界切分，**每张卡最多 5 个表格**（飞书硬限制 230099/11310，表格绝不从中间切断），续片以「回复分段 n」卡片跟进同一话题，全文无丢失；续卡被拒收时自动降级为纯文本消息；推理不跨卡，面板有独立的 5 KB 上限（`REASONING_MAX_BYTES`，含截断标记，超出保留头部 + 截断提示）且面板内表格省略；分段时预留 `CARD_PANEL_RESERVE_BYTES`（5.5 KB）给面板，正文与面板合计不超单卡目标。
+续卡（正文超出单卡预算时自动投放）：`📄 回复分段 n` → 可选活动行（仅当该卡是当前活动卡）→ 正文，无面板、无页脚、无分割线：
+
+```jsonc
+{
+  "schema": "2.0",
+  "config": { "width_mode": "fill" },
+  "body": {
+    "elements": [
+      { "tag": "markdown", "text_size": "notation", "content": "📄 回复分段 2" },
+      // 可选活动行（小字）：仅当该卡正在流式输出时出现，冻结后不再重复
+      { "tag": "markdown", "content": "<续卡正文>" }
+    ]
+  }
+}
+```
+
+- 主卡构成：推理折叠面板（`thinking` 阶段始终渲染；`replying` / `done` / `error` 仅当存在推理内容时渲染）→ 可选状态行（小字）→ 可选工具行（小字）→ 正文 markdown → 分割线 → 结算页脚（两行小字）。
+- 活动两行互相独立、互不顶替，且只在当前正在流式输出的那张卡上渲染；冻结的续卡/主卡不再重复当前活动行。完成态只保留结算状态行（工作流结论 / 子代理完成摘要），工具行收起。
+- 结算页脚内容分两行：第一行 `🧠 模型 {model}({effort}) · 🔑 会话 {sessionId} · ⏱ 推理 {时长}`；第二行 `📊 上下文 {tokens}/{window} ({占比}) · 📩 输入 {n} · 📨 输出 {n} · ⚡ 缓存命中 {pct}`。推理时长为本轮所有推理阶段的累计墙钟时间（每个 step 从首个推理增量到该 step 输出结束——首个正文增量或 step 结束；工具执行时间不计入；跨 step 累加；回合在推理中结束时计到 turn 结束；无推理为 `—`）；占比 <10% 保留一位小数、≥10% 取整，无窗口时只显示 tokens。输入/输出为 session 累计口径；模型、推理强度、缓存命中按当前轮次（本轮在请求头产生前失败时模型/缓存命中显示 `—`、推理强度省略，不沿用上一轮）；首帧与流式中不出现 0/— 空统计。
+- 失败：错误只在正文出现一次（`❌ **本轮运行失败**` + 错误消息，有错误码时追加 `错误码：<code>`），不再有重复的状态行；无推理内容时也没有「回复失败」面板。
+- 单卡片 JSON 目标 ≤ 28 KB（`CARD_TARGET_BYTES`），飞书硬上限 30 KB（`CARD_MAX_BYTES`，仅作绝对兜底）；正文超长时**自动分段投放**——按整卡真实渲染测量（主卡探测面板最大窗口 + 完成态页脚，续卡无面板/页脚可用满 28 KB，约 27.8 K ASCII 字符、100 KB ASCII 正文约 4 张卡），断点统一避开代码围栏与表格（单个代码块/表格小于单卡预算时整体换卡，超过单卡预算时只能硬切、内容不丢），**每张卡最多 5 个表格**（飞书硬限制 230099/11310，单个表格小于单卡预算时不会被从中间切断），续片以「📄 回复分段 n」卡片跟进同一话题，全文无丢失；续卡被拒收时自动降级为纯文本消息；推理不跨卡，面板有独立的 5 KB 上限（`REASONING_MAX_BYTES`，含截断标记，超出保留头部 + 截断提示）且面板内表格省略。
 
 ## 4. DSH 侧集成点（全部为公开扩展点）
 
@@ -177,7 +204,7 @@
 |---|------|------|------|
 | R1 | 私聊 `reply_in_thread` 是否生效未经文档明示 | 中 | 真机验证；失败自动降级：私聊整体视为“话题”，续聊继续同一 session（行为退化为常规 DM 机器人），不阻塞主流程 |
 | R2 | patch 全量替换卡片：用户手动展开折叠面板后，下一次 patch（500ms 内）会把它重新折叠 | 低（体验） | v1 接受：流式期间保持默认折叠；流式结束后不再 patch，用户可自由展开。备选：CardKit 2.1 局部更新（需评估申请门槛），列入 v2 |
-| R3 | 卡片 30 KB 上限 / 单卡表格数量上限（230099/11310） | 低 | 单卡预算 28 KB（2 KB 冗余）；正文超长按干净断点分段投放（每卡 ≤ 5 表，表格不断裂，全文保留），分段预算预留面板 5.5 KB；续卡被拒降级纯文本；推理面板独立 5 KB 上限，与正文长度无关 |
+| R3 | 卡片 30 KB 上限 / 单卡表格数量上限（230099/11310） | 低 | 单卡预算 28 KB（`CARD_TARGET_BYTES`，2 KB 冗余）；正文超长按干净断点分段投放（每卡 ≤ 5 表；单个表格/代码块小于单卡预算时整体换卡不被切断，超过单卡预算时只能硬切但内容不丢）；分段按整卡真实渲染测量——主卡探测面板最大窗口 + 完成态页脚，续卡无面板/页脚预留、可用满 28 KB；续卡被拒降级纯文本；推理面板独立 5 KB 上限，与正文长度无关 |
 | R4 | 消息/表情/更新的 5 QPS 限频 | 低 | patch 2 QPS 天然安全；多个并发 session 时加全局节流与 429 退避重试（错误码 230020） |
 | R5 | 机器人收不到自己发的消息（需过滤） | 低 | 事件 `sender.sender_type` / open_id 过滤 |
 | R6 | 用户撤回触发消息 | 低 | reaction 调用失败静默容忍（错误码 231002 等），不阻断流程 |
@@ -190,7 +217,7 @@
 | M0 脚手架 | pnpm workspace、`src/index.ts` 插件骨架（apply(ctx) + Config schema）、类型声明合并 | 可加载的空插件 |
 | M1 飞书接入 | WSClient 长连接、事件订阅、文本/post 解析、@ 判定、凭据配置（`ctx.credentials` 凭据库引用，不落明文） | 能收消息并回文本 |
 | M2 话题与路由 | Typing/DONE reaction、reply_in_thread 建话题、storageDomain 路由表、懒恢复、工作区目录创建 | 私聊/群聊/话题群三通道贯通 |
-| M3 流式卡片 | 卡片 2.0 渲染器、session/event 订阅、500ms 节流 patch、折叠面板三态、session 信息两行 | 完整流式体验 |
+| M3 流式卡片 | 卡片 2.0 渲染器、session/event 订阅、500ms 节流 patch、折叠面板三态、两行结算页脚（完成后主卡一次） | 完整流式体验 |
 | M4 联调加固 | 真机自建应用全流程验证（含 R1 私聊话题）、限频/退避/异常兜底、README + 配置文档 | 可交付 v1 |
 
 ## 7. 仓库结构（计划）

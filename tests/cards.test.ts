@@ -5,8 +5,8 @@
 import { describe, expect, it } from 'vitest'
 import {
   CARD_MAX_BYTES,
-  CARD_PANEL_RESERVE_BYTES,
   CARD_TARGET_BYTES,
+  INTERRUPTION_NOTICE,
   PANEL_CHEVRON_TOKEN,
   PANEL_TITLES,
   REASONING_MAX_BYTES,
@@ -14,6 +14,8 @@ import {
   buildApprovalCard,
   buildApprovalSettledCard,
   buildCard,
+  buildInterruptionCard,
+  buildOnboardingCard,
   cardJsonBytes,
   segmentCardContent,
   splitBodyForCard,
@@ -22,7 +24,7 @@ import {
 } from '../src/cards.ts'
 import type { ApprovalQuestion, CardState } from '../src/cards.ts'
 
-/** JSON-escaped UTF-8 size of a string; the metric `clipText` budgets with. */
+/** JSON-escaped UTF-8 size of a string; the metric the panel budget uses. */
 function escapedJsonBytes(text: string): number {
   return new TextEncoder().encode(JSON.stringify(text)).length
 }
@@ -48,19 +50,29 @@ function elements(state: Partial<CardState> = {}, options?: Parameters<typeof bu
   return card.body.elements
 }
 
+function tags(list: Array<Record<string, any>>): string[] {
+  return list.map(element => element.tag)
+}
+
+/** Full stats for footer assertions. */
+const fullStats = {
+  sessionId: 'sess-42',
+  inputTokens: 12345,
+  outputTokens: 678,
+  cacheHitPct: 0.873,
+  contextTokens: 24100,
+  contextWindow: 128000,
+  model: 'deepseek-v4-pro',
+  effort: 'max',
+}
+
 describe('buildCard', () => {
   it('emits the 2.0 structure: schema + config.width_mode + body.elements', () => {
     const card = buildCard(baseState()) as unknown as CardShape
     expect(card.schema).toBe('2.0')
     expect(card.config.width_mode).toBe('fill')
-    expect(card.body.elements.map(element => element.tag)).toEqual([
-      'collapsible_panel',
-      'hr',
-      'markdown',
-      'hr',
-      'markdown',
-      'markdown',
-    ])
+    // A live first frame: the reasoning panel (phase indicator) + body placeholder.
+    expect(tags(card.body.elements)).toEqual(['collapsible_panel', 'markdown'])
   })
 
   it('renders the fold panel: default collapsed, bordered, right-aligned built-in chevron', () => {
@@ -78,7 +90,7 @@ describe('buildCard', () => {
 
   it('switches the panel title by phase', () => {
     for (const phase of ['thinking', 'replying', 'done', 'error'] as const) {
-      const panel = elements({ phase })[0]
+      const panel = elements({ phase, reasoning: '想过' })[0]
       expect(panel?.header.title.content).toBe(PANEL_TITLES[phase])
     }
   })
@@ -86,39 +98,83 @@ describe('buildCard', () => {
   it('uses placeholders for empty reasoning and body', () => {
     const list = elements({ phase: 'thinking' })
     expect(list[0]?.elements[0]?.content).toContain('等待模型输出')
-    expect(list[2]?.content).toContain('正在生成')
+    expect(list[1]?.content).toContain('正在生成')
+    expect(elements({ phase: 'done' })[0]?.content).toContain('本次无正文输出')
   })
 
-  it('renders the two info lines with session-cumulative figures in notation size', () => {
-    const list = elements({
-      stats: {
-        sessionId: 'sess-42',
-        inputTokens: 12345,
-        outputTokens: 678,
-        cacheHitPct: 0.873,
-        contextTokens: 24100,
-        contextWindow: 128000,
-        model: 'deepseek-v4-pro',
-        effort: 'max',
-      },
-    })
-    const line1 = list[4]?.content ?? ''
-    const line2 = list[5]?.content ?? ''
+  it('omits the panel once the turn settles without reasoning content', () => {
+    // A settled non-reasoning turn: no empty bordered box at the top — just the
+    // body, the divider and the two footer lines.
+    expect(tags(elements({ phase: 'done', body: '答案' }))).toEqual(['markdown', 'hr', 'markdown', 'markdown'])
+    expect(tags(elements({ phase: 'error', body: '失败', reasoning: '   ' })))
+      .toEqual(['markdown', 'hr', 'markdown', 'markdown'])
+    // Reasoning content keeps it.
+    expect(tags(elements({ phase: 'done', reasoning: '想过', body: '答案' }))[0]).toBe('collapsible_panel')
+    // While thinking the panel is the phase indicator, even with no reasoning yet.
+    expect(tags(elements({ phase: 'thinking' }))[0]).toBe('collapsible_panel')
+  })
+
+  it('renders the settled footer under a divider: model/session/reasoning + usage', () => {
+    const list = elements({ phase: 'done', reasoning: '想过', body: '答案', stats: fullStats })
+    // panel → body → hr → model line → usage line.
+    expect(tags(list)).toEqual(['collapsible_panel', 'markdown', 'hr', 'markdown', 'markdown'])
+
+    const modelLine = list[3]?.content ?? ''
+    const usageLine = list[4]?.content ?? ''
+    expect(list[3]?.text_size).toBe('notation')
     expect(list[4]?.text_size).toBe('notation')
-    expect(list[5]?.text_size).toBe('notation')
-    expect(line1).toContain('🔑 sess-42')
-    expect(line1).toContain('input token 12,345')
-    expect(line1).toContain('output token 678')
-    expect(line2).toContain('模型 deepseek-v4-pro(max)')
-    expect(line2).toContain('缓存命中 87.3%')
-    expect(line2).toContain('上下文 24,100 / 128,000')
+    expect(modelLine).toContain('🧠 模型 deepseek-v4-pro(max)')
+    expect(modelLine).toContain('🔑 会话 sess-42')
+    expect(modelLine).toContain('⏱ 推理 —')
+    expect(usageLine).toContain('📊 上下文 24,100/128,000 (19%)')
+    expect(usageLine).toContain('📩 输入 12,345')
+    expect(usageLine).toContain('📨 输出 678')
+    expect(usageLine).toContain('⚡ 缓存命中 87.3%')
+
+    // Live cards never show the not-yet-meaningful counters.
+    for (const phase of ['thinking', 'replying'] as const) {
+      expect(elements({ phase, body: '答案' }).some(element => element.text_size === 'notation')).toBe(false)
+    }
+    // Continuation cards never repeat the footer (it already lives on the main card).
+    expect(list).toHaveLength(5)
+    expect(elements({ phase: 'done', body: '答案' }, { segment: 2 })).toHaveLength(2)
+    expect(tags(elements({ phase: 'done', body: '答案' }, { segment: 2 }))).toEqual(['markdown', 'markdown'])
   })
 
-  it('renders placeholders for missing cache/context figures', () => {
-    const list = elements()
-    const line2 = list[5]?.content ?? ''
-    expect(line2).toContain('缓存命中 —')
-    expect(line2).toContain('上下文 —')
+  it('formats the reasoning time as seconds or minutes', () => {
+    const reasoningLine = (reasoningMs?: number): string =>
+      elements({ phase: 'done', reasoning: '想过', body: '答案', stats: { ...fullStats, reasoningMs } })[3]?.content ?? ''
+    expect(reasoningLine(0)).toContain('推理 0.0s')
+    expect(reasoningLine(1_500)).toContain('推理 1.5s')
+    expect(reasoningLine(3_200)).toContain('推理 3.2s')
+    expect(reasoningLine(59_960)).toContain('推理 60.0s')
+    expect(reasoningLine(60_000)).toContain('推理 1分0s')
+    expect(reasoningLine(65_000)).toContain('推理 1分5s')
+    expect(reasoningLine()).toContain('推理 —')
+  })
+
+  it('renders placeholders for missing cache/context/model figures', () => {
+    const list = elements({ phase: 'done', body: '答案' })
+    const modelLine = list[2]?.content ?? ''
+    const usageLine = list[3]?.content ?? ''
+    expect(modelLine).toContain('🧠 模型 —')
+    expect(modelLine).toContain('⏱ 推理 —')
+    expect(usageLine).toContain('📊 上下文 —')
+    expect(usageLine).toContain('⚡ 缓存命中 —')
+  })
+
+  it('renders the context share with a sane precision', () => {
+    const usage = (stats: Partial<typeof fullStats>): string =>
+      elements({ phase: 'done', body: '答案', stats: { ...fullStats, ...stats } })[3]?.content ?? ''
+    expect(usage({ contextTokens: 3_618, contextWindow: 1_000_000 })).toContain('(0.4%)')
+    expect(usage({ contextTokens: 5_000, contextWindow: 100_000 })).toContain('(5.0%)')
+    // Just below ten percent rounds to 10 and uses the integer form.
+    expect(usage({ contextTokens: 9_960, contextWindow: 100_000 })).toContain('(10%)')
+    expect(usage({ contextTokens: 9_960, contextWindow: 100_000 })).not.toContain('(10.0%)')
+    expect(usage({ contextTokens: 64_000, contextWindow: 100_000 })).toContain('(64%)')
+    expect(usage({ contextTokens: 64_000, contextWindow: undefined })).toContain('上下文 64,000 tokens')
+    // A non-positive window is treated as "no window".
+    expect(usage({ contextTokens: 64_000, contextWindow: 0 })).toContain('上下文 64,000 tokens')
   })
 
   it('renders the two activity lines (status + tool) between the panel and the body, omitted when empty', () => {
@@ -126,57 +182,25 @@ describe('buildCard', () => {
       status: '🧵 工作流 audit 结束（完成）',
       tool: '🔧 调用工具：bash · 已运行 12s',
     })
-    expect(list.map(element => element.tag)).toEqual([
-      'collapsible_panel',
-      'markdown',
-      'markdown',
-      'hr',
-      'markdown',
-      'hr',
-      'markdown',
-      'markdown',
-    ])
+    expect(tags(list)).toEqual(['collapsible_panel', 'markdown', 'markdown', 'markdown'])
     expect(list[1]?.content).toBe('🧵 工作流 audit 结束（完成）')
     expect(list[1]?.text_size).toBe('notation')
     expect(list[2]?.content).toBe('🔧 调用工具：bash · 已运行 12s')
     expect(list[2]?.text_size).toBe('notation')
     // Only the tool line.
-    expect(elements({ tool: '🔧 调用工具：bash' }).map(element => element.tag)).toEqual([
-      'collapsible_panel',
-      'markdown',
-      'hr',
-      'markdown',
-      'hr',
-      'markdown',
-      'markdown',
-    ])
-    // Empty / undefined activity keeps the original element layout.
-    expect(elements({ status: '', tool: '' }).map(element => element.tag)).toEqual([
-      'collapsible_panel',
-      'hr',
-      'markdown',
-      'hr',
-      'markdown',
-      'markdown',
-    ])
+    expect(tags(elements({ tool: '🔧 调用工具：bash' }))).toEqual(['collapsible_panel', 'markdown', 'markdown'])
+    // Empty / undefined activity keeps the compact layout.
+    expect(tags(elements({ status: '', tool: '' }))).toEqual(['collapsible_panel', 'markdown'])
   })
 
   it('renders both activity lines on continuation cards too (after the segment header)', () => {
     const list = elements(
       { status: '🧵 工作流 audit · 3/8 子代理完成 · 已运行 1分2s', tool: '🔧 调用工具：grep' },
-      { panel: false, segment: 2 },
+      { segment: 2 },
     )
-    expect(list.map(element => element.tag)).toEqual([
-      'markdown',
-      'markdown',
-      'markdown',
-      'hr',
-      'markdown',
-      'hr',
-      'markdown',
-      'markdown',
-    ])
-    expect(list[0]?.content).toContain('回复分段 2')
+    expect(tags(list)).toEqual(['markdown', 'markdown', 'markdown', 'markdown'])
+    expect(list[0]?.content).toBe('📄 回复分段 2')
+    expect(list[0]?.text_size).toBe('notation')
     expect(list[1]?.content).toContain('工作流 audit')
     expect(list[1]?.text_size).toBe('notation')
     expect(list[2]?.content).toContain('调用工具：grep')
@@ -185,12 +209,12 @@ describe('buildCard', () => {
 })
 
 describe('card budget (28 KB target, 30 KB cap)', () => {
-  it('keeps the card under the 28 KB target when reasoning overflows', () => {
+  it('keeps the card under the target when reasoning overflows', () => {
     const body = 'y'.repeat(5_000)
     const card = buildCard(baseState({ body, reasoning: 'r'.repeat(40_000) }))
     const list = (card as unknown as CardShape).body.elements
     const panelText = list[0]?.elements[0]?.content ?? ''
-    const bodyText = list[2]?.content ?? ''
+    const bodyText = list[1]?.content ?? ''
 
     // Body has priority: it survives intact, reasoning is clipped.
     expect(bodyText).toBe(body)
@@ -203,9 +227,23 @@ describe('card budget (28 KB target, 30 KB cap)', () => {
   it('clips the body too when it alone exceeds the budget (absolute last resort)', () => {
     const card = buildCard(baseState({ reasoning: 'r'.repeat(40_000), body: 'y'.repeat(40_000) }))
     const list = (card as unknown as CardShape).body.elements
-    const bodyText = list[2]?.content ?? ''
+    const bodyText = list[1]?.content ?? ''
     expect(bodyText).toContain('已截断')
     expect(bodyText.length).toBeLessThan(40_000)
+    expect(cardJsonBytes(card)).toBeLessThanOrEqual(CARD_MAX_BYTES)
+  })
+
+  it('caps pathological caller-supplied activity lines so the hard cap still holds', () => {
+    const card = buildCard(baseState({
+      status: 's'.repeat(40_000),
+      tool: 't'.repeat(40_000),
+      body: '答案',
+    }))
+    const list = (card as unknown as CardShape).body.elements
+    // panel, status, tool, body — the activity lines are defensively clipped.
+    expect(list[1]?.text_size).toBe('notation')
+    expect((list[1]?.content ?? '').length).toBeLessThan(1_000)
+    expect((list[2]?.content ?? '').length).toBeLessThan(1_000)
     expect(cardJsonBytes(card)).toBeLessThanOrEqual(CARD_MAX_BYTES)
   })
 
@@ -213,18 +251,16 @@ describe('card budget (28 KB target, 30 KB cap)', () => {
     const card = buildCard(baseState({ reasoning: '想想', body: '答' }))
     const list = (card as unknown as CardShape).body.elements
     expect(list[0]?.elements[0]?.content).toBe('想想')
-    expect(list[2]?.content).toBe('答')
+    expect(list[1]?.content).toBe('答')
   })
 
-  it('renders the continuation variant: segment header, no fold panel', () => {
-    const card = buildCard(baseState({ phase: 'replying', body: '分段正文' }), { panel: false, segment: 2 }) as unknown as CardShape
+  it('renders the continuation variant: segment header only, no panel and no footer', () => {
+    const card = buildCard(baseState({ phase: 'done', body: '分段正文' }), { segment: 2 }) as unknown as CardShape
     const list = card.body.elements
-    expect(list.map(element => element.tag)).toEqual([
-      'markdown', 'hr', 'markdown', 'hr', 'markdown', 'markdown',
-    ])
+    expect(tags(list)).toEqual(['markdown', 'markdown'])
     expect(list[0]?.text_size).toBe('notation')
-    expect(list[0]?.content).toBe('📄 回复分段 2 · 回复中')
-    expect(list[2]?.content).toBe('分段正文')
+    expect(list[0]?.content).toBe('📄 回复分段 2')
+    expect(list[1]?.content).toBe('分段正文')
   })
 })
 
@@ -232,16 +268,21 @@ describe('reasoning panel budget (5 KB cap)', () => {
   /** The rendered fold-panel markdown of a built card. */
   function panelMarkdown(card: object): string {
     const list = (card as unknown as CardShape).body.elements
-    return list[0]?.elements[0]?.content ?? ''
+    return list[0]?.elements?.[0]?.content ?? ''
   }
 
-  it('reserves the panel wrapper on top of the markdown cap', () => {
-    // REASONING_MAX_BYTES caps the panel markdown; the element wrapper (border,
-    // header, chevron, nested array) measures ~315 B more, so the segment
-    // budget holds back a larger reserve.
+  it('caps the panel window at 5 KB and keeps it independent of the body', () => {
     expect(REASONING_MAX_BYTES).toBe(5_000)
-    expect(CARD_PANEL_RESERVE_BYTES).toBeGreaterThan(REASONING_MAX_BYTES)
-    expect(CARD_PANEL_RESERVE_BYTES).toBeLessThan(CARD_TARGET_BYTES - 20_000)
+    const reasoning = 'r'.repeat(40_000)
+    const small = buildCard(baseState({ phase: 'replying', reasoning, body: '答' }))
+    const large = buildCard(baseState({ phase: 'replying', reasoning, body: 'b'.repeat(20_000) }))
+
+    // The panel neither yields space to the growing body nor borrows any.
+    expect(panelMarkdown(small)).toBe(panelMarkdown(large))
+    expect(escapedJsonBytes(panelMarkdown(large))).toBeLessThanOrEqual(REASONING_MAX_BYTES)
+    expect(panelMarkdown(large)).toContain('r'.repeat(4_000))
+    expect(cardJsonBytes(small)).toBeLessThanOrEqual(CARD_TARGET_BYTES)
+    expect(cardJsonBytes(large)).toBeLessThanOrEqual(CARD_TARGET_BYTES)
   })
 
   it('passes reasoning inside the cap through untouched', () => {
@@ -253,7 +294,7 @@ describe('reasoning panel budget (5 KB cap)', () => {
   })
 
   it('clips overflowing reasoning to the cap and marks it', () => {
-    // Visible windows at the cap: ASCII ≈4.96 K chars, CJK ≈1.65 K, 🤔 ≈2.5 K.
+    // Visible windows at the cap: ASCII ≈4.96 K chars, CJK ≈1.65 K, 🤔 ≈1.24 K.
     for (const [chunk, minChars] of [['r', 4_000], ['推', 1_500], ['🤔', 2_400]] as const) {
       const panel = panelMarkdown(buildCard(baseState({ phase: 'replying', reasoning: chunk.repeat(20_000) })))
       expect(panel.endsWith(TRUNCATION_SUFFIX)).toBe(true)
@@ -264,31 +305,28 @@ describe('reasoning panel budget (5 KB cap)', () => {
     }
   })
 
-  it('holds the same reasoning window for a tiny and a maxed-out body', () => {
-    const reasoning = 'r'.repeat(40_000)
-    const small = buildCard(baseState({ reasoning, body: '答' }))
-    const large = buildCard(baseState({ reasoning, body: 'b'.repeat(20_000) }))
-
-    // The panel neither yields space to the growing body nor borrows any: the
-    // old card-wide budget shrank the panel to the marker as the body grew.
-    expect(panelMarkdown(small)).toBe(panelMarkdown(large))
-    expect(panelMarkdown(large)).toContain('r'.repeat(4_000))
-    expect(cardJsonBytes(small)).toBeLessThanOrEqual(CARD_TARGET_BYTES)
-    expect(cardJsonBytes(large)).toBeLessThanOrEqual(CARD_MAX_BYTES)
-  })
-
-  it('keeps a frozen segment inside the target once the panel travels with it', () => {
+  it('keeps a frozen main-card segment inside the target when its panel fills up', () => {
     const split = segmentCardContent(baseState({ body: 'x'.repeat(200_000) }))
-    const frozen = buildCard(baseState({ body: split.head, reasoning: '推'.repeat(40_000) }))
+    const frozen = buildCard(baseState({ phase: 'error', body: split.head, reasoning: '推'.repeat(40_000) }))
 
     expect(split.tail).not.toBe('')
-    // The segment budget reserves the panel cap, so body + clipped panel fit.
+    // The main-card probe budgets the panel's full window and the settled
+    // footer, so a panel that keeps growing after the split still fits.
     expect(cardJsonBytes(frozen)).toBeLessThanOrEqual(CARD_TARGET_BYTES)
+  })
+
+  it('lets continuation cards use the whole budget (no panel reserve)', () => {
+    const split = segmentCardContent(baseState({ body: 'x'.repeat(200_000) }), { segment: 2 })
+    // The old card-wide reserve held continuation bodies back by ~5.5 KB.
+    expect(split.head.length).toBeGreaterThan(27_000)
+    expect(cardJsonBytes(buildCard(baseState({ body: split.head }), { segment: 2 })))
+      .toBeLessThanOrEqual(CARD_TARGET_BYTES)
   })
 
   it('still clips a pathological body to the hard cap with a full panel', () => {
     const card = buildCard(baseState({ body: 'y'.repeat(300_000), reasoning: 'r'.repeat(40_000) }))
-    const body = (card as unknown as CardShape).body.elements[2]?.content ?? ''
+    const list = (card as unknown as CardShape).body.elements
+    const body = list[1]?.content ?? ''
 
     expect(body).toContain('已截断')
     expect(escapedJsonBytes(panelMarkdown(card))).toBeLessThanOrEqual(REASONING_MAX_BYTES)
@@ -316,7 +354,7 @@ describe('segmentCardContent / splitBodyForCard', () => {
     expect(cardJsonBytes(buildCard(baseState({ body: split.head })))).toBeLessThanOrEqual(CARD_TARGET_BYTES)
   })
 
-  it('never splits inside a fenced code block', () => {
+  it('never splits inside a fenced code block that straddles the ceiling', () => {
     const overhead = cardJsonBytes(buildCard(baseState()))
     const fill = CARD_TARGET_BYTES - overhead - 100
     // The fence opens well before the budget ceiling and closes far after it,
@@ -328,6 +366,18 @@ describe('segmentCardContent / splitBodyForCard', () => {
     expect(split.head).toBe('intro')
     expect(split.tail.startsWith('```js')).toBe(true)
     expect(split.tail.endsWith('after')).toBe(true)
+  })
+
+  it('never splits inside a fenced code block that sits below the ceiling', () => {
+    // The fence closes before the ceiling, but the last paragraph break lies
+    // inside it: the breakpoint must fall back to the fence start.
+    const body = 'a'.repeat(16_000) + '\n\n```js\n' + 'c'.repeat(900) + '\n\n'
+      + 'd'.repeat(900) + '\n```\n' + 'z'.repeat(4_200)
+
+    const split = splitBodyForCard(body, 22_000)
+    expect((split.head.match(/^[ \t]*```/gm) ?? [])).toHaveLength(0)
+    expect(split.head).toBe('a'.repeat(16_000))
+    expect(split.tail.startsWith('```js')).toBe(true)
   })
 
   it('splits before a heading line when no paragraph break exists', () => {
@@ -418,6 +468,34 @@ describe('markdown table handling', () => {
       const pipeLines = (piece.match(/^\s*\|[^\n]*\|/gm) ?? []).length
       expect(pipeLines).toBeLessThanOrEqual(15)
     }
+  })
+})
+
+describe('buildInterruptionCard', () => {
+  it('renders the minimal interruption notice', () => {
+    const card = buildInterruptionCard() as unknown as CardShape
+    expect(card.schema).toBe('2.0')
+    expect(card.config.width_mode).toBe('fill')
+    expect(tags(card.body.elements)).toEqual(['markdown'])
+    expect(card.body.elements[0]?.content).toBe(INTERRUPTION_NOTICE)
+  })
+
+  it('keeps the segment header on repaired continuation cards', () => {
+    const card = buildInterruptionCard({ segment: 2 }) as unknown as CardShape
+    expect(tags(card.body.elements)).toEqual(['markdown', 'markdown'])
+    expect(card.body.elements[0]?.content).toBe('📄 回复分段 2 · 回复中断')
+    expect(card.body.elements[1]?.content).toBe(INTERRUPTION_NOTICE)
+  })
+})
+
+describe('buildOnboardingCard', () => {
+  it('renders the welcome text and command cheat sheet', () => {
+    const card = buildOnboardingCard() as unknown as CardShape
+    expect(card.schema).toBe('2.0')
+    const all = card.body.elements.map(element => element.content ?? '').join('\n')
+    expect(all).toContain('欢迎使用飞书 DSH')
+    expect(all).toContain('常用命令')
+    expect(all).toContain('/status')
   })
 })
 

@@ -84,7 +84,7 @@ SDK 支持 `groupAllowlist` / `dmMode: 'allowlist'` + `dmAllowlist`，但插件*
 独立审计还补充了三个同源缺口，都应在 P1/P2 顺手处理：
 
 - **route-free / 未知 slash 在 owner 门之前就有副作用**：`/help` 会建话题发卡、`/health` 会泄露路由数、live Agent 数、bot open_id 尾号；非法命令名也会回输入错误卡（`src/service.ts:868-882`、`:942-994`）。
-- **HITL 审批卡在群话题内对群成员可见**：审批卡携带工具名、reason、sessionId（`src/cards/approval.ts:62-90`），流式卡底部的 session 信息同样在群里可见（`src/cards/streaming.ts:205`）。新模型下群内只有管理员和已授权用户，属“已授权成员可见”的可接受范围，后续可改私聊投递。
+- **HITL 审批卡在群话题内对群成员可见**：审批卡携带工具名、reason、sessionId（`src/cards/approval.ts:62-90`），流式卡结算后的页脚第一行仍带完整 session id、在群里可见（`buildModelLine`，`src/cards/streaming.ts:291-295`）。新模型下群内只有管理员和已授权用户，属“已授权成员可见”的可接受范围，后续可改私聊投递。
 - **错误回显未脱敏**：入站异常会原样回 `dsh-channels 处理失败：<error>`（`src/service.ts:754-761`），可能带本地路径/Session 信息。
 
 ### 2.6 身份发现能力已经有了

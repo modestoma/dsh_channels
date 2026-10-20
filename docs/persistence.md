@@ -70,7 +70,7 @@
 2. **段卡更新**（`streamer.ts`）：续卡发送成功、message id 解析后经新钩子 `onSegmentDelivered(mainCardMessageId, index, messageId, mode)` 上报；服务端通过 `table.update()`（宿主原子 read-modify-write）合并进快照。
 3. **清除**（`streamer.ts` `finalize`）：turn 结束即经 `onTurnFinalized(sessionId, turn, mainCardMessageId)` 删除快照。会话创建失败路径（卡片已落「会话创建失败」终态）同样主动清除。
 4. **修复**（`service.ts` `start()`，长连接建立后后台执行 `repairInflight()`）：
-   - 对每条快照：所有 `mode: 'card'` 的卡 patch 为终态中断卡（主卡带折叠面板，续卡带分段头，正文为「⚠️ 服务已重启，本次回复中断，请重新发送消息。」）；移除 Typing、补 DONE（表情操作 best-effort）。
+   - 对每条快照：所有 `mode: 'card'` 的卡 patch 为终态中断卡（`buildInterruptionCard`：正文为「⚠️ 服务已重启，本次回复中断，请重新发送消息。」一条 markdown；主卡只有该条正文、**不带折叠面板**，续卡额外带 `📄 回复分段 n · 回复中断` 的 notation 分段头；不带 token 统计）；移除 Typing、补 DONE（表情操作 best-effort）。
    - 成功后删除快照；失败则 `attempts + 1`，达到 2 次后删除（一次性修复 + 有限重试，防止对无法接受 patch 的介质无限重试）。
 
 ## 已知取舍（v1）

@@ -1815,7 +1815,9 @@ describe('FeishuService', () => {
     }))
 
     const failedCard = JSON.stringify((h.channel.updated.at(-1) as { card: object }).card)
-    expect(failedCard).toContain('回复失败')
+    // The failure diagnostic appears once, in the body (the settled footer
+    // still renders); there is no duplicated "回复失败" panel title/status line.
+    expect(failedCard).toContain('本轮运行失败')
     expect(failedCard).toContain('UNSUPPORTED_REASONING_EFFORT')
     expect(failedCard).toContain('模型 —')
     expect(failedCard).not.toContain('(high)')
@@ -2744,6 +2746,10 @@ describe('/stop, structured questions, and host projections', () => {
         type: 'chunk', attemptId: 'a1', revision: 1, index: 0, time: 1,
         chunk: { type: 'text-delta', index: 0, text: 'hi' },
       },
+    })
+    // The figures live on the settled footer, so the turn must end first.
+    h.ctxState.sessionListeners[0]!(agent.session, {
+      type: 'turn/end', seq: 2, data: { turn: 1, reason: 'stop' },
     })
     await waitUntil(() => {
       const json = JSON.stringify(h.channel.updated.map(update => (update as { card: object }).card))

@@ -11,7 +11,7 @@
  * @module dsh-channels/session/repair
  */
 
-import { buildInterruptionCard } from '../cards/streaming.ts'
+import { buildInterruptionCard, segmentCardOptions } from '../cards/streaming.ts'
 import type { InflightSnapshot } from '../domain.ts'
 import type { FeishuChannel } from '../feishu-channel.ts'
 import type { FeishuDomainHandle } from '../domain.ts'
@@ -146,8 +146,7 @@ export class InflightRepair {
       if (card.mode !== 'card') continue
       // Full replacement: the interrupted card's streamed content lived only
       // in the previous process. Continuation cards keep their segment header.
-      const options = index === 0 ? {} : { panel: false, segment: index + 1 }
-      await channel.updateCard(card.messageId, buildInterruptionCard(options))
+      await channel.updateCard(card.messageId, buildInterruptionCard(segmentCardOptions(index)))
     }
     if (snapshot.reactionId !== undefined) {
       await channel.removeReaction(snapshot.triggerMessageId, snapshot.reactionId).catch(() => {})

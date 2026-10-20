@@ -57,6 +57,26 @@ export function textButton(options: TextButtonOptions): object {
   }
 }
 
+/**
+ * Collapsible fold panel: collapsed by default, grey rounded border, and a
+ * built-in right-aligned chevron that flips when expanded. Used for the
+ * streaming card's reasoning window and any future "secondary detail" area.
+ */
+export function foldPanel(title: string, content: string, iconToken: string): object {
+  return {
+    tag: 'collapsible_panel',
+    expanded: false,
+    border: { color: 'grey', corner_radius: '8px' },
+    header: {
+      title: { tag: 'plain_text', content: title },
+      icon: { tag: 'standard_icon', token: iconToken },
+      icon_position: 'right',
+      icon_expanded_angle: 180,
+    },
+    elements: [markdown(content)],
+  }
+}
+
 /** A row of equal-width columns, each holding one element. */
 export function columnSet(
   columns: object[],
