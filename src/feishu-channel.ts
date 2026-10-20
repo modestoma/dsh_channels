@@ -88,6 +88,19 @@ export interface FeishuChannel {
     fileKey: string,
     type: 'image' | 'file',
   ): Promise<ResourceChunkStream>
+  /** P0 probe surface: raw `im.v1.message.get` (quoted / merged-forward container). */
+  messageGet?(messageId: string): Promise<unknown>
+  /** P0 probe surface: raw `im.v1.message.list` (thread / chat history). */
+  messageList?(params: RawMessageListParams): Promise<unknown>
+}
+
+/** Query for the raw `im.v1.message.list` endpoint. */
+export interface RawMessageListParams {
+  container_id_type: 'chat' | 'thread'
+  container_id: string
+  page_size?: number
+  page_token?: string
+  sort_type?: 'ByCreateTimeAsc' | 'ByCreateTimeDesc'
 }
 
 /** Ordered byte chunks of one inbound resource. */
@@ -254,6 +267,20 @@ class LarkChannelAdapter implements FeishuChannel {
   async threadIdOfMessage(messageId: string): Promise<string | undefined> {
     const res = await this.channel.rawClient.im.v1.message.get({ path: { message_id: messageId } })
     return res?.data?.items?.[0]?.thread_id
+  }
+
+  async messageGet(messageId: string): Promise<unknown> {
+    const message = this.channel.rawClient.im.v1.message as unknown as {
+      get(input: { path: { message_id: string } }): Promise<unknown>
+    }
+    return await message.get({ path: { message_id: messageId } })
+  }
+
+  async messageList(params: RawMessageListParams): Promise<unknown> {
+    const message = this.channel.rawClient.im.v1.message as unknown as {
+      list(input: { params: RawMessageListParams }): Promise<unknown>
+    }
+    return await message.list({ params })
   }
 
   async downloadResource(

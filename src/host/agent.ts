@@ -58,10 +58,55 @@ export interface SystemPromptRuntime {
   section(section: PromptSection): () => void
 }
 
+/** One model-facing content block a channel tool may project (text/image/file). */
+export interface ToolContentBlock {
+  readonly type: string
+  readonly [key: string]: unknown
+}
+
+/** One tool execution's cooperative cancellation signal. */
+export interface ToolExecution {
+  readonly signal: AbortSignal
+}
+
+/** Canonical output contract of one channel tool registration. */
+export interface ToolOutputContract {
+  readonly schema: Record<string, unknown>
+  render(args: Record<string, unknown>, value: unknown): readonly ToolContentBlock[]
+  presentationMeta?(args: Record<string, unknown>, value: unknown): unknown
+}
+
+/**
+ * One model-facing tool registration. Kept structural (no runtime import of
+ * the host's `@deepseek-ai/dsh-tools` package) so the plugin keeps its
+ * zero-host-dependency stance.
+ */
+export interface ToolDefinition {
+  readonly name: string
+  readonly description: string
+  readonly parameters: Record<string, unknown>
+  readonly output: ToolOutputContract
+  readonly timeoutMs?: number
+  execute(
+    args: Record<string, unknown>,
+    exec: ToolExecution,
+  ): Promise<unknown> | unknown
+  presentCall?(args: Record<string, unknown>): unknown
+  presentResult?(args: Record<string, unknown>, value: unknown): unknown
+  readonly isConcurrencySafe?: () => boolean
+}
+
+/** The Agent-scoped slice of the host `tools` registry. */
+export interface ToolRuntime {
+  register(definition: ToolDefinition): unknown
+}
+
 export interface AgentContext {
   commands: CommandRuntime
   /** Present inside a setup scope that injected `systemPrompt`. */
   systemPrompt?: SystemPromptRuntime
+  /** Present inside a setup scope that injected `tools`. */
+  tools?: ToolRuntime
   /** Register an Agent-scoped model-call override. */
   on(
     event: 'agent/request',
