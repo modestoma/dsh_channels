@@ -40,3 +40,47 @@
 ## 验证与交付证据
 
 待执行。
+
+## 启动 Prompt（复制到新会话）
+
+```text
+你负责 attachment_pipeline_v2 / admission_manifest_flow 的实现。
+
+仓库：/Users/moka/dev/project/dsh_ext/dsh_channels，本地 main 分支。
+执行约束（decisions.md D9/D10）：不创建平台 Issue/Milestone；不拉分支/worktree；不用 PR；直接改本地 main 并本地提交；不推送、不合并、不发布；提交用 conventional commit。
+
+开始前阅读：
+1. .agents/issues/admission_manifest_flow.md（本任务正文与 AC）
+2. .agents/roadmaps/attachment_pipeline_v2/roadmap.md 与 plan.json
+3. .agents/roadmaps/attachment_pipeline_v2/decisions.md（D1–D10）
+4. .agents/notes/2026_10_20_attachment_pipeline.md
+5. .agents/issues/platform_spike.md 的 P0 证据（P0 收官 3f05d81；开始时以 git rev-parse HEAD 为准）
+6. 前置任务证据：attachment_fetch_tool、native_attachment_store、pending_attachment_registry 的“验证与交付证据”与对应提交
+7. 相关源码：src/routing/inbound.ts、src/feishu/agent-context.ts、src/feishu/inbound-attachments.ts、src/session/manager.ts、src/workspaces.ts 与 service/inbound 测试
+
+P0 已验证、必须沿用的前提：
+- 会话/卡片可以先建立，模型回合不必等待附件字节；
+- 通道模型 deepseek-flash 支持图片输入，图片预取为 ImageBlock 可行；
+- 纯附件消息不回复、不建会话、不下载；未 @ 群事件会投递，静默登记可覆盖群聊；
+- 文件由工具懒取；FileBlock + 文本路径双兜底；合并转发资源按容器 id 下载；
+- 工具输出 JSON 清洗、AbortError 可读（P0 教训）；被取消回合会在历史里留下失败工具结果。
+
+任务：把入站主链路改为“立即建会话 + 清单进 prompt + 图片预取 + 文件懒取”（细节以本 Issue AC 为准）：
+- 删除路由决策前同步下载附件的路径；触发消息先建会话/绑话题/首帧卡片/持久化路由/挂载工具，再拼 prompt；
+- 新增 src/feishu/manifest.ts：稳定 <feishu_context> 块，只列“未加载”的附件元数据（message_id / file_key / 类型 / 文件名），无内容时不产生 token；
+- 纯附件消息：过准入后只静默登记，不下载、不建会话、不回复、不加表情；
+- 图片预取：route 建立后、followup 前预取，超时/超限/失败降级为清单；prefetchImages 可关；
+- followup 使用多块内容（文本 + 图片块 + 清单文本块）；
+- 更新 agent-context.ts guidance：原生库、文件默认未加载、用工具取、只读副本修改前复制、不要主动枚举其他附件；
+- 保留 attachmentStore: 'archive' 旧行为降级；旧 _staging 只保留一次性迁入，新流程不再写 staging。
+
+预计写入范围（越界前先暂停询问）：src/routing/inbound.ts、src/feishu/manifest.ts（新增）、src/feishu/agent-context.ts、src/feishu/inbound-attachments.ts、src/workspaces.ts、src/config.ts、tests/service.test.ts、tests/inbound-attachments.test.ts。本任务不做引用摘录/话题历史工具（quote_history_tools 负责），不做面板与文档（panel_docs_release 负责）。
+
+完成标准：
+1. 逐条满足 Issue AC；pnpm typecheck、pnpm test、pnpm build 全绿。
+2. 把实际命令、结果、未验证项写回本 Issue 的“验证与交付证据”（至少覆盖三类会话的零等待/纯附件静默/图片预取/文件懒取/archive 降级）。
+3. 若当前会话是协调者：同步 runtime.json 对应任务 resume 并保持 roadmap validate 通过（按 D10）；否则只更新 Issue。
+4. 在 main 上本地提交（不推送）；最终回复：改动摘要、关键文件、测试结果、提交 SHA、风险/未验证项。
+5. 遇到范围/接口变化先暂停，在 decisions.md 追加决定并询问用户。
+```
+

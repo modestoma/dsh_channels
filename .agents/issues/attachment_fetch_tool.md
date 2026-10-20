@@ -40,3 +40,45 @@
 ## 验证与交付证据
 
 待执行。
+
+## 启动 Prompt（复制到新会话）
+
+```text
+你负责 attachment_pipeline_v2 / attachment_fetch_tool 的实现。
+
+仓库：/Users/moka/dev/project/dsh_ext/dsh_channels，本地 main 分支。
+执行约束（decisions.md D9/D10）：不创建平台 Issue/Milestone；不拉分支/worktree；不用 PR；直接改本地 main 并本地提交；不推送、不合并、不发布；提交用 conventional commit。
+
+开始前阅读：
+1. .agents/issues/attachment_fetch_tool.md（本任务正文与 AC）
+2. .agents/roadmaps/attachment_pipeline_v2/roadmap.md 与 plan.json
+3. .agents/roadmaps/attachment_pipeline_v2/decisions.md（D1–D10）
+4. .agents/notes/2026_10_20_attachment_pipeline.md
+5. .agents/issues/platform_spike.md 的 P0 证据（P0 收官 3f05d81；开始时以 git rev-parse HEAD 为准）
+6. 前置任务证据：native_attachment_store、pending_attachment_registry 的“验证与交付证据”与对应提交
+7. 相关源码：src/feishu-channel.ts（messageGet/messageList 已就绪）、src/host/agent.ts（tool 运行时类型）、src/session/manager.ts、src/routing/inbound.ts 的会话建立逻辑
+
+P0 已验证、必须沿用的前提与教训：
+- 工具注册路径：agent setup 后 agentCtx.inject(['tools']) 注册成功，模型可实际调用；
+- 工具结果可以同时携带 text 与 ImageBlock；FileBlock 内容块可下发，但保留文本路径兜底；
+- 合并转发资源必须用顶层容器 message_id 下载；子消息 id 会 400；
+- 工具输出必须做 JSON 清洗（不能含 undefined，否则 DSH 报 value is not lossless JSON）；
+- AbortError / 用户取消必须映射成可读错误（不能是 [object Object]）；
+- 大文件下载约 41–44s（980MB），需要 timeoutMs 与 exec.signal 取消。
+
+任务：实现 feishu_attachment_fetch 工具（细节以本 Issue AC 为准）：
+- 本地窄类型手写定义（不 import DSH 运行时包），zod 校验参数；presentCall/presentResult 便于卡片展示；
+- 每 route 维护“已知消息/资源”白名单（触发消息、引用、静默登记、历史工具结果），只允许白名单内 message_id/file_key；合并转发按容器 id 下载子资源；
+- 在 preset setup 后注册；tools/attachments 缺失时 no-op + 告警；borrow 的 live agent 做一次 best-effort 补挂；功能开关 feishuTools.attachmentFetch；
+- 限制：单次资源数、单次总字节、timeoutMs、取消后不留半文件；失败逐资源结构化返回。
+
+预计写入范围（越界前先暂停询问）：src/feishu/tools.ts（新增）、src/host/agent.ts（如需补类型）、src/session/manager.ts（挂载接入）、src/config.ts（开关）、tests/feishu-tools.test.ts。本任务不接 prompt 清单与准入流程（admission_manifest_flow 负责）。
+
+完成标准：
+1. 逐条满足 Issue AC；pnpm typecheck、pnpm test、pnpm build 全绿。
+2. 把实际命令、结果、未验证项写回本 Issue 的“验证与交付证据”。
+3. 若当前会话是协调者：同步 runtime.json 对应任务 resume 并保持 roadmap validate 通过（按 D10）；否则只更新 Issue。
+4. 在 main 上本地提交（不推送）；最终回复：改动摘要、关键文件、测试结果、提交 SHA、风险/未验证项。
+5. 遇到范围/接口变化先暂停，在 decisions.md 追加决定并询问用户。
+```
+

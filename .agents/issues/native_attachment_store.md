@@ -35,3 +35,43 @@
 ## 验证与交付证据
 
 待执行。
+
+## 启动 Prompt（复制到新会话）
+
+```text
+你负责 attachment_pipeline_v2 / native_attachment_store 的实现。
+
+仓库：/Users/moka/dev/project/dsh_ext/dsh_channels，本地 main 分支。
+执行约束（decisions.md D9/D10）：不创建平台 Issue/Milestone；不拉分支/worktree；不用 PR；直接改本地 main 并本地提交；不推送、不合并、不发布；提交用 conventional commit。
+
+开始前阅读：
+1. .agents/issues/native_attachment_store.md（本任务正文与 AC）
+2. .agents/roadmaps/attachment_pipeline_v2/roadmap.md 与 plan.json
+3. .agents/roadmaps/attachment_pipeline_v2/decisions.md（D1–D10）
+4. .agents/notes/2026_10_20_attachment_pipeline.md
+5. .agents/issues/platform_spike.md 的 P0 证据（P0 收官提交 3f05d81；开始时以 git rev-parse HEAD 为准）
+6. 相关源码：src/feishu/inbound-attachments.ts、src/feishu-channel.ts、src/host/、src/config.ts 与现有测试
+
+P0 已验证、必须沿用的前提：
+- channel 会话里 ctx.attachments 可用（saveImage / saveFileStream / fileHostPath / imageHostPath 均存在）；
+- 图片 saveImage 后可作为 ImageBlock 下发；通道模型 deepseek-flash 声明并实测支持图片输入；
+- 文件 saveFileStream 流式入库（980MB 文件峰值 RSS 约 451MB）；FileBlock 内容块可下发，句柄路径可由 bash 读取；
+- 不引入 DSH 包的运行时依赖，宿主桥接只用本地窄类型。
+
+任务：实现附件存储层（细节以本 Issue AC 为准）：
+- 新增 ctx.attachments 的最小窄类型与访问封装；服务缺失时返回明确的“未挂载”状态；
+- 图片：saveImage → ImageBlock 形状；解码/规范化失败返回结构化错误；
+- 文件：saveFileStream 流式写入，返回 FileAttachmentRef；同时提供“句柄文本 + 只读路径”格式化，作为 FileBlock 不可用时的兜底；
+- archive 降级：attachmentStore: 'native' | 'archive'（默认 native），archive 复用现有 AttachmentIntake 写话题 attachments/；
+- 本任务不接准入调用点、不实现工具、不改 prompt 组装；这些由后续任务负责。
+
+预计写入范围（越界前先暂停询问）：src/host/（窄类型）、src/feishu/native-attachments.ts（新增）、src/feishu/inbound-attachments.ts（仅复用/抽取下载流，不改现有语义）、src/config.ts、tests/native-attachments.test.ts。
+
+完成标准：
+1. 逐条满足 Issue AC；pnpm typecheck、pnpm test、pnpm build 全绿。
+2. 把实际命令、结果、未验证项写回本 Issue 的“验证与交付证据”。
+3. 若当前会话是协调者：同步 .agents/roadmaps/attachment_pipeline_v2/runtime.json 对应任务的 resume，并保持 roadmap validate 通过（无平台对象时按 D10 用 planned+resume）；否则只更新 Issue，交协调者收口。
+4. 在 main 上本地提交（不推送）；最终回复：改动摘要、关键文件、测试结果、提交 SHA、风险/未验证项。
+5. 遇到需求/接口变化先暂停，在 decisions.md 追加决定并询问用户，不自行扩大范围。
+```
+

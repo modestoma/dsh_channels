@@ -37,3 +37,41 @@
 ## 验证与交付证据
 
 待执行。
+
+## 启动 Prompt（复制到新会话）
+
+```text
+你负责 attachment_pipeline_v2 / panel_docs_release 的实现与整体验收准备。
+
+仓库：/Users/moka/dev/project/dsh_ext/dsh_channels，本地 main 分支。
+执行约束（decisions.md D9/D10）：不创建平台 Issue/Milestone；不拉分支/worktree；不用 PR；直接改本地 main 并本地提交；不推送、不合并、不发布；提交用 conventional commit。
+
+开始前阅读：
+1. .agents/issues/panel_docs_release.md（本任务正文与 AC）
+2. .agents/roadmaps/attachment_pipeline_v2/roadmap.md 与 plan.json、decisions.md（D1–D10）
+3. .agents/notes/2026_10_20_attachment_pipeline.md
+4. 所有前置 Issue 的“验证与交付证据”与对应提交（platform_spike / native_attachment_store / pending_attachment_registry / attachment_fetch_tool / admission_manifest_flow / quote_history_tools）
+5. 相关源码：src/config.ts、src/settings/contract.ts、src/settings/surface.ts、src/cleanup.ts、src/workspaces.ts、README.md、docs/feishu-onboarding.md
+
+前置状态与必须沿用的结论：
+- P0：ctx.attachments 可用；图片 ImageBlock 可下发；FileBlock + 文本路径双兜底；大文件流式 RSS 受控；message.get/list 与合并转发容器规则可用；未 @ 群事件可投递；重启回放通过。
+- 存储：图片与文件都进 DSH 原生附件库；DSH 原生库不自动清理，插件不再承担入站附件清理；工作区清理只保留给 Agent 产物与旧版目录。
+- 取消/中断错误必须可读（P0 的 [object Object] 教训）；工具输出必须 JSON 清洗。
+
+任务：收口配置面板、文档、清理语义与验收（细节以本 Issue AC 为准）：
+- 配置与面板：attachmentStore、prefetchImages、prefetchImageTimeoutMs、pendingAttachmentTtlMs/Limit、attachmentFetch*、feishuTools.attachmentFetch/topicMessages、historyBootstrapLimit；同步 config/contract/surface 与帮助文案；
+- 清理与保留：确认入站附件不再占用话题目录；清理面板文案改为“只清理工作区与 Agent 产物，不影响 Session 附件”；pending TTL 接入既有 GC；旧 _staging 一次性迁入的移除窗口在本任务定案；
+- 文档：README 行为/配置/权限章节；docs/feishu-onboarding.md 权限与验证步骤；新增 v2 管线设计文档（存储、清单、工具、降级、隐私边界）；
+- 回归与验收：补测试至全绿；执行 e2e 手测清单（私聊/对话群/话题群 × 文本/图片/文件/纯附件/引用/历史 × 大文件/失败/权限缺失）；把整体 AC 证据写入 .agents/roadmaps/attachment_pipeline_v2/acceptance.md；pnpm check 通过；
+- 发布边界：不发布应用版本、不推送/合并、不创建平台对象（除非用户另行授权）。
+
+预计写入范围（越界前先暂停询问）：src/settings/、src/config.ts、README.md、docs/、src/cleanup.ts、src/workspaces.ts、tests/（settings/config/cleanup 相关）、.agents/roadmaps/attachment_pipeline_v2/acceptance.md。
+
+完成标准：
+1. 逐条满足 Issue AC；pnpm check（typecheck + test + build + verify:host + verify:client）全绿。
+2. 把实际命令、结果、e2e 手测结论、未验证项写回本 Issue 证据与 acceptance.md；整体验收需用户确认后再进入 awaiting_acceptance。
+3. 若当前会话是协调者：同步 runtime.json 对应任务 resume 并保持 roadmap validate 通过（按 D10）；否则只更新 Issue 与 acceptance。
+4. 在 main 上本地提交（不推送）；最终回复：改动摘要、文档入口、验证结果、提交 SHA、风险/未验证项、用户验收事项。
+5. 不扩大功能范围；发现需求变化先暂停，在 decisions.md 追加决定并询问用户。
+```
+
