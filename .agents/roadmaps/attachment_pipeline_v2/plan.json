@@ -1,0 +1,60 @@
+{
+  "approval_ref": "本会话用户确认（2026-10-20）：采用“立即建会话 + 清单/摘录 + 图片预取 + 文件懒取”方案，并要求落盘 .agents/roadmaps/attachment_pipeline_v2；内容批准，不含执行、推送、合并或发布授权。",
+  "approved_revision": 1,
+  "base_branch": "main",
+  "id": "attachment_pipeline_v2",
+  "max_parallel": 1,
+  "revision": 1,
+  "schema_version": 2,
+  "tasks": [
+    {
+      "key": "platform_spike",
+      "document": ".agents/issues/platform_spike.md",
+      "revision": 1,
+      "depends_on": [],
+      "resources": ["scripts"]
+    },
+    {
+      "key": "native_attachment_store",
+      "document": ".agents/issues/native_attachment_store.md",
+      "revision": 1,
+      "depends_on": ["platform_spike"],
+      "resources": ["src/host", "src/feishu/native-attachments.ts", "src/config.ts", "tests/native-attachments.test.ts"]
+    },
+    {
+      "key": "pending_attachment_registry",
+      "document": ".agents/issues/pending_attachment_registry.md",
+      "revision": 1,
+      "depends_on": ["platform_spike"],
+      "resources": ["src/domain.ts", "src/feishu/pending-attachments.ts", "src/cleanup.ts", "src/config.ts", "tests/pending-attachments.test.ts"]
+    },
+    {
+      "key": "attachment_fetch_tool",
+      "document": ".agents/issues/attachment_fetch_tool.md",
+      "revision": 1,
+      "depends_on": ["native_attachment_store", "pending_attachment_registry"],
+      "resources": ["src/feishu/tools.ts", "src/host", "src/session/manager.ts", "tests/feishu-tools.test.ts"]
+    },
+    {
+      "key": "admission_manifest_flow",
+      "document": ".agents/issues/admission_manifest_flow.md",
+      "revision": 1,
+      "depends_on": ["attachment_fetch_tool"],
+      "resources": ["src/routing", "src/feishu/manifest.ts", "src/feishu/agent-context.ts", "src/feishu/inbound-attachments.ts", "src/workspaces.ts", "src/config.ts", "tests/service.test.ts", "tests/inbound-attachments.test.ts"]
+    },
+    {
+      "key": "quote_history_tools",
+      "document": ".agents/issues/quote_history_tools.md",
+      "revision": 1,
+      "depends_on": ["admission_manifest_flow"],
+      "resources": ["src/feishu/message-read.ts", "src/feishu/tools.ts", "src/routing", "docs/feishu-onboarding.md", "tests/message-read.test.ts"]
+    },
+    {
+      "key": "panel_docs_release",
+      "document": ".agents/issues/panel_docs_release.md",
+      "revision": 1,
+      "depends_on": ["quote_history_tools"],
+      "resources": ["src/settings", "src/config.ts", "README.md", "docs", "tests", "src/cleanup.ts", "src/workspaces.ts"]
+    }
+  ]
+}
