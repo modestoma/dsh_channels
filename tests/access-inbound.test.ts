@@ -186,7 +186,7 @@ describe('guarded 模式：准入零副作用', () => {
       messageId: 'om_group_admin', content: '@机器人 你好',
     }))
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
-    expect(followupsOf(h, 0)).toBe(1)
+    await waitUntil(() => expect(followupsOf(h, 0)).toBe(1))
     expect(h.service.accessSnapshot().groups).toEqual([])
     await h.service.shutdown()
   })
@@ -215,14 +215,14 @@ describe('guarded 模式：已授权群', () => {
       mentionedBot: true, messageId: 'om_admin_open', content: '管理员来了',
     }))
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
-    expect(followupsOf(h, 0)).toBe(1)
+    await waitUntil(() => expect(followupsOf(h, 0)).toBe(1))
 
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_group', senderId: 'ou_bob',
       mentionedBot: true, messageId: 'om_bob_open', content: '白名单用户来了',
     }))
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
-    expect(followupsOf(h, 1)).toBe(1)
+    await waitUntil(() => expect(followupsOf(h, 1)).toBe(1))
 
     const groupSendsBefore = sentTo(h.channel, 'oc_group').length
     await h.onMessage(makeMessage({
@@ -248,7 +248,7 @@ describe('guarded 模式：已授权群', () => {
       mentionedBot: true, messageId: 'om_admin_unauth', content: '先聊一下',
     }))
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
-    expect(followupsOf(h, 0)).toBe(1)
+    await waitUntil(() => expect(followupsOf(h, 0)).toBe(1))
 
     expect(await h.service.addAccessUser('ou_bob')).toMatchObject({ ok: true })
     // 群未授权：白名单用户仍不能对话。
@@ -272,7 +272,7 @@ describe('guarded 模式：已授权群', () => {
       mentionedBot: true, messageId: 'om_bob_after_auth', content: '@机器人 你好',
     }))
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
-    expect(followupsOf(h, 1)).toBe(1)
+    await waitUntil(() => expect(followupsOf(h, 1)).toBe(1))
     await h.service.shutdown()
   })
 
@@ -341,7 +341,7 @@ describe('guarded 模式：/auth 用户管理', () => {
       mentionedBot: true, messageId: 'om_after_restart', content: '重启后我还在吗',
     }))
     await waitUntil(() => expect(restarted.ctxState.agents.created).toHaveLength(1))
-    expect(followupsOf(restarted, 0)).toBe(1)
+    await waitUntil(() => expect(followupsOf(restarted, 0)).toBe(1))
     await restarted.service.shutdown()
   })
 
@@ -447,7 +447,7 @@ describe('guarded 模式：话题所有权', () => {
     await flush()
 
     expect(h.ctxState.agents.created).toHaveLength(1)
-    expect(followupsOf(h, 0)).toBe(1)
+    await waitUntil(() => expect(followupsOf(h, 0)).toBe(1))
     expect(h.ctxState.workspaces.workspaces.size).toBe(1)
     expect(existsSync(path.join(aliceRoute.workspacePath, ATTACHMENTS_DIR))).toBe(false)
     await h.service.shutdown()
@@ -484,7 +484,7 @@ describe('guarded 模式：话题所有权', () => {
     await flush()
     expect(next).not.toHaveBeenCalled()
     expect(h.channel.sent.some(entry => sentJson(entry).includes('已记录你的文字回答'))).toBe(false)
-    expect(followupsOf(h, 0)).toBe(1)
+    await waitUntil(() => expect(followupsOf(h, 0)).toBe(1))
 
     await h.service.shutdown()
     await expect(pending).rejects.toThrow('插件已关闭')
@@ -500,7 +500,7 @@ describe('open 模式：兼容旧行为', () => {
       mentionedBot: false, messageId: 'om_open_dm', content: '你好',
     }))
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
-    expect(followupsOf(h, 0)).toBe(1)
+    await waitUntil(() => expect(followupsOf(h, 0)).toBe(1))
     expect(h.channel.sent.some(entry => sentJson(entry).includes('非管理员禁用私聊功能'))).toBe(false)
 
     await h.onMessage(makeMessage({
@@ -508,7 +508,7 @@ describe('open 模式：兼容旧行为', () => {
       mentionedBot: true, messageId: 'om_open_group', content: '@机器人 你好',
     }))
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
-    expect(followupsOf(h, 1)).toBe(1)
+    await waitUntil(() => expect(followupsOf(h, 1)).toBe(1))
     await h.service.shutdown()
   })
 })

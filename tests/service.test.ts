@@ -133,6 +133,18 @@ async function resetFollowupAfterEstablishment(agent: { followup: unknown }): Pr
   mock(agent.followup).mockClear()
 }
 
+/**
+ * `/renew` creates the replacement agent before committing the route record;
+ * waiting for the created agent is therefore not enough to read the route.
+ * Wait until the commit actually points the topic at the new Session.
+ */
+async function waitForRenewedRoute(h: SetupResult, key: string, sessionId: string): Promise<void> {
+  await waitUntil(() => {
+    const route = h.ctxState.domain.raw.table('routes').get(key) as RouteRecord | undefined
+    expect(route?.sessionId).toBe(sessionId)
+  })
+}
+
 const gunzipBuffer = promisify(gunzip)
 
 describe('FeishuService', () => {
@@ -163,10 +175,12 @@ describe('FeishuService', () => {
     expect(json).toContain('degraded')
     expect(json).not.toContain('bot-open-id')
     expect(json).toContain('…n-id')
-    expect(h.channel.reactions).toEqual([
-      { messageId: 'om_health', emojiType: 'Typing' },
-      { messageId: 'om_health', emojiType: 'DONE' },
-    ])
+  await waitUntil(() => {
+      expect(h.channel.reactions).toEqual([
+        { messageId: 'om_health', emojiType: 'Typing' },
+        { messageId: 'om_health', emojiType: 'DONE' },
+      ])
+  })
   })
 
   it('lists all supported commands for unbound /help without creating a workspace or Session', async () => {
@@ -190,10 +204,12 @@ describe('FeishuService', () => {
     expect(json).toContain('/renew')
     expect(json).toContain('/history')
     expect(json).toContain('/export')
-    expect(h.channel.reactions).toEqual([
-      { messageId: 'om_help', emojiType: 'Typing' },
-      { messageId: 'om_help', emojiType: 'DONE' },
-    ])
+  await waitUntil(() => {
+      expect(h.channel.reactions).toEqual([
+        { messageId: 'om_help', emojiType: 'Typing' },
+        { messageId: 'om_help', emojiType: 'DONE' },
+      ])
+  })
   })
 
   it('rejects /help arguments without creating a workspace or Session', async () => {
@@ -225,10 +241,12 @@ describe('FeishuService', () => {
     expect(json).toContain('ou_alice')
     expect(mock(h.channel.send)).toHaveBeenCalledTimes(1)
     expect((h.channel.sent[0] as { options?: object }).options).toEqual({ replyTo: 'om_userid' })
-    expect(h.channel.reactions).toEqual([
-      { messageId: 'om_userid', emojiType: 'Typing' },
-      { messageId: 'om_userid', emojiType: 'DONE' },
-    ])
+  await waitUntil(() => {
+      expect(h.channel.reactions).toEqual([
+        { messageId: 'om_userid', emojiType: 'Typing' },
+        { messageId: 'om_userid', emojiType: 'DONE' },
+      ])
+  })
   })
 
   it('returns /groupid in a group root when the bot is mentioned', async () => {
@@ -246,10 +264,12 @@ describe('FeishuService', () => {
     expect(json).toContain('oc_group')
     expect(mock(h.channel.send)).toHaveBeenCalledTimes(1)
     expect((h.channel.sent[0] as { options?: object }).options).toEqual({ replyTo: 'om_groupid' })
-    expect(h.channel.reactions).toEqual([
-      { messageId: 'om_groupid', emojiType: 'Typing' },
-      { messageId: 'om_groupid', emojiType: 'DONE' },
-    ])
+  await waitUntil(() => {
+      expect(h.channel.reactions).toEqual([
+        { messageId: 'om_groupid', emojiType: 'Typing' },
+        { messageId: 'om_groupid', emojiType: 'DONE' },
+      ])
+  })
   })
 
   it.each(['userid', 'groupid'] as const)(
@@ -814,8 +834,8 @@ describe('FeishuService', () => {
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
 
     const renewed = h.ctxState.agents.created[1]!
+    await waitForRenewedRoute(h, 'omt_1', renewed.options.sessionId)
     const route = h.ctxState.domain.raw.table('routes').get('omt_1') as RouteRecord
-    expect(route.sessionId).toBe(renewed.options.sessionId)
     expect(route.sessionHistory?.map(entry => entry.sessionId)).toEqual([
       old.options.sessionId, renewed.options.sessionId,
     ])
@@ -926,10 +946,10 @@ describe('FeishuService', () => {
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
 
     const failed = h.ctxState.agents.created[1]!
+    await waitUntil(() => expect(mock(failed.handle.dispose)).toHaveBeenCalledTimes(1))
     const route = h.ctxState.domain.raw.table('routes').get('omt_1') as RouteRecord
     const workspace = h.ctxState.workspaces.workspaces.get(route.workspacePath)!
     expect(route.sessionId).toBe(old.options.sessionId)
-    expect(mock(failed.handle.dispose)).toHaveBeenCalledTimes(1)
     expect(mock(workspace.detachSession)).toHaveBeenCalledWith(failed.options.sessionId)
     expect(mock(old.handle.dispose)).not.toHaveBeenCalled()
 
@@ -956,8 +976,8 @@ describe('FeishuService', () => {
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
 
     const renewed = h.ctxState.agents.created[1]!
+    await waitForRenewedRoute(h, 'omt_1', renewed.options.sessionId)
     const route = h.ctxState.domain.raw.table('routes').get('omt_1') as RouteRecord
-    expect(route.sessionId).toBe(renewed.options.sessionId)
     expect(mock(old.handle.dispose)).toHaveBeenCalledTimes(1)
     expect(h.ctxState.agents.liveAgents.get(renewed.options.sessionId)?.agent).toBe(renewed.handle.agent)
   })
@@ -1264,11 +1284,14 @@ describe('FeishuService', () => {
     await Promise.all([h.onMessage(redelivery), h.onMessage(redelivery)])
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
 
+    await waitUntil(() => {
+      const route = h.ctxState.domain.raw.table('routes').get('omt_1') as RouteRecord | undefined
+      expect(route?.sessionHistory).toHaveLength(2)
+    })
     const route = h.ctxState.domain.raw.table('routes').get('omt_1') as RouteRecord
     expect(h.ctxState.agents.created).toHaveLength(2)
     expect(mock(h.ctxState.ctx.commands.execute)).toHaveBeenCalledTimes(1)
     expect(mock(old.handle.dispose)).toHaveBeenCalledTimes(1)
-    expect(route.sessionHistory).toHaveLength(2)
     expect(new Set(route.sessionHistory?.map(entry => entry.sessionId)).size).toBe(2)
   })
 
@@ -1367,8 +1390,7 @@ describe('FeishuService', () => {
 
     const renewed = h.ctxState.agents.created[1]!
     expect(renewed.options.agentOptions).toEqual(foreignAgent.options)
-    expect((h.ctxState.domain.raw.table('routes').get('omt_1') as RouteRecord).sessionId)
-      .toBe(renewed.options.sessionId)
+    await waitForRenewedRoute(h, 'omt_1', renewed.options.sessionId)
     expect(foreignDispose).not.toHaveBeenCalled()
     await service.shutdown()
   })
@@ -2824,8 +2846,8 @@ describe('command registry dispatch', () => {
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
 
     const renewed = h.ctxState.agents.created[1]!
+    await waitForRenewedRoute(h, 'omt_1', renewed.options.sessionId)
     const route = h.ctxState.domain.raw.table('routes').get('omt_1') as RouteRecord
-    expect(route.sessionId).toBe(renewed.options.sessionId)
     // The alias executes the canonical command on the agent plane.
     expect(sessionEvents(old.handle.agent.session).slice(-2).map(event => event.type))
       .toEqual(['command/run', 'command/done'])
@@ -3083,7 +3105,7 @@ describe('inbound attachments', () => {
     const [name] = finalFiles()
     expect(name).toMatch(/\.png$/)
     expect(h.ctxState.agents.created).toHaveLength(0)
-    expect(h.channel.reactions).toEqual([{ messageId: 'om_image', emojiType: 'DONE' }])
+    await waitUntil(() => expect(h.channel.reactions).toEqual([{ messageId: 'om_image', emojiType: 'DONE' }]))
     await h.service.shutdown()
   })
 
