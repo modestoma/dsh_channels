@@ -315,9 +315,10 @@ export class PendingAttachmentStore {
    * that is already registered (storage-level idempotency; the inbound dedup
    * table remains the authoritative redelivery guard).
    *
-   * The durable write happens BEFORE evicting older rows of the same scope: if
-   * the write fails the scope is left untouched (a scope can exceed the cap by
-   * at most one until the next sweep instead of losing an old row for nothing).
+   * The durable write happens BEFORE evicting older rows of the same scope: a
+   * failed write leaves the scope untouched instead of losing an old row for
+   * nothing. A successful eviction restores the cap immediately; only a failed
+   * delete can leave the scope over the cap until the next sweep.
    */
   async registerMessage(
     msg: NormalizedMessage,
@@ -375,7 +376,8 @@ export class PendingAttachmentStore {
   ): PendingAttachmentRecord[] {
     const now = this.now()
     // A thread scope can see its own rows plus the same sender's chat-scope
-    // rows (see `recordInScope`), so at most two scopes' caps are visible.
+    // rows (see `recordInScope`), so at most two scopes' caps (2× the per-scope
+    // cap) can be visible; the requested manifest window is clamped to that.
     const maxVisible = Math.max(1, this.deps.maxPerScope() * 2)
     const requested = options.limit ?? PENDING_ATTACHMENT_MANIFEST_LIMIT
     const limit = Math.max(1, Math.min(requested, maxVisible))
