@@ -50,7 +50,7 @@
 | AC | 方法 | 实际证据 | 结论 |
 | --- | --- | --- | --- |
 | AC1 工具注册可用 | 真实 channel 会话 + probe 工具调用 | 7 个 channel 会话 `mount ok=true`；模型在 p2p/群/话题中实际调用 `p0_probe`；卡片工具行可见。注：probe 的 `env.tools.injected=false` 是探针闭包 bug（未把 inject ctx 传回 execute），mount 记录与真实调用证明注册成功 | ✅ Go |
-| AC2 图片原生可见 | `p0_probe image` + 让模型描述 | `modelInfo.inputModalities=[text,image]`；工具结果同时含 text 与 `{type:'image',attachment}`；模型下一轮准确描述“红圆 / 绿色方块 / 蓝色矩形 / 文字 P0-42”，未调用 `read_image`；附件对象落库并可回读 | ✅ Go |
+| AC2 图片原生可见 | `p0_probe image` + 让模型描述 | `modelInfo.inputModalities=[text,image]`；工具结果同时含 text 与 `{type:'image',attachment}`；模型下一轮准确描述“红圆 / 绿色方块 / 蓝色矩形 / 文字 P0-42”，未调用 `read_image`；附件对象落库并可回读。**重启回放**：干净构建重启后冷恢复同一话题，模型能从历史重新 `read_image` 原附件路径并准确复述 P0-42；`p0_probe` 返回 `unknown tool` 证明探针已移除 | ✅ Go |
 | AC3 文件块与只读路径 | 流式生成 / Feishu 大文件 / bash 读取 / 取消 | 64MiB `saveFileStream` 0.087s，RSS 324→325MB；8MiB `file_block` 结果含 FileBlock 内容块；`bash` 读取只读路径成功（`-r--------`，内容 sha256 与 attachmentId 一致）；飞书 980,644,948 字节 zip 两次流式入库（40.98s / 44.05s，RSS 峰值 447/451MB），字节一致；1GiB slow 流在 `/stop` 后记录 `file_aborted`（53,215,305 bytes / 1.98s）。探针曾因返回值含 `undefined` 报 `value is not lossless JSON`（仅探针 bug，保存已完成；修复=输出 JSON 清洗） | ✅ Go（P1 用 FileBlock + 文本路径双保险） |
 | AC4 飞书读取权限 | bot 身份调用 message API | `message.get` 引用消息 `code=0`；`message.list(chat)` `code=0`、20 条、`has_more=true`；`message.list(thread)` `code=0`、7 条；`merge_forward` 的 `message.get` 返回 3 条（容器 + 文本子消息 + 图片子消息）；容器 id 下载首块 13,546B 成功，子消息 id 下载返回 400。入群前历史未测 | ✅ Go（入群前历史留 P2 补测） |
 | AC5 引用与合并转发 | 引用消息 / 合并转发 / 话题列表 | 引用消息经 `replyToMessageId` 定位并可读；合并转发资源仅容器 id 可取；话题 thread 列表可读 | ✅ Go |
@@ -59,7 +59,7 @@
 ### 对 P1 的输入
 
 - P1 采用“立即建会话 + 清单 + 图片预取 + 文件懒取”，无需等待下载；通道模型声明并实测支持图片输入，图片预取成立。
-- 工具输出必须做 JSON 清洗（无 `undefined`）；`AbortError` 映射为可读文本；每个 action 都落证据。
+- 工具输出必须做 JSON 清洗（无 `undefined`）；`AbortError` 映射为可读文本；每个 action 都落证据。被取消的回合会在 Session 历史里留下失败的工具结果，后续回合模型可能主动提及它——P1 工具必须给出可读错误（不能是 `[object Object]`），避免模型把“取消”误报为产品故障。
 - 大文件流式 RSS 受控（980MB 文件峰值约 451MB），但 Feishu 下载约 41–44s，工具需有超时/取消与可读失败说明。
-- 待补：入群前历史、p2p `message.list`、清理 probe 后的重启回放（第二次重启窗口）。
+- 待补：入群前历史、p2p `message.list`（P2 补测）；重启回放已完成。
 - 交付沉淀：channel `messageGet` / `messageList` 包装与 channel tool 运行时类型保留给 P1；main 提交 SHA 见 git log 与 runtime 快照。

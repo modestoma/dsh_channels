@@ -87,8 +87,8 @@
 
 - 决定标识、时间与用户确认来源：D10，2026-10-20，P0 真机验证完成后由协调者记录；用户在会话中确认“都跑完了”，并提供了 1GB 飞书文件。
 - 用户原意，性质为疑问 / 提案 / 明确决定：事实记录与执行调整（非需求变化）。
-- 本次变化摘要：P0 全部 Go —— 工具注册（7 个会话）、图片 ImageBlock（模型直接描述测试图）、FileBlock/只读路径/大文件流式/取消、飞书 `message.get`/`list(chat|thread)`/合并转发容器规则、未 @ 群消息事件投递均通过；通道模型 `deepseek-flash` 声明并实测支持图片输入。探针自身缺陷（输出 JSON 清洗、AbortError 文案、inject ctx 捕获）仅影响探针，已移除探针；保留 channel `messageGet`/`messageList` 包装与 channel tool 运行时类型作为 P1 交付物。
-- 受影响的目标与任务：`platform_spike` 完成（“清理后重启回放”待第二次窗口）；P1 可直接开始，无范围或 revision 变化。
+- 本次变化摘要：P0 全部 Go —— 工具注册（7 个会话）、图片 ImageBlock（模型直接描述测试图）、FileBlock/只读路径/大文件流式/取消、飞书 `message.get`/`list(chat|thread)`/合并转发容器规则、未 @ 群消息事件投递、干净构建重启后的历史回放均通过；通道模型 `deepseek-flash` 声明并实测支持图片输入。被 `/stop` 取消的回合会在历史里留下失败工具结果（探针显示 `[object Object]`），P1 工具需可读化错误。探针自身缺陷（输出 JSON 清洗、AbortError 文案、inject ctx 捕获）仅影响探针，已移除探针；保留 channel `messageGet`/`messageList` 包装与 channel tool 运行时类型作为 P1 交付物。
+- 受影响的目标与任务：`platform_spike` 完成（含干净构建重启后的历史回放：模型从冷恢复会话重新读取原附件路径并准确描述 P0-42，`p0_probe` 已 `unknown tool`）；P1 可直接开始，无范围或 revision 变化。
 - 暂停、继续、返工和验证安排：无暂停；重启回放纳入 P0 收官；入群前历史与 p2p `message.list` 纳入 P2 补测。
 - 平台对象缺失时的运行记录约定：roadmap-workflow schema 要求 running/merged 任务有已发布 issue_url/PR；本项目按 D9 不创建平台对象，因此 `runtime.json` 无法表达 running/merged。执行状态以任务 `resume` 记录，交付证据以 main 提交 SHA + Issue 证据 + 本条决定为准；`validate` 保持通过，不伪造平台字段。
 - 对应 revision、批准范围与理由：revision 1；无需求变化，不提升任何任务 revision。

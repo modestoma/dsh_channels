@@ -67,13 +67,14 @@
 
 ## 当前假设与 P0 结论（2026-10-20）
 
-P0 验证已完成（除“清理 probe 后的重启回放”待第二次窗口），证据见 [platform_spike.md](../../issues/platform_spike.md)；结论 **Go**，不改变范围与 revision。
+P0 验证已完成（含干净构建重启后的历史回放），证据见 [platform_spike.md](../../issues/platform_spike.md)；结论 **Go**，不改变范围与 revision。
 
 - A1 ✅ `ctx.tools` / `ctx.attachments` 在 channel 作用域可用：7 个会话挂载成功，模型实际调用工具。
 - A2 ✅ 工具结果可下发 `ImageBlock`（模型直接描述测试图）；`FileBlock` 内容块可下发并保留文本路径兜底。
 - A3 ✅ `fileHostPath` 只读路径可被 channel 会话的 `bash` 读取，内容校验一致。
 - A4 ✅ bot 身份可 `message.get` / `message.list(chat|thread)`；合并转发资源必须用顶层容器 id 下载。
 - A5 ✅ 未 @ 的群消息事件会投递到机器人（静默登记在群聊可覆盖）。
+- A6 ✅ 重启回放：干净构建后冷恢复同一话题，模型从历史重新读取原附件路径并准确描述 P0-42；探针已不可调用（`unknown tool`）。
 
 **未决问题**
 

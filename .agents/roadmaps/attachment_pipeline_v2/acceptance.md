@@ -4,7 +4,7 @@
 
 | AC | 实现入口 | 实际验证与证据 | 未验证项 / 遗留问题 |
 | --- | --- | --- | --- |
-| AC-1 / AC-2 / AC-3 / AC-5 / AC-7（P0 局部） | [platform_spike.md](../../issues/platform_spike.md) | 2026-10-20 P0：工具注册、图片原生可见、文件流式/只读路径/取消、大文件 980MB 流式入库（RSS 峰值 451MB）、飞书 get/list/合并转发容器、未 @ 事件投递均通过 | 重启回放待第二次窗口；入群前历史与 p2p message.list 待 P2 补测 |
+| AC-1 / AC-2 / AC-3 / AC-5 / AC-7（P0 局部） | [platform_spike.md](../../issues/platform_spike.md) | 2026-10-20 P0：工具注册、图片原生可见（含重启后历史回放）、文件流式/只读路径/取消、大文件 980MB 流式入库（RSS 峰值 451MB）、飞书 get/list/合并转发容器、未 @ 事件投递均通过 | 入群前历史与 p2p message.list 待 P2 补测 |
 
 ## 用户验收
 
