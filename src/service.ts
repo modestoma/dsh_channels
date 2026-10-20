@@ -66,6 +66,8 @@ import type { LiveAgent, RenewCommit } from './session/manager.ts'
 import { CardDelivery } from './feishu/delivery.ts'
 import { AttachmentIntake } from './feishu/inbound-attachments.ts'
 import { PendingAttachmentStore } from './feishu/pending-attachments.ts'
+import { AttachmentFetchToolRuntime } from './feishu/tools.ts'
+import type { KnownAttachmentMessageInput, KnownAttachmentSource } from './feishu/tools.ts'
 import { InboundRouter } from './routing/inbound.ts'
 import type { RequestPolicyController } from './session/request-policy.ts'
 import type { ChannelFactory, FeishuChannel, NormalizedMessage } from './feishu-channel.ts'
@@ -305,6 +307,12 @@ export class FeishuService {
   private readonly inbound: InboundRouter
   /** Agent/session lifecycle: live registry, resume, presets, renew. */
   private readonly sessions: SessionManager
+  /**
+   * Model-facing Feishu tools. Today only `feishu_attachment_fetch`; the
+   * runtime also owns the per-route known-message whitelist the admission and
+   * quote layers populate.
+   */
+  private readonly attachmentFetchTools: AttachmentFetchToolRuntime
   /** FIFO admission for ordinary turns and commands targeting one route. */
   private readonly routeOperations = new RouteOperationQueue()
   /** Active Host command executions, aborted before shutdown tears peers down. */
@@ -386,6 +394,7 @@ export class FeishuService {
       persistRoute: (key, record) => this.routes.put(key, record),
       started: () => this.started,
       detachStream: sessionId => this.streamer?.detach(sessionId),
+      mountTools: (agentCtx, sessionId) => this.attachmentFetchTools.mount(agentCtx, sessionId),
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
     })
     this.attachments = new AttachmentIntake({
@@ -399,6 +408,23 @@ export class FeishuService {
       enabled: () => this.config.acceptAttachments,
       ttlMs: () => this.config.pendingAttachmentTtlMs,
       maxPerScope: () => this.config.pendingAttachmentLimit,
+      warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
+    })
+    this.attachmentFetchTools = new AttachmentFetchToolRuntime({
+      config: () => this.config,
+      channel: () => this.channel,
+      pending: () => this.pendingAttachments,
+      routeOfSession: sessionId => {
+        const record = this.routes.findBySession(sessionId)
+        if (record === undefined) return undefined
+        return {
+          key: record.key,
+          kind: record.kind,
+          chatId: record.chatId,
+          chatType: record.chatType,
+          senderOpenId: record.senderOpenId,
+        }
+      },
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
     })
     this.delivery = new CardDelivery({
@@ -443,6 +469,28 @@ export class FeishuService {
       questionAnswerer: () => this.questionAnswerer,
       commands: { handleSlash: (msg, line) => this.handleSlashMessage(msg, line) },
     })
+  }
+
+  /**
+   * Pre-authorize one admitted Feishu message for `feishu_attachment_fetch`.
+   *
+   * The admission and quote layers call this after their access gates for the
+   * triggering / quoted message; the tool otherwise only authorizes messages
+   * visible in the durable pending-attachment registry. Registering is a pure
+   * in-memory operation (one LRU entry per route) and never fails the caller.
+   */
+  noteKnownAttachmentMessage(
+    record: RouteRecord,
+    message: KnownAttachmentMessageInput,
+    source: KnownAttachmentSource = 'trigger',
+  ): void {
+    this.attachmentFetchTools.noteKnownMessage({
+      key: record.key,
+      kind: record.kind,
+      chatId: record.chatId,
+      chatType: record.chatType,
+      senderOpenId: record.senderOpenId,
+    }, message, source)
   }
 
   // ---- lifecycle / Web settings panel ----------------------------------
@@ -919,6 +967,7 @@ export class FeishuService {
       retireRoute: async route => {
         if (route.kind === 'thread') await this.routes.retire(route.key)
         else await this.routes.remove(route.key)
+        this.attachmentFetchTools.forgetRoute(route.key)
       },
       warn: message => this.ctx.logger?.warn?.(message),
     }
@@ -1297,6 +1346,7 @@ export class FeishuService {
       this.retentionTimer = undefined
     }
     await this.sessions.disposeAll()
+    this.attachmentFetchTools.clear()
     this.routeOperations.clear()
     this.inbound.clear()
     this.routes.clear()
@@ -2133,11 +2183,25 @@ export class FeishuService {
           } else {
             await this.routes.remove(key)
           }
+          this.attachmentFetchTools.forgetRoute(key)
           removedRoutes++
         } catch (error) {
           this.ctx.logger?.warn?.('dsh-channels: GC of route %s failed: %s', key, String(error))
         }
       }
+    }
+
+    // Reconcile the attachment-fetch whitelist with the active route set: the
+    // inbound TTL path retires a thread route directly (tombstone), so its
+    // in-memory whitelist bucket would otherwise live until process exit.
+    const droppedToolRoutes = this.attachmentFetchTools.pruneRoutes(
+      routeKey => this.routes.get(routeKey) !== undefined,
+    )
+    if (droppedToolRoutes > 0) {
+      this.ctx.logger?.info?.(
+        'dsh-channels: record GC dropped %d stale attachment-tool route bucket(s)',
+        droppedToolRoutes,
+      )
     }
 
     const inflight = this.domain?.inflight

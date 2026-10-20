@@ -65,6 +65,14 @@ export interface SessionManagerDeps {
   started(): boolean
   /** Drop streamer state for a session whose owner handle is being released. */
   detachStream(sessionId: string): void
+  /**
+   * Register this channel's model tools inside one Agent scope. Called from
+   * the agent-preset `setup` after the preset is mounted (tools live inside
+   * presets in web-profile deployments), and once more for a BORROWED live
+   * agent as a best-effort race guard (D7). Optional: unit tests that do not
+   * compose model tools omit it.
+   */
+  mountTools?(agentCtx: AgentContext, sessionId: string): Promise<void> | void
   warn(message: string, ...args: unknown[]): void
 }
 
@@ -82,6 +90,8 @@ export class SessionManager {
   private readonly live = new Map<string, LiveAgent>()
   private readonly pendingResume = new Map<string, Promise<LiveAgent>>()
   private readonly policies = new WeakMap<AgentContext, RequestPolicyController>()
+  /** Agent scopes this plugin already attempted to mount model tools into. */
+  private readonly toolMounts = new WeakSet<AgentContext>()
 
   constructor(private readonly deps: SessionManagerDeps) {}
 
@@ -116,7 +126,7 @@ export class SessionManager {
     cwd: string,
     agentOptions: Record<string, unknown> = this.agentOptions(),
   ): Promise<AgentHandle> {
-    const composition = await this.presetComposition(undefined, true)
+    const composition = await this.presetComposition(undefined, true, sessionId)
     const handle = await this.deps.ctx.agents.create({
       sessionId,
       meta: {
@@ -166,7 +176,7 @@ export class SessionManager {
     if (own !== undefined) return own
 
     const foreign = this.deps.ctx.agents.get(sessionId as SessionId)
-    if (foreign !== undefined) return this.borrow(sessionId, foreign)
+    if (foreign !== undefined) return await this.borrow(sessionId, foreign)
 
     let pending = this.pendingResume.get(sessionId)
     if (pending === undefined) {
@@ -179,9 +189,14 @@ export class SessionManager {
   }
 
   /** Borrow one foreign live agent and mount this channel's scoped policy. */
-  private borrow(sessionId: string, agent: Agent): LiveAgent {
+  private async borrow(sessionId: string, agent: Agent): Promise<LiveAgent> {
     const borrowed = borrowLiveAgent(agent, this.mountRequestPolicy(agent.ctx, agent.session))
     this.live.set(sessionId, borrowed)
+    // Best-effort tool backfill (D7): the foreign owner may have composed the
+    // session without this plugin's setup (web UI resolver, previous plugin
+    // instance). mountToolsFor swallows failures, so the borrow itself never
+    // fails; awaiting it makes the tool available before the first turn.
+    await this.mountToolsFor(agent.ctx, sessionId)
     return borrowed
   }
 
@@ -193,7 +208,7 @@ export class SessionManager {
       // (config override or roster default). A session persisted before the
       // preset fix has no preset recorded on its header; re-resolving here is
       // what repairs it on the first resume after a restart.
-      const composition = await this.presetComposition(undefined, true)
+      const composition = await this.presetComposition(undefined, true, sessionId)
       const handle = await this.deps.ctx.agents.resume({
         resumeSessionId: sessionId,
         agentOptions: this.agentOptions(),
@@ -215,7 +230,7 @@ export class SessionManager {
       // Lost a cold-resume race: another owner published the session while our
       // resume was in flight. Borrow the winner instead of failing the turn.
       const winner = this.deps.ctx.agents.get(sessionId)
-      if (winner !== undefined) return this.borrow(sessionId, winner)
+      if (winner !== undefined) return await this.borrow(sessionId, winner)
       throw error
     }
   }
@@ -255,7 +270,7 @@ export class SessionManager {
   async renew(record: RouteRecord, oldLive: LiveAgent): Promise<RenewCommit> {
     const sessionId = randomUUID() as SessionId
     const preset = this.effectivePreset(oldLive.agent.session)
-    const composition = await this.presetComposition(preset, false)
+    const composition = await this.presetComposition(preset, false, sessionId)
     const services: PlacementServices = placementServices(this.deps.ctx)
     const switchable = services.workingDirectory !== undefined
     const workspacePath = record.workspacePath
@@ -358,6 +373,7 @@ export class SessionManager {
   private async presetComposition(
     requestedPreset: string | undefined = this.deps.config.agentPreset,
     useRosterDefault = true,
+    sessionId?: string,
   ): Promise<PresetComposition> {
     // Read through ctx.get (safe lookup): only the web profile ships a roster,
     // and direct property access on a cordis context throws for services the
@@ -369,6 +385,7 @@ export class SessionManager {
       // cannot guarantee that the explicit channel value wins.
       this.mountRequestPolicy(agentCtx)
       await mountChannelCommands(agentCtx)
+      if (sessionId !== undefined) await this.mountToolsFor(agentCtx, sessionId)
     }
     if (presets === undefined || (requestedPreset === undefined && !useRosterDefault)) {
       return { setup: channelCommandsOnly }
@@ -380,7 +397,27 @@ export class SessionManager {
         this.mountRequestPolicy(agentCtx)
         await presets.mount(agentCtx, resolved.id)
         await mountChannelCommands(agentCtx)
+        if (sessionId !== undefined) await this.mountToolsFor(agentCtx, sessionId)
       },
+    }
+  }
+
+  /**
+   * Mount the channel model tools into one Agent scope, at most once per
+   * scope. A failure is logged and swallowed: missing tools never fail a
+   * session (attachment fetch degrades to its structured failures).
+   */
+  private async mountToolsFor(agentCtx: AgentContext, sessionId: string): Promise<void> {
+    if (this.deps.mountTools === undefined) return
+    if (this.toolMounts.has(agentCtx)) return
+    try {
+      await this.deps.mountTools(agentCtx, sessionId)
+      this.toolMounts.add(agentCtx)
+    } catch (error) {
+      this.deps.warn(
+        'dsh-channels: mounting channel tools for session %s failed: %s',
+        sessionId, String(error),
+      )
     }
   }
 

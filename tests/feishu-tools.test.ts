@@ -1,0 +1,1690 @@
+/**
+ * `feishu_attachment_fetch` runtime tests: tool registration, the per-route
+ * authorization whitelist, image/file results, limits/cancellation, and merged
+ * forward resources.
+ *
+ * The stubs mirror the real seams: a fake `ctx.attachments`, a fake
+ * `ctx.tools` registry, the real pending-attachment registry (memory backing)
+ * and a Feishu channel whose resource/message reads are scripted per test.
+ */
+
+import { createHash } from 'node:crypto'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { resolveConfig } from '../src/config.ts'
+import type { FeishuConfig } from '../src/config.ts'
+import type { RouteRecord } from '../src/domain.ts'
+import type {
+  AdmittedPromptContentPart, AttachmentAdmissionPart, AttachmentStore, FileAttachmentRef,
+  ImageAttachmentRef, ImageAttachmentLimits,
+} from '../src/host/attachments.ts'
+import type { AgentContext, ToolDefinition, ToolRuntime } from '../src/host/agent.ts'
+import type { FeishuChannel } from '../src/feishu-channel.ts'
+import { PendingAttachmentStore } from '../src/feishu/pending-attachments.ts'
+import {
+  ATTACHMENT_FETCH_TOOL_NAME,
+  AttachmentFetchToolRuntime,
+  RouteAttachmentWhitelist,
+  attachmentFetchArgsSchema,
+  presentAttachmentFetchResult,
+  renderAttachmentFetchResult,
+  type AttachmentFetchRoute,
+  type AttachmentFetchValue,
+  type KnownAttachmentResource,
+} from '../src/feishu/tools.ts'
+import { SessionManager } from '../src/session/manager.ts'
+import type { SessionId } from '../src/dsh-types.ts'
+import {
+  makeAgent, makeAgentContext, makeAgentPresets, makeChannel, makeHostContext, makeMessage,
+  makeSession,
+} from './helpers.ts'
+
+// ---- Shared fakes -------------------------------------------------------
+
+const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]
+
+/** Valid PNG-prefixed bytes of `size` bytes (the store only sniffs the header). */
+function pngBytes(size = 16): Uint8Array {
+  const bytes = new Uint8Array(Math.max(size, PNG_SIGNATURE.length))
+  bytes.set(PNG_SIGNATURE, 0)
+  return bytes
+}
+
+function fileBytes(...values: number[]): Uint8Array {
+  return new Uint8Array(values)
+}
+
+function streamOf(chunks: readonly Uint8Array[]): AsyncGenerator<Uint8Array> {
+  return (async function* () {
+    for (const chunk of chunks) yield chunk
+  })()
+}
+
+function digest(bytes: Uint8Array): string {
+  return createHash('sha256').update(bytes).digest('hex')
+}
+
+function deferred<T = void>(): { promise: Promise<T>; resolve(value: T): void } {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((settle) => { resolve = settle })
+  return { promise, resolve }
+}
+
+interface FakeStore extends AttachmentStore {
+  readonly images: ImageAttachmentRef[]
+  readonly files: Array<{ ref: FileAttachmentRef; bytes: Uint8Array }>
+  readonly aborted: { count: number }
+}
+
+interface FakeStoreOptions {
+  imageLimits?: ImageAttachmentLimits
+  fileHostPath?: (ref: FileAttachmentRef) => string | undefined
+  imageHostPath?: (ref: ImageAttachmentRef) => string | undefined
+}
+
+function makeAttachmentStore(options: FakeStoreOptions = {}): FakeStore {
+  const images: ImageAttachmentRef[] = []
+  const files: Array<{ ref: FileAttachmentRef; bytes: Uint8Array }> = []
+  const aborted = { count: 0 }
+  const store: FakeStore = {
+    images,
+    files,
+    aborted,
+    imageLimits: options.imageLimits ?? {
+      maxImageBytes: 1024 * 1024,
+      maxImagesPerMessage: 10,
+      maxMessageImageBytes: 10 * 1024 * 1024,
+      maxImagePixels: 100_000_000,
+      maxImageDimension: 10_000,
+      mediaTypes: ['image/png', 'image/jpeg', 'image/webp', 'image/gif'],
+    },
+    async saveImage(input) {
+      const ref: ImageAttachmentRef = {
+        attachmentId: `sha256:${digest(input.data)}`,
+        mediaType: input.mediaType,
+        bytes: input.data.byteLength,
+        width: 640,
+        height: 480,
+        ...(input.name === undefined ? {} : { name: input.name }),
+      }
+      images.push(ref)
+      return ref
+    },
+    async saveFileStream(input) {
+      const chunks: Uint8Array[] = []
+      const abortedSignal = () => aborted.count > 0
+      const onAbort = (): void => { aborted.count += 1 }
+      if (input.signal?.aborted === true) {
+        aborted.count += 1
+        throw abortError()
+      }
+      input.signal?.addEventListener('abort', onAbort)
+      try {
+        for await (const chunk of input.data) {
+          if (abortedSignal()) throw abortError()
+          chunks.push(chunk)
+        }
+        if (abortedSignal()) throw abortError()
+      } finally {
+        input.signal?.removeEventListener('abort', onAbort)
+      }
+      const bytes = new Uint8Array(chunks.reduce((total, chunk) => total + chunk.byteLength, 0))
+      let offset = 0
+      for (const chunk of chunks) {
+        bytes.set(chunk, offset)
+        offset += chunk.byteLength
+      }
+      const ref: FileAttachmentRef = {
+        attachmentId: `sha256:${digest(bytes)}`,
+        name: input.name ?? 'file.bin',
+        bytes: bytes.byteLength,
+      }
+      files.push({ ref, bytes })
+      return ref
+    },
+    fileHostPath: options.fileHostPath
+      ?? (ref => `/host/attachments/files/${ref.attachmentId}.bin`),
+    imageHostPath: options.imageHostPath
+      ?? (ref => `/host/attachments/images/${ref.attachmentId}`),
+    async admitPromptContent(parts: readonly AttachmentAdmissionPart[]): Promise<AdmittedPromptContentPart[]> {
+      return parts as unknown as AdmittedPromptContentPart[]
+    },
+  }
+  return store
+}
+
+function abortError(): Error {
+  const error = new Error('The operation was aborted')
+  error.name = 'AbortError'
+  return error
+}
+
+type DownloadHandler = (
+  messageId: string,
+  fileKey: string,
+  type: 'image' | 'file',
+) => AsyncIterable<Uint8Array> | Promise<AsyncIterable<Uint8Array>>
+
+interface TestChannel extends FeishuChannel {
+  readonly downloaded: Array<{ messageId: string; fileKey: string; type: 'image' | 'file' }>
+  messageGet: (messageId: string) => Promise<unknown>
+}
+
+function makeTestChannel(handlers: {
+  download?: DownloadHandler
+  messageGet?: (messageId: string) => Promise<unknown>
+} = {}): TestChannel {
+  const base = makeChannel()
+  const channel = base as unknown as TestChannel
+  const downloaded: Array<{ messageId: string; fileKey: string; type: 'image' | 'file' }> = []
+  Object.assign(channel, { downloaded })
+  channel.downloadResource = async (messageId, fileKey, type) => {
+    downloaded.push({ messageId, fileKey, type })
+    if (handlers.download !== undefined) return await handlers.download(messageId, fileKey, type)
+    return type === 'image' ? streamOf([pngBytes()]) : streamOf([fileBytes(1, 2, 3)])
+  }
+  channel.messageGet = async (messageId: string) => {
+    if (handlers.messageGet === undefined) throw new Error('unexpected message.get')
+    return await handlers.messageGet(messageId)
+  }
+  return channel
+}
+
+function makePendingStore(options: { now?: () => number; ttlMs?: number } = {}): PendingAttachmentStore {
+  return new PendingAttachmentStore({
+    table: () => undefined,
+    enabled: () => true,
+    ttlMs: () => options.ttlMs ?? 7 * 24 * 60 * 60 * 1000,
+    maxPerScope: () => 10,
+    ...(options.now === undefined ? {} : { now: options.now }),
+  })
+}
+
+function makeConfig(
+  overrides: Omit<Partial<FeishuConfig>, 'feishuTools'> = {},
+  tools: Partial<FeishuConfig['feishuTools']> = {},
+): FeishuConfig {
+  const base = resolveConfig({})
+  return { ...base, ...overrides, feishuTools: { ...base.feishuTools, ...tools } }
+}
+
+const DEFAULT_ROUTE: AttachmentFetchRoute = {
+  key: 'omt_thread_1',
+  kind: 'thread',
+  chatId: 'oc_chat',
+  chatType: 'group',
+  senderOpenId: 'ou_user',
+}
+
+interface RuntimeHarness {
+  runtime: AttachmentFetchToolRuntime
+  ctx: AgentContext
+  definitions: Map<string, ToolDefinition>
+  register: ReturnType<typeof vi.fn>
+  route: AttachmentFetchRoute
+  config: FeishuConfig
+  channel: TestChannel
+  store: FakeStore
+  pending: PendingAttachmentStore
+  warn: ReturnType<typeof vi.fn>
+  mount(): Promise<ToolDefinition>
+  definition(): ToolDefinition
+}
+
+interface SetupOptions {
+  /** `null` simulates a disconnected channel (deps return undefined). */
+  channel?: TestChannel | null
+  store?: FakeStore
+  config?: FeishuConfig
+  pending?: PendingAttachmentStore
+  route?: AttachmentFetchRoute
+  sessionId?: string
+  /** Simulate a session that has no durable route binding (unbound agent). */
+  unbound?: boolean
+  includeTools?: boolean
+  includeAttachments?: boolean
+}
+
+function setupRuntime(options: SetupOptions = {}): RuntimeHarness {
+  const config = options.config ?? makeConfig()
+  const configuredChannel = options.channel === undefined ? makeTestChannel() : options.channel
+  const channel = configuredChannel ?? makeTestChannel()
+  const store = options.store ?? makeAttachmentStore()
+  const pending = options.pending ?? makePendingStore()
+  const route = options.route ?? DEFAULT_ROUTE
+  const sessionId = options.sessionId ?? 'session-tools'
+  const warn = vi.fn()
+  const ctx = makeAgentContext()
+  const definitions = new Map<string, ToolDefinition>()
+  const register = vi.fn((definition: ToolDefinition) => {
+    definitions.set(definition.name, definition)
+    return () => { definitions.delete(definition.name) }
+  })
+  if (options.includeTools !== false) ctx.tools = { register } as unknown as ToolRuntime
+  if (options.includeAttachments !== false) ctx.attachments = store
+  const runtime = new AttachmentFetchToolRuntime({
+    config: () => config,
+    channel: () => configuredChannel ?? undefined,
+    pending: () => pending,
+    routeOfSession: id => (options.unbound === true || id !== sessionId ? undefined : route),
+    warn,
+    now: () => 1_700_000_000_000,
+  })
+  const definition = (): ToolDefinition => {
+    const found = definitions.get(ATTACHMENT_FETCH_TOOL_NAME)
+    if (found === undefined) throw new Error('tool was not mounted')
+    return found
+  }
+  return {
+    runtime, ctx, definitions, register, route, config, channel, store, pending, warn,
+    definition,
+    async mount(): Promise<ToolDefinition> {
+      await runtime.mount(ctx, sessionId)
+      return definition()
+    },
+  }
+}
+
+function knownFile(
+  harness: RuntimeHarness,
+  options: {
+    messageId?: string
+    fileKey?: string
+    fileName?: string
+    kind?: 'message' | 'merge_forward'
+    resources?: readonly KnownAttachmentResource[]
+    route?: AttachmentFetchRoute
+    source?: 'trigger' | 'quote' | 'manual'
+  } = {},
+): string {
+  const messageId = options.messageId ?? 'om_known'
+  harness.runtime.noteKnownMessage(
+    options.route ?? harness.route,
+    {
+      messageId,
+      kind: options.kind ?? 'message',
+      resources: options.resources ?? [{
+        type: 'file',
+        fileKey: options.fileKey ?? 'file_key_1',
+        fileName: options.fileName ?? 'report.pdf',
+      }],
+    },
+    options.source ?? 'trigger',
+  )
+  return messageId
+}
+
+async function runTool(
+  definition: ToolDefinition,
+  args: Record<string, unknown>,
+  signal?: AbortSignal,
+): Promise<AttachmentFetchValue> {
+  const value = await definition.execute(args, { signal: signal ?? new AbortController().signal })
+  return value as AttachmentFetchValue
+}
+
+/** Assert a tool value is lossless JSON (P0 lesson: no `undefined`). */
+function expectLosslessJson(value: unknown): void {
+  const seen = new WeakSet<object>()
+  const walk = (candidate: unknown, path: string): void => {
+    if (candidate === undefined) throw new Error(`${path} is undefined (not lossless JSON)`)
+    if (typeof candidate === 'function' || typeof candidate === 'symbol' || typeof candidate === 'bigint') {
+      throw new Error(`${path} has non-JSON type ${typeof candidate}`)
+    }
+    if (typeof candidate === 'number' && !Number.isFinite(candidate)) {
+      throw new Error(`${path} is not a finite number`)
+    }
+    if (Array.isArray(candidate)) {
+      candidate.forEach((entry, index) => walk(entry, `${path}[${index}]`))
+      return
+    }
+    if (typeof candidate === 'object' && candidate !== null) {
+      if (seen.has(candidate)) throw new Error(`${path} is circular`)
+      seen.add(candidate)
+      for (const [key, entry] of Object.entries(candidate)) walk(entry, `${path}.${key}`)
+    }
+  }
+  walk(value, 'value')
+  expect(JSON.parse(JSON.stringify(value))).toEqual(value)
+}
+
+// ---- AC1: registration ------------------------------------------------
+
+describe('feishu attachment-fetch registration', () => {
+  it('registers the model-facing tool after the tools/attachments injection', async () => {
+    const harness = setupRuntime()
+    const definition = await harness.mount()
+
+    expect(harness.register).toHaveBeenCalledTimes(1)
+    expect(definition.name).toBe(ATTACHMENT_FETCH_TOOL_NAME)
+    expect(definition.description).toContain('Feishu')
+    expect(definition.description).toContain('file_key')
+    expect(definition.parameters).toMatchObject({
+      type: 'object',
+      required: ['message_id'],
+    })
+    expect(definition.output.schema).toMatchObject({
+      type: 'object',
+      required: ['message_id', 'ok', 'summary', 'results'],
+    })
+    expect(definition.isConcurrencySafe?.()).toBe(false)
+    expect(JSON.parse(JSON.stringify(definition.parameters))).toEqual(definition.parameters)
+
+    // Mounting the same scope twice must not register a duplicate row.
+    await harness.runtime.mount(harness.ctx, 'session-tools')
+    expect(harness.register).toHaveBeenCalledTimes(1)
+  })
+
+  it('warns once and skips registration when the tools service is missing', async () => {
+    const first = setupRuntime({ includeTools: false })
+    await first.mount().catch(() => undefined)
+    expect(first.definitions.size).toBe(0)
+    expect(first.warn).toHaveBeenCalledTimes(1)
+    expect(String(first.warn.mock.calls[0]?.[0])).toContain('tools')
+
+    const second = setupRuntime({ includeTools: false })
+    await second.runtime.mount(second.ctx, 'session-tools')
+    // The warning is runtime-scoped; a second scope of the same runtime reuses it.
+    // (A second runtime would warn again — one warning per runtime instance.)
+    expect(second.warn).toHaveBeenCalledTimes(1)
+    expect(second.definitions.size).toBe(0)
+  })
+
+  it('warns once and skips registration when the attachments service is missing', async () => {
+    const harness = setupRuntime({ includeAttachments: false })
+    await harness.mount().catch(() => undefined)
+    expect(harness.definitions.size).toBe(0)
+    expect(harness.register).not.toHaveBeenCalled()
+    expect(harness.warn).toHaveBeenCalledTimes(1)
+    expect(String(harness.warn.mock.calls[0]?.[0])).toContain('attachments')
+  })
+
+  it('does not inject or register when the feature switch is off', async () => {
+    const harness = setupRuntime({ config: makeConfig({}, { attachmentFetch: false }) })
+    const inject = vi.spyOn(harness.ctx, 'inject')
+    await harness.runtime.mount(harness.ctx, 'session-tools')
+    expect(inject).not.toHaveBeenCalled()
+    expect(harness.definitions.size).toBe(0)
+  })
+
+  it('reports a readable failure when the switch is turned off after registration', async () => {
+    const harness = setupRuntime()
+    const definition = await harness.mount()
+    const messageId = knownFile(harness)
+    const config = harness.config as FeishuConfig & { feishuTools: FeishuConfig['feishuTools'] }
+    config.feishuTools = { ...config.feishuTools, attachmentFetch: false }
+
+    const value = await runTool(definition, { message_id: messageId })
+    expect(value.ok).toBe(false)
+    expect(value.summary).toContain('已禁用')
+    expect(harness.channel.downloaded).toEqual([])
+  })
+
+  it('warns once when real cordis settles an injection without calling back', async () => {
+    // Real cordis behavior when a required dependency never appears: the
+    // injection fiber settles without ever invoking the callback.
+    const harness = setupRuntime()
+    vi.spyOn(harness.ctx, 'inject').mockImplementation((() => Promise.resolve()) as typeof harness.ctx.inject)
+    await harness.runtime.mount(harness.ctx, 'session-tools')
+    expect(harness.definitions.size).toBe(0)
+    expect(harness.warn).toHaveBeenCalledTimes(1)
+    expect(String(harness.warn.mock.calls[0]?.[0])).toContain('不可用')
+
+    // A second scope without the services reuses the one-time warning.
+    const second = makeAgentContext()
+    vi.spyOn(second, 'inject').mockImplementation((() => Promise.resolve()) as typeof second.inject)
+    await harness.runtime.mount(second, 'session-tools')
+    expect(harness.warn).toHaveBeenCalledTimes(1)
+  })
+
+  it('dedupes the mount attempt on the outer agent scope even with a different callback context', async () => {
+    const harness = setupRuntime()
+    const callbackCtx = makeAgentContext()
+    callbackCtx.tools = { register: harness.register } as unknown as ToolRuntime
+    callbackCtx.attachments = harness.store
+    const inject = vi.spyOn(harness.ctx, 'inject').mockImplementation((((
+      _deps: readonly string[],
+      callback: (ctx: AgentContext) => void,
+    ) => {
+      callback(callbackCtx)
+      return Promise.resolve()
+    }) as typeof harness.ctx.inject))
+
+    await harness.runtime.mount(harness.ctx, 'session-tools')
+    await harness.runtime.mount(harness.ctx, 'session-tools')
+    // The outer-scope WeakMap must prevent a second injection altogether.
+    expect(inject).toHaveBeenCalledTimes(1)
+    expect(harness.register).toHaveBeenCalledTimes(1)
+    expect(harness.definitions.size).toBe(1)
+  })
+
+  it('re-registers the tool after the host service reloads the injection', async () => {
+    const harness = setupRuntime()
+    const callbackCtx = makeAgentContext()
+    let active = 0
+    const disposers: Array<() => void> = []
+    const register = vi.fn(() => {
+      active += 1
+      const dispose = (): void => { active -= 1 }
+      disposers.push(dispose)
+      return dispose
+    })
+    callbackCtx.tools = { register } as unknown as ToolRuntime
+    callbackCtx.attachments = harness.store
+    let callback: ((ctx: AgentContext) => void) | undefined
+    vi.spyOn(harness.ctx, 'inject').mockImplementation((((
+      _deps: readonly string[],
+      cb: (ctx: AgentContext) => void,
+    ) => {
+      callback = cb
+      cb(callbackCtx)
+      return Promise.resolve()
+    }) as typeof harness.ctx.inject))
+
+    await harness.runtime.mount(harness.ctx, 'session-tools')
+    expect(active).toBe(1)
+    // Cordis unloads the injection fiber (service remount): its effects are
+    // disposed and the SAME callback context is invoked again.
+    disposers[0]?.()
+    expect(active).toBe(0)
+    callback?.(callbackCtx)
+    expect(active).toBe(1)
+    expect(register).toHaveBeenCalledTimes(2)
+  })
+
+  it('logs one warning and keeps the session alive when the injection fails', async () => {
+    const harness = setupRuntime()
+    vi.spyOn(harness.ctx, 'inject').mockRejectedValueOnce(new Error('no such service'))
+    await expect(harness.runtime.mount(harness.ctx, 'session-tools')).resolves.toBeUndefined()
+    expect(harness.definitions.size).toBe(0)
+    expect(harness.warn).toHaveBeenCalledTimes(1)
+    expect(String(harness.warn.mock.calls[0]?.[0])).toContain('mounting')
+  })
+
+  it('does not block session creation when the host services never appear in time', async () => {
+    vi.useFakeTimers()
+    try {
+      const harness = setupRuntime()
+      let release!: () => void
+      const injection = new Promise<void>((resolve) => { release = resolve })
+      let callback: ((ctx: AgentContext) => void) | undefined
+      vi.spyOn(harness.ctx, 'inject').mockImplementation(((_deps: readonly string[], cb: (ctx: AgentContext) => void) => {
+        callback = cb
+        return injection as unknown as PromiseLike<unknown>
+      }) as typeof harness.ctx.inject)
+
+      const mounting = harness.runtime.mount(harness.ctx, 'session-tools')
+      await vi.advanceTimersByTimeAsync(2_100)
+      await mounting
+      expect(harness.definitions.size).toBe(0)
+      expect(harness.warn).toHaveBeenCalledTimes(1)
+      expect(String(harness.warn.mock.calls[0]?.[0])).toContain('不可用')
+
+      // The services mount later: the pending injection still registers the tool.
+      callback?.(harness.ctx)
+      release()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(harness.definitions.size).toBe(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('mounts after the preset setup and threads the session id', async () => {
+    const presets = makeAgentPresets()
+    const ctxState = makeHostContext(undefined, presets)
+    const order: string[] = []
+    presets.mount.mockImplementation(async (agentCtx: AgentContext, id?: string) => {
+      order.push('preset')
+      return { id: id ?? presets.defaultId, path: '/presets/standard' }
+    })
+    const mountTools = vi.fn(async (agentCtx: AgentContext, sessionId: string) => {
+      expect(agentCtx).toBeDefined()
+      expect(sessionId).toBe('session-create')
+      order.push('tools')
+    })
+    const manager = new SessionManager({
+      ctx: ctxState.ctx,
+      config: resolveConfig({}),
+      persistRoute: async () => {},
+      started: () => true,
+      detachStream: () => {},
+      mountTools,
+      warn: vi.fn(),
+    })
+
+    await manager.createSession('session-create' as SessionId, '/tmp/ws')
+
+    expect(order).toEqual(['preset', 'tools'])
+    expect(mountTools).toHaveBeenCalledTimes(1)
+  })
+
+  it('mounts on cold resume and backfills a borrowed live agent once', async () => {
+    const presets = makeAgentPresets()
+    const ctxState = makeHostContext(undefined, presets)
+    const mountTools = vi.fn(async () => {})
+    const manager = new SessionManager({
+      ctx: ctxState.ctx,
+      config: resolveConfig({}),
+      persistRoute: async () => {},
+      started: () => true,
+      detachStream: () => {},
+      mountTools,
+      warn: vi.fn(),
+    })
+    const record: RouteRecord = {
+      key: 'omt_thread_1',
+      kind: 'thread',
+      sessionId: 'session-resume',
+      chatId: 'oc_chat',
+      chatType: 'group',
+      senderOpenId: 'ou_user',
+      workspacePath: '/tmp/ws',
+      cardMessageId: 'om_card',
+      createdAt: 1,
+      lastActivityAt: 1,
+    }
+
+    await manager.ensureLive(record)
+    expect(mountTools).toHaveBeenCalledWith(expect.anything(), 'session-resume')
+
+    // A second ensureLive is served from the plugin's own live registry.
+    await manager.ensureLive(record)
+    expect(mountTools).toHaveBeenCalledTimes(1)
+
+    // A foreign live agent (web UI / previous instance) is borrowed and gets
+    // exactly one best-effort tool backfill.
+    const borrowState = makeHostContext(undefined, makeAgentPresets())
+    const borrowMount = vi.fn(async () => {})
+    const borrowManager = new SessionManager({
+      ctx: borrowState.ctx,
+      config: resolveConfig({}),
+      persistRoute: async () => {},
+      started: () => true,
+      detachStream: () => {},
+      mountTools: borrowMount,
+      warn: vi.fn(),
+    })
+    const foreign = makeAgent(makeSession('session-foreign' as SessionId))
+    borrowState.agents.liveAgents.set('session-foreign', { agent: foreign, dispose: async () => {} })
+    const foreignRecord: RouteRecord = { ...record, sessionId: 'session-foreign' }
+    const live = await borrowManager.ensureLive(foreignRecord)
+    expect(live.agent).toBe(foreign)
+    expect(borrowMount).toHaveBeenCalledWith(foreign.ctx, 'session-foreign')
+    await borrowManager.ensureLive(foreignRecord)
+    expect(borrowMount).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps session creation alive when tool mounting fails', async () => {
+    const presets = makeAgentPresets()
+    const ctxState = makeHostContext(undefined, presets)
+    const warn = vi.fn()
+    const manager = new SessionManager({
+      ctx: ctxState.ctx,
+      config: resolveConfig({}),
+      persistRoute: async () => {},
+      started: () => true,
+      detachStream: () => {},
+      mountTools: async () => { throw new Error('tool service exploded') },
+      warn,
+    })
+
+    await expect(manager.createSession('session-mount-fail' as SessionId, '/tmp/ws')).resolves.toBeDefined()
+    expect(warn).toHaveBeenCalledWith(
+      'dsh-channels: mounting channel tools for session %s failed: %s',
+      'session-mount-fail',
+      expect.stringContaining('tool service exploded'),
+    )
+  })
+})
+
+// ---- AC2: authorization whitelist -------------------------------------
+
+describe('feishu attachment-fetch authorization', () => {
+  it('keeps the whitelist per route and rejects a reused key with another owner', () => {
+    const whitelist = new RouteAttachmentWhitelist()
+    whitelist.register(DEFAULT_ROUTE, {
+      messageId: 'om_1', kind: 'message', resources: [{ type: 'file', fileKey: 'k1' }],
+    })
+    expect(whitelist.lookup(DEFAULT_ROUTE, 'om_1')?.messageId).toBe('om_1')
+    expect(whitelist.lookup({ ...DEFAULT_ROUTE, chatId: 'oc_other' }, 'om_1')).toBeUndefined()
+    expect(whitelist.lookup({ ...DEFAULT_ROUTE, senderOpenId: 'ou_other' }, 'om_1')).toBeUndefined()
+    expect(whitelist.lookup({
+      key: 'omt_other', kind: 'thread', chatId: 'oc_chat', chatType: 'group', senderOpenId: 'ou_user',
+    }, 'om_1')).toBeUndefined()
+    expect(whitelist.size(DEFAULT_ROUTE.key)).toBe(1)
+  })
+
+  it('evicts the least recently used known message', () => {
+    const whitelist = new RouteAttachmentWhitelist(2)
+    const message = (messageId: string) => ({
+      messageId, kind: 'message' as const, resources: [{ type: 'file' as const, fileKey: `${messageId}-key` }],
+    })
+    whitelist.register(DEFAULT_ROUTE, message('om_1'))
+    whitelist.register(DEFAULT_ROUTE, message('om_2'))
+    // Touch om_1 so om_2 becomes the eviction candidate.
+    expect(whitelist.lookup(DEFAULT_ROUTE, 'om_1')).toBeDefined()
+    whitelist.register(DEFAULT_ROUTE, message('om_3'))
+    expect(whitelist.lookup(DEFAULT_ROUTE, 'om_1')).toBeDefined()
+    expect(whitelist.lookup(DEFAULT_ROUTE, 'om_2')).toBeUndefined()
+    expect(whitelist.lookup(DEFAULT_ROUTE, 'om_3')).toBeDefined()
+  })
+
+  it('drops whitelist buckets for retired routes', () => {
+    const harness = setupRuntime()
+    knownFile(harness)
+    harness.runtime.noteKnownMessage(
+      { ...DEFAULT_ROUTE, key: 'omt_other' },
+      { messageId: 'om_other', kind: 'message', resources: [] },
+      'trigger',
+    )
+    expect(harness.runtime.whitelist.size()).toBe(2)
+
+    expect(harness.runtime.pruneRoutes(key => key === DEFAULT_ROUTE.key)).toBe(1)
+    expect(harness.runtime.whitelist.size()).toBe(1)
+    harness.runtime.forgetRoute(DEFAULT_ROUTE.key)
+    expect(harness.runtime.whitelist.size()).toBe(0)
+    harness.runtime.clear()
+  })
+
+  it('fetches a whitelisted message and records it for later turns', async () => {
+    const harness = setupRuntime()
+    const definition = await harness.mount()
+    const messageId = knownFile(harness)
+
+    const value = await runTool(definition, { message_id: messageId })
+    expect(value.ok).toBe(true)
+    expect(value.results[0]?.ok).toBe(true)
+    expect(harness.channel.downloaded).toEqual([
+      { messageId, fileKey: 'file_key_1', type: 'file' },
+    ])
+    expectLosslessJson(value)
+    // A later turn can fetch the same message again from the whitelist alone.
+    const again = await runTool(definition, { message_id: messageId })
+    expect(again.ok).toBe(true)
+  })
+
+  it('refuses an unknown message id without touching the channel', async () => {
+    const harness = setupRuntime()
+    const definition = await harness.mount()
+
+    const value = await runTool(definition, { message_id: 'om_unknown' })
+    expect(value.ok).toBe(false)
+    expect(value.results).toEqual([])
+    expect(value.summary).toContain('授权范围')
+    expect(harness.channel.downloaded).toEqual([])
+  })
+
+  it('reports a missing route binding instead of throwing', async () => {
+    const harness = setupRuntime({ unbound: true })
+    const definition = await harness.mount()
+    const messageId = knownFile(harness)
+
+    const value = await runTool(definition, { message_id: messageId })
+    expect(value.ok).toBe(false)
+    expect(value.summary).toContain('尚未绑定飞书对话')
+    expect(harness.channel.downloaded).toEqual([])
+  })
+
+  it('refuses a file_key that does not belong to the known message', async () => {
+    const harness = setupRuntime()
+    const definition = await harness.mount()
+    const messageId = knownFile(harness)
+
+    const value = await runTool(definition, { message_id: messageId, file_key: 'file_key_other' })
+    expect(value.ok).toBe(false)
+    expect(value.summary).toContain('file_key')
+    expect(value.summary).toContain('file_key_1')
+    expect(harness.channel.downloaded).toEqual([])
+  })
+
+  it('authorizes pending-registry messages, consumes the manifest row and reuses the whitelist', async () => {
+    const harness = setupRuntime()
+    const definition = await harness.mount()
+    const message = makeMessage({
+      messageId: 'om_pending',
+      chatId: DEFAULT_ROUTE.chatId,
+      threadId: DEFAULT_ROUTE.key,
+      senderId: DEFAULT_ROUTE.senderOpenId,
+      rawContentType: 'file',
+      content: '',
+      resources: [{ type: 'file', fileKey: 'file_key_pending', fileName: 'pending.pdf' }],
+    })
+    await harness.pending.registerMessage(message, { admitted: true })
+
+    const value = await runTool(definition, { message_id: 'om_pending' })
+    expect(value.ok).toBe(true)
+    expect(harness.channel.downloaded[0]).toEqual({
+      messageId: 'om_pending', fileKey: 'file_key_pending', type: 'file',
+    })
+    const scope = { chatId: DEFAULT_ROUTE.chatId, threadId: DEFAULT_ROUTE.key, senderOpenId: DEFAULT_ROUTE.senderOpenId }
+    expect(harness.pending.list(scope)).toEqual([])
+    // Consumed rows stay queryable, and the whitelist keeps retries authorized.
+    expect(harness.pending.get(scope, 'om_pending')?.consumed).toBe(true)
+    const retry = await runTool(definition, { message_id: 'om_pending' })
+    expect(retry.ok).toBe(true)
+  })
+
+  it('keeps an all-failed pending fetch discoverable (not consumed) and retriable', async () => {
+    const harness = setupRuntime()
+    const definition = await harness.mount()
+    const message = makeMessage({
+      messageId: 'om_pending_fail',
+      chatId: DEFAULT_ROUTE.chatId,
+      threadId: DEFAULT_ROUTE.key,
+      senderId: DEFAULT_ROUTE.senderOpenId,
+      rawContentType: 'file',
+      content: '',
+      resources: [{ type: 'file', fileKey: 'file_key_flaky' }],
+    })
+    await harness.pending.registerMessage(message, { admitted: true })
+    harness.channel.downloadResource = async () => { throw new Error('temporary failure') }
+
+    const failed = await runTool(definition, { message_id: 'om_pending_fail' })
+    expect(failed.ok).toBe(false)
+    const scope = { chatId: DEFAULT_ROUTE.chatId, threadId: DEFAULT_ROUTE.key, senderOpenId: DEFAULT_ROUTE.senderOpenId }
+    expect(harness.pending.list(scope)).toHaveLength(1)
+
+    // The whitelist entry recorded before the downloads keeps the retry authorized.
+    harness.channel.downloadResource = async () => streamOf([fileBytes(7)])
+    const retry = await runTool(definition, { message_id: 'om_pending_fail' })
+    expect(retry.ok).toBe(true)
+    expect(harness.pending.list(scope)).toEqual([])
+  })
+
+  it('does not see another sender\'s pending registration', async () => {
+    const harness = setupRuntime()
+    const definition = await harness.mount()
+    const message = makeMessage({
+      messageId: 'om_pending_other',
+      chatId: DEFAULT_ROUTE.chatId,
+      threadId: DEFAULT_ROUTE.key,
+      senderId: 'ou_someone_else',
+      rawContentType: 'file',
+      content: '',
+      resources: [{ type: 'file', fileKey: 'file_key_other_owner' }],
+    })
+    await harness.pending.registerMessage(message, { admitted: true })
+
+    const value = await runTool(definition, { message_id: 'om_pending_other' })
+    expect(value.ok).toBe(false)
+    expect(harness.channel.downloaded).toEqual([])
+  })
+
+  it('lets a topic route reach its own chat-scope pending registration', async () => {
+    const harness = setupRuntime()
+    const definition = await harness.mount()
+    // A group file posted WITHOUT an @ before the topic existed is registered
+    // without a thread id; the later @-created topic must still fetch it.
+    const message = makeMessage({
+      messageId: 'om_pending_chat_scope',
+      chatId: DEFAULT_ROUTE.chatId,
+      threadId: undefined,
+      senderId: DEFAULT_ROUTE.senderOpenId,
+      rawContentType: 'file',
+      content: '',
+      resources: [{ type: 'file', fileKey: 'file_key_chat_scope' }],
+    })
+    await harness.pending.registerMessage(message, { admitted: true })
+
+    const value = await runTool(definition, { message_id: 'om_pending_chat_scope' })
+    expect(value.ok).toBe(true)
+    expect(harness.channel.downloaded[0]?.fileKey).toBe('file_key_chat_scope')
+  })
+
+  it('refuses an expired pending registration', async () => {
+    let now = 1_000
+    const pending = makePendingStore({ now: () => now, ttlMs: 100 })
+    const harness = setupRuntime({ pending })
+    const definition = await harness.mount()
+    const message = makeMessage({
+      messageId: 'om_pending_expired',
+      chatId: DEFAULT_ROUTE.chatId,
+      threadId: DEFAULT_ROUTE.key,
+      senderId: DEFAULT_ROUTE.senderOpenId,
+      rawContentType: 'file',
+      content: '',
+      resources: [{ type: 'file', fileKey: 'file_key_expired' }],
+    })
+    await pending.registerMessage(message, { admitted: true })
+    now += 200
+
+    const value = await runTool(definition, { message_id: 'om_pending_expired' })
+    expect(value.ok).toBe(false)
+    expect(harness.channel.downloaded).toEqual([])
+  })
+
+  it('validates the arguments with zod (message_id required, unknown keys rejected)', () => {
+    expect(attachmentFetchArgsSchema.safeParse({ message_id: 'om_1' }).success).toBe(true)
+    expect(attachmentFetchArgsSchema.safeParse({ file_key: 'k1' }).success).toBe(false)
+    expect(attachmentFetchArgsSchema.safeParse({ message_id: 'om_1', extra: 1 }).success).toBe(false)
+  })
+
+  it('throws a readable error for invalid arguments instead of a raw object', async () => {
+    const harness = setupRuntime()
+    const definition = await harness.mount()
+    await expect(runTool(definition, { file_key: 'k1' })).rejects.toThrow(/invalid message_id/u)
+  })
+})
+
+// ---- AC3: image results -----------------------------------------------
+
+describe('feishu attachment-fetch images', () => {
+  it('returns an ImageBlock plus text metadata and the read-only path', async () => {
+    const harness = setupRuntime()
+    const definition = await harness.mount()
+    const messageId = knownFile(harness, {
+      resources: [{ type: 'image', fileKey: 'img_key_1', fileName: 'shot.png' }],
+    })
+
+    const value = await runTool(definition, { message_id: messageId })
+    expect(value.ok).toBe(true)
+    const item = value.results[0]
+    expect(item?.kind).toBe('image')
+    expect(item?.bytes).toBeGreaterThanOrEqual(PNG_SIGNATURE.length)
+    expect(item?.width).toBe(640)
+    expect(item?.height).toBe(480)
+    expect(item?.media_type).toBe('image/png')
+    expect(item?.read_path).toContain('/host/attachments/images/')
+    expect(item?.attachment).toBe(harness.store.images[0])
+    expectLosslessJson(value)
+
+    const blocks = definition.output.render({}, value)
+    expect(blocks[0]?.type).toBe('text')
+    const text = String((blocks[0] as { text?: unknown }).text)
+    expect(text).toContain('图片')
+    expect(text).toContain('640×480')
+    expect(text).toContain('image/png')
+    expect(text).toContain('无法查看图片')
+    const imageBlock = blocks.find(block => block.type === 'image')
+    expect(imageBlock?.attachment).toBe(harness.store.images[0])
+  })
+
+  it('reports one unsupported image as a structured failure without failing the call shape', async () => {
+    const channel = makeTestChannel({ download: () => streamOf([fileBytes(1, 2, 3, 4)]) })
+    const harness = setupRuntime({ channel })
+    const definition = await harness.mount()
+    const messageId = knownFile(harness, {
+      resources: [{ type: 'image', fileKey: 'img_bad' }],
+    })
+
+    const value = await runTool(definition, { message_id: messageId })
+    expect(value.ok).toBe(false)
+    expect(value.results[0]).toMatchObject({ ok: false, kind: 'image', code: 'UNSUPPORTED_IMAGE_TYPE' })
+    expect(harness.store.images).toEqual([])
+    const text = String((definition.output.render({}, value)[0] as { text?: unknown }).text)
+    expect(text).toContain('获取失败')
+  })
+
+  it('enforces the host image byte limit before storing', async () => {
+    const store = makeAttachmentStore({
+      imageLimits: {
+        maxImageBytes: 8,
+        maxImagesPerMessage: 10,
+        maxMessageImageBytes: 1024,
+        maxImagePixels: 100_000_000,
+        maxImageDimension: 10_000,
+        mediaTypes: ['image/png'],
+      },
+    })
+    const channel = makeTestChannel({ download: () => streamOf([pngBytes(16)]) })
+    const harness = setupRuntime({ channel, store })
+    const definition = await harness.mount()
+    const messageId = knownFile(harness, {
+      resources: [{ type: 'image', fileKey: 'img_large' }],
+    })
+
+    const value = await runTool(definition, { message_id: messageId })
+    expect(value.ok).toBe(false)
+    expect(value.results[0]?.code).toBe('IMAGE_TOO_LARGE')
+    expect(harness.store.images).toEqual([])
+  })
+
+  it('enforces the call byte budget for images', async () => {
+    const harness = setupRuntime({ config: makeConfig({}, { attachmentFetchMaxBytes: 5 }) })
+    const definition = await harness.mount()
+    const messageId = knownFile(harness, {
+      resources: [{ type: 'image', fileKey: 'img_budget' }],
+    })
+    harness.channel.downloadResource = async () => streamOf([pngBytes(16)])
+
+    const value = await runTool(definition, { message_id: messageId })
+    expect(value.ok).toBe(false)
+    expect(value.results[0]?.code).toBe('BYTES_LIMIT')
+    expect(harness.store.images).toEqual([])
+  })
+})
+
+// ---- AC4: file results -------------------------------------------------
+
+describe('feishu attachment-fetch files', () => {
+  it('streams a file into the native library and returns a FileBlock with handle text', async () => {
+    const payload = fileBytes(10, 20, 30, 40, 50)
+    const channel = makeTestChannel({ download: () => streamOf([payload.subarray(0, 2), payload.subarray(2)]) })
+    const harness = setupRuntime({ channel })
+    const definition = await harness.mount()
+    const messageId = knownFile(harness, { fileKey: 'file_key_report', fileName: 'report.pdf' })
+
+    const value = await runTool(definition, { message_id: messageId })
+    expect(value.ok).toBe(true)
+    const item = value.results[0]
+    expect(item?.kind).toBe('file')
+    expect(item?.bytes).toBe(payload.byteLength)
+    expect(item?.attachment).toBe(harness.store.files[0]?.ref)
+    expect(harness.store.files[0]?.ref.name).toBe('report.pdf')
+    // Content consistency: the stored bytes are exactly the downloaded bytes.
+    expect([...(harness.store.files[0]?.bytes ?? [])]).toEqual([...payload])
+    expect(item?.handle_text).toContain('report.pdf')
+    expect(item?.handle_text).toContain('/host/attachments/files/')
+    expectLosslessJson(value)
+
+    const blocks = definition.output.render({}, value)
+    const text = String((blocks[0] as { text?: unknown }).text)
+    expect(text).toContain('report.pdf')
+    expect(text).toContain('/host/attachments/files/')
+    const fileBlock = blocks.find(block => block.type === 'file')
+    expect(fileBlock?.attachment).toBe(harness.store.files[0]?.ref)
+  })
+
+  it('keeps the textual handle fallback when the host maps no read-only path', async () => {
+    const store = makeAttachmentStore({ fileHostPath: () => undefined })
+    const harness = setupRuntime({ store })
+    const definition = await harness.mount()
+    const messageId = knownFile(harness)
+
+    const value = await runTool(definition, { message_id: messageId })
+    expect(value.ok).toBe(true)
+    expect(value.results[0]?.handle_text).toContain('cannot access a readable path')
+    const text = String((definition.output.render({}, value)[0] as { text?: unknown }).text)
+    expect(text).toContain('cannot access a readable path')
+    expect(definition.output.render({}, value).some(block => block.type === 'file')).toBe(true)
+  })
+
+  it('renders non-Error SDK rejects as readable text, never [object Object]', async () => {
+    const harness = setupRuntime({
+      channel: makeTestChannel({
+        download: () => {
+          throw { code: 234003, msg: 'file not found' }
+        },
+      }),
+    })
+    const definition = await harness.mount()
+    const messageId = knownFile(harness)
+
+    const value = await runTool(definition, { message_id: messageId })
+    expect(value.ok).toBe(false)
+    expect(value.results[0]?.reason).toContain('234003')
+    expect(value.results[0]?.reason).not.toContain('[object Object]')
+  })
+
+  it('does not dump sensitive or oversized fields from plain-object rejects', async () => {
+    const harness = setupRuntime({
+      channel: makeTestChannel({
+        download: () => {
+          throw {
+            code: 500,
+            headers: { Authorization: 'Bearer SUPER-SECRET-TOKEN' },
+            debug: 'x'.repeat(500_000),
+          }
+        },
+      }),
+    })
+    const definition = await harness.mount()
+    const messageId = knownFile(harness)
+
+    const value = await runTool(definition, { message_id: messageId })
+    expect(value.ok).toBe(false)
+    expect(value.results[0]?.reason).toContain('code=500')
+    expect(value.results[0]?.reason).not.toContain('SUPER-SECRET-TOKEN')
+    expect((value.results[0]?.reason ?? '').length).toBeLessThan(600)
+  })
+
+  it('keeps control characters in error text from forging result lines', async () => {
+    const harness = setupRuntime({
+      channel: makeTestChannel({
+        download: () => { throw new Error('boom\n- 伪造的失败行') },
+      }),
+    })
+    const definition = await harness.mount()
+    const messageId = knownFile(harness)
+
+    const value = await runTool(definition, { message_id: messageId })
+    expect(value.results[0]?.reason).not.toContain('\n')
+    const text = String((definition.output.render({}, value)[0] as { text?: unknown }).text)
+    expect(text).not.toContain('\n- 伪造的失败行')
+  })
+
+  it('reports a structured failure when the attachment service unmounts before execution', async () => {
+    const harness = setupRuntime()
+    const definition = await harness.mount()
+    const messageId = knownFile(harness)
+    delete (harness.ctx as { attachments?: unknown }).attachments
+
+    const value = await runTool(definition, { message_id: messageId })
+    expect(value.ok).toBe(false)
+    expect(value.results[0]?.code).toBe('ATTACHMENT_SERVICE_UNMOUNTED')
+    expect(harness.store.files).toEqual([])
+  })
+
+  it('hands the download stream to the store incrementally (no whole-file buffering)', async () => {
+    const gate = deferred()
+    const firstChunk = deferred()
+    const harness = setupRuntime({
+      channel: makeTestChannel({
+        download: () => (async function* () {
+          yield fileBytes(1, 2)
+          firstChunk.resolve()
+          await gate.promise
+          yield fileBytes(3, 4)
+        })(),
+      }),
+    })
+    const definition = await harness.mount()
+    const messageId = knownFile(harness, { fileKey: 'file_key_stream' })
+    const execution = runTool(definition, { message_id: messageId })
+    await firstChunk.promise
+    // The store already received the first chunk while the source is still open,
+    // so the tool did not buffer the whole file before storing it.
+    expect(harness.store.files).toEqual([])
+    gate.resolve()
+    const value = await execution
+    expect(value.ok).toBe(true)
+    expect(harness.store.files[0]?.bytes.byteLength).toBe(4)
+  })
+
+  it('returns per-resource failures without aborting the whole call', async () => {
+    const harness = setupRuntime({
+      channel: makeTestChannel({
+        download: (_messageId, fileKey, type) => {
+          if (fileKey === 'file_key_bad') throw new Error('status code 400 bad request')
+          return type === 'image' ? streamOf([pngBytes()]) : streamOf([fileBytes(1, 2, 3)])
+        },
+      }),
+    })
+    const definition = await harness.mount()
+    const messageId = knownFile(harness, {
+      resources: [
+        { type: 'file', fileKey: 'file_key_bad', fileName: 'bad.bin' },
+        { type: 'file', fileKey: 'file_key_good', fileName: 'good.bin' },
+      ],
+    })
+
+    const value = await runTool(definition, { message_id: messageId })
+    expect(value.ok).toBe(false)
+    expect(value.results).toHaveLength(2)
+    expect(value.results[0]).toMatchObject({ ok: false, code: 'DOWNLOAD_FAILED' })
+    expect(value.results[0]?.reason).toContain('文件可能已过期')
+    expect(value.results[1]).toMatchObject({ ok: true, kind: 'file' })
+    expect(harness.store.files).toHaveLength(1)
+    expect(value.summary).toContain('1/2')
+  })
+
+  it('reports folder resources as unsupported without downloading', async () => {
+    const harness = setupRuntime()
+    const definition = await harness.mount()
+    const messageId = knownFile(harness, {
+      resources: [{ type: 'file', fileKey: 'folder_key', folder: true }],
+    })
+
+    const value = await runTool(definition, { message_id: messageId })
+    expect(value.ok).toBe(false)
+    expect(value.results[0]?.code).toBe('FOLDER_UNSUPPORTED')
+    expect(harness.channel.downloaded).toEqual([])
+  })
+})
+
+// ---- AC5: limits and cancellation -------------------------------------
+
+describe('feishu attachment-fetch limits and cancellation', () => {
+  it('refuses a message over the per-call resource limit before downloading', async () => {
+    const resources: KnownAttachmentResource[] = [1, 2, 3].map(index => ({
+      type: 'file' as const, fileKey: `file_key_${index}`,
+    }))
+    const harness = setupRuntime({ config: makeConfig({}, { attachmentFetchMaxResources: 2 }) })
+    const definition = await harness.mount()
+    const messageId = knownFile(harness, { resources })
+
+    const value = await runTool(definition, { message_id: messageId })
+    expect(value.ok).toBe(false)
+    expect(value.summary).toContain('上限')
+    expect(harness.channel.downloaded).toEqual([])
+  })
+
+  it('accepts a file that fits the byte budget exactly', async () => {
+    const harness = setupRuntime({ config: makeConfig({}, { attachmentFetchMaxBytes: 3 }) })
+    const definition = await harness.mount()
+    const messageId = knownFile(harness, { fileKey: 'file_key_exact' })
+    harness.channel.downloadResource = async () => streamOf([fileBytes(1, 2, 3)])
+
+    const value = await runTool(definition, { message_id: messageId })
+    expect(value.ok).toBe(true)
+    expect(harness.store.files[0]?.ref.bytes).toBe(3)
+  })
+
+  it('enforces the total byte budget while streaming and commits no file', async () => {
+    const harness = setupRuntime({ config: makeConfig({}, { attachmentFetchMaxBytes: 4 }) })
+    const definition = await harness.mount()
+    const messageId = knownFile(harness, { fileKey: 'file_key_budget' })
+    harness.channel.downloadResource = async () => streamOf([fileBytes(1, 2, 3), fileBytes(4, 5)])
+
+    const value = await runTool(definition, { message_id: messageId })
+    expect(value.ok).toBe(false)
+    expect(value.results[0]?.code).toBe('BYTES_LIMIT')
+    expect(harness.store.files).toEqual([])
+  })
+
+  it('enforces the byte budget across several resources', async () => {
+    const harness = setupRuntime({ config: makeConfig({}, { attachmentFetchMaxBytes: 4 }) })
+    const definition = await harness.mount()
+    const messageId = knownFile(harness, {
+      resources: [
+        { type: 'file', fileKey: 'file_key_first', fileName: 'first.bin' },
+        { type: 'file', fileKey: 'file_key_second', fileName: 'second.bin' },
+      ],
+    })
+    harness.channel.downloadResource = async () => streamOf([fileBytes(1, 2, 3)])
+
+    const value = await runTool(definition, { message_id: messageId })
+    expect(value.ok).toBe(false)
+    expect(value.results[0]?.ok).toBe(true)
+    expect(value.results[1]?.code).toBe('BYTES_LIMIT')
+    expect(harness.store.files).toHaveLength(1)
+  })
+
+  it('reports a message-read failure when expanding a known message id', async () => {
+    const harness = setupRuntime({
+      channel: makeTestChannel({ messageGet: async () => { throw new Error('boom') } }),
+    })
+    const definition = await harness.mount()
+    harness.runtime.noteKnownMessage(harness.route, {
+      messageId: 'om_expand_fail', kind: 'message', resources: [],
+    }, 'trigger')
+
+    const value = await runTool(definition, { message_id: 'om_expand_fail' })
+    expect(value.ok).toBe(false)
+    expect(value.summary).toContain('读取飞书消息内容失败')
+  })
+
+  it('reports a message without downloadable resources', async () => {
+    const harness = setupRuntime({
+      channel: makeTestChannel({
+        messageGet: async () => ({
+          data: { items: [{ message_id: 'om_text', msg_type: 'text', body: { content: '{"text":"hi"}' } }] },
+        }),
+      }),
+    })
+    const definition = await harness.mount()
+    harness.runtime.noteKnownMessage(harness.route, {
+      messageId: 'om_text', kind: 'message', resources: [],
+    }, 'trigger')
+
+    const value = await runTool(definition, { message_id: 'om_text' })
+    expect(value.ok).toBe(false)
+    expect(value.summary).toContain('不包含可下载')
+    expect(harness.channel.downloaded).toEqual([])
+  })
+
+  it('reports a disconnected channel per resource', async () => {
+    const harness = setupRuntime({ channel: null })
+    const definition = await harness.mount()
+    const messageId = knownFile(harness)
+
+    const value = await runTool(definition, { message_id: messageId })
+    expect(value.ok).toBe(false)
+    expect(value.results[0]?.code).toBe('CHANNEL_UNAVAILABLE')
+  })
+
+  it('performs no download for an already-aborted call', async () => {
+    const harness = setupRuntime()
+    const definition = await harness.mount()
+    const messageId = knownFile(harness)
+    const controller = new AbortController()
+    controller.abort()
+
+    const value = await runTool(definition, { message_id: messageId }, controller.signal)
+    expect(value.ok).toBe(false)
+    expect(value.summary).toContain('取消')
+    expect(harness.channel.downloaded).toEqual([])
+    expect(harness.store.files).toEqual([])
+  })
+
+  it('cancels a mid-stream file download without committing a partial file', async () => {
+    const gate = deferred()
+    const firstChunk = deferred()
+    const harness = setupRuntime({
+      channel: makeTestChannel({
+        download: () => (async function* () {
+          yield fileBytes(1, 2)
+          firstChunk.resolve()
+          await gate.promise
+          yield fileBytes(3)
+        })(),
+      }),
+    })
+    const definition = await harness.mount()
+    const messageId = knownFile(harness, { fileKey: 'file_key_cancel' })
+    const controller = new AbortController()
+    const execution = runTool(definition, { message_id: messageId }, controller.signal)
+    await firstChunk.promise
+    controller.abort()
+    gate.resolve()
+
+    const value = await execution
+    expect(value.ok).toBe(false)
+    expect(value.results[0]?.code).toBe('ABORTED')
+    expect(harness.store.files).toEqual([])
+    expect(harness.store.aborted.count).toBeGreaterThan(0)
+  })
+
+  it('never hangs on a stalled pending-consume write after fetching', async () => {
+    vi.useFakeTimers()
+    try {
+      const record = {
+        key: 'om_pending_stall',
+        scopeKey: 'thread:oc_chat:omt_thread_1:ou_user',
+        messageId: 'om_pending_stall',
+        chatId: DEFAULT_ROUTE.chatId,
+        chatType: 'group',
+        threadId: DEFAULT_ROUTE.key,
+        senderOpenId: DEFAULT_ROUTE.senderOpenId,
+        receivedAt: 1,
+        kind: 'file',
+        resources: [{ type: 'file', fileKey: 'file_key_stall' }],
+      }
+      const stalled = {
+        get: () => record,
+        consume: () => new Promise(() => {}),
+      } as unknown as PendingAttachmentStore
+      const harness = setupRuntime({
+        pending: stalled,
+        config: makeConfig({}, { attachmentFetchTimeoutMs: 1_000 }),
+      })
+      const definition = await harness.mount()
+      const execution = runTool(definition, { message_id: 'om_pending_stall' })
+      await vi.advanceTimersByTimeAsync(1_100)
+      const value = await execution
+      // Attachment delivery already happened; the stalled bookkeeping write
+      // must not keep the tool call pending past the deadline.
+      expect(value.ok).toBe(true)
+      expect(harness.store.files).toHaveLength(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('times out with a readable reason and leaves no committed file', async () => {
+    vi.useFakeTimers()
+    try {
+      const gate = deferred()
+      const harness = setupRuntime({
+        config: makeConfig({}, { attachmentFetchTimeoutMs: 1_000 }),
+        channel: makeTestChannel({
+          download: () => (async function* () {
+            yield fileBytes(1, 2)
+            await gate.promise
+          })(),
+        }),
+      })
+      const definition = await harness.mount()
+      const messageId = knownFile(harness, {
+        resources: [
+          { type: 'file', fileKey: 'file_key_timeout_1', fileName: 'a.bin' },
+          { type: 'file', fileKey: 'file_key_timeout_2', fileName: 'b.bin' },
+        ],
+      })
+      const execution = runTool(definition, { message_id: messageId })
+      await vi.advanceTimersByTimeAsync(1_100)
+      const value = await execution
+      expect(value.ok).toBe(false)
+      expect(value.results[0]?.code).toBe('TIMEOUT')
+      // The remaining resources are not attempted after the deadline.
+      expect(value.results[1]?.code).toBe('TIMEOUT')
+      expect(value.summary).toContain('超时')
+      expect(harness.store.files).toEqual([])
+      expect(harness.channel.downloaded).toHaveLength(1)
+      gate.resolve()
+      await vi.runOnlyPendingTimersAsync()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('returns a readable reason when every resource fails', async () => {
+    const harness = setupRuntime({
+      channel: makeTestChannel({ download: () => { throw new Error('boom') } }),
+    })
+    const definition = await harness.mount()
+    const messageId = knownFile(harness)
+
+    const value = await runTool(definition, { message_id: messageId })
+    expect(value.ok).toBe(false)
+    expect(value.summary).toContain('下载失败')
+    const text = String((definition.output.render({}, value)[0] as { text?: unknown }).text)
+    expect(text).toContain('获取失败')
+  })
+})
+
+// ---- AC6: merged forward ----------------------------------------------
+
+describe('feishu attachment-fetch merged forward', () => {
+  const mergeForwardResponse = {
+    code: 0,
+    data: {
+      items: [
+        { message_id: 'om_container', msg_type: 'merge_forward', body: { content: 'Merged and forwarded messages' }, chat_id: 'oc_chat' },
+        { message_id: 'om_child_text', msg_type: 'text', body: { content: '{"text":"hello"}' }, chat_id: 'oc_chat' },
+        {
+          message_id: 'om_child_image',
+          msg_type: 'image',
+          body: { content: '{"image_key":"img_key_forwarded"}' },
+          chat_id: 'oc_chat',
+          upper_message_id: 'om_container',
+        },
+      ],
+    },
+  }
+
+  it('expands the container and downloads children through the container message id', async () => {
+    const harness = setupRuntime({
+      channel: makeTestChannel({ messageGet: async () => mergeForwardResponse }),
+    })
+    const definition = await harness.mount()
+    harness.runtime.noteKnownMessage(
+      harness.route,
+      { messageId: 'om_container', kind: 'merge_forward', resources: [] },
+      'trigger',
+    )
+
+    const value = await runTool(definition, { message_id: 'om_container' })
+    expect(value.ok).toBe(true)
+    expect(value.results[0]).toMatchObject({ ok: true, kind: 'image', file_key: 'img_key_forwarded' })
+    expect(harness.channel.downloaded).toEqual([
+      { messageId: 'om_container', fileKey: 'img_key_forwarded', type: 'image' },
+    ])
+    expectLosslessJson(value)
+  })
+
+  it('downloads a registered child resource through its container id, never the child id', async () => {
+    const harness = setupRuntime()
+    const definition = await harness.mount()
+    harness.runtime.noteKnownMessage(
+      harness.route,
+      {
+        messageId: 'om_child_message',
+        kind: 'message',
+        resources: [{
+          type: 'file',
+          fileKey: 'file_key_child',
+          fileName: 'child.txt',
+          containerMessageId: 'om_container',
+        }],
+      },
+      'quote',
+    )
+
+    const value = await runTool(definition, { message_id: 'om_child_message' })
+    expect(value.ok).toBe(true)
+    expect(harness.channel.downloaded).toEqual([
+      { messageId: 'om_container', fileKey: 'file_key_child', type: 'file' },
+    ])
+  })
+
+  it('refuses an unregistered child message id', async () => {
+    const harness = setupRuntime({
+      channel: makeTestChannel({ messageGet: async () => mergeForwardResponse }),
+    })
+    const definition = await harness.mount()
+
+    const value = await runTool(definition, { message_id: 'om_child_image' })
+    expect(value.ok).toBe(false)
+    expect(value.summary).toContain('授权范围')
+    expect(harness.channel.downloaded).toEqual([])
+  })
+
+  it('finds post files[] and locale-wrapped elements when expanding a message id', async () => {
+    const postContent = {
+      zh_cn: {
+        title: '报告',
+        content: [[
+          { tag: 'text', text: 'see attached' },
+          { tag: 'img', image_key: 'img_post_inline' },
+        ]],
+        files: [{ file_key: 'file_post_top', file_name: '数据.xlsx' }],
+      },
+    }
+    const harness = setupRuntime({
+      channel: makeTestChannel({
+        messageGet: async () => ({
+          data: {
+            items: [{
+              message_id: 'om_post',
+              msg_type: 'post',
+              body: { content: JSON.stringify(postContent) },
+            }],
+          },
+        }),
+      }),
+    })
+    const definition = await harness.mount()
+    harness.runtime.noteKnownMessage(harness.route, {
+      messageId: 'om_post', kind: 'message', resources: [],
+    }, 'trigger')
+
+    const value = await runTool(definition, { message_id: 'om_post' })
+    expect(value.ok).toBe(true)
+    expect(value.results.map(item => item.file_key).sort()).toEqual(['file_post_top', 'img_post_inline'])
+    expect(harness.channel.downloaded.map(entry => entry.fileKey).sort())
+      .toEqual(['file_post_top', 'img_post_inline'])
+  })
+
+  it('expands post children of a merged-forward container without losing files', async () => {
+    const childPost = {
+      content: [[{ tag: 'img', image_key: 'img_child_post' }]],
+      files: [{ file_key: 'file_child_post', file_name: 'child.pdf' }],
+    }
+    const harness = setupRuntime({
+      channel: makeTestChannel({
+        messageGet: async () => ({
+          data: {
+            items: [
+              { message_id: 'om_container2', msg_type: 'merge_forward', body: { content: 'Merged and forwarded messages' } },
+              { message_id: 'om_child_post', msg_type: 'post', body: { content: JSON.stringify(childPost) } },
+            ],
+          },
+        }),
+      }),
+    })
+    const definition = await harness.mount()
+    harness.runtime.noteKnownMessage(harness.route, {
+      messageId: 'om_container2', kind: 'merge_forward', resources: [],
+    }, 'trigger')
+
+    const value = await runTool(definition, { message_id: 'om_container2' })
+    expect(value.ok).toBe(true)
+    expect(
+      harness.channel.downloaded
+        .map(entry => `${entry.messageId}:${entry.fileKey}`)
+        .sort(),
+    ).toEqual([
+      'om_container2:file_child_post',
+      'om_container2:img_child_post',
+    ])
+  })
+
+  it('reports folder entries inside post files as unsupported', async () => {
+    const harness = setupRuntime({
+      channel: makeTestChannel({
+        messageGet: async () => ({
+          data: {
+            items: [{
+              message_id: 'om_post_folder',
+              msg_type: 'post',
+              body: {
+                content: JSON.stringify({
+                  content: [[{ tag: 'text', text: 'folder' }]],
+                  files: [{ file_key: 'folder_key_post', file_name: '资料', is_folder: true }],
+                }),
+              },
+            }],
+          },
+        }),
+      }),
+    })
+    const definition = await harness.mount()
+    harness.runtime.noteKnownMessage(harness.route, {
+      messageId: 'om_post_folder', kind: 'message', resources: [],
+    }, 'trigger')
+
+    const value = await runTool(definition, { message_id: 'om_post_folder' })
+    expect(value.ok).toBe(false)
+    expect(value.results[0]?.code).toBe('FOLDER_UNSUPPORTED')
+    expect(harness.channel.downloaded).toEqual([])
+  })
+
+  it('blocks a merged-forward expansion that exceeds the resource cap', async () => {
+    const items = [{ message_id: 'om_big_container', msg_type: 'merge_forward', body: { content: 'Merged and forwarded messages' } }]
+    for (let index = 0; index < 12; index += 1) {
+      items.push({
+        message_id: `om_big_child_${index}`,
+        msg_type: 'image',
+        body: { content: JSON.stringify({ image_key: `img_big_${index}` }) },
+      })
+    }
+    const harness = setupRuntime({
+      channel: makeTestChannel({ messageGet: async () => ({ data: { items } }) }),
+      config: makeConfig({}, { attachmentFetchMaxResources: 10 }),
+    })
+    const definition = await harness.mount()
+    harness.runtime.noteKnownMessage(harness.route, {
+      messageId: 'om_big_container', kind: 'merge_forward', resources: [],
+    }, 'trigger')
+
+    const value = await runTool(definition, { message_id: 'om_big_container' })
+    expect(value.ok).toBe(false)
+    expect(value.summary).toContain('上限')
+    expect(harness.channel.downloaded).toEqual([])
+  })
+
+  it('ignores non-standard nested files/tag fields outside the post body shape', async () => {
+    const harness = setupRuntime({
+      channel: makeTestChannel({
+        messageGet: async () => ({
+          data: {
+            items: [{
+              message_id: 'om_post_extra',
+              msg_type: 'post',
+              body: {
+                content: JSON.stringify({
+                  content: [[{ tag: 'text', text: 'no attachment here' }]],
+                  extra: { files: [{ file_key: 'metadata_file_key' }] },
+                }),
+              },
+            }],
+          },
+        }),
+      }),
+    })
+    const definition = await harness.mount()
+    harness.runtime.noteKnownMessage(harness.route, {
+      messageId: 'om_post_extra', kind: 'message', resources: [],
+    }, 'trigger')
+
+    const value = await runTool(definition, { message_id: 'om_post_extra' })
+    expect(value.ok).toBe(false)
+    expect(value.summary).toContain('不包含可下载')
+    expect(harness.channel.downloaded).toEqual([])
+  })
+
+  it('filters merged-forward children by file_key', async () => {
+    const harness = setupRuntime({
+      channel: makeTestChannel({ messageGet: async () => mergeForwardResponse }),
+    })
+    const definition = await harness.mount()
+    harness.runtime.noteKnownMessage(
+      harness.route,
+      { messageId: 'om_container', kind: 'merge_forward', resources: [] },
+      'trigger',
+    )
+
+    const value = await runTool(definition, { message_id: 'om_container', file_key: 'img_key_forwarded' })
+    expect(value.ok).toBe(true)
+    expect(harness.channel.downloaded).toHaveLength(1)
+
+    const missing = await runTool(definition, { message_id: 'om_container', file_key: 'img_missing' })
+    expect(missing.ok).toBe(false)
+    expect(missing.summary).toContain('file_key')
+    expect(harness.channel.downloaded).toHaveLength(1)
+  })
+})
+
+// ---- Presentation and configuration -----------------------------------
+
+describe('feishu attachment-fetch presentation and configuration', () => {
+  it('projects a readable call line and result summary for host-local cards', async () => {
+    const harness = setupRuntime()
+    const definition = await harness.mount()
+    const messageId = knownFile(harness)
+
+    expect(definition.presentCall?.({ message_id: messageId })).toBe(`获取飞书附件 ${messageId}`)
+    expect(definition.presentCall?.({ message_id: messageId, file_key: 'file_key_1' }))
+      .toBe(`获取飞书附件 ${messageId}（file_key_1）`)
+    const value = await runTool(definition, { message_id: messageId })
+    expect(definition.presentResult?.({ message_id: messageId }, value)).toBe(value.summary)
+  })
+
+  it('renders a safe fallback for a null/absent value from replay projections', () => {
+    const blocks = renderAttachmentFetchResult(undefined)
+    expect(blocks).toHaveLength(1)
+    expect(blocks[0]?.type).toBe('text')
+    expect(presentAttachmentFetchResult(null)).toBe(ATTACHMENT_FETCH_TOOL_NAME)
+    // A malformed replayed results array must not throw inside the projection.
+    const malformed = renderAttachmentFetchResult({
+      message_id: 'om_1', ok: false, summary: 'x', results: [null, { ok: true, kind: 'image' }],
+    })
+    expect(malformed[0]?.type).toBe('text')
+  })
+
+  it('does not mount when attachments are globally disabled', async () => {
+    const harness = setupRuntime({ config: makeConfig({ acceptAttachments: false }) })
+    await harness.runtime.mount(harness.ctx, 'session-tools')
+    expect(harness.definitions.size).toBe(0)
+    expect(harness.register).not.toHaveBeenCalled()
+  })
+
+  it('defaults the feature switch, limits and timeout', () => {
+    const config = resolveConfig({})
+    expect(config.feishuTools).toEqual({
+      attachmentFetch: true,
+      attachmentFetchMaxResources: 10,
+      attachmentFetchMaxBytes: 100 * 1024 * 1024,
+      attachmentFetchTimeoutMs: 120_000,
+    })
+  })
+
+  it('accepts nested overrides and rejects out-of-range limits', () => {
+    const config = resolveConfig({
+      feishuTools: {
+        attachmentFetch: false,
+        attachmentFetchMaxResources: 3,
+        attachmentFetchMaxBytes: 1024,
+        attachmentFetchTimeoutMs: 5_000,
+      },
+    })
+    expect(config.feishuTools).toMatchObject({
+      attachmentFetch: false,
+      attachmentFetchMaxResources: 3,
+      attachmentFetchMaxBytes: 1024,
+      attachmentFetchTimeoutMs: 5_000,
+    })
+    expect(config.feishuTools.attachmentFetchMaxResources).toBe(3)
+    expect(() => resolveConfig({ feishuTools: { attachmentFetchMaxResources: 0 } }))
+      .toThrow(/invalid configuration/u)
+    expect(() => resolveConfig({ feishuTools: { attachmentFetchTimeoutMs: 10 } }))
+      .toThrow(/invalid configuration/u)
+  })
+})
+
+// ---- Utility ----------------------------------------------------------
+
+afterEach(() => {
+  vi.useRealTimers()
+})

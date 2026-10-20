@@ -44,6 +44,15 @@ export const DEFAULT_PENDING_ATTACHMENT_TTL_MS = 7 * 24 * 60 * 60 * 1000
 /** Default per-`(chat, thread, sender)` cap of pending attachment rows. */
 export const DEFAULT_PENDING_ATTACHMENT_LIMIT = 10
 
+/** Default per-call attachment count of `feishu_attachment_fetch`. */
+export const DEFAULT_ATTACHMENT_FETCH_MAX_RESOURCES = 10
+
+/** Default per-call total download budget of `feishu_attachment_fetch` (100 MiB). */
+export const DEFAULT_ATTACHMENT_FETCH_MAX_BYTES = 100 * 1024 * 1024
+
+/** Default whole-call timeout of `feishu_attachment_fetch` (120 s). */
+export const DEFAULT_ATTACHMENT_FETCH_TIMEOUT_MS = 120_000
+
 /** A credential reference: `FEISHU_APP_ID`-style name resolved through ctx.credentials. */
 const credentialRefSchema = z.string().regex(
   CREDENTIAL_REF_PATTERN,
@@ -189,6 +198,40 @@ export const configSchema = z.object({
    * rows. Default 10.
    */
   pendingAttachmentLimit: z.number().int().min(1).max(100).default(DEFAULT_PENDING_ATTACHMENT_LIMIT),
+  /**
+   * Model-facing Feishu tools.
+   *
+   * - `attachmentFetch` (default on): register `feishu_attachment_fetch` in
+   *   channel sessions so the model can fetch images/files of a known message
+   *   on demand. Registration is skipped (with one warning) on deployments
+   *   without the host `tools` / `attachments` services.
+   * - `attachmentFetchMaxResources`: maximum attachments one tool call may
+   *   fetch (1–50). A message with more attachments is refused with a readable
+   *   reason so the model can retry per `file_key`.
+   * - `attachmentFetchMaxBytes`: total download budget of one tool call
+   *   (default 100 MiB). Files stream to the native attachment library, so the
+   *   limit is enforced while streaming rather than buffered first.
+   * - `attachmentFetchTimeoutMs`: whole-call timeout (default 120 s). On expiry
+   *   the in-flight download is cancelled and reported per attachment.
+   *
+   * The remaining tool toggles (`feishu_topic_messages`) arrive with the
+   * `quote_history_tools` task; the Web panel/metrics ship with
+   * `panel_docs_release`.
+   */
+  feishuTools: z.object({
+    attachmentFetch: z.boolean().default(true),
+    attachmentFetchMaxResources: z.number().int().min(1).max(50)
+      .default(DEFAULT_ATTACHMENT_FETCH_MAX_RESOURCES),
+    attachmentFetchMaxBytes: z.number().int().min(1).max(1024 * 1024 * 1024)
+      .default(DEFAULT_ATTACHMENT_FETCH_MAX_BYTES),
+    attachmentFetchTimeoutMs: z.number().int().min(1_000).max(600_000)
+      .default(DEFAULT_ATTACHMENT_FETCH_TIMEOUT_MS),
+  }).default({
+    attachmentFetch: true,
+    attachmentFetchMaxResources: DEFAULT_ATTACHMENT_FETCH_MAX_RESOURCES,
+    attachmentFetchMaxBytes: DEFAULT_ATTACHMENT_FETCH_MAX_BYTES,
+    attachmentFetchTimeoutMs: DEFAULT_ATTACHMENT_FETCH_TIMEOUT_MS,
+  }),
   /**
    * Delete the topic directories of stale conversations, plus legacy
    * one-workspace-per-topic directories written by older plugin versions.

@@ -53,6 +53,12 @@ function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
     attachmentStore: 'native',
     pendingAttachmentTtlMs: 7 * 24 * 60 * 60 * 1000,
     pendingAttachmentLimit: 10,
+    feishuTools: {
+      attachmentFetch: true,
+      attachmentFetchMaxResources: 10,
+      attachmentFetchMaxBytes: 100 * 1024 * 1024,
+      attachmentFetchTimeoutMs: 120_000,
+    },
     topicIsolation: 'auto',
     workspaceRetention: 'off',
     workspaceRetentionAuto: false,
