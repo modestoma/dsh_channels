@@ -79,6 +79,21 @@ git diff --check -> exit 0
 - 已记录不修项（见下方未验证项/已知差异）：native 模式回执表情、面板/文档、merge_forward 原生记录。
 - 复核后追加的 2 个用例（非下载存储故障不误标、超长错误截断）纳入最终 47 个用例。
 
+### 批次 A 真机加载/回归冒烟（2026-10-21 00:07–00:15，本机 desktop profile）
+
+目的：让真实 profile 加载本任务的新构建，确认默认 `attachmentStore=native` 未改变现有 archive 行为。
+AC4/AC5 的真机项仍待 `admission_manifest_flow` 接线后验证，本批次不覆盖新存储主路径。
+
+- **环境**：DSH 0.2.1-rc.2 desktop profile，插件 `link:` 指向本仓库；`pnpm build` 产物为 HEAD `717e98a` 工作树。
+- **免重启重载**：在 `~/.dsh/profiles/desktop/cordis.patch.yml` 的 `- id: dsh-channels` 下追加 `attachmentStore: native`（与默认等价；备份 `/tmp/dsh-cordis.patch.backup.yml`），触发 HMR profile recomposition。
+  - 证据：00:07:20 插件条目被 HMR 替换，飞书长连接重建——旧连接 `59835→198.18.36.45` 关闭，新连接 `61040→198.18.37.178`（`open.feishu.cn`）与 `61041→198.18.36.45` 建立；
+  - `plugin_manager` 复核 `include:dsh-channels`（`@modesto_ma/dsh-channels`）= enabled + `fiberPhase: active`，无 failed 状态。
+- **真实消息回归**（用户手工在 p2p 测试会话发送；2026-10-21 00:11 / 00:12）：
+  - 图片消息：新会话 `5624ae8c-c7ff-4184-bd08-2fbbb0433a79`，归档 `<workspace>/topics/omt_19b21a55244f1bad/attachments/20261020-161110-image.jpg`（8192×4608 JPEG，sha256 `fbd0d85c83a4206259e08c7edb75b0eca8a014acd26a187ff431ad6330b1836c`）；进入模型的 prompt 文本为「看下这张图片里是什么？」（附件占位符已剥离，旧 archive 语义不变）；该会话 13 条 assistant 消息 / 16 次 tool call / 0 错误事件。
+  - 文件消息：新会话 `40dd5e1c-f5c4-4dfb-988e-638f6f9fdde7`，归档 `<workspace>/topics/omt_19b21a3f9ecf1ba0/attachments/20261020-161241-dsh-session-session-7531c78c-….zip`（`unzip -l` 校验为有效 zip）；prompt 文本「看下这个文件」；47 条 assistant 消息 / 46 次 tool call / 0 错误事件。
+- **原生库落点**：`~/.dsh/attachments/v1` 对象文件 61 → 69；新增 8 个 JPEG 均可追溯为 channel agent 回合内 `read_image`/工具结果的图片投影（例如 216228 字节对象为所发图片的 2730×1536 请求版本，见该会话 `tool/result` 事件），**不是**入站附件存储路径写入（本任务无运行时消费者）；入站图片/文件只落在话题 `attachments/`。
+- **结论**：批次 A 通过——新构建在真实 profile 正常加载，默认 native 配置不改变旧 archive 行为。AC4/AC5 真机项保持不变，待接线验证。
+
 ### 未验证项 / 已知差异
 
 1. **AC4 真机手动**未在本任务重跑：本任务明确不接准入调用点、无 `fileHostPath` 产物可供真机读取；沿用 P0 Go 证据，待 `admission_manifest_flow` 接线后复验 `read`/`bash`。
@@ -86,7 +101,7 @@ git diff --check -> exit 0
 3. native 模式不再添加 DONE/No 回执表情：纯附件消息按 D2 保持静默；文本+附件混合消息的回执行为由 `admission_manifest_flow` 显式决定。
 4. `merge_forward` 的文本记录在 native 模式仍写话题 `attachments/`（`fallback: forwarded-record`）：DSH 原生库无对应文本记录形态，计划由 `quote_history_tools` 统一处理。
 5. Web 设置面板尚未暴露 `attachmentStore`（面板/文档属 `panel_docs_release` 范围）。
-6. 仅完成本地单测/类型/构建验证；未在真实 profile 重载插件、未做真机飞书消息验证。
+6. 已做批次 A 真机加载/旧行为回归冒烟（见上），但新存储层主路径（`saveImage`/`saveFileStream`/`fileHostPath` 的实际入站调用）仍未在真实 profile 执行过（本任务无调用点）。
 7. 会话中 mid-message 卸载（服务在单条消息处理中消失）按资源返回结构化未挂载失败，但无专门测试（评审建议后续补一条）。
 
 
