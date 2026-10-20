@@ -56,8 +56,8 @@ import {
 import type { CleanupDeps, CleanupRoute, CleanupTombstone, ScannedSessionDir, WorkspaceStats } from './cleanup.ts'
 import type {
   AccessGroupRecord, AccessRequestRecord, AccessUserRecord,
-  ExpiredRouteRecord, FeishuDomainGlobal, FeishuDomainHandle, InflightSnapshot, ProcessedRecord, RawDomainHandle,
-  RouteRecord,
+  ExpiredRouteRecord, FeishuDomainGlobal, FeishuDomainHandle, InflightSnapshot, PendingAttachmentRecord,
+  PendingAttachmentsTable, ProcessedRecord, RawDomainHandle, RouteRecord,
 } from './domain.ts'
 import { RouteStore } from './session/routes.ts'
 import { InflightRepair } from './session/repair.ts'
@@ -65,6 +65,7 @@ import { SessionManager } from './session/manager.ts'
 import type { LiveAgent, RenewCommit } from './session/manager.ts'
 import { CardDelivery } from './feishu/delivery.ts'
 import { AttachmentIntake } from './feishu/inbound-attachments.ts'
+import { PendingAttachmentStore } from './feishu/pending-attachments.ts'
 import { InboundRouter } from './routing/inbound.ts'
 import type { RequestPolicyController } from './session/request-policy.ts'
 import type { ChannelFactory, FeishuChannel, NormalizedMessage } from './feishu-channel.ts'
@@ -127,6 +128,29 @@ async function openFeishuDomain(ctx: HostContext): Promise<FeishuDomainHandle> {
   const accessGroupsRaw = domain.table('access_groups')
   const accessUsersRaw = domain.table('access_users')
   const accessRequestsRaw = domain.table('access_requests')
+  // Pending attachment metadata is a table ADDED to the domain at the same
+  // version (see `pendingAttachmentRecordSchema`); hosts that cannot accept the
+  // addition leave this undefined and the registry degrades to its memory TTL
+  // fallback without taking the whole storage domain down.
+  let pendingAttachmentsRaw: ReturnType<RawDomainHandle['table']> | undefined
+  try {
+    pendingAttachmentsRaw = domain.table('pending_attachments')
+  } catch (error) {
+    ctx.logger?.warn?.('dsh-channels: pending attachment table unavailable: %s', String(error))
+  }
+  const pendingAttachments: PendingAttachmentsTable | undefined = pendingAttachmentsRaw === undefined
+    ? undefined
+    : {
+      get: key => pendingAttachmentsRaw.get(key) as PendingAttachmentRecord | undefined,
+      put: (key, value) => pendingAttachmentsRaw.put(key, value),
+      update: (key, fn) => pendingAttachmentsRaw.update(
+        key,
+        current => fn(current as PendingAttachmentRecord),
+      ),
+      delete: key => pendingAttachmentsRaw.delete(key),
+      entries: () =>
+        pendingAttachmentsRaw.entries() as IterableIterator<[string, PendingAttachmentRecord]>,
+    }
   return {
     routes: {
       get: key => table.get(key) as RouteRecord | undefined,
@@ -170,6 +194,7 @@ async function openFeishuDomain(ctx: HostContext): Promise<FeishuDomainHandle> {
       delete: key => accessRequestsRaw.delete(key),
       entries: () => accessRequestsRaw.entries() as IterableIterator<[string, AccessRequestRecord]>,
     },
+    pendingAttachments,
     getGlobal: () => (domain.global.get() ?? {}) as FeishuDomainGlobal,
     setGlobal: value => domain.global.set(value),
     close: () => domain.close(),
@@ -270,6 +295,12 @@ export class FeishuService {
   private readonly delivery: CardDelivery
   /** Inbound attachment archival (Feishu resources → workspace files). */
   private readonly attachments: AttachmentIntake
+  /**
+   * Silently registered attachment metadata (`pending_attachments` table):
+   * admission-layer registration, prompt manifest reads, fetch authorization
+   * whitelist, and the TTL/cap sweep wired into the periodic record GC.
+   */
+  private readonly pendingAttachments: PendingAttachmentStore
   /** Inbound routing: dedup, admission, decision tree, session establishment. */
   private readonly inbound: InboundRouter
   /** Agent/session lifecycle: live registry, resume, presets, renew. */
@@ -360,6 +391,14 @@ export class FeishuService {
     this.attachments = new AttachmentIntake({
       enabled: () => this.config.acceptAttachments,
       channel: () => this.channel,
+      warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
+    })
+    this.pendingAttachments = new PendingAttachmentStore({
+      // Undefined storage domain/table → the registry's memory TTL fallback.
+      table: () => this.domain?.pendingAttachments,
+      enabled: () => this.config.acceptAttachments,
+      ttlMs: () => this.config.pendingAttachmentTtlMs,
+      maxPerScope: () => this.config.pendingAttachmentLimit,
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
     })
     this.delivery = new CardDelivery({
@@ -2018,13 +2057,18 @@ export class FeishuService {
 
 
   /**
-   * GC pass over the routing domain. Two independent halves:
+   * GC pass over the routing domain. Three independent parts:
    *
    * 1. Dedup records (unconditional): `processed` records and in-process
    *    guard entries older than `PROCESSED_RETENTION_MS` are dropped —
    *    redelivery windows are minutes, so a day of retention is ample and
    *    keeps the table bounded regardless of the route TTL setting.
-   * 2. Route/inflight GC (`routeTtlMs > 0`): thread routes idle past the TTL
+   * 2. Pending attachment metadata (unconditional): rows past
+   *    `pendingAttachmentTtlMs` and rows above `pendingAttachmentLimit` per
+   *    `(chat, thread?, sender)` scope are removed. Independent of the route
+   *    TTL: the registry keeps its own 7-day default even when route retirement
+   *    is disabled.
+   * 3. Route/inflight GC (`routeTtlMs > 0`): thread routes idle past the TTL
    *    are retired into minimal persistent tombstones before their active
    *    records are deleted. A later message in that visible topic is then
    *    rejected instead of silently creating a context-free Session. Degraded
@@ -2056,6 +2100,18 @@ export class FeishuService {
       }
     }
     this.inbound.pruneAccepted(processedCutoff)
+
+    try {
+      const pruned = await this.pendingAttachments.prune()
+      if (pruned.removedExpired > 0 || pruned.removedOverLimit > 0) {
+        this.ctx.logger?.info?.(
+          'dsh-channels: record GC removed %d expired and %d over-limit pending attachment record(s)',
+          pruned.removedExpired, pruned.removedOverLimit,
+        )
+      }
+    } catch (error) {
+      this.ctx.logger?.warn?.('dsh-channels: pending attachment GC failed: %s', String(error))
+    }
 
     const ttlMs = this.config.routeTtlMs
     if (ttlMs === 0) {

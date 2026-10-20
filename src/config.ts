@@ -38,6 +38,12 @@ export const DEFAULT_QUESTION_TIMEOUT_MS = 5 * 60 * 1000
 export const ATTACHMENT_STORE_MODES = ['native', 'archive'] as const
 export type AttachmentStoreMode = (typeof ATTACHMENT_STORE_MODES)[number]
 
+/** Default retention of silently registered attachment metadata: 7 days. */
+export const DEFAULT_PENDING_ATTACHMENT_TTL_MS = 7 * 24 * 60 * 60 * 1000
+
+/** Default per-`(chat, thread, sender)` cap of pending attachment rows. */
+export const DEFAULT_PENDING_ATTACHMENT_LIMIT = 10
+
 /** A credential reference: `FEISHU_APP_ID`-style name resolved through ctx.credentials. */
 const credentialRefSchema = z.string().regex(
   CREDENTIAL_REF_PATTERN,
@@ -146,7 +152,8 @@ export const configSchema = z.object({
    * save them below `<workspace>/attachments/`. Nothing is forwarded to the
    * model automatically: the Agent reads whichever attachment the
    * conversation needs with its ordinary filesystem tools. Disabled keeps
-   * attachment messages inert (no save, no turn).
+   * attachment messages inert (no save, no turn, no pending metadata
+   * registration).
    */
   acceptAttachments: z.boolean().default(true),
   /**
@@ -164,6 +171,24 @@ export const configSchema = z.object({
    * the storage layer and its tested fallback.
    */
   attachmentStore: z.enum(ATTACHMENT_STORE_MODES).default('native'),
+  /**
+   * Retention of silently registered attachment metadata (the
+   * `pending_attachments` table). A message that does not trigger a model turn
+   * (attachment-only p2p message, un-mentioned group message, attachment-only
+   * message inside a bound topic) is recorded as metadata only; a later
+   * triggered message in the same `(chat, thread, sender)` scope may list and
+   * fetch it. Rows older than this window are removed by the periodic record
+   * GC. `0` disables age pruning (the per-scope cap still bounds each scope).
+   * Default 7 days.
+   */
+  pendingAttachmentTtlMs: z.number().int().min(0).default(DEFAULT_PENDING_ATTACHMENT_TTL_MS),
+  /**
+   * Maximum silently registered attachment rows kept per `(chat, thread,
+   * sender)` scope. Registering beyond the cap evicts the oldest row of that
+   * scope; the prompt manifest only ever shows the most recent 5 unconsumed
+   * rows. Default 10.
+   */
+  pendingAttachmentLimit: z.number().int().min(1).max(100).default(DEFAULT_PENDING_ATTACHMENT_LIMIT),
   /**
    * Delete the topic directories of stale conversations, plus legacy
    * one-workspace-per-topic directories written by older plugin versions.

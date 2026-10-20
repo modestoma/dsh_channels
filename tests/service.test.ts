@@ -51,6 +51,8 @@ function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
     welcomeOnboarding: false,
     acceptAttachments: true,
     attachmentStore: 'native',
+    pendingAttachmentTtlMs: 7 * 24 * 60 * 60 * 1000,
+    pendingAttachmentLimit: 10,
     topicIsolation: 'auto',
     workspaceRetention: 'off',
     workspaceRetentionAuto: false,
