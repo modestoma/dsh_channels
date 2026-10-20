@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   appendSessionHistory, expiredRouteRecordSchema, feishuDomain, normalizeRouteRecord, normalizeSessionHistory,
-  routeRecordSchema,
+  routeRecordSchema, sessionDirOf,
 } from '../src/domain.ts'
 import type { RouteRecord } from '../src/domain.ts'
 
@@ -52,6 +52,26 @@ describe('route Session history', () => {
       { sessionId: 'session-current', createdAt: 100 },
       { sessionId: 'session-new', createdAt: 300 },
     ])
+  })
+
+  it('reads the effective session directory with a legacy fallback', () => {
+    expect(sessionDirOf(route())).toBe('/workspace/owner')
+    expect(sessionDirOf(route({
+      workspacePath: '/workspace/owner',
+      sessionDir: '/workspace/owner/topics/omt_1',
+      worktreeBranch: 'feishu-omt_1',
+    }))).toBe('/workspace/owner/topics/omt_1')
+  })
+
+  it('accepts per-topic placement fields on a route record and rejects empty ones', () => {
+    const parsed = routeRecordSchema.parse(route({
+      sessionDir: '/workspace/owner/topics/omt_1',
+      worktreeBranch: 'feishu-omt_1',
+    }))
+    expect(parsed.sessionDir).toBe('/workspace/owner/topics/omt_1')
+    expect(parsed.worktreeBranch).toBe('feishu-omt_1')
+    expect(() => routeRecordSchema.parse(route({ sessionDir: '' }))).toThrow()
+    expect(() => routeRecordSchema.parse(route({ worktreeBranch: '' }))).toThrow()
   })
 
   it('rejects invalid history rows through the durable schema', () => {
@@ -121,6 +141,23 @@ describe('expired route tombstone', () => {
     expect(() => expiredRouteRecordSchema.parse({ ...base, workspacePath: '' })).toThrow()
     expect(() => expiredRouteRecordSchema.parse({ ...base, lastActivityAt: -1 })).toThrow()
     expect(() => expiredRouteRecordSchema.parse({ ...base, lastActivityAt: 1.5 })).toThrow()
+  })
+
+  it('carries the per-topic directory and worktree branch for cleanup', () => {
+    expect(expiredRouteRecordSchema.parse({
+      key: 'omt_expired',
+      chatId: 'oc_chat',
+      chatType: 'group',
+      senderOpenId: 'ou_owner',
+      expiredAt: 300,
+      workspacePath: '/workspace/owner',
+      sessionDir: '/workspace/owner/topics/omt_expired',
+      worktreeBranch: 'feishu-omt_expired',
+      lastActivityAt: 250,
+    })).toMatchObject({
+      sessionDir: '/workspace/owner/topics/omt_expired',
+      worktreeBranch: 'feishu-omt_expired',
+    })
   })
 })
 

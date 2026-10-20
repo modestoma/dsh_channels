@@ -104,6 +104,23 @@ export const configSchema = z.object({
    */
   threadFallback: z.enum(['degrade', 'strict']).default('degrade'),
   /**
+   * Per-topic working-directory isolation inside one user workspace.
+   *
+   * - `auto` (default): use a Git worktree per topic when the user workspace
+   *   is a Git repository (the workspace directory contains `.git`), otherwise
+   *   a plain subdirectory.
+   * - `subdir`: always a plain subdirectory (no Git requirement, no duplicated
+   *   checkouts).
+   * - `worktree`: always try a Git worktree; when the workspace is not a Git
+   *   repository, the `worktrees` service is unavailable, or creation is
+   *   denied, log a warning and fall back to a subdirectory.
+   *
+   * The workspace itself stays the Session header cwd either way, so Sessions
+   * remain grouped under the user's project; only the effective working
+   * directory changes. See `docs/workspace-isolation-design.md`.
+   */
+  topicIsolation: z.enum(['auto', 'subdir', 'worktree']).default('auto'),
+  /**
    * Route-table GC threshold. Route records (and stale in-flight repair
    * snapshots) whose last activity is older than this many milliseconds are
    * retired at startup and on every periodic sweep. Real thread routes leave a
@@ -129,17 +146,19 @@ export const configSchema = z.object({
    */
   acceptAttachments: z.boolean().default(true),
   /**
-   * Delete the workspace directories of stale conversations. `off` (default)
-   * never deletes; `7d`/`30d`/`90d`/`180d` remove plugin-created workspaces
-   * whose last activity is older than the threshold. The managed Web panel
-   * exposes this as a select, previews the candidates, and can run one
-   * cleanup manually. DSH Session logs are never deleted.
+   * Delete the topic directories of stale conversations, plus legacy
+   * one-workspace-per-topic directories written by older plugin versions.
+   * `off` (default) never deletes; `7d`/`30d`/`90d`/`180d` remove those
+   * directories when their last activity is older than the threshold. User
+   * workspaces themselves are never deleted. The managed Web panel exposes
+   * this as a select, previews the candidates, and can run one cleanup
+   * manually. DSH Session logs are never deleted.
    */
   workspaceRetention: z.enum(WORKSPACE_RETENTION_VALUES).default('off'),
   /**
-   * Run the workspace-retention cleanup at startup and once per day. Off by
-   * default: deletion is irreversible, so it stays an explicit opt-in even
-   * when a retention threshold is configured.
+   * Run the retention cleanup at startup and once per day. Off by default:
+   * deletion is irreversible, so it stays an explicit opt-in even when a
+   * retention threshold is configured.
    */
   workspaceRetentionAuto: z.boolean().default(false),
   /**

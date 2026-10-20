@@ -14,7 +14,7 @@ import type { AgentHandle, HostContext, SessionId, UserMessage, Workspace } from
 import type { FeishuConfig } from '../config.ts'
 import { buildCard, buildOnboardingCard, initialStreamingCard } from '../cards.ts'
 import { RouteOperationQueue } from '../commands.ts'
-import { chatRouteKey } from '../domain.ts'
+import { chatRouteKey, sessionDirOf } from '../domain.ts'
 import type { FeishuDomainHandle, RouteRecord } from '../domain.ts'
 import type { CardDelivery } from '../feishu/delivery.ts'
 import {
@@ -28,6 +28,10 @@ import type { InflightRepair } from '../session/repair.ts'
 import type { SessionManager } from '../session/manager.ts'
 import type { RouteStore } from '../session/routes.ts'
 import type { TurnStreamer } from '../streamer.ts'
+import {
+  enterTopic, placementServices, planTopic, restoreTopicDir,
+} from '../session/isolation.ts'
+import type { PlacementServices, TopicPlacement, TopicPlan } from '../session/isolation.ts'
 import { ensureWorkspace, stagingPathFor, topicTokenFor } from '../workspaces.ts'
 
 /** The command plane the inbound router delegates admission-time work to. */
@@ -313,12 +317,12 @@ export class InboundRouter {
 
     return await this.routeOperations.run(record?.key ?? chatKey, async () => {
       if (!this.started) return { saved: 0, failed: 0, failures: [], attachmentOnly: true, text: '' }
-      // An existing topic has a workspace already; a conversation without one
-      // stages files below baseDir until its first Session creates the topic
-      // workspace and adopts them.
+      // An existing topic already has its own working directory; a
+      // conversation without one stages files below baseDir until its first
+      // Session creates the topic directory and adopts them.
       const directory = record === undefined
         ? stagingPathFor(this.config.baseDir, msg.chatType, msg.chatId, msg.senderId)
-        : attachmentsDir(record.workspacePath)
+        : attachmentsDir(sessionDirOf(record))
       return await this.attachments.archive(msg, directory)
     })
   }
@@ -395,25 +399,20 @@ export class InboundRouter {
     const initialStats = { sessionId, inputTokens: 0, outputTokens: 0 }
 
     // 2. First card frame — also creates the topic (reply_in_thread). The
-    //    topic identity is only known after Feishu answers, and it decides the
-    //    workspace: every new topic gets its own directory.
+    //    topic identity is only known after Feishu answers, and it names the
+    //    topic's private working directory inside the user's workspace.
     const sent = await this.delivery.replyFirstCard(msg, initialStreamingCard(sessionId))
     const typingId = await typingPromise
     const key = sent.degraded || sent.threadId === undefined ? chatKey : sent.threadId
     const kind = sent.degraded || sent.threadId === undefined ? 'chat' : 'thread'
 
-    // 3. Workspace for this topic, then adopt attachments staged before it.
-    let workspace: Workspace
-    try {
-      workspace = await ensureWorkspace(
-        this.ctx, this.config.baseDir, msg.chatType, msg.chatId, msg.senderId,
-        topicTokenFor(key, kind, sessionId),
-      )
-      await adoptStagedAttachments(
-        stagingPathFor(this.config.baseDir, msg.chatType, msg.chatId, msg.senderId),
-        workspace.path,
-      )
-    } catch (error) {
+    const topicToken = topicTokenFor(key, kind, sessionId)
+    const services: PlacementServices = placementServices(this.ctx)
+    const warn = (message: string, ...args: unknown[]): void => {
+      this.ctx.logger?.warn?.(message, ...args)
+    }
+    /** Patch the streaming card to its terminal creation-failure state. */
+    const failCreation = async (error: unknown): Promise<void> => {
       void this.repair.clear(sent.messageId)
       await this.delivery.requireChannel().updateCard(sent.messageId, buildCard({
         phase: 'done',
@@ -421,6 +420,20 @@ export class InboundRouter {
         body: `会话创建失败：${String(error)}`,
         stats: { ...initialStats },
       })).catch(() => {})
+    }
+
+    // 3. User workspace (the durable project this Session is grouped under)
+    //    plus the per-topic placement plan. No Agent exists yet; the plan
+    //    materializes anything that must exist before creation.
+    let workspace: Workspace
+    let plan: TopicPlan
+    try {
+      workspace = await ensureWorkspace(
+        this.ctx, this.config.baseDir, msg.chatType, msg.chatId, msg.senderId,
+      )
+      plan = await planTopic(services, this.config, workspace.path, topicToken, warn)
+    } catch (error) {
+      await failCreation(error)
       throw error
     }
 
@@ -439,27 +452,39 @@ export class InboundRouter {
       attempts: 0,
     })
 
-    // 4. Create the agent/session bound to the workspace directory.
-    let handle: AgentHandle
+    // 4. Create the Session (header cwd = user workspace when directories can
+    //    be switched), then enter its own topic directory / worktree.
+    let handle: AgentHandle | undefined
+    let placement: TopicPlacement | undefined
     try {
-      handle = await this.sessions.createSession(sessionId, workspace.path)
+      handle = await this.sessions.createSession(sessionId, plan.cwd)
+      placement = await enterTopic(services, handle.agent, plan, workspace.path, topicToken, warn)
+      // A workspace attachment only validates when the header cwd is the
+      // workspace itself; the hard fallback (no workingDirectory service) must
+      // skip it instead of logging a guaranteed failure.
+      if (plan.cwd === workspace.path) {
+        void Promise.resolve(workspace.attachSession(sessionId)).catch((error: unknown) => {
+          warn('dsh-channels: attaching initial session %s to workspace failed: %s', sessionId, String(error))
+        })
+      }
+      // Files staged before this topic existed belong to this conversation.
+      await adoptStagedAttachments(
+        stagingPathFor(this.config.baseDir, msg.chatType, msg.chatId, msg.senderId),
+        placement.sessionDir,
+      ).catch((error: unknown) => {
+        warn('dsh-channels: adopting staged attachments failed: %s', String(error))
+      })
+      await this.sessions.mountGuidance(handle.agent, placement.sessionDir)
     } catch (error) {
-      // The card lands in a final failure state — no repair needed later.
-      void this.repair.clear(sent.messageId)
-      await this.delivery.requireChannel().updateCard(sent.messageId, buildCard({
-        phase: 'done',
-        reasoning: '',
-        body: `会话创建失败：${String(error)}`,
-        stats: { ...initialStats },
-      })).catch(() => {})
+      // The card lands in a final failure state — no repair needed later. A
+      // Session created just before the failure must not stay live unnoticed.
+      await handle?.dispose().catch(() => {})
+      await failCreation(error)
       throw error
     }
-    void Promise.resolve(workspace.attachSession(sessionId)).catch(error => {
-      this.ctx.logger?.warn?.(
-        'dsh-channels: attaching initial session %s to workspace failed: %s',
-        sessionId, String(error),
-      )
-    })
+    if (handle === undefined || placement === undefined) {
+      throw new Error('dsh-channels: session creation completed without a handle')
+    }
 
     // 5. Persist the route (thread-scoped, or degraded chat-scoped).
     const createdAt = handle.agent.session.header.createdAt
@@ -471,6 +496,8 @@ export class InboundRouter {
       chatType: msg.chatType,
       senderOpenId: msg.senderId,
       workspacePath: workspace.path,
+      sessionDir: placement.sessionDir,
+      ...(placement.worktreeBranch === undefined ? {} : { worktreeBranch: placement.worktreeBranch }),
       cardMessageId: sent.messageId,
       createdAt,
       lastActivityAt: createdAt,
@@ -487,24 +514,42 @@ export class InboundRouter {
     // Defence in depth: every current caller checks this first, but a future
     // call path must not be able to continue another user's Session.
     if (!this.access.ownsRoute(msg, record)) return
+    const services = placementServices(this.ctx)
+    const warn = (message: string, ...args: unknown[]): void => {
+      this.ctx.logger?.warn?.(message, ...args)
+    }
+    const typingPromise = this.delivery.requireChannel().addReaction(msg.messageId, 'Typing').catch(() => undefined)
+    const live = await this.sessions.ensureLive(record)
+    // The topic directory can disappear independently of the Session (manual
+    // deletion, external cleanup). Recreate it and re-align the effective
+    // working directory so the turn never leaks into the shared workspace root.
+    const placement = await restoreTopicDir(services, live.agent, {
+      workspacePath: record.workspacePath,
+      sessionDir: sessionDirOf(record),
+      ...(record.worktreeBranch === undefined ? {} : { worktreeBranch: record.worktreeBranch }),
+    }, warn)
+    let current: RouteRecord = record
+    if (placement.sessionDir !== sessionDirOf(record) || placement.worktreeBranch !== record.worktreeBranch) {
+      current = { ...record, sessionDir: placement.sessionDir }
+      delete current.worktreeBranch
+      if (placement.worktreeBranch !== undefined) current = { ...current, worktreeBranch: placement.worktreeBranch }
+    }
     // Files staged before this conversation's topic existed follow its next
     // turn (for example a file sent in the chat before the first prompt).
     await adoptStagedAttachments(
       stagingPathFor(this.config.baseDir, msg.chatType, msg.chatId, msg.senderId),
-      record.workspacePath,
+      placement.sessionDir,
     ).catch((error: unknown) => {
       this.ctx.logger?.warn?.('dsh-channels: adopting staged attachments failed: %s', String(error))
     })
-    const typingPromise = this.delivery.requireChannel().addReaction(msg.messageId, 'Typing').catch(() => undefined)
-    const live = await this.sessions.ensureLive(record)
 
-    const sent = await this.delivery.replyFirstCard(msg, initialStreamingCard(record.sessionId))
+    const sent = await this.delivery.replyFirstCard(msg, initialStreamingCard(current.sessionId))
     const typingId = await typingPromise
 
     // Repair snapshot first — same crash-window reasoning as `startSession`.
     await this.repair.write({
       key: sent.messageId,
-      sessionId: record.sessionId,
+      sessionId: current.sessionId,
       chatId: msg.chatId,
       triggerMessageId: msg.messageId,
       reactionId: typingId,
@@ -513,8 +558,8 @@ export class InboundRouter {
       attempts: 0,
     })
 
-    await this.routes.put(record.key, {
-      ...record,
+    await this.routes.put(current.key, {
+      ...current,
       cardMessageId: sent.messageId,
       lastActivityAt: Date.now(),
     })

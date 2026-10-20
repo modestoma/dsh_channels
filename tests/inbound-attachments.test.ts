@@ -201,10 +201,10 @@ describe('attachment intake', () => {
 
 describe('agent guidance', () => {
   it('points the Agent at its conversation attachment directory', () => {
-    expect(attachmentsGuidance()).toContain('own attachments directory')
+    expect(attachmentsGuidance()).toContain('own `attachments/` directory')
     const withPath = attachmentsGuidance('/tmp/feishu-ws/topic-1/attachments')
     expect(withPath).toContain('/tmp/feishu-ws/topic-1/attachments')
-    expect(withPath).toContain('separate workspaces')
+    expect(withPath).toContain('separate directories')
     expect(FEISHU_ATTACHMENTS_SECTION).toBe('dsh-channels:feishu-attachments')
   })
 

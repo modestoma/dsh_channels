@@ -130,6 +130,7 @@ class FakeTarget implements SettingsTarget {
   cleanupRun: CleanupRunWire = {
     ok: true,
     deletedWorkspaces: 0,
+    deletedSessionDirs: 0,
     retiredRoutes: 0,
     freedBytes: 0,
     failures: [],
@@ -1139,6 +1140,7 @@ describe('SettingsSurface workspace cleanup', () => {
     target.cleanupRun = {
       ok: true,
       deletedWorkspaces: 3,
+      deletedSessionDirs: 2,
       retiredRoutes: 5,
       freedBytes: 10_240,
       failures: ['/ws/one: EBUSY'],
@@ -1581,7 +1583,7 @@ describe('settings routes', () => {
   it('runs the workspace cleanup via POST with the same guards', async () => {
     const { surface, target } = makeSurface()
     target.cleanupState = { retention: '30d', thresholdMs: 30 * 86_400_000, auto: false, workspaces: 2, candidates: 1, candidateBytes: 512 }
-    target.cleanupRun = { ok: true, deletedWorkspaces: 1, retiredRoutes: 2, freedBytes: 512, failures: [] }
+    target.cleanupRun = { ok: true, deletedWorkspaces: 1, deletedSessionDirs: 2, retiredRoutes: 2, freedBytes: 512, failures: [] }
     const { server, routes } = makeWebServer()
     registerSettingsRoutes(server, surface)
 

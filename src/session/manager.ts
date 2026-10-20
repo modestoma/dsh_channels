@@ -25,12 +25,14 @@ import type {
 } from '../dsh-types.ts'
 import type { FeishuConfig } from '../config.ts'
 import { mountChannelCommands } from '../commands.ts'
-import { appendSessionHistory } from '../domain.ts'
+import { appendSessionHistory, sessionDirOf } from '../domain.ts'
 import type { RouteRecord } from '../domain.ts'
 import { mountChannelGuidance } from '../feishu/agent-context.ts'
 import { attachmentsDir } from '../feishu/inbound-attachments.ts'
 import { installRequestPolicy } from './request-policy.ts'
 import type { RequestPolicyController } from './request-policy.ts'
+import { placementServices, restoreTopicDir } from './isolation.ts'
+import type { PlacementServices, TopicPlacement } from './isolation.ts'
 import { workspaceTitleFor } from '../workspaces.ts'
 
 /** One live agent plus this plugin's ownership handle. */
@@ -105,14 +107,16 @@ export class SessionManager {
 
   /**
    * Create the root agent for one freshly routed session and register it live.
-   * The caller owns the workspace attachment and the failure card.
+   * `cwd` is the Session header cwd (the user workspace when the deployment can
+   * switch directories). The caller owns placement, the workspace attachment,
+   * the attachment guidance, and the failure card.
    */
   async createSession(
     sessionId: SessionId,
     cwd: string,
     agentOptions: Record<string, unknown> = this.agentOptions(),
   ): Promise<AgentHandle> {
-    const composition = await this.presetComposition(undefined, true, attachmentsDir(cwd))
+    const composition = await this.presetComposition(undefined, true)
     const handle = await this.deps.ctx.agents.create({
       sessionId,
       meta: {
@@ -125,6 +129,24 @@ export class SessionManager {
     this.requestPolicy(handle.agent)
     this.live.set(sessionId, { agent: handle.agent, handle })
     return handle
+  }
+
+  /**
+   * Register the attachment-directory guidance for one Session. Called after
+   * the effective working directory is known (a worktree checkout path is
+   * only returned once the worktree exists), so the prompt section can name
+   * the absolute directory. Best-effort: a missing system-prompt service
+   * (headless) is a no-op and a late registration never blocks the turn.
+   */
+  async mountGuidance(agent: Agent, directory: string): Promise<void> {
+    try {
+      await mountChannelGuidance(agent.ctx, attachmentsDir(directory))
+    } catch (error) {
+      this.deps.warn(
+        'dsh-channels: mounting attachment guidance for session %s failed: %s',
+        agent.id, String(error),
+      )
+    }
   }
 
   /**
@@ -171,9 +193,7 @@ export class SessionManager {
       // (config override or roster default). A session persisted before the
       // preset fix has no preset recorded on its header; re-resolving here is
       // what repairs it on the first resume after a restart.
-      const composition = await this.presetComposition(
-        undefined, true, attachmentsDir(record.workspacePath),
-      )
+      const composition = await this.presetComposition(undefined, true)
       const handle = await this.deps.ctx.agents.resume({
         resumeSessionId: sessionId,
         agentOptions: this.agentOptions(),
@@ -187,6 +207,7 @@ export class SessionManager {
         throw new Error('dsh-channels: session resume aborted by shutdown')
       }
       this.requestPolicy(handle.agent)
+      await this.mountGuidance(handle.agent, sessionDirOf(record))
       const liveAgent: LiveAgent = { agent: handle.agent, handle }
       this.live.set(sessionId, liveAgent)
       return liveAgent
@@ -224,17 +245,23 @@ export class SessionManager {
     return controller
   }
 
-  /** Create, workspace-attach, and atomically publish one renewed route. */
+  /**
+   * Create, place, workspace-attach, and atomically publish one renewed route.
+   *
+   * A renewal keeps the topic's working directory: the new Session is created
+   * with the user workspace as its header cwd (so it stays grouped under the
+   * project) and then re-entered into the same topic directory or worktree.
+   */
   async renew(record: RouteRecord, oldLive: LiveAgent): Promise<RenewCommit> {
     const sessionId = randomUUID() as SessionId
     const preset = this.effectivePreset(oldLive.agent.session)
-    const composition = await this.presetComposition(preset, false, attachmentsDir(record.workspacePath))
+    const composition = await this.presetComposition(preset, false)
+    const services: PlacementServices = placementServices(this.deps.ctx)
+    const switchable = services.workingDirectory !== undefined
+    const workspacePath = record.workspacePath
     const workspace = await this.deps.ctx.workspaceRegistry.create(
-      record.workspacePath,
-      workspaceTitleFor(
-        record.chatType, record.chatId, record.senderOpenId,
-        record.kind === 'thread' ? record.key : record.sessionId,
-      ),
+      workspacePath,
+      workspaceTitleFor(record.chatType, record.chatId, record.senderOpenId),
     )
 
     let newHandle: AgentHandle | undefined
@@ -243,23 +270,38 @@ export class SessionManager {
       newHandle = await this.deps.ctx.agents.create({
         sessionId,
         meta: {
-          cwd: record.workspacePath,
+          // Without an effective-directory service the Session must be born in
+          // its topic directory; otherwise the workspace root keeps it grouped.
+          cwd: switchable ? workspacePath : sessionDirOf(record),
           ...(composition.agentPreset === undefined ? {} : { agentPreset: composition.agentPreset }),
         },
         agentOptions: { ...oldLive.agent.options },
         setup: composition.setup,
       })
       this.requestPolicy(newHandle.agent)
-      await workspace.attachSession(sessionId)
-      attached = true
+      const placement: TopicPlacement = await restoreTopicDir(services, newHandle.agent, {
+        workspacePath,
+        sessionDir: sessionDirOf(record),
+        ...(record.worktreeBranch === undefined ? {} : { worktreeBranch: record.worktreeBranch }),
+      }, this.deps.warn.bind(this.deps))
+      if (switchable) {
+        await workspace.attachSession(sessionId)
+        attached = true
+      }
+      await this.mountGuidance(newHandle.agent, placement.sessionDir)
       const createdAt = newHandle.agent.session.header.createdAt
 
-      const current: RouteRecord = {
+      const base: RouteRecord = {
         ...record,
         sessionId,
         sessionHistory: appendSessionHistory(record, sessionId, createdAt),
         lastActivityAt: Date.now(),
+        sessionDir: placement.sessionDir,
       }
+      delete base.worktreeBranch
+      const current: RouteRecord = placement.worktreeBranch === undefined
+        ? base
+        : { ...base, worktreeBranch: placement.worktreeBranch }
       await this.deps.persistRoute(record.key, current)
       this.live.set(sessionId, { agent: newHandle.agent, handle: newHandle })
       return { previous: record, current, oldLive }
@@ -308,11 +350,14 @@ export class SessionManager {
    * resumes. The id resolves BEFORE the session exists because the session
    * boundary snapshots `meta` before asynchronous setup begins; mounting stays
    * inside `setup`, where a failure rolls the whole creation back.
+   *
+   * The attachment guidance is mounted later through {@link mountGuidance},
+   * because a Git worktree's checkout path only exists after the Agent (and so
+   * the worktree) has been created.
    */
   private async presetComposition(
     requestedPreset: string | undefined = this.deps.config.agentPreset,
     useRosterDefault = true,
-    attachmentsDir?: string,
   ): Promise<PresetComposition> {
     // Read through ctx.get (safe lookup): only the web profile ships a roster,
     // and direct property access on a cordis context throws for services the
@@ -324,7 +369,6 @@ export class SessionManager {
       // cannot guarantee that the explicit channel value wins.
       this.mountRequestPolicy(agentCtx)
       await mountChannelCommands(agentCtx)
-      await mountChannelGuidance(agentCtx, attachmentsDir)
     }
     if (presets === undefined || (requestedPreset === undefined && !useRosterDefault)) {
       return { setup: channelCommandsOnly }
@@ -336,7 +380,6 @@ export class SessionManager {
         this.mountRequestPolicy(agentCtx)
         await presets.mount(agentCtx, resolved.id)
         await mountChannelCommands(agentCtx)
-        await mountChannelGuidance(agentCtx, attachmentsDir)
       },
     }
   }

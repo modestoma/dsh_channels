@@ -148,6 +148,8 @@ export class RouteStore {
       senderOpenId: record.senderOpenId,
       expiredAt: now,
       workspacePath: record.workspacePath,
+      ...(record.sessionDir === undefined ? {} : { sessionDir: record.sessionDir }),
+      ...(record.worktreeBranch === undefined ? {} : { worktreeBranch: record.worktreeBranch }),
       lastActivityAt: record.lastActivityAt,
     }
     await this.deps.domain()?.expiredRoutes.put(key, tombstone)

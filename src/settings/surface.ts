@@ -160,7 +160,7 @@ const SELECT_OPTIONS: Partial<Record<EditableKey, ReadonlyArray<{ value: string;
 const FIELD_META: Record<EditableKey, { label: string; help: string; min?: number; max?: number; step?: number; placeholder?: string; wide?: boolean }> = {
   baseDir: {
     label: '工作区根目录（文件落点）',
-    help: '每个飞书话题拥有独立工作区：私聊 <baseDir>/topics/p2p/<open_id>/<topic>/，群聊 <baseDir>/topics/groups/<chat_id>/<open_id>/<topic>/（topic 来自话题 id）。必须是绝对路径（~ 开头按家目录展开），保存时会创建该目录；只影响之后新建立的工作区 —— 已有话题即使 /renew 也沿用原工作区，旧文件不会迁移。',
+    help: '每个用户/群成员一个工作区：私聊 <baseDir>/p2p/<open_id>/，群聊 <baseDir>/groups/<chat_id>/<open_id>/；每个话题在其中拥有独立工作目录 <工作区>/topics/<话题>/（Git 仓库工作区可自动改用 worktree）。必须是绝对路径（~ 开头按家目录展开），保存时会创建该目录；只影响之后新建立的会话 —— 已有话题即使 /renew 也沿用原目录，旧文件不会迁移。',
     placeholder: '/Users/you/.dsh/dsh-channels/workspaces',
     wide: true,
   },
@@ -186,8 +186,8 @@ const FIELD_META: Record<EditableKey, { label: string; help: string; min?: numbe
     step: 1,
   },
   acceptAttachments: { label: '接收并保存附件', help: '接收飞书图片、文件与合并转发记录，保存到工作区的 attachments/ 目录；模型不会自动读取，需要时用文件工具自行查看。关闭后附件消息不保存、不触发回复。' },
-  workspaceRetention: { label: '过期工作区保留期', help: '超过所选天数没有活动的飞书工作区会进入下方「工作区清理」列表；「关闭」表示永不删除。DSH 会话日志不受影响。' },
-  workspaceRetentionAuto: { label: '自动执行工作区清理', help: '开启后插件在启动时及每天执行一次过期工作区清理；关闭时只能在下方卡片手动清理。开启前请确认保留期已设置。' },
+  workspaceRetention: { label: '过期目录保留期', help: '超过所选天数没有活动的飞书话题目录（以及旧版本按话题建立的工作区目录）会进入下方清理列表；用户工作区本身永不删除。DSH 会话日志不受影响。' },
+  workspaceRetentionAuto: { label: '自动执行目录清理', help: '开启后插件在启动时及每天执行一次过期目录清理；关闭时只能在下方卡片手动清理。开启前请确认保留期已设置。' },
   provider: { label: '模型服务商', help: '留空 = 使用部署默认；例如 deepseek-official。', placeholder: '留空 = 部署默认' },
   model: { label: '模型 id', help: '留空 = 使用部署默认；例如 deepseek-v4-flash。', placeholder: '留空 = 部署默认' },
   reasoningEffort: { label: '推理档位', help: '模型声明的精确档位 id（如 high / max）；留空 = 适配器默认。', placeholder: '留空 = 适配器默认' },
@@ -403,6 +403,14 @@ export function normalizeAccessName(
 /** Build the read-only advanced card from the effective config. */
 export function readOnlyFields(config: FeishuConfig): ReadOnlyFieldWire[] {
   return [
+    {
+      key: 'topicIsolation',
+      label: '话题目录隔离',
+      value: config.topicIsolation === 'auto'
+        ? '自动（Git 仓库用 worktree，否则普通子目录）'
+        : config.topicIsolation === 'worktree' ? 'Git worktree（失败回退子目录）' : '普通子目录',
+      help: '每个话题的独立工作目录形式；在 profile 配置里用 topicIsolation 设置（auto / subdir / worktree）。',
+    },
     { key: 'routeTtlMs', label: '话题路由过期', value: formatDays(config.routeTtlMs), help: '超期话题的后续消息会被明确拒绝，而不是新建 Context-free Session。' },
     { key: 'approvalTimeoutMs', label: '审批卡片等待', value: formatSeconds(config.approvalTimeoutMs) },
     { key: 'questionTimeoutMs', label: '提问卡片等待', value: formatSeconds(config.questionTimeoutMs) },
@@ -569,7 +577,7 @@ export class SettingsSurface {
     try {
       cleanup = await this.target.cleanupPreview()
     } catch (error) {
-      this.logger?.warn?.('dsh-channels: 工作区清理预览失败：%s', messageOf(error))
+      this.logger?.warn?.('dsh-channels: 目录清理预览失败：%s', messageOf(error))
       cleanup = {
         retention: effective.workspaceRetention,
         auto: effective.workspaceRetentionAuto,

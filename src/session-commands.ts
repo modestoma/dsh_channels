@@ -61,8 +61,8 @@ export interface SessionStatusCardInput {
 export interface SessionStatusExtras {
   /** Effective permission preset of this Session (`ctx.permissionPresets`). */
   permissionPreset?: string
-  /** Workspace directory bound to this route. */
-  workspacePath?: string
+  /** Effective working directory of this Session (its topic directory). */
+  sessionDir?: string
   /** Plugin uptime in milliseconds. */
   uptimeMs?: number
   /** Live agent entries this channel owns/borrows. */
@@ -123,7 +123,7 @@ function statusExtrasElements(extras: SessionStatusExtras | undefined): object[]
   if (extras === undefined) return []
   const lines: string[] = []
   if (extras.permissionPreset !== undefined) lines.push(`**权限预设**：\`${escapeInlineCode(extras.permissionPreset)}\``)
-  if (extras.workspacePath !== undefined) lines.push(`**工作区**：\`${escapeInlineCode(extras.workspacePath)}\``)
+  if (extras.sessionDir !== undefined) lines.push(`**会话目录**：\`${escapeInlineCode(extras.sessionDir)}\``)
   if (extras.uptimeMs !== undefined) lines.push(`**插件运行时长**：${fmtUptime(extras.uptimeMs)}`)
   if (extras.liveAgents !== undefined || extras.routeCount !== undefined) {
     const parts: string[] = []
@@ -148,33 +148,59 @@ export type WorkDirResolution =
   | { kind: 'missing'; text: string }
   | { kind: 'mismatch'; text: string }
 
-/** Validate the Session header cwd against the plugin's durable route. */
-export function resolveWorkDir(headerCwd: string | undefined, routeWorkspacePath: string): WorkDirResolution {
+/** The durable route facts needed to verify a Session's working directory. */
+export interface WorkDirRoute {
+  /** Workspace root owning the Session (its header cwd when grouped). */
+  readonly workspacePath: string
+  /** Effective working directory (topic directory / worktree); absent on v1 routes. */
+  readonly sessionDir?: string
+}
+
+/**
+ * Validate the Session header cwd against the plugin's durable route and
+ * return the Session's effective working directory.
+ *
+ * The header cwd is normally the workspace root (the Session stays grouped
+ * under the user's project while working in a per-topic directory). In the
+ * degraded placement used when the host exposes no `workingDirectory` service,
+ * the header cwd is the topic directory itself.
+ */
+export function resolveWorkDir(
+  headerCwd: string | undefined,
+  route: WorkDirRoute,
+): WorkDirResolution {
   if (headerCwd === undefined || headerCwd === '' || !path.isAbsolute(headerCwd)) {
     return {
       kind: 'missing',
       text: '当前 Session header 未记录可用的绝对工作目录；请检查 Session 创建或恢复配置。',
     }
   }
-  if (!path.isAbsolute(routeWorkspacePath)) {
+  if (!path.isAbsolute(route.workspacePath)) {
     return {
       kind: 'missing',
-      text: '当前飞书路由未记录可用的绝对工作目录；请检查路由持久化状态。',
+      text: '当前飞书路由未记录可用的工作区目录；请检查路由持久化状态。',
     }
   }
-  if (headerCwd !== routeWorkspacePath) {
+  if (route.sessionDir !== undefined && !path.isAbsolute(route.sessionDir)) {
+    return {
+      kind: 'missing',
+      text: '当前飞书路由未记录可用的会话目录；请检查路由持久化状态。',
+    }
+  }
+  const expected = route.sessionDir ?? route.workspacePath
+  if (headerCwd !== route.workspacePath && headerCwd !== expected) {
     return {
       kind: 'mismatch',
       text: 'Session header 与飞书路由记录的工作目录不一致；为避免返回错误目录，已拒绝显示。',
     }
   }
-  return { kind: 'success', path: headerCwd }
+  return { kind: 'success', path: expected }
 }
 
-/** Render one verified absolute workspace path. */
-export function buildWorkDirCard(sessionId: string, workspacePath: string): object {
+/** Render one verified absolute working directory. */
+export function buildWorkDirCard(sessionId: string, sessionDir: string): object {
   return standaloneCard('**📁 当前工作目录**', [
-    { tag: 'markdown', content: `\`${escapeInlineCode(workspacePath)}\`` },
+    { tag: 'markdown', content: `\`${escapeInlineCode(sessionDir)}\`` },
     { tag: 'markdown', content: sessionId, text_size: 'notation' },
   ])
 }
@@ -182,7 +208,8 @@ export function buildWorkDirCard(sessionId: string, workspacePath: string): obje
 export interface RenewCardInput {
   previousSessionId: string
   currentSessionId: string
-  workspacePath: string
+  /** Topic directory that the renewed Session reuses. */
+  sessionDir: string
 }
 
 /** Render the committed route switch without implying that the old log was deleted. */
@@ -192,7 +219,7 @@ export function buildRenewCard(input: RenewCardInput): object {
       tag: 'markdown',
       content: `**旧 Session**：${input.previousSessionId}\n`
         + `**新 Session**：${input.currentSessionId}\n`
-        + `**复用工作区**：\`${escapeInlineCode(input.workspacePath)}\``,
+        + `**复用目录**：\`${escapeInlineCode(input.sessionDir)}\``,
     },
     { tag: 'markdown', content: '旧 Session 及其日志仍由 Harness 保留。', text_size: 'notation' },
   ])

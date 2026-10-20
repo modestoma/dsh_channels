@@ -10,8 +10,16 @@
 
 import { z } from 'zod'
 
-/** Route key kinds. `thread` = real Feishu topic; `chat` = degraded chat-scoped fallback. */
-export const ROUTE_RECORD_VERSION = 1
+/**
+ * Route key kinds. `thread` = real Feishu topic; `chat` = degraded chat-scoped
+ * fallback.
+ *
+ * Version 2 adds the optional `sessionDir` / `worktreeBranch` fields (the
+ * Session's effective working directory). Version-1 records stay readable: an
+ * absent `sessionDir` means the workspace path itself is the working directory
+ * (the pre-v2 model).
+ */
+export const ROUTE_RECORD_VERSION = 2
 
 export const sessionHistoryEntrySchema = z.object({
   /** One Session that has been bound to this route. */
@@ -35,8 +43,16 @@ export const routeRecordSchema = z.object({
   chatType: z.enum(['p2p', 'group']),
   /** Workspace owner (sender open_id). */
   senderOpenId: z.string().min(1),
-  /** Workspace directory for this (chat, user) pair. */
+  /** Workspace root owning this route: the Session header cwd / sandbox root. */
   workspacePath: z.string().min(1),
+  /**
+   * Effective working directory of the bound Session (the per-topic directory
+   * or Git worktree checkout). Absent on records written before per-topic
+   * directories existed: `workspacePath` is then the working directory too.
+   */
+  sessionDir: z.string().min(1).optional(),
+  /** Git branch owning `sessionDir` when it is a worktree checkout. */
+  worktreeBranch: z.string().min(1).optional(),
   /** Message id of the latest streaming card (updated per turn). */
   cardMessageId: z.string().min(1),
   /** Epoch ms when the record was created. */
@@ -71,6 +87,12 @@ export const expiredRouteRecordSchema = z.object({
   /** Workspace the retired route belonged to; absent in tombstones written by
    *  older plugin versions, so the field must stay optional. */
   workspacePath: z.string().min(1).optional(),
+  /** Effective working directory the retired route's Session used; absent in
+   *  legacy tombstones (retention cleanup then treats `workspacePath` as the
+   *  directory, matching pre-v2 routes). */
+  sessionDir: z.string().min(1).optional(),
+  /** Git branch of that directory when it was a worktree checkout. */
+  worktreeBranch: z.string().min(1).optional(),
   /** Epoch ms of the last activity through the route before retirement.
    *  Optional for the same legacy-compatibility reason; consumers fall back to
    *  `expiredAt` when it is absent. */
@@ -114,6 +136,15 @@ export function appendSessionHistory(
     sessionId,
     sessionHistory: [...normalizeSessionHistory(record), { sessionId, createdAt }],
   })
+}
+
+/**
+ * Effective working directory of one route's Session. Records written before
+ * per-topic directories have no `sessionDir`; their workspace path is the
+ * directory the Session really works in.
+ */
+export function sessionDirOf(record: Pick<RouteRecord, 'workspacePath' | 'sessionDir'>): string {
+  return record.sessionDir ?? record.workspacePath
 }
 
 /**

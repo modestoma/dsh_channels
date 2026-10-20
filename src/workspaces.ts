@@ -1,13 +1,22 @@
 /**
- * Workspace directory resolution: one DSH workspace per (user × chat).
+ * Workspace directory resolution: one DSH workspace per user, one working
+ * directory per Feishu topic.
  *
- * Every Feishu topic gets its own workspace, grouped by the (chat, user) pair:
- * - p2p:    `<baseDir>/p2p/<open_id>/<topic>/`
- * - group:  `<baseDir>/groups/<chat_id>/<open_id>/<topic>/`
+ * - p2p:   workspace `<baseDir>/p2p/<open_id>/`
+ * - group: workspace `<baseDir>/groups/<chat_id>/<open_id>/`
+ * - topic: `<workspace>/topics/<topic-token>/` (the Session's effective cwd)
+ *
+ * The workspace root is the Session header cwd: it keeps the Session grouped
+ * under the user's project in the GUI and stays the sandbox write boundary.
+ * The per-topic directory is where the tools actually work (see
+ * `./session/isolation.ts`), so files produced by different topics never mix.
+ * Older versions registered one workspace per topic under `<baseDir>/topics/`;
+ * those directories are kept verbatim for legacy routes and are only removed
+ * by the retention cleanup, never migrated.
  *
  * Attachments received before a topic exists are staged below
  * `<baseDir>/_staging/<chatType>/<chat_id>/<open_id>/` and adopted into the
- * topic workspace once its first Session is created.
+ * topic directory once its first Session is created.
  *
  * Feishu ids (`ou_…`, `oc_…`) are safe path segments, but they are validated
  * anyway so a hostile id can never escape `baseDir`.
@@ -123,36 +132,51 @@ export function topicTokenFor(
   return kind === 'thread' ? safeSegment(routeKey, 'route key') : safeSegment(sessionId, 'session id')
 }
 
+/** Git branch (and worktree directory) name for one topic token. */
+export function worktreeBranchFor(topicToken: string): string {
+  return `feishu-${safeSegment(topicToken, 'topic token')}`
+}
+
 /**
- * Deterministic workspace directory for one Feishu topic: every route gets its
- * own workspace below its (user × chat) grouping directory.
+ * Deterministic workspace directory for one user in one chat context: the
+ * durable project the user's Sessions are grouped under.
  *
- * - p2p:   `<baseDir>/topics/p2p/<open_id>/<topic>/`
- * - group: `<baseDir>/topics/groups/<chat_id>/<open_id>/<topic>/`
+ * - p2p:   `<baseDir>/p2p/<open_id>/`
+ * - group: `<baseDir>/groups/<chat_id>/<open_id>/`
  *
- * A separate `topics/` root keeps new workspaces out of the legacy (user ×
- * chat) workspace directories left by older versions, so cleaning one can
- * never delete the other.
+ * These are the same paths older versions used as their shared (user × chat)
+ * workspaces, so an upgraded deployment reuses the existing registry record
+ * instead of creating a second project for the same user.
  */
 export function workspacePathFor(
   baseDir: string,
   chatType: 'p2p' | 'group',
   chatId: string,
   senderOpenId: string,
-  topicToken: string,
 ): string {
-  const chat = safeSegment(chatId, 'chatId')
   const user = safeSegment(senderOpenId, 'senderOpenId')
-  const topic = safeSegment(topicToken, 'topic token')
-  return chatType === 'p2p'
-    ? path.join(baseDir, 'topics', 'p2p', user, topic)
-    : path.join(baseDir, 'topics', 'groups', chat, user, topic)
+  if (chatType === 'p2p') return path.join(baseDir, 'p2p', user)
+  return path.join(baseDir, 'groups', safeSegment(chatId, 'chatId'), user)
+}
+
+/** Per-topic working directory inside one user workspace. */
+export function topicDirFor(workspacePath: string, topicToken: string): string {
+  return path.join(workspacePath, 'topics', safeSegment(topicToken, 'topic token'))
+}
+
+/**
+ * Root of the legacy (one workspace per topic) directories. Legacy workspaces
+ * live strictly below this path, which is how the retention cleanup tells them
+ * apart from user workspaces that must never be deleted.
+ */
+export function legacyTopicWorkspaceRoot(baseDir: string): string {
+  return path.join(baseDir, 'topics')
 }
 
 /**
  * Staging directory for attachments that arrive before their topic (and so
- * its workspace) exists. Not a registered workspace: files move into the real
- * workspace as soon as the first Session of that topic is created.
+ * its topic directory) exists. Not a registered workspace: files move into the
+ * real topic directory as soon as the first Session of that topic is created.
  */
 export function stagingPathFor(
   baseDir: string,
@@ -170,17 +194,16 @@ export function workspaceTitleFor(
   chatType: 'p2p' | 'group',
   chatId: string,
   senderOpenId: string,
-  topicToken?: string,
 ): string {
-  const base = chatType === 'p2p'
+  return chatType === 'p2p'
     ? `飞书私聊 · ${senderOpenId}`
     : `飞书群聊 · ${chatId} · ${senderOpenId}`
-  return topicToken === undefined ? base : `${base} · ${topicToken}`
 }
 
 /**
- * Ensure one topic's workspace directory exists and is registered with the
- * host's workspace registry. Idempotent: repeated calls return the same record.
+ * Ensure one user's workspace directory exists and is registered with the
+ * host's workspace registry. Idempotent: repeated calls return the same record,
+ * and an existing record keeps its (possibly renamed) title.
  */
 export async function ensureWorkspace(
   ctx: HostContext,
@@ -188,12 +211,11 @@ export async function ensureWorkspace(
   chatType: 'p2p' | 'group',
   chatId: string,
   senderOpenId: string,
-  topicToken: string,
 ): Promise<Workspace> {
-  const dir = workspacePathFor(baseDir, chatType, chatId, senderOpenId, topicToken)
+  const dir = workspacePathFor(baseDir, chatType, chatId, senderOpenId)
   await mkdir(dir, { recursive: true })
   return ctx.workspaceRegistry.create(
     dir,
-    workspaceTitleFor(chatType, chatId, senderOpenId, topicToken),
+    workspaceTitleFor(chatType, chatId, senderOpenId),
   )
 }

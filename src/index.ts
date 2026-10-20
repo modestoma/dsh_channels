@@ -8,7 +8,9 @@
  * “DONE”，失败显示结构化错误并更新为 “No”。
  *
  * 工作区归属：私聊一人一工作区；群聊中每个用户在该群拥有独立工作区
- * （目录即工作区，会话以 cwd 落盘）。
+ * （工作区是会话 header cwd，保证 GUI 归属与沙箱边界）。每个话题在该工作区
+ * 内拥有独立的工作目录（`topics/<话题>`，Git 仓库工作区可自动改用 worktree），
+ * 因此话题之间的文件互不干扰，而工作区数量只随用户增长。
  *
  * @module dsh-channels
  */
@@ -61,8 +63,8 @@ export { createLogicalSessionExport, DSH_CHANNELS_VERSION, LOGICAL_EXPORT_FORMAT
 export { addUsage, applyProjectionViews, averageDecodeTokensPerSecond, averageTtftMs, cacheHitPct, EMPTY_TOTALS, foldAll, foldEvent, foldSessionStats, measureSessionContext, readProjectionViews, usageFromBuckets } from './stats.ts'
 export { FeishuService } from './service.ts'
 export { TurnStreamer } from './streamer.ts'
-export { ensureWorkspace, stagingPathFor, topicTokenFor, workspacePathFor, workspaceTitleFor } from './workspaces.ts'
-export { accessGroupRecordSchema, accessRequestRecordSchema, accessUserRecordSchema, appendSessionHistory, chatRouteKey, expiredRouteRecordSchema, feishuDomain, normalizeRouteRecord, normalizeSessionHistory, routeRecordSchema, sessionHistoryEntrySchema, inflightSnapshotSchema, processedRecordSchema } from './domain.ts'
+export { ensureWorkspace, legacyTopicWorkspaceRoot, stagingPathFor, topicDirFor, topicTokenFor, workspacePathFor, workspaceTitleFor, worktreeBranchFor } from './workspaces.ts'
+export { accessGroupRecordSchema, accessRequestRecordSchema, accessUserRecordSchema, appendSessionHistory, chatRouteKey, expiredRouteRecordSchema, feishuDomain, normalizeRouteRecord, normalizeSessionHistory, routeRecordSchema, sessionDirOf, sessionHistoryEntrySchema, inflightSnapshotSchema, processedRecordSchema } from './domain.ts'
 
 /** Cordis function-plugin name. */
 export const name = 'channels'

@@ -67,25 +67,35 @@ describe('Session command result cards', () => {
     expect(json).not.toContain('0 tokens/s')
   })
 
-  it('returns only a verified absolute work directory', () => {
-    expect(resolveWorkDir('/workspace/alice', '/workspace/alice')).toEqual({
+  it('returns only a verified absolute effective working directory', () => {
+    // Legacy route: the workspace path itself is the session directory.
+    expect(resolveWorkDir('/workspace/alice', { workspacePath: '/workspace/alice' })).toEqual({
       kind: 'success', path: '/workspace/alice',
     })
-    expect(resolveWorkDir('/workspace/alice', '/workspace/bob')).toMatchObject({ kind: 'mismatch' })
-    expect(resolveWorkDir(undefined, '/workspace/alice')).toMatchObject({ kind: 'missing' })
-    expect(resolveWorkDir('relative', '/workspace/alice')).toMatchObject({ kind: 'missing' })
+    // Per-topic route: header cwd is the workspace root, effective dir is the topic dir.
+    expect(resolveWorkDir('/workspace/alice', {
+      workspacePath: '/workspace/alice', sessionDir: '/workspace/alice/topics/omt_1',
+    })).toEqual({ kind: 'success', path: '/workspace/alice/topics/omt_1' })
+    // Degraded placement (no workingDirectory service): header cwd is the topic dir.
+    expect(resolveWorkDir('/workspace/alice/topics/omt_1', {
+      workspacePath: '/workspace/alice', sessionDir: '/workspace/alice/topics/omt_1',
+    })).toEqual({ kind: 'success', path: '/workspace/alice/topics/omt_1' })
+    expect(resolveWorkDir('/workspace/alice', { workspacePath: '/workspace/bob' }))
+      .toMatchObject({ kind: 'mismatch' })
+    expect(resolveWorkDir(undefined, { workspacePath: '/workspace/alice' })).toMatchObject({ kind: 'missing' })
+    expect(resolveWorkDir('relative', { workspacePath: '/workspace/alice' })).toMatchObject({ kind: 'missing' })
     expect(JSON.stringify(buildWorkDirCard('session-1', '/workspace/alice'))).toContain('/workspace/alice')
   })
 
-  it('renders both Session ids and the reused workspace after renew', () => {
+  it('renders both Session ids and the reused directory after renew', () => {
     const json = JSON.stringify(buildRenewCard({
       previousSessionId: 'session-old',
       currentSessionId: 'session-new',
-      workspacePath: '/workspace/alice',
+      sessionDir: '/workspace/alice/topics/omt_1',
     }))
     expect(json).toContain('session-old')
     expect(json).toContain('session-new')
-    expect(json).toContain('/workspace/alice')
+    expect(json).toContain('/workspace/alice/topics/omt_1')
     expect(json).toContain('仍由 Harness 保留')
   })
 

@@ -20,7 +20,7 @@ export const CREDENTIALS_ROUTE = '/dsh-channels/credentials'
 export const RECONNECT_ROUTE = '/dsh-channels/reconnect'
 /** 模型/推理档位/预设选择器的宿主目录（provider → model → effort 级联刷新）。 */
 export const CATALOG_ROUTE = '/dsh-channels/catalog'
-/** 手动执行一次过期工作区清理（POST，无请求体）。 */
+/** 手动执行一次过期目录清理（POST，无请求体）。 */
 export const CLEANUP_ROUTE = '/dsh-channels/cleanup'
 /** 访问与授权只读快照（GET/HEAD）：准入模式、管理员、群/用户白名单、待处理申请。 */
 export const ACCESS_ROUTE = '/dsh-channels/access'
@@ -49,7 +49,7 @@ export const PICK_DIRECTORY_ROUTE = '/dsh-channels/pick-directory'
  * 因此不会落进覆盖层文件。
  *
  * `baseDir`（工作区根目录 = 模型/工具产生文件的落点）可覆盖，但面板只接受
- * **绝对路径**（`~` 会展开）；已有 Session / 工作区不迁移，只影响之后新建的
+ * **绝对路径**（`~` 会展开）；已有 Session / 目录不迁移，只影响之后新建的
  * 会话。校验与保存时建目录见 `src/workspaces.ts`。
  */
 export const EDITABLE_KEYS = [
@@ -361,9 +361,9 @@ export interface CleanupPreviewWire {
   thresholdMs?: number
   /** Periodic cleanup runs at startup and once per day. */
   auto: boolean
-  /** Plugin-created workspaces under the current baseDir. */
+  /** Plugin-created workspaces under the current baseDir (user projects). */
   workspaces: number
-  /** Workspaces older than the threshold (the deletable set). */
+  /** Directories older than the threshold (legacy topic workspaces + per-topic dirs). */
   candidates: number
   /** Total bytes currently occupied by the candidates. */
   candidateBytes: number
@@ -375,9 +375,11 @@ export interface CleanupPreviewWire {
 export interface CleanupRunWire {
   ok: boolean
   deletedWorkspaces: number
+  /** Per-topic working directories removed (current layout). */
+  deletedSessionDirs: number
   retiredRoutes: number
   freedBytes: number
-  /** One `path: message` line per workspace that could not be deleted. */
+  /** One `path: message` line per directory that could not be deleted. */
   failures: string[]
   error?: string
 }
@@ -570,7 +572,7 @@ export const PANEL_COPY = {
   connectionTabHelp: '连接状态与飞书应用凭据。凭据不完整时不会连接飞书。',
   sessionsTabHelp: '私聊、群聊触发方式与入站内容；「需重连」项在下次连接时读取。',
   modelTabHelp: '飞书会话使用的模型服务商、模型、推理档位与 Agent 预设；下拉选项来自宿主机实时目录，保存后对新会话生效。',
-  workspaceTabHelp: '每个飞书话题一个独立工作区（模型/工具产生文件的落点）；只影响之后新建的话题。',
+  workspaceTabHelp: '每个用户一个工作区（模型/工具产生文件的落点），每个话题在其中拥有独立工作目录；只影响之后新建的话题。',
   accessTabHelp: '准入采用 fail-closed：管理员不受白名单限制，非管理员私聊会被拒绝，群聊需要「群已授权 + 用户在白名单」两层同时命中。',
   advancedTabHelp: '流式刷新等低层参数、Web 覆盖文件与只读信息。',
   save: '保存更改',
@@ -618,11 +620,12 @@ export const PANEL_COPY = {
   readOnlyCard: '部署级参数',
   // ---- model --------------------------------------------------------------
   // ---- cleanup ------------------------------------------------------------
-  cleanupCard: '工作区清理',
-  cleanupCardHelp: '删除超过保留期且不再活跃的飞书工作区目录；只会删除本插件在「工作区根目录」下创建的目录，DSH 会话日志不删除。删除不可恢复：相关旧话题会失效并提示已过期，工作区列表记录同步移除。',
+  cleanupCard: '目录清理',
+  cleanupCardHelp: '删除超过保留期且不再活跃的飞书话题目录（以及旧版本按话题建立的工作区目录）；用户工作区本身、DSH 会话日志都不会删除。删除不可恢复：相关旧话题会失效并提示已过期。',
   cleanupRetention: '保留期',
   cleanupAutoLabel: '自动清理',
-  cleanupCandidates: '可清理工作区',
+  cleanupCandidates: '可清理目录',
+  cleanupWorkspaces: '插件工作区',
   cleanupCandidateBytes: '预计释放空间',
   cleanupRetentionOff: '关闭（不删除）',
   cleanupAutoOn: '已开启（启动时 + 每天一次）',
@@ -630,17 +633,18 @@ export const PANEL_COPY = {
   cleanupAutoInactive: '未执行（保留期为关闭）',
   cleanupNow: '立即清理',
   cleanupRunning: '清理中…',
-  cleanupConfirm: '确定清理过期工作区吗？该操作不可恢复，会删除这些工作区内的全部文件（包括 attachments/ 附件）。',
-  cleanupConfirmHint: '删除前会再次确认；保留期为「关闭」或没有过期工作区时按钮不可用。',
-  cleanupDisabledOff: '保留策略为「关闭」：请先在上方「过期工作区保留期」中选择保留天数。',
-  cleanupDisabledEmpty: '没有超过保留期的过期工作区。',
+  cleanupConfirm: '确定清理过期目录吗？该操作不可恢复，会删除这些目录内的全部文件（包括 attachments/ 附件）。',
+  cleanupConfirmHint: '删除前会再次确认；保留期为「关闭」或没有过期目录时按钮不可用。',
+  cleanupDisabledOff: '保留策略为「关闭」：请先在上方「过期目录保留期」中选择保留天数。',
+  cleanupDisabledEmpty: '没有超过保留期的过期目录。',
   cleanupPreviewFailed: '无法读取清理预览',
   cleanupDone: '清理完成',
   cleanupFailed: '清理失败',
   cleanupDeleted: '已删除工作区',
+  cleanupDeletedDirs: '话题目录',
   cleanupRetired: '已清理话题路由',
   cleanupFreed: '释放空间',
-  cleanupFailures: '以下工作区未能删除：',
+  cleanupFailures: '以下目录未能删除：',
   // ---- access -------------------------------------------------------------
   accessCard: '访问与授权',
   accessCardHelp: '准入采用 fail-closed：管理员不受白名单限制（私聊、任意群聊都可直接对话）；非管理员私聊会被拒绝，群聊需要「群已授权 + 用户在白名单」两层同时命中。管理员与准入模式在上方「准入与授权」中编辑；私聊机器人发送 /userid 获取自己的 open_id。',

@@ -15,6 +15,7 @@ import type { CardActionEvent, ChannelFactory, FeishuChannel, NormalizedMessage 
 import { CordisFiberState } from '../src/dsh-types.ts'
 import type { AgentHandle, ApprovalOutcome, CordisPluginRuntime, SessionId, SessionProjections } from '../src/dsh-types.ts'
 import type { RouteRecord } from '../src/domain.ts'
+import { sessionDirOf } from '../src/domain.ts'
 import { FEISHU_ATTACHMENTS_SECTION } from '../src/feishu/agent-context.ts'
 import type { SessionExportBuilder } from '../src/session-export.ts'
 import {
@@ -49,6 +50,7 @@ function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
     // Onboarding is opt-in per test: it adds a card that would shift send counts.
     welcomeOnboarding: false,
     acceptAttachments: true,
+    topicIsolation: 'auto',
     workspaceRetention: 'off',
     workspaceRetentionAuto: false,
     ...partial,
@@ -617,13 +619,20 @@ describe('FeishuService', () => {
     const agent = h.ctxState.agents.created[0]!.handle.agent
     const cwd = agent.session.header.cwd
     expect(cwd).toBeDefined()
+    const route = [...(h.ctxState.domain.raw.table('routes').entries() as Iterable<[string, RouteRecord]>)]
+      .map(([, value]) => value)[0]!
+    // The header keeps the user workspace; the command shows the topic dir.
+    expect(route.workspacePath).toBe(cwd)
+    expect(sessionDirOf(route)).not.toBe(cwd)
 
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_workdir', senderId: 'ou_owner', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_workspace_command', content: '/workspace',
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
-    expect(JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)).toContain(cwd)
+    const card = JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)
+    expect(card).toContain(sessionDirOf(route))
+    expect(card).not.toContain(`\"${cwd}\"`)
   })
 
   it('rejects a mismatched /workspace and logs no path values', async () => {
@@ -802,11 +811,15 @@ describe('FeishuService', () => {
     })
     const workspace = h.ctxState.workspaces.workspaces.get(route.workspacePath)!
     expect(mock(workspace.attachSession)).toHaveBeenLastCalledWith(renewed.options.sessionId)
+    // The renewed Session re-enters the same topic directory.
+    expect(h.ctxState.workingDirectory.sets).toContainEqual({
+      sessionId: renewed.options.sessionId, path: sessionDirOf(route),
+    })
 
     const resultCard = JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)
     expect(resultCard).toContain(old.options.sessionId)
     expect(resultCard).toContain(renewed.options.sessionId)
-    expect(resultCard).toContain(route.workspacePath)
+    expect(resultCard).toContain(sessionDirOf(route))
 
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_renew', senderId: 'ou_owner', threadId: 'omt_1',
@@ -1393,10 +1406,12 @@ describe('FeishuService', () => {
     const firstSend = h.channel.sent[0] as { options?: { replyTo?: string; replyInThread?: boolean } }
     expect(firstSend?.options).toMatchObject({ replyTo: msg.messageId, replyInThread: true })
 
-    // Agent created with the workspace directory.
+    // Agent created with the user workspace as header cwd (keeps the Session
+    // grouped under the project) …
     expect(h.ctxState.agents.created).toHaveLength(1)
     const created = h.ctxState.agents.created[0]!
-    const workspacePath = path.join(h.config.baseDir, 'topics', 'p2p', 'ou_alice', 'omt_1')
+    const workspacePath = path.join(h.config.baseDir, 'p2p', 'ou_alice')
+    const sessionDir = path.join(workspacePath, 'topics', 'omt_1')
     expect(created.options.meta?.cwd).toBe(workspacePath)
     expect(created.options.agentOptions).toEqual({
       provider: 'deepseek-official',
@@ -1407,6 +1422,12 @@ describe('FeishuService', () => {
       model: 'deepseek-v4-flash',
       reasoningEffort: 'high',
     })).resolves.toMatchObject({ reasoningEffort: 'tiny' })
+
+    // … and switched to its own topic directory inside that workspace.
+    expect(h.ctxState.workingDirectory.sets).toContainEqual({
+      sessionId: created.options.sessionId, path: sessionDir,
+    })
+    expect(h.ctxState.worktrees.created).toHaveLength(0)
 
     // Workspace registered and session attached.
     expect(h.ctxState.workspaces.workspaces.get(workspacePath)).toBeDefined()
@@ -1532,11 +1553,14 @@ describe('FeishuService', () => {
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
     const cwds = h.ctxState.agents.created.map(entry => entry.options.meta?.cwd as string)
     expect(cwds).toHaveLength(2)
-    const aliceDir = cwds.find(cwd => cwd.includes(`${path.sep}ou_alice${path.sep}`))!
-    const bobDir = cwds.find(cwd => cwd.includes(`${path.sep}ou_bob${path.sep}`))!
-    expect(path.dirname(aliceDir)).toBe(path.join(h.config.baseDir, 'topics', 'groups', 'oc_grp', 'ou_alice'))
-    expect(path.dirname(bobDir)).toBe(path.join(h.config.baseDir, 'topics', 'groups', 'oc_grp', 'ou_bob'))
-    expect(aliceDir).not.toBe(bobDir)
+    const aliceWorkspace = path.join(h.config.baseDir, 'groups', 'oc_grp', 'ou_alice')
+    const bobWorkspace = path.join(h.config.baseDir, 'groups', 'oc_grp', 'ou_bob')
+    expect(new Set(cwds)).toEqual(new Set([aliceWorkspace, bobWorkspace]))
+    // Each user's Session works in its own topic directory below its workspace.
+    const dirs = h.ctxState.workingDirectory.sets.map(entry => entry.path)
+    expect(dirs).toContainEqual(path.join(aliceWorkspace, 'topics', 'omt_1'))
+    expect(dirs).toContainEqual(path.join(bobWorkspace, 'topics', 'omt_2'))
+    expect(aliceWorkspace).not.toBe(bobWorkspace)
   })
 
   it('ignores messages from the bot itself and empty content', async () => {
@@ -2892,7 +2916,7 @@ describe('/permissions and /status extras', () => {
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
     const json = JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)
     expect(json).toContain('权限预设')
-    expect(json).toContain('工作区')
+    expect(json).toContain('会话目录')
     expect(json).toContain('插件运行时长')
     expect(route?.workspacePath).toBeDefined()
     await h.service.shutdown()
@@ -3008,7 +3032,7 @@ describe('inbound attachments', () => {
       .map(([, value]) => value)[0]!
     const sections = promptSectionsOf(h.ctxState.agents.created[0]!.setupCtx)
     const guidance = sections.find(section => section.name === FEISHU_ATTACHMENTS_SECTION)
-    expect(guidance?.text).toContain(`${record.workspacePath}/attachments`)
+    expect(guidance?.text).toContain(`${sessionDirOf(record)}/attachments`)
     await h.service.shutdown()
   })
 
@@ -3055,7 +3079,7 @@ describe('inbound attachments', () => {
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
     const record = [...(h.ctxState.domain.raw.table('routes').entries() as Iterable<[string, RouteRecord]>)]
       .map(([, value]) => value)[0]!
-    const workspaceAttachments = path.join(record.workspacePath, 'attachments')
+    const workspaceAttachments = path.join(sessionDirOf(record), 'attachments')
     await waitUntil(() => expect(readdirSync(workspaceAttachments).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1))
     expect(readdirSync(workspaceAttachments).filter(name => !name.startsWith('.tmp-'))[0]).toMatch(/report\.pdf$/)
     expect(readdirSync(staging)).toEqual([])
@@ -3102,7 +3126,7 @@ describe('inbound attachments', () => {
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
     const record = [...(h.ctxState.domain.raw.table('routes').entries() as Iterable<[string, RouteRecord]>)]
       .map(([, value]) => value)[0]!
-    const dir = path.join(record.workspacePath, 'attachments')
+    const dir = path.join(sessionDirOf(record), 'attachments')
     await waitUntil(() => expect(readdirSync(dir).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1))
     expect(readdirSync(dir)[0]).toMatch(/-bugreport-2025-11-04-141749\.zip$/)
     const agent = h.ctxState.agents.created[0]!.handle.agent
@@ -3128,7 +3152,7 @@ describe('inbound attachments', () => {
       messageId: 'om_iso_a_img', content: '![image](img_a)',
       resources: [{ type: 'image', fileKey: 'img_a' }] as never,
     }))
-    const dirA = path.join(routeA.workspacePath, 'attachments')
+    const dirA = path.join(sessionDirOf(routeA), 'attachments')
     await waitUntil(() => expect(readdirSync(dirA).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1))
 
     await h.onMessage(makeMessage({
@@ -3141,13 +3165,15 @@ describe('inbound attachments', () => {
       messageId: 'om_iso_b_img', content: '![image](img_b)',
       resources: [{ type: 'image', fileKey: 'img_b' }] as never,
     }))
-    const dirB = path.join(routeB.workspacePath, 'attachments')
+    const dirB = path.join(sessionDirOf(routeB), 'attachments')
     await waitUntil(() => expect(readdirSync(dirB).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1))
 
-    // Each topic owns a fresh workspace named after its thread id.
-    expect(routeB.workspacePath).not.toBe(routeA.workspacePath)
-    expect(path.basename(routeA.workspacePath)).toBe(routeA.key)
-    expect(path.basename(routeB.workspacePath)).toBe(routeB.key)
+    // Both topics share the user workspace but own distinct working
+    // directories named after their thread ids.
+    expect(routeB.workspacePath).toBe(routeA.workspacePath)
+    expect(sessionDirOf(routeB)).not.toBe(sessionDirOf(routeA))
+    expect(path.basename(sessionDirOf(routeA))).toBe(routeA.key)
+    expect(path.basename(sessionDirOf(routeB))).toBe(routeB.key)
     expect(readdirSync(dirA).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1)
     expect(readdirSync(dirB).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1)
 
@@ -3155,6 +3181,77 @@ describe('inbound attachments', () => {
       .find(section => section.name === FEISHU_ATTACHMENTS_SECTION)?.text ?? ''
     expect(guidanceB).toContain(dirB)
     expect(guidanceB).not.toContain(dirA)
+    await h.service.shutdown()
+  })
+
+  it('uses a Git worktree per topic when the user workspace is a repository', async () => {
+    const h = await setup({ topicIsolation: 'auto' })
+    const workspaceDir = path.join(h.config.baseDir, 'p2p', 'ou_alice')
+    mkdirSync(path.join(workspaceDir, '.git'), { recursive: true })
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', senderId: 'ou_alice', mentionedBot: false, content: 'hi',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+
+    const created = h.ctxState.agents.created[0]!
+    expect(created.options.meta?.cwd).toBe(workspaceDir)
+    expect(h.ctxState.worktrees.created).toHaveLength(1)
+    expect(h.ctxState.worktrees.created[0]?.name).toBe('feishu-omt_1')
+    const expectedDir = path.join(workspaceDir, '.agents', 'worktrees', 'feishu-omt_1')
+    const route = [...(h.ctxState.domain.raw.table('routes').entries() as Iterable<[string, RouteRecord]>)]
+      .map(([, value]) => value)[0]!
+    expect(route.workspacePath).toBe(workspaceDir)
+    expect(route.sessionDir).toBe(expectedDir)
+    expect(route.worktreeBranch).toBe('feishu-omt_1')
+    // The Session stays grouped under the user workspace.
+    expect(h.ctxState.workspaces.workspaces.get(workspaceDir)).toBeDefined()
+    expect(mock(h.ctxState.workspaces.workspaces.get(workspaceDir)!.attachSession))
+      .toHaveBeenCalledWith(created.options.sessionId)
+    await h.service.shutdown()
+  })
+
+  it('falls back to a plain topic directory when worktree creation fails', async () => {
+    const h = await setup({ topicIsolation: 'worktree' })
+    h.ctxState.worktrees.failWith = new Error('git denied')
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', senderId: 'ou_alice', mentionedBot: false, content: 'hi',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+
+    const workspaceDir = path.join(h.config.baseDir, 'p2p', 'ou_alice')
+    const created = h.ctxState.agents.created[0]!
+    expect(created.options.meta?.cwd).toBe(workspaceDir)
+    const route = [...(h.ctxState.domain.raw.table('routes').entries() as Iterable<[string, RouteRecord]>)]
+      .map(([, value]) => value)[0]!
+    expect(route.workspacePath).toBe(workspaceDir)
+    expect(route.sessionDir).toBe(path.join(workspaceDir, 'topics', 'omt_1'))
+    expect(route.worktreeBranch).toBeUndefined()
+    const logged = mock(h.ctxState.ctx.logger!.warn!).mock.calls.map(call => String(call[0]))
+    expect(logged.some(line => line.includes('creating a worktree'))).toBe(true)
+    await h.service.shutdown()
+  })
+
+  it('keeps the same topic directory across continued messages', async () => {
+    const h = await setup()
+    const first = makeMessage({
+      chatType: 'p2p', senderId: 'ou_alice', mentionedBot: false, content: '开始',
+    })
+    await h.onMessage(first)
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const created = h.ctxState.agents.created[0]!
+    const route = [...(h.ctxState.domain.raw.table('routes').entries() as Iterable<[string, RouteRecord]>)]
+      .map(([, value]) => value)[0]!
+
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', senderId: 'ou_alice', mentionedBot: false,
+      threadId: route.key, messageId: 'om_continue', content: '继续',
+    }))
+    await waitUntil(() => expect(mock(created.handle.agent.followup)).toHaveBeenCalledTimes(2))
+
+    const sets = h.ctxState.workingDirectory.sets
+      .filter(entry => entry.sessionId === created.options.sessionId)
+    expect(sets.map(entry => entry.path)).toEqual([sessionDirOf(route)])
+    expect(h.ctxState.agents.created).toHaveLength(1)
     await h.service.shutdown()
   })
 
@@ -3200,18 +3297,19 @@ describe('inbound attachments', () => {
     expect(message.content).toEqual([{ type: 'text', text: '看这张图 里有什么' }])
     const record = [...(h.ctxState.domain.raw.table('routes').entries() as Iterable<[string, RouteRecord]>)]
       .map(([, value]) => value)[0]!
-    const dir = path.join(record.workspacePath, 'attachments')
+    const dir = path.join(sessionDirOf(record), 'attachments')
     await waitUntil(() => expect(readdirSync(dir).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1))
     await h.service.shutdown()
   })
 })
 
-describe('workspace retention cleanup', () => {
+describe('directory retention cleanup', () => {
   const STALE = 10 * 24 * 60 * 60 * 1000
 
-  it('previews and deletes a stale workspace while retiring its route', async () => {
+  it('previews and deletes a stale legacy topic workspace while retiring its route', async () => {
     const h = await setup({ workspaceRetention: '7d' })
-    const dir = path.join(h.config.baseDir, 'groups', 'oc_stale', 'ou_old')
+    // Legacy layout: one registered workspace per topic below <baseDir>/topics.
+    const dir = path.join(h.config.baseDir, 'topics', 'groups', 'oc_stale', 'ou_old')
     mkdirSync(path.join(dir, 'attachments'), { recursive: true })
     writeFileSync(path.join(dir, 'attachments', 'old.txt'), 'stale bytes')
     const old = new Date(Date.now() - STALE)
@@ -3241,6 +3339,7 @@ describe('workspace retention cleanup', () => {
     const result = await h.service.runWorkspaceCleanup()
     expect(result.ok).toBe(true)
     expect(result.deletedWorkspaces).toBe(1)
+    expect(result.deletedSessionDirs).toBe(0)
     expect(result.retiredRoutes).toBe(1)
     expect(result.freedBytes).toBeGreaterThan(0)
     expect(existsSync(dir)).toBe(false)
@@ -3252,7 +3351,56 @@ describe('workspace retention cleanup', () => {
     await h.service.shutdown()
   })
 
-  it('never offers a workspace whose session is still live', async () => {
+  it('deletes a stale topic directory but keeps the user workspace registered', async () => {
+    const h = await setup({ workspaceRetention: '7d' })
+    // Current layout, seeded without a live Agent (retention never offers a
+    // directory whose Session is still live).
+    const workspaceDir = path.join(h.config.baseDir, 'groups', 'oc_topic_ws', 'ou_owner')
+    const topicDir = path.join(workspaceDir, 'topics', 'omt_topic')
+    mkdirSync(path.join(topicDir, 'attachments'), { recursive: true })
+    writeFileSync(path.join(topicDir, 'attachments', 'old.txt'), 'stale bytes')
+    const old = new Date(Date.now() - STALE)
+    utimesSync(topicDir, old, old)
+    await h.ctxState.workspaces.registry.create(workspaceDir, '飞书群聊 · oc_topic_ws · ou_owner')
+    const record: RouteRecord = {
+      key: 'omt_topic',
+      kind: 'thread',
+      sessionId: 'session-topic',
+      chatId: 'oc_topic_ws',
+      chatType: 'group',
+      senderOpenId: 'ou_owner',
+      workspacePath: workspaceDir,
+      sessionDir: topicDir,
+      cardMessageId: 'om_topic_card',
+      createdAt: old.getTime(),
+      lastActivityAt: old.getTime(),
+      sessionHistory: [{ sessionId: 'session-topic', createdAt: old.getTime() }],
+    }
+    await h.ctxState.domain.raw.table('routes').put(record.key, record)
+
+    const preview = await h.service.cleanupPreview()
+    expect(preview.workspaces).toBe(1)
+    expect(preview.candidates).toBe(1)
+    expect(preview.candidateBytes).toBeGreaterThan(0)
+
+    const result = await h.service.runWorkspaceCleanup()
+    expect(result.ok).toBe(true)
+    expect(result.deletedWorkspaces).toBe(0)
+    expect(result.deletedSessionDirs).toBe(1)
+    expect(result.retiredRoutes).toBe(1)
+    expect(existsSync(topicDir)).toBe(false)
+    expect(existsSync(workspaceDir)).toBe(true)
+    // The user workspace stays registered; the old topic is tombstoned.
+    expect(h.ctxState.workspaces.workspaces.get(workspaceDir)).toBeDefined()
+    expect(h.ctxState.domain.raw.table('routes').get(record.key)).toBeUndefined()
+    expect(h.ctxState.domain.raw.table('expired_routes').get(record.key)).toMatchObject({
+      workspacePath: workspaceDir,
+      sessionDir: topicDir,
+    })
+    await h.service.shutdown()
+  })
+
+  it('never offers a topic directory whose session is still live', async () => {
     const h = await setup({ workspaceRetention: '7d' })
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_live_ws', senderId: 'ou_owner',
@@ -3261,14 +3409,18 @@ describe('workspace retention cleanup', () => {
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
     const record = [...(h.ctxState.domain.raw.table('routes').entries() as Iterable<[string, RouteRecord]>)]
       .map(([, value]) => value)[0]!
+    const topicDir = sessionDirOf(record)
     const old = new Date(Date.now() - STALE)
-    utimesSync(record.workspacePath, old, old)
+    utimesSync(topicDir, old, old)
+    await h.ctxState.domain.raw.table('routes').put(record.key, {
+      ...record, lastActivityAt: old.getTime(),
+    })
 
     const preview = await h.service.cleanupPreview()
     expect(preview.candidates).toBe(0)
     const result = await h.service.runWorkspaceCleanup()
-    expect(result.deletedWorkspaces).toBe(0)
-    expect(existsSync(record.workspacePath)).toBe(true)
+    expect(result.deletedSessionDirs).toBe(0)
+    expect(existsSync(topicDir)).toBe(true)
     await h.service.shutdown()
   })
 

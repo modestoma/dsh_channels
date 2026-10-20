@@ -1,5 +1,5 @@
 /**
- * 工作区清理卡：展示清理预览（保留期 / 自动清理 / 候选数量与空间），
+ * 目录清理卡：展示清理预览（保留期 / 自动清理 / 候选数量与空间），
  * 执行前二次确认，结果与部分失败逐条展示。`cleanup.error` 非空时
  * （例如未连接、无法扫描工作区）按钮天然禁用并显示原因。
  *
@@ -34,7 +34,8 @@ export function CleanupCard(props: {
   const facts = [
     { label: PANEL_COPY.cleanupRetention, value: retentionLabel(panel, cleanup) },
     { label: PANEL_COPY.cleanupAutoLabel, value: autoText },
-    { label: PANEL_COPY.cleanupCandidates, value: `${cleanup.candidates} / ${cleanup.workspaces} 个` },
+    { label: PANEL_COPY.cleanupCandidates, value: `${cleanup.candidates} 个` },
+    { label: PANEL_COPY.cleanupWorkspaces, value: `${cleanup.workspaces} 个` },
     { label: PANEL_COPY.cleanupCandidateBytes, value: formatBytes(cleanup.candidateBytes) },
   ]
   const running = busy === 'cleanup'
@@ -63,6 +64,7 @@ export function CleanupCard(props: {
                 ? (
                     <span>
                       {PANEL_COPY.cleanupDone}：{PANEL_COPY.cleanupDeleted} {result.deletedWorkspaces} 个，
+                      {PANEL_COPY.cleanupDeletedDirs} {result.deletedSessionDirs} 个，
                       {PANEL_COPY.cleanupRetired} {result.retiredRoutes} 条，
                       {PANEL_COPY.cleanupFreed} {formatBytes(result.freedBytes)}。
                     </span>

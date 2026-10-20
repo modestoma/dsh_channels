@@ -106,6 +106,7 @@ chmod 600 $DSH_HOME/.credentials.yaml
     requireMention: true                # 普通群需 @ 机器人
     dmMode: 'open'                      # 私聊通道开关
     threadFallback: 'degrade'           # 话题被拒时降级为会话级路由
+    topicIsolation: 'auto'              # 话题目录隔离：auto（Git 仓库用 worktree，否则子目录）/ subdir / worktree
     approvalTimeoutMs: 300000           # HITL 审批决策卡等待时长（默认 5 分钟）
     accessMode: 'guarded'               # 准入模式：guarded（默认）| open（旧行为，不安全）
     adminOpenId: 'ou_xxx'               # 管理员 open_id（可留空，留空时 guarded 下拒绝一切对话）
@@ -118,7 +119,7 @@ chmod 600 $DSH_HOME/.credentials.yaml
 | 配置项 | 默认 | 说明 |
 |--------|------|------|
 | `appId` / `appSecret` | `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | 凭据引用名（shell 标识符），经 `ctx.credentials` 解析；仅当凭据库使用其它变量名时才需要覆盖。明文密钥会被拒绝 |
-| `baseDir` | `./channels-data` | 工作区目录树根：每个话题一个独立工作区，`topics/p2p/<open_id>/<topic>/`、`topics/groups/<chat_id>/<open_id>/<topic>/`（模型/工具产生文件的落点）；Web 面板可覆盖，只接受绝对路径，`~` 展开，保存时创建并校验目录，只影响之后新建的话题 |
+| `baseDir` | `./channels-data` | 工作区目录树根：每个用户一个工作区（私聊 `p2p/<open_id>/`，群聊 `groups/<chat_id>/<open_id>/`），每个话题的工作目录为 `<工作区>/topics/<话题>/`（模型/工具产生文件的落点）；Web 面板可覆盖，只接受绝对路径，`~` 展开，保存时创建并校验目录，只影响之后新建的会话 |
 | `provider` / `model` | 部署默认 | 新建 session 的路由；省略时继承部署默认 |
 | `reasoningEffort` | 适配器/provider 默认 | Session 初始/重置推理档位；可在话题内用 `/effort` 覆盖 |
 | `maxTokens` | 适配器默认 | 每次模型请求输出上限 |
@@ -126,6 +127,7 @@ chmod 600 $DSH_HOME/.credentials.yaml
 | `dmMode` | `open` | 私聊开关 |
 | `requireMention` | `true` | 普通群是否需要 @ 机器人（话题内续聊不受影响） |
 | `threadFallback` | `degrade` | 话题回复被拒时：`degrade` 降级为会话级延续 / `strict` 直接失败 |
+| `topicIsolation` | `auto` | 话题工作目录形式：`auto`（工作区含 `.git` 时用 Git worktree，否则普通子目录）/ `subdir` / `worktree`（失败回退子目录） |
 | `approvalTimeoutMs` | `300000` | HITL 审批决策卡等待时长（10s–1h）；超时自动拒绝 |
 | `accessMode` | `guarded` | 准入模式：`guarded` 仅管理员+白名单；`open` 保留旧行为（任何可用范围用户可对话，不安全） |
 | `adminOpenId` | 未设置 | 唯一管理员 open_id（`ou_` 开头）；留空 + guarded = 拒绝一切对话（`/userid` 引导仍可用）。面板可改 |
@@ -202,7 +204,7 @@ DSH_HOME=$DSH_HOME pnpm dsh web        # 默认 http://127.0.0.1:3080
 | 2 | 私聊续聊 | 在刚建的话题里直接再发消息（**不 @**） | 继续同一 session：卡片底部 session id 不变，input/output token 累计增长 |
 | 3 | 群聊 @ | 在普通群 @ 机器人发消息 | 同 #1；该消息成为新话题根 |
 | 4 | 群聊话题内 | 在上一步的话题里直接发消息（不 @） | 延续该 session，不再要求 @ |
-| 5 | 同群第二个用户 | 换另一个人 @ 机器人 | 新话题 + 新 session；dsh 工作区列表中出现**独立的第二个工作区**（`topics/groups/<chat_id>/<用户 open_id>/<topic>/`），与原用户的话题工作区互不可见 |
+| 5 | 同群第二个用户 | 换另一个人 @ 机器人 | 新话题 + 新 session；dsh 工作区列表中出现**该用户的独立工作区**（`groups/<chat_id>/<用户 open_id>/`），会话实际工作在它自己的 `topics/<话题>/` 下，与原用户的话题目录互不可见 |
 | 6 | 话题群 | 在话题群某话题中 @ 机器人 | 机器人直接在该话题内回复卡片（不新建话题） |
 | 7 | 折叠面板 | 点面板标题 | 展开推理内容，右侧箭头翻转向上；再点收起 |
 | 8 | 重启恢复 | 重启 dsh 后在旧话题里发消息 | 机器人懒恢复原 session，token 统计继续累计 |
@@ -214,7 +216,7 @@ DSH_HOME=$DSH_HOME pnpm dsh web        # 默认 http://127.0.0.1:3080
 | 14 | 管理员直通（免群授权） | 刚被拉进未授权群时，管理员直接 @ 机器人发消息 | 正常开会话（管理员不受白名单限制）；不授权该群也不影响管理员使用 |
 | 14a | 群授权与群内准入 | 管理员点「授权本群」（或在群内发 `/auth allow`）；未授权用户 @；管理员 `/auth user add <open_id>` 后该用户再 @ | 授权前非管理员 @ 无响应（管理员除外）；授权后白名单用户可分别开会话；未授权用户 @ 不建会话且管理员收到用户授权卡；授权该用户后可正常开会话 |
 | 15 | 撤销与持久化 | `/auth revoke`（群内）/ `/auth user remove <open_id>`；重启 dsh 后再试 | 撤销后对应主体立即无法开启对话；重启后已授权群/用户仍有效（持久化） |
-| 16 | 话题越权防护 | 授权群里用户 A 创建话题后，用户 B 在 A 的话题里发普通消息/附件/回答提问 | B 的消息被静默丢弃，不会进入 A 的 Session、不会写入 A 的工作区；A 自己发言正常 |
+| 16 | 话题越权防护 | 授权群里用户 A 创建话题后，用户 B 在 A 的话题里发普通消息/附件/回答提问 | B 的消息被静默丢弃，不会进入 A 的 Session、不会写入 A 的话题目录；A 自己发言正常 |
 
 ### 5.0 HITL 审批验证点（重点）
 
@@ -228,16 +230,16 @@ DSH_HOME=$DSH_HOME pnpm dsh web        # 默认 http://127.0.0.1:3080
 
 飞书官方文档没有明示 `reply_in_thread` 对**私聊**的约束。联调时在私聊里观察第 1 步：消息是否真的聚合成“话题”形态（话题气泡）。若飞书拒绝话题回复，插件按 `threadFallback: 'degrade'` 自动改为普通回复，此时私聊内所有消息延续同一个 session（等价于“私聊整体即话题”），功能不受阻。若你希望私聊必须话题形态，把 `threadFallback` 设为 `strict` 并反馈错误码。
 
-### 5.2 验证工作区归属
+### 5.2 验证工作区与话题目录
 
-打开 dsh Web GUI → 工作区列表，应看到：
+打开 dsh Web GUI → 工作区列表，应看到**每人一个**项目：
 
 ```
-飞书私聊 · ou_xxx · omt_xxx          （对应 <baseDir>/topics/p2p/ou_xxx/omt_xxx/）
-飞书群聊 · oc_yyy · ou_xxx · omt_xxx （对应 <baseDir>/topics/groups/oc_yyy/ou_xxx/omt_xxx/）
+飞书私聊 · ou_xxx          （对应 <baseDir>/p2p/ou_xxx/）
+飞书群聊 · oc_yyy · ou_xxx （对应 <baseDir>/groups/oc_yyy/ou_xxx/）
 ```
 
-每个新话题会创建新的工作区目录；同一话题内 `/renew` 仍复用该工作区。
+每个新话题在该工作区内创建独立的话题工作目录 `<工作区>/topics/<话题 id>/`，会话列表仍归属该项目；同一话题内 `/renew` 复用同一话题目录。也可在飞书里用 `/workspace` 查看当前会话的实际工作目录。
 
 ## 6. 常见问题排查
 

@@ -21,6 +21,7 @@ describe('resolveConfig', () => {
     expect(config.requireMention).toBe(true)
     expect(config.dmMode).toBe('open')
     expect(config.threadFallback).toBe('degrade')
+    expect(config.topicIsolation).toBe('auto')
     expect(config.loggerLevel).toBe('info')
     expect(config.agentPreset).toBeUndefined()
     expect(config.reasoningEffort).toBeUndefined()
@@ -52,6 +53,17 @@ describe('resolveConfig', () => {
   it('rejects non-identifier spellings (the schema cannot tell refs from secrets)', () => {
     expect(() => resolveConfig({ appId: 'cli-123', appSecret: 'FEISHU_APP_SECRET' })).toThrow(/credential reference/)
     expect(() => resolveConfig({ appId: 'cli_123', appSecret: 'FEISHU APP SECRET' })).toThrow(/credential reference/)
+  })
+
+  it('accepts every topic-isolation mode and rejects unknown ones', () => {
+    for (const mode of ['auto', 'subdir', 'worktree'] as const) {
+      expect(resolveConfig({
+        appId: 'FEISHU_APP_ID', appSecret: 'FEISHU_APP_SECRET', topicIsolation: mode,
+      }).topicIsolation).toBe(mode)
+    }
+    expect(() => resolveConfig({
+      appId: 'FEISHU_APP_ID', appSecret: 'FEISHU_APP_SECRET', topicIsolation: 'shared',
+    })).toThrow(/invalid configuration/)
   })
 
   it('rejects the legacy env: indirection', () => {
