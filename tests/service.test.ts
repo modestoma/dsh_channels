@@ -110,6 +110,29 @@ const waitUntil = async (assert: () => void) => {
 
 /** Narrow a stub method back to its vitest mock for assertions. */
 const mock = (fn: unknown) => fn as unknown as ReturnType<typeof vi.fn>
+
+/** The setup() harness's return value (host fakes + the wired service). */
+type SetupResult = Awaited<ReturnType<typeof setup>>
+
+/**
+ * Session establishment hands the first prompt to the agent as its LAST step —
+ * after the workspace, repair snapshot, route record, first card and streamer
+ * attach. `agents.created` alone is therefore not a delivery barrier: on a slow
+ * CI filesystem, reading the route or resetting the followup spy right after it
+ * races that handoff. Waiting for the first `followup` is the deterministic
+ * "session is established" signal.
+ */
+async function waitForEstablishedSession(h: SetupResult): Promise<void> {
+  await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+  await waitUntil(() => expect(mock(h.ctxState.agents.created[0]!.handle.agent.followup)).toHaveBeenCalled())
+}
+
+/** Wait for the first prompt handoff, then reset the followup spy. */
+async function resetFollowupAfterEstablishment(agent: { followup: unknown }): Promise<void> {
+  await waitUntil(() => expect(mock(agent.followup)).toHaveBeenCalled())
+  mock(agent.followup).mockClear()
+}
+
 const gunzipBuffer = promisify(gunzip)
 
 describe('FeishuService', () => {
@@ -406,9 +429,9 @@ describe('FeishuService', () => {
       chatType: 'group', chatId: 'oc_commands', senderId: 'ou_owner',
       messageId: 'om_start', content: '开始',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
-    mock(agent.followup).mockClear()
+    await resetFollowupAfterEstablishment(agent)
 
     const command = makeMessage({
       chatType: 'group', chatId: 'oc_commands', senderId: 'ou_owner',
@@ -433,7 +456,7 @@ describe('FeishuService', () => {
       chatType: 'group', chatId: 'oc_effort', senderId: 'ou_owner',
       messageId: 'om_effort_start', content: '开始',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const created = h.ctxState.agents.created[0]!
     const agent = created.handle.agent
     const request = () => dispatchAgentRequest(created.setupCtx, {
@@ -483,7 +506,7 @@ describe('FeishuService', () => {
       chatType: 'group', chatId: 'oc_effort_restore', senderId: 'ou_owner',
       messageId: 'om_effort_restore_start', content: '开始',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const original = h.ctxState.agents.created[0]!.handle.agent
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_effort_restore', senderId: 'ou_owner', threadId: 'omt_1',
@@ -520,9 +543,9 @@ describe('FeishuService', () => {
       chatType: 'group', chatId: 'oc_health_route', senderId: 'ou_owner',
       messageId: 'om_health_start', content: '开始',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
-    mock(agent.followup).mockClear()
+    await resetFollowupAfterEstablishment(agent)
 
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_health_route', senderId: 'ou_owner',
@@ -540,7 +563,7 @@ describe('FeishuService', () => {
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_owned', senderId: 'ou_owner', messageId: 'om_owner', content: '开始',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
     const route = h.ctxState.domain.raw.table('routes').get('omt_1') as RouteRecord
     mock(h.ctxState.ctx.commands.execute).mockClear()
@@ -564,7 +587,7 @@ describe('FeishuService', () => {
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_status', senderId: 'ou_owner', messageId: 'om_status_start', content: '开始',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
     const events = sessionEvents(agent.session) as unknown as Array<Record<string, unknown>>
     events.push(
@@ -590,7 +613,7 @@ describe('FeishuService', () => {
         },
       } },
     )
-    mock(agent.followup).mockClear()
+    await resetFollowupAfterEstablishment(agent)
 
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_status', senderId: 'ou_owner', threadId: 'omt_1',
@@ -615,7 +638,7 @@ describe('FeishuService', () => {
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_workdir', senderId: 'ou_owner', messageId: 'om_workdir_start', content: '开始',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
     const cwd = agent.session.header.cwd
     expect(cwd).toBeDefined()
@@ -640,7 +663,7 @@ describe('FeishuService', () => {
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_workdir_bad', senderId: 'ou_owner', content: '开始',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
     const header = agent.session.header as unknown as { cwd: string }
     const routePath = header.cwd
@@ -676,13 +699,13 @@ describe('FeishuService', () => {
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_compact', senderId: 'ou_owner', content: '开始',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
     ;(sessionEvents(agent.session) as unknown as Array<Record<string, unknown>>).push({
       type: 'request/header', seq: 1, time: 1,
       data: { header: { config: { provider: 'deepseek-official', model: 'deepseek-v4-pro' } } },
     })
-    mock(agent.followup).mockClear()
+    await resetFollowupAfterEstablishment(agent)
 
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_compact', senderId: 'ou_owner', threadId: 'omt_1',
@@ -709,7 +732,7 @@ describe('FeishuService', () => {
       chatType: 'group', chatId: 'oc_compact_empty', senderId: 'ou_owner',
       messageId: 'om_compact_empty_start', content: '开始',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_compact_empty', senderId: 'ou_owner', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_compact_empty_command', content: '/compact',
@@ -737,7 +760,7 @@ describe('FeishuService', () => {
       chatType: 'group', chatId: 'oc_compact_error', senderId: 'ou_owner',
       messageId: 'om_compact_error_start', content: '开始',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_compact_error', senderId: 'ou_owner', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_compact_error_command', content: '/compact',
@@ -755,7 +778,7 @@ describe('FeishuService', () => {
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_no_compact', senderId: 'ou_owner', content: '开始',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_no_compact', senderId: 'ou_owner', threadId: 'omt_1',
@@ -773,7 +796,7 @@ describe('FeishuService', () => {
       chatType: 'group', chatId: 'oc_renew', senderId: 'ou_owner',
       messageId: 'om_renew_start', content: '开始',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const old = h.ctxState.agents.created[0]!
     let disposedAfterCommandDone = false
     mock(old.handle.dispose).mockImplementationOnce(async () => {
@@ -865,7 +888,7 @@ describe('FeishuService', () => {
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_renew_create_fail', senderId: 'ou_owner', content: '开始',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const old = h.ctxState.agents.created[0]!
     agentsOptions.failCreate = new Error('simulated renewed create failure')
 
@@ -892,7 +915,7 @@ describe('FeishuService', () => {
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_renew_route_fail', senderId: 'ou_owner', content: '开始',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const old = h.ctxState.agents.created[0]!
     mock(h.ctxState.domain.raw.table('routes').put).mockRejectedValueOnce(new Error('route write failed'))
 
@@ -922,7 +945,7 @@ describe('FeishuService', () => {
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_renew_card_fail', senderId: 'ou_owner', content: '开始',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const old = h.ctxState.agents.created[0]!
     h.channel.send = vi.fn(async () => { throw new Error('result delivery failed') })
 
@@ -944,7 +967,7 @@ describe('FeishuService', () => {
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_renew_restart', senderId: 'ou_owner', content: '开始',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const oldSessionId = h.ctxState.agents.created[0]!.options.sessionId
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_renew_restart', senderId: 'ou_owner', threadId: 'omt_1',
@@ -977,7 +1000,7 @@ describe('FeishuService', () => {
       chatType: 'group', chatId: 'oc_history', senderId: 'ou_owner',
       messageId: 'om_history_start', content: '开始',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const firstSessionId = h.ctxState.agents.created[0]!.options.sessionId
 
     await h.onMessage(makeMessage({
@@ -1038,12 +1061,12 @@ describe('FeishuService', () => {
       chatType: 'group', chatId: 'oc_export', senderId: 'ou_owner',
       messageId: 'om_export_start', content: '开始',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
     ;(sessionEvents(agent.session) as unknown as Array<Record<string, unknown>>).push({
       type: 'turn/end', seq: 41, time: 1_000, data: { turn: 1, reason: 'complete' },
     })
-    mock(agent.followup).mockClear()
+    await resetFollowupAfterEstablishment(agent)
 
     const command = makeMessage({
       chatType: 'group', chatId: 'oc_export', senderId: 'ou_owner', threadId: 'omt_1',
@@ -1085,7 +1108,7 @@ describe('FeishuService', () => {
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_export_args', senderId: 'ou_owner', content: '开始',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
 
     await h.onMessage(makeMessage({
@@ -1106,7 +1129,7 @@ describe('FeishuService', () => {
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_export_owned', senderId: 'ou_owner', content: '开始',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
     mock(h.ctxState.ctx.commands.execute).mockClear()
 
@@ -1132,7 +1155,7 @@ describe('FeishuService', () => {
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_export_gzip_fail', senderId: 'ou_owner', content: '开始',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
 
     await h.onMessage(makeMessage({
@@ -1154,7 +1177,7 @@ describe('FeishuService', () => {
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_export_upload_fail', senderId: 'ou_owner', content: '开始',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
 
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_export_upload_fail', senderId: 'ou_owner', threadId: 'omt_1',
@@ -1182,9 +1205,9 @@ describe('FeishuService', () => {
       chatType: 'group', chatId: 'oc_command_serial', senderId: 'ou_owner',
       messageId: 'om_command_serial_start', content: '开始',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
-    mock(agent.followup).mockClear()
+    await resetFollowupAfterEstablishment(agent)
 
     const originalExecute = h.ctxState.ctx.commands.execute
     let releaseCommand: () => void = () => {}
@@ -1230,7 +1253,7 @@ describe('FeishuService', () => {
       chatType: 'group', chatId: 'oc_renew_redelivery', senderId: 'ou_owner',
       messageId: 'om_renew_redelivery_start', content: '开始',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const old = h.ctxState.agents.created[0]!
     mock(h.ctxState.ctx.commands.execute).mockClear()
 
@@ -1255,7 +1278,7 @@ describe('FeishuService', () => {
       chatType: 'group', chatId: 'oc_command_shutdown', senderId: 'ou_owner',
       messageId: 'om_command_shutdown_start', content: '开始',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
 
     let commandSignal: AbortSignal | undefined
     let markCommandStarted: () => void = () => {}
@@ -1290,7 +1313,7 @@ describe('FeishuService', () => {
       chatType: 'group', chatId: 'oc_command_isolation', senderId: 'ou_owner',
       messageId: 'om_command_isolation_start', content: '开始',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
     const listener = h.ctxState.sessionListeners[0]!
     listener(agent.session, { type: 'turn/end', seq: 1, data: { turn: 1, reason: 'stop' } })
@@ -1321,7 +1344,7 @@ describe('FeishuService', () => {
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_renew_borrowed', senderId: 'ou_owner', content: '开始',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const route = h.ctxState.domain.raw.table('routes').get('omt_1') as RouteRecord
     await h.service.shutdown()
 
@@ -1397,7 +1420,7 @@ describe('FeishuService', () => {
     const h = await setup({ reasoningEffort: 'tiny' }, {}, { reasoningEffort: 'high' })
     const msg = makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', mentionedBot: false, content: '你好呀' })
     await h.onMessage(msg)
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
 
     // Typing reaction first.
     expect(h.channel.reactions).toContainEqual({ messageId: msg.messageId, emojiType: 'Typing' })
@@ -1447,7 +1470,7 @@ describe('FeishuService', () => {
   it('composes created sessions from the roster default preset (mount in setup + header meta)', async () => {
     const h = await setup({}, {}, {})
     await h.onMessage(makeMessage({ chatType: 'p2p', senderId: 'ou_alice', mentionedBot: false, content: 'hi' }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
 
     const created = h.ctxState.agents.created[0]!
     expect(created.options.meta?.agentPreset).toBe('standard')
@@ -1463,7 +1486,7 @@ describe('FeishuService', () => {
   it('mounts the configured agentPreset id instead of the roster default', async () => {
     const h = await setup({ agentPreset: 'channels' }, {}, { defaultId: 'standard' })
     await h.onMessage(makeMessage({ chatType: 'p2p', senderId: 'ou_alice', mentionedBot: false, content: 'hi' }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
 
     const created = h.ctxState.agents.created[0]!
     expect(created.options.meta?.agentPreset).toBe('channels')
@@ -1475,7 +1498,7 @@ describe('FeishuService', () => {
   it('leaves preset composition bare but still mounts channel commands without a roster', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({ chatType: 'p2p', senderId: 'ou_alice', mentionedBot: false, content: 'hi' }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
 
     const created = h.ctxState.agents.created[0]!
     expect(created.options.meta?.agentPreset).toBeUndefined()
@@ -1515,7 +1538,7 @@ describe('FeishuService', () => {
       content: '继续',
     })
     await h.onMessage(second)
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
     await waitUntil(() => expect(mock(agent.followup)).toHaveBeenCalledTimes(2))
 
@@ -1543,7 +1566,7 @@ describe('FeishuService', () => {
     const h = await setup({ requireMention: false })
     const msg = makeMessage({ chatType: 'group', mentionedBot: false, content: '直接问' })
     await h.onMessage(msg)
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
   })
 
   it('gives every group user their own workspace in the same chat', async () => {
@@ -1575,7 +1598,7 @@ describe('FeishuService', () => {
     const h = await setup({}, { failReplyInThread: true })
     const msg = makeMessage({ chatType: 'group', content: '话题不支持' })
     await h.onMessage(msg)
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
 
     const sends = h.channel.sent as Array<{ options?: { replyInThread?: boolean } }>
     expect(sends[0]?.options?.replyInThread).toBeUndefined()
@@ -1595,7 +1618,9 @@ describe('FeishuService', () => {
   it('resumes the persisted session when the live agent is gone', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: 'hello' }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    // Establishment only completes once the first prompt reaches the agent;
+    // by then the route record is durable, which the restart below relies on.
+    await waitForEstablishedSession(h)
     const sessionId = h.ctxState.agents.created[0]!.options.sessionId
 
     // Simulate a restart: drop live agents, keep the route table.
@@ -1615,7 +1640,7 @@ describe('FeishuService', () => {
   it('composes resumed sessions from the same preset resolution as creation', async () => {
     const h = await setup({}, {}, {})
     await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: 'hello' }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
 
     // Simulate a restart: drop live agents, keep the route table.
     await h.service.shutdown()
@@ -1640,7 +1665,7 @@ describe('FeishuService', () => {
   it('borrows a live agent, prepends the configured effort, and releases only that policy', async () => {
     const h = await setup({ reasoningEffort: 'tiny' })
     await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: 'hello' }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const sessionId = h.ctxState.agents.created[0]!.options.sessionId
     await h.service.shutdown()
 
@@ -1695,7 +1720,7 @@ describe('FeishuService', () => {
       },
     })
     await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: 'hello' }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     sessionId = h.ctxState.agents.created[0]!.options.sessionId
     await h.service.shutdown()
 
@@ -1718,7 +1743,7 @@ describe('FeishuService', () => {
   it('disposes an agent resumed during shutdown instead of leaking it live', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: 'hello' }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const sessionId = h.ctxState.agents.created[0]!.options.sessionId
     await h.service.shutdown()
 
@@ -1765,7 +1790,7 @@ describe('FeishuService', () => {
       messageId: 'om_first_trigger', content: '第一轮',
     })
     await h.onMessage(first)
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
 
     const agent = h.ctxState.agents.created[0]!.handle.agent
     const listener = h.ctxState.sessionListeners[0]!
@@ -1829,7 +1854,7 @@ describe('FeishuService', () => {
   it('sends oversized body segments as continuation cards inside the topic', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: '长文' }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
 
     const agent = h.ctxState.agents.created[0]!.handle.agent
     const listener = h.ctxState.sessionListeners[0]!
@@ -1849,7 +1874,7 @@ describe('FeishuService', () => {
   it('falls back to plain text for a rejected segment while the initial card succeeded', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: '长文' }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
 
     // Reject only subsequent card sends (the initial reply card already landed).
@@ -1883,7 +1908,7 @@ describe('FeishuService', () => {
     const h = await setup()
     const msg = makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', mentionedBot: false, content: 'hi' })
     await h.onMessage(msg)
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
 
     const entries = inflightEntries(h)
     expect(entries).toHaveLength(1)
@@ -1910,7 +1935,7 @@ describe('FeishuService', () => {
     const h = await setup()
     const first = makeMessage({ chatType: 'group', chatId: 'oc_grp', senderId: 'ou_alice', content: '一' })
     await h.onMessage(first)
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
 
     // Second message while the first turn is still "streaming" (never ended).
     const second = makeMessage({
@@ -1931,7 +1956,7 @@ describe('FeishuService', () => {
   it('folds resolved segment card ids into the snapshot', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: '长文' }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
     h.ctxState.assistantStreamListeners[0]!({ agent, frame: { type: 'chunk', attemptId: 'attempt-1', revision: 1, index: 0, time: 1, chunk: { type: 'text-delta', index: 0, text: 'x'.repeat(30_000) } } })
     await waitUntil(() => {
@@ -1959,7 +1984,7 @@ describe('FeishuService', () => {
     const h = await setup()
     const msg = makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: 'hi' })
     await h.onMessage(msg)
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
 
     // Crash mid-turn: shutdown without the turn ever ending.
     await h.service.shutdown()
@@ -1986,7 +2011,7 @@ describe('FeishuService', () => {
   it('retries a failed repair once, then retires the snapshot', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: 'hi' }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     await h.service.shutdown()
 
     // First boot: every card patch fails → attempts 0→1, snapshot kept.
@@ -2013,7 +2038,7 @@ describe('FeishuService', () => {
   it('skips text-mode segment cards during repair (content already delivered)', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: '长文' }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
 
     // Segment 2 lands as a text fallback, then the crash happens mid-turn.
@@ -2074,7 +2099,7 @@ describe('FeishuService', () => {
     await h.onMessage(second)
 
     releaseFirst()
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
     await waitUntil(() => expect(mock(agent.followup)).toHaveBeenCalledTimes(2))
 
@@ -2098,7 +2123,7 @@ describe('FeishuService', () => {
     await h.onMessage(first)
     await h.onMessage(second)
 
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
     await waitUntil(() => expect(mock(agent.followup)).toHaveBeenCalledTimes(2))
 
@@ -2128,7 +2153,7 @@ describe('FeishuService', () => {
     })
     await h.onMessage(second)
 
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
     await waitUntil(() => expect(mock(agent.followup)).toHaveBeenCalledTimes(1))
     expect((mock(agent.followup).mock.calls[0]?.[0] as { content: Array<{ text: string }> }).content[0]?.text).toBe('重试')
@@ -2398,7 +2423,7 @@ describe('FeishuService', () => {
     await h.onMessage(msg)
     await h.onMessage(msg) // WS redelivery of the same event
 
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     await settle()
     expect(h.ctxState.agents.created).toHaveLength(1)
     expect(h.channel.sent).toHaveLength(1)
@@ -2411,7 +2436,7 @@ describe('FeishuService', () => {
     const h = await setup()
     const first = makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: '开始' })
     await h.onMessage(first)
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     await waitUntil(() => {
       const entries = [...(h.ctxState.domain.raw.table('routes').entries() as IterableIterator<[string, unknown]>)]
       expect(entries).toHaveLength(1)
@@ -2436,7 +2461,7 @@ describe('FeishuService', () => {
     const h = await setup()
     const msg = makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: '跨重启' })
     await h.onMessage(msg)
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     await waitUntil(() => expect(processedEntries(h)).toHaveLength(1))
     await h.service.shutdown()
 
@@ -2486,7 +2511,7 @@ describe('HITL approval wiring', () => {
       chatType: 'group', chatId: 'oc_approval', senderId: 'ou_owner', content: '审批一下',
     })
     await h.onMessage(msg)
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
 
     const agent = h.ctxState.agents.created[0]!.handle.agent
     const { listener } = h.ctxState.approvalListeners[0]!
@@ -2560,7 +2585,7 @@ describe('HITL approval wiring', () => {
       chatType: 'group', chatId: 'oc_shutdown', senderId: 'ou_owner', content: '先问后关',
     })
     await h.onMessage(msg)
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
     const { listener } = h.ctxState.approvalListeners[0]!
     const pending = listener({
@@ -2586,7 +2611,7 @@ describe('/stop, structured questions, and host projections', () => {
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_questions', senderId: 'ou_owner', content: '问一下',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
     const { listener } = h.ctxState.questionListeners[0]!
     const next = vi.fn(async () => ({ answers: [] }))
@@ -2657,7 +2682,7 @@ describe('/stop, structured questions, and host projections', () => {
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_q_shutdown', senderId: 'ou_owner', content: '先问后关',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
     const { listener } = h.ctxState.questionListeners[0]!
     const pending = listener({
@@ -2674,12 +2699,12 @@ describe('/stop, structured questions, and host projections', () => {
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_stop', senderId: 'ou_owner', messageId: 'om_stop_start', content: '开始',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
     const cancel = vi.fn()
     ;(agent as unknown as { status: string }).status = 'running'
     ;(agent as unknown as { cancel: unknown }).cancel = cancel
-    mock(agent.followup).mockClear()
+    await resetFollowupAfterEstablishment(agent)
 
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_stop', senderId: 'ou_owner', threadId: 'omt_1',
@@ -2701,7 +2726,7 @@ describe('/stop, structured questions, and host projections', () => {
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_stop_idle', senderId: 'ou_owner', content: '开始',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
     const cancel = vi.fn()
     ;(agent as unknown as { cancel: unknown }).cancel = cancel
@@ -2732,7 +2757,7 @@ describe('/stop, structured questions, and host projections', () => {
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_proj', senderId: 'ou_owner', content: '开始',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
     // The window is turn-scoped on the card: a request header must exist for
     // this turn before the model line is rendered at all.
@@ -2765,7 +2790,7 @@ describe('/stop, structured questions, and host projections', () => {
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_stream', senderId: 'ou_owner', content: '开始',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
     h.ctxState.assistantStreamListeners[0]!({
       agent,
@@ -2789,7 +2814,7 @@ describe('command registry dispatch', () => {
       chatType: 'group', chatId: 'oc_alias', senderId: 'ou_owner',
       messageId: 'om_alias_start', content: '开始',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const old = h.ctxState.agents.created[0]!
 
     await h.onMessage(makeMessage({
@@ -2813,7 +2838,7 @@ describe('command registry dispatch', () => {
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_unknown', senderId: 'ou_owner', content: '开始',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
 
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_unknown', senderId: 'ou_owner', threadId: 'omt_1',
@@ -2833,7 +2858,7 @@ describe('free-text question answers', () => {
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_qtext', senderId: 'ou_owner', content: '问一下',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
     const { listener } = h.ctxState.questionListeners[0]!
     const pending = listener({
@@ -2841,7 +2866,7 @@ describe('free-text question answers', () => {
       agent,
     }, vi.fn(async () => ({ answers: [] })))
     await waitUntil(() => expect(h.channel.sent.length).toBe(2))
-    mock(agent.followup).mockClear()
+    await resetFollowupAfterEstablishment(agent)
 
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_qtext', senderId: 'ou_owner', threadId: 'omt_1',
@@ -2865,7 +2890,7 @@ describe('/permissions and /status extras', () => {
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_perm', senderId: 'ou_owner', content: '开始',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
 
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_perm', senderId: 'ou_owner', threadId: 'omt_1',
@@ -2894,7 +2919,7 @@ describe('/permissions and /status extras', () => {
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_perm_on', senderId: 'ou_owner', content: '开始',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
 
     await h.onMessage(makeMessage({
@@ -2912,7 +2937,7 @@ describe('/permissions and /status extras', () => {
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_status_extra', senderId: 'ou_owner', content: '开始',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const route = h.ctxState.domain.raw.table('routes').get('omt_1') as RouteRecord | undefined
 
     await h.onMessage(makeMessage({
@@ -2959,7 +2984,7 @@ describe('/model', () => {
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_model_view', senderId: 'ou_owner', content: '开始',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
     ;(sessionEvents(agent.session) as unknown as Array<Record<string, unknown>>).push({
       type: 'request/header', seq: 1, time: 1,
@@ -2983,7 +3008,7 @@ describe('/model', () => {
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_model_set', senderId: 'ou_owner', content: '开始',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const created = h.ctxState.agents.created[0]!
     const agent = created.handle.agent
 
@@ -3007,7 +3032,7 @@ describe('/model', () => {
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_model_bad', senderId: 'ou_owner', content: '开始',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
     ;(sessionEvents(agent.session) as unknown as Array<Record<string, unknown>>).push({
       type: 'request/header', seq: 1, time: 1,
@@ -3033,7 +3058,7 @@ describe('inbound attachments', () => {
       chatType: 'group', chatId: 'oc_guide', senderId: 'ou_owner',
       messageId: 'om_guide', content: '开始',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const record = [...(h.ctxState.domain.raw.table('routes').entries() as Iterable<[string, RouteRecord]>)]
       .map(([, value]) => value)[0]!
     const sections = promptSectionsOf(h.ctxState.agents.created[0]!.setupCtx)
@@ -3082,7 +3107,7 @@ describe('inbound attachments', () => {
       chatType: 'group', chatId, senderId, messageId: 'om_prompt',
       content: '看 report.pdf 的第一页',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const record = [...(h.ctxState.domain.raw.table('routes').entries() as Iterable<[string, RouteRecord]>)]
       .map(([, value]) => value)[0]!
     const workspaceAttachments = path.join(sessionDirOf(record), 'attachments')
@@ -3129,7 +3154,7 @@ describe('inbound attachments', () => {
       chatType: 'group', chatId: 'oc_post_file', senderId: 'ou_owner', messageId: 'om_post_file',
       rawContentType: 'post', content: '看一下这个文件的内容', raw,
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const record = [...(h.ctxState.domain.raw.table('routes').entries() as Iterable<[string, RouteRecord]>)]
       .map(([, value]) => value)[0]!
     const dir = path.join(sessionDirOf(record), 'attachments')
@@ -3151,7 +3176,7 @@ describe('inbound attachments', () => {
     await h.onMessage(makeMessage({
       chatType: 'group', chatId, senderId, messageId: 'om_iso_a', content: '开始 A',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const routeA = routes()[0]!
     await h.onMessage(makeMessage({
       chatType: 'group', chatId, senderId, threadId: routeA.key, mentionedBot: false,
@@ -3197,7 +3222,7 @@ describe('inbound attachments', () => {
     await h.onMessage(makeMessage({
       chatType: 'p2p', senderId: 'ou_alice', mentionedBot: false, content: 'hi',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
 
     const created = h.ctxState.agents.created[0]!
     expect(created.options.meta?.cwd).toBe(workspaceDir)
@@ -3222,7 +3247,7 @@ describe('inbound attachments', () => {
     await h.onMessage(makeMessage({
       chatType: 'p2p', senderId: 'ou_alice', mentionedBot: false, content: 'hi',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
 
     const workspaceDir = path.join(h.config.baseDir, 'p2p', 'ou_alice')
     const created = h.ctxState.agents.created[0]!
@@ -3243,7 +3268,7 @@ describe('inbound attachments', () => {
       chatType: 'p2p', senderId: 'ou_alice', mentionedBot: false, content: '开始',
     })
     await h.onMessage(first)
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const created = h.ctxState.agents.created[0]!
     const route = [...(h.ctxState.domain.raw.table('routes').entries() as Iterable<[string, RouteRecord]>)]
       .map(([, value]) => value)[0]!
@@ -3297,7 +3322,7 @@ describe('inbound attachments', () => {
       content: '看这张图 ![image](img_1) 里有什么',
       resources: [{ type: 'image', fileKey: 'img_1' }] as never,
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
     const message = mock(agent.followup).mock.calls[0]![0] as { content: Array<{ type: string; text?: string }> }
     expect(message.content).toEqual([{ type: 'text', text: '看这张图 里有什么' }])
@@ -3412,7 +3437,7 @@ describe('directory retention cleanup', () => {
       chatType: 'group', chatId: 'oc_live_ws', senderId: 'ou_owner',
       messageId: 'om_live_ws', content: '开始',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     const record = [...(h.ctxState.domain.raw.table('routes').entries() as Iterable<[string, RouteRecord]>)]
       .map(([, value]) => value)[0]!
     const topicDir = sessionDirOf(record)
@@ -3448,7 +3473,7 @@ describe('/history enrichment', () => {
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_hist', senderId: 'ou_owner', content: '开始',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
 
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_hist', senderId: 'ou_owner', threadId: 'omt_1',
@@ -3467,7 +3492,7 @@ describe('/history enrichment', () => {
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_hist_fail', senderId: 'ou_owner', content: '开始',
     }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitForEstablishedSession(h)
     h.ctxState.sessionQuery.readTitleSnapshots.mockRejectedValueOnce(new Error('query unavailable'))
 
     await h.onMessage(makeMessage({
