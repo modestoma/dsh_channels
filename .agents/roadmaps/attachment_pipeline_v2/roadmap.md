@@ -65,22 +65,22 @@
 
 验收通过需对应 `plan.json` 当前 revision 与 main 上的交付提交 SHA（本 Roadmap 不使用 PR）；自动检查与用户实际操作分别记录在 `acceptance.md`。
 
-## 当前假设与未决问题
+## 当前假设与 P0 结论（2026-10-20）
 
-**假设（P0 需验证）**
+P0 验证已完成（除“清理 probe 后的重启回放”待第二次窗口），证据见 [platform_spike.md](../../issues/platform_spike.md)；结论 **Go**，不改变范围与 revision。
 
-- A1 `ctx.tools` / `ctx.attachments` 在目标 profile 的 channel 会话作用域可用。
-- A2 工具结果可下发 `ImageBlock`；`FileBlock` 可下发或退化句柄文本。
-- A3 `fileHostPath` 映射出的只读路径可被 channel 会话的 `read`/`bash` 读取。
-- A4 bot 身份可 `message.get`/`mget`/`list(thread)`；合并转发资源可按顶层容器 id 下载。
-- A5 未 @ 的群消息事件会投递到机器人（决定静默登记在群聊的覆盖面）。
+- A1 ✅ `ctx.tools` / `ctx.attachments` 在 channel 作用域可用：7 个会话挂载成功，模型实际调用工具。
+- A2 ✅ 工具结果可下发 `ImageBlock`（模型直接描述测试图）；`FileBlock` 内容块可下发并保留文本路径兜底。
+- A3 ✅ `fileHostPath` 只读路径可被 channel 会话的 `bash` 读取，内容校验一致。
+- A4 ✅ bot 身份可 `message.get` / `message.list(chat|thread)`；合并转发资源必须用顶层容器 id 下载。
+- A5 ✅ 未 @ 的群消息事件会投递到机器人（静默登记在群聊可覆盖）。
 
-**未决问题（P0/执行中确认，不写成用户决定）**
+**未决问题**
 
-- Q1 敏感权限（如 `im:message.group_msg`）不可获批时，“@ 之前消息”的覆盖范围与提示文案。
-- Q2 文本模型路由下图片预取的降级文案（占位说明 vs 提示切换模型）。
-- Q3 工具成功下载后是否给源消息补 DONE 表情（体验细节，默认不做）。
-- Q4 旧 `_staging` 一次性迁入停止的具体版本窗口。
+- Q1 入群前历史与敏感权限范围：群/话题历史在现有权限下已可读；入群前历史待 P2 前补测，若不可读则按“机器人可见范围”提示。
+- Q2 文本模型路由下图片预取：通道模型支持 image；其它模型仍需 P1 在预取前检查模态并降级为清单。
+- Q3 工具成功下载后给源消息补 DONE 表情：默认不做。
+- Q4 旧 `_staging` 一次性迁入停止窗口：P3 决定。
 
 ## 评审与执行授权
 
