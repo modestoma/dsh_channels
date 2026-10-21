@@ -33,9 +33,9 @@
 | D3 | 引用机器人消息但未 @ 不触发模型（对话群主聊天区）；已绑定话题 / 话题群内保持“无需 @ 续聊” |
 | D4 | 模型漏调工具用工具与 prompt 优化收敛，不做预下载兜底 |
 | D5 | 大文件懒取 + 单次资源数 / 字节上限 + 超时 / 取消；工具内流式写入 |
-| D6 | 图片与文件统一走 DSH 原生附件库；插件不再提供入站附件清理，工作区清理仅保留给 Agent 产物与旧版目录 |
+| D6 | 图片与文件统一走 DSH 原生附件库；插件不再提供入站附件清理 |
 | D11 | 引用 / 历史附件通过清单行的 `message_id` “可发现 + 可取”；被动读使用独立 3s 预算；degraded chat route 拒绝 topic 消息读取 |
-| D12 | 旧 `_staging` 一次性迁入保留一个版本周期：本版本兼容迁入（成功时 warn），v2 发布后的下一个 minor 版本移除；`_staging` 显式排除在目录清理之外 |
+| D12 | 旧 `_staging` 一次性迁入保留一个版本周期：本版本兼容迁入（成功时 warn），v2 发布后的下一个 minor 版本移除 |
 
 ## 3. 端到端数据流
 
@@ -198,7 +198,7 @@ native 后端下，准入通过后由 `inboundAttachmentState` 做**不下载的
 ## 9. 隐私与安全边界
 
 - **按 route 授权**：所有附件获取都必须同时满足“route 精确匹配（key/kind/chat/chatType/sender）+ 该消息已被可信来源登记或回读确认为 route owner 本人在本 route 容器里的消息”。只有 message id 无法解锁任何资源；跨会话、跨话题、跨用户一律拒绝。
-- **白名单容量与失效**：每 route LRU 128；route 退休 / GC / 关闭 / 清理时回收；进程内不重放 Session 历史（重启后由准入 / 引用 / 历史层按当前回合重新登记）。
+- **白名单容量与失效**：每 route LRU 128；route 退休 / GC / 关闭时回收；进程内不重放 Session 历史（重启后由准入 / 引用 / 历史层按当前回合重新登记）。
 - **不读凭据、不直连 OpenAPI**：guidance 明确禁止读取 / 打印飞书凭据（如 `$DSH_HOME/.credentials.yaml`）和直接调用飞书 OpenAPI；插件只通过注入的飞书 channel 与宿主服务访问数据。P2 真机曾暴露“模型绕路读取凭据”的宿主侧风险，已加 guidance，建议轮换 secret 并在宿主层限制 channel 会话读取 `$DSH_HOME`（非插件可改范围）。
 - **附件字节不进提示**：prompt 只含元数据清单 / 引用摘录 / 历史摘要与原生 `ImageBlock`；文件字节只经工具写入原生库，模型通过只读路径按需读取；清单与工具输出对 id / 文件名做字符白名单与转义，防止换行注入与提示注入。
 - **错误可读化**：工具错误统一映射为稳定 code + 中文原因，非 Error 抛值做字段白名单与截断（≤500 字符），不把原始对象 / 堆栈写进会话。
@@ -206,9 +206,9 @@ native 后端下，准入通过后由 `inboundAttachmentState` 做**不下载的
 
 ## 10. 清理与保留
 
-- **原生附件库**：由 DSH 拥有，插件**不提供清理入口**，也不在目录清理 / 路由 GC 中触碰。磁盘随使用增长，用户已接受（decisions D6 / roadmap 非目标）。
-- **工作区清理（`workspaceRetention` + 手动「目录清理」）**：只删除 `<baseDir>` 下插件创建的**话题工作目录**与**旧版“一个话题一个工作区”目录**，先把仍指向它们的活跃路由退休为墓碑；**用户工作区本身永不删除，DSH Session 日志与事件永不删除**。native 后端下附件不在这些目录里，因此清理不影响 Session 附件；若显式使用 archive 后端，`attachments/` 副本位于话题目录，会随目录清理一起删除。
-- **`_staging`（旧版兼容，D12）**：v2 主路径不再写入；本版本仅在首个 Session 创建 / 续聊时对旧版遗留文件做一次性迁入（best-effort，成功时输出一条 warn，含迁入数量与退役提示）。移除时点：attachment_pipeline_v2 交付发布后的**下一个 minor 版本**发布任务中删除 `stagingPathFor` / `stagingRoot` / 迁入调用及相关文档。`<baseDir>/_staging` 被显式排除在保留期目录清理之外（planning 与 apply 双层拒绝），避免清理误删尚未迁入的遗留附件——DSH 原生附件库本就不在工作区、不参与清理。
+- **原生附件库**：由 DSH 拥有，插件**不提供清理入口**，也不在路由 GC 中触碰。磁盘随使用增长，用户已接受（decisions D6 / roadmap 非目标）。
+- **工作区与话题目录**：插件不删除任何工作区或话题目录，也不删除 DSH Session 日志与事件；需要回收磁盘时由运维手动删除话题目录（下次对话时重建空目录）。若显式使用 archive 后端，`attachments/` 副本位于话题目录，会随目录一起删除。
+- **`_staging`（旧版兼容，D12）**：v2 主路径不再写入；本版本仅在首个 Session 创建 / 续聊时对旧版遗留文件做一次性迁入（best-effort，成功时输出一条 warn，含迁入数量与退役提示）。移除时点：attachment_pipeline_v2 交付发布后的**下一个 minor 版本**发布任务中删除 `stagingPathFor` / `stagingRoot` / 迁入调用及相关文档。
 - **路由墓碑**：过期话题路由退休为持久化墓碑（thread/chat/owner/工作区/会话目录/最后活动时间），后续消息明确提示“话题已过期”，不恢复旧 Session；Session 与日志不动。
 - **升级连续性**：旧 archive 部署切到 native 后，历史话题里的旧附件目录不会被新会话枚举；Session 历史仍可用原路径读取。新入站附件只进原生库。
 
@@ -248,7 +248,7 @@ native 后端下，准入通过后由 `inboundAttachmentState` 做**不下载的
 | `tests/inbound-attachments.test.ts` | 不下载分类、占位符剥离、post `files[]` 恢复、旧 archive 行为回归 |
 | `tests/message-read.test.ts` | get/mget/list 与渲染、引用/历史块边界、route 归属矩阵、失败与权限降级 |
 | `tests/service.test.ts` | 零等待、首回合闸门、静默附件不进后续清单、懒取、archive 降级、问答拦截 |
-| `tests/config.test.ts` / `tests/cleanup.test.ts` / `tests/settings.test.ts` | 新配置默认值/边界、清理边界、面板读写与嵌套合并 |
+| `tests/config.test.ts` / `tests/settings.test.ts` | 新配置默认值/边界、面板读写与嵌套合并 |
 
 各 Issue 交付时记录的测试规模（作为历史证据，不代替当前 `pnpm check`）：P1 原生存储 47 项；pending 33 项；fetch 工具 66 项；admission 后全量 30 files / 770 tests；P2 后 31 files / 860 tests。P3 的回归以实际 `pnpm check` 结果为准。
 
@@ -299,12 +299,12 @@ native 后端下，准入通过后由 `inboundAttachmentState` 做**不下载的
 - 只发附件、不带文字的消息不会在下一轮自动列出；“先发文件、再单独提问”而不引用时模型看不到该文件，需要引用（多个文件可合并转发后引用）。
 - 合并转发单条读取子消息 >50 条时截断（summary 标注），无翻页。
 - archive 后端会阻塞会话建立（旧语义），且入口/清理语义与 native 不同（见 §8、§10）。
-- `_staging` 仅旧版一次性迁入兼容（成功时 warn），v2 发布后的下一个 minor 版本移除（D12）；该目录不受保留期清理影响。
+- `_staging` 仅旧版一次性迁入兼容（成功时 warn），v2 发布后的下一个 minor 版本移除（D12）。
 
 ## 14. 相关文档
 
 - [README.md](../README.md)：安装、命令、面板、配置示例与行为总览。
 - [docs/feishu-onboarding.md](feishu-onboarding.md)：飞书应用权限、配置与真机联调 / P3 验证清单。
-- [docs/workspace-isolation-design.md](workspace-isolation-design.md)：工作区粒度、话题目录与清理边界。
+- [docs/workspace-isolation-design.md](workspace-isolation-design.md)：工作区粒度与话题目录。
 - `.agents/roadmaps/attachment_pipeline_v2/`：roadmap / decisions / acceptance。
 - 各任务证据：`.agents/issues/{platform_spike,native_attachment_store,pending_attachment_registry,attachment_fetch_tool,admission_manifest_flow,quote_history_tools,panel_docs_release}.md`。

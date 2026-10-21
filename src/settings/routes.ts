@@ -1,6 +1,6 @@
 /**
  * Web 设置面板的 HTTP 路由：status / panel / catalog / config(PUT,DELETE) /
- * credentials(PUT,DELETE) / reconnect / cleanup / access。
+ * credentials(PUT,DELETE) / reconnect / access。
  *
  * 路由注册进宿主可选的 `webServer` 服务（headless profile 没有它时面板自然
  * 不存在，飞书通道不受影响）。写操作额外做同源校验 —— 本机非回环绑定下
@@ -20,7 +20,6 @@ import {
   ACCESS_ROUTE,
   ACCESS_USERS_ROUTE,
   CATALOG_ROUTE,
-  CLEANUP_ROUTE,
   CONFIG_ROUTE,
   CREDENTIALS_ROUTE,
   PANEL_ROUTE,
@@ -308,19 +307,6 @@ export function registerSettingsRoutes(server: HostWebServer, surface: SettingsS
         // An incomplete configuration is a client-side state (the panel routes
         // the user to the credentials form), not a server failure.
         sendJson(res, result.ok ? 200 : (result.unconfigured === true ? 400 : 500), result)
-      }),
-    }),
-    server.register({
-      kind: 'exact',
-      path: CLEANUP_ROUTE,
-      handler: guarded(async (req, res) => {
-        if (!allowOnly(req, res, ['POST'])) return
-        if (!isSameOriginRequest(req)) {
-          forbiddenWrite(res)
-          return
-        }
-        const result = await surface.runCleanup()
-        sendJson(res, result.ok ? 200 : 500, result)
       }),
     }),
     server.register({

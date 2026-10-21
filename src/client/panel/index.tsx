@@ -2,8 +2,8 @@
  * 设置 →「飞书渠道」页面：数据加载、5 秒状态轮询、全局 draft 与顶部状态头 /
  * tab 导航的外壳。
  *
- * 所有 Host 交互（panel / status / catalog / config / credentials / cleanup /
- * access / pick-directory）都集中在这里；tab 组件只接收渲染所需的数据与
+ * 所有 Host 交互（panel / status / catalog / config / credentials / access /
+ * pick-directory）都集中在这里；tab 组件只接收渲染所需的数据与
  * 回调。页面不 import 任何 DSH 客户端包，只依赖 react 与 `settings.section`
  * 槽位。
  *
@@ -17,7 +17,6 @@ import type {
   AccessWire,
   CatalogWire,
   ChannelStatusWire,
-  CleanupRunWire,
   ConfigValue,
   CredentialField,
   EditableKey,
@@ -39,7 +38,6 @@ import {
   removeAccessGroup,
   removeAccessUser,
   resolveAccessRequest,
-  runCleanup,
   saveConfig,
   saveCredentials,
 } from '../api.ts'
@@ -51,7 +49,6 @@ import { ModelTab } from './model-tab.tsx'
 import { SessionsTab } from './sessions-tab.tsx'
 import {
   fieldLabel,
-  formatBytes,
   messageOf,
   NoticeBar,
   phaseBadge,
@@ -85,8 +82,6 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
   const [appSecretInput, setAppSecretInput] = useState('')
   const [catalog, setCatalog] = useState<CatalogWire | null>(null)
   const [catalogBusy, setCatalogBusy] = useState(false)
-  const [cleanupResult, setCleanupResult] = useState<CleanupRunWire | null>(null)
-  const [cleanupError, setCleanupError] = useState<string | null>(null)
   const [accessNotice, setAccessNotice] = useState<string | null>(null)
   const [accessError, setAccessError] = useState<string | null>(null)
   const catalogTicket = useRef(0)
@@ -102,8 +97,6 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
   const loadPanel = useCallback(async (): Promise<void> => {
     setLoad({ phase: 'loading' })
     setNotice(null)
-    setCleanupResult(null)
-    setCleanupError(null)
     setAccessNotice(null)
     setAccessError(null)
     try {
@@ -145,7 +138,7 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
         setPollError(null)
         // A phase transition changes what the panel payload can offer: the
         // storage domain opens/closes with the connection, so the access
-        // whitelists and the cleanup preview go stale. Re-read the panel but
+        // whitelists go stale. Re-read the panel but
         // never touch the dirty draft.
         if (previousPhase !== undefined && previousPhase !== next.phase) {
           try {
@@ -260,8 +253,8 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
   }, [])
 
   /**
-   * Manual refresh: reload the whole panel payload so access lists, the cleanup
-   * preview and `restartPendingKeys` catch up with the Host. The dirty draft is
+   * Manual refresh: reload the whole panel payload so access lists and
+   * `restartPendingKeys` catch up with the Host. The dirty draft is
    * deliberately preserved — refreshing never discards user input.
    */
   const onRefresh = useCallback(async (): Promise<void> => {
@@ -301,8 +294,6 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
       }
       setLoad({ phase: 'ready', panel: result.panel })
       setStatus(result.panel.status)
-      setCleanupResult(null)
-      setCleanupError(null)
       // Clear only the submitted keys: edits typed while the request was in
       // flight stay in the draft instead of being silently discarded.
       setDraft(previous => {
@@ -372,8 +363,6 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
       setLoad({ phase: 'ready', panel: result.panel })
       setStatus(result.panel.status)
       setDraft({})
-      setCleanupResult(null)
-      setCleanupError(null)
       setNotice({ kind: 'ok', text: PANEL_COPY.cleared })
     } catch (error) {
       setNotice({ kind: 'error', text: messageOf(error) })
@@ -416,40 +405,6 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
       setBusy(null)
     }
   }, [refreshStatus, running])
-
-  /**
-   * Delete stale workspaces after an explicit confirmation. The Host refreshes
-   * the panel in the same response, so the preview counts update immediately;
-   * partial failures stay visible in the card instead of being swallowed.
-   */
-  const onRunCleanup = useCallback(async (): Promise<void> => {
-    if (panel === null) return
-    const { cleanup } = panel
-    const confirmed = typeof window.confirm === 'function'
-      ? window.confirm(
-        `${PANEL_COPY.cleanupConfirm}\n${PANEL_COPY.cleanupCandidates}：${cleanup.candidates} · ${PANEL_COPY.cleanupCandidateBytes}：${formatBytes(cleanup.candidateBytes)}`,
-      )
-      : true
-    if (!confirmed) return
-    setBusy('cleanup')
-    setNotice(null)
-    setCleanupResult(null)
-    setCleanupError(null)
-    try {
-      const response = await runCleanup()
-      if (!response.ok) {
-        setCleanupError(response.error)
-        return
-      }
-      setLoad({ phase: 'ready', panel: response.panel })
-      setStatus(response.panel.status)
-      setCleanupResult(response.result)
-    } catch (error) {
-      setCleanupError(messageOf(error))
-    } finally {
-      setBusy(null)
-    }
-  }, [panel])
 
   /** Replace the embedded access snapshot after a whitelist mutation. */
   const applyAccess = useCallback((access: AccessWire): void => {
@@ -729,13 +684,7 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
         {activeTab === 'model' ? <ModelTab form={form} catalogBusy={catalogBusy} /> : null}
         {activeTab === 'workspace'
           ? (
-              <WorkspaceTab
-                form={form}
-                cleanup={form.panel.cleanup}
-                cleanupResult={cleanupResult}
-                cleanupError={cleanupError}
-                onRunCleanup={() => { void onRunCleanup() }}
-              />
+              <WorkspaceTab form={form} />
             )
           : null}
         {activeTab === 'access'

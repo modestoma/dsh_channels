@@ -46,7 +46,7 @@ src/
 | 问答卡自由文本回答 | ✅ | 无选项问题直接开放答题；阻塞期间普通文本回复即答案（`custom`） |
 | `/model` 查看与切换 | ✅ | `session/request-policy.ts` 统一 provider/model/effort；`ctx.llm.listModels` 校验；经 `command/run` 持久化 |
 | 附件输入 | ✅ | v2：入站图片/文件默认进 DSH 原生附件库；触发消息图片预取、文件由 `feishu_attachment_fetch` 懒取、纯附件静默登记；`archive` 降级保留旧行为（`feishu/inbound-attachments.ts` 落工作区 `attachments/`，合并转发记录转存 `.txt`）；详见 [attachment-pipeline-v2.md](attachment-pipeline-v2.md) |
-| 目录清理 | ✅ | `cleanup.ts` 纯策略 + 设置面板卡片：`workspaceRetention`（off/7/30/90/180 天）+ 手动/每日清理，只清理工作区与 Agent 产物（过期话题目录/旧版话题工作区）并把路由退休为墓碑，用户工作区、Session 日志与原生附件库保留 |
+| 目录清理 | 已移除 | 插件不删除工作区与话题目录；运维按需手动删除话题目录，下次对话时重建空目录 |
 
 ## 验证基线
 

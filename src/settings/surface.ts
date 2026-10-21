@@ -25,9 +25,6 @@ import type {
   CatalogWire,
   ChannelPhaseWire,
   ChannelStatusWire,
-  CleanupPreviewWire,
-  CleanupResponse,
-  CleanupRunWire,
   ClearConfigResponse,
   ClearCredentialResponse,
   ConfigValue,
@@ -91,10 +88,6 @@ export interface SettingsTarget {
   credentialStates(): Promise<{ appId: CredentialInfo; appSecret: CredentialInfo }>
   setCredential(field: CredentialField, value: string): Promise<void>
   clearCredential(field: CredentialField): Promise<void>
-  /** What the workspace-retention cleanup would delete right now (read-only scan). */
-  cleanupPreview(): Promise<CleanupPreviewWire>
-  /** Run the workspace cleanup once; partial failures are reported per workspace. */
-  runWorkspaceCleanup(): Promise<CleanupRunWire>
   /** Current admission snapshot: mode, administrator, whitelists, pending requests. */
   accessSnapshot(): AccessWire
   /** Authorize one group (panel entry); resolves with the refreshed snapshot. */
@@ -133,7 +126,6 @@ const BOOLEAN_KEYS = new Set<EditableKey>([
   'allowPermissionSwitch',
   'acceptAttachments',
   'prefetchImages',
-  'workspaceRetentionAuto',
   'feishuTools.attachmentFetch',
   'feishuTools.topicMessages',
 ])
@@ -150,13 +142,6 @@ const SELECT_OPTIONS: Partial<Record<EditableKey, ReadonlyArray<{ value: string;
   threadFallback: [
     { value: 'degrade', label: '话题被拒时降级为会话级' },
     { value: 'strict', label: '话题被拒时直接失败' },
-  ],
-  workspaceRetention: [
-    { value: 'off', label: '关闭（不删除）' },
-    { value: '7d', label: '7 天' },
-    { value: '30d', label: '30 天' },
-    { value: '90d', label: '90 天' },
-    { value: '180d', label: '180 天' },
   ],
   loggerLevel: [
     { value: 'debug', label: 'debug' },
@@ -282,8 +267,6 @@ const FIELD_META: Record<EditableKey, { label: string; help: string; min?: numbe
     max: 120_000,
     step: 1_000,
   },
-  workspaceRetention: { label: '过期目录保留期', help: '只清理工作区与 Agent 产物目录，不影响 Session 附件：默认 native 存储下附件在 DSH 原生附件库，不参与目录清理；仅当显式使用 archive 后端时，附件副本位于话题目录、会随目录清理。用户工作区本身永不删除，DSH 会话日志不受影响。' },
-  workspaceRetentionAuto: { label: '自动执行目录清理', help: '开启后插件在启动时及每天执行一次过期目录清理；关闭时只能在下方卡片手动清理。开启前请确认保留期已设置；清理只清理工作区与 Agent 产物目录，不影响 Session 附件。' },
   provider: { label: '模型服务商', help: '留空 = 使用部署默认；例如 deepseek-official。', placeholder: '留空 = 部署默认' },
   model: { label: '模型 id', help: '留空 = 使用部署默认；例如 deepseek-v4-flash。', placeholder: '留空 = 部署默认' },
   reasoningEffort: { label: '推理档位', help: '模型声明的精确档位 id（如 high / max）；留空 = 适配器默认。', placeholder: '留空 = 适配器默认' },
@@ -295,8 +278,6 @@ const FIELD_META: Record<EditableKey, { label: string; help: string; min?: numbe
 
 const GROUP_OF: Record<EditableKey, EditableFieldWire['group']> = {
   baseDir: 'workspace',
-  workspaceRetention: 'workspace',
-  workspaceRetentionAuto: 'workspace',
   dmMode: 'behavior',
   requireMention: 'behavior',
   threadFallback: 'behavior',
@@ -682,23 +663,6 @@ export class SettingsSurface {
       appSecret: toWire(effective.appSecret, credentialStates.appSecret),
     }
 
-    // The cleanup preview is derived from live workspace/route state; a broken
-    // seam must not break the whole panel, so it degrades to zero counts + error.
-    let cleanup: CleanupPreviewWire
-    try {
-      cleanup = await this.target.cleanupPreview()
-    } catch (error) {
-      this.logger?.warn?.('dsh-channels: 目录清理预览失败：%s', messageOf(error))
-      cleanup = {
-        retention: effective.workspaceRetention,
-        auto: effective.workspaceRetentionAuto,
-        workspaces: 0,
-        candidates: 0,
-        candidateBytes: 0,
-        error: messageOf(error),
-      }
-    }
-
     // The access snapshot comes from in-memory maps, but a broken seam must
     // still not take the whole panel down: degrade to an empty, fail-closed
     // view (the whitelist mutations will report their own errors).
@@ -729,7 +693,6 @@ export class SettingsSurface {
         readOnly: readOnlyFields(effective),
         credentials,
       },
-      cleanup,
       access,
     }
   }
@@ -1006,23 +969,6 @@ export class SettingsSurface {
   async pickDirectory(signal: AbortSignal): Promise<string | null> {
     if (this.directoryPicker === undefined) throw new Error(PANEL_COPY.directoryPickFailed)
     return await this.directoryPicker.pick(signal)
-  }
-
-  /**
-   * Run the workspace-retention cleanup once. Irreversible deletions are the
-   * target's responsibility; the surface only reports the outcome and returns
-   * a refreshed panel (its cleanup preview then reflects the remaining workspaces).
-   */
-  async runCleanup(): Promise<CleanupResponse> {
-    const busy = this.writeBusy()
-    if (busy !== undefined) return busy
-    let result: CleanupRunWire
-    try {
-      result = await this.target.runWorkspaceCleanup()
-    } catch (error) {
-      return { ok: false, error: `清理失败：${messageOf(error)}` }
-    }
-    return { ok: true, result, panel: await this.panel() }
   }
 }
 
