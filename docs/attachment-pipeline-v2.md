@@ -151,7 +151,7 @@ native 后端下，准入通过后由 `inboundAttachmentState` 做**不下载的
 
 - 参数：`message_id`（必填）；`file_key`（可选，只取该消息的某个资源，缺省取全部）。
 - 输出：`{ message_id, ok, summary, results[] }`；每个结果含 `ok / kind(image|file) / name / file_key / bytes / media_type / width / height / read_path / handle_text / code / reason / attachment`。渲染为文本 + 每个成功资源的 `ImageBlock` / `FileBlock`；文本始终存在（文本模型或宿主不支持 `FileBlock` 时的兜底）。
-- **授权链**：先查本 route 的进程内白名单（LRU，每 route 128 条）；未命中时用 `message.get` 回读该消息，只有 route owner 本人发出、未撤回、属于本 route（同 chat；话题路由为本话题或聊天主线，chat 路由为主线）的消息才授权，回读失败一律拒绝。`message_id` 单独出现在参数里不足以授权；跨 chat / 跨话题、他人未登记的消息一律 `AUTHORIZATION_DENIED`，不下载任何字节。`file_key` 必须属于该消息已解析的资源集，否则 `UNKNOWN_FILE_KEY`。
+- **授权链**：先查本 route 的进程内白名单（LRU，每 route 128 条）；未命中时用 `message.get` 回读该消息，只有 route owner 本人发出、未撤回、属于本 route 容器（同 chat；话题路由只认本话题，chat 路由为主线）的消息才授权；别的话题与未登记的主线消息一律拒绝，话题之间不互通，回读失败一律拒绝。`message_id` 单独出现在参数里不足以授权；跨 chat / 跨话题、他人未登记的消息一律 `AUTHORIZATION_DENIED`，不下载任何字节。`file_key` 必须属于该消息已解析的资源集，否则 `UNKNOWN_FILE_KEY`。
 - **授权来源**：触发消息（准入层登记，`source='trigger'`）、引用消息（`quote`）、首轮历史（`history`）、近期附件（`recent`）、工具自身成功解析的消息（`tool-result`）进入本 route 的进程内白名单；回读授权的消息以 `tool-result` 记入白名单。`containerMessageId` 只能来自可信登记，绝不从模型参数取下载 id。
 - **合并转发**：用顶层容器 `message_id` 展开子消息并下载子资源；子消息 id 不能作为下载 id（P0：子 id 返回 400）。
 - **限制与取消**：单次资源数、总字节预算（文件在流式写入中逐 chunk 计量）、整段 `timeoutMs`；遵守 `exec.signal`，超时/取消把当前与剩余资源标记 `TIMEOUT` / `ABORTED`，不提交半文件、逐资源失败不中断整体调用。图片受宿主 `maxImageBytes` 额外约束。
@@ -161,7 +161,7 @@ native 后端下，准入通过后由 `inboundAttachmentState` 做**不下载的
 
 - 参数：`message_id?`（单条读取，形状 `^om_[A-Za-z0-9_-]{1,128}$`）、`limit?`（列表页大小，默认 10、上限 50）、`cursor?`（上一页返回的 opaque page token，≤2048 字符）。`message_id` 与 `cursor` 互斥。
 - 输出：`{ ok, summary, container{type,id}, order(newest_first|single), message_count, has_more, cursor?, messages[], code?, reason? }`；每条消息含 `message_id / type / sender / time / deleted / text / parent_message_id / resources[]`（图片/文件/文件夹元数据）。渲染文本有界（≤50 行、12k 字符）并显式输出 `- 下一页 cursor: <token>`（P2 真机缺陷修复，提交 `7964c64`）。
-- **读取范围**：只允许当前 route 的容器——thread 路由读该话题（单条读取另接受本人或已登记的主线消息）；degraded chat 路由读会话主时间线并过滤其他话题消息；`message_id` 模式校验容器归属，跨 chat / 跨话题一律 `MESSAGE_OUT_OF_ROUTE`。
+- **读取范围**：只允许当前 route 的容器——thread 路由读该话题（单条读取另接受已登记到本 route 的主线消息）；degraded chat 路由读会话主时间线并过滤其他话题消息；`message_id` 模式校验容器归属，跨 chat / 跨话题一律 `MESSAGE_OUT_OF_ROUTE`。
 - **授权联动**：单条读取会展开合并转发并按容器 id 登记；列表只登记“带资源 / 合并转发”的行，避免纯文本长历史把 LRU 白名单挤爆；读到的资源即获得 fetch 授权。
 - **错误**：`ROUTE_NOT_FOUND`、`TOOL_DISABLED`、`INVALID_ARGUMENT`、`MESSAGE_OUT_OF_ROUTE`、`MESSAGE_READ_FAILED`、`PERMISSION_DENIED`、`ABORTED`、`TIMEOUT`、`INTERNAL_ERROR`，均带中文可读原因；缺读取 scope 时不会报死错。
 - **挂载**：`feishuTools.topicMessages=true`（默认）即挂载，**与存储后端无关**；archive 部署仍可读历史文本，但工具描述会追加“本部署 `feishu_attachment_fetch` 不可用”的提示。
@@ -199,11 +199,11 @@ native 后端下，准入通过后由 `inboundAttachmentState` 做**不下载的
 | 近期附件读取失败 / 超时 | 清单只少近期附件行，回合照常运行 |
 | 缺消息读取 scope（`im:message:readonly` 等） | 引用 / 历史块与近期附件行静默省略（首次一条 warn）；显式调用 `feishu_topic_messages` 返回可读 `PERMISSION_DENIED`；普通对话不受影响 |
 | 话题回复被拒（非主题群等） | `threadFallback: degrade` 退化为会话级路由；degraded 路由拒绝 topic 消息的引用/读取 |
-| 重启 | 路由懒恢复；进程内白名单不重放；本人消息由 fetch 回读授权，他人的引用/历史消息需重新出现在引用或历史中才可取 |
+| 重启 | 路由懒恢复；进程内白名单不重放；本人在本话题的消息由 fetch 回读授权；首轮从主线列出的附件与他人的引用/历史消息需重新出现才可取 |
 
 ## 9. 隐私与安全边界
 
-- **按 route 授权**：所有附件获取都必须同时满足“route 精确匹配（key/kind/chat/chatType/sender）+ 该消息已被可信来源登记或回读确认为 route owner 本人的本会话消息”。只有 message id 无法解锁任何资源；跨会话、跨话题、跨用户一律拒绝。
+- **按 route 授权**：所有附件获取都必须同时满足“route 精确匹配（key/kind/chat/chatType/sender）+ 该消息已被可信来源登记或回读确认为 route owner 本人在本 route 容器里的消息”。只有 message id 无法解锁任何资源；跨会话、跨话题、跨用户一律拒绝。
 - **近期附件的范围**：只选 route owner 本人在本 route 容器（话题路由另含聊天主线）中的消息；其他 sender / topic / chat 的消息跳过。
 - **白名单容量与失效**：每 route LRU 128；route 退休 / GC / 关闭 / 清理时回收；进程内不重放 Session 历史（重启后由准入 / 引用 / 历史层按当前回合重新登记）。
 - **不读凭据、不直连 OpenAPI**：guidance 明确禁止读取 / 打印飞书凭据（如 `$DSH_HOME/.credentials.yaml`）和直接调用飞书 OpenAPI；插件只通过注入的飞书 channel 与宿主服务访问数据。P2 真机曾暴露“模型绕路读取凭据”的宿主侧风险，已加 guidance，建议轮换 secret 并在宿主层限制 channel 会话读取 `$DSH_HOME`（非插件可改范围）。
@@ -303,7 +303,7 @@ native 后端下，准入通过后由 `inboundAttachmentState` 做**不下载的
 
 - 图片预取期间卡片已可见，但 `followup` 会等待预取窗口（默认 ≤10 s，可配）；这是“首轮图片可见”与“首字延迟”的取舍。
 - 文件懒取依赖模型主动调用工具；prompt 已用“未加载”措辞、工具描述与清单提示收敛漏调风险，但不做预下载兜底（D4）。
-- 白名单为进程内 LRU（128/route），重启后清空；本人在本会话的消息由 fetch 回读授权，他人的引用/历史消息需重新出现才可取。
+- 白名单为进程内 LRU（128/route），重启后清空；本人在本话题的消息由 fetch 回读授权，首轮从主线列出的附件与他人的引用/历史消息需重新出现才可取。
 - 单 route 容量、manifest 50 行、历史 N≤20、工具输出 12k/50 行等均为有界设计，超限时给出显式截断/省略标注。
 - 近期附件只列本人上一轮之后的消息、最多 `recentAttachmentLimit` 条，依赖消息读取权限（群聊需 `im:message.group_msg`），每回合多一到两次 `message.list`；续聊回合只读本话题、不回看主线；问答回答附带的附件若之后机器人又发了新消息，会被扫描边界挡住。
 - 合并转发单条读取子消息 >50 条时截断（summary 标注），无翻页。

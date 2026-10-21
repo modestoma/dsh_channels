@@ -20,8 +20,9 @@
  * - messages this tool already resolved (successful or failed attempts), so a
  *   later turn in the same session keeps its authorized resources;
  * - on a whitelist miss, a message the tool reads back from Feishu and finds to
- *   be the route owner's own message in the route's chat, inside its topic or
- *   on the main timeline.
+ *   be the route owner's own message inside the route's container (its topic,
+ *   or the main timeline of a degraded chat route); another topic never
+ *   matches.
  *
  * The whitelist is an in-memory LRU per route and is not replayed from Session
  * history; the read-back rule keeps the owner's earlier attachments fetchable
@@ -271,7 +272,7 @@ export type AttachmentFetchFailureCode =
 
 const FETCH_FAILURE_REASONS: Readonly<Record<string, string>> = {
   ROUTE_NOT_FOUND: '当前会话尚未绑定飞书对话，无法获取附件',
-  AUTHORIZATION_DENIED: '该消息不在本会话的附件授权范围内（仅可获取触发消息、引用消息、附件清单中列出的消息或本人在本会话发送的消息）',
+  AUTHORIZATION_DENIED: '该消息不在本会话的附件授权范围内（仅可获取触发消息、引用消息、附件清单中列出的消息或本人在本话题发送的消息）',
   CHANNEL_UNAVAILABLE: '飞书连接未运行，无法获取附件',
   MESSAGE_READ_FAILED: '读取飞书消息内容失败',
   NO_RESOURCES: '该消息不包含可下载的图片或文件',
@@ -1679,7 +1680,7 @@ const TOPIC_MESSAGES_FAILURE_REASONS: Readonly<Record<TopicMessagesFailureCode, 
   TOOL_DISABLED: '话题消息读取工具已禁用',
   INVALID_ARGUMENT: '读取消息的参数不合法',
   MESSAGE_OUT_OF_ROUTE:
-    '该消息不在当前会话的飞书话题/聊天范围内（仅可读取当前话题的消息、本人在本聊天主线发送的消息或本会话已知的消息）',
+    '该消息不在当前会话的飞书话题/聊天范围内（仅可读取当前话题的消息或本会话已知的消息）',
   MESSAGE_READ_FAILED: '读取飞书消息失败',
   PERMISSION_DENIED: '飞书应用缺少读取消息的权限（如 im:message:readonly），无法读取引用或话题消息',
   ABORTED: '读取飞书消息已取消',
@@ -2078,10 +2079,9 @@ export class TopicMessagesToolRuntime {
       }
     }
     // Route membership is enforced on the container: another chat, another
-    // topic of the same group, or another sender's unregistered main-timeline
-    // message is refused. The owner's main-timeline messages and messages
-    // already admitted to this route (trigger/quote/recent) may be read even
-    // without a topic id (they precede the topic).
+    // topic of the same group, or an unregistered main-timeline message is
+    // refused. A message already admitted to this route (trigger/quote/recent)
+    // may be read even without a topic id (it precedes the topic).
     const known = this.deps.isKnownMessage(route, messageId)
     if (!messageBelongsToRoute(route, container, known ? [messageId] : [])) {
       return {

@@ -879,9 +879,9 @@ export function topicMessageViewOf(
  * - a message of another chat (or one whose chat id the API did not return) is
  *   always rejected: a missing id must fail closed, never open;
  * - a thread route accepts messages of its own topic, plus main-timeline
- *   messages the route owner sent or that were already admitted to this route
- *   (both precede the topic: files posted before the @-mention, a quote of a
- *   main-timeline message);
+ *   messages only when they were already admitted to this route (a quote of a
+ *   main-timeline message, or a file listed on the topic's first turn, happens
+ *   before the bot creates the topic); other topics never match;
  * - a degraded chat route accepts main-timeline messages only (topic messages
  *   belong to other topics of the same chat and must never leak in), even when
  *   they were somehow referenced by id.
@@ -898,7 +898,7 @@ export function messageBelongsToRoute(
   const known = knownMessageIds.includes(item.messageId)
   if (route.kind === 'thread') {
     if (item.threadId === route.key) return true
-    return item.threadId === undefined && (known || item.senderOpenId === route.senderOpenId)
+    return item.threadId === undefined && known
   }
   return item.threadId === undefined
 }

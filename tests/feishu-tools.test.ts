@@ -814,22 +814,12 @@ describe('feishu attachment-fetch authorization', () => {
     expect(calls).toEqual(['om_owned'])
   })
 
-  it('lets a topic route read back the owner\'s main-timeline message (AC-4)', async () => {
-    const harness = setupRuntime()
-    const definition = await harness.mount()
-    // A group file posted WITHOUT an @ before the topic existed has no thread
-    // id; the later @-created topic must still fetch it.
-    readBack(harness, ownerFile('om_owned_main', { thread_id: undefined }))
-
-    const value = await runTool(definition, { message_id: 'om_owned_main' })
-    expect(value.ok).toBe(true)
-    expect(harness.channel.downloaded[0]?.fileKey).toBe('om_owned_main_key')
-  })
-
-  it('refuses read-back messages of another sender, topic, or chat, and deleted ones', async () => {
+  it('refuses read-back messages of another sender, topic, chat, or the main timeline, and deleted ones', async () => {
     const cases: Array<Parameters<typeof makeRawMessage>[0]> = [
       ownerFile('om_foreign', { sender_id: 'ou_someone_else' }),
       ownerFile('om_foreign', { thread_id: 'omt_other_topic' }),
+      // An unregistered main-timeline message never joins a topic route.
+      ownerFile('om_foreign', { thread_id: undefined }),
       ownerFile('om_foreign', { chat_id: 'oc_other_chat' }),
       ownerFile('om_foreign', { chat_id: undefined }),
       ownerFile('om_foreign', { deleted: true }),
@@ -1948,7 +1938,7 @@ describe('feishu topic-messages single read', () => {
     expect(value.messages[0]?.text).toBe('main timeline quote')
   })
 
-  it('allows the owner\'s main-timeline message in a topic route', async () => {
+  it('refuses the owner\'s unregistered main-timeline message in a topic route', async () => {
     const harness = setupRuntime()
     harness.channel.messageGet = async () => makeMessageGetResponse([
       makeRawMessage({
@@ -1963,12 +1953,8 @@ describe('feishu topic-messages single read', () => {
     const definition = await harness.mountTopic()
 
     const value = await runTopicTool(definition, { message_id: 'om_owner_main' })
-    expect(value.ok).toBe(true)
-    expect(value.messages[0]?.resources?.[0]).toEqual({
-      type: 'file', file_key: 'file_key_owner_main', name: 'owner.pdf',
-    })
-    // The read also refreshes the shared whitelist for the fetch tool.
-    expect(harness.runtime.isKnownMessage(DEFAULT_ROUTE, 'om_owner_main')).toBe(true)
+    expect(value.ok).toBe(false)
+    expect(harness.runtime.isKnownMessage(DEFAULT_ROUTE, 'om_owner_main')).toBe(false)
   })
 
   it('exposes isKnownMessage over the whitelist', async () => {
