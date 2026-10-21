@@ -26,6 +26,10 @@
  * Continuation cards (`options.segment`) carry a segment header and the body;
  * they have no panel and no footer, so a long answer is not repeated chrome.
  *
+ * The stop button follows the activity lines: the streamer only passes it for
+ * the card that is currently streaming and drops it once the turn settles, so
+ * a settled card never offers a control that can no longer act.
+ *
  * Budgets, two independent ones:
  * - Each card is measured as a whole: segmentation targets `CARD_TARGET_BYTES`
  *   (main cards probe the panel at its maximum window, so reasoning that keeps
@@ -39,16 +43,26 @@
  * @module dsh-channels/cards/streaming
  */
 
-import { card, divider, foldPanel, markdown, note } from './primitives.ts'
+import { card, divider, foldPanel, markdown, note, textButton } from './primitives.ts'
 
-export type PanelPhase = 'thinking' | 'replying' | 'done' | 'error'
+export type PanelPhase = 'thinking' | 'replying' | 'done' | 'stopped' | 'error'
 
 export const PANEL_TITLES: Record<PanelPhase, string> = {
   thinking: '推理中',
   replying: '回复中',
   done: '回复结束',
+  stopped: '已停止',
   error: '回复失败',
 }
+
+/** `decision` carried by the streaming card's stop button. */
+export const STOP_ACTION = 'turn-stop'
+
+/**
+ * Stop control state on the streaming card: `ready` offers the button,
+ * `stopping` shows it disabled after the owner clicked it.
+ */
+export type StopControl = 'ready' | 'stopping'
 
 /** Built-in icon token for the fold-panel chevron (from the official component docs). */
 export const PANEL_CHEVRON_TOKEN = 'down-small-ccm_outlined'
@@ -124,6 +138,14 @@ export interface CardState {
    * Empty/undefined → omitted.
    */
   tool?: string
+  /**
+   * Stop control for the actively streaming card. Same rule as `status`: the
+   * streamer passes it only for the current card of an unsettled turn.
+   * Undefined → no button.
+   */
+  stop?: StopControl
+  /** Add the owner-only notice under the stop button (a non-owner clicked it). */
+  stopDenied?: boolean
   stats: CardStats
 }
 
@@ -311,7 +333,7 @@ function reasoningPlaceholder(phase: PanelPhase): string {
 }
 
 function bodyPlaceholder(phase: PanelPhase): string {
-  return phase === 'done' || phase === 'error' ? '*（本次无正文输出）*' : '*正在生成…*'
+  return isSettled(phase) ? '*（本次无正文输出）*' : '*正在生成…*'
 }
 
 /** The panel's markdown: stripped of tables, with a placeholder when empty. */
@@ -341,7 +363,7 @@ function interruptionHeader(segment: number): string {
 }
 
 function isSettled(phase: PanelPhase): boolean {
-  return phase === 'done' || phase === 'error'
+  return phase === 'done' || phase === 'stopped' || phase === 'error'
 }
 
 /**
@@ -358,6 +380,23 @@ function activityNote(text: string | undefined): object | undefined {
     ? text
     : `${text.slice(0, ACTIVITY_LINE_MAX_CHARS - 1)}…`
   return note(clipped)
+}
+
+/** Main-card line of a turn that ended through a stop request. */
+export const STOPPED_NOTICE = '⏹ 已按请求停止本轮回复'
+
+/** The stop button plus its optional owner-only notice. */
+function stopElements(stop: StopControl, denied: boolean): object[] {
+  const elements: object[] = [textButton({
+    label: stop === 'stopping' ? '正在停止…' : '⏹ 停止',
+    type: 'default',
+    width: 'default',
+    margin: '8px 0 0 0',
+    disabled: stop === 'stopping',
+    value: { decision: STOP_ACTION },
+  })]
+  if (denied) elements.push(note('ℹ️ 仅发起该会话的用户可停止'))
+  return elements
 }
 
 // ---- rendering ------------------------------------------------------------
@@ -391,6 +430,10 @@ function renderCard(
   if (toolNote !== undefined) elements.push(toolNote)
 
   elements.push(markdown(body.trim() === '' ? bodyPlaceholder(state.phase) : body))
+
+  if (state.stop !== undefined) elements.push(...stopElements(state.stop, state.stopDenied === true))
+
+  if (main && state.phase === 'stopped') elements.push(note(STOPPED_NOTICE))
 
   if (main && isSettled(state.phase)) {
     // The divider separates the answer from the turn's metadata; the two
@@ -474,8 +517,10 @@ const PANEL_PROBE_MARKDOWN = 'r'.repeat(REASONING_MAX_BYTES - 2)
  *
  * The probe renders the worst card this segment can ever become: the main card
  * always budgets the panel's full window (reasoning may keep growing after the
- * split) and its settled footer, while continuation cards have neither. The
- * `error` phase is probed because it has the longest panel title.
+ * split) and its settled footer, while continuation cards have neither. Every
+ * card also budgets the stop button with its notice, since the newest card
+ * carries it while streaming. The `error` phase is probed because it has the
+ * longest panel title.
  */
 export function segmentCardContent(state: CardState, options: CardOptions = {}): BodySplit {
   const main = options.segment === undefined
@@ -483,6 +528,8 @@ export function segmentCardContent(state: CardState, options: CardOptions = {}):
     ...state,
     phase: 'error',
     reasoning: main ? PANEL_PROBE_MARKDOWN : '',
+    stop: 'stopping',
+    stopDenied: true,
   }
   const limit = fitPrefix(
     state.body,
@@ -568,14 +615,15 @@ export function splitBodyForCard(body: string, maxChars: number, maxTables: numb
 
 /**
  * The initial (empty) streaming card for one session: thinking phase, empty
- * body and reasoning, zeroed stats. The service sends it as the topic-creating
- * first reply and then streams into the same message.
+ * body and reasoning, zeroed stats, and the stop button. The service sends it
+ * as the topic-creating first reply and then streams into the same message.
  */
 export function initialStreamingCard(sessionId: string): object {
   const state: CardState = {
     phase: 'thinking',
     reasoning: '',
     body: '',
+    stop: 'ready',
     stats: { sessionId, inputTokens: 0, outputTokens: 0 },
   }
   return buildCard(state)
