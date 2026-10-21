@@ -81,7 +81,7 @@
 |------|------|------|
 | 工作区（私聊） | `(bot, open_id)` → 目录 `<baseDir>/p2p/<open_id>/`（header cwd） | `ctx.workspaceRegistry` + 磁盘 |
 | 工作区（群聊） | `(bot, chat_id, open_id)` → 目录 `<baseDir>/groups/<chat_id>/<open_id>/` | 同上 |
-| 话题工作目录 | `<工作区>/topics/<topic>/`（实际 cwd，附件落 `<目录>/attachments/`） | Session 日志 `working-directory/change` + 路由记录 `sessionDir` |
+| 话题工作目录 | `<工作区>/topics/<topic>/`（实际 cwd；入站附件 v2 默认进 DSH 原生附件库，仅 archive 降级落 `<目录>/attachments/`） | Session 日志 `working-directory/change` + 路由记录 `sessionDir` |
 | session | `thread_id` → DSH `sessionId`（每话题一个） | 插件 `storageDomain` 域 `channels_routes` |
 | 会话延续 | 事件 `thread_id` 命中映射 → `agent.followup()` | — |
 

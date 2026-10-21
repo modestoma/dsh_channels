@@ -45,8 +45,8 @@ src/
 | 首触引导卡 | ✅ | 私聊首次触达一张，`welcomedChats` 持久化去重，`welcomeOnboarding` 可关 |
 | 问答卡自由文本回答 | ✅ | 无选项问题直接开放答题；阻塞期间普通文本回复即答案（`custom`） |
 | `/model` 查看与切换 | ✅ | `session/request-policy.ts` 统一 provider/model/effort；`ctx.llm.listModels` 校验；经 `command/run` 持久化 |
-| 附件输入 | ✅ | `feishu/inbound-attachments.ts`：图片/文件流式落盘到工作区 `attachments/`、合并转发记录转存 `.txt`；不触发模型，Agent 用工具按需读取；`acceptAttachments` 可配 |
-| 目录清理 | ✅ | `cleanup.ts` 纯策略 + 设置面板卡片：`workspaceRetention`（off/7/30/90/180 天）+ 手动/每日清理，删除过期话题目录/旧版话题工作区并把路由退休为墓碑，用户工作区与 Session 日志保留 |
+| 附件输入 | ✅ | v2：入站图片/文件默认进 DSH 原生附件库；触发消息图片预取、文件由 `feishu_attachment_fetch` 懒取、纯附件静默登记；`archive` 降级保留旧行为（`feishu/inbound-attachments.ts` 落工作区 `attachments/`，合并转发记录转存 `.txt`）；详见 [attachment-pipeline-v2.md](attachment-pipeline-v2.md) |
+| 目录清理 | ✅ | `cleanup.ts` 纯策略 + 设置面板卡片：`workspaceRetention`（off/7/30/90/180 天）+ 手动/每日清理，只清理工作区与 Agent 产物（过期话题目录/旧版话题工作区）并把路由退休为墓碑，用户工作区、Session 日志与原生附件库保留 |
 
 ## 验证基线
 
