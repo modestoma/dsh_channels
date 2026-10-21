@@ -93,6 +93,19 @@ function routeRecords(harness: Harness): Array<[string, RouteRecord]> {
   return [...(table.entries() as IterableIterator<[string, RouteRecord]>)]
 }
 
+/**
+ * Wait for one sender's route to be committed. Session creation precedes the
+ * route write, so `agents.created` alone does not mean the route is readable.
+ */
+async function waitForRoute(harness: Harness, senderOpenId: string): Promise<[string, RouteRecord]> {
+  let found: [string, RouteRecord] | undefined
+  await waitUntil(() => {
+    found = routeRecords(harness).find(([, record]) => record.senderOpenId === senderOpenId)
+    expect(found).toBeDefined()
+  })
+  return found!
+}
+
 /** Count the agent followups of the first created Session. */
 function followupsOf(harness: Harness, index = 0): number {
   const created = harness.ctxState.agents.created[index]
@@ -434,7 +447,7 @@ describe('guarded 模式：话题所有权', () => {
       mentionedBot: true, messageId: 'om_alice_topic', content: '我来开个话题',
     }))
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
-    const [threadKey, aliceRoute] = routeRecords(h).find(([, record]) => record.senderOpenId === 'ou_alice')!
+    const [threadKey, aliceRoute] = await waitForRoute(h, 'ou_alice')
     expect(aliceRoute.kind).toBe('thread')
     expect(threadKey.length).toBeGreaterThan(0)
 
@@ -465,7 +478,7 @@ describe('guarded 模式：话题所有权', () => {
     }))
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
     const agent = h.ctxState.agents.created[0]!.handle.agent
-    const [threadKey] = routeRecords(h).find(([, record]) => record.senderOpenId === 'ou_alice')!
+    const [threadKey] = await waitForRoute(h, 'ou_alice')
 
     const { listener } = h.ctxState.questionListeners[0]!
     const next = vi.fn(async () => ({ answers: [] }))
