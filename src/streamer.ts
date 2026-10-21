@@ -24,8 +24,16 @@
  *     card. Reasoning is never segmented — it stays on card 1 inside the
  *     fold panel's own fixed window, independent of the body length.
  *  4. `finalize(turn)` — flip every segment card to its terminal state
- *     (`回复结束` / `回复失败`), render the settled footer on the main card and
- *     request the Typing → DONE/No reaction swap on the triggering message.
+ *     (`回复结束` / `已停止` / `回复失败`), render the settled footer on the main
+ *     card and request the Typing → DONE/No reaction swap on the triggering
+ *     message.
+ *
+ * Stop button: the card that is currently streaming in the session's active
+ * (front) turn carries a stop button until the turn settles; queued turns
+ * gain it when they become the front. `stopTargetOf()` resolves a clicked card to its
+ * session; `markStopping()` / `markStopDenied()` record the click's outcome
+ * on the card. Ownership checks and the cancellation itself belong to the
+ * caller.
  *
  * The first visible text delta flips the panel title 推理中 → 回复中; the
  * final patch flips it to 回复结束 or 回复失败. Patching is throttled to `refreshMs` and
@@ -42,7 +50,7 @@
 
 import type { AssistantStreamFrame, Session, SessionEvent, TurnEndReason } from './dsh-types.ts'
 import { buildCard, segmentCardContent, segmentCardOptions } from './cards.ts'
-import type { CardState, PanelPhase } from './cards.ts'
+import type { CardState, PanelPhase, StopControl } from './cards.ts'
 import type { FeishuChannel } from './feishu-channel.ts'
 import { cacheHitPct, foldAll, foldEvent } from './stats.ts'
 import type { HeaderSample, StatsFold, UsageSample } from './stats.ts'
@@ -202,6 +210,10 @@ interface TurnState {
    * durable model history, so the card must drop them again.
    */
   attempts: Map<string, AttemptMark>
+  /** The owner clicked stop; the button renders disabled until the turn settles. */
+  stopRequested: boolean
+  /** A non-owner clicked stop; the owner-only notice renders under the button. */
+  stopDenied: boolean
 }
 
 /** Card/body lengths captured at one stream attempt's `start` frame. */
@@ -360,10 +372,15 @@ export class TurnStreamer {
       toolKind: '',
       heartbeatTimer: undefined,
       attempts: new Map(),
+      stopRequested: false,
+      stopDenied: false,
     })
     this.bySession.set(session.id, queue)
     const state = queue[queue.length - 1]!
     this.scheduleHeartbeat(session.id, state)
+    // The first frame is sent without a stop button; the front turn gains it
+    // on its first patch.
+    if (this.front(session.id) === state) this.markDirty(session.id, state)
   }
 
   /** Drop all state for a session (agent disposed / route removed). */
@@ -381,8 +398,45 @@ export class TurnStreamer {
     this.segmentChains.delete(sessionId)
   }
 
+  /** Drop every session's state and timers (service shutdown). */
+  detachAll(): void {
+    for (const sessionId of [...this.bySession.keys()]) this.detach(sessionId)
+  }
+
   hasSession(sessionId: string): boolean {
     return this.bySession.has(sessionId)
+  }
+
+  /**
+   * The session whose active (front) turn streams into `messageId`, or
+   * undefined when the card belongs to no such turn (queued, settled,
+   * detached, or unknown). Only the front turn is the one `cancel` stops.
+   * @param messageId Feishu message id of a clicked card.
+   * @returns The owning session id.
+   */
+  stopTargetOf(messageId: string): string | undefined {
+    for (const sessionId of this.bySession.keys()) {
+      if (this.front(sessionId)?.cards.some(card => card.messageId === messageId) === true) return sessionId
+    }
+    return undefined
+  }
+
+  /** Render the stop button disabled on the session's live turn. */
+  markStopping(sessionId: string): void {
+    this.markStop(sessionId, state => { state.stopRequested = true })
+  }
+
+  /** Add the owner-only notice under the session's stop button (once). */
+  markStopDenied(sessionId: string): void {
+    this.markStop(sessionId, state => { state.stopDenied = true })
+  }
+
+  private markStop(sessionId: string, apply: (state: TurnState) => void): void {
+    const state = this.front(sessionId)
+    if (state === undefined) return
+    const before = `${state.stopRequested}/${state.stopDenied}`
+    apply(state)
+    if (`${state.stopRequested}/${state.stopDenied}` !== before) this.markDirty(sessionId, state)
   }
 
   /** The front (oldest unfinished) turn state of a session. */
@@ -518,7 +572,7 @@ export class TurnStreamer {
         // The ended turn belongs to the front state: assign it if a turn was
         // rejected/emptied before any step started.
         if (state.turn === undefined) state.turn = event.data.turn
-        this.finalize(session.id, state, turnFailure(event.data.reason))
+        this.finalize(session.id, state, turnFailure(event.data.reason), turnAborted(event.data.reason))
         break
       }
       default:
@@ -884,12 +938,16 @@ export class TurnStreamer {
       const kind = this.noteKind('tool', tool, state.toolKind)
       if (kind !== undefined) state.toolKind = kind
     }
+    const stop: StopControl | undefined = !active || state.finalized || this.front(sessionId) !== state
+      ? undefined
+      : state.stopRequested ? 'stopping' : 'ready'
     return {
       phase: state.phase,
       reasoning: state.reasoning,
       body,
       status: active ? state.status : '',
       tool: active ? state.tool : '',
+      ...(stop === undefined ? {} : { stop, stopDenied: state.stopDenied }),
       stats: this.statsFor(sessionId, state),
     }
   }
@@ -1062,10 +1120,13 @@ export class TurnStreamer {
     sessionId: string,
     state: TurnState,
     failure: { message: string; code?: string } | undefined,
+    aborted = false,
   ): void {
     if (state.finalized) return
     state.finalized = true
-    state.phase = failure === undefined ? 'done' : 'error'
+    // Only a stop this channel requested reads as 已停止; other cancellation
+    // causes (parent, hook, disposal) settle like a normal end.
+    state.phase = failure !== undefined ? 'error' : aborted && state.stopRequested ? 'stopped' : 'done'
     // A turn that ends inside a reasoning phase (e.g. no answer text) still
     // reports the time it spent reasoning.
     this.closeReasoning(state)
@@ -1118,6 +1179,9 @@ export class TurnStreamer {
       if (queue === undefined) return
       const index = queue.indexOf(state)
       if (index >= 0) queue.splice(index, 1)
+      // The next queued turn becomes the active one and gains the stop button.
+      const next = this.front(sessionId)
+      if (next !== undefined) this.markDirty(sessionId, next)
     })
 
     this.hooks.onTurnFinalized(sessionId, state.turn ?? 0, state.cards[0]?.messageId ?? '')
@@ -1134,6 +1198,11 @@ export class TurnStreamer {
       this.hooks.onError(state.triggerMessageId, error)
     }
   }
+}
+
+/** Whether a turn ended through a cancellation request (`/stop`, the stop button). */
+function turnAborted(reason: TurnEndReason): boolean {
+  return typeof reason === 'object' && reason !== null && reason.kind === 'aborted'
 }
 
 /** Extract the user-visible failure from the current Harness turn-end union. */

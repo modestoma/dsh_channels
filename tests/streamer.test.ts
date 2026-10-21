@@ -1038,3 +1038,119 @@ describe('TurnStreamer live assistant frames', () => {
     expect(json).toContain('64,000')
   })
 })
+
+describe('TurnStreamer stop button', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  function buttonsOf(card: object): Array<{ text: { content: string }; disabled?: boolean }> {
+    const elements = (card as { body: { elements: Array<Record<string, unknown>> } }).body.elements
+    return elements.filter(element => element.tag === 'button') as never
+  }
+
+  function streamText(streamer: TurnStreamer, session: Session, text: string): void {
+    streamer.onAssistantFrame(session, { type: 'start', attemptId: 'attempt-1', revision: 1, turn: 1, step: 1 })
+    streamer.onAssistantFrame(session, { type: 'chunk', attemptId: 'attempt-1', revision: 1, index: 0, time: 1, chunk: { type: 'text-delta', index: 0, text } })
+  }
+
+  it('shows the button on the streaming card, then drops it when the turn settles', async () => {
+    const ch = channel()
+    const streamer = new TurnStreamer(ch, 500, hooks())
+    const session = makeSession('sess-stop-live')
+    streamer.attach(session, 'om_card', 'om_trigger', undefined)
+    streamText(streamer, session, '进行中')
+    await vi.advanceTimersByTimeAsync(500)
+    expect(buttonsOf(ch.updated.at(-1)!.card).map(button => button.text.content)).toEqual(['⏹ 停止'])
+    expect(streamer.stopTargetOf('om_card')).toBe('sess-stop-live')
+    expect(streamer.stopTargetOf('om_other')).toBeUndefined()
+
+    streamer.onSessionEvent(session, { type: 'turn/end', seq: 2, data: { turn: 1, reason: { kind: 'completed' } } })
+    expect(buttonsOf(ch.updated.at(-1)!.card)).toHaveLength(0)
+    expect(JSON.stringify(ch.updated.at(-1)!.card)).not.toContain('已按请求停止')
+    expect(streamer.stopTargetOf('om_card')).toBeUndefined()
+  })
+
+  it('moves the button to the newest segment card', async () => {
+    const ch = channel()
+    const streamer = new TurnStreamer(ch, 500, hooks())
+    const session = makeSession('sess-stop-seg')
+    streamer.attach(session, 'om_card', 'om_trigger', undefined)
+    streamText(streamer, session, 'x'.repeat(30_000))
+    await vi.advanceTimersByTimeAsync(500)
+    await vi.advanceTimersByTimeAsync(500)
+    const main = ch.updated.filter(update => update.messageId === 'om_card').at(-1)!
+    const segment = ch.updated.filter(update => update.messageId === 'om_seg_2').at(-1)!
+    expect(buttonsOf(main.card)).toHaveLength(0)
+    expect(buttonsOf(segment.card)).toHaveLength(1)
+    expect(streamer.stopTargetOf('om_seg_2')).toBe('sess-stop-seg')
+  })
+
+  it('renders stopping and denied states, and settles an aborted turn as stopped', async () => {
+    const ch = channel()
+    const streamer = new TurnStreamer(ch, 500, hooks())
+    const session = makeSession('sess-stop-abort')
+    streamer.attach(session, 'om_card', 'om_trigger', undefined)
+    streamText(streamer, session, '进行中')
+    await vi.advanceTimersByTimeAsync(500)
+    const patches = ch.updated.length
+
+    streamer.markStopDenied('sess-stop-abort')
+    streamer.markStopDenied('sess-stop-abort')
+    await vi.advanceTimersByTimeAsync(500)
+    expect(ch.updated).toHaveLength(patches + 1)
+    expect(JSON.stringify(ch.updated.at(-1)!.card)).toContain('仅发起该会话的用户可停止')
+
+    streamer.markStopping('sess-stop-abort')
+    await vi.advanceTimersByTimeAsync(500)
+    const [button] = buttonsOf(ch.updated.at(-1)!.card)
+    expect(button?.text.content).toBe('正在停止…')
+    expect(button?.disabled).toBe(true)
+
+    streamer.onSessionEvent(session, {
+      type: 'turn/end', seq: 2, data: { turn: 1, reason: { kind: 'aborted', reason: { kind: 'user' } } },
+    })
+    const settled = JSON.stringify(ch.updated.at(-1)!.card)
+    expect(settled).toContain('⏹ 已按请求停止本轮回复')
+    expect(settled).not.toContain('正在停止')
+    // Marks on a session without a live turn are no-ops.
+    streamer.markStopping('sess-stop-abort')
+    streamer.markStopping('sess-unknown')
+  })
+
+  it('offers the button only on the active turn, and moves it to the next queued turn', async () => {
+    const ch = channel()
+    const streamer = new TurnStreamer(ch, 500, hooks())
+    const session = makeSession('sess-stop-queue')
+    streamer.attach(session, 'om_first', 'om_t1', undefined)
+    streamer.attach(session, 'om_second', 'om_t2', undefined)
+    await vi.advanceTimersByTimeAsync(500)
+    const latest = (id: string) => ch.updated.filter(update => update.messageId === id).at(-1)
+    expect(buttonsOf(latest('om_first')!.card)).toHaveLength(1)
+    expect(latest('om_second')).toBeUndefined()
+    expect(streamer.stopTargetOf('om_second')).toBeUndefined()
+
+    streamer.onSessionEvent(session, { type: 'turn/end', seq: 1, data: { turn: 1, reason: { kind: 'completed' } } })
+    await vi.advanceTimersByTimeAsync(500)
+    expect(buttonsOf(latest('om_second')!.card)).toHaveLength(1)
+    expect(streamer.stopTargetOf('om_second')).toBe('sess-stop-queue')
+  })
+
+  it('settles a cancellation it did not request as a normal end', async () => {
+    const ch = channel()
+    const streamer = new TurnStreamer(ch, 500, hooks())
+    const session = makeSession('sess-stop-parent')
+    streamer.attach(session, 'om_card', 'om_trigger', undefined)
+    streamText(streamer, session, '进行中')
+    streamer.onSessionEvent(session, {
+      type: 'turn/end', seq: 2, data: { turn: 1, reason: { kind: 'aborted', reason: { kind: 'parent' } } },
+    })
+    const settled = JSON.stringify(ch.updated.at(-1)!.card)
+    expect(settled).not.toContain('已按请求停止')
+    expect(buttonsOf(ch.updated.at(-1)!.card)).toHaveLength(0)
+  })
+})

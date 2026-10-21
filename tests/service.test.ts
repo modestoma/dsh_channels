@@ -2759,7 +2759,7 @@ describe('/stop, structured questions, and host projections', () => {
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
 
-    expect(cancel).toHaveBeenCalledWith({ kind: 'user' })
+    expect(cancel).toHaveBeenCalledWith({ kind: 'user' }, { keepInbox: true })
     const json = JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)
     expect(json).toContain('已请求停止当前回合')
     expect(mock(agent.followup)).not.toHaveBeenCalled()
@@ -2784,6 +2784,60 @@ describe('/stop, structured questions, and host projections', () => {
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
     expect(JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)).toContain('当前没有正在运行的回合')
+    await h.service.shutdown()
+  })
+
+  it('cancels the running turn from the streaming card stop button, owner only', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_stop_btn', senderId: 'u_owner', messageId: 'om_stop_btn_start', content: '开始',
+    }))
+    await waitForEstablishedSession(h)
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    const cancel = vi.fn()
+    ;(agent as unknown as { status: string }).status = 'running'
+    ;(agent as unknown as { cancel: unknown }).cancel = cancel
+    // The first frame has no button; the active turn gains it on its first patch.
+    expect(JSON.stringify((h.channel.sent[0] as { input: object }).input)).not.toContain('⏹ 停止')
+    await waitUntil(() => expect(h.channel.updated.some(update =>
+      JSON.stringify((update as { card: object }).card).includes('⏹ 停止'),
+    )).toBe(true))
+    const value = { decision: 'turn-stop' }
+
+    // A stranger's click only adds the owner-only notice.
+    await h.channel.fireCardAction({
+      messageId: 'om_1', chatId: 'oc_stop_btn',
+      operator: { openId: 'ou_x', userId: 'u_stranger' }, action: { value, tag: 'button' },
+    })
+    expect(cancel).not.toHaveBeenCalled()
+    await waitUntil(() => expect(h.channel.updated.some(update =>
+      JSON.stringify((update as { card: object }).card).includes('仅发起该会话的用户可停止'),
+    )).toBe(true))
+
+    // The owner's click from another chat (a forwarded card) is refused too.
+    await h.channel.fireCardAction({
+      messageId: 'om_1', chatId: 'oc_elsewhere',
+      operator: { openId: 'ou_o', userId: 'u_owner' }, action: { value, tag: 'button' },
+    })
+    expect(cancel).not.toHaveBeenCalled()
+
+    // Unknown cards are ignored.
+    await h.channel.fireCardAction({
+      messageId: 'om_unknown', chatId: 'oc_stop_btn',
+      operator: { openId: 'ou_o', userId: 'u_owner' }, action: { value, tag: 'button' },
+    })
+    expect(cancel).not.toHaveBeenCalled()
+
+    await h.channel.fireCardAction({
+      messageId: 'om_1', chatId: 'oc_stop_btn',
+      operator: { openId: 'ou_o', userId: 'u_owner' }, action: { value, tag: 'button' },
+    })
+    expect(cancel).toHaveBeenCalledWith({ kind: 'user' }, { keepInbox: true })
+    await waitUntil(() => expect(h.channel.updated.some(update =>
+      JSON.stringify((update as { card: object }).card).includes('正在停止'),
+    )).toBe(true))
+    // No reply card: the button answers on the streaming card itself.
+    expect(h.channel.sent).toHaveLength(1)
     await h.service.shutdown()
   })
 
@@ -3098,6 +3152,150 @@ describe('/model', () => {
   })
 })
 
+describe('command picker cards', () => {
+  function buttonValues(card: object): Array<{ label: string; value: Record<string, unknown> }> {
+    const out: Array<{ label: string; value: Record<string, unknown> }> = []
+    const walk = (elements: Array<Record<string, unknown>>): void => {
+      for (const element of elements) {
+        if (element.tag === 'button') {
+          out.push({
+            label: (element.text as { content: string }).content,
+            value: (element.behaviors as Array<{ value: Record<string, unknown> }>)[0]!.value,
+          })
+        }
+        for (const column of (element.columns as Array<{ elements: Array<Record<string, unknown>> }> | undefined) ?? []) {
+          walk(column.elements)
+        }
+      }
+    }
+    walk((card as { body: { elements: Array<Record<string, unknown>> } }).body.elements)
+    return out
+  }
+
+  const lastCard = (h: SetupResult): object => (h.channel.sent.at(-1) as { input: { card: object } }).input.card
+
+  async function establishWithModel(h: SetupResult, chatId: string) {
+    await h.onMessage(makeMessage({ chatType: 'group', chatId, senderId: 'u_owner', content: '开始' }))
+    await waitForEstablishedSession(h)
+    const created = h.ctxState.agents.created[0]!
+    ;(sessionEvents(created.handle.agent.session) as unknown as Array<Record<string, unknown>>).push({
+      type: 'request/header', seq: 1, time: 1,
+      data: { header: { config: { provider: 'deepseek-official', model: 'deepseek-v4-flash' } } },
+    })
+    return created
+  }
+
+  it('answers bare /model with model buttons and switches on an owner click', async () => {
+    const h = await setup()
+    const created = await establishWithModel(h, 'oc_pick_model')
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_pick_model', senderId: 'u_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_pick_model', content: '/model',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
+    const buttons = buttonValues(lastCard(h))
+    expect(buttons.map(button => button.label)).toEqual(['✅ deepseek-v4-flash', 'deepseek-v4-pro', '恢复默认'])
+    const pro = buttons[1]!.value
+    expect(pro).toEqual({
+      decision: 'command-pick', command: 'model', arg: 'deepseek-v4-pro', sessionId: created.handle.agent.session.id,
+    })
+
+    // Strangers and forwarded copies are ignored without a reply.
+    await h.channel.fireCardAction({
+      messageId: 'om_2', chatId: 'oc_pick_model',
+      operator: { openId: 'ou_x', userId: 'u_stranger' }, action: { value: pro, tag: 'button' },
+    })
+    await h.channel.fireCardAction({
+      messageId: 'om_2', chatId: 'oc_other',
+      operator: { openId: 'ou_o', userId: 'u_owner' }, action: { value: pro, tag: 'button' },
+    })
+    await h.channel.fireCardAction({
+      messageId: 'om_2', chatId: 'oc_pick_model',
+      operator: { openId: 'ou_o', userId: 'u_owner' },
+      action: { value: { ...pro, sessionId: 'sess-stale' }, tag: 'button' },
+    })
+    await flush()
+    expect(h.channel.sent).toHaveLength(2)
+
+    await h.channel.fireCardAction({
+      messageId: 'om_2', chatId: 'oc_pick_model',
+      operator: { openId: 'ou_o', userId: 'u_owner' }, action: { value: pro, tag: 'button' },
+    })
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(3))
+    const reply = h.channel.sent.at(-1) as { options: Record<string, unknown>; input: object }
+    expect(JSON.stringify(reply.input)).toContain('已切换为')
+    expect(reply.options).toMatchObject({ replyTo: 'om_2', replyInThread: true })
+    await expect(dispatchAgentRequest(created.setupCtx, { provider: 'deepseek-official', model: 'deepseek-v4-flash' }))
+      .resolves.toMatchObject({ model: 'deepseek-v4-pro' })
+    await h.service.shutdown()
+  })
+
+  it('answers bare /effort with the efforts the model advertises', async () => {
+    const h = await setup({ reasoningEffort: 'high' })
+    mock(h.ctxState.ctx.llm!.resolveModelInfo).mockResolvedValue({
+      context: { contextWindow: 128000 },
+      reasoning: { efforts: [{ id: 'low', name: '低' }, { id: 'high', name: '高' }], defaultEffort: 'low' },
+    })
+    const created = await establishWithModel(h, 'oc_pick_effort')
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_pick_effort', senderId: 'u_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_pick_effort', content: '/effort',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
+    const buttons = buttonValues(lastCard(h))
+    expect(buttons.map(button => button.label)).toEqual(['低', '✅ 高', '恢复默认'])
+
+    await h.channel.fireCardAction({
+      messageId: 'om_2', chatId: 'oc_pick_effort',
+      operator: { openId: 'ou_o', userId: 'u_owner' }, action: { value: buttons[0]!.value, tag: 'button' },
+    })
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(3))
+    await expect(dispatchAgentRequest(created.setupCtx, { provider: 'deepseek-official', model: 'deepseek-v4-flash' }))
+      .resolves.toMatchObject({ reasoningEffort: 'low' })
+    await h.service.shutdown()
+  })
+
+  it('keeps the text answer when the model advertises no efforts or the lookup fails', async () => {
+    const h = await setup()
+    await establishWithModel(h, 'oc_pick_effort_none')
+    const command = async (messageId: string) => {
+      const before = h.channel.sent.length
+      await h.onMessage(makeMessage({
+        chatType: 'group', chatId: 'oc_pick_effort_none', senderId: 'u_owner', threadId: 'omt_1',
+        mentionedBot: false, messageId, content: '/effort',
+      }))
+      await waitUntil(() => expect(h.channel.sent).toHaveLength(before + 1))
+    }
+    await command('om_effort_none')
+    expect(buttonValues(lastCard(h))).toHaveLength(0)
+    mock(h.ctxState.ctx.llm!.resolveModelInfo).mockRejectedValue(new Error('offline'))
+    await command('om_effort_fail')
+    expect(buttonValues(lastCard(h))).toHaveLength(0)
+    await h.service.shutdown()
+  })
+
+  it('answers bare /permissions with preset buttons only when switching is allowed', async () => {
+    const h = await setup({ allowPermissionSwitch: true })
+    await h.onMessage(makeMessage({ chatType: 'group', chatId: 'oc_pick_perm', senderId: 'u_owner', content: '开始' }))
+    await waitForEstablishedSession(h)
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_pick_perm', senderId: 'u_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_pick_perm', content: '/permissions',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
+    const buttons = buttonValues(lastCard(h))
+    expect(buttons.map(button => button.label)).toEqual(['Read only', '✅ Standard'])
+    await h.channel.fireCardAction({
+      messageId: 'om_2', chatId: 'oc_pick_perm',
+      operator: { openId: 'ou_o', userId: 'u_owner' }, action: { value: buttons[0]!.value, tag: 'button' },
+    })
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(3))
+    expect(h.ctxState.permissions.set).toHaveBeenCalledWith(agent.session, 'read-only')
+    await h.service.shutdown()
+  })
+})
+
 describe('inbound attachments', () => {
   it('registers the attachment guidance with the session workspace path', async () => {
     const h = await setup()
@@ -3243,6 +3441,8 @@ describe('inbound attachments', () => {
       chatType: 'group', chatId, senderId, messageId: 'om_iso_b', content: '开始 B',
     }))
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
+    // The route record commits after the Agent is created.
+    await waitUntil(() => expect(routes().some(route => route.sessionId !== routeA.sessionId)).toBe(true))
     const routeB = routes().find(route => route.sessionId !== routeA.sessionId)!
     await h.onMessage(makeMessage({
       chatType: 'group', chatId, senderId, threadId: routeB.key, mentionedBot: false,

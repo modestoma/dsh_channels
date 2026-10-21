@@ -31,13 +31,15 @@ import type {
   CredentialProvider,
   CordisFiber,
   HostContext,
+  LlmModelInfo,
   LlmService,
   Session,
   SessionId,
   SessionProjections,
   TokenMeter,
 } from './dsh-types.ts'
-import { standaloneInfoCard } from './cards.ts'
+import { buildPickerCard, parsePickAction, standaloneInfoCard, STOP_ACTION } from './cards.ts'
+import type { PickerOption } from './cards.ts'
 import {
   armEffortCommand, armModelCommand, armRenewCommand, registerModelCommand, commandResultCardKind, parseSlashCommand,
   registerEffortCommand, registerRenewCommand, RouteOperationQueue, supportedCommandHelp, supportedCommandList,
@@ -70,7 +72,7 @@ import type { MessageReadRoute, RawMessageItem } from './feishu/message-read.ts'
 import type { AttachmentStore } from './host/attachments.ts'
 import { InboundRouter } from './routing/inbound.ts'
 import type { RequestPolicyController } from './session/request-policy.ts'
-import type { ChannelFactory, FeishuChannel, NormalizedMessage } from './feishu-channel.ts'
+import type { CardActionEvent, ChannelFactory, FeishuChannel, NormalizedMessage } from './feishu-channel.ts'
 import { AppOwnerLookupError, FeishuApiError } from './feishu-channel.ts'
 import { buildHealthCard, foldHealthSnapshot, HEALTH_DEPENDENCY_NAMES } from './health.ts'
 import type { HealthDependencyName, HealthSnapshot } from './health.ts'
@@ -1356,6 +1358,10 @@ export class FeishuService {
       void accessRequests.onCardAction(event)
       answerer.onCardAction(event)
       questions.onCardAction(event)
+      this.onStopAction(event)
+      void this.onPickAction(event).catch((error: unknown) => {
+        this.ctx.logger?.warn?.('dsh-channels: picker card action failed: %s', String(error))
+      })
     })
 
     this.unlistenHost.push(this.ctx.on('session/event', (session, event) => {
@@ -1489,6 +1495,7 @@ export class FeishuService {
       // Already disconnected is fine.
     }
     this.channel = undefined
+    this.streamer?.detachAll()
     this.streamer = undefined
     await this.domain?.close()
     this.domain = undefined
@@ -1828,10 +1835,7 @@ export class FeishuService {
       return
     }
     if (spec.name === 'stop') {
-      const agent = this.sessions.get(current.sessionId)?.agent
-        ?? this.ctx.agents.get(current.sessionId as SessionId)
-      const running = agent?.status === 'running'
-      agent?.cancel?.({ kind: 'user' })
+      const running = this.cancelTurn(current.sessionId)
       await this.delivery.commandCard(msg, {
         kind: 'success', command: 'stop', sessionId: current.sessionId,
         text: running ? '已请求停止当前回合。' : '当前没有正在运行的回合。',
@@ -1842,6 +1846,72 @@ export class FeishuService {
       kind: 'unavailable', command: spec.name, text: `命令 /${spec.name} 暂不可用。`,
       sessionId: current.sessionId,
     })
+  }
+
+  /**
+   * Cancel one Session's live turn without resuming anything. Queued
+   * messages stay in the inbox: each already has its own streaming card and
+   * runs next.
+   * @param sessionId The Session to cancel.
+   * @returns Whether a turn was running.
+   */
+  private cancelTurn(sessionId: string): boolean {
+    const agent = this.sessions.get(sessionId)?.agent
+      ?? this.ctx.agents.get(sessionId as SessionId)
+    const running = agent?.status === 'running'
+    agent?.cancel?.({ kind: 'user' }, { keepInbox: true })
+    if (running) this.streamer?.markStopping(sessionId)
+    return running
+  }
+
+  /**
+   * Streaming-card stop button. Only the session owner, clicking inside the
+   * session's own chat, cancels the turn; another operator gets the
+   * owner-only notice on the card instead.
+   */
+  private onStopAction(event: CardActionEvent): void {
+    if (!this.started) return
+    if ((event.action.value as { decision?: unknown } | undefined)?.decision !== STOP_ACTION) return
+    const sessionId = this.streamer?.stopTargetOf(event.messageId)
+    if (sessionId === undefined) return
+    const route = this.routes.findBySession(sessionId)
+    if (route === undefined) return
+    if (event.operator.userId !== route.senderUserId || event.chatId !== route.chatId) {
+      this.streamer?.markStopDenied(sessionId)
+      return
+    }
+    this.cancelTurn(sessionId)
+  }
+
+  /**
+   * Picker-card click: run the chosen `/<command> <arg>` exactly as if the
+   * operator had typed it under the picker card, so access admission, route
+   * ownership and validation are the typed command's. Stale pickers (the
+   * topic was rebound, or the card was forwarded elsewhere) and non-owner
+   * clicks are ignored.
+   */
+  private async onPickAction(event: CardActionEvent): Promise<void> {
+    if (!this.started) return
+    const action = parsePickAction(event.action.value)
+    if (action === undefined) return
+    const route = this.routes.findBySession(action.sessionId)
+    const userId = event.operator.userId
+    if (route === undefined || route.chatId !== event.chatId || userId !== route.senderUserId) return
+    const line = `/${action.command} ${action.arg}`
+    await this.handleSlashMessage({
+      messageId: event.messageId,
+      chatId: route.chatId,
+      chatType: route.chatType,
+      senderId: userId,
+      content: line,
+      rawContentType: 'text',
+      resources: [],
+      mentions: [],
+      mentionAll: false,
+      mentionedBot: true,
+      ...(route.kind === 'thread' ? { threadId: route.key } : {}),
+      createTime: Date.now(),
+    }, line)
   }
 
   /**
@@ -1864,14 +1934,27 @@ export class FeishuService {
     const live = await this.sessions.ensureLive(current)
     let active: string | undefined
     let catalogLine = ''
+    let choices: PickerOption[] = []
     try {
       active = presets.current(live.agent.session)
       const catalog = presets.catalog()
       catalogLine = catalog.options.map(option => `\`${option.value}\``).join('、')
+      choices = catalog.options.map(option => ({ label: option.name || option.value, arg: option.value }))
     } catch {
       active = undefined
     }
     const requested = parsed.rawInput.trim()
+    if (requested === '' && this.config.allowPermissionSwitch && choices.length > 0) {
+      await this.delivery.standaloneReply(msg, buildPickerCard({
+        title: '🔐 权限预设',
+        command: 'permissions',
+        text: `**当前权限预设**：${active === undefined ? '暂无数据' : `\`${active}\``}\n切换会同时调整沙箱与审批策略。`,
+        sessionId: current.sessionId,
+        options: choices,
+        ...(active === undefined ? {} : { current: active }),
+      }))
+      return
+    }
     if (requested === '') {
       const lines = [
         `**当前权限预设**：${active === undefined ? '暂无数据' : `\`${active}\``}`,
@@ -1998,6 +2081,7 @@ export class FeishuService {
     }
     await this.renderCommandResult({
       spec, msg, current, live,
+      bare: parsed.rawInput.trim() === '',
       result: execution.result,
       compactBefore,
       renewAdmission,
@@ -2012,6 +2096,8 @@ export class FeishuService {
     msg: NormalizedMessage
     current: RouteRecord
     live: LiveAgent
+    /** The command was typed without arguments. */
+    bare: boolean
     result: CommandResult
     compactBefore: ContextMeasurement | undefined
     renewAdmission: RenewAdmission | undefined
@@ -2021,6 +2107,17 @@ export class FeishuService {
     const { spec, msg, current, live, result, compactBefore, renewAdmission, effortAdmission, modelAdmission } = input
     if (spec.name === 'effort') effortAdmission?.controller.sync(live.agent.session.snapshotEvents())
     if (spec.name === 'model') modelAdmission?.controller.sync(live.agent.session.snapshotEvents())
+    if (input.bare && result.kind === 'success') {
+      const picker = spec.name === 'model' && modelAdmission !== undefined
+        ? await this.modelPicker(current, live, modelAdmission)
+        : spec.name === 'effort' && effortAdmission !== undefined
+          ? await this.effortPicker(current, live, effortAdmission, result.text ?? '')
+          : undefined
+      if (picker !== undefined) {
+        await this.delivery.standaloneReply(msg, picker)
+        return
+      }
+    }
     if (spec.name === 'renew' && result.kind === 'success' && renewAdmission?.commit !== undefined) {
       await this.delivery.standaloneReply(msg, buildRenewCard({
         previousSessionId: renewAdmission.commit.previous.sessionId,
@@ -2378,22 +2475,10 @@ export class FeishuService {
     if (admission.live.agent !== invocation.agent) {
       return { kind: 'error', text: '/model 只能通过已授权的飞书话题执行。' }
     }
-    const session = invocation.agent.session
-    const state = admission.controller.state
-    const header = session.requestHeader?.()?.config
-    const currentProvider = state.effectiveModel?.provider
-      ?? (typeof header?.provider === 'string' && header.provider !== '' ? header.provider : undefined)
-    const currentModel = state.effectiveModel?.model
-      ?? (typeof header?.model === 'string' && header.model !== '' ? header.model : undefined)
-    const source = state.modelSource === 'session'
-      ? 'Session 覆盖'
-      : state.modelSource === 'config' ? '配置默认' : '部署默认'
+    const { provider: currentProvider, model: currentModel } = currentModelRoute(admission.live, admission.controller)
 
     if (rawInput === '') {
-      const lines = [
-        `**当前模型**：${currentModel === undefined ? '尚无模型请求记录' : `\`${currentModel}\``}`
-          + `${currentProvider === undefined ? '' : `（provider \`${currentProvider}\`）`} · ${source}`,
-      ]
+      const lines = [currentModelLine(admission.live, admission.controller)]
       const models = await this.listModels(currentProvider)
       if (models.length > 0) {
         lines.push(`**可选模型（${models.length}）**：${models.slice(0, 20).map(id => `\`${id}\``).join('、')}`
@@ -2428,6 +2513,59 @@ export class FeishuService {
     }
     const label = provider === undefined ? model : `${provider}/${model}`
     return { kind: 'success', text: `当前 Session 模型已切换为 \`${label}\`（下一条消息生效）。` }
+  }
+
+  /** `/model` picker: the provider's advertised models, or undefined when none are listed. */
+  private async modelPicker(
+    current: RouteRecord,
+    live: LiveAgent,
+    admission: ModelAdmission,
+  ): Promise<object | undefined> {
+    const route = currentModelRoute(live, admission.controller)
+    const models = await this.listModels(route.provider)
+    if (models.length === 0) return undefined
+    return buildPickerCard({
+      title: '🧠 模型',
+      command: 'model',
+      text: `${currentModelLine(live, admission.controller)}\n切换在下一条消息生效。`,
+      sessionId: current.sessionId,
+      options: models.map(id => ({ label: id, arg: id })),
+      ...(route.model === undefined ? {} : { current: route.model }),
+      reset: true,
+    })
+  }
+
+  /**
+   * `/effort` picker: the efforts the current model route advertises, or
+   * undefined when the route is unknown or advertises none.
+   */
+  private async effortPicker(
+    current: RouteRecord,
+    live: LiveAgent,
+    admission: EffortAdmission,
+    text: string,
+  ): Promise<object | undefined> {
+    const route = currentModelRoute(live, admission.controller)
+    if (route.provider === undefined || route.model === undefined) return undefined
+    let reasoning: LlmModelInfo['reasoning']
+    try {
+      const llm = this.ctx.get?.('llm') as LlmService | undefined
+      reasoning = (await llm?.resolveModelInfo(route.provider, route.model))?.reasoning
+    } catch (error) {
+      this.ctx.logger?.warn?.('dsh-channels: effort catalog lookup failed: %s', String(error))
+      return undefined
+    }
+    if (reasoning === undefined || reasoning.efforts.length === 0) return undefined
+    const active = admission.controller.state.effectiveEffort ?? reasoning.defaultEffort
+    return buildPickerCard({
+      title: '💭 推理强度',
+      command: 'effort',
+      text,
+      sessionId: current.sessionId,
+      options: reasoning.efforts.map(effort => ({ label: effort.name || effort.id, arg: effort.id })),
+      ...(active === undefined ? {} : { current: active }),
+      reset: true,
+    })
   }
 
   /** Model ids advertised for one provider route (empty when unavailable). */
@@ -2569,4 +2707,29 @@ export class FeishuService {
       ...(pressure?.contextWindow === undefined ? {} : { contextWindow: pressure.contextWindow }),
     }
   }
+}
+
+/** The model route the next request of a Session uses, as far as it is known. */
+function currentModelRoute(
+  live: LiveAgent,
+  controller: RequestPolicyController,
+): { provider: string | undefined; model: string | undefined } {
+  const state = controller.state
+  const header = live.agent.session.requestHeader?.()?.config
+  return {
+    provider: state.effectiveModel?.provider
+      ?? (typeof header?.provider === 'string' && header.provider !== '' ? header.provider : undefined),
+    model: state.effectiveModel?.model
+      ?? (typeof header?.model === 'string' && header.model !== '' ? header.model : undefined),
+  }
+}
+
+/** `**当前模型**：…` line shared by the `/model` text answer and its picker. */
+function currentModelLine(live: LiveAgent, controller: RequestPolicyController): string {
+  const { provider, model } = currentModelRoute(live, controller)
+  const source = controller.state.modelSource === 'session'
+    ? 'Session 覆盖'
+    : controller.state.modelSource === 'config' ? '配置默认' : '部署默认'
+  return `**当前模型**：${model === undefined ? '尚无模型请求记录' : `\`${model}\``}`
+    + `${provider === undefined ? '' : `（provider \`${provider}\`）`} · ${source}`
 }

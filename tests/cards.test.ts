@@ -16,7 +16,13 @@ import {
   buildCard,
   buildInterruptionCard,
   buildOnboardingCard,
+  buildPickerCard,
   cardJsonBytes,
+  initialStreamingCard,
+  MAX_PICKER_OPTIONS,
+  parsePickAction,
+  PICK_ACTION,
+  STOP_ACTION,
   segmentCardContent,
   splitBodyForCard,
   stripTables,
@@ -609,5 +615,126 @@ describe('approval decision cards', () => {
     expect(approvalElements(card).some(element => element.tag === 'column_set')).toBe(false)
     // The settled card keeps the question summary for context.
     expect(markdownsOf(card).some(text => text.includes('bash'))).toBe(true)
+  })
+})
+
+type Element = Record<string, unknown>
+
+function elementsOf(card: object): Element[] {
+  return (card as { body: { elements: Element[] } }).body.elements
+}
+
+function buttonsOf(card: object): Element[] {
+  const out: Element[] = []
+  const walk = (elements: Element[]): void => {
+    for (const element of elements) {
+      if (element.tag === 'button') out.push(element)
+      for (const column of (element.columns as Array<{ elements: Element[] }> | undefined) ?? []) walk(column.elements)
+    }
+  }
+  walk(elementsOf(card))
+  return out
+}
+
+function buttonLabel(button: Element): string | undefined {
+  return (button.text as { content?: string } | undefined)?.content
+}
+
+function buttonValue(button: Element): unknown {
+  return (button.behaviors as Array<{ value: unknown }>)[0]!.value
+}
+
+describe('streaming card stop button', () => {
+  it('renders an enabled stop button after the body while ready', () => {
+    const elements = elementsOf(buildCard(baseState({ phase: 'replying', body: '正文', stop: 'ready' })))
+    const index = elements.findIndex(element => element.tag === 'button')
+    expect(index).toBe(elements.length - 1)
+    expect(elements[index - 1]).toMatchObject({ tag: 'markdown', content: '正文' })
+    expect(buttonLabel(elements[index]!)).toBe('⏹ 停止')
+    expect(elements[index]!.disabled).toBeUndefined()
+    expect(buttonValue(elements[index]!)).toEqual({ decision: STOP_ACTION })
+  })
+
+  it('disables the button while stopping and adds the owner-only notice when denied', () => {
+    const card = buildCard(baseState({ phase: 'replying', stop: 'stopping', stopDenied: true }))
+    const [button] = buttonsOf(card)
+    expect(buttonLabel(button!)).toBe('正在停止…')
+    expect(button!.disabled).toBe(true)
+    expect(JSON.stringify(card)).toContain('仅发起该会话的用户可停止')
+  })
+
+  it('omits the button without a stop control', () => {
+    expect(buttonsOf(buildCard(baseState({ phase: 'done', body: 'x' })))).toHaveLength(0)
+  })
+
+  it('leaves the button off the first frame', () => {
+    expect(buttonsOf(initialStreamingCard('sess-1'))).toHaveLength(0)
+  })
+
+  it('settles a stopped turn with its own panel title and the footer', () => {
+    const card = buildCard(baseState({ phase: 'stopped', reasoning: '想了想', body: '' }))
+    const json = JSON.stringify(card)
+    expect(json).toContain(PANEL_TITLES.stopped)
+    expect(json).toContain('已按请求停止本轮回复')
+    expect(json).toContain('本次无正文输出')
+    expect(json).toContain('缓存命中')
+  })
+
+  it('keeps a split continuation head within the target budget with the button', () => {
+    const body = 'x'.repeat(40_000)
+    const options = { segment: 2 }
+    const split = segmentCardContent(baseState({ phase: 'replying', body }), options)
+    const card = buildCard(baseState({ phase: 'replying', body: split.head, stop: 'stopping', stopDenied: true }), options)
+    expect(cardJsonBytes(card)).toBeLessThanOrEqual(CARD_TARGET_BYTES)
+  })
+})
+
+describe('command picker cards', () => {
+  const input = {
+    title: '🧠 模型',
+    command: 'model' as const,
+    text: '**当前模型**：`a`',
+    sessionId: 'sess-pick',
+    options: [{ label: 'a', arg: 'a' }, { label: 'b', arg: 'b' }, { label: 'c', arg: 'c' }],
+    current: 'a',
+  }
+
+  it('renders the choices in two-column rows with the current one highlighted', () => {
+    const card = buildPickerCard(input)
+    const rows = elementsOf(card).filter(element => element.tag === 'column_set')
+    expect(rows).toHaveLength(2)
+    const buttons = buttonsOf(card)
+    expect(buttons.map(buttonLabel)).toEqual(['✅ a', 'b', 'c'])
+    expect(buttons[0]!.type).toBe('primary')
+    expect(buttonValue(buttons[1]!)).toEqual({ decision: PICK_ACTION, command: 'model', arg: 'b', sessionId: 'sess-pick' })
+    expect(JSON.stringify(card)).toContain('仅发起该会话的用户可操作')
+  })
+
+  it('adds a reset button on request', () => {
+    const buttons = buttonsOf(buildPickerCard({ ...input, reset: true }))
+    expect(buttonLabel(buttons.at(-1)!)).toBe('恢复默认')
+    expect(buttonValue(buttons.at(-1)!)).toMatchObject({ arg: 'reset' })
+  })
+
+  it('skips arguments that are not one token and reports the overflow', () => {
+    const options = [
+      { label: 'bad', arg: 'two words' },
+      ...Array.from({ length: MAX_PICKER_OPTIONS + 2 }, (_, index) => ({ label: `m${index}`, arg: `m${index}` })),
+    ]
+    const card = buildPickerCard({ ...input, options })
+    expect(buttonsOf(card)).toHaveLength(MAX_PICKER_OPTIONS)
+    expect(buttonsOf(card).map(buttonLabel)).not.toContain('bad')
+    expect(JSON.stringify(card)).toContain('另有 2 项未展示')
+  })
+
+  it('parses only well-formed picker values', () => {
+    const value = { decision: PICK_ACTION, command: 'effort', arg: 'high', sessionId: 's' }
+    expect(parsePickAction(value)).toEqual(value)
+    expect(parsePickAction(undefined)).toBeUndefined()
+    expect(parsePickAction({ ...value, decision: STOP_ACTION })).toBeUndefined()
+    expect(parsePickAction({ ...value, command: 'renew' })).toBeUndefined()
+    expect(parsePickAction({ ...value, arg: 'a b' })).toBeUndefined()
+    expect(parsePickAction({ ...value, arg: 1 })).toBeUndefined()
+    expect(parsePickAction({ ...value, sessionId: '' })).toBeUndefined()
   })
 })
