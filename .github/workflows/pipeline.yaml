@@ -14,8 +14,9 @@ on:
         default: true
 
 concurrency:
-  # Keep manual releases independent from push and pull request checks.
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  # Each manual dispatch gets its own group so a newer dispatch never replaces
+  # a pending one; the release job serializes them instead.
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}${{ github.event_name == 'workflow_dispatch' && format('-{0}', github.run_id) || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -63,6 +64,8 @@ jobs:
     concurrency:
       group: dsh-channels-release
       cancel-in-progress: false
+      # Queued dispatches can differ in dry_run, so none may replace another.
+      queue: max
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
