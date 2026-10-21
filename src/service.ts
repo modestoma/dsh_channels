@@ -719,22 +719,22 @@ export class FeishuService {
 
   /**
    * Read the route owner's attachment messages sent after the previous turn
-   * (see `feishu/recent-attachments`). A thread route scans its topic and, on
-   * the first turn, also the chat main timeline, where files posted before the
-   * topic existed live; a degraded chat route scans the main timeline. Both
-   * pages are read concurrently under the passive prompt budget, and a failed
-   * page contributes nothing.
+   * (see `feishu/recent-attachments`). A thread route scans its topic and, when
+   * `includeMainTimeline` is set, also the chat main timeline, where loose files
+   * posted before the topic existed live; a degraded chat route scans the main
+   * timeline. Both pages are read concurrently under the passive prompt budget,
+   * and a failed page contributes nothing.
    */
   private async readRecentAttachments(input: {
     record: RouteRecord
-    firstTurn: boolean
+    includeMainTimeline: boolean
     excludeMessageIds: readonly string[]
   }): Promise<readonly KnownAttachmentMessageInput[]> {
     const { record } = input
     const containers: RecentAttachmentContainer[] = record.kind === 'thread'
       ? [
         { type: 'thread', threadId: record.key },
-        ...(input.firstTurn ? [{ type: 'chat' } as const] : []),
+        ...(input.includeMainTimeline ? [{ type: 'chat' } as const] : []),
       ]
       : [{ type: 'chat' }]
     const limit = this.config.recentAttachmentLimit

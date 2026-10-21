@@ -3649,6 +3649,40 @@ describe('native attachment pipeline', () => {
     await h.service.shutdown()
   })
 
+  it('keeps a topic-group trigger to its own topic (AC3/AC5)', async () => {
+    const history = scriptedHistory({
+      chat: [
+        makeRawMessage({
+          message_id: 'om_main_image', msg_type: 'image', chat_id: 'oc_topic_group',
+          sender_id: 'ou_alice', content: { image_key: 'img_main' },
+        }),
+      ],
+      thread: [
+        makeRawMessage({
+          message_id: 'om_topic_image', msg_type: 'image', chat_id: 'oc_topic_group', thread_id: 'omt_group_topic',
+          sender_id: 'ou_alice', content: { image_key: 'img_topic' },
+        }),
+      ],
+    })
+    // A reply inside a topic stays in that topic.
+    const { h } = await setupNative({}, {
+      messageList: history.messageList,
+      downloadResource: () => [PNG],
+      threadIdOfMessage: async () => 'omt_group_topic',
+    })
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_topic_group', senderId: 'ou_alice', mentionedBot: true,
+      threadId: 'omt_group_topic', messageId: 'om_topic_group_trigger', content: '这张图是什么',
+    }))
+    await waitForEstablishedSession(h)
+    const manifest = manifestOf(firstPromptOf(h))
+    expect(manifest).toContain('message_id=om_topic_image')
+    expect(manifest).not.toContain('om_main_image')
+    const recentScans = history.calls.filter(call => call.page_size === 50)
+    expect(recentScans.map(call => call.container_id_type)).toEqual(['thread'])
+    await h.service.shutdown()
+  })
+
   it('keeps a bound topic quiet for attachment-only messages but continues on text (AC3/AC6)', async () => {
     const history = scriptedHistory({})
     const { h } = await setupNative({}, { messageList: history.messageList, downloadResource: () => [PNG] })

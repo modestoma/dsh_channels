@@ -101,7 +101,8 @@ export interface InboundMessageReadPort {
    */
   recentAttachments(input: {
     record: RouteRecord
-    firstTurn: boolean
+    /** Also scan the chat main timeline (only a topic created from a main-timeline trigger). */
+    includeMainTimeline: boolean
     excludeMessageIds: readonly string[]
   }): Promise<readonly KnownAttachmentMessageInput[]>
 }
@@ -870,9 +871,12 @@ export class InboundRouter {
     record: RouteRecord,
     options: TurnDeliveryOptions,
   ): Promise<readonly KnownAttachmentMessageInput[]> {
+    // A trigger already inside a topic (every message of a topic group) keeps
+    // the scan to that topic; only a main-timeline trigger (p2p, normal group)
+    // has loose main-timeline files in front of it.
     const messages = await this.deps.messageRead.recentAttachments({
       record,
-      firstTurn: options.firstTurn === true,
+      includeMainTimeline: options.firstTurn === true && msg.threadId === undefined,
       excludeMessageIds: options.excludeMessageIds ?? [msg.messageId],
     })
     for (const message of messages) {
