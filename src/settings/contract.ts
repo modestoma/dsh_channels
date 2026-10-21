@@ -260,7 +260,30 @@ export interface ChannelStatusWire {
   overlayPath: string
   /** 正在连接或重连时为 true，此时面板的写操作按钮禁用。 */
   busy: boolean
+  /** 连接后的权限自检结果；未连接或自检尚未完成时缺省。 */
+  scopeCheck?: ScopeCheckWire
 }
+
+/** One plugin need whose scopes are all missing. */
+export interface MissingScopeWire {
+  /** Scope names, preferred first; granting any one satisfies the need. */
+  scopes: string[]
+  /** `required` breaks a core path; `optional` only degrades a feature. */
+  level: 'required' | 'optional'
+  /** What the plugin loses without it. */
+  purpose: string
+  /** Developer-console permission page filtered to the preferred scope. */
+  consoleUrl: string
+}
+
+/** Post-connect scope self-check outcome. */
+export type ScopeCheckWire =
+  /** Every applicable need is granted. */
+  | { state: 'ok'; checkedAt: number }
+  /** Some needs are missing; `consoleUrl` opens the console filtered to all of them. */
+  | { state: 'missing'; checkedAt: number; missing: MissingScopeWire[]; consoleUrl: string }
+  /** The grant list could not be read; `error` carries the Feishu reason. */
+  | { state: 'error'; checkedAt: number; error: string }
 
 /** The whole editable configuration surface, with provenance. */
 export interface PanelConfigWire {
@@ -498,6 +521,14 @@ export const PANEL_COPY = {
   statusSummaryConnecting: '正在连接飞书长连接…',
   statusSummaryError: '最近一次连接飞书失败，请检查凭据与网络后重试。',
   lastError: '最近一次连接失败',
+  scopeCheckTitle: '权限自检',
+  scopeCheckOk: '已开通插件需要的全部飞书权限。',
+  scopeCheckMissing: '以下飞书权限未开通，开通后需在开发者后台发布新版本：',
+  scopeCheckOpenAll: '在开发者后台开通全部缺失权限',
+  scopeCheckOpenOne: '去开通',
+  scopeCheckOptional: '可选',
+  scopeCheckRequired: '必需',
+  scopeCheckError: '无法读取应用的权限授予状态：',
   missingConfig: '缺少配置',
   statusHintUnconfigured: '配置完成后插件会自动连接；也可以稍后在本页手动连接。',
   connectionInfo: '连接信息',

@@ -71,7 +71,7 @@ import type { AttachmentStore } from './host/attachments.ts'
 import { InboundRouter } from './routing/inbound.ts'
 import type { RequestPolicyController } from './session/request-policy.ts'
 import type { ChannelFactory, FeishuChannel, NormalizedMessage } from './feishu-channel.ts'
-import { AppOwnerLookupError } from './feishu-channel.ts'
+import { AppOwnerLookupError, FeishuApiError } from './feishu-channel.ts'
 import { buildHealthCard, foldHealthSnapshot, HEALTH_DEPENDENCY_NAMES } from './health.ts'
 import type { HealthDependencyName, HealthSnapshot } from './health.ts'
 import {
@@ -88,8 +88,9 @@ import { ACTIVITY_BUILD_MARKER, TurnStreamer } from './streamer.ts'
 import type { ProjectedStats, StreamerHooks } from './streamer.ts'
 import type { FeishuConfig } from './config.ts'
 import type {
-  AccessMutationResponse, AccessRequestWire, AccessWire,
+  AccessMutationResponse, AccessRequestWire, AccessWire, ScopeCheckWire,
 } from './settings/contract.ts'
+import { checkScopes } from './feishu/scopes.ts'
 import { mergeOverlay } from './settings/overlay.ts'
 import type { OverlayPatch, OverlayStore } from './settings/overlay.ts'
 
@@ -102,9 +103,14 @@ const GC_SWEEP_INTERVAL_MS = 6 * 60 * 60 * 1000
 const PROCESSED_RETENTION_MS = 24 * 60 * 60 * 1000
 /** Upper bound on the boot-time app-owner lookup before the connection opens. */
 const APP_OWNER_LOOKUP_TIMEOUT_MS = 10_000
+/** Upper bound on the post-connect scope grant query. */
+const SCOPE_CHECK_TIMEOUT_MS = 10_000
 
 /** Outcome of the app-owner lookup for the current connection. */
-type AppOwnerState = { readonly userId: string } | { readonly error: string }
+type AppOwnerState =
+  | { readonly userId: string }
+  /** `apiRejected`: Feishu answered with an error code (typically a missing app-info scope). */
+  | { readonly error: string; readonly apiRejected: boolean }
 
 
 interface RenewAdmission {
@@ -308,6 +314,8 @@ export class FeishuService {
    * is unset. Cleared on shutdown so a reconnect looks it up again.
    */
   private appOwner: AppOwnerState | undefined
+  /** Post-connect scope self-check; cleared on shutdown. */
+  private scopeCheckState: ScopeCheckWire | undefined
 
   constructor(
     ctx: HostContext,
@@ -1035,10 +1043,13 @@ export class FeishuService {
       ])
       state = userId !== undefined && FEISHU_USER_ID_PATTERN.test(userId)
         ? { userId }
-        : { error: '应用所有者不是企业内成员，或接口未返回其 user_id' }
+        : { error: '应用所有者不是企业内成员，或接口未返回其 user_id', apiRejected: false }
     } catch (error) {
       const detail = error instanceof AppOwnerLookupError ? error.detail : messageOf(error)
-      state = { error: `获取应用信息失败：${detail}；请在开发者后台为应用开通「获取应用信息」相关权限并发布版本` }
+      state = {
+        error: `获取应用信息失败：${detail}；请在开发者后台为应用开通「获取应用信息」相关权限并发布版本`,
+        apiRejected: error instanceof AppOwnerLookupError && error.code !== undefined,
+      }
     } finally {
       if (timer !== undefined) clearTimeout(timer)
     }
@@ -1047,6 +1058,64 @@ export class FeishuService {
     this.appOwner = state
     if ('error' in state && this.configuredAdminUserId() === undefined) {
       this.ctx.logger?.warn?.('dsh-channels: app owner fallback unavailable: %s', state.error)
+    }
+  }
+
+  /** Latest post-connect scope self-check, when one finished for this connection. */
+  scopeCheck(): ScopeCheckWire | undefined {
+    return this.scopeCheckState
+  }
+
+  /**
+   * Compare the app's granted scopes with what the plugin uses and log the
+   * missing ones. Never throws; waits for the owner lookup so the app-info
+   * need reflects its outcome.
+   */
+  private async runScopeCheck(channel: FeishuChannel, appId: string, ownerLookup: Promise<void>): Promise<void> {
+    this.scopeCheckState = undefined
+    if (channel.grantedScopes === undefined) return
+    await ownerLookup
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let state: ScopeCheckWire
+    try {
+      const grants = await Promise.race([
+        channel.grantedScopes(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`超时（${SCOPE_CHECK_TIMEOUT_MS} ms）`)), SCOPE_CHECK_TIMEOUT_MS)
+        }),
+      ])
+      const result = checkScopes(grants, appId, {
+        dmEnabled: this.config.dmMode === 'open',
+        ownerLookupFailed: this.config.accessMode === 'guarded'
+          && this.configuredAdminUserId() === undefined
+          && this.appOwner !== undefined && 'error' in this.appOwner && this.appOwner.apiRejected,
+      })
+      state = result.consoleUrl === undefined
+        ? { state: 'ok', checkedAt: Date.now() }
+        : {
+            state: 'missing',
+            checkedAt: Date.now(),
+            missing: result.missing.map(item => ({
+              scopes: [...item.anyOf], level: item.level, purpose: item.purpose, consoleUrl: item.consoleUrl,
+            })),
+            consoleUrl: result.consoleUrl,
+          }
+    } catch (error) {
+      const detail = error instanceof FeishuApiError ? error.detail : messageOf(error)
+      state = { state: 'error', checkedAt: Date.now(), error: detail }
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
+    }
+    // A background check can outlive its connection (shutdown/reconnect).
+    if (this.channel !== channel) return
+    this.scopeCheckState = state
+    if (state.state === 'ok') {
+      this.ctx.logger?.info?.('dsh-channels: scope self-check passed')
+    } else if (state.state === 'missing') {
+      const lines = state.missing.map(item => `${item.level === 'required' ? '必需' : '可选'} ${item.scopes.join(' 或 ')}：${item.purpose}`)
+      this.ctx.logger?.warn?.('dsh-channels: 飞书权限缺失 %d 项，开通后需发布新版本（%s）：\n  %s', state.missing.length, state.consoleUrl, lines.join('\n  '))
+    } else {
+      this.ctx.logger?.warn?.('dsh-channels: 飞书权限自检失败：%s', state.error)
     }
   }
 
@@ -1257,6 +1326,8 @@ export class FeishuService {
     const ownerLookup = this.resolveAppOwner(channel)
     if (this.configuredAdminUserId() === undefined) await ownerLookup
     await channel.connect()
+    // Background: the result only feeds the panel and the log.
+    void this.runScopeCheck(channel, appId, ownerLookup)
     // Repair cards a previous instance left mid-flight (best-effort, background).
     void this.repair.repairAll().catch((error: unknown) => {
       this.ctx.logger?.warn?.('dsh-channels: inflight repair failed: %s', String(error))
@@ -1367,6 +1438,7 @@ export class FeishuService {
     this.domain = undefined
     this.runningConfig = undefined
     this.appOwner = undefined
+    this.scopeCheckState = undefined
   }
 
   // ---- inbound routing -------------------------------------------------

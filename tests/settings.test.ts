@@ -40,6 +40,7 @@ import type {
   AccessWire,
   CatalogWire,
   EditableValues,
+  ScopeCheckWire,
 } from '../src/settings/contract.ts'
 import {
   OverlayStore,
@@ -122,6 +123,7 @@ class FakeTarget implements SettingsTarget {
   failRestart: string | undefined
   failConnect: string | undefined
   healthState = healthySnapshot()
+  scopeCheckState: ScopeCheckWire | undefined
   /** Admission snapshot handed to the panel (the real service keeps it in memory). */
   accessState: AccessWire = {
     mode: 'guarded',
@@ -163,6 +165,7 @@ class FakeTarget implements SettingsTarget {
   startedAtMs(): number | undefined { return 1_000 }
   uptimeMs(): number | undefined { return this.runningFlag ? 60_000 : undefined }
   startError(): string | undefined { return this.startErrorText }
+  scopeCheck(): ScopeCheckWire | undefined { return this.scopeCheckState }
   configSnapshot(): FeishuConfig { return { ...this.config } }
   baseConfigSnapshot(): FeishuConfig { return { ...this.base } }
   runningConfigSnapshot(): FeishuConfig | undefined {
@@ -977,6 +980,15 @@ describe('SettingsSurface', () => {
     expect(status.phase).toBe('connected')
     expect(status.configured).toBe(false)
     expect(status.missingConfig).toEqual(['FEISHU_APP_SECRET（飞书 App Secret）'])
+  })
+
+  it('carries the scope self-check only while the channel runs', async () => {
+    const { surface, target } = makeSurface()
+    expect((await surface.status()).scopeCheck).toBeUndefined()
+    target.scopeCheckState = { state: 'ok', checkedAt: 5 }
+    expect((await surface.status()).scopeCheck).toEqual({ state: 'ok', checkedAt: 5 })
+    target.runningFlag = false
+    expect((await surface.status()).scopeCheck).toBeUndefined()
   })
 
   it('surfaces the health reasons that explain a degraded level', async () => {

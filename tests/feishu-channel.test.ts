@@ -14,7 +14,12 @@ const sdk = vi.hoisted(() => {
     addReaction: vi.fn(async () => 'reaction-1'),
     removeReaction: vi.fn(async () => {}),
     rawClient: {
-      application: { v6: { application: { get: vi.fn(async (): Promise<unknown> => ({ code: 0, data: {} })) } } },
+      application: {
+        v6: {
+          application: { get: vi.fn(async (): Promise<unknown> => ({ code: 0, data: {} })) },
+          scope: { list: vi.fn(async (): Promise<unknown> => ({ code: 0, data: {} })) },
+        },
+      },
       request: vi.fn(async () => ({ data: { items: [] } })),
       im: {
         v1: {
@@ -37,7 +42,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 
 import { Readable } from 'node:stream'
 import {
-  AppOwnerLookupError, contentRangeTotal, defaultChannelFactory, downloadResourceInRanges, RANGE_DOWNLOAD_CHUNK_BYTES,
+  AppOwnerLookupError, contentRangeTotal, FeishuApiError, defaultChannelFactory, downloadResourceInRanges, RANGE_DOWNLOAD_CHUNK_BYTES,
 } from '../src/feishu-channel.ts'
 import type { FeishuConnectionStatus, ResourceChunkStream } from '../src/feishu-channel.ts'
 
@@ -66,6 +71,36 @@ const options = {
 describe('LarkChannelAdapter', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+  })
+
+  describe('grantedScopes', () => {
+    const list = () => sdk.channel.rawClient.application.v6.scope.list
+
+    it('maps grant_status 1 to granted and keeps the scope type', async () => {
+      list().mockResolvedValueOnce({ code: 0, data: { scopes: [
+        { scope_name: 'im:message', grant_status: 1, scope_type: 'tenant' },
+        { scope_name: 'im:chat:readonly', grant_status: 2 },
+      ] } })
+      await expect(defaultChannelFactory(options).grantedScopes?.()).resolves.toEqual([
+        { name: 'im:message', granted: true, type: 'tenant' },
+        { name: 'im:chat:readonly', granted: false },
+      ])
+      list().mockResolvedValueOnce({ code: 0 })
+      await expect(defaultChannelFactory(options).grantedScopes?.()).resolves.toEqual([])
+    })
+
+    it('rejects a non-zero code and maps thrown errors', async () => {
+      list().mockResolvedValueOnce({ code: 99991672, msg: 'denied' })
+      const error = await defaultChannelFactory(options).grantedScopes?.().catch((e: unknown) => e)
+      expect(error).toBeInstanceOf(FeishuApiError)
+      expect(error).toMatchObject({ code: 99991672, detail: 'code=99991672 denied' })
+      list().mockResolvedValueOnce({ code: 5 })
+      await expect(defaultChannelFactory(options).grantedScopes?.()).rejects.toMatchObject({ detail: 'code=5' })
+      list().mockRejectedValueOnce(Object.assign(new Error('400'), { response: { data: { msg: 'bad' } } }))
+      await expect(defaultChannelFactory(options).grantedScopes?.()).rejects.toMatchObject({ detail: 'bad' })
+      list().mockRejectedValueOnce('down')
+      await expect(defaultChannelFactory(options).grantedScopes?.()).rejects.toMatchObject({ detail: 'down' })
+    })
   })
 
   describe('appOwnerUserId', () => {

@@ -6,12 +6,13 @@
  * - error：连接信息卡 + 最近一次连接失败 + 「重试」
  * - connected：连接信息卡 + 「重启飞书连接」+ 凭据卡
  * - connecting：禁用按钮显示「连接中…」
+ * - 已连接且权限自检完成：权限自检卡（缺失权限红字 + 开发者后台深链）
  *
  * @module dsh-channels/client/panel/connection-tab
  */
 
 import { PANEL_COPY } from '../../settings/contract.ts'
-import type { ChannelStatusWire, PanelWire } from '../../settings/contract.ts'
+import type { ChannelStatusWire, PanelWire, ScopeCheckWire } from '../../settings/contract.ts'
 import { CredentialsCard } from './credentials-card.tsx'
 import { connectionStateLabel, fieldLabel, formatUptime, phaseBadge, TabHelp } from './shared.tsx'
 import type { BusyAction, CredentialsView } from './shared.tsx'
@@ -35,6 +36,7 @@ export function ConnectionTab(props: ConnectionTabProps): JSX.Element {
       {status.phase === 'unconfigured'
         ? <OnboardingCard status={status} />
         : <ConnectionInfoCard status={status} busy={busy} onReconnect={onReconnect} />}
+      {status.scopeCheck === undefined ? null : <ScopeCheckCard check={status.scopeCheck} />}
       <CredentialsCard panel={panel} credentials={credentials} />
     </div>
   )
@@ -182,6 +184,47 @@ function ConnectionInfoCard(props: {
             )
           : null}
       </div>
+    </section>
+  )
+}
+
+/** Post-connect scope self-check: missing scopes in red, each with a console deep link. */
+function ScopeCheckCard(props: { check: ScopeCheckWire }): JSX.Element {
+  const { check } = props
+  return (
+    <section className="dsh-channels-cfg__card">
+      <div className="dsh-channels-cfg__cardHead">
+        <span className="dsh-channels-cfg__cardTitle">{PANEL_COPY.scopeCheckTitle}</span>
+      </div>
+      {check.state === 'ok'
+        ? <div className="dsh-channels-cfg__notice dsh-channels-cfg__notice--ok">{PANEL_COPY.scopeCheckOk}</div>
+        : null}
+      {check.state === 'error'
+        ? (
+            <div className="dsh-channels-cfg__notice dsh-channels-cfg__notice--error">
+              <strong>{PANEL_COPY.scopeCheckError}</strong>
+              <span className="dsh-channels-cfg__mono">{check.error}</span>
+            </div>
+          )
+        : null}
+      {check.state === 'missing'
+        ? (
+            <div className="dsh-channels-cfg__notice dsh-channels-cfg__notice--error">
+              <strong>{PANEL_COPY.scopeCheckMissing}</strong>
+              <ul className="dsh-channels-cfg__scopeList">
+                {check.missing.map(item => (
+                  <li key={item.scopes.join(',')}>
+                    <span>[{item.level === 'required' ? PANEL_COPY.scopeCheckRequired : PANEL_COPY.scopeCheckOptional}] </span>
+                    <span className="dsh-channels-cfg__mono">{item.scopes.join(' / ')}</span>
+                    <span>：{item.purpose} </span>
+                    <a href={item.consoleUrl} target="_blank" rel="noreferrer noopener">{PANEL_COPY.scopeCheckOpenOne}</a>
+                  </li>
+                ))}
+              </ul>
+              <a href={check.consoleUrl} target="_blank" rel="noreferrer noopener">{PANEL_COPY.scopeCheckOpenAll}</a>
+            </div>
+          )
+        : null}
     </section>
   )
 }

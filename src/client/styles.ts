@@ -68,6 +68,8 @@ select.dsh-channels-cfg__input{appearance:auto;cursor:pointer}
 .dsh-channels-cfg__notice{display:flex;flex-direction:column;gap:2px;padding:8px 10px;border-radius:8px;font-size:12px;line-height:18px;overflow-wrap:anywhere}
 .dsh-channels-cfg__notice--ok{color:var(--dsw-alias-state-business-primary,#0a7d33);background:color-mix(in srgb,currentColor 8%,transparent)}
 .dsh-channels-cfg__notice--error{color:var(--dsw-alias-state-danger-primary,#c62828);background:color-mix(in srgb,currentColor 8%,transparent)}
+.dsh-channels-cfg__notice a{color:inherit;text-decoration:underline}
+.dsh-channels-cfg__scopeList{margin:2px 0;padding-left:18px;display:flex;flex-direction:column;gap:2px}
 .dsh-channels-cfg__banner{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:8px 10px;border-radius:8px;border:1px dashed var(--dsw-alias-state-warning-primary,#a15c00);color:var(--dsw-alias-state-warning-primary,#a15c00);font-size:12px;line-height:18px}
 .dsh-channels-cfg__footer{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding-top:2px}
 .dsh-channels-cfg__spacer{flex:1}
