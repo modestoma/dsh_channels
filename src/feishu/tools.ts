@@ -2296,6 +2296,13 @@ export function renderTopicMessagesResult(value: unknown): readonly ToolContentB
   if (typeof result.reason === 'string' && result.reason !== '' && result.reason !== summary) {
     lines.push(`原因：${result.reason}`)
   }
+  // The model needs the opaque token verbatim to continue paging; it is only
+  // visible through this rendered text (the host shows render output, not the
+  // structured value). Omitting it made the model guess message ids in the
+  // 2026-10-21 real-device smoke test.
+  if (typeof result.cursor === 'string' && result.cursor !== '') {
+    lines.push(`- 下一页 cursor: ${sanitizeInlineText(result.cursor, 512)}`)
+  }
   const messages = (Array.isArray(result.messages) ? result.messages : [])
     .filter((message): message is TopicMessageView => typeof message === 'object' && message !== null)
   let used = lines.join('\n').length

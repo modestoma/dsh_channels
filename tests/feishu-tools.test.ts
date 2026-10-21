@@ -2365,6 +2365,10 @@ describe('feishu topic-messages list', () => {
     const text = String((definition.output.render({}, value)[0] as { text?: unknown }).text)
     expect(text).toContain('newest message')
     expect(text).toContain('om_new')
+    // The opaque cursor must be visible in the rendered output: the model only
+    // sees render text, and real-device pagination failed without it.
+    expect(text).toContain('token_next')
+    expect(text).toContain('下一页 cursor')
 
     // The cursor is forwarded as page_token; the default page size is 10.
     const secondPage = await runTopicTool(definition, { cursor: 'token_next' })

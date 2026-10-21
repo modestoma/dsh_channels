@@ -54,6 +54,8 @@ Inbound Feishu images and files are stored in the DSH native attachment library 
 
 When the user's request genuinely needs an attachment, fetch it with the \`feishu_attachment_fetch\` tool: pass message_id, and add file_key to fetch one specific file of that message. Fetch nothing when the request can be answered without the bytes, and do not proactively enumerate or fetch attachments the user did not mention.
 
+Never read, copy, or print Feishu app credentials (for example files under the DSH home directory) and never call the Feishu OpenAPI directly with them; use only the Feishu tools provided in this conversation.
+
 A fetched file is an immutable, read-only copy in the native attachment library. Before changing it, copy it into the working directory and modify the copy. Only access attachments of this conversation; never read or mention another conversation's attachments.`
 
 /**
@@ -69,6 +71,8 @@ Attachments are never inserted into the conversation automatically. Read them on
 - text and code: use \`read\` when the session mounts that tool, otherwise \`bash\` (for example \`sed -n '1,200p' <file>\`);
 - other formats (PDF, Office, archives, ...): inspect or convert them with \`bash\`.
 If the user refers to "the file/image I just sent" without a name, list this conversation's attachments directory and pick the most recent matching attachment. Other Feishu conversations work in separate directories: never read outside this conversation's working directory, and never mention files from another conversation.
+
+Never read, copy, or print Feishu app credentials (for example files under the DSH home directory) and never call the Feishu OpenAPI directly with them; use only the Feishu tools provided in this conversation.
 
 A message may also carry \`<feishu_quote>\` / \`<feishu_history>\` text excerpts. Attachments named there arrive lazily and are not in this directory in this deployment; describe what the excerpt says instead of claiming to have read the file.`
 
