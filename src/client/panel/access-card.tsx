@@ -44,8 +44,8 @@ export interface AccessCardProps {
   error: string | null
   onAddGroup: (chatId: string, name: string) => Promise<boolean>
   onRemoveGroup: (chatId: string) => void
-  onAddUser: (openId: string, name: string) => Promise<boolean>
-  onRemoveUser: (openId: string) => void
+  onAddUser: (userId: string, name: string) => Promise<boolean>
+  onRemoveUser: (userId: string) => void
   onResolveRequest: (token: string, decision: 'allow' | 'deny') => void
 }
 
@@ -54,7 +54,7 @@ export function AccessCard(props: AccessCardProps): JSX.Element {
   const { access } = panel
   const [groupChatId, setGroupChatId] = useState('')
   const [groupName, setGroupName] = useState('')
-  const [userOpenId, setUserOpenId] = useState('')
+  const [userUserId, setUserUserId] = useState('')
   const [userName, setUserName] = useState('')
   const groups: readonly AccessGroupWire[] = access.groups
   const users: readonly AccessUserWire[] = access.users
@@ -71,9 +71,9 @@ export function AccessCard(props: AccessCardProps): JSX.Element {
   }
 
   const submitUser = async (): Promise<void> => {
-    if (userOpenId.trim() === '') return
-    if (await onAddUser(userOpenId, userName)) {
-      setUserOpenId('')
+    if (userUserId.trim() === '') return
+    if (await onAddUser(userUserId, userName)) {
+      setUserUserId('')
       setUserName('')
     }
   }
@@ -171,11 +171,11 @@ export function AccessCard(props: AccessCardProps): JSX.Element {
                   : (
                       <ul className="dsh-channels-cfg__accessList">
                         {users.map(user => (
-                          <li className="dsh-channels-cfg__accessRow" key={user.openId}>
+                          <li className="dsh-channels-cfg__accessRow" key={user.userId}>
                             <span className="dsh-channels-cfg__accessMain">
-                              <span>{user.name ?? user.openId}</span>
+                              <span>{user.name ?? user.userId}</span>
                               <span className="dsh-channels-cfg__accessMeta">
-                                <span className="dsh-channels-cfg__mono">{user.openId}</span>
+                                <span className="dsh-channels-cfg__mono">{user.userId}</span>
                                 {` · ${accessSourceLabel(user.source)} · ${formatAccessDate(user.addedAt)}`}
                               </span>
                             </span>
@@ -183,7 +183,7 @@ export function AccessCard(props: AccessCardProps): JSX.Element {
                               type="button"
                               className="dsh-channels-cfg__btn"
                               disabled={disabled}
-                              onClick={() => onRemoveUser(user.openId)}
+                              onClick={() => onRemoveUser(user.userId)}
                             >
                               {working ? PANEL_COPY.accessWorking : PANEL_COPY.accessRemove}
                             </button>
@@ -195,11 +195,11 @@ export function AccessCard(props: AccessCardProps): JSX.Element {
                   <input
                     type="text"
                     className="dsh-channels-cfg__input dsh-channels-cfg__accessInput"
-                    value={userOpenId}
-                    placeholder={PANEL_COPY.accessUserOpenIdPlaceholder}
-                    aria-label={PANEL_COPY.accessUserOpenIdPlaceholder}
+                    value={userUserId}
+                    placeholder={PANEL_COPY.accessUserIdPlaceholder}
+                    aria-label={PANEL_COPY.accessUserIdPlaceholder}
                     disabled={disabled}
-                    onChange={event => setUserOpenId(event.target.value)}
+                    onChange={event => setUserUserId(event.target.value)}
                   />
                   <input
                     type="text"
@@ -213,7 +213,7 @@ export function AccessCard(props: AccessCardProps): JSX.Element {
                   <button
                     type="button"
                     className="dsh-channels-cfg__btn dsh-channels-cfg__btn--primary"
-                    disabled={disabled || userOpenId.trim() === ''}
+                    disabled={disabled || userUserId.trim() === ''}
                     onClick={() => { void submitUser() }}
                   >
                     {working ? PANEL_COPY.accessWorking : PANEL_COPY.accessAddUser}

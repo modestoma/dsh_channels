@@ -390,8 +390,8 @@ export function registerSettingsRoutes(server: HostWebServer, surface: SettingsS
         const payload = await readAccessBody(req, res)
         if (payload === undefined) return
         const result = methodOf(req) === 'DELETE'
-          ? await surface.removeAccessUser(payload.openId)
-          : await surface.saveAccessUser(payload.openId, payload.name)
+          ? await surface.removeAccessUser(payload.userId)
+          : await surface.saveAccessUser(payload.userId, payload.name)
         sendJson(res, result.ok ? 200 : 400, result)
       }),
     }),

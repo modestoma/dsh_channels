@@ -24,7 +24,7 @@ export const CATALOG_ROUTE = '/dsh-channels/catalog'
 export const ACCESS_ROUTE = '/dsh-channels/access'
 /** 群白名单增删（POST/DELETE，body `{ chatId, name? }` / `{ chatId }`）。 */
 export const ACCESS_GROUPS_ROUTE = '/dsh-channels/access/groups'
-/** 用户白名单增删（POST/DELETE，body `{ openId, name? }` / `{ openId }`）。 */
+/** 用户白名单增删（POST/DELETE，body `{ userId, name? }` / `{ userId }`）。 */
 export const ACCESS_USERS_ROUTE = '/dsh-channels/access/users'
 /** 结算一条待处理授权申请（POST，body `{ token, decision }`）。 */
 export const ACCESS_REQUESTS_ROUTE = '/dsh-channels/access/requests'
@@ -61,7 +61,7 @@ export const EDITABLE_KEYS = [
   'welcomeOnboarding',
   'allowPermissionSwitch',
   // 准入与授权（管理员/准入模式/申请有效期；白名单由「访问与授权」卡片管理）
-  'adminOpenId',
+  'adminUserId',
   'accessMode',
   'authRequestTtlDays',
   // 内容与附件（v2 管线；`feishuTools.*` 是嵌套配置，覆盖层仍写成嵌套对象）
@@ -292,9 +292,9 @@ export interface AccessGroupWire {
   addedAt: number
 }
 
-/** One authorized user `open_id` (global across every authorized group). */
+/** One authorized user `user_id` (global across every authorized group). */
 export interface AccessUserWire {
-  openId: string
+  userId: string
   /** Display name captured at authorization time. */
   name?: string
   /** Which authorization entry produced the grant. */
@@ -308,7 +308,7 @@ export interface AccessRequestWire {
   /** Opaque token; never derived from the target id. */
   token: string
   kind: 'group' | 'user'
-  /** `chat_id` for a group request, `open_id` for a user request. */
+  /** `chat_id` for a group request, `user_id` for a user request. */
   targetId: string
   /** Display name of the requested target (group name / user name), when known. */
   name?: string
@@ -331,7 +331,7 @@ export interface AccessRequestWire {
 export interface AccessWire {
   mode: 'open' | 'guarded'
   admin: {
-    openId?: string
+    userId?: string
     /** false while guarded mode would refuse every conversation (fail closed). */
     configured: boolean
   }
@@ -592,9 +592,9 @@ export const PANEL_COPY = {
   // ---- model --------------------------------------------------------------
   // ---- access -------------------------------------------------------------
   accessCard: '访问与授权',
-  accessCardHelp: '准入采用 fail-closed：管理员不受白名单限制（私聊、任意群聊都可直接对话）；非管理员私聊会被拒绝，群聊需要「群已授权 + 用户在白名单」两层同时命中。管理员与准入模式在上方「准入与授权」中编辑；私聊机器人发送 /userid 获取自己的 open_id。',
+  accessCardHelp: '准入采用 fail-closed：管理员不受白名单限制（私聊、任意群聊都可直接对话）；非管理员私聊会被拒绝，群聊需要「群已授权 + 用户在白名单」两层同时命中。管理员与准入模式在上方「准入与授权」中编辑；私聊机器人发送 /userid 获取自己的 user_id。',
   accessModeOpenWarning: '当前准入模式为开放（open）：应用可用范围内的任何人都能开启对话。该模式不安全，仅建议调试时使用。',
-  accessAdminMissingWarning: '当前准入=guarded 但未配置管理员，所有对话都会被拒绝。请在上方「准入与授权」填写管理员 open_id。',
+  accessAdminMissingWarning: '当前准入=guarded 但未配置管理员，所有对话都会被拒绝。请在上方「准入与授权」填写管理员 user_id。',
   accessGroupsTitle: '已授权群',
   accessGroupsEmpty: '尚未授权任何群。机器人被拉进群后，管理员会收到带 chat_id 的群信息卡；也可在群内发送 /groupid 获取。',
   accessUsersTitle: '已授权用户',
@@ -603,7 +603,7 @@ export const PANEL_COPY = {
   accessRequestsEmpty: '没有待处理的授权申请。',
   accessGroupChatIdPlaceholder: '群 chat_id（oc_…）',
   accessGroupNamePlaceholder: '群名（可选）',
-  accessUserOpenIdPlaceholder: '用户 open_id（ou_…）',
+  accessUserIdPlaceholder: '用户 user_id',
   accessUserNamePlaceholder: '昵称（可选）',
   accessAddGroup: '添加群',
   accessAddUser: '添加用户',
@@ -625,5 +625,5 @@ export const PANEL_COPY = {
   accessRequestAllowed: '已授权',
   accessRequestDenied: '已忽略',
   accessHints: '三种授权入口：群内 /auth 命令、入群与用户授权卡、本面板。撤销立即生效；白名单只约束非管理员（管理员在任何私聊/群聊都直接放行），非管理员需要群和用户两层同时命中。',
-  accessChatIdHint: 'chat_id 可从入群群信息卡或群内 /groupid 获取；open_id 可私聊机器人发送 /userid 获取。',
+  accessChatIdHint: 'chat_id 可从入群群信息卡或群内 /groupid 获取；user_id 可私聊机器人发送 /userid 获取。',
 } as const

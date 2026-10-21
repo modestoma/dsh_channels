@@ -19,7 +19,7 @@ export function makeAccessConfig(partial: Partial<FeishuConfig> = {}): FeishuCon
     appId: 'FEISHU_APP_ID',
     appSecret: 'FEISHU_APP_SECRET',
     accessMode: 'guarded',
-    adminOpenId: 'ou_admin',
+    adminUserId: 'u_admin',
     ...partial,
   })
 }
@@ -57,7 +57,7 @@ export function groupRecord(partial: Partial<AccessGroupRecord> = {}): AccessGro
   return {
     chatId: 'oc_group',
     source: 'command',
-    addedBy: 'ou_admin',
+    addedBy: 'u_admin',
     addedAt: 1_000,
     ...partial,
   }
@@ -66,9 +66,9 @@ export function groupRecord(partial: Partial<AccessGroupRecord> = {}): AccessGro
 /** One authorized-user record. */
 export function userRecord(partial: Partial<AccessUserRecord> = {}): AccessUserRecord {
   return {
-    openId: 'ou_alice',
+    userId: 'u_alice',
     source: 'command',
-    addedBy: 'ou_admin',
+    addedBy: 'u_admin',
     addedAt: 1_000,
     ...partial,
   }

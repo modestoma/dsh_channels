@@ -293,7 +293,7 @@ export class SessionManager {
     const workspacePath = record.workspacePath
     const workspace = await this.deps.ctx.workspaceRegistry.create(
       workspacePath,
-      workspaceTitleFor(record.chatType, record.chatId, record.senderOpenId),
+      workspaceTitleFor(record.chatType, record.chatId, record.senderUserId),
     )
 
     let newHandle: AgentHandle | undefined

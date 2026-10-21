@@ -21,7 +21,7 @@ import {
 import { makeChannel, makeMessage } from './helpers.ts'
 import type { FakeChannelOptions } from './helpers.ts'
 
-const ADMIN = 'ou_admin'
+const ADMIN = 'u_admin'
 const DAY_MS = 86_400_000
 
 type FakeChannel = ReturnType<typeof makeChannel>
@@ -111,18 +111,18 @@ function sentCard(entry: SentEntry): object {
 }
 
 /** One card-action event from the administrator's DM card. */
-function cardAction(messageId: string, value: unknown, openId = ADMIN): CardActionEvent {
+function cardAction(messageId: string, value: unknown, userId = ADMIN): CardActionEvent {
   return {
     messageId,
     chatId: ADMIN,
-    operator: { openId },
+    operator: { openId: 'ou_operator', userId },
     action: { value, tag: 'button' },
   }
 }
 
 /** One group-attributed bot-added event. */
-function botAdded(chatId: string, operatorOpenId = ADMIN) {
-  return { chatId, operator: { openId: operatorOpenId } }
+function botAdded(chatId: string, operatorUserId = ADMIN) {
+  return { chatId, operator: { openId: 'ou_operator', userId: operatorUserId } }
 }
 
 /** Create a pending group request through the bot-added path and return its token. */
@@ -146,7 +146,7 @@ function routeRecord(partial: Partial<RouteRecord> = {}): RouteRecord {
     sessionId: 'session-a',
     chatId: 'oc_group',
     chatType: 'group',
-    senderOpenId: 'ou_alice',
+    senderUserId: 'u_alice',
     workspacePath: '/workspace/alice',
     cardMessageId: 'om_card',
     createdAt: 1,
@@ -159,7 +159,7 @@ describe('AccessController.admit：私聊', () => {
   it('非管理员私聊回固定提示，且只发一条文本', async () => {
     const runtime = setup()
     const msg = makeMessage({
-      chatType: 'p2p', chatId: 'oc_p2p_alice', senderId: 'ou_alice', mentionedBot: false, content: '你好',
+      chatType: 'p2p', chatId: 'oc_p2p_alice', senderId: 'u_alice', mentionedBot: false, content: '你好',
     })
 
     await expect(runtime.controller.admit(msg)).resolves.toBe(false)
@@ -175,7 +175,7 @@ describe('AccessController.admit：私聊', () => {
     const clock = { now: 1_000_000 }
     const runtime = setup({ clock })
     const msg = () => makeMessage({
-      chatType: 'p2p', chatId: 'oc_p2p_alice', senderId: 'ou_alice', mentionedBot: false, content: '在吗',
+      chatType: 'p2p', chatId: 'oc_p2p_alice', senderId: 'u_alice', mentionedBot: false, content: '在吗',
     })
 
     await runtime.controller.admit(msg())
@@ -203,9 +203,9 @@ describe('AccessController.admit：私聊', () => {
 
   it('未配置管理员时私聊回引导文案（仍不建会话，且受同一冷却）', async () => {
     const clock = { now: 1_000_000 }
-    const runtime = setup({ config: { adminOpenId: undefined }, clock })
+    const runtime = setup({ config: { adminUserId: undefined }, clock })
     const msg = () => makeMessage({
-      chatType: 'p2p', chatId: 'oc_p2p_alice', senderId: 'ou_alice', mentionedBot: false, content: '你好',
+      chatType: 'p2p', chatId: 'oc_p2p_alice', senderId: 'u_alice', mentionedBot: false, content: '你好',
     })
 
     await expect(runtime.controller.admit(msg())).resolves.toBe(false)
@@ -223,9 +223,9 @@ describe('AccessController.admit：私聊', () => {
 
   it('用户白名单在私聊仍然被拒（白名单只在群聊生效）', async () => {
     const runtime = setup()
-    await runtime.store.addUser({ openId: 'ou_alice', source: 'command', addedBy: ADMIN, addedAt: 1 })
+    await runtime.store.addUser({ userId: 'u_alice', source: 'command', addedBy: ADMIN, addedAt: 1 })
     const msg = makeMessage({
-      chatType: 'p2p', chatId: 'oc_p2p_alice', senderId: 'ou_alice', mentionedBot: false, content: '你好',
+      chatType: 'p2p', chatId: 'oc_p2p_alice', senderId: 'u_alice', mentionedBot: false, content: '你好',
     })
 
     await expect(runtime.controller.admit(msg)).resolves.toBe(false)
@@ -235,7 +235,7 @@ describe('AccessController.admit：私聊', () => {
   it('channel 缺失时只 warn，不抛也不阻塞判定', async () => {
     const runtime = setup({ noChannel: true })
     const msg = makeMessage({
-      chatType: 'p2p', chatId: 'oc_p2p_alice', senderId: 'ou_alice', mentionedBot: false, content: '你好',
+      chatType: 'p2p', chatId: 'oc_p2p_alice', senderId: 'u_alice', mentionedBot: false, content: '你好',
     })
 
     await expect(runtime.controller.admit(msg)).resolves.toBe(false)
@@ -247,7 +247,7 @@ describe('AccessController.admit：群聊', () => {
   it('未授权群里的普通闲聊静默丢弃，不触发任何申请', async () => {
     const runtime = setup()
     const msg = makeMessage({
-      chatType: 'group', chatId: 'oc_unauthorized', senderId: 'ou_alice', mentionedBot: false, content: '随便聊聊',
+      chatType: 'group', chatId: 'oc_unauthorized', senderId: 'u_alice', mentionedBot: false, content: '随便聊聊',
     })
 
     await expect(runtime.controller.admit(msg)).resolves.toBe(false)
@@ -259,7 +259,7 @@ describe('AccessController.admit：群聊', () => {
   it('未授权群被非管理员 @ 时静默并触发群授权申请钩子', async () => {
     const runtime = setup()
     const msg = makeMessage({
-      chatType: 'group', chatId: 'oc_unauthorized', senderId: 'ou_alice', mentionedBot: true, content: '@机器人',
+      chatType: 'group', chatId: 'oc_unauthorized', senderId: 'u_alice', mentionedBot: true, content: '@机器人',
     })
 
     await expect(runtime.controller.admit(msg)).resolves.toBe(false)
@@ -283,7 +283,7 @@ describe('AccessController.admit：群聊', () => {
   it('未授权群里命中已有话题（threadId）也算“对机器人说的”，触发群授权申请', async () => {
     const runtime = setup()
     const msg = makeMessage({
-      chatType: 'group', chatId: 'oc_unauthorized', senderId: 'ou_alice',
+      chatType: 'group', chatId: 'oc_unauthorized', senderId: 'u_alice',
       mentionedBot: false, threadId: 'omt_old', content: '继续',
     })
     await expect(runtime.controller.admit(msg)).resolves.toBe(false)
@@ -294,7 +294,7 @@ describe('AccessController.admit：群聊', () => {
     const runtime = setup()
     await runtime.store.addGroup(groupRecord({ chatId: 'oc_group' }))
     const msg = makeMessage({
-      chatType: 'group', chatId: 'oc_group', senderId: 'ou_stranger', mentionedBot: true, content: '@机器人',
+      chatType: 'group', chatId: 'oc_group', senderId: 'u_stranger', mentionedBot: true, content: '@机器人',
     })
 
     await expect(runtime.controller.admit(msg)).resolves.toBe(false)
@@ -306,9 +306,9 @@ describe('AccessController.admit：群聊', () => {
   it('已授权群里管理员与白名单用户放行', async () => {
     const runtime = setup()
     await runtime.store.addGroup(groupRecord({ chatId: 'oc_group' }))
-    await runtime.store.addUser({ openId: 'ou_alice', source: 'command', addedBy: ADMIN, addedAt: 1 })
+    await runtime.store.addUser({ userId: 'u_alice', source: 'command', addedBy: ADMIN, addedAt: 1 })
 
-    for (const senderId of [ADMIN, 'ou_alice']) {
+    for (const senderId of [ADMIN, 'u_alice']) {
       const msg = makeMessage({
         chatType: 'group', chatId: 'oc_group', senderId, mentionedBot: true, content: '你好',
       })
@@ -320,8 +320,8 @@ describe('AccessController.admit：群聊', () => {
   it('open 模式放行任何人且不发提示', async () => {
     const runtime = setup({ config: { accessMode: 'open' } })
     for (const msg of [
-      makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_anyone', mentionedBot: false, content: '1' }),
-      makeMessage({ chatType: 'group', chatId: 'oc_any', senderId: 'ou_anyone', content: '2' }),
+      makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'u_anyone', mentionedBot: false, content: '1' }),
+      makeMessage({ chatType: 'group', chatId: 'oc_any', senderId: 'u_anyone', content: '2' }),
     ]) {
       await expect(runtime.controller.admit(msg)).resolves.toBe(true)
     }
@@ -331,10 +331,10 @@ describe('AccessController.admit：群聊', () => {
 
 describe('AccessController.admitCommand', () => {
   it('私聊 /userid 对所有发送者放行（含管理员未配置时）', async () => {
-    for (const config of [{}, { adminOpenId: undefined }] as Partial<FeishuConfig>[]) {
+    for (const config of [{}, { adminUserId: undefined }] as Partial<FeishuConfig>[]) {
       const runtime = setup({ config })
       const msg = makeMessage({
-        chatType: 'p2p', chatId: 'oc_p2p_alice', senderId: 'ou_alice', mentionedBot: false, content: '/userid',
+        chatType: 'p2p', chatId: 'oc_p2p_alice', senderId: 'u_alice', mentionedBot: false, content: '/userid',
       })
       await expect(runtime.controller.admitCommand(msg, 'userid')).resolves.toBe(true)
       expect(runtime.channel.sent).toEqual([])
@@ -342,9 +342,9 @@ describe('AccessController.admitCommand', () => {
   })
 
   it('管理员未配置时私聊非管理员命令回配置引导文案', async () => {
-    const runtime = setup({ config: { adminOpenId: undefined } })
+    const runtime = setup({ config: { adminUserId: undefined } })
     const msg = makeMessage({
-      chatType: 'p2p', chatId: 'oc_p2p_alice', senderId: 'ou_alice', mentionedBot: false, content: '/help',
+      chatType: 'p2p', chatId: 'oc_p2p_alice', senderId: 'u_alice', mentionedBot: false, content: '/help',
     })
     await expect(runtime.controller.admitCommand(msg, 'help')).resolves.toBe(false)
     expect(textSends(runtime.channel)).toEqual([DM_UNCONFIGURED_TEXT])
@@ -353,7 +353,7 @@ describe('AccessController.admitCommand', () => {
   it('私聊非管理员的其他命令回固定提示并拒绝', async () => {
     const runtime = setup()
     const msg = makeMessage({
-      chatType: 'p2p', chatId: 'oc_p2p_alice', senderId: 'ou_alice', mentionedBot: false, content: '/help',
+      chatType: 'p2p', chatId: 'oc_p2p_alice', senderId: 'u_alice', mentionedBot: false, content: '/help',
     })
     await expect(runtime.controller.admitCommand(msg, 'help')).resolves.toBe(false)
     expect(textSends(runtime.channel)).toEqual([DM_DENY_TEXT])
@@ -385,7 +385,7 @@ describe('AccessController.admitCommand', () => {
     const runtime = setup()
     for (const name of ['auth', 'groupid', 'help']) {
       const msg = makeMessage({
-        chatType: 'group', chatId: 'oc_unauthorized', senderId: 'ou_alice', content: `/${name}`,
+        chatType: 'group', chatId: 'oc_unauthorized', senderId: 'u_alice', content: `/${name}`,
       })
       await expect(runtime.controller.admitCommand(msg, name)).resolves.toBe(false)
     }
@@ -395,19 +395,19 @@ describe('AccessController.admitCommand', () => {
   it('已授权群按完整准入矩阵判定命令', async () => {
     const runtime = setup()
     await runtime.store.addGroup(groupRecord({ chatId: 'oc_group' }))
-    await runtime.store.addUser({ openId: 'ou_alice', source: 'command', addedBy: ADMIN, addedAt: 1 })
+    await runtime.store.addUser({ userId: 'u_alice', source: 'command', addedBy: ADMIN, addedAt: 1 })
 
     const authorize = (senderId: string) => makeMessage({
       chatType: 'group', chatId: 'oc_group', senderId, content: '/help',
     })
-    await expect(runtime.controller.admitCommand(authorize('ou_alice'), 'help')).resolves.toBe(true)
-    await expect(runtime.controller.admitCommand(authorize('ou_stranger'), 'help')).resolves.toBe(false)
+    await expect(runtime.controller.admitCommand(authorize('u_alice'), 'help')).resolves.toBe(true)
+    await expect(runtime.controller.admitCommand(authorize('u_stranger'), 'help')).resolves.toBe(false)
   })
 
   it('open 模式下所有命令直接放行', async () => {
     const runtime = setup({ config: { accessMode: 'open' } })
     const msg = makeMessage({
-      chatType: 'group', chatId: 'oc_any', senderId: 'ou_anyone', content: '/help',
+      chatType: 'group', chatId: 'oc_any', senderId: 'u_anyone', content: '/help',
     })
     await expect(runtime.controller.admitCommand(msg, 'help')).resolves.toBe(true)
   })
@@ -416,23 +416,23 @@ describe('AccessController.admitCommand', () => {
 describe('AccessController.ownsRoute / isAdmin', () => {
   it('chatId 与 sender 双匹配才算话题拥有者', () => {
     const runtime = setup()
-    const record = routeRecord({ senderOpenId: 'ou_alice', chatId: 'oc_group' })
+    const record = routeRecord({ senderUserId: 'u_alice', chatId: 'oc_group' })
     expect(runtime.controller.ownsRoute(makeMessage({
-      chatType: 'group', chatId: 'oc_group', senderId: 'ou_alice', content: 'x',
+      chatType: 'group', chatId: 'oc_group', senderId: 'u_alice', content: 'x',
     }), record)).toBe(true)
     expect(runtime.controller.ownsRoute(makeMessage({
-      chatType: 'group', chatId: 'oc_group', senderId: 'ou_bob', content: 'x',
+      chatType: 'group', chatId: 'oc_group', senderId: 'u_bob', content: 'x',
     }), record)).toBe(false)
     expect(runtime.controller.ownsRoute(makeMessage({
-      chatType: 'group', chatId: 'oc_other', senderId: 'ou_alice', content: 'x',
+      chatType: 'group', chatId: 'oc_other', senderId: 'u_alice', content: 'x',
     }), record)).toBe(false)
   })
 
   it('isAdmin 会裁剪配置与输入两侧的空白', () => {
-    const runtime = setup({ config: { adminOpenId: '  ou_admin  ' } })
-    expect(runtime.controller.isAdmin('ou_admin')).toBe(true)
-    expect(runtime.controller.isAdmin(' ou_admin ')).toBe(true)
-    expect(runtime.controller.isAdmin('ou_other')).toBe(false)
+    const runtime = setup({ config: { adminUserId: '  u_admin  ' } })
+    expect(runtime.controller.isAdmin('u_admin')).toBe(true)
+    expect(runtime.controller.isAdmin(' u_admin ')).toBe(true)
+    expect(runtime.controller.isAdmin('u_other')).toBe(false)
     expect(runtime.controller.isAdmin(undefined)).toBe(false)
   })
 })
@@ -441,11 +441,11 @@ describe('AccessRequests.handleBotAdded', () => {
   it('未授权群：私聊管理员群信息卡，记录 pending 并回写 messageId', async () => {
     const runtime = setup({ channel: {
       chatInfo: async () => ({
-        chatId: 'oc_new', chatType: 'group', name: '产品群', memberCount: 12, ownerId: 'ou_owner',
+        chatId: 'oc_new', chatType: 'group', name: '产品群', memberCount: 12, ownerId: 'u_owner',
       }),
     } })
 
-    await runtime.requests.handleBotAdded(botAdded('oc_new', 'ou_inviter'))
+    await runtime.requests.handleBotAdded(botAdded('oc_new', 'u_inviter'))
 
     expect(runtime.channel.sent).toHaveLength(1)
     const [entry] = runtime.channel.sent
@@ -454,7 +454,7 @@ describe('AccessRequests.handleBotAdded', () => {
     expect(json).toContain('群信息')
     expect(json).toContain('oc_new')
     expect(json).toContain('产品群')
-    expect(json).toContain('ou_inviter')
+    expect(json).toContain('u_inviter')
     expect(json).toContain('授权本群')
 
     const pending = runtime.store.pendingRequestFor('group', 'oc_new')
@@ -462,7 +462,7 @@ describe('AccessRequests.handleBotAdded', () => {
       kind: 'group',
       targetId: 'oc_new',
       groupName: '产品群',
-      requesterOpenId: 'ou_inviter',
+      requesterUserId: 'u_inviter',
       status: 'pending',
       messageId: 'om_1',
     })
@@ -507,7 +507,7 @@ describe('AccessRequests.handleBotAdded', () => {
   })
 
   it('管理员未配置时只 warn：不发卡、不建申请', async () => {
-    const runtime = setup({ config: { adminOpenId: undefined } })
+    const runtime = setup({ config: { adminUserId: undefined } })
     await runtime.requests.handleBotAdded(botAdded('oc_new'))
 
     expect(runtime.channel.sent).toEqual([])
@@ -539,7 +539,7 @@ describe('AccessRequests.onCardAction', () => {
   it('非管理员点击不生效，且只提示一次“仅管理员可操作”', async () => {
     const runtime = setup()
     const { token } = await pendingGroupCard(runtime)
-    const event = cardAction('om_1', { token, action: 'allow' }, 'ou_alice')
+    const event = cardAction('om_1', { token, action: 'allow' }, 'u_alice')
 
     await runtime.requests.onCardAction(event)
     await runtime.requests.onCardAction(event)
@@ -626,7 +626,7 @@ describe('AccessRequests.onCardAction', () => {
     const runtime = setup()
     await runtime.store.addGroup(groupRecord({ chatId: 'oc_group', name: '产品群' }))
     const msg = makeMessage({
-      chatType: 'group', chatId: 'oc_group', senderId: 'ou_bob',
+      chatType: 'group', chatId: 'oc_group', senderId: 'u_bob',
       senderName: 'Bob', mentionedBot: true, content: '@机器人 我能用吗',
     })
 
@@ -636,14 +636,14 @@ describe('AccessRequests.onCardAction', () => {
     expect(runtime.channel.sent[0]?.chatId).toBe(ADMIN)
     const card = sentCard(runtime.channel.sent[0]!)
     expect(JSON.stringify(card)).toContain('用户授权申请')
-    expect(JSON.stringify(card)).toContain('ou_bob')
+    expect(JSON.stringify(card)).toContain('u_bob')
     const value = buttonValue(card, '授权用户')
     expect(value).toBeDefined()
 
     await runtime.requests.onCardAction(cardAction('om_1', value!))
 
-    expect(runtime.store.hasUser('ou_bob')).toBe(true)
-    expect(runtime.store.getUser('ou_bob')).toMatchObject({ source: 'card', name: 'Bob' })
+    expect(runtime.store.hasUser('u_bob')).toBe(true)
+    expect(runtime.store.getUser('u_bob')).toMatchObject({ source: 'card', name: 'Bob' })
     expect(runtime.store.getRequest(value!.token)?.status).toBe('approved')
   })
 
@@ -651,7 +651,7 @@ describe('AccessRequests.onCardAction', () => {
     const runtime = setup()
     await runtime.store.addGroup(groupRecord({ chatId: 'oc_group' }))
     const msg = makeMessage({
-      chatType: 'group', chatId: 'oc_group', senderId: 'ou_bob', mentionedBot: true, content: '@机器人',
+      chatType: 'group', chatId: 'oc_group', senderId: 'u_bob', mentionedBot: true, content: '@机器人',
     })
     await runtime.requests.ensureUserRequest(msg)
     await runtime.requests.ensureUserRequest(msg)
@@ -686,7 +686,7 @@ describe('AccessRequests.resolve（面板与卡片共用路径）', () => {
     const runtime = setup()
     const { token } = await pendingGroupCard(runtime)
 
-    const result = await runtime.requests.resolve(token, 'allow', 'ou_alice')
+    const result = await runtime.requests.resolve(token, 'allow', 'u_alice')
     expect(result.ok).toBe(false)
     expect(result.ok ? '' : result.error).toContain('仅管理员')
     expect(runtime.store.hasGroup('oc_new')).toBe(false)
@@ -757,7 +757,7 @@ describe('AccessRequests.ensureGroupRequest（入群事件缺失时的兜底）'
   it('未授权群首次被 @ 时补发群信息卡并去重', async () => {
     const runtime = setup()
     const msg = makeMessage({
-      chatType: 'group', chatId: 'oc_fallback', senderId: 'ou_alice', mentionedBot: true, content: '@机器人',
+      chatType: 'group', chatId: 'oc_fallback', senderId: 'u_alice', mentionedBot: true, content: '@机器人',
     })
 
     await runtime.requests.ensureGroupRequest(msg)
@@ -774,10 +774,10 @@ describe('AccessRequests.ensureGroupRequest（入群事件缺失时的兜底）'
     await runtime.store.addGroup(groupRecord({ chatId: 'oc_group' }))
 
     await runtime.requests.ensureGroupRequest(makeMessage({
-      chatType: 'group', chatId: 'oc_group', senderId: 'ou_bob', mentionedBot: true, content: '@机器人',
+      chatType: 'group', chatId: 'oc_group', senderId: 'u_bob', mentionedBot: true, content: '@机器人',
     }))
     await runtime.requests.ensureGroupRequest(makeMessage({
-      chatType: 'group', chatId: 'oc_plain', senderId: 'ou_bob', mentionedBot: false, content: '闲聊',
+      chatType: 'group', chatId: 'oc_plain', senderId: 'u_bob', mentionedBot: false, content: '闲聊',
     }))
 
     expect(runtime.channel.sent).toEqual([])

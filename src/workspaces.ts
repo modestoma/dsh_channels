@@ -2,8 +2,8 @@
  * Workspace directory resolution: one DSH workspace per user, one working
  * directory per Feishu topic.
  *
- * - p2p:   workspace `<baseDir>/p2p/<open_id>/`
- * - group: workspace `<baseDir>/groups/<chat_id>/<open_id>/`
+ * - p2p:   workspace `<baseDir>/p2p/<user_id>/`
+ * - group: workspace `<baseDir>/groups/<chat_id>/<user_id>/`
  * - topic: `<workspace>/topics/<topic-token>/` (the Session's effective cwd)
  *
  * The workspace root is the Session header cwd: it keeps the Session grouped
@@ -16,14 +16,14 @@
  * stale ones by hand (a missing topic directory is recreated on the next turn).
  *
  * Attachments received before a topic exists were staged by older plugin
- * versions below `<baseDir>/_staging/<chatType>/<chat_id>/<open_id>/` and
+ * versions below `<baseDir>/_staging/<chatType>/<chat_id>/<user_id>/` and
  * adopted into the topic directory once its first Session is created. The v2
  * pipeline stores inbound attachments in the DSH native attachment library and
  * never writes staging, so this is a one-release compatibility path only: it is
  * scheduled for removal in the release cycle after attachment_pipeline_v2 ships
  * (see Roadmap decisions D12 and docs/attachment-pipeline-v2.md).
  *
- * Feishu ids (`ou_…`, `oc_…`) are safe path segments, but they are validated
+ * Feishu ids (`user_id`, `oc_…`) are safe path segments, but they are validated
  * anyway so a hostile id can never escape `baseDir`.
  *
  * @module dsh-channels/workspaces
@@ -146,8 +146,8 @@ export function worktreeBranchFor(topicToken: string): string {
  * Deterministic workspace directory for one user in one chat context: the
  * durable project the user's Sessions are grouped under.
  *
- * - p2p:   `<baseDir>/p2p/<open_id>/`
- * - group: `<baseDir>/groups/<chat_id>/<open_id>/`
+ * - p2p:   `<baseDir>/p2p/<user_id>/`
+ * - group: `<baseDir>/groups/<chat_id>/<user_id>/`
  *
  * These are the same paths older versions used as their shared (user × chat)
  * workspaces, so an upgraded deployment reuses the existing registry record
@@ -157,9 +157,9 @@ export function workspacePathFor(
   baseDir: string,
   chatType: 'p2p' | 'group',
   chatId: string,
-  senderOpenId: string,
+  senderUserId: string,
 ): string {
-  const user = safeSegment(senderOpenId, 'senderOpenId')
+  const user = safeSegment(senderUserId, 'senderUserId')
   if (chatType === 'p2p') return path.join(baseDir, 'p2p', user)
   return path.join(baseDir, 'groups', safeSegment(chatId, 'chatId'), user)
 }
@@ -195,10 +195,10 @@ export function stagingPathFor(
   baseDir: string,
   chatType: 'p2p' | 'group',
   chatId: string,
-  senderOpenId: string,
+  senderUserId: string,
 ): string {
   const chat = safeSegment(chatId, 'chatId')
-  const user = safeSegment(senderOpenId, 'senderOpenId')
+  const user = safeSegment(senderUserId, 'senderUserId')
   return path.join(stagingRoot(baseDir), chatType, chat, user)
 }
 
@@ -206,11 +206,11 @@ export function stagingPathFor(
 export function workspaceTitleFor(
   chatType: 'p2p' | 'group',
   chatId: string,
-  senderOpenId: string,
+  senderUserId: string,
 ): string {
   return chatType === 'p2p'
-    ? `飞书私聊 · ${senderOpenId}`
-    : `飞书群聊 · ${chatId} · ${senderOpenId}`
+    ? `飞书私聊 · ${senderUserId}`
+    : `飞书群聊 · ${chatId} · ${senderUserId}`
 }
 
 /**
@@ -223,12 +223,12 @@ export async function ensureWorkspace(
   baseDir: string,
   chatType: 'p2p' | 'group',
   chatId: string,
-  senderOpenId: string,
+  senderUserId: string,
 ): Promise<Workspace> {
-  const dir = workspacePathFor(baseDir, chatType, chatId, senderOpenId)
+  const dir = workspacePathFor(baseDir, chatType, chatId, senderUserId)
   await mkdir(dir, { recursive: true })
   return ctx.workspaceRegistry.create(
     dir,
-    workspaceTitleFor(chatType, chatId, senderOpenId),
+    workspaceTitleFor(chatType, chatId, senderUserId),
   )
 }

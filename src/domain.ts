@@ -41,8 +41,8 @@ export const routeRecordSchema = z.object({
   chatId: z.string().min(1),
   /** `p2p` or `group`. */
   chatType: z.enum(['p2p', 'group']),
-  /** Workspace owner (sender open_id). */
-  senderOpenId: z.string().min(1),
+  /** Workspace owner (sender user_id). */
+  senderUserId: z.string().min(1),
   /** Workspace root owning this route: the Session header cwd / sandbox root. */
   workspacePath: z.string().min(1),
   /**
@@ -81,7 +81,7 @@ export const expiredRouteRecordSchema = z.object({
   /** Original chat type, retained for diagnostics and future policy. */
   chatType: z.enum(['p2p', 'group']),
   /** Original route owner; never used to grant access after expiry. */
-  senderOpenId: z.string().min(1),
+  senderUserId: z.string().min(1),
   /** Epoch ms when the route was retired. */
   expiredAt: z.number().int().nonnegative(),
   /** Workspace the retired route belonged to; absent in tombstones written by
@@ -201,7 +201,7 @@ export const accessGroupRecordSchema = z.object({
   name: z.string().optional(),
   /** Which authorization entry produced this grant. */
   source: z.enum(['command', 'card', 'panel']),
-  /** Administrator open_id that authorized it. */
+  /** Administrator user_id that authorized it. */
   addedBy: z.string().min(1),
   /** Epoch ms when it was authorized. */
   addedAt: z.number().int().nonnegative(),
@@ -210,18 +210,18 @@ export const accessGroupRecordSchema = z.object({
 export type AccessGroupRecord = z.infer<typeof accessGroupRecordSchema>
 
 /**
- * One authorized user (`open_id`), global across every authorized group.
+ * One authorized user (`user_id`), global across every authorized group.
  * Private chats are administrator-only, so this grant only affects group
  * conversations.
  */
 export const accessUserRecordSchema = z.object({
-  /** Feishu open id (`ou_...`) — also the table key. */
-  openId: z.string().min(1),
+  /** Feishu `user_id` — also the table key. */
+  userId: z.string().min(1),
   /** Display name captured when the user was authorized (optional). */
   name: z.string().optional(),
   /** Which authorization entry produced this grant. */
   source: z.enum(['command', 'card', 'panel']),
-  /** Administrator open_id that authorized it. */
+  /** Administrator user_id that authorized it. */
   addedBy: z.string().min(1),
   /** Epoch ms when it was authorized. */
   addedAt: z.number().int().nonnegative(),
@@ -240,14 +240,14 @@ export const accessRequestRecordSchema = z.object({
   token: z.string().min(1),
   /** What is being requested. */
   kind: z.enum(['group', 'user']),
-  /** `chat_id` for a group request; `open_id` for a user request. */
+  /** `chat_id` for a group request; `user_id` for a user request. */
   targetId: z.string().min(1),
   /** Chat the request originated from, when applicable. */
   chatId: z.string().optional(),
   /** Group name captured for the card (group requests, or the group the user was seen in). */
   groupName: z.string().optional(),
   /** User who triggered a user request. */
-  requesterOpenId: z.string().optional(),
+  requesterUserId: z.string().optional(),
   /** Display name of that user, when the event carried one. */
   requesterName: z.string().optional(),
   /** Lifecycle state; only `pending` requests accept a card action. */
@@ -282,7 +282,7 @@ export const processedRecordSchema = z.object({
 export type ProcessedRecord = z.infer<typeof processedRecordSchema>
 
 export interface FeishuDomainSpecShape {
-  name: 'channels_routes'
+  name: 'channels_routes_v2'
   version: 1
   global: {
     schema: z.ZodType<FeishuDomainGlobal>
@@ -337,7 +337,9 @@ export type FeishuDomainGlobal = z.infer<typeof feishuDomainGlobalSchema>
  * runtime import of `@deepseek-ai/dsh-storage-domain`.
  */
 export const feishuDomain: FeishuDomainSpecShape = {
-  name: 'channels_routes',
+  // v2 keys every user by `user_id`. The open_id-keyed `channels_routes` unit
+  // is neither read nor migrated; it stays on disk untouched.
+  name: 'channels_routes_v2',
   version: 1,
   global: {
     schema: feishuDomainGlobalSchema,
@@ -401,7 +403,7 @@ export interface AccessGroupsTable {
   entries(): IterableIterator<[string, AccessGroupRecord]>
 }
 
-/** Normalized table handle for authorized users (key = `open_id`). */
+/** Normalized table handle for authorized users (key = `user_id`). */
 export interface AccessUsersTable {
   get(key: string): AccessUserRecord | undefined
   put(key: string, value: AccessUserRecord): Promise<unknown> | void
@@ -450,9 +452,18 @@ export interface RawDomainHandle {
   close(): Promise<void>
 }
 
+/**
+ * Feishu tenant `user_id` (letters, digits, `_`, `-`). It doubles as a
+ * workspace path segment and as a DM target, where the SDK infers the
+ * receive id type from the prefix: `ou_`/`on_`/`oc_` would be sent as an
+ * open_id/union_id/chat_id, so those prefixes are rejected (a pasted open_id
+ * fails validation instead of matching nobody).
+ */
+export const FEISHU_USER_ID_PATTERN = /^(?!ou_|on_|oc_)[A-Za-z0-9_-]+$/u
+
 /** Build a chat-scoped fallback key for degraded (topic-less) routing. */
-export function chatRouteKey(chatType: 'p2p' | 'group', chatId: string, senderOpenId: string): string {
+export function chatRouteKey(chatType: 'p2p' | 'group', chatId: string, senderUserId: string): string {
   return chatType === 'p2p'
-    ? `chat:p2p:${chatId}:${senderOpenId}`
-    : `chat:group:${chatId}:${senderOpenId}`
+    ? `chat:p2p:${chatId}:${senderUserId}`
+    : `chat:group:${chatId}:${senderUserId}`
 }

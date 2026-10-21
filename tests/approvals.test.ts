@@ -17,7 +17,7 @@ const ROUTE: ApprovalRoute = {
   chatId: 'oc_test_chat',
   cardMessageId: 'om_main_card',
   inThread: true,
-  senderOpenId: 'ou_owner',
+  senderUserId: 'u_owner',
 }
 
 function makeRequest(sessionId = 'sess-approval', overrides: Partial<ApprovalRequest> = {}): ApprovalRequest {
@@ -29,11 +29,11 @@ function makeRequest(sessionId = 'sess-approval', overrides: Partial<ApprovalReq
   }
 }
 
-function clickEvent(messageId: string, decision: unknown, openId = ROUTE.senderOpenId): CardActionEvent {
+function clickEvent(messageId: string, decision: unknown, userId = ROUTE.senderUserId): CardActionEvent {
   return {
     messageId,
     chatId: ROUTE.chatId,
-    operator: { openId },
+    operator: { openId: 'ou_operator', userId },
     action: { value: { decision }, tag: 'button' },
   }
 }
@@ -140,7 +140,7 @@ describe('ApprovalAnswerer', () => {
       outcome => { settled = true; return outcome },
     )
     await vi.waitFor(() => expect(channel.sent).toHaveLength(1))
-    answerer.onCardAction(clickEvent('om_1', 'allow', 'ou_stranger'))
+    answerer.onCardAction(clickEvent('om_1', 'allow', 'u_stranger'))
     await flush()
     expect(settled).toBe(false)
     expect(answerer.pendingCount()).toBe(1)
@@ -150,7 +150,7 @@ describe('ApprovalAnswerer', () => {
     )
     expect(notices).toHaveLength(1)
     // Second stranger click does not re-patch.
-    answerer.onCardAction(clickEvent('om_1', 'allow', 'ou_stranger'))
+    answerer.onCardAction(clickEvent('om_1', 'allow', 'u_stranger'))
     await flush()
     expect(channel.updated).toHaveLength(1)
     answerer.dispose()

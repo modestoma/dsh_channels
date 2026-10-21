@@ -20,6 +20,7 @@
    | `im:message`（获取与发送单聊、群组消息） | 收发消息、回复话题、下载消息内图片/文件资源（`messageResource.get`，具体 scope 以控制台该接口要求为准） |
    | `im:message:readonly`（读取单聊、群组消息内容） | 引用摘录、话题历史、`feishu_topic_messages` 的消息读取（message.get / mget / list），以及附件资源定位与合并转发子资源读取 |
    | `im:message.p2p_msg:readonly`（读取用户发给机器人的单聊消息） | 私聊通道 |
+   | `contact:user.employee_id:readonly`（获取用户 user ID，**必需**） | 插件用 `user_id` 识别用户（准入、话题归属、工作区目录）；未开通时所有用户消息都会被丢弃（控制台打印 warn）。外部联系人/跨租户用户没有本租户 `user_id`，无法使用 |
    | `im:message.group_msg`（读取群组中所有消息，**敏感权限**） | 读取群/话题中机器人入群前或未 @ 机器人的历史消息；控制台要求时申请并由企业管理员审批，未开通时按“机器人可见范围”降级 |
    | `im:message.reactions:write_only`（发送、删除消息表情回复） | Typing / DONE / No 表态 |
    | `im:message:update`（更新消息卡片） | 流式卡片刷新（patch） |
@@ -130,7 +131,7 @@ chmod 600 $DSH_HOME/.credentials.yaml
       topicMessagesTimeoutMs: 20000     # 单次话题读取整段超时（20 s）
     approvalTimeoutMs: 300000           # HITL 审批决策卡等待时长（默认 5 分钟）
     accessMode: 'guarded'               # 准入模式：guarded（默认）| open（旧行为，不安全）
-    adminOpenId: 'ou_xxx'               # 管理员 open_id（可留空，留空时 guarded 下拒绝一切对话）
+    adminUserId: 'a1b2c3d4'            # 管理员 user_id（可留空，留空时 guarded 下拒绝一切对话）
     authRequestTtlDays: 7               # 入群/用户授权申请卡有效期（天）
     loggerLevel: 'info'
 ```
@@ -140,7 +141,7 @@ chmod 600 $DSH_HOME/.credentials.yaml
 | 配置项 | 默认 | 说明 |
 |--------|------|------|
 | `appId` / `appSecret` | `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | 凭据引用名（shell 标识符），经 `ctx.credentials` 解析；仅当凭据库使用其它变量名时才需要覆盖。明文密钥会被拒绝 |
-| `baseDir` | `./channels-data` | 工作区目录树根：每个用户一个工作区（私聊 `p2p/<open_id>/`，群聊 `groups/<chat_id>/<open_id>/`），每个话题的工作目录为 `<工作区>/topics/<话题>/`（模型/工具产生文件的落点）；Web 面板可覆盖，只接受绝对路径，`~` 展开，保存时创建并校验目录，只影响之后新建的会话 |
+| `baseDir` | `./channels-data` | 工作区目录树根：每个用户一个工作区（私聊 `p2p/<user_id>/`，群聊 `groups/<chat_id>/<user_id>/`），每个话题的工作目录为 `<工作区>/topics/<话题>/`（模型/工具产生文件的落点）；Web 面板可覆盖，只接受绝对路径，`~` 展开，保存时创建并校验目录，只影响之后新建的会话 |
 | `provider` / `model` | 部署默认 | 新建 session 的路由；省略时继承部署默认 |
 | `reasoningEffort` | 适配器/provider 默认 | Session 初始/重置推理档位；可在话题内用 `/effort` 覆盖 |
 | `maxTokens` | 适配器默认 | 每次模型请求输出上限 |
@@ -151,7 +152,7 @@ chmod 600 $DSH_HOME/.credentials.yaml
 | `topicIsolation` | `auto` | 话题工作目录形式：`auto`（工作区含 `.git` 时用 Git worktree，否则普通子目录）/ `subdir` / `worktree`（失败回退子目录） |
 | `approvalTimeoutMs` | `300000` | HITL 审批决策卡等待时长（10s–1h）；超时自动拒绝 |
 | `accessMode` | `guarded` | 准入模式：`guarded` 仅管理员+白名单；`open` 保留旧行为（任何可用范围用户可对话，不安全） |
-| `adminOpenId` | 未设置 | 唯一管理员 open_id（`ou_` 开头）；留空 + guarded = 拒绝一切对话（`/userid` 引导仍可用）。面板可改 |
+| `adminUserId` | 未设置 | 唯一管理员 user_id（不是 `ou_` 开头的 open_id）；留空 + guarded = 拒绝一切对话（`/userid` 引导仍可用）。面板可改 |
 | `authRequestTtlDays` | `7` | 入群/用户授权申请卡有效期（1–30 天） |
 | `acceptAttachments` | `true` | 接收飞书图片/文件/合并转发记录。native 下触发消息图片预取、文件懒取、纯附件静默不回复（引用该消息再提问时列入清单）；`false` 时附件消息完全惰性（不保存、不触发、不列入清单） |
 | `attachmentStore` | `native` | 入站附件后端：`native`（DSH 原生附件库，默认；不可变、内容寻址去重、随 Session 回放、不自动清理）/ `archive`（旧版下载到话题工作区 `attachments/`，会阻塞会话建立） |
@@ -175,18 +176,18 @@ chmod 600 $DSH_HOME/.credentials.yaml
 
 插件默认 `accessMode: 'guarded'`：**没有配置管理员时，所有对话都会被拒绝**（这是 fail-closed 的安全默认值）。初始化顺序：
 
-1. 启动 dsh 后在飞书**私聊机器人**发送 `/userid`（未配置管理员时任何私聊用户都可以用，只回固定文本，不建会话）→ 复制返回的 `ou_...`；
-2. 打开 Web **设置 → 飞书渠道 → 访问授权**，把 `ou_...` 填进「管理员 open_id」并保存（立即生效）；也可以直接写 profile 的 `adminOpenId`；
+1. 启动 dsh 后在飞书**私聊机器人**发送 `/userid`（未配置管理员时任何私聊用户都可以用，只回固定文本，不建会话）→ 复制返回的 user_id；
+2. 打开 Web **设置 → 飞书渠道 → 访问授权**，把它填进「管理员 user_id」并保存（立即生效）；也可以直接写 profile 的 `adminUserId`；
 3. 现在管理员私聊机器人即可正常对话。**其他用户私聊会收到一条固定提示**（“非管理员禁用私聊功能哦…”），不会建会话；
 4. **给群授权**（三种入口任选；目的是放行**非管理员**，管理员本人在任何群都能直接对话）：
    - 机器人被拉进群 → 管理员私聊收到**群信息卡**（群名/`chat_id`/成员数/邀请人）→ 点「授权本群」；
    - 管理员在群里发 `/auth allow` → 回执「已授权本群」；`/auth revoke` 撤销；
    - Web 面板「访问与授权 → 已授权群」手动添加 `chat_id`（可用 `/groupid` 查看）；
 5. **给用户授权**（三种入口任选）：
-   - 已授权群里未授权用户 @ 机器人 → 管理员收到**用户授权申请卡**（含昵称/open_id）→ 点「授权用户」；
-   - 管理员发 `/auth user add ou_xxx`；`/auth user remove ou_xxx` 撤销；
-   - Web 面板「访问与授权 → 已授权用户」手动添加 open_id（用户可用 `/userid` 查看）；
-6. 授权/撤销**立即生效**；白名单与待处理申请持久化在插件 `channels_routes` 域，重启不丢。`/auth list` 可随时查看白名单与待处理申请。
+   - 已授权群里未授权用户 @ 机器人 → 管理员收到**用户授权申请卡**（含昵称/user_id）→ 点「授权用户」；
+   - 管理员发 `/auth user add <user_id>`；`/auth user remove <user_id>` 撤销；
+   - Web 面板「访问与授权 → 已授权用户」手动添加 user_id（用户可用 `/userid` 查看）；
+6. 授权/撤销**立即生效**；白名单与待处理申请持久化在插件 `channels_routes_v2` 域，重启不丢。`/auth list` 可随时查看白名单与待处理申请。
 
 > 说明：**管理员不受白名单限制**——机器人被拉进新群后，管理员可以直接 @ 机器人开会话，不需要先授权该群；授权群/用户只影响**非管理员**。管理员在任意群里都可以使用 `/auth`、`/groupid` 等命令。
 
@@ -212,7 +213,7 @@ DSH_HOME=$DSH_HOME pnpm dsh web        # 默认 http://127.0.0.1:3080
 [dsh-channels] 准入=guarded，管理员已配置
 ```
 
-> 准入相关控制台输出：`准入=open`（不安全，仅调试）、`准入=guarded，管理员已配置`、`准入=guarded 但未配置管理员 open_id：所有对话都会被拒绝…`（此时按 §3.3 配置管理员即可）。
+> 准入相关控制台输出：`准入=open`（不安全，仅调试）、`准入=guarded，管理员已配置`、`准入=guarded 但未配置管理员 user_id：所有对话都会被拒绝…`（此时按 §3.3 配置管理员即可）。
 
 > 第二行只在宿主挂载了 `approval` 服务时出现；若显示 `主机未挂载 approval 服务，HITL 审批应答关闭`，说明该部署未启用 HITL（`approval/request` 事件永远不会派发），并非插件故障。
 
@@ -250,18 +251,18 @@ DSH_HOME=$DSH_HOME pnpm dsh web        # 默认 http://127.0.0.1:3080
 | 2 | 私聊续聊 | 在刚建的话题里直接再发消息（**不 @**） | 继续同一 session：完成后主卡结算页脚第一行的 session id 不变，input/output token 累计增长 |
 | 3 | 群聊 @ | 在普通群 @ 机器人发消息 | 同 #1；该消息成为新话题根 |
 | 4 | 群聊话题内 | 在上一步的话题里直接发消息（不 @） | 延续该 session，不再要求 @ |
-| 5 | 同群第二个用户 | 换另一个人 @ 机器人 | 新话题 + 新 session；dsh 工作区列表中出现**该用户的独立工作区**（`groups/<chat_id>/<用户 open_id>/`），会话实际工作在它自己的 `topics/<话题>/` 下，与原用户的话题目录互不可见 |
+| 5 | 同群第二个用户 | 换另一个人 @ 机器人 | 新话题 + 新 session；dsh 工作区列表中出现**该用户的独立工作区**（`groups/<chat_id>/<用户 user_id>/`），会话实际工作在它自己的 `topics/<话题>/` 下，与原用户的话题目录互不可见 |
 | 6 | 话题群 | 在话题群某话题中 @ 机器人 | 机器人直接在该话题内回复卡片（不新建话题） |
 | 7 | 折叠面板 | 点面板标题 | 展开推理内容，右侧箭头翻转向上；再点收起 |
 | 8 | 重启恢复 | 重启 dsh 后在旧话题里发消息 | 机器人懒恢复原 session，token 统计继续累计 |
 | 9 | 降级路径 | 在关闭话题功能的群里 @ 机器人 | 正常回复（普通回复气泡），后续 @ 延续同一 session |
 | 10 | HITL 审批 | 让模型执行需要审批的动作（如提示沙箱升级：`bash` 被沙箱拒绝后带 `sandbox_permissions` 重试） | 同一话题内出现独立的「⚠️ 需要你的审批」卡片（✅ 允许 / ❌ 拒绝）；点允许后卡片变「✅ 已允许执行」且动作继续，点拒绝变「❌ 已拒绝」；不点则到时（默认 5 分钟）变「⏱ 已超时未处理，自动拒绝」 |
-| 11 | 管理员初始化（准入） | 未配置 `adminOpenId` 时私聊 `/userid`，把 open_id 填入面板保存 | 未配置时 `/userid` 也只回固定文本、不建会话；保存后面板显示管理员已配置，管理员私聊正常对话 |
+| 11 | 管理员初始化（准入） | 未配置 `adminUserId` 时私聊 `/userid`，把 user_id 填入面板保存 | 未配置时 `/userid` 也只回固定文本、不建会话；保存后面板显示管理员已配置，管理员私聊正常对话 |
 | 12 | 非管理员私聊 | 用另一个飞书账号私聊机器人 | 只收到一条固定提示（“非管理员禁用私聊功能哦…”）；不建话题/会话、不产生模型调用；该账号发 `/userid` 仍可拿到自己的 ID |
 | 13 | 入群通知 | 把机器人拉进一个新群 | 管理员私聊收到群信息卡（群名/`chat_id`/成员数/邀请人），未授权群带「授权本群 / 忽略」按钮；群里没有任何机器人消息 |
 | 14 | 管理员直通（免群授权） | 刚被拉进未授权群时，管理员直接 @ 机器人发消息 | 正常开会话（管理员不受白名单限制）；不授权该群也不影响管理员使用 |
-| 14a | 群授权与群内准入 | 管理员点「授权本群」（或在群内发 `/auth allow`）；未授权用户 @；管理员 `/auth user add <open_id>` 后该用户再 @ | 授权前非管理员 @ 无响应（管理员除外）；授权后白名单用户可分别开会话；未授权用户 @ 不建会话且管理员收到用户授权卡；授权该用户后可正常开会话 |
-| 15 | 撤销与持久化 | `/auth revoke`（群内）/ `/auth user remove <open_id>`；重启 dsh 后再试 | 撤销后对应主体立即无法开启对话；重启后已授权群/用户仍有效（持久化） |
+| 14a | 群授权与群内准入 | 管理员点「授权本群」（或在群内发 `/auth allow`）；未授权用户 @；管理员 `/auth user add <user_id>` 后该用户再 @ | 授权前非管理员 @ 无响应（管理员除外）；授权后白名单用户可分别开会话；未授权用户 @ 不建会话且管理员收到用户授权卡；授权该用户后可正常开会话 |
+| 15 | 撤销与持久化 | `/auth revoke`（群内）/ `/auth user remove <user_id>`；重启 dsh 后再试 | 撤销后对应主体立即无法开启对话；重启后已授权群/用户仍有效（持久化） |
 | 16 | 话题越权防护 | 授权群里用户 A 创建话题后，用户 B 在 A 的话题里发普通消息/附件/回答提问 | B 的消息被静默丢弃，不会进入 A 的 Session、不会写入 A 的话题目录；A 自己发言正常 |
 
 ### 5.0 HITL 审批验证点（重点）
@@ -281,8 +282,8 @@ DSH_HOME=$DSH_HOME pnpm dsh web        # 默认 http://127.0.0.1:3080
 打开 dsh Web GUI → 工作区列表，应看到**每人一个**项目：
 
 ```
-飞书私聊 · ou_xxx          （对应 <baseDir>/p2p/ou_xxx/）
-飞书群聊 · oc_yyy · ou_xxx （对应 <baseDir>/groups/oc_yyy/ou_xxx/）
+飞书私聊 · <user_id>          （对应 <baseDir>/p2p/<user_id>/）
+飞书群聊 · oc_yyy · <user_id> （对应 <baseDir>/groups/oc_yyy/<user_id>/）
 ```
 
 每个新话题在该工作区内创建独立的话题工作目录 `<工作区>/topics/<话题 id>/`，会话列表仍归属该项目；同一话题内 `/renew` 复用同一话题目录。也可在飞书里用 `/workspace` 查看当前会话的实际工作目录。
@@ -339,7 +340,7 @@ DSH_HOME=$DSH_HOME pnpm dsh web        # 默认 http://127.0.0.1:3080
 | 现象 | 排查 |
 |------|------|
 | 私聊无响应 | 用户是否在应用**可用范围**内；权限 `im:message.p2p_msg:readonly` 是否随版本发布；若返回的是“非管理员禁用私聊功能哦”，说明准入生效（把该用户加入白名单或让管理员对话） |
-| 私聊提示“机器人尚未配置管理员” | `accessMode: 'guarded'` 且未配置 `adminOpenId`：按 §3.3 在面板填写管理员 open_id |
+| 私聊提示“机器人尚未配置管理员” | `accessMode: 'guarded'` 且未配置 `adminUserId`：按 §3.3 在面板填写管理员 user_id |
 | 机器人被拉进群但管理员没收到群信息卡 | 是否订阅 **im.chat.member.bot.added_v1** 事件并重新发布版本；群信息读取权限是否已开通（`getChatInfo` 失败只会缺群名，不影响卡片本体） |
 | 群内 @ 机器人无响应（登录台无 access 报错） | 管理员不受白名单限制，可直接对话；**非管理员**需要该群已授权且自己在用户白名单里。可用 `/auth status`（管理员）或 Web 面板「访问授权」标签页确认 |
 | `/auth` 无反应 | `/auth` 仅管理员可用；非管理员在群里会被静默忽略、私聊会收到固定提示 |

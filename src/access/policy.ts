@@ -13,7 +13,7 @@
  *    or any group, regardless of the whitelists;
  *  - private chats: non-administrators are refused;
  *  - group chats: non-administrators need the group to be authorized AND
- *    their open_id to be on the global user whitelist.
+ *    their user_id to be on the global user whitelist.
  *
  * @module dsh-channels/access/policy
  */
@@ -34,7 +34,7 @@ export interface AccessSubject {
 export interface AccessSnapshot {
   /** Authorized group `chat_id`s. */
   groups: ReadonlySet<string>
-  /** Authorized user `open_id`s (global, across authorized groups). */
+  /** Authorized user `user_id`s (global, across authorized groups). */
   users: ReadonlySet<string>
 }
 
@@ -56,16 +56,16 @@ export type AccessDecision =
   }
 
 /** The configuration slice admission reads (allows easy fakes in tests). */
-export type AccessPolicyConfig = Pick<FeishuConfig, 'accessMode' | 'adminOpenId'>
+export type AccessPolicyConfig = Pick<FeishuConfig, 'accessMode' | 'adminUserId'>
 
-/** True when `openId` is exactly the configured administrator. */
-export function isAdminOpenId(
-  config: Pick<FeishuConfig, 'adminOpenId'>,
-  openId: string | undefined,
+/** True when `userId` is exactly the configured administrator. */
+export function isAdminUserId(
+  config: Pick<FeishuConfig, 'adminUserId'>,
+  userId: string | undefined,
 ): boolean {
-  const admin = config.adminOpenId?.trim()
+  const admin = config.adminUserId?.trim()
   if (admin === undefined || admin === '') return false
-  return openId !== undefined && openId.trim() === admin
+  return userId !== undefined && userId.trim() === admin
 }
 
 /**
@@ -81,7 +81,7 @@ export function decideAccess(
 ): AccessDecision {
   if (config.accessMode === 'open') return { kind: 'allow', reason: 'open' }
 
-  const admin = config.adminOpenId?.trim()
+  const admin = config.adminUserId?.trim()
   if (admin === undefined || admin === '') return { kind: 'deny', reason: 'admin-missing' }
 
   // The administrator is never constrained by the whitelists: they may start

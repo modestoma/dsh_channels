@@ -199,9 +199,8 @@ class LarkChannelAdapter implements FeishuChannel {
       appId: options.appId,
       appSecret: options.appSecret,
       loggerLevel: LOGGER_LEVELS[options.loggerLevel],
-      // Keep the raw event body: rich-text messages attach files in a
-      // top-level `files` array the SDK normalizer drops, so the attachment
-      // intake recovers them from `msg.raw` instead.
+      // Keep the raw event body: the sender `user_id` and the top-level
+      // rich-text `files` array are only recoverable from `msg.raw`.
       includeRawEvent: true,
       policy: {
         // The plugin routes mentions itself (thread routing must work without
@@ -224,7 +223,21 @@ class LarkChannelAdapter implements FeishuChannel {
   }
 
   onMessage(handler: (message: NormalizedMessage) => void | Promise<void>): () => void {
-    return this.channel.on('message', handler)
+    return this.channel.on('message', message => {
+      const userId = senderUserIdOf(message.raw)
+      if (userId === undefined) {
+        // Bots and other apps never carry a user_id; neither do external
+        // users or a tenant app without the user ID scope. None of them can
+        // be identified, so none of them may reach admission or routing.
+        console.warn(
+          '[dsh-channels] dropped message %s: sender has no user_id '
+          + '(bot/app sender, external user, or the app lacks contact:user.employee_id:readonly)',
+          message.messageId,
+        )
+        return
+      }
+      return handler({ ...message, senderId: userId })
+    })
   }
 
   onCardAction(handler: (event: CardActionEvent) => void | Promise<void>): () => void {
@@ -286,9 +299,9 @@ class LarkChannelAdapter implements FeishuChannel {
 
   async messageGet(messageId: string): Promise<unknown> {
     const message = this.channel.rawClient.im.v1.message as unknown as {
-      get(input: { path: { message_id: string } }): Promise<unknown>
+      get(input: { path: { message_id: string }; params: { user_id_type: 'user_id' } }): Promise<unknown>
     }
-    return await message.get({ path: { message_id: messageId } })
+    return await message.get({ path: { message_id: messageId }, params: { user_id_type: 'user_id' } })
   }
 
   async messageMget(messageIds: readonly string[]): Promise<unknown> {
@@ -308,7 +321,7 @@ class LarkChannelAdapter implements FeishuChannel {
     }
     return await client.request({
       method: 'GET',
-      url: `/open-apis/im/v1/messages/mget?${query}&card_msg_content_type=raw_card_content`,
+      url: `/open-apis/im/v1/messages/mget?${query}&card_msg_content_type=raw_card_content&user_id_type=user_id`,
     })
   }
 
@@ -387,6 +400,22 @@ export function sniffImageMediaType(data: Uint8Array): 'image/png' | 'image/jpeg
   if (data.length >= 12 && data[8] === 0x57 && data[9] === 0x45 && data[10] === 0x42 && data[11] === 0x50) return 'image/webp'
   if (data.length >= 6 && data[0] === 0x47 && data[1] === 0x49 && data[2] === 0x46) return 'image/gif'
   return undefined
+}
+
+/**
+ * The sender `user_id` of one raw `im.message.receive_v1` event body. The SDK
+ * normalizer fills `senderId` with the open_id; the plugin identifies users by
+ * the tenant-wide `user_id`, which Feishu only sends to tenant-internal apps
+ * granted `contact:user.employee_id:readonly`.
+ *
+ * @param raw - `NormalizedMessage.raw` (requires `includeRawEvent`).
+ * @returns the non-empty `user_id`, or `undefined` when the event has none.
+ */
+export function senderUserIdOf(raw: unknown): string | undefined {
+  if (raw === null || typeof raw !== 'object') return undefined
+  const sender = (raw as { sender?: { sender_id?: { user_id?: unknown } } }).sender
+  const userId = sender?.sender_id?.user_id
+  return typeof userId === 'string' && userId !== '' ? userId : undefined
 }
 
 const LOGGER_LEVELS: Record<ChannelConnectOptions['loggerLevel'], LoggerLevel> = {

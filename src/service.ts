@@ -46,7 +46,7 @@ import type { EffortCommandAction, ParsedSlashCommand } from './commands.ts'
 import { commandSpec } from './commands/registry.ts'
 import type { ChannelCommandSpec } from './commands/registry.ts'
 import type { PermissionPresets, SessionQuery } from './dsh-types.ts'
-import { feishuDomain, sessionDirOf } from './domain.ts'
+import { FEISHU_USER_ID_PATTERN, feishuDomain, sessionDirOf } from './domain.ts'
 import type {
   AccessGroupRecord, AccessRequestRecord, AccessUserRecord,
   ExpiredRouteRecord, FeishuDomainGlobal, FeishuDomainHandle, InflightSnapshot,
@@ -376,7 +376,7 @@ export class FeishuService {
           kind: record.kind,
           chatId: record.chatId,
           chatType: record.chatType,
-          senderOpenId: record.senderOpenId,
+          senderUserId: record.senderUserId,
         }
       },
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
@@ -392,7 +392,7 @@ export class FeishuService {
           kind: record.kind,
           chatId: record.chatId,
           chatType: record.chatType,
-          senderOpenId: record.senderOpenId,
+          senderUserId: record.senderUserId,
         }
       },
       noteKnownMessage: (route, message, source) => {
@@ -515,7 +515,7 @@ export class FeishuService {
       kind: record.kind,
       chatId: record.chatId,
       chatType: record.chatType,
-      senderOpenId: record.senderOpenId,
+      senderUserId: record.senderUserId,
     }, message, source)
   }
 
@@ -531,7 +531,7 @@ export class FeishuService {
       kind: record.kind,
       chatId: record.chatId,
       chatType: record.chatType,
-      senderOpenId: record.senderOpenId,
+      senderUserId: record.senderUserId,
     }
   }
 
@@ -853,14 +853,14 @@ export class FeishuService {
 
   /** Whitelists + pending authorization requests (read-only Web projection). */
   accessSnapshot(): AccessWire {
-    const admin = this.config.adminOpenId
+    const admin = this.config.adminUserId
     return {
       mode: this.config.accessMode,
       // Whitelists live in the storage domain, which is only open while the
       // channel runs; an unconnected panel must not present them as empty.
       loaded: this.domain !== undefined,
       admin: {
-        ...(admin === undefined ? {} : { openId: admin }),
+        ...(admin === undefined ? {} : { userId: admin }),
         configured: admin !== undefined,
       },
       groups: this.accessStore.groupRecords().map(record => ({
@@ -870,7 +870,7 @@ export class FeishuService {
         addedAt: record.addedAt,
       })),
       users: this.accessStore.userRecords().map(record => ({
-        openId: record.openId,
+        userId: record.userId,
         ...(record.name === undefined ? {} : { name: record.name }),
         source: record.source,
         addedAt: record.addedAt,
@@ -887,7 +887,7 @@ export class FeishuService {
         if (name !== undefined) wire.name = name
         if (record.chatId !== undefined) wire.chatId = record.chatId
         if (record.groupName !== undefined) wire.groupName = record.groupName
-        const requester = record.requesterName ?? record.requesterOpenId
+        const requester = record.requesterName ?? record.requesterUserId
         if (requester !== undefined) wire.requester = requester
         return wire
       }),
@@ -898,8 +898,8 @@ export class FeishuService {
   async addAccessGroup(chatId: string, name?: string): Promise<AccessMutationResponse> {
     const id = this.cleanAccessTargetId(chatId)
     if (id === undefined) return { ok: false, error: 'chat_id 不合法（应为 oc_ 开头的群 ID）' }
-    const admin = this.config.adminOpenId
-    if (admin === undefined) return { ok: false, error: '请先在「访问授权」标签页设置管理员 open_id' }
+    const admin = this.config.adminUserId
+    if (admin === undefined) return { ok: false, error: '请先在「访问授权」标签页设置管理员 user_id' }
     try {
       if (!this.accessStore.hasGroup(id)) {
         await this.accessStore.addGroup({
@@ -929,15 +929,15 @@ export class FeishuService {
   }
 
   /** Panel: authorize one user (global across authorized groups). */
-  async addAccessUser(openId: string, name?: string): Promise<AccessMutationResponse> {
-    const id = this.cleanAccessUserId(openId)
-    if (id === undefined) return { ok: false, error: 'open_id 不合法（应以 ou_ 开头）' }
-    const admin = this.config.adminOpenId
-    if (admin === undefined) return { ok: false, error: '请先在「访问授权」标签页设置管理员 open_id' }
+  async addAccessUser(userId: string, name?: string): Promise<AccessMutationResponse> {
+    const id = this.cleanAccessUserId(userId)
+    if (id === undefined) return { ok: false, error: 'user_id 不合法（只能包含字母、数字、_ 和 -，不是 ou_ 开头的 open_id）' }
+    const admin = this.config.adminUserId
+    if (admin === undefined) return { ok: false, error: '请先在「访问授权」标签页设置管理员 user_id' }
     try {
       if (!this.accessStore.hasUser(id)) {
         await this.accessStore.addUser({
-          openId: id,
+          userId: id,
           ...(name === undefined || name.trim() === '' ? {} : { name: name.trim() }),
           source: 'panel',
           addedBy: admin,
@@ -951,9 +951,9 @@ export class FeishuService {
   }
 
   /** Panel: revoke one user. */
-  async removeAccessUser(openId: string): Promise<AccessMutationResponse> {
-    const id = this.cleanAccessUserId(openId)
-    if (id === undefined) return { ok: false, error: 'open_id 不合法' }
+  async removeAccessUser(userId: string): Promise<AccessMutationResponse> {
+    const id = this.cleanAccessUserId(userId)
+    if (id === undefined) return { ok: false, error: 'user_id 不合法' }
     try {
       await this.accessStore.removeUser(id)
       return { ok: true, access: this.accessSnapshot() }
@@ -966,8 +966,8 @@ export class FeishuService {
   async resolveAccessRequest(token: string, decision: 'allow' | 'deny'): Promise<AccessMutationResponse> {
     const requests = this.accessRequests
     if (requests === undefined) return { ok: false, error: '授权服务尚未启动' }
-    const actor = this.config.adminOpenId
-    if (actor === undefined) return { ok: false, error: '请先在「访问授权」标签页配置管理员 open_id' }
+    const actor = this.config.adminUserId
+    if (actor === undefined) return { ok: false, error: '请先在「访问授权」标签页配置管理员 user_id' }
     try {
       const result = await requests.resolve(token, decision, actor)
       if (!result.ok) return { ok: false, error: result.error }
@@ -986,10 +986,10 @@ export class FeishuService {
     return value
   }
 
-  /** Same normalization for user open_ids, which must look like ou_xxx. */
+  /** Same normalization for user ids, which must be Feishu `user_id`s. */
   private cleanAccessUserId(raw: string): string | undefined {
     const value = this.cleanAccessTargetId(raw)
-    if (value === undefined || !/^ou_[A-Za-z0-9_-]+$/u.test(value)) return undefined
+    if (value === undefined || !FEISHU_USER_ID_PATTERN.test(value)) return undefined
     return value
   }
 
@@ -1210,10 +1210,10 @@ export class FeishuService {
     })
     if (this.config.accessMode === 'open') {
       console.warn('[dsh-channels] 准入=open：任何应用可用范围内的用户都可以对话（不安全，仅调试）')
-    } else if (this.config.adminOpenId === undefined) {
+    } else if (this.config.adminUserId === undefined) {
       console.warn(
-        '[dsh-channels] 准入=guarded 但未配置管理员 open_id：所有对话都会被拒绝；'
-        + '私聊机器人发送 /userid 取得 open_id 后填入 Web 设置面板',
+        '[dsh-channels] 准入=guarded 但未配置管理员 user_id：所有对话都会被拒绝；'
+        + '私聊机器人发送 /userid 取得 user_id 后填入 Web 设置面板',
       )
     } else {
       console.info('[dsh-channels] 准入=guarded，管理员已配置')
@@ -1357,7 +1357,7 @@ export class FeishuService {
       return
     }
 
-    if (msg.senderId !== route.senderOpenId) {
+    if (msg.senderId !== route.senderUserId) {
       await this.delivery.commandCard(msg, {
         kind: 'forbidden', command: parsed.name, text: '无权操作此会话。',
       })
@@ -1367,7 +1367,7 @@ export class FeishuService {
     const operation = this.routeOperations.run(route.key, async () => {
       if (!this.started) return
       const current = this.routes.get(route.key) ?? route
-      if (msg.senderId !== current.senderOpenId) {
+      if (msg.senderId !== current.senderUserId) {
         await this.delivery.commandCard(msg, {
           kind: 'forbidden', command: parsed.name, text: '无权操作此会话。',
         })
@@ -1400,12 +1400,12 @@ export class FeishuService {
         const pending = this.accessStore.pendingRequests()
         await this.delivery.standaloneReply(msg, standaloneInfoCard('**🔐 访问授权状态**', [
           `**准入模式**：\`${this.config.accessMode}\``,
-          `**管理员**：${this.config.adminOpenId === undefined ? '未配置' : `\`${this.config.adminOpenId}\``}`,
+          `**管理员**：${this.config.adminUserId === undefined ? '未配置' : `\`${this.config.adminUserId}\``}`,
           ...(msg.chatType === 'group'
             ? [`**本群**：${this.accessStore.hasGroup(msg.chatId) ? '已授权' : '未授权'}（\`${msg.chatId}\`）`]
             : []),
           `**白名单**：群 ${groups.length} 个 · 用户 ${users.length} 个 · 待处理申请 ${pending.length} 个`,
-          '群授权：`/auth allow` 或 `/auth revoke`（在目标群内发）；用户授权：`/auth user add <open_id>`。',
+          '群授权：`/auth allow` 或 `/auth revoke`（在目标群内发）；用户授权：`/auth user add <user_id>`。',
         ]), direct)
         return
       }
@@ -1452,35 +1452,35 @@ export class FeishuService {
       }
       if (action === 'user') {
         const sub = words[1]
-        const openId = words[2]
-        if ((sub !== 'add' && sub !== 'remove') || openId === undefined
-          || !/^ou_[A-Za-z0-9_-]+$/u.test(openId)) {
+        const userId = words[2]
+        if ((sub !== 'add' && sub !== 'remove') || userId === undefined
+          || !FEISHU_USER_ID_PATTERN.test(userId)) {
           await this.delivery.commandCard(msg, {
             kind: 'input-error', command: 'auth',
-            text: '用法：/auth user add <open_id> 或 /auth user remove <open_id>（open_id 以 ou_ 开头，可用 /userid 查看）。',
+            text: '用法：/auth user add <user_id> 或 /auth user remove <user_id>（可用 /userid 查看）。',
           }, direct)
           return
         }
         if (sub === 'add') {
-          if (this.accessStore.hasUser(openId)) {
+          if (this.accessStore.hasUser(userId)) {
             await this.delivery.commandCard(msg, {
-              kind: 'success', command: 'auth', text: `该用户已在白名单中（\`${openId}\`）。`,
+              kind: 'success', command: 'auth', text: `该用户已在白名单中（\`${userId}\`）。`,
             }, direct)
             return
           }
           await this.accessStore.addUser({
-            openId, source: 'command', addedBy: msg.senderId, addedAt: now,
+            userId, source: 'command', addedBy: msg.senderId, addedAt: now,
           })
           await this.delivery.commandCard(msg, {
             kind: 'success', command: 'auth',
-            text: `✅ 已授权用户 \`${openId}\`（在所有已授权群里生效）。`,
+            text: `✅ 已授权用户 \`${userId}\`（在所有已授权群里生效）。`,
           }, direct)
           return
         }
-        const removed = await this.accessStore.removeUser(openId)
+        const removed = await this.accessStore.removeUser(userId)
         await this.delivery.commandCard(msg, {
           kind: removed ? 'success' : 'unavailable', command: 'auth',
-          text: removed ? `已移除用户 \`${openId}\`，立即生效。` : `用户 \`${openId}\` 不在白名单中。`,
+          text: removed ? `已移除用户 \`${userId}\`，立即生效。` : `用户 \`${userId}\` 不在白名单中。`,
         }, direct)
         return
       }
@@ -1493,7 +1493,7 @@ export class FeishuService {
           : groups.slice(0, 30).map(group => `- ${group.name ?? group.chatId} \`${group.chatId}\``)
         const userLines = users.length === 0
           ? ['（暂无）']
-          : users.slice(0, 30).map(user => `- ${user.name ?? user.openId} \`${user.openId}\``)
+          : users.slice(0, 30).map(user => `- ${user.name ?? user.userId} \`${user.userId}\``)
         await this.delivery.standaloneReply(msg, standaloneInfoCard('**🔐 访问授权清单**', [
           `**已授权群（${groups.length}）**`,
           ...groupLines,
@@ -1505,7 +1505,7 @@ export class FeishuService {
       }
       await this.delivery.commandCard(msg, {
         kind: 'input-error', command: 'auth',
-        text: '用法：/auth [status|allow|revoke|list|user add <open_id>|user remove <open_id>]',
+        text: '用法：/auth [status|allow|revoke|list|user add <user_id>|user remove <user_id>]',
       }, direct)
     } catch (error) {
       this.ctx.logger?.warn?.('dsh-channels: /auth failed: %s', String(error))
@@ -2144,7 +2144,7 @@ export class FeishuService {
       chatId: record.chatId,
       cardMessageId: record.cardMessageId,
       inThread: record.kind === 'thread',
-      senderOpenId: record.senderOpenId,
+      senderUserId: record.senderUserId,
     }
   }
 

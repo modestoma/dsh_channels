@@ -12,7 +12,7 @@ function route(partial: Partial<RouteRecord> = {}): RouteRecord {
     sessionId: 'session-current',
     chatId: 'oc_chat',
     chatType: 'group',
-    senderOpenId: 'ou_owner',
+    senderUserId: 'u_owner',
     workspacePath: '/workspace/owner',
     cardMessageId: 'om_card',
     createdAt: 100,
@@ -87,13 +87,13 @@ describe('expired route tombstone', () => {
       key: 'omt_expired',
       chatId: 'oc_chat',
       chatType: 'group',
-      senderOpenId: 'ou_owner',
+      senderUserId: 'u_owner',
       expiredAt: 300,
     })).toEqual({
       key: 'omt_expired',
       chatId: 'oc_chat',
       chatType: 'group',
-      senderOpenId: 'ou_owner',
+      senderUserId: 'u_owner',
       expiredAt: 300,
     })
   })
@@ -103,7 +103,7 @@ describe('expired route tombstone', () => {
       key: 'omt_expired',
       chatId: 'oc_chat',
       chatType: 'group',
-      senderOpenId: 'ou_owner',
+      senderUserId: 'u_owner',
       expiredAt: 300,
       workspacePath: '/workspace/owner',
       lastActivityAt: 250,
@@ -111,7 +111,7 @@ describe('expired route tombstone', () => {
       key: 'omt_expired',
       chatId: 'oc_chat',
       chatType: 'group',
-      senderOpenId: 'ou_owner',
+      senderUserId: 'u_owner',
       expiredAt: 300,
       workspacePath: '/workspace/owner',
       lastActivityAt: 250,
@@ -123,7 +123,7 @@ describe('expired route tombstone', () => {
       key: 'omt_expired',
       chatId: 'oc_chat',
       chatType: 'p2p',
-      senderOpenId: 'ou_owner',
+      senderUserId: 'u_owner',
       expiredAt: 300,
     })
     expect(legacy.workspacePath).toBeUndefined()
@@ -135,7 +135,7 @@ describe('expired route tombstone', () => {
       key: 'omt_expired',
       chatId: 'oc_chat',
       chatType: 'group',
-      senderOpenId: 'ou_owner',
+      senderUserId: 'u_owner',
       expiredAt: 300,
     }
     expect(() => expiredRouteRecordSchema.parse({ ...base, workspacePath: '' })).toThrow()
@@ -148,7 +148,7 @@ describe('expired route tombstone', () => {
       key: 'omt_expired',
       chatId: 'oc_chat',
       chatType: 'group',
-      senderOpenId: 'ou_owner',
+      senderUserId: 'u_owner',
       expiredAt: 300,
       workspacePath: '/workspace/owner',
       sessionDir: '/workspace/owner/topics/omt_expired',

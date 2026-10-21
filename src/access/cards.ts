@@ -25,8 +25,8 @@ export interface GroupInfoCardInput {
   memberCount?: number
   /** Group owner `open_id`, when available. */
   ownerId?: string
-  /** `open_id` of whoever invited/triggered the bot. */
-  inviterOpenId?: string
+  /** `user_id` of whoever invited/triggered the bot. */
+  inviterUserId?: string
   /** Whether the group already passed the first admission gate. */
   authorized: boolean
   /** Opaque request token; only present for a *pending* group request. */
@@ -37,8 +37,8 @@ export interface GroupInfoCardInput {
 
 /** Inputs of the user-authorization request card sent to the administrator. */
 export interface UserRequestCardInput {
-  /** `open_id` of the user asking for access. */
-  openId: string
+  /** `user_id` of the user asking for access. */
+  userId: string
   /** Display name of that user, when known. */
   name?: string
   /** Chat the request originated from. */
@@ -57,7 +57,7 @@ export interface UserRequestCardInput {
 export interface RequestSettledCardInput {
   /** What kind of grant the request was about. */
   kind: 'group' | 'user'
-  /** `chat_id` (group) or `open_id` (user) the request targeted. */
+  /** `chat_id` (group) or `user_id` (user) the request targeted. */
   targetId: string
   /** Human-readable target name, when known. */
   targetName?: string
@@ -121,8 +121,8 @@ export function buildGroupInfoCard(input: GroupInfoCardInput): object {
   if (input.ownerId !== undefined && input.ownerId !== '') {
     elements.push(field('群主', `\`${input.ownerId}\``))
   }
-  if (input.inviterOpenId !== undefined && input.inviterOpenId !== '') {
-    elements.push(field('邀请人', `\`${input.inviterOpenId}\``))
+  if (input.inviterUserId !== undefined && input.inviterUserId !== '') {
+    elements.push(field('邀请人', `\`${input.inviterUserId}\``))
   }
   elements.push(field('加入时间', formatTime(input.now)))
   elements.push(divider())
@@ -140,7 +140,7 @@ export function buildGroupInfoCard(input: GroupInfoCardInput): object {
 
 /**
  * The user-authorization request card: an unauthorized user mentioned the bot
- * inside an authorized group, so the administrator can grant that `open_id`
+ * inside an authorized group, so the administrator can grant that `user_id`
  * from the DM card.
  */
 export function buildUserRequestCard(input: UserRequestCardInput): object {
@@ -148,7 +148,7 @@ export function buildUserRequestCard(input: UserRequestCardInput): object {
   const groupName = input.groupName === undefined ? undefined : clip(input.groupName)
   const elements: object[] = [
     field('用户', display === '' ? '（未知昵称）' : display),
-    field('open_id', `\`${input.openId}\``),
+    field('user_id', `\`${input.userId}\``),
   ]
   if (groupName !== undefined && groupName !== '') {
     const group = input.chatId === undefined ? groupName : `${groupName}（\`${input.chatId}\`）`

@@ -14,7 +14,7 @@ function at(time: number, type: string, data: unknown): SessionEvent {
 function route(partial: Partial<RouteRecord> = {}): RouteRecord {
   return {
     key: 'thread-1', kind: 'thread', sessionId: 'session-current', chatId: 'chat-1', chatType: 'group',
-    senderOpenId: 'ou_owner', workspacePath: '/workspace/alice', cardMessageId: 'message-1',
+    senderUserId: 'u_owner', workspacePath: '/workspace/alice', cardMessageId: 'message-1',
     createdAt: 1_000, lastActivityAt: 1_000, ...partial,
   }
 }

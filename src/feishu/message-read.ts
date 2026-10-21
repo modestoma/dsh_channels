@@ -67,7 +67,7 @@ const MAX_ID_CHARS = 128
 /**
  * The channel-plane identity of the conversation whose history may be read.
  * Structurally satisfied by the durable `RouteRecord` (`key` = thread id or
- * the degraded chat route key, `senderOpenId` = workspace owner).
+ * the degraded chat route key, `senderUserId` = workspace owner).
  */
 export interface MessageReadRoute {
   /** Durable route key (thread id, or the degraded `chat:<chatId>` key). */
@@ -75,7 +75,7 @@ export interface MessageReadRoute {
   readonly kind: 'thread' | 'chat'
   readonly chatId: string
   readonly chatType: 'p2p' | 'group'
-  readonly senderOpenId: string
+  readonly senderUserId: string
 }
 
 /** One downloadable resource discovered on a message (no container id yet). */
@@ -96,7 +96,7 @@ export interface MessageReadKnownMessage {
   readonly messageId: string
   readonly kind: 'message' | 'merge_forward'
   readonly resources: readonly MessageReadResource[]
-  readonly senderOpenId?: string
+  readonly senderUserId?: string
 }
 
 /** One parsed raw `im.v1.message.*` item (see the SDK response types). */
@@ -114,7 +114,7 @@ export interface RawMessageItem {
   readonly upperMessageId?: string
   readonly deleted: boolean
   readonly chatId?: string
-  readonly senderOpenId?: string
+  readonly senderUserId?: string
   readonly senderType?: string
   /** Parsed JSON body (`text`, `image_key`, post rows, ...), when parseable. */
   readonly content?: Record<string, unknown>
@@ -266,7 +266,7 @@ export function parseMessageItem(raw: unknown): RawMessageItem | undefined {
   const sender = asRecord(record.sender)
   const createTime = numberField(record, 'create_time')
   const resources = resourcesOfItem(msgType, content)
-  const senderOpenId = senderOpenIdOf(record, sender)
+  const senderUserId = senderUserIdOf(sender)
   const chatId = stringField(record, 'chat_id')
   const threadId = stringField(record, 'thread_id')
   const parentId = stringField(record, 'parent_id')
@@ -281,7 +281,7 @@ export function parseMessageItem(raw: unknown): RawMessageItem | undefined {
     ...(upperMessageId === undefined ? {} : { upperMessageId }),
     deleted: booleanField(record, 'deleted') === true,
     ...(chatId === undefined ? {} : { chatId }),
-    ...(senderOpenId === undefined ? {} : { senderOpenId }),
+    ...(senderUserId === undefined ? {} : { senderUserId }),
     ...(senderType === undefined ? {} : { senderType }),
     ...(content === undefined ? {} : { content }),
     ...(rawContent === undefined ? {} : { rawContent: boundRawContent(rawContent) }),
@@ -290,17 +290,13 @@ export function parseMessageItem(raw: unknown): RawMessageItem | undefined {
 }
 
 /**
- * Sender open_id lives under `sender.id`; older payloads expose the sender as
- * a plain string. Both shapes are tolerated without inventing extra fields.
+ * Sender `user_id` under `sender.id`. Reads request `user_id_type=user_id`;
+ * an id of any other `id_type` (an app sender, an external user, or an
+ * endpoint that ignores the parameter) is not a user identity and is dropped.
  */
-function senderOpenIdOf(
-  record: Record<string, unknown>,
-  sender: Record<string, unknown> | undefined,
-): string | undefined {
-  const nested = stringField(sender, 'id')
-  if (nested !== undefined) return nested
-  const direct = record.sender
-  return typeof direct === 'string' && direct.length > 0 ? direct : undefined
+function senderUserIdOf(sender: Record<string, unknown> | undefined): string | undefined {
+  if (stringField(sender, 'id_type') !== 'user_id') return undefined
+  return stringField(sender, 'id')
 }
 
 /** Parse a JSON-string body; direct objects are tolerated for stubs. */
@@ -778,14 +774,14 @@ export function knownMessageOfItems(
       messageId: container.messageId,
       kind: 'merge_forward',
       resources: [],
-      ...(container.senderOpenId === undefined ? {} : { senderOpenId: container.senderOpenId }),
+      ...(container.senderUserId === undefined ? {} : { senderUserId: container.senderUserId }),
     }
   }
   return {
     messageId: container.messageId,
     kind: 'message',
     resources: container.resources,
-    ...(container.senderOpenId === undefined ? {} : { senderOpenId: container.senderOpenId }),
+    ...(container.senderUserId === undefined ? {} : { senderUserId: container.senderUserId }),
   }
 }
 
@@ -805,7 +801,7 @@ export function knownMessagesOfHistory(
         messageId: item.messageId,
         kind: 'merge_forward',
         resources: [],
-        ...(item.senderOpenId === undefined ? {} : { senderOpenId: item.senderOpenId }),
+        ...(item.senderUserId === undefined ? {} : { senderUserId: item.senderUserId }),
       })
       continue
     }
@@ -813,7 +809,7 @@ export function knownMessagesOfHistory(
       messageId: item.messageId,
       kind: 'message',
       resources: item.resources,
-      ...(item.senderOpenId === undefined ? {} : { senderOpenId: item.senderOpenId }),
+      ...(item.senderUserId === undefined ? {} : { senderUserId: item.senderUserId }),
     })
   }
   return known

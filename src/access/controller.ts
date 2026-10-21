@@ -23,15 +23,15 @@
 import type { FeishuConfig } from '../config.ts'
 import type { RouteRecord } from '../domain.ts'
 import type { FeishuChannel, NormalizedMessage } from '../feishu-channel.ts'
-import { decideAccess, isAdminOpenId } from './policy.ts'
+import { decideAccess, isAdminUserId } from './policy.ts'
 import type { AccessDecision } from './policy.ts'
 import type { AccessStore, AccessStoreSnapshot } from './store.ts'
 
 /** Fixed private-chat notice for non-administrators (no model call). */
-export const DM_DENY_TEXT = '非管理员禁用私聊功能哦～如需使用，请在管理员授权的群里 @ 我；或联系管理员把你的 open_id 加入白名单。'
+export const DM_DENY_TEXT = '非管理员禁用私聊功能哦～如需使用，请在管理员授权的群里 @ 我；或联系管理员把你的 user_id 加入白名单。'
 
 /** Fixed private-chat notice while no administrator is configured. */
-export const DM_UNCONFIGURED_TEXT = '机器人尚未配置管理员。发送 /userid 可查看你的 open_id，交给部署者配置后即可启用。'
+export const DM_UNCONFIGURED_TEXT = '机器人尚未配置管理员。发送 /userid 可查看你的 user_id，交给部署者配置后即可启用。'
 
 /** Per-sender cooldown for the repeated private-chat notice (10 s). */
 const DM_NOTICE_COOLDOWN_MS = 10_000
@@ -55,7 +55,7 @@ export interface AccessControllerDeps {
 }
 
 export class AccessController {
-  /** sender open_id → last fixed-notice delivery instant (DM spam guard). */
+  /** sender user_id → last fixed-notice delivery instant (DM spam guard). */
   private readonly dmNoticeAt = new Map<string, number>()
 
   constructor(private readonly deps: AccessControllerDeps) {}
@@ -68,9 +68,9 @@ export class AccessController {
     return this.deps.now?.() ?? Date.now()
   }
 
-  /** True when `openId` is exactly the configured administrator. */
-  isAdmin(openId?: string): boolean {
-    return isAdminOpenId(this.config(), openId)
+  /** True when `userId` is exactly the configured administrator. */
+  isAdmin(userId?: string): boolean {
+    return isAdminUserId(this.config(), userId)
   }
 
   /** Current whitelist snapshot used by the pure policy. */
@@ -134,7 +134,7 @@ export class AccessController {
     try {
       if (msg.chatType === 'p2p') {
         // `/userid` is the bootstrap entry for everyone: it only echoes the
-        // sender's own open_id and has no storage/model side effect.
+        // sender's own user_id and has no storage/model side effect.
         if (commandName === 'userid') return true
         if (this.isAdmin(msg.senderId)) return true
         await this.noticeDeniedDm(msg)
@@ -156,7 +156,7 @@ export class AccessController {
    * execution inside someone else's topic.
    */
   ownsRoute(msg: NormalizedMessage, record: RouteRecord): boolean {
-    return record.senderOpenId === msg.senderId && record.chatId === msg.chatId
+    return record.senderUserId === msg.senderId && record.chatId === msg.chatId
   }
 
   /** Drop in-memory notices (shutdown; durable state lives in the store). */
@@ -176,7 +176,7 @@ export class AccessController {
     const last = this.dmNoticeAt.get(msg.senderId)
     if (last !== undefined && now - last < DM_NOTICE_COOLDOWN_MS) return
     this.dmNoticeAt.set(msg.senderId, now)
-    const text = this.config().adminOpenId === undefined ? DM_UNCONFIGURED_TEXT : DM_DENY_TEXT
+    const text = this.config().adminUserId === undefined ? DM_UNCONFIGURED_TEXT : DM_DENY_TEXT
     await this.sendText(msg.chatId, text, msg.messageId)
   }
 
