@@ -14,6 +14,7 @@ const sdk = vi.hoisted(() => {
     addReaction: vi.fn(async () => 'reaction-1'),
     removeReaction: vi.fn(async () => {}),
     rawClient: {
+      application: { v6: { application: { get: vi.fn(async (): Promise<unknown> => ({ code: 0, data: {} })) } } },
       request: vi.fn(async () => ({ data: { items: [] } })),
       im: {
         v1: {
@@ -36,7 +37,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 
 import { Readable } from 'node:stream'
 import {
-  contentRangeTotal, defaultChannelFactory, downloadResourceInRanges, RANGE_DOWNLOAD_CHUNK_BYTES,
+  AppOwnerLookupError, contentRangeTotal, defaultChannelFactory, downloadResourceInRanges, RANGE_DOWNLOAD_CHUNK_BYTES,
 } from '../src/feishu-channel.ts'
 import type { FeishuConnectionStatus, ResourceChunkStream } from '../src/feishu-channel.ts'
 
@@ -65,6 +66,46 @@ const options = {
 describe('LarkChannelAdapter', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+  })
+
+  describe('appOwnerUserId', () => {
+    const get = () => sdk.channel.rawClient.application.v6.application.get
+
+    it('queries the own app with user_id and returns a tenant-member owner', async () => {
+      get().mockResolvedValueOnce({ code: 0, data: { app: { owner: { type: 2, owner_id: ' u_owner ' } } } })
+      await expect(defaultChannelFactory(options).appOwnerUserId?.()).resolves.toBe('u_owner')
+      expect(get()).toHaveBeenCalledWith({
+        path: { app_id: 'cli_test' },
+        params: { lang: 'zh_cn', user_id_type: 'user_id' },
+      })
+    })
+
+    it.each([
+      { app: { owner: { type: 0, owner_id: 'u_feishu' } } },
+      { app: { owner: { type: 2, owner_id: '  ' } } },
+      { app: {} },
+    ])('returns undefined without a tenant-member owner id (%j)', async (data) => {
+      get().mockResolvedValueOnce({ code: 0, data })
+      await expect(defaultChannelFactory(options).appOwnerUserId?.()).resolves.toBeUndefined()
+    })
+
+    it('rejects a non-zero API code with its code and msg', async () => {
+      get().mockResolvedValueOnce({ code: 99991672, msg: 'Access denied' })
+      const error = await defaultChannelFactory(options).appOwnerUserId?.().catch((e: unknown) => e)
+      expect(error).toBeInstanceOf(AppOwnerLookupError)
+      expect(error).toMatchObject({ code: 99991672, detail: 'code=99991672 Access denied' })
+    })
+
+    it('maps a thrown HTTP error body and a bare error', async () => {
+      get().mockRejectedValueOnce(Object.assign(new Error('Request failed with status code 400'), {
+        response: { data: { code: 99991672, msg: 'scope required' } },
+      }))
+      await expect(defaultChannelFactory(options).appOwnerUserId?.())
+        .rejects.toMatchObject({ code: 99991672, detail: 'code=99991672 scope required' })
+      get().mockRejectedValueOnce(new Error('socket hang up'))
+      await expect(defaultChannelFactory(options).appOwnerUserId?.())
+        .rejects.toMatchObject({ detail: 'socket hang up' })
+    })
   })
 
   it.each<FeishuConnectionStatus>([

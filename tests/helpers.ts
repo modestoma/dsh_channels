@@ -757,6 +757,8 @@ export interface FakeChannelOptions {
   connectionStatus?: FeishuConnectionStatus
   /** Chat info returned by the `getChatInfo` stub (defaults to a group shell). */
   chatInfo?: (chatId: string) => ChatInfo | Promise<ChatInfo>
+  /** App-owner lookup stub; omitted = the channel has no owner lookup. */
+  appOwnerUserId?: () => Promise<string | undefined>
 }
 
 /**
@@ -887,6 +889,7 @@ export function makeChannel(options: FakeChannelOptions = {}): FeishuChannel & {
       removedReactions.push({ messageId, reactionId })
     }),
     threadIdOfMessage: options.threadIdOfMessage ?? (async () => `omt_${serial}`),
+    ...(options.appOwnerUserId === undefined ? {} : { appOwnerUserId: options.appOwnerUserId }),
     ...(options.messageGet === undefined
       ? {}
       : { messageGet: async (messageId: string): Promise<unknown> => await options.messageGet?.(messageId) }),
