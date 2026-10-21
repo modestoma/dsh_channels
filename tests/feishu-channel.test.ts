@@ -79,6 +79,14 @@ describe('LarkChannelAdapter', () => {
     expect(sdk.channel.getConnectionStatus).toHaveBeenCalledOnce()
   })
 
+  it('disables SDK debounce merging so a burst never collapses into the last sender', () => {
+    defaultChannelFactory(options)
+
+    expect(sdk.createLarkChannel).toHaveBeenCalledWith(expect.objectContaining({
+      safety: { batch: { text: { delayMs: 0 } } },
+    }))
+  })
+
   it('passes a Buffer-backed file payload to the official SDK', async () => {
     const channel = defaultChannelFactory(options)
     const source = Buffer.from('{"session":"test"}\n')
