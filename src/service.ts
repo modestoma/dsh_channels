@@ -1086,6 +1086,7 @@ export class FeishuService {
       ])
       const result = checkScopes(grants, appId, {
         dmEnabled: this.config.dmMode === 'open',
+        requireMention: this.config.requireMention,
         ownerLookupFailed: this.config.accessMode === 'guarded'
           && this.configuredAdminUserId() === undefined
           && this.appOwner !== undefined && 'error' in this.appOwner && this.appOwner.apiRejected,

@@ -33,6 +33,8 @@ export interface ScopeRequirement {
 export interface ScopeCheckContext {
   /** Direct messages are accepted (`dmMode: 'open'`). */
   readonly dmEnabled: boolean
+  /** Ordinary group messages need an @ mention (`requireMention`). */
+  readonly requireMention: boolean
   /**
    * The app-owner lookup failed while it backs the administrator (guarded
    * mode without `adminUserId`).
@@ -63,14 +65,23 @@ export const SCOPE_GRANTED_STATUS = 1
 /** Messaging scopes that need no runtime context to apply. */
 const BASE_REQUIREMENTS: readonly ScopeRequirement[] = [
   { anyOf: ['im:message', 'im:message:send_as_bot'], level: 'required', purpose: '以机器人身份发送消息、下载消息附件' },
-  { anyOf: ['im:message.group_at_msg:readonly', 'im:message.group_msg'], level: 'required', purpose: '接收群聊中 @ 机器人的消息' },
   { anyOf: ['contact:user.employee_id:readonly'], level: 'required', purpose: '获取用户 user_id；缺失时所有用户消息都会被丢弃' },
   { anyOf: ['im:message:update', 'im:message'], level: 'required', purpose: '流式更新回复卡片' },
   { anyOf: ['im:message.reactions:write_only', 'im:message'], level: 'optional', purpose: '给消息添加/移除处理中表情' },
   { anyOf: ['im:message:readonly', 'im:message'], level: 'optional', purpose: '读取引用消息、话题历史与 feishu_topic_messages' },
-  { anyOf: ['im:message.group_msg'], level: 'optional', purpose: '读取群/话题中未 @ 机器人的历史消息（敏感权限，需管理员审批）' },
   { anyOf: ['im:chat:readonly', 'im:chat'], level: 'optional', purpose: '机器人入群后读取群信息、发送群信息卡' },
 ]
+
+/** Group receive needs while ordinary group messages require an @ mention. */
+const MENTION_GROUP_REQUIREMENTS: readonly ScopeRequirement[] = [
+  { anyOf: ['im:message.group_at_msg:readonly', 'im:message.group_msg'], level: 'required', purpose: '接收群聊中 @ 机器人的消息' },
+  { anyOf: ['im:message.group_msg'], level: 'optional', purpose: '读取群/话题中未 @ 机器人的历史消息（敏感权限，需管理员审批）' },
+]
+
+/** Group receive need while unmentioned group messages are answered (`requireMention: false`). */
+const ALL_GROUP_REQUIREMENT: ScopeRequirement = {
+  anyOf: ['im:message.group_msg'], level: 'required', purpose: '接收群聊中所有消息（requireMention 已关闭；敏感权限，需管理员审批）',
+}
 
 /** Direct-message receive scope, applicable while DMs are accepted. */
 const DM_REQUIREMENT: ScopeRequirement = {
@@ -103,12 +114,13 @@ export function scopeConsoleUrl(appId: string, scopes: readonly string[]): strin
 /**
  * The requirements that apply under `context`, in display order.
  *
- * @param context Runtime facts (DM mode, owner-fallback need).
+ * @param context Runtime facts (DM mode, mention requirement, owner-fallback need).
  * @returns Requirement table for this connection.
  */
 export function scopeRequirements(context: ScopeCheckContext): readonly ScopeRequirement[] {
   return [
     ...(context.dmEnabled ? [DM_REQUIREMENT] : []),
+    ...(context.requireMention ? MENTION_GROUP_REQUIREMENTS : [ALL_GROUP_REQUIREMENT]),
     ...BASE_REQUIREMENTS,
   ]
 }

@@ -21,7 +21,7 @@ const ALL_GRANTED: readonly ScopeGrant[] = [
   'im:chat:readonly',
 ].map(name => ({ name, granted: true, type: 'tenant' as const }))
 
-const NO_OWNER_FALLBACK = { dmEnabled: true, ownerLookupFailed: false }
+const NO_OWNER_FALLBACK = { dmEnabled: true, requireMention: true, ownerLookupFailed: false }
 
 describe('checkScopes', () => {
   it('reports nothing when every applicable need is granted', () => {
@@ -57,9 +57,19 @@ describe('checkScopes', () => {
 
   it('skips the DM scope when DMs are disabled and adds the app-info need when the owner lookup was rejected', () => {
     const grants = ALL_GRANTED.filter(grant => grant.name !== 'im:message.p2p_msg:readonly')
-    expect(scopeRequirements({ dmEnabled: false, ownerLookupFailed: false }).some(item => item.anyOf.includes('im:message.p2p_msg:readonly'))).toBe(false)
-    const result = checkScopes(grants, 'cli_x', { dmEnabled: false, ownerLookupFailed: true })
+    expect(scopeRequirements({ dmEnabled: false, requireMention: true, ownerLookupFailed: false }).some(item => item.anyOf.includes('im:message.p2p_msg:readonly'))).toBe(false)
+    const result = checkScopes(grants, 'cli_x', { dmEnabled: false, requireMention: true, ownerLookupFailed: true })
     expect(result.missing.map(item => item.anyOf[0])).toEqual(['admin:app.info:readonly'])
+  })
+
+  it('requires group_msg when unmentioned group messages are answered', () => {
+    const grants = ALL_GRANTED.filter(grant => grant.name !== 'im:message.group_msg')
+    const noMention = { ...NO_OWNER_FALLBACK, requireMention: false }
+    expect(checkScopes(grants, 'cli_x', noMention).missing.map(item => [item.level, item.anyOf.join('|')]))
+      .toEqual([['required', 'im:message.group_msg']])
+    expect(checkScopes(grants, 'cli_x', NO_OWNER_FALLBACK).missing.map(item => [item.level, item.anyOf.join('|')]))
+      .toEqual([['optional', 'im:message.group_msg']])
+    expect(checkScopes(ALL_GRANTED, 'cli_x', noMention).missing).toEqual([])
   })
 
   it('builds an encoded console URL', () => {
