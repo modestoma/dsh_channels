@@ -53,6 +53,15 @@ export const DEFAULT_ATTACHMENT_FETCH_MAX_BYTES = 100 * 1024 * 1024
 /** Default whole-call timeout of `feishu_attachment_fetch` (120 s). */
 export const DEFAULT_ATTACHMENT_FETCH_TIMEOUT_MS = 120_000
 
+/** Default per-image byte cap for trigger-message prefetch (20 MiB). */
+export const DEFAULT_PREFETCH_IMAGE_MAX_BYTES = 20 * 1024 * 1024
+
+/** Default total byte budget for one trigger-message image prefetch (50 MiB). */
+export const DEFAULT_PREFETCH_TOTAL_MAX_BYTES = 50 * 1024 * 1024
+
+/** Default short timeout for one trigger-message image prefetch (10 s). */
+export const DEFAULT_PREFETCH_TIMEOUT_MS = 10_000
+
 /** A credential reference: `FEISHU_APP_ID`-style name resolved through ctx.credentials. */
 const credentialRefSchema = z.string().regex(
   CREDENTIAL_REF_PATTERN,
@@ -157,12 +166,14 @@ export const configSchema = z.object({
    */
   approvalTimeoutMs: z.number().int().min(10_000).max(3_600_000).default(DEFAULT_APPROVAL_TIMEOUT_MS),
   /**
-   * Accept inbound Feishu images, files, and merged-forward chat records and
-   * save them below `<workspace>/attachments/`. Nothing is forwarded to the
-   * model automatically: the Agent reads whichever attachment the
-   * conversation needs with its ordinary filesystem tools. Disabled keeps
-   * attachment messages inert (no save, no turn, no pending metadata
-   * registration).
+   * Accept inbound Feishu images, files, and merged-forward chat records.
+   *
+   * With the native backend (default) images of the triggering message are
+   * prefetched into the DSH native attachment library and files stay lazy
+   * behind a prompt manifest; with the archive backend the resources are saved
+   * below `<workspace>/attachments/` before the turn, exactly like the legacy
+   * pipeline. Disabled keeps attachment messages inert (no save, no turn, no
+   * pending metadata registration).
    */
   acceptAttachments: z.boolean().default(true),
   /**
@@ -175,11 +186,41 @@ export const configSchema = z.object({
    * - `archive`: legacy behavior — write the resources into the topic
    *   workspace `attachments/` directory through the existing intake.
    *
-   * Callers that consume this switch (admission, fetch tool) are wired by the
-   * later attachment-pipeline tasks; `native_attachment_store` only provides
-   * the storage layer and its tested fallback.
+   * Admission consumes this switch through the backend-selecting inbound
+   * store: an explicit `archive` always uses the legacy download path, and a
+   * `native` deployment without the mounted host service degrades to the same
+   * legacy path (see `effectiveAttachmentMode`).
    */
   attachmentStore: z.enum(ATTACHMENT_STORE_MODES).default('native'),
+  /**
+   * Prefetch images attached to the triggering message into the first model
+   * turn (native attachment backend only). The session, topic, and streaming
+   * card are already visible before the prefetch starts; the turn only waits
+   * for the (short, bounded) image download, never for file bytes. Failed,
+   * oversized, or timed-out images degrade to a manifest row that the model
+   * can fetch with `feishu_attachment_fetch`. Set `false` to keep every
+   * attachment lazy (images then need the tool as well).
+   */
+  prefetchImages: z.boolean().default(true),
+  /**
+   * Largest single image the trigger-message prefetch buffers in memory before
+   * refusing it (default 20 MiB). A refused image stays in the manifest and
+   * is fetched on demand.
+   */
+  prefetchImageMaxBytes: z.number().int().min(1).max(200 * 1024 * 1024)
+    .default(DEFAULT_PREFETCH_IMAGE_MAX_BYTES),
+  /**
+   * Total byte budget of one trigger-message image prefetch (default 50 MiB).
+   * Once exhausted, the remaining images degrade to the manifest.
+   */
+  prefetchTotalMaxBytes: z.number().int().min(1).max(1024 * 1024 * 1024)
+    .default(DEFAULT_PREFETCH_TOTAL_MAX_BYTES),
+  /**
+   * Short whole-prefetch timeout (default 10 s). On expiry the already-loaded
+   * images stay in the prompt and the rest degrade to the manifest, so a slow
+   * image download never blocks the turn for long.
+   */
+  prefetchTimeoutMs: z.number().int().min(100).max(120_000).default(DEFAULT_PREFETCH_TIMEOUT_MS),
   /**
    * Retention of silently registered attachment metadata (the
    * `pending_attachments` table). A message that does not trigger a model turn
@@ -204,7 +245,10 @@ export const configSchema = z.object({
    * - `attachmentFetch` (default on): register `feishu_attachment_fetch` in
    *   channel sessions so the model can fetch images/files of a known message
    *   on demand. Registration is skipped (with one warning) on deployments
-   *   without the host `tools` / `attachments` services.
+   *   without the host `tools` / `attachments` services. Turning it off also
+   *   keeps inbound attachments on the archive backend: lazy native files
+   *   would be unreachable without the tool, so admission downloads them to
+   *   the workspace instead (see `effectiveAttachmentMode`).
    * - `attachmentFetchMaxResources`: maximum attachments one tool call may
    *   fetch (1–50). A message with more attachments is refused with a readable
    *   reason so the model can retry per `file_key`.

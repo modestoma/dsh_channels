@@ -68,6 +68,20 @@ export const FALLBACK_MAX_IMAGE_BYTES = 20 * 1024 * 1024
 
 // ---- Service discovery --------------------------------------------------
 
+/**
+ * Minimal context surface that can resolve the host attachment service.
+ *
+ * Both the plugin's host context and an Agent-scoped context satisfy it: the
+ * direct property is attempted first (it throws in cordis scopes that did not
+ * inject the service) and the safe `get()` lookup resolves host-wide services
+ * (including from the plugin's own context, which is a sibling of the
+ * attachment plugin in the loader composition).
+ */
+export interface AttachmentServiceContext {
+  attachments?: unknown
+  get?(name: string): unknown
+}
+
 /** The host attachment store is mounted and usable. */
 export interface AttachmentServiceMounted {
   readonly mounted: true
@@ -112,16 +126,18 @@ export function attachmentServiceStateOf(service: AttachmentStore | undefined): 
 }
 
 /**
- * Resolve the native attachment service from one Agent scope.
+ * Resolve the native attachment service from one context.
  *
  * Cordis throws when an un-injected service property is read, so both the
  * direct property and the safe `ctx.get` lookup are attempted inside guards:
  * a missing service must read as "not mounted", never as a thrown error.
  */
-export function resolveAttachmentService(ctx: AgentContext | undefined): AttachmentStore | undefined {
+export function resolveAttachmentService(
+  ctx: AttachmentServiceContext | undefined,
+): AttachmentStore | undefined {
   if (ctx === undefined || ctx === null) return undefined
   try {
-    const direct = (ctx as { attachments?: unknown }).attachments
+    const direct = ctx.attachments
     if (isAttachmentStore(direct)) return direct
   } catch {
     // Not injected into this scope: fall through to the safe lookup.
@@ -632,6 +648,36 @@ export function planAttachmentStorage(input: {
   }
 }
 
+/**
+ * Effective backend for new inbound bytes.
+ *
+ * An explicit `archive` configuration always wins (legacy behavior, including
+ * synchronous workspace downloads). A `native` configuration degrades to
+ * `archive` when:
+ *
+ * - the host does not mount the attachment service (headless/older hosts must
+ *   keep the pre-v2 pipeline instead of losing their attachments); or
+ * - the model-facing fetch tool is disabled: files in the native pipeline are
+ *   only obtainable through `feishu_attachment_fetch`, so a manifest without
+ *   that tool would promise an operation the model cannot perform. Falling
+ *   back keeps their bytes readable from the workspace archive instead.
+ *
+ * With `acceptAttachments: false` the backend is `archive` too: the legacy
+ * disabled path is the known-inert behavior (no downloads, no turn for
+ * attachment-only messages), and the archive guidance never advertises a tool
+ * that is not mounted.
+ */
+export function effectiveAttachmentMode(
+  configured: AttachmentStoreMode,
+  service: AttachmentStore | undefined,
+  attachmentFetchToolEnabled = true,
+  attachmentsEnabled = true,
+): AttachmentStoreMode {
+  if (configured === 'archive' || service === undefined) return 'archive'
+  if (!attachmentsEnabled || !attachmentFetchToolEnabled) return 'archive'
+  return 'native'
+}
+
 /** One image stored natively for an inbound message. */
 export interface StoredNativeImage {
   readonly kind: 'image'
@@ -710,6 +756,14 @@ export class InboundAttachmentStore {
   /**
    * Store every image/file resource (and, for forwarded records, the legacy
    * text archive) of one inbound message.
+   *
+   * The v2 native admission pipeline does NOT call this for triggering
+   * messages: it prefetches images and leaves files lazy behind the prompt
+   * manifest. This facade is used by the `archive` / missing-host fallback
+   * (synchronous workspace download) and by the storage-layer tests. Its
+   * `forwarded-record` text fallback therefore only runs for archive
+   * deployments; reading merged-forward transcripts in native deployments is
+   * owned by `quote_history_tools`.
    *
    * @returns `undefined` when the message carries no attachment payload;
    *   otherwise a structured result whose `text` is the remaining prompt.

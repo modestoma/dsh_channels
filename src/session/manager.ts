@@ -29,6 +29,7 @@ import { appendSessionHistory, sessionDirOf } from '../domain.ts'
 import type { RouteRecord } from '../domain.ts'
 import { mountChannelGuidance } from '../feishu/agent-context.ts'
 import { attachmentsDir } from '../feishu/inbound-attachments.ts'
+import { effectiveAttachmentMode, resolveAttachmentService } from '../feishu/native-attachments.ts'
 import { installRequestPolicy } from './request-policy.ts'
 import type { RequestPolicyController } from './request-policy.ts'
 import { placementServices, restoreTopicDir } from './isolation.ts'
@@ -142,15 +143,31 @@ export class SessionManager {
   }
 
   /**
-   * Register the attachment-directory guidance for one Session. Called after
-   * the effective working directory is known (a worktree checkout path is
-   * only returned once the worktree exists), so the prompt section can name
-   * the absolute directory. Best-effort: a missing system-prompt service
-   * (headless) is a no-op and a late registration never blocks the turn.
+   * Register the attachment guidance for one Session. Called after the
+   * effective working directory is known (a worktree checkout path is only
+   * returned once the worktree exists), so the archive guidance can name the
+   * absolute directory. The guidance flavor follows the *effective* attachment
+   * backend: an explicitly configured archive deployment, or a native
+   * deployment whose host does not mount `ctx.attachments`, keeps the legacy
+   * workspace-directory instructions. Best-effort: a missing system-prompt
+   * service (headless) is a no-op and a late registration never blocks the turn.
    */
   async mountGuidance(agent: Agent, directory: string): Promise<void> {
+    // With inbound attachments disabled the Agent has no attachment workflow to
+    // discover (and the legacy guidance would wrongly claim files are archived).
+    if (!this.deps.config.acceptAttachments) return
+    const mode = effectiveAttachmentMode(
+      this.deps.config.attachmentStore,
+      resolveAttachmentService(this.deps.ctx),
+      this.deps.config.feishuTools.attachmentFetch,
+      this.deps.config.acceptAttachments,
+    )
     try {
-      await mountChannelGuidance(agent.ctx, attachmentsDir(directory))
+      await mountChannelGuidance(
+        agent.ctx,
+        mode,
+        mode === 'archive' ? attachmentsDir(directory) : undefined,
+      )
     } catch (error) {
       this.deps.warn(
         'dsh-channels: mounting attachment guidance for session %s failed: %s',

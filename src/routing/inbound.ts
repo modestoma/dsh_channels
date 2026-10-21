@@ -10,19 +10,30 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import type { AgentHandle, HostContext, SessionId, UserMessage, Workspace } from '../dsh-types.ts'
-import type { FeishuConfig } from '../config.ts'
+import type {
+  AgentHandle, AttachmentStore, ContentBlock, HostContext, SessionId, UserMessage, Workspace,
+} from '../dsh-types.ts'
+import type { AttachmentStoreMode, FeishuConfig } from '../config.ts'
 import { buildCard, buildOnboardingCard, initialStreamingCard } from '../cards.ts'
 import { RouteOperationQueue } from '../commands.ts'
 import { chatRouteKey, sessionDirOf } from '../domain.ts'
-import type { FeishuDomainHandle, RouteRecord } from '../domain.ts'
+import type { FeishuDomainHandle, PendingAttachmentRecord, RouteRecord } from '../domain.ts'
 import type { CardDelivery } from '../feishu/delivery.ts'
 import {
-  adoptStagedAttachments, attachmentsDir, hasAttachmentPayload,
+  adoptStagedAttachments, attachmentsDir, attachmentResources, hasAttachmentPayload,
+  inboundAttachmentState, prefetchImageAttachments,
 } from '../feishu/inbound-attachments.ts'
-import { AttachmentIntake } from '../feishu/inbound-attachments.ts'
-import type { AttachmentArchiveResult, AttachmentFailure } from '../feishu/inbound-attachments.ts'
-import type { NormalizedMessage } from '../feishu-channel.ts'
+import type {
+  AttachmentFailure, InboundAttachmentState,
+} from '../feishu/inbound-attachments.ts'
+import { buildFeishuContextBlock, triggerManifestAttachments } from '../feishu/manifest.ts'
+import {
+  InboundAttachmentStore, NativeAttachmentStore, effectiveAttachmentMode,
+} from '../feishu/native-attachments.ts'
+import type { InboundAttachmentStoreResult } from '../feishu/native-attachments.ts'
+import type { PendingAttachmentScope, PendingAttachmentStore } from '../feishu/pending-attachments.ts'
+import type { KnownAttachmentMessageInput } from '../feishu/tools.ts'
+import type { FeishuChannel, NormalizedMessage } from '../feishu-channel.ts'
 import type { QuestionAnswerer } from '../interactions/questions.ts'
 import type { InflightRepair } from '../session/repair.ts'
 import type { SessionManager } from '../session/manager.ts'
@@ -55,6 +66,14 @@ export interface InboundAccessPort {
   ownsRoute(msg: NormalizedMessage, record: RouteRecord): boolean
 }
 
+/** Live trigger-image prefetch policy (see `prefetchImages` config). */
+export interface AttachmentPrefetchPolicy {
+  readonly enabled: boolean
+  readonly maxImageBytes: number
+  readonly maxTotalBytes: number
+  readonly timeoutMs: number
+}
+
 export interface InboundDeps {
   ctx: HostContext
   config: FeishuConfig
@@ -64,7 +83,18 @@ export interface InboundDeps {
   repair: InflightRepair
   delivery: CardDelivery
   sessions: SessionManager
-  attachments: AttachmentIntake
+  /** Configured inbound attachment backend (`attachmentStore`). */
+  attachmentMode(): AttachmentStoreMode
+  /** Host-level native attachment library; undefined = not mounted. */
+  nativeAttachments(): AttachmentStore | undefined
+  /** Backend-selecting archive/fallback store (legacy workspace download). */
+  attachmentStore: InboundAttachmentStore
+  /** Durable metadata registry for silently registered attachments. */
+  pendingAttachments: PendingAttachmentStore
+  /** Pre-authorize the triggering message for `feishu_attachment_fetch`. */
+  noteKnownAttachments(record: RouteRecord, message: KnownAttachmentMessageInput): void
+  /** Live image-prefetch policy for triggering messages. */
+  prefetchImages(): AttachmentPrefetchPolicy
   /** Channel-plane access control (administrator + whitelist gates). */
   access: InboundAccessPort
   /** Shared per-route FIFO admission (commands and turns must not interleave). */
@@ -98,6 +128,31 @@ export function feishuUserMessage(text: string): UserMessage {
   } as unknown as UserMessage
 }
 
+/**
+ * Whitelist registration input for one triggering message.
+ *
+ * The fetch tool requires explicit per-route authorization; the trigger
+ * message is the one exception the admission layer can vouch for. Resources
+ * are copied from the same normalization the manifest uses, and merged-forward
+ * containers carry no direct resources (the tool expands them through the
+ * container id, per the P0 rule).
+ */
+export function knownAttachmentMessageOf(msg: NormalizedMessage): KnownAttachmentMessageInput {
+  const forwarded = msg.rawContentType === 'merge_forward'
+  const resources = attachmentResources(msg).map(resource => ({
+    type: resource.type,
+    fileKey: resource.fileKey,
+    ...(resource.fileName === undefined ? {} : { fileName: resource.fileName }),
+    ...(resource.folder === true ? { folder: true } : {}),
+  }))
+  return {
+    messageId: msg.messageId,
+    kind: forwarded ? 'merge_forward' : 'message',
+    resources,
+    senderOpenId: msg.senderId,
+  }
+}
+
 export class InboundRouter {
   /**
    * In-process dedup guard: message id → accept timestamp. Set synchronously
@@ -114,6 +169,13 @@ export class InboundRouter {
    * overwrites, or the "no route, no mention" drop window.
    */
   private readonly establishing = new Map<string, Promise<RouteRecord>>()
+  /**
+   * route key → first-turn delivery gate. A new Session persists its route
+   * before the prompt is assembled (image prefetch); a message that observes
+   * the route in that window must wait for the first followup instead of
+   * racing it, otherwise the topic's turns reach the model out of order.
+   */
+  private readonly firstDeliveries = new Map<string, { promise: Promise<void>; release(): void }>()
 
   constructor(private readonly deps: InboundDeps) {}
 
@@ -124,7 +186,8 @@ export class InboundRouter {
   private get repair(): InflightRepair { return this.deps.repair }
   private get delivery(): CardDelivery { return this.deps.delivery }
   private get sessions(): SessionManager { return this.deps.sessions }
-  private get attachments(): AttachmentIntake { return this.deps.attachments }
+  private get attachmentStore(): InboundAttachmentStore { return this.deps.attachmentStore }
+  private get pendingAttachments(): PendingAttachmentStore { return this.deps.pendingAttachments }
   private get routeOperations(): RouteOperationQueue { return this.deps.queue }
   private get streamer(): TurnStreamer | undefined { return this.deps.streamer() }
   private get questionAnswerer(): QuestionAnswerer | undefined { return this.deps.questionAnswerer() }
@@ -136,6 +199,28 @@ export class InboundRouter {
     for (const [messageId, acceptedAt] of this.accepted) {
       if (acceptedAt < cutoff) this.accepted.delete(messageId)
     }
+  }
+
+  /**
+   * Open the first-turn delivery gate of one route. Registered BEFORE the
+   * route record is persisted, so any message that can observe the route also
+   * observes its gate. The returned closer must be called exactly once.
+   */
+  private openDeliveryGate(key: string): () => void {
+    let settle!: () => void
+    const promise = new Promise<void>((resolve) => { settle = resolve })
+    const release = (): void => {
+      if (this.firstDeliveries.get(key)?.promise === promise) this.firstDeliveries.delete(key)
+      settle()
+    }
+    this.firstDeliveries.set(key, { promise, release })
+    return release
+  }
+
+  /** Wait for the in-flight first followup of a route, when one is pending. */
+  private async awaitFirstDelivery(key: string): Promise<void> {
+    const pending = this.firstDeliveries.get(key)
+    if (pending !== undefined) await pending.promise.catch(() => undefined)
   }
 
 /**
@@ -163,6 +248,10 @@ export class InboundRouter {
   clear(): void {
     this.accepted.clear()
     this.establishing.clear()
+    // Resolve pending gates before dropping them so a message waiting on a
+    // first-turn delivery never stays suspended across a teardown.
+    for (const entry of [...this.firstDeliveries.values()]) entry.release()
+    this.firstDeliveries.clear()
   }
 
   /** Entry point: one normalized inbound message. */
@@ -223,22 +312,45 @@ export class InboundRouter {
       return
     }
 
-    // Attachments are archived before session work: an attachment-only message
-    // produces no model turn, and a caption mixed with attachments keeps only
-    // the caption as the prompt. The Agent reads the files on demand later.
-    const archived = await this.archiveAttachments(msg)
-    if (archived !== undefined) {
-      if (archived.failures.length > 0) {
-        await this.delivery.noticeText(msg, buildAttachmentFailureNotice(archived.failures))
+    // Attachment admission. The effective backend selects between the legacy
+    // synchronous workspace download (`attachmentStore: 'archive'`, or a
+    // native deployment whose host does not mount the attachment service) and
+    // the v2 lazy pipeline: no attachment bytes are downloaded before the
+    // session/card exists, and files are never downloaded by admission at all.
+    if (this.attachmentBackend() === 'archive') {
+      // Attachments are archived before session work: an attachment-only
+      // message produces no model turn, and a caption mixed with attachments
+      // keeps only the caption as the prompt. The Agent reads the files on
+      // demand later.
+      const archived = await this.archiveAttachments(msg)
+      if (archived !== undefined) {
+        if (archived.failures.length > 0) {
+          await this.delivery.noticeText(msg, buildAttachmentFailureNotice(archived.failures))
+        }
+        if (archived.attachmentOnly) return
+        content = archived.text
+        if (content === '') return
       }
-      if (archived.attachmentOnly) return
-      content = archived.text
-      if (content === '') return
+    } else {
+      // Native pipeline: classify without downloading. Attachment-only
+      // messages and messages that cannot start a turn are silently registered
+      // (no reply, no reaction, no Session); a mixed caption becomes the prompt
+      // with its placeholders stripped.
+      const state = inboundAttachmentState(msg)
+      if (state.hasPayload) {
+        const resolution = await this.resolveNativeAttachmentMessage(msg, state)
+        if (resolution.kind === 'silent') return
+        content = resolution.text
+        if (content === '') return
+      }
     }
 
     // A session blocked on `ask_user_question` has no other use for an inbound
     // text message: the next reply becomes the free-text answer.
-    if (await this.tryAnswerPendingQuestion(msg, content)) return
+    if (await this.tryAnswerPendingQuestion(msg, content)) {
+      await this.registerConsumedTriggerAttachments(msg)
+      return
+    }
 
     // 1. Real topic route first (works without a mention, per product spec).
     if (msg.threadId !== undefined) {
@@ -247,6 +359,9 @@ export class InboundRouter {
         // Only the topic creator may continue its Session (admission already
         // passed, but another authorized user could be in the same group).
         if (!this.access.ownsRoute(msg, record)) return
+        // The route may be durable while its first turn is still being
+        // prepared (prefetch): stay behind that turn instead of racing it.
+        await this.awaitFirstDelivery(record.key)
         await this.routeOperations.run(record.key, () => {
           if (!this.started) return
           return this.continueSession(msg, this.routes.get(record.key) ?? record, content)
@@ -260,6 +375,7 @@ export class InboundRouter {
     const chatRecord = this.routes.get(chatKey)
     if (chatRecord !== undefined) {
       if (!this.access.ownsRoute(msg, chatRecord)) return
+      await this.awaitFirstDelivery(chatRecord.key)
       await this.routeOperations.run(chatRecord.key, () => {
         if (!this.started) return
         return this.continueSession(msg, this.routes.get(chatRecord.key) ?? chatRecord, content)
@@ -292,14 +408,17 @@ export class InboundRouter {
   }
 
   /**
-   * Archive the attachment payload of one message, if any. Returns `undefined`
-   * when the message carries no archivable payload; otherwise the archive
-   * result whose `text` is the remaining prompt (possibly empty).
+   * Legacy archive path: download every resource of one message into the
+   * conversation workspace (or its pre-topic staging directory). Returns
+   * `undefined` when the message carries no archivable payload; otherwise the
+   * storage result whose `text` is the remaining prompt (possibly empty).
    *
    * Runs inside the same per-route FIFO as turns so a caption sent right after
-   * a file is queued behind the file's download instead of racing it.
+   * a file is queued behind the file's download instead of racing it. Only the
+   * `archive` effective backend calls this; the native pipeline never downloads
+   * files during admission.
    */
-  private async archiveAttachments(msg: NormalizedMessage): Promise<AttachmentArchiveResult | undefined> {
+  private async archiveAttachments(msg: NormalizedMessage): Promise<InboundAttachmentStoreResult | undefined> {
     if (!hasAttachmentPayload(msg)) return undefined
 
     const threadRecord = msg.threadId === undefined ? undefined : this.routes.get(msg.threadId)
@@ -312,20 +431,242 @@ export class InboundRouter {
     // already owns does not.
     if (record === undefined && msg.chatType === 'group'
       && this.config.requireMention && !msg.mentionedBot) {
-      return { saved: 0, failed: 0, failures: [], attachmentOnly: true, text: '' }
+      return {
+        mode: 'archive', saved: 0, failed: 0, failures: [], stored: [], attachmentOnly: true, text: '',
+      }
     }
 
     return await this.routeOperations.run(record?.key ?? chatKey, async () => {
-      if (!this.started) return { saved: 0, failed: 0, failures: [], attachmentOnly: true, text: '' }
+      if (!this.started) {
+        return {
+          mode: 'archive', saved: 0, failed: 0, failures: [], stored: [], attachmentOnly: true, text: '',
+        } satisfies InboundAttachmentStoreResult
+      }
       // An existing topic already has its own working directory; a
       // conversation without one stages files below baseDir until its first
       // Session creates the topic directory and adopts them.
       const directory = record === undefined
         ? stagingPathFor(this.config.baseDir, msg.chatType, msg.chatId, msg.senderId)
         : attachmentsDir(sessionDirOf(record))
-      return await this.attachments.archive(msg, directory)
+      return await this.attachmentStore.store(msg, directory)
     })
   }
+
+  /**
+   * Effective inbound attachment backend for the live deployment.
+   *
+   * The lazy native pipeline can only deliver files through
+   * `feishu_attachment_fetch`; with that tool disabled (or without the host
+   * attachment library) the deployment falls back to the legacy archive
+   * backend, where the Agent reads the downloaded workspace copies instead of
+   * a manifest that would name an unavailable tool.
+   */
+  private attachmentBackend(): AttachmentStoreMode {
+    return effectiveAttachmentMode(
+      this.deps.attachmentMode(),
+      this.deps.nativeAttachments(),
+      this.config.feishuTools.attachmentFetch,
+      this.config.acceptAttachments,
+    )
+  }
+
+  /**
+   * Native-pipeline attachment decision for one message, without downloading.
+   *
+   * Returns `{ kind: 'silent' }` when the message must stay inert (metadata
+   * registration only: no reply, no reaction, no Session, no download) and
+   * `{ kind: 'prompt', text }` when a model turn starts with this text. The
+   * caller keeps the message flowing through the normal route decision tree.
+   */
+  private async resolveNativeAttachmentMessage(
+    msg: NormalizedMessage,
+    state: InboundAttachmentState,
+  ): Promise<{ kind: 'silent' } | { kind: 'prompt'; text: string }> {
+    // A foreign sender's attachment never registers (and is dropped later by
+    // the route-ownership checks): silent metadata must stay per-sender.
+    const threadRecord = msg.threadId === undefined ? undefined : this.routes.get(msg.threadId)
+    const chatKey = chatRouteKey(msg.chatType, msg.chatId, msg.senderId)
+    const chatRecord = threadRecord === undefined ? this.routes.get(chatKey) : undefined
+    const foreign = (threadRecord !== undefined && !this.access.ownsRoute(msg, threadRecord))
+      || (chatRecord !== undefined && !this.access.ownsRoute(msg, chatRecord))
+    if (foreign) return { kind: 'prompt', text: state.text }
+
+    if (!this.config.acceptAttachments && state.attachmentOnly) return { kind: 'silent' }
+    if (state.attachmentOnly) {
+      await this.registerSilentAttachment(msg)
+      return { kind: 'silent' }
+    }
+    if (!this.config.acceptAttachments) return { kind: 'prompt', text: state.text }
+
+    // Group messages without an @-mention (and without an already-bound topic)
+    // never start a turn, but their attachments must remain discoverable from
+    // the topic a later @-mentioned message creates (Roadmap AC-4).
+    const pendingEstablishment = this.establishing.get(chatKey)
+    const requiresMention = msg.chatType === 'group' && this.config.requireMention && !msg.mentionedBot
+    const triggers = threadRecord !== undefined || chatRecord !== undefined
+      || pendingEstablishment !== undefined || !requiresMention
+    if (!triggers) {
+      await this.registerSilentAttachment(msg)
+      return { kind: 'silent' }
+    }
+    return { kind: 'prompt', text: state.text }
+  }
+
+  /**
+   * Record attachment metadata without any side effect beyond the durable
+   * registry write. Never replies, reacts, downloads, or establishes a Session.
+   */
+  private async registerSilentAttachment(msg: NormalizedMessage): Promise<void> {
+    if (!this.config.acceptAttachments) return
+    // `admitted: true` is safe because every call site runs after
+    // `access.admit` returned true; the registry itself has no admission policy.
+    try {
+      await this.pendingAttachments.registerMessage(msg, { admitted: true })
+    } catch (error) {
+      // Metadata only: a registry failure must never fail the inbound pipeline.
+      this.ctx.logger?.warn?.(
+        'dsh-channels: registering pending attachment metadata for %s failed: %s',
+        msg.messageId, String(error),
+      )
+    }
+  }
+
+  /**
+   * A native-pipeline message whose caption was consumed as a structured
+   * question answer starts no model turn, so its attachments would otherwise
+   * vanish from the conversation. Register them silently for later turns;
+   * the archive backend already downloaded them before question interception.
+   */
+  private async registerConsumedTriggerAttachments(msg: NormalizedMessage): Promise<void> {
+    if (this.attachmentBackend() !== 'native') return
+    if (!inboundAttachmentState(msg).hasPayload) return
+    await this.registerSilentAttachment(msg)
+  }
+  /**
+   * Build the first-turn user message for the native pipeline: the caption
+   * text, the prefetched trigger images, and the `<feishu_context>` manifest
+   * block listing every attachment still unloaded. The manifest is omitted
+   * entirely (no token cost) when nothing is unloaded.
+   *
+   * Runs after the session/card/route exist and before `followup`; only the
+   * triggering message's images are prefetched (bounded and short-timeout),
+   * files never are.
+   */
+  private async nativeTurnMessage(
+    msg: NormalizedMessage,
+    record: RouteRecord,
+    content: string,
+  ): Promise<UserMessage> {
+    const message = feishuUserMessage(content)
+    const blocks: ContentBlock[] = content === '' ? [] : [{ type: 'text', text: content }]
+    const state = inboundAttachmentState(msg)
+    const attachmentPipeline = this.config.acceptAttachments
+
+    // Authorize the trigger message before any prefetch attempt so the model
+    // can fetch whatever the prefetch could not load.
+    if (state.hasPayload && attachmentPipeline) {
+      try {
+        this.deps.noteKnownAttachments(record, knownAttachmentMessageOf(msg))
+      } catch (error) {
+        this.ctx.logger?.warn?.(
+          'dsh-channels: authorizing trigger attachments of %s failed: %s',
+          msg.messageId, String(error),
+        )
+      }
+    }
+
+    const loadedFileKeys = new Set<string>()
+    const policy = this.deps.prefetchImages()
+    const images = state.resources.filter(resource => resource.type === 'image')
+    if (state.hasPayload && attachmentPipeline && policy.enabled && images.length > 0) {
+      const prefetched = await prefetchImageAttachments({
+        msg,
+        resources: images,
+        channel: this.liveChannel(),
+        maxImageBytes: policy.maxImageBytes,
+        maxTotalBytes: policy.maxTotalBytes,
+        timeoutMs: policy.timeoutMs,
+        saveImage: async (bytes, name) => {
+          const store = new NativeAttachmentStore({ service: () => this.deps.nativeAttachments() })
+          const saved = await store.saveImage({ bytes, ...(name === undefined ? {} : { name }) })
+          return saved.ok
+            ? { ok: true, block: saved.value.block }
+            : { ok: false, reason: saved.reason }
+        },
+        warn: (warning, ...args) => this.ctx.logger?.warn?.(warning, ...args),
+      })
+      // Spread each block into a plain object literal: the host `ContentBlock`
+      // union carries an index signature that the named `ImageBlock` interface
+      // does not declare, and the clone is structurally identical.
+      blocks.push(...prefetched.blocks.map(block => ({ ...block })))
+      for (const fileKey of prefetched.loadedFileKeys) loadedFileKeys.add(fileKey)
+    }
+
+    let pending: readonly PendingAttachmentRecord[] = []
+    if (attachmentPipeline) {
+      try {
+        pending = this.pendingAttachments.list(this.pendingScopeOfRecord(record))
+      } catch (error) {
+        this.ctx.logger?.warn?.(
+          'dsh-channels: listing pending attachments for %s failed: %s',
+          record.key, String(error),
+        )
+      }
+    }
+    const manifest = attachmentPipeline
+      ? buildFeishuContextBlock({
+        trigger: triggerManifestAttachments(msg, loadedFileKeys),
+        pending,
+      })
+      : ''
+    if (manifest !== '') blocks.push({ type: 'text', text: manifest })
+    // A trigger always carries caption text, but keep the message well-formed
+    // if a future call path ever reaches here with nothing to say.
+    if (blocks.length === 0) blocks.push({ type: 'text', text: '' })
+    message.content = blocks
+    return message
+  }
+
+  /**
+   * First-turn delivery: the lazy native pipeline assembles blocks + manifest,
+   * every other deployment keeps the legacy single text block. A failure in
+   * prompt assembly degrades to the plain text prompt (the turn must run).
+   */
+  private async deliverTurnMessage(
+    msg: NormalizedMessage,
+    record: RouteRecord,
+    content: string,
+  ): Promise<UserMessage> {
+    if (this.attachmentBackend() !== 'native') return feishuUserMessage(content)
+    try {
+      return await this.nativeTurnMessage(msg, record, content)
+    } catch (error) {
+      this.ctx.logger?.warn?.(
+        'dsh-channels: assembling the attachment manifest for %s failed: %s',
+        msg.messageId, String(error),
+      )
+      return feishuUserMessage(content)
+    }
+  }
+
+  /** Pending-registry isolation scope for one persisted route. */
+  private pendingScopeOfRecord(record: RouteRecord): PendingAttachmentScope {
+    return {
+      chatId: record.chatId,
+      senderOpenId: record.senderOpenId,
+      ...(record.kind === 'thread' ? { threadId: record.key } : {}),
+    }
+  }
+
+  /** Live channel accessor for best-effort prefetch; undefined when gone. */
+  private liveChannel(): FeishuChannel | undefined {
+    try {
+      return this.delivery.requireChannel()
+    } catch {
+      return undefined
+    }
+  }
+
   /**
    * Consume one plain reply as an `ask_user_question` free-text answer.
    *
@@ -503,11 +844,23 @@ export class InboundRouter {
       lastActivityAt: createdAt,
       sessionHistory: [{ sessionId, createdAt }],
     }
-    await this.routes.put(key, record)
+    // The delivery gate is opened BEFORE the route becomes durable: a message
+    // that can see the route must also wait for this Session's first followup
+    // (the image prefetch below keeps the route-to-followup window open).
+    const closeDeliveryGate = this.openDeliveryGate(key)
+    try {
+      await this.routes.put(key, record)
 
-    // 6. Stream into the card and hand the message to the driver.
-    this.streamer?.attach(handle.agent.session, sent.messageId, msg.messageId, typingId)
-    handle.agent.followup(feishuUserMessage(content))
+      // 6. Stream into the card and hand the message to the driver. The prompt
+      //    is assembled only now (after the route is durable and tools are
+      //    mounted): images may be prefetched, files stay lazy behind the
+      //    manifest. `routes.put` and `followup` stay synchronous with respect
+      //    to other turns because later messages wait on the delivery gate.
+      this.streamer?.attach(handle.agent.session, sent.messageId, msg.messageId, typingId)
+      handle.agent.followup(await this.deliverTurnMessage(msg, record, content))
+    } finally {
+      closeDeliveryGate()
+    }
     return record
   }
   private async continueSession(msg: NormalizedMessage, record: RouteRecord, content: string): Promise<void> {
@@ -564,6 +917,6 @@ export class InboundRouter {
       lastActivityAt: Date.now(),
     })
     this.streamer?.attach(live.agent.session, sent.messageId, msg.messageId, typingId)
-    live.agent.followup(feishuUserMessage(content))
+    live.agent.followup(await this.deliverTurnMessage(msg, current, content))
   }
 }

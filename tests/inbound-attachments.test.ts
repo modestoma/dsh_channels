@@ -200,16 +200,37 @@ describe('attachment intake', () => {
 })
 
 describe('agent guidance', () => {
-  it('points the Agent at its conversation attachment directory', () => {
-    expect(attachmentsGuidance()).toContain('own `attachments/` directory')
-    const withPath = attachmentsGuidance('/tmp/feishu-ws/topic-1/attachments')
+  it('points the archive Agent at its conversation attachment directory', () => {
+    expect(attachmentsGuidance('archive')).toContain('own `attachments/` directory')
+    const withPath = attachmentsGuidance('archive', '/tmp/feishu-ws/topic-1/attachments')
     expect(withPath).toContain('/tmp/feishu-ws/topic-1/attachments')
     expect(withPath).toContain('separate directories')
     expect(FEISHU_ATTACHMENTS_SECTION).toBe('dsh-channels:feishu-attachments')
   })
 
   it('escapes backticks in a hostile directory path', () => {
-    expect(attachmentsGuidance('/tmp/a`b/topic/attachments')).toContain("/tmp/a'b/topic/attachments")
+    expect(attachmentsGuidance('archive', '/tmp/a`b/topic/attachments')).toContain("/tmp/a'b/topic/attachments")
+  })
+
+  it('describes the native library and the lazy fetch manifest by default', () => {
+    const native = attachmentsGuidance()
+    expect(native).toBe(attachmentsGuidance('native'))
+    expect(native).toContain('native attachment library')
+    expect(native).toContain('feishu_attachment_fetch')
+    expect(native).toContain('<feishu_context>')
+    expect(native).toContain('not loaded')
+    expect(native).toContain('read-only copy')
+    expect(native).toContain('copy it into the working directory')
+    expect(native).not.toContain('own `attachments/` directory')
+
+    // The two flavors never leak each other's wording.
+    const archive = attachmentsGuidance('archive', '/tmp/feishu-ws/topic-1/attachments')
+    expect(archive).not.toContain('native attachment library')
+    expect(archive).not.toContain('feishu_attachment_fetch')
+    expect(archive).not.toContain('<feishu_context>')
+    // Native mode has no per-conversation directory, so it ignores the path.
+    expect(attachmentsGuidance('native', '/tmp/feishu-ws/topic-1/attachments'))
+      .not.toContain('/tmp/feishu-ws/topic-1/attachments')
   })
 })
 

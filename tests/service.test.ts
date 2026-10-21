@@ -17,9 +17,11 @@ import type { AgentHandle, ApprovalOutcome, CordisPluginRuntime, SessionId, Sess
 import type { RouteRecord } from '../src/domain.ts'
 import { sessionDirOf } from '../src/domain.ts'
 import { FEISHU_ATTACHMENTS_SECTION } from '../src/feishu/agent-context.ts'
+import { ATTACHMENT_FETCH_TOOL_NAME } from '../src/feishu/tools.ts'
 import type { SessionExportBuilder } from '../src/session-export.ts'
 import {
   dispatchAgentRequest, makeHostContext, makeChannel, makeMessage, makeAgentPresets, makeSession, makeAgent, promptSectionsOf, sessionEvents,
+  followupMessagesOf, makeAttachmentStore, makeToolsRuntime,
 } from './helpers.ts'
 import type { FakeAgentPresets, FakeAgentPresetsOptions, FakeAgentsOptions } from './helpers.ts'
 
@@ -51,6 +53,10 @@ function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
     welcomeOnboarding: false,
     acceptAttachments: true,
     attachmentStore: 'native',
+    prefetchImages: true,
+    prefetchImageMaxBytes: 20 * 1024 * 1024,
+    prefetchTotalMaxBytes: 50 * 1024 * 1024,
+    prefetchTimeoutMs: 10_000,
     pendingAttachmentTtlMs: 7 * 24 * 60 * 60 * 1000,
     pendingAttachmentLimit: 10,
     feishuTools: {
@@ -89,6 +95,7 @@ async function setup(
   agentsOptions: FakeAgentsOptions = {},
   sessionExportBuilder?: SessionExportBuilder,
   projections?: SessionProjections,
+  extraServices: Record<string, unknown> = {},
 ): Promise<Harness> {
   const config = makeConfig(partial)
   const channel = makeChannel(channelOptions)
@@ -97,6 +104,7 @@ async function setup(
     presetOptions === undefined ? undefined : makeAgentPresets(presetOptions),
     agentsOptions,
     projections,
+    extraServices,
   )
   const factoryCalls: unknown[] = []
   const factory: ChannelFactory = options => {
@@ -3361,6 +3369,526 @@ describe('inbound attachments', () => {
       .map(([, value]) => value)[0]!
     const dir = path.join(sessionDirOf(record), 'attachments')
     await waitUntil(() => expect(readdirSync(dir).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1))
+    await h.service.shutdown()
+  })
+})
+
+describe('native attachment pipeline', () => {
+  const PNG = new Uint8Array([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x01, 0x02, 0x03])
+  const pngResources = [{ type: 'image', fileKey: 'img_1' }] as never
+  const routesOf = (h: SetupResult): RouteRecord[] =>
+    [...(h.ctxState.domain.raw.table('routes').entries() as Iterable<[string, RouteRecord]>)]
+      .map(([, value]) => value)
+  const pendingRowsOf = (h: SetupResult): unknown[] =>
+    [...(h.ctxState.domain.raw.table('pending_attachments').entries() as Iterable<[string, unknown]>)]
+  const firstPromptOf = (h: SetupResult) =>
+    followupMessagesOf(h.ctxState.agents.created[0]!.handle.agent)[0]!.content
+  const textBlocksOf = (content: Array<{ type: string; text?: string }>): string[] =>
+    content.filter(block => block.type === 'text').map(block => block.text ?? '')
+  const manifestOf = (content: Array<{ type: string; text?: string }>): string =>
+    textBlocksOf(content).find(text => text.includes('<feishu_context>')) ?? ''
+
+  /** Native deployment: host attachments service + Agent tools/attachments scopes. */
+  const setupNative = async (
+    partial: Partial<FeishuConfig> = {},
+    channelOptions: Parameters<typeof makeChannel>[0] = {},
+    attachmentOptions: Parameters<typeof makeAttachmentStore>[0] = {},
+  ) => {
+    const attachments = makeAttachmentStore(attachmentOptions)
+    const tools = makeToolsRuntime()
+    const h = await setup(
+      partial,
+      channelOptions,
+      undefined,
+      { agentExtras: { attachments, tools } },
+      undefined,
+      undefined,
+      { attachments },
+    )
+    return { h, attachments, tools }
+  }
+
+  it('creates the session and card before a slow image prefetch resolves (AC1)', async () => {
+    let release!: (chunks: Uint8Array[]) => void
+    const gate = new Promise<Uint8Array[]>(resolve => { release = resolve })
+    const { h } = await setupNative({}, { downloadResource: () => gate })
+    const handling = h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_slow', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_slow_image', content: '这是什么 ![image](img_1)', resources: pngResources,
+    }))
+
+    // Session, topic/card and route are durable while the image bytes are
+    // still blocked in the download stub — the model turn has not started.
+    await waitUntil(() => expect(h.channel.sent.length).toBeGreaterThan(0))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    await waitUntil(() => expect(routesOf(h)).toHaveLength(1))
+    expect(mock(h.ctxState.agents.created[0]!.handle.agent.followup)).not.toHaveBeenCalled()
+
+    release([PNG])
+    await handling
+    await waitForEstablishedSession(h)
+    const prompt = firstPromptOf(h)
+    expect(prompt[0]).toEqual({ type: 'text', text: '这是什么' })
+    expect(prompt[1]).toMatchObject({ type: 'image', attachment: { mediaType: 'image/png' } })
+    // The prefetched image is visible in the prompt, so it is not listed as unloaded.
+    expect(manifestOf(prompt)).toBe('')
+    await h.service.shutdown()
+  })
+
+  it('never downloads files before the turn and lists them in the manifest (AC1/AC5)', async () => {
+    const downloads: string[] = []
+    const { h, attachments, tools } = await setupNative({}, {
+      downloadResource: (_messageId, fileKey) => {
+        downloads.push(fileKey)
+        return [new TextEncoder().encode('file-bytes')]
+      },
+    })
+    const messageId = 'om_file_trigger'
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_lazy', senderId: 'ou_alice', mentionedBot: false,
+      messageId, content: '看下 <file key="file_1" name="report.pdf"/> 这个文件',
+      resources: [{ type: 'file', fileKey: 'file_1', fileName: 'report.pdf' }] as never,
+    }))
+    await waitForEstablishedSession(h)
+
+    expect(downloads).toEqual([])
+    const prompt = firstPromptOf(h)
+    expect(prompt[0]).toEqual({ type: 'text', text: '看下 这个文件' })
+    const manifest = manifestOf(prompt)
+    expect(manifest).toContain(`message_id=${messageId}`)
+    expect(manifest).toContain('file_key=file_1')
+    expect(manifest).toContain('type=file')
+    expect(manifest).toContain('report.pdf')
+
+    // Lazy fetch: only the model-driven tool call downloads and stores bytes.
+    const definition = tools.definitions.get(ATTACHMENT_FETCH_TOOL_NAME)
+    expect(definition).toBeDefined()
+    const result = await definition!.execute(
+      { message_id: messageId },
+      { signal: new AbortController().signal },
+    ) as { ok: boolean; results: Array<{ ok: boolean; kind?: string }> }
+    expect(result.ok).toBe(true)
+    expect(result.results[0]).toMatchObject({ ok: true, kind: 'file' })
+    expect(downloads).toEqual(['file_1'])
+    expect(attachments.savedFiles).toHaveLength(1)
+    expect(new TextDecoder().decode(attachments.savedFiles[0]!.data)).toBe('file-bytes')
+    const rendered = definition!.output.render({ message_id: messageId }, result)
+    expect(rendered.some(block => block.type === 'text')).toBe(true)
+    expect(rendered.some(block => block.type === 'file')).toBe(true)
+    await h.service.shutdown()
+  })
+
+  it('prefetches trigger images into image blocks and omits them from the manifest (AC2/AC4)', async () => {
+    const { h, attachments } = await setupNative({}, { downloadResource: () => [PNG] })
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_prefetch', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_image_trigger', content: '这张图是什么 ![image](img_1)', resources: pngResources,
+    }))
+    await waitForEstablishedSession(h)
+
+    const prompt = firstPromptOf(h)
+    expect(prompt).toHaveLength(2)
+    expect(prompt[0]).toEqual({ type: 'text', text: '这张图是什么' })
+    expect(prompt[1]).toMatchObject({ type: 'image' })
+    expect(manifestOf(prompt)).toBe('')
+    expect(attachments.savedImages).toHaveLength(1)
+    await h.service.shutdown()
+  })
+
+  it('silently registers an attachment-only p2p message and lists it next turn (AC2/AC3)', async () => {
+    const downloads: string[] = []
+    const { h } = await setupNative({}, {
+      downloadResource: (_messageId, fileKey) => {
+        downloads.push(fileKey)
+        return [PNG]
+      },
+    })
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_silent', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_silent_image', rawContentType: 'image', content: '![image](img_1)', resources: pngResources,
+    }))
+
+    await waitUntil(() => expect(pendingRowsOf(h)).toHaveLength(1))
+    expect(h.ctxState.agents.created).toHaveLength(0)
+    expect(h.channel.sent).toHaveLength(0)
+    expect(h.channel.reactions).toEqual([])
+    expect(downloads).toEqual([])
+    expect(routesOf(h)).toHaveLength(0)
+
+    // A later text trigger surfaces the silently registered attachment in the
+    // manifest of the session it creates (chat-scope rows visible to the topic).
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_silent', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_silent_text', content: '刚才那张图是什么',
+    }))
+    await waitForEstablishedSession(h)
+    const manifest = manifestOf(firstPromptOf(h))
+    expect(manifest).toContain('message_id=om_silent_image')
+    expect(manifest).toContain('file_key=img_1')
+    expect(manifest).toContain('type=image')
+    // The later trigger itself carries no bytes: still nothing downloaded.
+    expect(downloads).toEqual([])
+    await h.service.shutdown()
+  })
+
+  it('silently registers un-mentioned group attachments and topic-bound attachments (AC3/AC6)', async () => {
+    const downloads: string[] = []
+    const { h } = await setupNative({}, {
+      downloadResource: (_messageId, fileKey) => {
+        downloads.push(fileKey)
+        return [new TextEncoder().encode('bytes')]
+      },
+    })
+    // Un-mentioned group message: metadata only, no turn, no reply.
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_group', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_group_silent', rawContentType: 'file', content: '<file key="g1" name="a.txt"/>',
+      resources: [{ type: 'file', fileKey: 'g1', fileName: 'a.txt' }] as never,
+    }))
+    await waitUntil(() => expect(pendingRowsOf(h)).toHaveLength(1))
+    expect(h.ctxState.agents.created).toHaveLength(0)
+    expect(h.channel.sent).toHaveLength(0)
+    expect(h.channel.reactions).toEqual([])
+    expect(downloads).toEqual([])
+    await h.service.shutdown()
+  })
+
+  it('keeps a bound topic quiet for attachment-only messages but continues on text (AC3/AC6)', async () => {
+    const { h } = await setupNative({}, { downloadResource: () => [PNG] })
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_topic', senderId: 'ou_alice', mentionedBot: true,
+      messageId: 'om_topic_first', content: '开始',
+    }))
+    await waitForEstablishedSession(h)
+    const route = routesOf(h)[0]!
+    expect(h.channel.sent).toHaveLength(1)
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_topic', senderId: 'ou_alice', mentionedBot: false,
+      threadId: route.key, messageId: 'om_topic_silent', rawContentType: 'image', content: '![image](img_1)', resources: pngResources,
+    }))
+    // No second card, no reaction, no download, no new Session.
+    expect(h.channel.sent).toHaveLength(1)
+    expect(h.ctxState.agents.created).toHaveLength(1)
+    expect(h.channel.reactions).toEqual([{ messageId: 'om_topic_first', emojiType: 'Typing' }])
+    await waitUntil(() => expect(pendingRowsOf(h)).toHaveLength(1))
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_topic', senderId: 'ou_alice', mentionedBot: false,
+      threadId: route.key, messageId: 'om_topic_text', content: '刚才的图是什么',
+    }))
+    await waitUntil(() => expect(mock(h.ctxState.agents.created[0]!.handle.agent.followup)).toHaveBeenCalledTimes(2))
+    const followups = followupMessagesOf(h.ctxState.agents.created[0]!.handle.agent)
+    const manifest = manifestOf(followups[1]!.content)
+    expect(manifest).toContain('message_id=om_topic_silent')
+    expect(manifest).toContain('file_key=img_1')
+    await h.service.shutdown()
+  })
+
+  it('degrades failed, oversized, timed-out, or disabled image prefetch to the manifest (AC4)', async () => {
+    // Storage failure: no image block, image listed as unloaded, turn proceeds.
+    const failing = await setupNative({}, { downloadResource: () => [PNG] }, {
+      failImage: new Error('fake store exploded'),
+    })
+    await failing.h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_fail', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_fail_image', content: '看图 ![image](img_1)', resources: pngResources,
+    }))
+    await waitForEstablishedSession(failing.h)
+    const failedPrompt = firstPromptOf(failing.h)
+    expect(failedPrompt.some(block => block.type === 'image')).toBe(false)
+    expect(manifestOf(failedPrompt)).toContain('message_id=om_fail_image')
+    await failing.h.service.shutdown()
+
+    // Per-image cap: bytes exceed the configured cap, so the image stays lazy.
+    const capped = await setupNative({ prefetchImageMaxBytes: 1 }, { downloadResource: () => [PNG] })
+    await capped.h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_cap', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_cap_image', content: '看图 ![image](img_1)', resources: pngResources,
+    }))
+    await waitForEstablishedSession(capped.h)
+    expect(firstPromptOf(capped.h).some(block => block.type === 'image')).toBe(false)
+    await capped.h.service.shutdown()
+
+    // Explicitly disabled prefetch: images always go through the tool.
+    const disabled = await setupNative({ prefetchImages: false }, { downloadResource: () => [PNG] })
+    await disabled.h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_no_prefetch', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_no_prefetch', content: '看图 ![image](img_1)', resources: pngResources,
+    }))
+    await waitForEstablishedSession(disabled.h)
+    const disabledPrompt = firstPromptOf(disabled.h)
+    expect(disabledPrompt.some(block => block.type === 'image')).toBe(false)
+    expect(manifestOf(disabledPrompt)).toContain('file_key=img_1')
+    expect(disabled.attachments.savedImages).toHaveLength(0)
+    await disabled.h.service.shutdown()
+
+    // Timeout: a stalled download must not hold the turn past the short budget.
+    const stalled = await setupNative({ prefetchTimeoutMs: 100 }, {
+      downloadResource: () => new Promise<Uint8Array[]>(() => {}),
+    })
+    await stalled.h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_stall', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_stall_image', content: '看图 ![image](img_1)', resources: pngResources,
+    }))
+    await waitForEstablishedSession(stalled.h)
+    const stalledPrompt = firstPromptOf(stalled.h)
+    expect(stalledPrompt.some(block => block.type === 'image')).toBe(false)
+    expect(manifestOf(stalledPrompt)).toContain('message_id=om_stall_image')
+    await stalled.h.service.shutdown()
+  })
+
+  it('turns no attachment into no manifest token (AC2)', async () => {
+    const { h } = await setupNative()
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_plain', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_plain', content: '普通消息',
+    }))
+    await waitForEstablishedSession(h)
+    expect(firstPromptOf(h)).toEqual([{ type: 'text', text: '普通消息' }])
+    await h.service.shutdown()
+  })
+
+  it('keeps attachment-only messages inert when attachments are disabled (AC3/AC7)', async () => {
+    const downloads: string[] = []
+    const { h, tools } = await setupNative({ acceptAttachments: false }, {
+      downloadResource: (_messageId, fileKey) => {
+        downloads.push(fileKey)
+        return [PNG]
+      },
+    })
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_off', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_off_image', content: '![image](img_1)', resources: pngResources,
+    }))
+    await flush()
+    expect(h.ctxState.agents.created).toHaveLength(0)
+    expect(h.channel.sent).toHaveLength(0)
+    expect(h.channel.reactions).toEqual([])
+    expect(downloads).toEqual([])
+    expect(pendingRowsOf(h)).toHaveLength(0)
+
+    // A text turn is still served, with the inert/archive guidance (attachments
+    // are disabled, so the native manifest and fetch tool must not be advertised).
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_off', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_off_text', content: '你好',
+    }))
+    await waitForEstablishedSession(h)
+    // Inert attachments: no attachment guidance section and no fetch tool.
+    const guidance = promptSectionsOf(h.ctxState.agents.created[0]!.setupCtx)
+      .find(section => section.name === FEISHU_ATTACHMENTS_SECTION)?.text
+    expect(guidance).toBeUndefined()
+    expect(tools.definitions.size).toBe(0)
+    await h.service.shutdown()
+  })
+
+  it('keeps the legacy archive behavior for explicit archive and missing-service deployments (AC7)', async () => {
+    // Explicit archive wins even when the native library is mounted.
+    const attachments = makeAttachmentStore()
+    const archiveTools = makeToolsRuntime()
+    const archived = await setup(
+      { attachmentStore: 'archive' },
+      { downloadResource: () => [PNG] },
+      undefined,
+      { agentExtras: { attachments, tools: archiveTools } },
+      undefined,
+      undefined,
+      { attachments },
+    )
+    await archived.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_archive', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_archive_image', content: '![image](img_1)', resources: pngResources,
+    }))
+    const staging = path.join(archived.config.baseDir, '_staging', 'p2p', 'oc_archive', 'ou_alice')
+    await waitUntil(() => expect(readdirSync(staging).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1))
+    expect(mock(archived.channel.downloadResource)).toHaveBeenCalled()
+    expect(archived.ctxState.agents.created).toHaveLength(0)
+    expect(pendingRowsOf(archived)).toHaveLength(0)
+    // A text turn in archive mode must not advertise the lazy fetch tool.
+    await archived.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_archive', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_archive_text', content: '开始',
+    }))
+    await waitForEstablishedSession(archived)
+    expect(archiveTools.definitions.size).toBe(0)
+    await archived.service.shutdown()
+
+    // Native configuration without the host service falls back to the legacy
+    // synchronous download for the triggering message.
+    const fallback = await setup({}, { downloadResource: () => [PNG] })
+    await fallback.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_fallback', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_fallback_image', content: '看图 ![image](img_1)', resources: pngResources,
+    }))
+    await waitForEstablishedSession(fallback)
+    expect(mock(fallback.channel.downloadResource)).toHaveBeenCalled()
+    expect(firstPromptOf(fallback)).toEqual([{ type: 'text', text: '看图' }])
+    const record = routesOf(fallback)[0]!
+    const dir = path.join(sessionDirOf(record), 'attachments')
+    await waitUntil(() => expect(readdirSync(dir).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1))
+    const fallbackWarnings = mock(fallback.ctxState.ctx.logger?.warn).mock.calls.flat().join(' ')
+    expect(fallbackWarnings).toContain('宿主未挂载 ctx.attachments')
+    await fallback.service.shutdown()
+  })
+
+  it('delivers the first topic turn before a message arriving during its prefetch (ordering)', async () => {
+    let release!: (chunks: Uint8Array[]) => void
+    const gate = new Promise<Uint8Array[]>(resolve => { release = resolve })
+    const { h } = await setupNative({}, { downloadResource: () => gate })
+
+    void h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_order', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_order_first', rawContentType: 'image',
+      content: '看图 ![image](img_1)', resources: pngResources,
+    }))
+    await waitUntil(() => expect(routesOf(h)).toHaveLength(1))
+    const route = routesOf(h)[0]!
+    const firstAgent = h.ctxState.agents.created[0]!.handle.agent
+    expect(mock(firstAgent.followup)).not.toHaveBeenCalled()
+
+    // The route is durable while the first prompt is still assembling: a
+    // second message in the topic must wait for the first followup.
+    void h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_order', senderId: 'ou_alice', mentionedBot: false,
+      threadId: route.key, messageId: 'om_order_second', content: '第二句',
+    }))
+    await flush()
+    await flush()
+    expect(mock(firstAgent.followup)).not.toHaveBeenCalled()
+
+    release([PNG])
+    await waitUntil(() => expect(mock(firstAgent.followup)).toHaveBeenCalledTimes(2))
+    const followups = followupMessagesOf(firstAgent)
+    expect(followups[0]!.content[0]).toEqual({ type: 'text', text: '看图' })
+    expect(followups[0]!.content[1]).toMatchObject({ type: 'image' })
+    expect(followups[1]!.content).toEqual([{ type: 'text', text: '第二句' }])
+    await h.service.shutdown()
+  })
+
+  it('never registers attachments of a foreign sender in a bound topic (AC3)', async () => {
+    const downloads: string[] = []
+    const { h } = await setupNative({}, {
+      downloadResource: (_messageId, fileKey) => {
+        downloads.push(fileKey)
+        return [PNG]
+      },
+    })
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_foreign', senderId: 'ou_alice', mentionedBot: true,
+      messageId: 'om_foreign_owner', content: '开始',
+    }))
+    await waitForEstablishedSession(h)
+    const route = routesOf(h)[0]!
+    const sentBefore = h.channel.sent.length
+    const reactionsBefore = h.channel.reactions.length
+    const processed = h.ctxState.domain.raw.table('processed')
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_foreign', senderId: 'ou_bob', mentionedBot: false,
+      threadId: route.key, messageId: 'om_foreign_image', rawContentType: 'image',
+      content: '![image](img_9)', resources: [{ type: 'image', fileKey: 'img_9' }] as never,
+    }))
+    await waitUntil(() => expect(processed.get('om_foreign_image')).toBeDefined())
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_foreign', senderId: 'ou_bob', mentionedBot: false,
+      threadId: route.key, messageId: 'om_foreign_mixed', rawContentType: 'image',
+      content: '看这个 ![image](img_9)', resources: [{ type: 'image', fileKey: 'img_9' }] as never,
+    }))
+    await waitUntil(() => expect(processed.get('om_foreign_mixed')).toBeDefined())
+    await flush()
+    await flush()
+
+    expect(pendingRowsOf(h)).toHaveLength(0)
+    expect(h.ctxState.agents.created).toHaveLength(1)
+    expect(h.channel.sent).toHaveLength(sentBefore)
+    expect(h.channel.reactions).toHaveLength(reactionsBefore)
+    expect(downloads).toEqual([])
+    await h.service.shutdown()
+  })
+
+  it('never registers attachments of a denied sender (AC3)', async () => {
+    const downloads: string[] = []
+    const { h } = await setupNative({ accessMode: 'guarded', adminOpenId: 'ou_admin' }, {
+      downloadResource: (_messageId, fileKey) => {
+        downloads.push(fileKey)
+        return [PNG]
+      },
+    })
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_denied', senderId: 'ou_mallory', mentionedBot: false,
+      messageId: 'om_denied_image', rawContentType: 'image', content: '![image](img_x)',
+      resources: [{ type: 'image', fileKey: 'img_x' }] as never,
+    }))
+    // A denied private chat gets the fixed notice; waiting for it proves the
+    // message passed the admission gate and took the denial path.
+    await waitUntil(() => expect(h.channel.sent.length).toBeGreaterThan(0))
+    await flush()
+
+    expect(pendingRowsOf(h)).toHaveLength(0)
+    expect(h.ctxState.agents.created).toHaveLength(0)
+    expect(h.channel.reactions).toEqual([])
+    expect(downloads).toEqual([])
+    await h.service.shutdown()
+  })
+
+  it('falls back to the archive backend when the fetch tool is disabled (AC7)', async () => {
+    const attachments = makeAttachmentStore()
+    const tools = makeToolsRuntime()
+    const h = await setup(
+      {
+        feishuTools: {
+          attachmentFetch: false,
+          attachmentFetchMaxResources: 10,
+          attachmentFetchMaxBytes: 100 * 1024 * 1024,
+          attachmentFetchTimeoutMs: 120_000,
+        },
+      },
+      { downloadResource: () => [PNG] },
+      undefined,
+      { agentExtras: { attachments, tools } },
+      undefined,
+      undefined,
+      { attachments },
+    )
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_tool_off', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_tool_off', rawContentType: 'image', content: '看图 ![image](img_1)',
+      resources: pngResources,
+    }))
+    await waitForEstablishedSession(h)
+
+    expect(mock(h.channel.downloadResource)).toHaveBeenCalled()
+    expect(firstPromptOf(h)).toEqual([{ type: 'text', text: '看图' }])
+    // The bytes land in the legacy workspace archive, not the native library:
+    // the archive guidance tells the model to read exactly that directory.
+    const record = routesOf(h)[0]!
+    const dir = path.join(sessionDirOf(record), 'attachments')
+    await waitUntil(() => expect(readdirSync(dir).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1))
+    expect(attachments.savedImages).toHaveLength(0)
+    // The lazy pipeline (and its fetch tool) is not advertised to the model.
+    expect(tools.definitions.size).toBe(0)
+    const guidance = promptSectionsOf(h.ctxState.agents.created[0]!.setupCtx)
+      .find(section => section.name === FEISHU_ATTACHMENTS_SECTION)?.text ?? ''
+    expect(guidance).toContain('attachments/')
+    expect(guidance).not.toContain('native attachment library')
+    await h.service.shutdown()
+  })
+
+  it('mounts the native guidance only when the native library is effective (AC2/AC7)', async () => {
+    const { h } = await setupNative()
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_guidance', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_guidance', content: '开始',
+    }))
+    await waitForEstablishedSession(h)
+    const guidance = promptSectionsOf(h.ctxState.agents.created[0]!.setupCtx)
+      .find(section => section.name === FEISHU_ATTACHMENTS_SECTION)?.text ?? ''
+    expect(guidance).toContain('native attachment library')
+    expect(guidance).toContain('feishu_attachment_fetch')
+    expect(guidance).toContain('<feishu_context>')
+    expect(guidance).not.toContain(`${sessionDirOf(routesOf(h)[0]!)}/attachments`)
     await h.service.shutdown()
   })
 })

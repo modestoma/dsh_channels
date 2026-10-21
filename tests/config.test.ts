@@ -3,7 +3,10 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { DEFAULT_ROUTE_TTL_MS, resolveConfig } from '../src/config.ts'
+import {
+  DEFAULT_PREFETCH_IMAGE_MAX_BYTES, DEFAULT_PREFETCH_TIMEOUT_MS, DEFAULT_PREFETCH_TOTAL_MAX_BYTES,
+  DEFAULT_ROUTE_TTL_MS, resolveConfig,
+} from '../src/config.ts'
 
 describe('resolveConfig', () => {
   it('accepts credential reference names', () => {
@@ -80,6 +83,23 @@ describe('resolveConfig', () => {
     const config = resolveConfig({})
     expect(config.appId).toBe('FEISHU_APP_ID')
     expect(config.appSecret).toBe('FEISHU_APP_SECRET')
+  })
+
+  it('defaults trigger-image prefetch and enforces its bounds', () => {
+    const config = resolveConfig({ appId: 'FEISHU_APP_ID', appSecret: 'FEISHU_APP_SECRET' })
+    expect(config.prefetchImages).toBe(true)
+    expect(config.prefetchImageMaxBytes).toBe(DEFAULT_PREFETCH_IMAGE_MAX_BYTES)
+    expect(config.prefetchTotalMaxBytes).toBe(DEFAULT_PREFETCH_TOTAL_MAX_BYTES)
+    expect(config.prefetchTimeoutMs).toBe(DEFAULT_PREFETCH_TIMEOUT_MS)
+    expect(resolveConfig({
+      appId: 'FEISHU_APP_ID', appSecret: 'FEISHU_APP_SECRET', prefetchImages: false,
+    }).prefetchImages).toBe(false)
+    expect(() => resolveConfig({
+      appId: 'FEISHU_APP_ID', appSecret: 'FEISHU_APP_SECRET', prefetchImageMaxBytes: 0,
+    })).toThrow(/invalid configuration/)
+    expect(() => resolveConfig({
+      appId: 'FEISHU_APP_ID', appSecret: 'FEISHU_APP_SECRET', prefetchTimeoutMs: 1,
+    })).toThrow(/invalid configuration/)
   })
 
   it('defaults routeTtlMs to 30 days, accepts 0 (disabled), rejects negatives', () => {

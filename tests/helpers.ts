@@ -4,15 +4,17 @@
  * @module tests/helpers
  */
 
+import { createHash } from 'node:crypto'
 import { mkdirSync, mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { vi } from 'vitest'
 import type {
   Agent, AgentContext, AgentHandle, AgentOptions, AgentRegistry, AgentRequestConfig, AgentRequestListener, ApprovalAnswererListener,
-  AssistantStreamPayload, CommandDefinition, CommandInvocation, CommandRuntime, EncodedImageAttachment, HostContext,
-  PermissionPresets, PromptSection, Session, SessionEvent, SessionId, SessionProjections, StorageDomainFacility, UserQuestionAnswererListener,
-  Workspace, WorkspaceRegistry,
+  AssistantStreamPayload, AttachmentStore, CommandDefinition, CommandInvocation, CommandRuntime, EncodedImageAttachment,
+  FileAttachmentRef, HostContext, ImageAttachmentLimits, ImageAttachmentRef, ImageMediaType, PermissionPresets, PromptSection,
+  Session, SessionEvent, SessionId, SessionProjections, StorageDomainFacility, ToolDefinition, ToolRuntime,
+  UserQuestionAnswererListener, Workspace, WorkspaceRegistry,
 } from '../src/dsh-types.ts'
 import type {
   CreatedWorktree, WorkingDirectoryService, WorktreeService,
@@ -137,7 +139,16 @@ export function promptSectionsOf(ctx: AgentContext): readonly PromptSection[] {
   return agentPromptSections.get(ctx) ?? []
 }
 
-export function makeAgentContext(commands = makeCommandRuntime()): AgentContext {
+/** Optional host services exposed inside a fake Agent scope. */
+export interface FakeAgentServices {
+  tools?: ToolRuntime
+  attachments?: AttachmentStore
+}
+
+export function makeAgentContext(
+  commands = makeCommandRuntime(),
+  services: FakeAgentServices = {},
+): AgentContext {
   const listeners: AgentRequestListener[] = []
   const sections: PromptSection[] = []
   const ctx: AgentContext = {
@@ -151,6 +162,8 @@ export function makeAgentContext(commands = makeCommandRuntime()): AgentContext 
         }
       },
     },
+    ...(services.tools === undefined ? {} : { tools: services.tools }),
+    ...(services.attachments === undefined ? {} : { attachments: services.attachments }),
     on(_event, listener, options) {
       const prepend = options === true || (typeof options === 'object' && options.prepend === true)
       if (prepend) listeners.unshift(listener)
@@ -185,6 +198,118 @@ export async function dispatchAgentRequest(
   return run(0)
 }
 
+/** Fake Agent-scoped tool registry recording every registered definition. */
+export function makeToolsRuntime(): ToolRuntime & {
+  definitions: Map<string, ToolDefinition>
+  register: ReturnType<typeof vi.fn>
+} {
+  const definitions = new Map<string, ToolDefinition>()
+  return {
+    definitions,
+    register: vi.fn((definition: ToolDefinition) => {
+      definitions.set(definition.name, definition)
+      return () => {
+        definitions.delete(definition.name)
+      }
+    }),
+  }
+}
+
+const DEFAULT_FAKE_IMAGE_LIMITS: ImageAttachmentLimits = {
+  maxImageBytes: 20 * 1024 * 1024,
+  maxImagesPerMessage: 20,
+  maxMessageImageBytes: 200 * 1024 * 1024,
+  maxImagePixels: 64 * 1024 * 1024,
+  maxImageDimension: 8192,
+  mediaTypes: ['image/png', 'image/jpeg', 'image/webp', 'image/gif'],
+}
+
+export interface FakeAttachmentStoreOptions {
+  imageLimits?: Partial<ImageAttachmentLimits>
+  /** Throw from `saveImage` (fixed error or per-call decision). */
+  failImage?: Error | ((input: { data: Uint8Array; mediaType: ImageMediaType; name?: string }) => Error | undefined)
+  /** Throw from `saveFileStream` (fixed error or per-call decision). */
+  failFile?: Error | ((input: { name?: string }) => Error | undefined)
+}
+
+/** One image committed by the fake native attachment library. */
+export interface FakeSavedImage {
+  readonly data: Uint8Array
+  readonly mediaType: ImageMediaType
+  readonly name?: string
+}
+
+/** One file committed by the fake native attachment library. */
+export interface FakeSavedFile {
+  readonly data: Uint8Array
+  readonly name: string
+}
+
+/**
+ * Fake host `ctx.attachments`: content-addressed-ish refs, image limits, and
+ * per-call recording so tests can assert both the prefetch and the lazy fetch
+ * paths without touching the real attachment library.
+ */
+export function makeAttachmentStore(options: FakeAttachmentStoreOptions = {}): AttachmentStore & {
+  savedImages: FakeSavedImage[]
+  savedFiles: FakeSavedFile[]
+} {
+  const savedImages: FakeSavedImage[] = []
+  const savedFiles: FakeSavedFile[] = []
+  const digest = (bytes: Uint8Array): string => createHash('sha256').update(bytes).digest('hex')
+  const imageRefOf = (data: Uint8Array, mediaType: ImageMediaType, name?: string): ImageAttachmentRef => ({
+    attachmentId: `sha256:${digest(data)}`,
+    mediaType,
+    bytes: data.byteLength,
+    width: 2,
+    height: 2,
+    ...(name === undefined ? {} : { name }),
+  })
+  const store = {
+    savedImages,
+    savedFiles,
+    imageLimits: { ...DEFAULT_FAKE_IMAGE_LIMITS, ...options.imageLimits },
+    saveImage: vi.fn(async (input: { data: Uint8Array; mediaType: ImageMediaType; name?: string }) => {
+      const failure = typeof options.failImage === 'function' ? options.failImage(input) : options.failImage
+      if (failure !== undefined) throw failure
+      const ref = imageRefOf(input.data, input.mediaType, input.name)
+      savedImages.push({
+        data: input.data,
+        mediaType: input.mediaType,
+        ...(input.name === undefined ? {} : { name: input.name }),
+      })
+      return ref
+    }),
+    saveFileStream: vi.fn(async (input: { data: AsyncIterable<Uint8Array>; name?: string }) => {
+      const failure = typeof options.failFile === 'function' ? options.failFile(input) : options.failFile
+      if (failure !== undefined) throw failure
+      const chunks: Uint8Array[] = []
+      for await (const chunk of input.data) chunks.push(chunk)
+      const data = new Uint8Array(Buffer.concat(chunks.map(chunk => Buffer.from(chunk))))
+      const name = input.name ?? 'file.bin'
+      savedFiles.push({ data, name })
+      return { attachmentId: `sha256:${digest(data)}`, name, bytes: data.byteLength } satisfies FileAttachmentRef
+    }),
+    fileHostPath: vi.fn((ref: FileAttachmentRef) =>
+      path.join(tmpdir(), 'dsh-channels-fake-attachments', ref.name)),
+    imageHostPath: vi.fn((ref: ImageAttachmentRef) =>
+      path.join(tmpdir(), 'dsh-channels-fake-attachments', `${ref.attachmentId.slice(-16)}.png`)),
+    admitPromptContent: vi.fn(async (content: readonly unknown[]) => content),
+    isAttachmentError: vi.fn(() => false),
+  }
+  return store as unknown as AttachmentStore & { savedImages: FakeSavedImage[]; savedFiles: FakeSavedFile[] }
+}
+
+/** Snapshot every followup prompt handed to a fake agent. */
+export function followupMessagesOf(agent: Agent): Array<{ content: Array<{ type: string; text?: string; attachment?: unknown }> }> {
+  return mockCallsOf(agent.followup).map(call => call[0] as { content: Array<{ type: string; text?: string; attachment?: unknown }> })
+}
+
+function mockCallsOf(fn: unknown): unknown[][] {
+  return (fn as unknown as { mock: { calls: unknown[][] } }).mock.calls
+}
+
+
 export function makeAgent(session: Session, options: AgentOptions = {}, ctx?: AgentContext): Agent {
   return {
     id: session.id,
@@ -206,6 +331,8 @@ export interface FakeAgentsOptions {
   onFailResume?: (options: Parameters<AgentRegistry['resume']>[0]) => void
   /** Optional durable Session snapshot returned by the next fake resume. */
   resumeSession?: Session
+  /** Host services exposed inside every fake Agent scope (tools/attachments). */
+  agentExtras?: FakeAgentServices
 }
 
 export function makeAgentRegistry(fail: FakeAgentsOptions = {}): {
@@ -225,7 +352,7 @@ export function makeAgentRegistry(fail: FakeAgentsOptions = {}): {
       // Mirror the host factory: setup composes the unpublished scope and is
       // awaited BEFORE the session/agent become visible; a rejection rolls the
       // creation back.
-      const setupCtx = makeAgentContext()
+      const setupCtx = makeAgentContext(undefined, fail.agentExtras ?? {})
       await options.setup?.(setupCtx)
       const session = makeSession(options.sessionId, options.meta?.cwd, options.meta?.agentPreset)
       const agent = makeAgent(session, options.agentOptions, setupCtx)
@@ -239,7 +366,7 @@ export function makeAgentRegistry(fail: FakeAgentsOptions = {}): {
         fail.onFailResume?.(options)
         throw fail.failResume
       }
-      const setupCtx = makeAgentContext()
+      const setupCtx = makeAgentContext(undefined, fail.agentExtras ?? {})
       await options.setup?.(setupCtx)
       const session = fail.resumeSession ?? makeSession(options.resumeSessionId)
       const agent = makeAgent(session, options.agentOptions, setupCtx)
@@ -465,6 +592,7 @@ export function makeHostContext(
   agentPresets?: FakeAgentPresets,
   agentsOptions: FakeAgentsOptions = {},
   projections?: SessionProjections,
+  extraServices: Record<string, unknown> = {},
 ): {
   ctx: HostContext
   agents: ReturnType<typeof makeAgentRegistry>
@@ -563,6 +691,7 @@ export function makeHostContext(
     worktrees: worktrees.service,
     ...(agentPresets === undefined ? {} : { agentPresets }),
     ...(projections === undefined ? {} : { sessionProjections: projections }),
+    ...extraServices,
   }
   const ctx: HostContext = {
     agents: agents.registry,

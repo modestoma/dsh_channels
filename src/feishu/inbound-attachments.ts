@@ -23,8 +23,9 @@ import { mkdir, open, readdir, rename, rm, stat, writeFile } from 'node:fs/promi
 import path from 'node:path'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
-import type { FeishuChannel, NormalizedMessage } from '../feishu-channel.ts'
+import type { FeishuChannel, NormalizedMessage, ResourceChunkStream } from '../feishu-channel.ts'
 import { sniffImageMediaType } from '../feishu-channel.ts'
+import type { ImageBlock } from '../host/attachments.ts'
 
 /** Workspace subdirectory that holds every archived attachment. */
 export const ATTACHMENTS_DIR = 'attachments'
@@ -155,6 +156,47 @@ export function hasAttachmentPayload(msg: NormalizedMessage): boolean {
   if (msg.rawContentType === 'merge_forward') return true
   if (msg.rawContentType === 'post') return true
   return attachmentResources(msg).length > 0
+}
+
+/** One inbound attachment payload classified without downloading a byte. */
+export interface InboundAttachmentState {
+  /** Whether the message carries an attachment payload (resources or a merged-forward record). */
+  readonly hasPayload: boolean
+  /** Decoded image/file resources, including `post` `files[]`, in message order. */
+  readonly resources: readonly AttachmentResource[]
+  /** Whether this is a `merge_forward` message (its record is plain text, not a resource). */
+  readonly forwarded: boolean
+  /** Prompt text left after removing attachment placeholders. */
+  readonly text: string
+  /** No prompt text remains once the placeholders are stripped (attachment-only message). */
+  readonly attachmentOnly: boolean
+}
+
+/**
+ * Classify one inbound message's attachment payload without downloading
+ * anything or touching state outside the message itself.
+ *
+ * The rules are exactly the ones the archive intake and the native storage
+ * layer already use, so admission can decide "silent register" versus "start a
+ * turn" before any Session exists: no resources and no merged-forward record
+ * means "no payload" and the raw content is the prompt; otherwise placeholders
+ * are stripped and an empty remainder marks an attachment-only message.
+ */
+export function inboundAttachmentState(msg: NormalizedMessage): InboundAttachmentState {
+  const resources = attachmentResources(msg)
+  const forwarded = msg.rawContentType === 'merge_forward'
+  if (resources.length === 0 && !forwarded) {
+    return {
+      hasPayload: false,
+      resources: [],
+      forwarded: false,
+      text: msg.content ?? '',
+      attachmentOnly: false,
+    }
+  }
+  const stripped = stripAttachmentPlaceholders(msg.content ?? '', forwarded)
+  const text = stripped === EMPTY_POST_PLACEHOLDER ? '' : stripped
+  return { hasPayload: true, resources, forwarded, text, attachmentOnly: text === '' }
 }
 
 /**
@@ -437,4 +479,395 @@ async function sniffExtension(file: string): Promise<string> {
   } finally {
     await handle?.close().catch(() => undefined)
   }
+}
+
+// ---- Trigger-message image prefetch -------------------------------------
+
+/** Outcome of storing one prefetched image in the DSH native attachment library. */
+export type ImagePrefetchSaveResult =
+  | { readonly ok: true; readonly block: ImageBlock }
+  | { readonly ok: false; readonly reason: string }
+
+/** Dependency-injected input of one trigger-message image prefetch. */
+export interface ImagePrefetchInput {
+  /** Triggering message; its id addresses every resource download. */
+  readonly msg: NormalizedMessage
+  /** Candidate resources in prompt order (non-image and folder entries are skipped). */
+  readonly resources: readonly AttachmentResource[]
+  /** Live Feishu channel; undefined means the connection is not running. */
+  readonly channel: FeishuChannel | undefined
+  /**
+   * Persist one downloaded image in the native attachment library. Failures
+   * are returned as values; a thrown error is contained per image as well.
+   */
+  saveImage(bytes: Uint8Array, name?: string): Promise<ImagePrefetchSaveResult>
+  /** Per-image byte cap. */
+  readonly maxImageBytes: number
+  /** Total byte budget of this whole prefetch. */
+  readonly maxTotalBytes: number
+  /** Short whole-prefetch deadline in milliseconds (non-positive = already expired). */
+  readonly timeoutMs: number
+  /** Structured warning sink (optional; never allowed to break the prefetch). */
+  warn?(message: string, ...args: unknown[]): void
+}
+
+/** Result of one trigger-message image prefetch; failures are values. */
+export interface PrefetchedImages {
+  /** Successfully stored image blocks, in input order (skipped entries excluded). */
+  readonly blocks: readonly ImageBlock[]
+  /** `file_key`s whose images were stored (the manifest must omit these). */
+  readonly loadedFileKeys: ReadonlySet<string>
+  /** One readable reason per image that was not stored, in processing order. */
+  readonly failures: readonly AttachmentFailure[]
+}
+
+/** Fixed reason for prefetch failures caused by a disconnected channel. */
+const PREFETCH_CHANNEL_UNAVAILABLE_REASON = '飞书连接未运行'
+/** Whole-prefetch timeout reason used when an in-flight image was interrupted. */
+const PREFETCH_TIMEOUT_REASON = '图片预取超时'
+/** Timeout reason for images that were never attempted after the deadline. */
+const PREFETCH_TIMEOUT_UNPROCESSED_REASON = '图片预取超时，未处理'
+/** Reason recorded for images after the total byte budget was exhausted. */
+const PREFETCH_TOTAL_LIMIT_SKIP_REASON = '超过预取总字节上限，已跳过预取'
+/** Cap for one readable prefetch failure reason (prompt/tool-safe). */
+const PREFETCH_MAX_REASON_TEXT = 500
+
+function prefetchTimeoutReason(timeoutMs: number): string {
+  return `${PREFETCH_TIMEOUT_REASON}（超过 ${timeoutMs} 毫秒）`
+}
+
+function imageLimitReason(readBytes: number, cap: number): string {
+  return `图片超过预取大小上限（已读取 ${readBytes} 字节，上限 ${cap} 字节）`
+}
+
+function totalLimitReason(readBytes: number, cap: number): string {
+  return `超过预取总字节上限（已读取 ${readBytes} 字节，上限 ${cap} 字节）`
+}
+
+/**
+ * Prefetch the images of one triggering message into the native attachment
+ * library before the first model turn.
+ *
+ * Images are downloaded strictly in order, so the returned blocks keep the
+ * message order. Every failure (channel unavailable, size cap, total budget,
+ * timeout, download, storage) is contained per image and reported as a value;
+ * this function never throws and never mutates its input. The whole prefetch
+ * shares one short deadline: on expiry the already-stored blocks are kept and
+ * the current plus all unprocessed images are reported as timeouts, so a slow
+ * download can never block the turn for long.
+ *
+ * Known limitation: the channel byte stream cannot be cancelled, so a stalled
+ * download is abandoned rather than aborted at the transport layer. The
+ * deadline aborts the collection loop between chunks, which keeps an
+ * abandoned download from buffering further bytes in this process. Likewise a
+ * `saveImage` call that is already in flight cannot be recalled; the deadline
+ * only guarantees that the prefetch returns without waiting for it.
+ */
+export async function prefetchImageAttachments(input: ImagePrefetchInput): Promise<PrefetchedImages> {
+  const images = input.resources.filter(resource => resource.type === 'image' && resource.folder !== true)
+  const blocks: ImageBlock[] = []
+  const loadedFileKeys = new Set<string>()
+  const failures: AttachmentFailure[] = []
+  const result = (): PrefetchedImages => ({ blocks, loadedFileKeys, failures })
+  if (images.length === 0) return result()
+
+  const channel = input.channel
+  if (channel === undefined) {
+    for (const resource of images) {
+      failures.push({ name: resourceName(resource), reason: PREFETCH_CHANNEL_UNAVAILABLE_REASON })
+    }
+    return result()
+  }
+
+  const deadline = createPrefetchDeadline(input.timeoutMs)
+  try {
+    await prefetchImagesSequentially(input, channel, images, deadline, blocks, loadedFileKeys, failures)
+  } catch (error) {
+    // Defensive containment: the loop classifies every expected failure, but
+    // this function must never throw into the admission path.
+    const detail = thrownValueText(error)
+    failures.push({ name: '图片', reason: boundedPrefetchReason(`图片预取异常：${detail}`) })
+    safeWarn(input, 'dsh-channels: prefetching images of message %s failed unexpectedly: %s', input.msg.messageId, detail)
+  } finally {
+    deadline.dispose()
+  }
+  return result()
+}
+
+/** Sequential image loop: order, stop-on-cap, and the shared deadline live here. */
+async function prefetchImagesSequentially(
+  input: ImagePrefetchInput,
+  channel: FeishuChannel,
+  images: readonly AttachmentResource[],
+  deadline: PrefetchDeadline,
+  blocks: ImageBlock[],
+  loadedFileKeys: Set<string>,
+  failures: AttachmentFailure[],
+): Promise<void> {
+  let loadedBytes = 0
+  let stoppedReason: string | undefined
+  for (const resource of images) {
+    const name = resourceName(resource)
+    if (stoppedReason !== undefined) {
+      failures.push({ name, reason: stoppedReason })
+      continue
+    }
+    if (deadline.expired) {
+      failures.push({ name, reason: PREFETCH_TIMEOUT_UNPROCESSED_REASON })
+      continue
+    }
+    if (loadedBytes >= input.maxTotalBytes) {
+      stoppedReason = PREFETCH_TOTAL_LIMIT_SKIP_REASON
+      failures.push({ name, reason: totalLimitReason(loadedBytes, input.maxTotalBytes) })
+      continue
+    }
+
+    const outcome = await deadline.race(
+      prefetchOneImage(input, channel, resource, deadline.signal, loadedBytes),
+    )
+    if (outcome === PREFETCH_TIMEOUT) {
+      failures.push({ name, reason: prefetchTimeoutReason(input.timeoutMs) })
+      continue
+    }
+    if (outcome.kind === 'stopped') {
+      stoppedReason = outcome.skipReason
+      failures.push({ name, reason: outcome.reason })
+      continue
+    }
+    // Downloaded bytes count against the budget even when the native store
+    // refuses the image: the budget bounds what this prefetch transferred.
+    loadedBytes += outcome.bytes
+    if (outcome.kind === 'failed') {
+      failures.push({ name, reason: outcome.reason })
+      continue
+    }
+    blocks.push(outcome.block)
+    loadedFileKeys.add(resource.fileKey)
+  }
+}
+
+/** One image's download + bounded collection + storage; never rejects. */
+async function prefetchOneImage(
+  input: ImagePrefetchInput,
+  channel: FeishuChannel,
+  resource: AttachmentResource,
+  signal: AbortSignal,
+  usedBytes: number,
+): Promise<PrefetchOutcome> {
+  let stream: ResourceChunkStream
+  try {
+    stream = await channel.downloadResource(input.msg.messageId, resource.fileKey, 'image')
+  } catch (error) {
+    const reason = downloadFailureReason(error)
+    safeWarn(
+      input, 'dsh-channels: prefetching image %s of message %s failed: %s',
+      resource.fileKey, input.msg.messageId, reason,
+    )
+    return { kind: 'failed', reason, bytes: 0 }
+  }
+
+  const collected = await collectPrefetchBytes(stream, signal, {
+    maxImageBytes: input.maxImageBytes,
+    maxTotalBytes: input.maxTotalBytes,
+    usedBytes,
+  })
+  if (collected.kind !== 'ok') {
+    if (collected.kind === 'failed') {
+      safeWarn(
+        input, 'dsh-channels: prefetching image %s of message %s failed: %s',
+        resource.fileKey, input.msg.messageId, collected.reason,
+      )
+    }
+    return collected
+  }
+  // The deadline may have expired while the last chunk arrived: do not store
+  // an image the caller already reported as timed out.
+  if (signal.aborted) {
+    return { kind: 'failed', reason: prefetchTimeoutReason(input.timeoutMs), bytes: collected.bytes }
+  }
+
+  let saved: ImagePrefetchSaveResult
+  try {
+    saved = await input.saveImage(collected.data, resource.fileName)
+  } catch (error) {
+    const detail = thrownValueText(error)
+    const reason = boundedPrefetchReason(`图片入库失败：${detail}`)
+    safeWarn(
+      input, 'dsh-channels: storing prefetched image %s of message %s failed: %s',
+      resource.fileKey, input.msg.messageId, detail,
+    )
+    return { kind: 'failed', reason, bytes: collected.bytes }
+  }
+  if (!saved.ok) {
+    safeWarn(
+      input, 'dsh-channels: storing prefetched image %s of message %s failed: %s',
+      resource.fileKey, input.msg.messageId, saved.reason,
+    )
+    return { kind: 'failed', reason: saved.reason, bytes: collected.bytes }
+  }
+  return { kind: 'saved', block: saved.block, bytes: collected.bytes }
+}
+
+/** Result of reading one image stream under both byte caps. */
+type PrefetchOutcome =
+  | { readonly kind: 'saved'; readonly block: ImageBlock; readonly bytes: number }
+  | { readonly kind: 'failed'; readonly reason: string; readonly bytes: number }
+  | { readonly kind: 'stopped'; readonly reason: string; readonly skipReason: string }
+
+/** Byte caps applied while one image is collected. */
+interface PrefetchByteCaps {
+  readonly maxImageBytes: number
+  readonly maxTotalBytes: number
+  /** Bytes already counted against the total budget. */
+  readonly usedBytes: number
+}
+
+/**
+ * Read one image stream completely under the single-image cap and the total
+ * budget. A single-image violation only refuses that image (later images may
+ * be small enough and are still tried); exhausting the total budget stops the
+ * whole prefetch and carries the reason for the remaining images.
+ */
+async function collectPrefetchBytes(
+  stream: AsyncIterable<Uint8Array>,
+  signal: AbortSignal,
+  caps: PrefetchByteCaps,
+): Promise<
+  | { readonly kind: 'ok'; readonly data: Uint8Array; readonly bytes: number }
+  | { readonly kind: 'failed'; readonly reason: string; readonly bytes: number }
+  | { readonly kind: 'stopped'; readonly reason: string; readonly skipReason: string }
+> {
+  const chunks: Uint8Array[] = []
+  let ownBytes = 0
+  try {
+    for await (const chunk of stream) {
+      if (signal.aborted) {
+        return { kind: 'failed', reason: PREFETCH_TIMEOUT_REASON, bytes: ownBytes }
+      }
+      ownBytes += chunk.byteLength
+      if (ownBytes > caps.maxImageBytes) {
+        return { kind: 'failed', reason: imageLimitReason(ownBytes, caps.maxImageBytes), bytes: ownBytes }
+      }
+      if (caps.usedBytes + ownBytes > caps.maxTotalBytes) {
+        return {
+          kind: 'stopped',
+          reason: totalLimitReason(caps.usedBytes + ownBytes, caps.maxTotalBytes),
+          skipReason: PREFETCH_TOTAL_LIMIT_SKIP_REASON,
+        }
+      }
+      chunks.push(chunk)
+    }
+  } catch (error) {
+    return { kind: 'failed', reason: downloadFailureReason(error), bytes: ownBytes }
+  }
+  const data = new Uint8Array(ownBytes)
+  let offset = 0
+  for (const chunk of chunks) {
+    data.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  return { kind: 'ok', data, bytes: ownBytes }
+}
+
+/** Marker resolved by the deadline promise; never surfaces to callers. */
+const PREFETCH_TIMEOUT = Symbol('dsh-channels-prefetch-timeout')
+
+/** One shared deadline for a whole prefetch (see {@link createPrefetchDeadline}). */
+interface PrefetchDeadline {
+  readonly expired: boolean
+  /** Aborted when the deadline expires; the collection loop checks it per chunk. */
+  readonly signal: AbortSignal
+  /** Resolve with the work value, or the timeout marker once the deadline expires. */
+  race<T>(work: Promise<T>): Promise<T | typeof PREFETCH_TIMEOUT>
+  /** Clear the underlying timer; safe to call more than once. */
+  dispose(): void
+}
+
+/**
+ * One shared deadline for a whole prefetch. A non-positive (or non-finite)
+ * `timeoutMs` means "already expired": no timer is armed and every race
+ * resolves immediately. The timer is always cleared by `dispose()`, so a
+ * completed prefetch leaves no dangling timer behind.
+ */
+function createPrefetchDeadline(timeoutMs: number): PrefetchDeadline {
+  const alreadyExpired = !Number.isFinite(timeoutMs) || timeoutMs <= 0
+  let expired = alreadyExpired
+  const controller = new AbortController()
+  let resolveTimeout: ((marker: typeof PREFETCH_TIMEOUT) => void) | undefined
+  const timedOut = new Promise<typeof PREFETCH_TIMEOUT>(resolve => { resolveTimeout = resolve })
+  let timer: ReturnType<typeof setTimeout> | undefined
+  if (alreadyExpired) {
+    controller.abort()
+    resolveTimeout?.(PREFETCH_TIMEOUT)
+  } else {
+    timer = setTimeout(() => {
+      expired = true
+      controller.abort()
+      resolveTimeout?.(PREFETCH_TIMEOUT)
+    }, timeoutMs)
+  }
+  return {
+    get expired(): boolean { return expired },
+    signal: controller.signal,
+    race<T>(work: Promise<T>): Promise<T | typeof PREFETCH_TIMEOUT> {
+      // A timed-out image may still settle later; observe its rejection so it
+      // never becomes an unhandled rejection after the prefetch returned.
+      void work.catch(() => undefined)
+      if (expired) return Promise.resolve(PREFETCH_TIMEOUT)
+      return Promise.race([work, timedOut])
+    },
+    dispose(): void {
+      if (timer !== undefined) {
+        clearTimeout(timer)
+        timer = undefined
+      }
+    },
+  }
+}
+
+/** Best-effort structured warning; a broken sink must never fail the prefetch. */
+function safeWarn(input: ImagePrefetchInput, message: string, ...args: unknown[]): void {
+  try {
+    input.warn?.(message, ...args)
+  } catch {
+    // Warnings are diagnostics only.
+  }
+}
+
+/** Readable text for an arbitrary thrown value (never `[object Object]`). */
+function thrownValueText(error: unknown): string {
+  if (error instanceof Error && error.message.length > 0) return error.message
+  if (typeof error === 'string' && error.length > 0) return error
+  if (error === null || error === undefined) return '未知错误'
+  if (typeof error === 'object') {
+    const record = error as Record<string, unknown>
+    const parts: string[] = []
+    for (const key of ['code', 'status', 'statusCode', 'name', 'msg', 'message']) {
+      const value = record[key]
+      if (typeof value === 'string' && value.length > 0) parts.push(`${key}=${value}`)
+      else if (typeof value === 'number' && Number.isFinite(value)) parts.push(`${key}=${value}`)
+    }
+    if (parts.length > 0) return parts.join(' ')
+    try {
+      const text = JSON.stringify(error)
+      if (text !== undefined && text !== '{}') return text
+    } catch {
+      // Circular structure: fall through to the fixed description.
+    }
+    return '未知错误（不可序列化的对象）'
+  }
+  return String(error)
+}
+
+/** Readable, bounded download failure reason (Feishu 400/403 mapped). */
+function downloadFailureReason(error: unknown): string {
+  return boundedPrefetchReason(describeFailure(new Error(thrownValueText(error))))
+}
+
+/** Strip control characters and bound one prompt-safe failure reason. */
+function boundedPrefetchReason(text: string): string {
+  const cleaned = text.replace(/[\u0000-\u001f\u007f]+/gu, ' ').trim()
+  const value = cleaned === '' ? '图片预取失败' : cleaned
+  if (value.length <= PREFETCH_MAX_REASON_TEXT) return value
+  return `${value.slice(0, PREFETCH_MAX_REASON_TEXT - 1)}…`
 }
