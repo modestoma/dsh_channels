@@ -282,89 +282,6 @@ export const processedRecordSchema = z.object({
 
 export type ProcessedRecord = z.infer<typeof processedRecordSchema>
 
-/**
- * Silently registered inbound attachment metadata ("pending attachments").
- *
- * A message that does not trigger a model turn — a p2p attachment-only
- * message, an un-mentioned group message, an attachment-only message inside an
- * already-bound topic — is recorded here without downloading bytes, replying,
- * or reacting. A later triggered message in the same `(chat, thread?, sender)`
- * scope can list these entries in its prompt manifest and fetch them on demand
- * through the attachment tool. The table stores metadata only (Feishu resource
- * keys), never bytes.
- *
- * Added without a storage-domain version bump: the host's JSON backend loads a
- * declared table that is missing from the stored document as empty and keeps
- * the stored `unit.version` (1), so existing deployments gain the table with no
- * migration. Downgrading to a plugin build without this table would drop it on
- * the next write — acceptable because plugin builds are replaced in place.
- */
-export const PENDING_ATTACHMENT_KINDS = ['image', 'file', 'post', 'merge_forward'] as const
-
-/** Kind of message that carried the attachment payload. */
-export type PendingAttachmentKind = (typeof PENDING_ATTACHMENT_KINDS)[number]
-
-/**
- * One attachment resource inside a pending record. Feishu downloads resources
- * by `(message id, file key)`; `containerMessageId` is set when only a
- * top-level container id works (merged-forward children).
- */
-export const pendingAttachmentResourceSchema = z.object({
-  /** Resource kind delivered by Feishu. */
-  type: z.enum(['image', 'file']),
-  /** Feishu resource key (`img_v3_...` / `file_v3_...`). */
-  fileKey: z.string().min(1),
-  /** Original file name, when Feishu reports one. */
-  fileName: z.string().min(1).optional(),
-  /** Feishu folder entries cannot be downloaded; recorded so the fetch tool can
-   *  answer with a structured "folder unsupported" instead of a raw API error. */
-  folder: z.boolean().optional(),
-  /** Top-level container message id to download through, when different from
-   *  this record's own `messageId` (merged-forward child resources). */
-  containerMessageId: z.string().min(1).optional(),
-})
-
-export type PendingAttachmentResource = z.infer<typeof pendingAttachmentResourceSchema>
-
-/**
- * One silently registered attachment message. Keyed by its Feishu message id so
- * a redelivered event can never register twice. `scopeKey` is the
- * `(chat, thread?, sender)` isolation unit; `consumed` marks metadata the
- * agent already fetched, which then drops out of the prompt manifest (the
- * record stays as an authorization fact until its TTL).
- */
-export const pendingAttachmentRecordSchema = z.object({
-  /** Key the record is stored under (= `messageId`). */
-  key: z.string().min(1),
-  /** `(chat, thread?, sender)` isolation key; see `pendingAttachmentScopeKey`. */
-  scopeKey: z.string().min(1),
-  /** Feishu message id of the attachment message (the container id for
-   *  merged-forward records). */
-  messageId: z.string().min(1),
-  /** Feishu chat the message arrived in. */
-  chatId: z.string().min(1),
-  /** `p2p` or `group`. */
-  chatType: z.enum(['p2p', 'group']),
-  /** Feishu topic the message belongs to, when it has one. */
-  threadId: z.string().min(1).optional(),
-  /** Normalized sender id (open_id) that the scope is bound to. */
-  senderOpenId: z.string().min(1),
-  /** Epoch ms when the metadata was registered (clock seam for tests). */
-  receivedAt: z.number().int().nonnegative(),
-  /** Kind of message that carried the payload. */
-  kind: z.enum(PENDING_ATTACHMENT_KINDS),
-  /** Attachment payloads; empty for merged-forward containers (children are
-   *  listed through the container's own message id on fetch). */
-  resources: z.array(pendingAttachmentResourceSchema),
-  /** Remaining caption text after attachment placeholders, truncated. */
-  textExcerpt: z.string().min(1).optional(),
-  /** Set once the agent fetched the attachment; consumed rows leave the
-   *  manifest but stay queryable by message id until the TTL sweep. */
-  consumed: z.boolean().optional(),
-})
-
-export type PendingAttachmentRecord = z.infer<typeof pendingAttachmentRecordSchema>
-
 export interface FeishuDomainSpecShape {
   name: 'channels_routes'
   version: 1
@@ -401,10 +318,6 @@ export interface FeishuDomainSpecShape {
       valueSchema: typeof accessRequestRecordSchema
       __key?: string
     }
-    pending_attachments: {
-      valueSchema: typeof pendingAttachmentRecordSchema
-      __key?: string
-    }
   }
 }
 
@@ -439,7 +352,6 @@ export const feishuDomain: FeishuDomainSpecShape = {
     access_groups: { valueSchema: accessGroupRecordSchema },
     access_users: { valueSchema: accessUserRecordSchema },
     access_requests: { valueSchema: accessRequestRecordSchema },
-    pending_attachments: { valueSchema: pendingAttachmentRecordSchema },
   },
 }
 
@@ -506,19 +418,6 @@ export interface AccessRequestsTable {
   entries(): IterableIterator<[string, AccessRequestRecord]>
 }
 
-/**
- * Normalized table handle for silently registered attachment metadata
- * (key = Feishu message id).
- */
-export interface PendingAttachmentsTable {
-  get(key: string): PendingAttachmentRecord | undefined
-  put(key: string, value: PendingAttachmentRecord): Promise<unknown> | void
-  /** Atomic read-modify-write on the host's write chain (`missing-key` when gone). */
-  update(key: string, fn: (current: PendingAttachmentRecord) => PendingAttachmentRecord): Promise<unknown>
-  delete(key: string): Promise<unknown> | void
-  entries(): IterableIterator<[string, PendingAttachmentRecord]>
-}
-
 /** Normalized domain handle. */
 export interface FeishuDomainHandle {
   routes: RoutesTable
@@ -528,12 +427,6 @@ export interface FeishuDomainHandle {
   accessGroups: AccessGroupsTable
   accessUsers: AccessUsersTable
   accessRequests: AccessRequestsTable
-  /**
-   * Pending attachment metadata. Optional on purpose: an embedded host whose
-   * storage domain refuses the added table leaves this undefined and the
-   * registry degrades to a process-memory TTL store (records lost on restart).
-   */
-  pendingAttachments?: PendingAttachmentsTable
   getGlobal(): FeishuDomainGlobal
   setGlobal(value: FeishuDomainGlobal): Promise<unknown> | void
   close(): Promise<void>

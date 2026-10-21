@@ -3,31 +3,23 @@
  * attachments that are registered but not loaded yet (Roadmap AC2).
  *
  * The module is pure, so these tests drive it with normalized messages and
- * pending records directly — no channel, store, filesystem, or clock.
+ * recent known messages directly — no channel, store, filesystem, or clock.
  */
 
 import { describe, expect, it } from 'vitest'
-import type { PendingAttachmentRecord } from '../src/domain.ts'
 import type { NormalizedMessage } from '../src/feishu-channel.ts'
 import {
   FEISHU_CONTEXT_TAG, MANIFEST_MAX_ROWS, buildFeishuContextBlock, manifestEntriesOfKnownMessage,
   triggerManifestAttachments,
 } from '../src/feishu/manifest.ts'
-import type { ManifestAttachmentEntry } from '../src/feishu/manifest.ts'
+import type { ManifestAttachmentEntry, ManifestKnownMessage } from '../src/feishu/manifest.ts'
 import { makeMessage } from './helpers.ts'
 
-function pending(partial: Partial<PendingAttachmentRecord> = {}): PendingAttachmentRecord {
-  const messageId = partial.messageId ?? partial.key ?? 'om_pending'
+function recent(partial: Partial<ManifestKnownMessage> = {}): ManifestKnownMessage {
   return {
-    key: messageId,
-    scopeKey: 'chat:oc_chat:ou_alice',
-    messageId,
-    chatId: 'oc_chat',
-    chatType: 'group',
-    senderOpenId: 'ou_alice',
-    receivedAt: 500,
-    kind: 'image',
-    resources: [{ type: 'image', fileKey: 'img_v3_pending' }],
+    messageId: 'om_recent',
+    kind: 'message',
+    resources: [{ type: 'image', fileKey: 'img_v3_recent' }],
     ...partial,
   }
 }
@@ -44,14 +36,14 @@ function triggerEntries(msg: NormalizedMessage, loaded: string[] = []): Manifest
 describe('feishu context manifest', () => {
   it('renders nothing when no attachment is unloaded', () => {
     expect(buildFeishuContextBlock({})).toBe('')
-    expect(buildFeishuContextBlock({ trigger: [], pending: [] })).toBe('')
+    expect(buildFeishuContextBlock({ trigger: [], recent: [] })).toBe('')
 
     const plain = makeMessage({ messageId: 'om_plain', content: 'hello' })
     expect(triggerEntries(plain)).toEqual([])
     expect(buildFeishuContextBlock({ trigger: triggerEntries(plain) })).toBe('')
 
-    // A non-forwarded pending record without resources contributes no row.
-    expect(buildFeishuContextBlock({ pending: [pending({ kind: 'post', resources: [] })] })).toBe('')
+    // A non-forwarded recent message without resources contributes no row.
+    expect(buildFeishuContextBlock({ recent: [recent({ kind: 'message', resources: [] })] })).toBe('')
   })
 
   it('lists trigger attachments, omitting images that were prefetched', () => {
@@ -101,36 +93,29 @@ describe('feishu context manifest', () => {
     expect(rows(block)).toEqual(['- message_id=om_forward type=merge_forward'])
   })
 
-  it('lists pending records in order and drops consumed / resource-less ones', () => {
+  it('lists recent messages in order and drops resource-less ones', () => {
     const block = buildFeishuContextBlock({
-      pending: [
-        pending({
-          messageId: 'om_pending_img',
-          kind: 'image',
+      recent: [
+        recent({
+          messageId: 'om_recent_img',
+          kind: 'message',
           resources: [{ type: 'image', fileKey: 'img_v3_p', fileName: '截图.png' }],
         }),
-        pending({
-          messageId: 'om_pending_file',
-          kind: 'file',
+        recent({
+          messageId: 'om_recent_file',
+          kind: 'message',
           resources: [{ type: 'file', fileKey: 'file_v3_p', fileName: 'spec.pdf', folder: true }],
         }),
-        pending({ messageId: 'om_pending_forward', kind: 'merge_forward', resources: [] }),
-        pending({
-          messageId: 'om_consumed',
-          consumed: true,
-          resources: [{ type: 'image', fileKey: 'img_v3_old' }],
-        }),
-        pending({ messageId: 'om_empty_post', kind: 'post', resources: [] }),
+        recent({ messageId: 'om_recent_forward', kind: 'merge_forward', resources: [] }),
+        recent({ messageId: 'om_empty_post', kind: 'message', resources: [] }),
       ],
     })
 
     expect(rows(block)).toEqual([
-      '- message_id=om_pending_img file_key=img_v3_p type=image name="截图.png"',
-      '- message_id=om_pending_file file_key=file_v3_p type=file name="spec.pdf" folder=true',
-      '- message_id=om_pending_forward type=merge_forward',
+      '- message_id=om_recent_img file_key=img_v3_p type=image name="截图.png"',
+      '- message_id=om_recent_file file_key=file_v3_p type=file name="spec.pdf" folder=true',
+      '- message_id=om_recent_forward type=merge_forward',
     ])
-    expect(block).not.toContain('om_consumed')
-    expect(block).not.toContain('img_v3_old')
     expect(block).not.toContain('om_empty_post')
   })
 
@@ -160,38 +145,38 @@ describe('feishu context manifest', () => {
     })).toEqual([])
   })
 
-  it('orders quoted rows after trigger rows and before pending rows', () => {
+  it('orders quoted rows after trigger rows and before recent rows', () => {
     const block = buildFeishuContextBlock({
       trigger: [{ messageId: 'om_trigger', type: 'file', fileKey: 'file_v3_t' }],
       quote: [{ messageId: 'om_quote', type: 'file', fileKey: 'file_v3_q', fileName: 'quoted.pdf' }],
-      pending: [pending({
-        messageId: 'om_pending',
-        kind: 'image',
+      recent: [recent({
+        messageId: 'om_recent',
+        kind: 'message',
         resources: [{ type: 'image', fileKey: 'img_v3_p' }],
       })],
     })
     expect(rows(block)).toEqual([
       '- message_id=om_trigger file_key=file_v3_t type=file',
       '- message_id=om_quote file_key=file_v3_q type=file name="quoted.pdf"',
-      '- message_id=om_pending file_key=img_v3_p type=image',
+      '- message_id=om_recent file_key=img_v3_p type=image',
     ])
   })
 
   it('puts trigger rows first and deduplicates by message id and file key', () => {
     const block = buildFeishuContextBlock({
       trigger: [{ messageId: 'om_dup', type: 'file', fileKey: 'file_v3_dup', fileName: 'one.txt' }],
-      pending: [
-        pending({
+      recent: [
+        recent({
           messageId: 'om_dup',
-          kind: 'post',
+          kind: 'message',
           resources: [
             { type: 'file', fileKey: 'file_v3_dup', fileName: 'duplicate.txt' },
             { type: 'file', fileKey: 'file_v3_other' },
           ],
         }),
-        pending({
+        recent({
           messageId: 'om_later',
-          kind: 'image',
+          kind: 'message',
           resources: [{ type: 'image', fileKey: 'img_v3_later' }],
         }),
       ],
@@ -291,9 +276,9 @@ describe('feishu context manifest', () => {
     expect(FEISHU_CONTEXT_TAG).toBe('feishu_context')
     const input = {
       trigger: [{ messageId: 'om_t', type: 'file' as const, fileKey: 'file_v3_t', fileName: 'x.txt' }],
-      pending: [pending({
+      recent: [recent({
         messageId: 'om_p',
-        kind: 'image',
+        kind: 'message',
         resources: [{ type: 'image', fileKey: 'img_v3_p' }],
       })],
     }

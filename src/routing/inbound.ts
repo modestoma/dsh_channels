@@ -17,7 +17,7 @@ import type { AttachmentStoreMode, FeishuConfig } from '../config.ts'
 import { buildCard, buildOnboardingCard, initialStreamingCard } from '../cards.ts'
 import { RouteOperationQueue } from '../commands.ts'
 import { chatRouteKey, sessionDirOf } from '../domain.ts'
-import type { FeishuDomainHandle, PendingAttachmentRecord, RouteRecord } from '../domain.ts'
+import type { FeishuDomainHandle, RouteRecord } from '../domain.ts'
 import type { CardDelivery } from '../feishu/delivery.ts'
 import {
   adoptStagedAttachments, attachmentsDir, attachmentResources, hasAttachmentPayload,
@@ -31,7 +31,6 @@ import {
   InboundAttachmentStore, NativeAttachmentStore, effectiveAttachmentMode,
 } from '../feishu/native-attachments.ts'
 import type { InboundAttachmentStoreResult } from '../feishu/native-attachments.ts'
-import type { PendingAttachmentScope, PendingAttachmentStore } from '../feishu/pending-attachments.ts'
 import type { KnownAttachmentMessageInput, KnownAttachmentSource } from '../feishu/tools.ts'
 import type { FeishuChannel, NormalizedMessage } from '../feishu-channel.ts'
 import type { QuestionAnswerer } from '../interactions/questions.ts'
@@ -95,6 +94,16 @@ export interface InboundMessageReadPort {
     limit: number
     excludeMessageIds: readonly string[]
   }): Promise<{ block: string; messages: readonly KnownAttachmentMessageInput[] } | undefined>
+  /**
+   * Resolve the route owner's attachment messages sent after the previous turn,
+   * newest first, at most `recentAttachmentLimit`. A failed read resolves to an
+   * empty list.
+   */
+  recentAttachments(input: {
+    record: RouteRecord
+    firstTurn: boolean
+    excludeMessageIds: readonly string[]
+  }): Promise<readonly KnownAttachmentMessageInput[]>
 }
 
 /** Live trigger-image prefetch policy (see `prefetchImages` config). */
@@ -120,12 +129,10 @@ export interface InboundDeps {
   nativeAttachments(): AttachmentStore | undefined
   /** Backend-selecting archive/fallback store (legacy workspace download). */
   attachmentStore: InboundAttachmentStore
-  /** Durable metadata registry for silently registered attachments. */
-  pendingAttachments: PendingAttachmentStore
   /**
    * Pre-authorize a message's attachments for `feishu_attachment_fetch`:
-   * `trigger` (the triggering message) by default, `quote`/`history` for the
-   * messages this turn's excerpt/history blocks name.
+   * `trigger` (the triggering message) by default, `quote`/`history`/`recent`
+   * for the messages this turn's excerpt, history and manifest blocks name.
    */
   noteKnownAttachments(
     record: RouteRecord,
@@ -133,9 +140,9 @@ export interface InboundDeps {
     source?: KnownAttachmentSource,
   ): void
   /**
-   * Read-only message access: quoted-message excerpt and first-turn topic
-   * history. Failures degrade silently to a `undefined` value (never a throw
-   * into the turn).
+   * Read-only message access: quoted-message excerpt, first-turn topic
+   * history, and recent attachment messages. Failures degrade silently to an
+   * absent value (never a throw into the turn).
    */
   messageRead: InboundMessageReadPort
   /** Live image-prefetch policy for triggering messages. */
@@ -211,11 +218,14 @@ interface TurnReadContext {
   historyBlock?: string
 }
 
-/** First-turn-only inputs of the prompt assembly. */
+/** Per-turn inputs of the prompt assembly. */
 interface TurnDeliveryOptions {
   /** New Session's first turn: attach the bounded topic history bootstrap. */
   firstTurn?: boolean
-  /** Message ids never shown in the history block (trigger + streaming card). */
+  /**
+   * Message ids never shown in the history block or listed as recent
+   * attachments (trigger + streaming card).
+   */
   excludeMessageIds?: readonly string[]
 }
 
@@ -253,7 +263,6 @@ export class InboundRouter {
   private get delivery(): CardDelivery { return this.deps.delivery }
   private get sessions(): SessionManager { return this.deps.sessions }
   private get attachmentStore(): InboundAttachmentStore { return this.deps.attachmentStore }
-  private get pendingAttachments(): PendingAttachmentStore { return this.deps.pendingAttachments }
   private get routeOperations(): RouteOperationQueue { return this.deps.queue }
   private get streamer(): TurnStreamer | undefined { return this.deps.streamer() }
   private get questionAnswerer(): QuestionAnswerer | undefined { return this.deps.questionAnswerer() }
@@ -399,12 +408,12 @@ export class InboundRouter {
       }
     } else {
       // Native pipeline: classify without downloading. Attachment-only
-      // messages and messages that cannot start a turn are silently registered
-      // (no reply, no reaction, no Session); a mixed caption becomes the prompt
-      // with its placeholders stripped.
+      // messages and messages that cannot start a turn stay inert (no reply,
+      // no reaction, no Session); a mixed caption becomes the prompt with its
+      // placeholders stripped.
       const state = inboundAttachmentState(msg)
       if (state.hasPayload) {
-        const resolution = await this.resolveNativeAttachmentMessage(msg, state)
+        const resolution = this.resolveNativeAttachmentMessage(msg, state)
         if (resolution.kind === 'silent') return
         content = resolution.text
         if (content === '') return
@@ -413,10 +422,7 @@ export class InboundRouter {
 
     // A session blocked on `ask_user_question` has no other use for an inbound
     // text message: the next reply becomes the free-text answer.
-    if (await this.tryAnswerPendingQuestion(msg, content)) {
-      await this.registerConsumedTriggerAttachments(msg)
-      return
-    }
+    if (await this.tryAnswerPendingQuestion(msg, content)) return
 
     // 1. Real topic route first (works without a mention, per product spec).
     if (msg.threadId !== undefined) {
@@ -571,75 +577,31 @@ export class InboundRouter {
   /**
    * Native-pipeline attachment decision for one message, without downloading.
    *
-   * Returns `{ kind: 'silent' }` when the message must stay inert (metadata
-   * registration only: no reply, no reaction, no Session, no download) and
-   * `{ kind: 'prompt', text }` when a model turn starts with this text. The
-   * caller keeps the message flowing through the normal route decision tree.
+   * Returns `{ kind: 'silent' }` when the message must stay inert (no reply,
+   * no reaction, no Session, no download, no local state; a later turn finds
+   * it through the recent-attachment read) and `{ kind: 'prompt', text }` when
+   * a model turn starts with this text. The caller keeps the message flowing
+   * through the normal route decision tree.
    */
-  private async resolveNativeAttachmentMessage(
+  private resolveNativeAttachmentMessage(
     msg: NormalizedMessage,
     state: InboundAttachmentState,
-  ): Promise<{ kind: 'silent' } | { kind: 'prompt'; text: string }> {
-    // A foreign sender's attachment never registers (and is dropped later by
-    // the route-ownership checks): silent metadata must stay per-sender.
-    const threadRecord = msg.threadId === undefined ? undefined : this.routes.get(msg.threadId)
-    const chatKey = chatRouteKey(msg.chatType, msg.chatId, msg.senderId)
-    const chatRecord = threadRecord === undefined ? this.routes.get(chatKey) : undefined
-    const foreign = (threadRecord !== undefined && !this.access.ownsRoute(msg, threadRecord))
-      || (chatRecord !== undefined && !this.access.ownsRoute(msg, chatRecord))
-    if (foreign) return { kind: 'prompt', text: state.text }
-
-    if (!this.config.acceptAttachments && state.attachmentOnly) return { kind: 'silent' }
-    if (state.attachmentOnly) {
-      await this.registerSilentAttachment(msg)
-      return { kind: 'silent' }
-    }
+  ): { kind: 'silent' } | { kind: 'prompt'; text: string } {
+    if (state.attachmentOnly) return { kind: 'silent' }
     if (!this.config.acceptAttachments) return { kind: 'prompt', text: state.text }
 
     // Group messages without an @-mention (and without an already-bound topic)
-    // never start a turn, but their attachments must remain discoverable from
-    // the topic a later @-mentioned message creates (Roadmap AC-4).
-    const pendingEstablishment = this.establishing.get(chatKey)
+    // never start a turn; their attachments stay discoverable from the topic a
+    // later @-mentioned message creates (Roadmap AC-4).
+    const threadRecord = msg.threadId === undefined ? undefined : this.routes.get(msg.threadId)
+    const chatKey = chatRouteKey(msg.chatType, msg.chatId, msg.senderId)
+    const chatRecord = threadRecord === undefined ? this.routes.get(chatKey) : undefined
     const requiresMention = msg.chatType === 'group' && this.config.requireMention && !msg.mentionedBot
     const triggers = threadRecord !== undefined || chatRecord !== undefined
-      || pendingEstablishment !== undefined || !requiresMention
-    if (!triggers) {
-      await this.registerSilentAttachment(msg)
-      return { kind: 'silent' }
-    }
-    return { kind: 'prompt', text: state.text }
+      || this.establishing.has(chatKey) || !requiresMention
+    return triggers ? { kind: 'prompt', text: state.text } : { kind: 'silent' }
   }
 
-  /**
-   * Record attachment metadata without any side effect beyond the durable
-   * registry write. Never replies, reacts, downloads, or establishes a Session.
-   */
-  private async registerSilentAttachment(msg: NormalizedMessage): Promise<void> {
-    if (!this.config.acceptAttachments) return
-    // `admitted: true` is safe because every call site runs after
-    // `access.admit` returned true; the registry itself has no admission policy.
-    try {
-      await this.pendingAttachments.registerMessage(msg, { admitted: true })
-    } catch (error) {
-      // Metadata only: a registry failure must never fail the inbound pipeline.
-      this.ctx.logger?.warn?.(
-        'dsh-channels: registering pending attachment metadata for %s failed: %s',
-        msg.messageId, String(error),
-      )
-    }
-  }
-
-  /**
-   * A native-pipeline message whose caption was consumed as a structured
-   * question answer starts no model turn, so its attachments would otherwise
-   * vanish from the conversation. Register them silently for later turns;
-   * the archive backend already downloaded them before question interception.
-   */
-  private async registerConsumedTriggerAttachments(msg: NormalizedMessage): Promise<void> {
-    if (this.attachmentBackend() !== 'native') return
-    if (!inboundAttachmentState(msg).hasPayload) return
-    await this.registerSilentAttachment(msg)
-  }
   /**
    * Build the first-turn user message for the native pipeline: the caption
    * text, the quoted-message excerpt, the prefetched trigger images, the
@@ -682,6 +644,9 @@ export class InboundRouter {
     // read runs CONCURRENTLY with the bounded image prefetch below: neither
     // waits for the other, and a failed read degrades to its absence (AC6).
     const contextPromise = this.readTurnContext(msg, record, options)
+    const recentPromise = attachmentPipeline
+      ? this.readRecentAttachments(msg, record, options)
+      : Promise.resolve([])
 
     const loadedFileKeys = new Set<string>()
     const prefetchedBlocks: ContentBlock[] = []
@@ -715,17 +680,7 @@ export class InboundRouter {
     if (context.quoteBlock !== undefined) blocks.push({ type: 'text', text: context.quoteBlock })
     blocks.push(...prefetchedBlocks)
 
-    let pending: readonly PendingAttachmentRecord[] = []
-    if (attachmentPipeline) {
-      try {
-        pending = this.pendingAttachments.list(this.pendingScopeOfRecord(record))
-      } catch (error) {
-        this.ctx.logger?.warn?.(
-          'dsh-channels: listing pending attachments for %s failed: %s',
-          record.key, String(error),
-        )
-      }
-    }
+    const recent = await recentPromise
     const manifest = attachmentPipeline
       ? buildFeishuContextBlock({
         trigger: triggerManifestAttachments(msg, loadedFileKeys),
@@ -735,7 +690,7 @@ export class InboundRouter {
         ...(context.quoteMessage === undefined
           ? {}
           : { quote: manifestEntriesOfKnownMessage(context.quoteMessage) }),
-        pending,
+        recent,
       })
       : ''
     if (manifest !== '') blocks.push({ type: 'text', text: manifest })
@@ -904,13 +859,33 @@ export class InboundRouter {
   }
 
 
-  /** Pending-registry isolation scope for one persisted route. */
-  private pendingScopeOfRecord(record: RouteRecord): PendingAttachmentScope {
-    return {
-      chatId: record.chatId,
-      senderOpenId: record.senderOpenId,
-      ...(record.kind === 'thread' ? { threadId: record.key } : {}),
+  /**
+   * Read the owner's attachment messages sent after the previous turn and
+   * register each in the route's attachment whitelist, so the manifest rows
+   * they produce are fetchable. A failed read or registration degrades to
+   * fewer rows; the turn always runs.
+   */
+  private async readRecentAttachments(
+    msg: NormalizedMessage,
+    record: RouteRecord,
+    options: TurnDeliveryOptions,
+  ): Promise<readonly KnownAttachmentMessageInput[]> {
+    const messages = await this.deps.messageRead.recentAttachments({
+      record,
+      firstTurn: options.firstTurn === true,
+      excludeMessageIds: options.excludeMessageIds ?? [msg.messageId],
+    })
+    for (const message of messages) {
+      try {
+        this.deps.noteKnownAttachments(record, message, 'recent')
+      } catch (error) {
+        this.ctx.logger?.debug?.(
+          'dsh-channels: registering recent attachments of %s failed: %s',
+          message.messageId, String(error),
+        )
+      }
     }
+    return messages
   }
 
   /** Live channel accessor for best-effort prefetch; undefined when gone. */
@@ -1168,6 +1143,8 @@ export class InboundRouter {
       lastActivityAt: Date.now(),
     })
     this.streamer?.attach(live.agent.session, sent.messageId, msg.messageId, typingId)
-    live.agent.followup(await this.deliverTurnMessage(msg, current, content))
+    live.agent.followup(await this.deliverTurnMessage(msg, current, content, {
+      excludeMessageIds: [msg.messageId, sent.messageId],
+    }))
   }
 }

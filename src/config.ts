@@ -38,11 +38,11 @@ export const DEFAULT_QUESTION_TIMEOUT_MS = 5 * 60 * 1000
 export const ATTACHMENT_STORE_MODES = ['native', 'archive'] as const
 export type AttachmentStoreMode = (typeof ATTACHMENT_STORE_MODES)[number]
 
-/** Default retention of silently registered attachment metadata: 7 days. */
-export const DEFAULT_PENDING_ATTACHMENT_TTL_MS = 7 * 24 * 60 * 60 * 1000
+/** Default number of recent attachment messages one turn's manifest lists. */
+export const DEFAULT_RECENT_ATTACHMENT_LIMIT = 5
 
-/** Default per-`(chat, thread, sender)` cap of pending attachment rows. */
-export const DEFAULT_PENDING_ATTACHMENT_LIMIT = 10
+/** Upper bound of `recentAttachmentLimit`. */
+export const MAX_RECENT_ATTACHMENT_LIMIT = 20
 
 /** Default per-call attachment count of `feishu_attachment_fetch`. */
 export const DEFAULT_ATTACHMENT_FETCH_MAX_RESOURCES = 10
@@ -193,7 +193,7 @@ export const configSchema = z.object({
    * behind a prompt manifest; with the archive backend the resources are saved
    * below `<workspace>/attachments/` before the turn, exactly like the legacy
    * pipeline. Disabled keeps attachment messages inert (no save, no turn, no
-   * pending metadata registration).
+   * recent-attachment manifest rows).
    */
   acceptAttachments: z.boolean().default(true),
   /**
@@ -264,23 +264,15 @@ export const configSchema = z.object({
   promptContextTimeoutMs: z.number().int().min(100).max(10_000)
     .default(DEFAULT_PROMPT_CONTEXT_TIMEOUT_MS),
   /**
-   * Retention of silently registered attachment metadata (the
-   * `pending_attachments` table). A message that does not trigger a model turn
+   * Maximum number of the owner's recent attachment messages one turn lists in
+   * its `<feishu_context>` manifest. A message that triggers no turn
    * (attachment-only p2p message, un-mentioned group message, attachment-only
-   * message inside a bound topic) is recorded as metadata only; a later
-   * triggered message in the same `(chat, thread, sender)` scope may list and
-   * fetch it. Rows older than this window are removed by the periodic record
-   * GC. `0` disables age pruning (the per-scope cap still bounds each scope).
-   * Default 7 days.
+   * message inside a bound topic) leaves no local state; the next triggered
+   * turn reads Feishu history and lists the owner's attachment messages sent
+   * after the previous turn, newest first. Default 5.
    */
-  pendingAttachmentTtlMs: z.number().int().min(0).default(DEFAULT_PENDING_ATTACHMENT_TTL_MS),
-  /**
-   * Maximum silently registered attachment rows kept per `(chat, thread,
-   * sender)` scope. Registering beyond the cap evicts the oldest row of that
-   * scope; the prompt manifest only ever shows the most recent 5 unconsumed
-   * rows. Default 10.
-   */
-  pendingAttachmentLimit: z.number().int().min(1).max(100).default(DEFAULT_PENDING_ATTACHMENT_LIMIT),
+  recentAttachmentLimit: z.number().int().min(1).max(MAX_RECENT_ATTACHMENT_LIMIT)
+    .default(DEFAULT_RECENT_ATTACHMENT_LIMIT),
   /**
    * Model-facing Feishu tools.
    *

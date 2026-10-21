@@ -470,7 +470,7 @@ describe('overlay paths and validation', () => {
     expect(migrated.requireMention).toBe(false)
     expect(migrated.attachmentStore).toBe('native')
     expect(migrated.prefetchImages).toBe(true)
-    expect(migrated.pendingAttachmentLimit).toBe(base.pendingAttachmentLimit)
+    expect(migrated.recentAttachmentLimit).toBe(base.recentAttachmentLimit)
     expect(migrated.feishuTools.attachmentFetch).toBe(true)
   })
 
@@ -648,8 +648,7 @@ describe('field descriptors', () => {
     })
     expect(byKey.get('prefetchImageMaxBytes')).toMatchObject({ kind: 'number', min: 1 })
     expect(byKey.get('prefetchTotalMaxBytes')).toMatchObject({ kind: 'number', min: 1 })
-    expect(byKey.get('pendingAttachmentTtlMs')).toMatchObject({ kind: 'number', min: 0 })
-    expect(byKey.get('pendingAttachmentLimit')).toMatchObject({ kind: 'number', min: 1, max: 100 })
+    expect(byKey.get('recentAttachmentLimit')).toMatchObject({ kind: 'number', min: 1, max: 20 })
     expect(byKey.get('historyBootstrapLimit')).toMatchObject({ kind: 'number', min: 0, max: 20 })
     expect(byKey.get('promptContextTimeoutMs')).toMatchObject({ kind: 'number', group: 'tools' })
     expect(byKey.get('feishuTools.attachmentFetch')).toMatchObject({
@@ -668,7 +667,7 @@ describe('field descriptors', () => {
     })
     // Every new descriptor renders under the「会话与行为」tab.
     const toolOrContent = new Set([
-      'attachmentStore', 'prefetchImages', 'prefetchTimeoutMs', 'pendingAttachmentTtlMs',
+      'attachmentStore', 'prefetchImages', 'prefetchTimeoutMs', 'recentAttachmentLimit',
       'historyBootstrapLimit', 'feishuTools.attachmentFetch', 'feishuTools.topicMessages',
     ])
     for (const field of FIELD_DESCRIPTORS) {
@@ -1098,8 +1097,7 @@ describe('SettingsSurface', () => {
       prefetchImageMaxBytes: 1024,
       prefetchTotalMaxBytes: 4096,
       historyBootstrapLimit: 3,
-      pendingAttachmentTtlMs: 0,
-      pendingAttachmentLimit: 5,
+      recentAttachmentLimit: 8,
       promptContextTimeoutMs: 1_500,
       'feishuTools.attachmentFetch': false,
       'feishuTools.attachmentFetchMaxResources': 4,
@@ -1118,8 +1116,7 @@ describe('SettingsSurface', () => {
       prefetchImageMaxBytes: 1024,
       prefetchTotalMaxBytes: 4096,
       historyBootstrapLimit: 3,
-      pendingAttachmentTtlMs: 0,
-      pendingAttachmentLimit: 5,
+      recentAttachmentLimit: 8,
       promptContextTimeoutMs: 1_500,
       feishuTools: {
         attachmentFetch: false,

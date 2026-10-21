@@ -4,8 +4,8 @@
  * forward resources.
  *
  * The stubs mirror the real seams: a fake `ctx.attachments`, a fake
- * `ctx.tools` registry, the real pending-attachment registry (memory backing)
- * and a Feishu channel whose resource/message reads are scripted per test.
+ * `ctx.tools` registry and a Feishu channel whose resource/message reads are
+ * scripted per test.
  */
 
 import { createHash } from 'node:crypto'
@@ -19,7 +19,6 @@ import type {
 } from '../src/host/attachments.ts'
 import type { AgentContext, ToolDefinition, ToolRuntime } from '../src/host/agent.ts'
 import type { FeishuChannel, RawMessageListParams } from '../src/feishu-channel.ts'
-import { PendingAttachmentStore } from '../src/feishu/pending-attachments.ts'
 import {
   ATTACHMENT_FETCH_TOOL_NAME,
   AttachmentFetchToolRuntime,
@@ -27,6 +26,7 @@ import {
   TOPIC_MESSAGES_TOOL_NAME,
   TopicMessagesToolRuntime,
   attachmentFetchArgsSchema,
+  attachmentFetchFailureReason,
   presentAttachmentFetchResult,
   renderAttachmentFetchResult,
   renderTopicMessagesResult,
@@ -203,16 +203,6 @@ function makeTestChannel(handlers: {
   return channel
 }
 
-function makePendingStore(options: { now?: () => number; ttlMs?: number } = {}): PendingAttachmentStore {
-  return new PendingAttachmentStore({
-    table: () => undefined,
-    enabled: () => true,
-    ttlMs: () => options.ttlMs ?? 7 * 24 * 60 * 60 * 1000,
-    maxPerScope: () => 10,
-    ...(options.now === undefined ? {} : { now: options.now }),
-  })
-}
-
 function makeConfig(
   overrides: Omit<Partial<FeishuConfig>, 'feishuTools'> = {},
   tools: Partial<FeishuConfig['feishuTools']> = {},
@@ -239,7 +229,6 @@ interface RuntimeHarness {
   config: FeishuConfig
   channel: TestChannel
   store: FakeStore
-  pending: PendingAttachmentStore
   warn: ReturnType<typeof vi.fn>
   mount(): Promise<ToolDefinition>
   definition(): ToolDefinition
@@ -252,7 +241,6 @@ interface SetupOptions {
   channel?: TestChannel | null
   store?: FakeStore
   config?: FeishuConfig
-  pending?: PendingAttachmentStore
   route?: AttachmentFetchRoute
   sessionId?: string
   /** Simulate a session that has no durable route binding (unbound agent). */
@@ -268,7 +256,6 @@ function setupRuntime(options: SetupOptions = {}): RuntimeHarness {
   const configuredChannel = options.channel === undefined ? makeTestChannel() : options.channel
   const channel = configuredChannel ?? makeTestChannel()
   const store = options.store ?? makeAttachmentStore()
-  const pending = options.pending ?? makePendingStore()
   const route = options.route ?? DEFAULT_ROUTE
   const sessionId = options.sessionId ?? 'session-tools'
   const warn = vi.fn()
@@ -283,7 +270,6 @@ function setupRuntime(options: SetupOptions = {}): RuntimeHarness {
   const runtime = new AttachmentFetchToolRuntime({
     config: () => config,
     channel: () => configuredChannel ?? undefined,
-    pending: () => pending,
     routeOfSession: id => (options.unbound === true || id !== sessionId ? undefined : route),
     warn,
     now: () => 1_700_000_000_000,
@@ -311,7 +297,7 @@ function setupRuntime(options: SetupOptions = {}): RuntimeHarness {
     return found
   }
   return {
-    runtime, topic, ctx, definitions, register, route, config, channel, store, pending, warn,
+    runtime, topic, ctx, definitions, register, route, config, channel, store, warn,
     definition,
     async mount(): Promise<ToolDefinition> {
       await runtime.mount(ctx, sessionId)
@@ -787,119 +773,86 @@ describe('feishu attachment-fetch authorization', () => {
     expect(harness.channel.downloaded).toEqual([])
   })
 
-  it('authorizes pending-registry messages, consumes the manifest row and reuses the whitelist', async () => {
+  /** Script `message.get` to return one raw message (or fail) and count the calls. */
+  function readBack(
+    harness: RuntimeHarness,
+    message: Parameters<typeof makeRawMessage>[0] | Error,
+  ): { calls: string[] } {
+    const calls: string[] = []
+    harness.channel.messageGet = async (messageId: string) => {
+      calls.push(messageId)
+      if (message instanceof Error) throw message
+      return makeMessageGetResponse([makeRawMessage(message)])
+    }
+    return { calls }
+  }
+
+  const ownerFile = (messageId: string, partial: Parameters<typeof makeRawMessage>[0] = {}) => ({
+    message_id: messageId,
+    msg_type: 'file',
+    chat_id: DEFAULT_ROUTE.chatId,
+    thread_id: DEFAULT_ROUTE.key,
+    sender_type: 'user',
+    sender_id: DEFAULT_ROUTE.senderOpenId,
+    content: { file_key: `${messageId}_key`, file_name: 'owned.pdf' },
+    ...partial,
+  })
+
+  it('authorizes the route owner\'s own topic message read back from Feishu and remembers it', async () => {
     const harness = setupRuntime()
     const definition = await harness.mount()
-    const message = makeMessage({
-      messageId: 'om_pending',
-      chatId: DEFAULT_ROUTE.chatId,
-      threadId: DEFAULT_ROUTE.key,
-      senderId: DEFAULT_ROUTE.senderOpenId,
-      rawContentType: 'file',
-      content: '',
-      resources: [{ type: 'file', fileKey: 'file_key_pending', fileName: 'pending.pdf' }],
-    })
-    await harness.pending.registerMessage(message, { admitted: true })
+    const { calls } = readBack(harness, ownerFile('om_owned'))
 
-    const value = await runTool(definition, { message_id: 'om_pending' })
+    const value = await runTool(definition, { message_id: 'om_owned' })
     expect(value.ok).toBe(true)
     expect(harness.channel.downloaded[0]).toEqual({
-      messageId: 'om_pending', fileKey: 'file_key_pending', type: 'file',
+      messageId: 'om_owned', fileKey: 'om_owned_key', type: 'file',
     })
-    const scope = { chatId: DEFAULT_ROUTE.chatId, threadId: DEFAULT_ROUTE.key, senderOpenId: DEFAULT_ROUTE.senderOpenId }
-    expect(harness.pending.list(scope)).toEqual([])
-    // Consumed rows stay queryable, and the whitelist keeps retries authorized.
-    expect(harness.pending.get(scope, 'om_pending')?.consumed).toBe(true)
-    const retry = await runTool(definition, { message_id: 'om_pending' })
+    // The resolved message joins the whitelist: a retry needs no second read.
+    const retry = await runTool(definition, { message_id: 'om_owned' })
     expect(retry.ok).toBe(true)
+    expect(calls).toEqual(['om_owned'])
   })
 
-  it('keeps an all-failed pending fetch discoverable (not consumed) and retriable', async () => {
+  it('lets a topic route read back the owner\'s main-timeline message (AC-4)', async () => {
     const harness = setupRuntime()
     const definition = await harness.mount()
-    const message = makeMessage({
-      messageId: 'om_pending_fail',
-      chatId: DEFAULT_ROUTE.chatId,
-      threadId: DEFAULT_ROUTE.key,
-      senderId: DEFAULT_ROUTE.senderOpenId,
-      rawContentType: 'file',
-      content: '',
-      resources: [{ type: 'file', fileKey: 'file_key_flaky' }],
-    })
-    await harness.pending.registerMessage(message, { admitted: true })
-    harness.channel.downloadResource = async () => { throw new Error('temporary failure') }
+    // A group file posted WITHOUT an @ before the topic existed has no thread
+    // id; the later @-created topic must still fetch it.
+    readBack(harness, ownerFile('om_owned_main', { thread_id: undefined }))
 
-    const failed = await runTool(definition, { message_id: 'om_pending_fail' })
-    expect(failed.ok).toBe(false)
-    const scope = { chatId: DEFAULT_ROUTE.chatId, threadId: DEFAULT_ROUTE.key, senderOpenId: DEFAULT_ROUTE.senderOpenId }
-    expect(harness.pending.list(scope)).toHaveLength(1)
-
-    // The whitelist entry recorded before the downloads keeps the retry authorized.
-    harness.channel.downloadResource = async () => streamOf([fileBytes(7)])
-    const retry = await runTool(definition, { message_id: 'om_pending_fail' })
-    expect(retry.ok).toBe(true)
-    expect(harness.pending.list(scope)).toEqual([])
-  })
-
-  it('does not see another sender\'s pending registration', async () => {
-    const harness = setupRuntime()
-    const definition = await harness.mount()
-    const message = makeMessage({
-      messageId: 'om_pending_other',
-      chatId: DEFAULT_ROUTE.chatId,
-      threadId: DEFAULT_ROUTE.key,
-      senderId: 'ou_someone_else',
-      rawContentType: 'file',
-      content: '',
-      resources: [{ type: 'file', fileKey: 'file_key_other_owner' }],
-    })
-    await harness.pending.registerMessage(message, { admitted: true })
-
-    const value = await runTool(definition, { message_id: 'om_pending_other' })
-    expect(value.ok).toBe(false)
-    expect(harness.channel.downloaded).toEqual([])
-  })
-
-  it('lets a topic route reach its own chat-scope pending registration', async () => {
-    const harness = setupRuntime()
-    const definition = await harness.mount()
-    // A group file posted WITHOUT an @ before the topic existed is registered
-    // without a thread id; the later @-created topic must still fetch it.
-    const message = makeMessage({
-      messageId: 'om_pending_chat_scope',
-      chatId: DEFAULT_ROUTE.chatId,
-      threadId: undefined,
-      senderId: DEFAULT_ROUTE.senderOpenId,
-      rawContentType: 'file',
-      content: '',
-      resources: [{ type: 'file', fileKey: 'file_key_chat_scope' }],
-    })
-    await harness.pending.registerMessage(message, { admitted: true })
-
-    const value = await runTool(definition, { message_id: 'om_pending_chat_scope' })
+    const value = await runTool(definition, { message_id: 'om_owned_main' })
     expect(value.ok).toBe(true)
-    expect(harness.channel.downloaded[0]?.fileKey).toBe('file_key_chat_scope')
+    expect(harness.channel.downloaded[0]?.fileKey).toBe('om_owned_main_key')
   })
 
-  it('refuses an expired pending registration', async () => {
-    let now = 1_000
-    const pending = makePendingStore({ now: () => now, ttlMs: 100 })
-    const harness = setupRuntime({ pending })
-    const definition = await harness.mount()
-    const message = makeMessage({
-      messageId: 'om_pending_expired',
-      chatId: DEFAULT_ROUTE.chatId,
-      threadId: DEFAULT_ROUTE.key,
-      senderId: DEFAULT_ROUTE.senderOpenId,
-      rawContentType: 'file',
-      content: '',
-      resources: [{ type: 'file', fileKey: 'file_key_expired' }],
-    })
-    await pending.registerMessage(message, { admitted: true })
-    now += 200
+  it('refuses read-back messages of another sender, topic, or chat, and deleted ones', async () => {
+    const cases: Array<Parameters<typeof makeRawMessage>[0]> = [
+      ownerFile('om_foreign', { sender_id: 'ou_someone_else' }),
+      ownerFile('om_foreign', { thread_id: 'omt_other_topic' }),
+      ownerFile('om_foreign', { chat_id: 'oc_other_chat' }),
+      ownerFile('om_foreign', { chat_id: undefined }),
+      ownerFile('om_foreign', { deleted: true }),
+    ]
+    for (const message of cases) {
+      const harness = setupRuntime()
+      const definition = await harness.mount()
+      readBack(harness, message)
+      const value = await runTool(definition, { message_id: 'om_foreign' })
+      expect(value.ok).toBe(false)
+      expect(value.summary).toContain(attachmentFetchFailureReason('AUTHORIZATION_DENIED'))
+      expect(harness.channel.downloaded).toEqual([])
+    }
+  })
 
-    const value = await runTool(definition, { message_id: 'om_pending_expired' })
+  it('fails closed when the read-back fails', async () => {
+    const harness = setupRuntime()
+    const definition = await harness.mount()
+    readBack(harness, new Error('missing scope'))
+
+    const value = await runTool(definition, { message_id: 'om_unreadable' })
     expect(value.ok).toBe(false)
+    expect(value.summary).toContain(attachmentFetchFailureReason('AUTHORIZATION_DENIED'))
     expect(harness.channel.downloaded).toEqual([])
   })
 
@@ -1323,42 +1276,6 @@ describe('feishu attachment-fetch limits and cancellation', () => {
     expect(value.results[0]?.code).toBe('ABORTED')
     expect(harness.store.files).toEqual([])
     expect(harness.store.aborted.count).toBeGreaterThan(0)
-  })
-
-  it('never hangs on a stalled pending-consume write after fetching', async () => {
-    vi.useFakeTimers()
-    try {
-      const record = {
-        key: 'om_pending_stall',
-        scopeKey: 'thread:oc_chat:omt_thread_1:ou_user',
-        messageId: 'om_pending_stall',
-        chatId: DEFAULT_ROUTE.chatId,
-        chatType: 'group',
-        threadId: DEFAULT_ROUTE.key,
-        senderOpenId: DEFAULT_ROUTE.senderOpenId,
-        receivedAt: 1,
-        kind: 'file',
-        resources: [{ type: 'file', fileKey: 'file_key_stall' }],
-      }
-      const stalled = {
-        get: () => record,
-        consume: () => new Promise(() => {}),
-      } as unknown as PendingAttachmentStore
-      const harness = setupRuntime({
-        pending: stalled,
-        config: makeConfig({}, { attachmentFetchTimeoutMs: 1_000 }),
-      })
-      const definition = await harness.mount()
-      const execution = runTool(definition, { message_id: 'om_pending_stall' })
-      await vi.advanceTimersByTimeAsync(1_100)
-      const value = await execution
-      // Attachment delivery already happened; the stalled bookkeeping write
-      // must not keep the tool call pending past the deadline.
-      expect(value.ok).toBe(true)
-      expect(harness.store.files).toHaveLength(1)
-    } finally {
-      vi.useRealTimers()
-    }
   })
 
   it('times out with a readable reason and leaves no committed file', async () => {
@@ -2031,37 +1948,30 @@ describe('feishu topic-messages single read', () => {
     expect(value.messages[0]?.text).toBe('main timeline quote')
   })
 
-  it('allows a pending-registry main-timeline message in a topic route', async () => {
+  it('allows the owner\'s main-timeline message in a topic route', async () => {
     const harness = setupRuntime()
-    const message = makeMessage({
-      messageId: 'om_pending_main',
-      chatId: DEFAULT_ROUTE.chatId,
-      senderId: DEFAULT_ROUTE.senderOpenId,
-      rawContentType: 'file',
-      content: '',
-      resources: [{ type: 'file', fileKey: 'file_key_pending_main' }],
-    })
-    await harness.pending.registerMessage(message, { admitted: true })
     harness.channel.messageGet = async () => makeMessageGetResponse([
       makeRawMessage({
-        message_id: 'om_pending_main',
+        message_id: 'om_owner_main',
         msg_type: 'file',
         chat_id: DEFAULT_ROUTE.chatId,
-        content: { file_key: 'file_key_pending_main', file_name: 'pending.pdf' },
+        sender_type: 'user',
+        sender_id: DEFAULT_ROUTE.senderOpenId,
+        content: { file_key: 'file_key_owner_main', file_name: 'owner.pdf' },
       }),
     ])
     const definition = await harness.mountTopic()
 
-    const value = await runTopicTool(definition, { message_id: 'om_pending_main' })
+    const value = await runTopicTool(definition, { message_id: 'om_owner_main' })
     expect(value.ok).toBe(true)
     expect(value.messages[0]?.resources?.[0]).toEqual({
-      type: 'file', file_key: 'file_key_pending_main', name: 'pending.pdf',
+      type: 'file', file_key: 'file_key_owner_main', name: 'owner.pdf',
     })
     // The read also refreshes the shared whitelist for the fetch tool.
-    expect(harness.runtime.isKnownMessage(DEFAULT_ROUTE, 'om_pending_main')).toBe(true)
+    expect(harness.runtime.isKnownMessage(DEFAULT_ROUTE, 'om_owner_main')).toBe(true)
   })
 
-  it('exposes isKnownMessage over the whitelist and durable pending registry', async () => {
+  it('exposes isKnownMessage over the whitelist', async () => {
     const harness = setupRuntime()
     expect(harness.runtime.isKnownMessage(DEFAULT_ROUTE, 'om_unknown')).toBe(false)
 
@@ -2069,25 +1979,15 @@ describe('feishu topic-messages single read', () => {
     expect(harness.runtime.isKnownMessage(DEFAULT_ROUTE, knownId)).toBe(true)
     expect(harness.runtime.isKnownMessage({ ...DEFAULT_ROUTE, key: 'omt_other' }, knownId)).toBe(false)
 
-    const pendingMessage = makeMessage({
-      messageId: 'om_pending_known',
-      chatId: DEFAULT_ROUTE.chatId,
-      threadId: DEFAULT_ROUTE.key,
-      senderId: DEFAULT_ROUTE.senderOpenId,
-      rawContentType: 'file',
-      content: '',
-      resources: [{ type: 'file', fileKey: 'file_key_known' }],
-    })
-    await harness.pending.registerMessage(pendingMessage, { admitted: true })
-    expect(harness.runtime.isKnownMessage(DEFAULT_ROUTE, 'om_pending_known')).toBe(true)
-
-    // 'history' is a valid registration source for the shared whitelist.
-    harness.runtime.noteKnownMessage(
-      DEFAULT_ROUTE,
-      { messageId: 'om_history_known', kind: 'message', resources: [] },
-      'history',
-    )
-    expect(harness.runtime.isKnownMessage(DEFAULT_ROUTE, 'om_history_known')).toBe(true)
+    // 'history' and 'recent' are valid registration sources for the shared whitelist.
+    for (const source of ['history', 'recent'] as const) {
+      harness.runtime.noteKnownMessage(
+        DEFAULT_ROUTE,
+        { messageId: `om_${source}_known`, kind: 'message', resources: [] },
+        source,
+      )
+      expect(harness.runtime.isKnownMessage(DEFAULT_ROUTE, `om_${source}_known`)).toBe(true)
+    }
   })
 
   it('expands a merged-forward container into child messages and notes the child count', async () => {

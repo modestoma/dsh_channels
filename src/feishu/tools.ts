@@ -14,21 +14,19 @@
  * against a per-route whitelist of messages the channel has already admitted
  * as relevant:
  *
- * - the triggering message / a quoted message registered by the admission and
- *   quote layers through {@link AttachmentFetchToolRuntime.noteKnownMessage};
- * - silently registered attachment messages from the `pending_attachments`
- *   registry (same `(chat, thread?, sender)` scope rules);
+ * - the triggering message, a quoted message, history rows, and the owner's
+ *   recent attachment messages, registered by the inbound layer through
+ *   {@link AttachmentFetchToolRuntime.noteKnownMessage};
  * - messages this tool already resolved (successful or failed attempts), so a
- *   later turn in the same session keeps its authorized resources.
+ *   later turn in the same session keeps its authorized resources;
+ * - on a whitelist miss, a message the tool reads back from Feishu and finds to
+ *   be the route owner's own message in the route's chat, inside its topic or
+ *   on the main timeline.
  *
- * The whitelist is an in-memory LRU per route; the pending registry is the
- * durable source for admitted attachment messages (silent registrations and,
- * once the admission task wires it, triggering messages). A prompt-injected
- * message id from another chat, user, or topic therefore cannot download
- * anything. The whitelist is not replayed from Session history: after a host
- * restart the admission/manifest layer re-registers the current turn's
- * messages, while older attachments remain reachable through the durable
- * pending registry until its TTL.
+ * The whitelist is an in-memory LRU per route and is not replayed from Session
+ * history; the read-back rule keeps the owner's earlier attachments fetchable
+ * after a host restart. A prompt-injected message id from another chat, user,
+ * or topic therefore cannot download anything.
  *
  * Failure model: every per-resource failure is a structured value (never a
  * thrown raw error) so one bad resource does not abort the call and session
@@ -40,7 +38,6 @@
 
 import { z } from 'zod'
 import type { FeishuConfig } from '../config.ts'
-import type { PendingAttachmentRecord, PendingAttachmentResource } from '../domain.ts'
 import type {
   AgentContext, ToolContentBlock, ToolDefinition, ToolExecution,
 } from '../host/agent.ts'
@@ -70,7 +67,6 @@ import {
 import type {
   AttachmentFailureCode, AttachmentResult, NativeAttachmentStore, StoredFile, StoredImage,
 } from './native-attachments.ts'
-import type { PendingAttachmentScope, PendingAttachmentStore } from './pending-attachments.ts'
 
 // ---- Public identity ----------------------------------------------------
 
@@ -115,7 +111,8 @@ export interface AttachmentFetchRoute {
 export type KnownAttachmentSource =
   | 'trigger'
   | 'quote'
-  | 'pending'
+  /** An attachment message the route owner sent after the previous turn. */
+  | 'recent'
   | 'tool-result'
   | 'manual'
   /** A message discovered while reading topic history/quote context (P2). */
@@ -165,16 +162,6 @@ function routesMatch(left: AttachmentFetchRoute, right: AttachmentFetchRoute): b
     && left.senderOpenId === right.senderOpenId
 }
 
-/** Pending-registry scope for one route (`threadId` only for topic routes). */
-export function pendingScopeOfRoute(route: AttachmentFetchRoute): PendingAttachmentScope {
-  const threadId = threadIdOfRoute(route)
-  return {
-    chatId: route.chatId,
-    senderOpenId: route.senderOpenId,
-    ...(threadId === undefined ? {} : { threadId }),
-  }
-}
-
 interface WhitelistedMessage {
   readonly route: AttachmentFetchRoute
   readonly message: KnownAttachmentMessage
@@ -185,11 +172,10 @@ interface WhitelistedMessage {
 /**
  * Per-route LRU of messages the channel has declared relevant.
  *
- * The store is intentionally process-local: silently registered attachments
- * have a durable registry of their own, while trigger/quote knowledge only
- * lives as long as the process (after a restart the admission/manifest layer
- * re-registers the current turn's messages; this tool does not replay Session
- * history into the whitelist).
+ * The store is intentionally process-local: after a restart the inbound layer
+ * re-registers the current turn's messages, and the fetch tool's owner
+ * read-back authorizes the owner's earlier messages; Session history is never
+ * replayed into the whitelist.
  */
 export class RouteAttachmentWhitelist {
   private readonly routes = new Map<string, Map<string, WhitelistedMessage>>()
@@ -285,7 +271,7 @@ export type AttachmentFetchFailureCode =
 
 const FETCH_FAILURE_REASONS: Readonly<Record<string, string>> = {
   ROUTE_NOT_FOUND: '当前会话尚未绑定飞书对话，无法获取附件',
-  AUTHORIZATION_DENIED: '该消息不在本会话的附件授权范围内（仅可获取触发消息、引用消息或附件清单中登记的消息）',
+  AUTHORIZATION_DENIED: '该消息不在本会话的附件授权范围内（仅可获取触发消息、引用消息、附件清单中列出的消息或本人在本会话发送的消息）',
   CHANNEL_UNAVAILABLE: '飞书连接未运行，无法获取附件',
   MESSAGE_READ_FAILED: '读取飞书消息内容失败',
   NO_RESOURCES: '该消息不包含可下载的图片或文件',
@@ -423,8 +409,6 @@ export interface AttachmentFetchRuntimeDeps {
   config(): FeishuConfig
   /** Live Feishu channel; undefined while disconnected/shut down. */
   channel(): FeishuChannel | undefined
-  /** Durable silent-registration registry (authorization + consumption). */
-  pending?(): PendingAttachmentStore | undefined
   /** Resolve the route currently bound to one session. */
   routeOfSession(sessionId: string): AttachmentFetchRoute | undefined
   /** Structured warning sink (mount degradation, unexpected failures). */
@@ -443,7 +427,6 @@ interface FetchCallContext {
   readonly native: NativeAttachmentStore
   readonly imageCap: number
   readonly channel: FeishuChannel | undefined
-  readonly pending: PendingAttachmentStore | undefined
 }
 
 interface DownloadBudget {
@@ -496,25 +479,13 @@ export class AttachmentFetchToolRuntime {
   }
 
   /**
-   * Whether one message id is authorized for one route: the in-memory whitelist
-   * first, then the durable pending registry — the same sources
-   * {@link resolveKnownMessage} uses when a fetch is executed. The
-   * `feishu_topic_messages` tool calls this to decide whether a main-timeline
-   * message (no `thread_id`) may be detached into the current topic route.
-   *
-   * Never throws: an unavailable registry fails closed.
+   * Whether one message id is in the route's whitelist. The
+   * `feishu_topic_messages` tool calls this to decide whether another sender's
+   * main-timeline message (no `thread_id`) may be read from the current topic
+   * route.
    */
   isKnownMessage(route: AttachmentFetchRoute, messageId: string): boolean {
-    if (this.whitelist.lookup(route, messageId) !== undefined) return true
-    const pending = this.deps.pending?.()
-    if (pending === undefined) return false
-    try {
-      return pending.get(pendingScopeOfRoute(route), messageId) !== undefined
-    } catch {
-      // Authorization lookups fail closed; a storage hiccup must not throw into
-      // the topic tool's read path.
-      return false
-    }
+    return this.whitelist.lookup(route, messageId) !== undefined
   }
 
   /**
@@ -702,7 +673,6 @@ export class AttachmentFetchToolRuntime {
       native: nativeAttachmentStoreOf(agentCtx),
       imageCap: imageByteCapOf(agentCtx),
       channel: this.deps.channel(),
-      pending: this.deps.pending?.(),
     }
     try {
       return await this.fetch(call)
@@ -726,8 +696,11 @@ export class AttachmentFetchToolRuntime {
     }
 
     // 1. Authorize the message against this route's known resources.
-    const known = this.resolveKnownMessage(call, messageId)
+    const known = await this.resolveKnownMessage(call, messageId)
     if (known === undefined) {
+      if (call.signal.aborted) {
+        return callFailure(messageId, failure(call.timeout.value ? 'TIMEOUT' : 'ABORTED'))
+      }
       return callFailure(messageId, failure('AUTHORIZATION_DENIED'))
     }
 
@@ -796,21 +769,6 @@ export class AttachmentFetchToolRuntime {
     }
 
     const fetched = results.filter(item => item.ok).length
-    // A pending manifest row is consumed only once an attachment was actually
-    // fetched: a run where every download failed keeps the row discoverable
-    // (retries are still authorized by the whitelist entry recorded above).
-    // The durable write is best-effort and raced against the call signal, so a
-    // stalled storage backend can never keep the tool call pending.
-    if (fetched > 0 && call.pending !== undefined) {
-      try {
-        await cancellable(
-          Promise.resolve(call.pending.consume(pendingScopeOfRoute(call.route), known.messageId)),
-          call.signal,
-        )
-      } catch {
-        // Bookkeeping only: the attachments were already delivered.
-      }
-    }
     const shownMessageId = displayText(messageId)
     const summary = fetched > 0
       ? `已获取 ${fetched}/${results.length} 个附件（消息 ${shownMessageId}）`
@@ -826,18 +784,33 @@ export class AttachmentFetchToolRuntime {
     }
   }
 
-  /** Whitelist first, then the durable silent-registration registry. */
-  private resolveKnownMessage(
+  /** Whitelist first, then the owner read-back. */
+  private async resolveKnownMessage(
     call: FetchCallContext,
     messageId: string,
-  ): KnownAttachmentMessage | undefined {
-    const known = this.whitelist.lookup(call.route, messageId)
-    if (known !== undefined) return known
-    const pending = call.pending
-    if (pending === undefined) return undefined
-    const record = pending.get(pendingScopeOfRoute(call.route), messageId)
-    if (record === undefined) return undefined
-    return knownMessageOfPending(record)
+  ): Promise<KnownAttachmentMessage | undefined> {
+    return this.whitelist.lookup(call.route, messageId) ?? await this.readOwnedMessage(call, messageId)
+  }
+
+  /**
+   * Authorize a whitelist miss by reading the message back from Feishu: the
+   * route owner's own, undeleted message that belongs to the route
+   * (`messageBelongsToRoute`) is authorized. Every read failure fails closed.
+   */
+  private async readOwnedMessage(
+    call: FetchCallContext,
+    messageId: string,
+  ): Promise<KnownAttachmentMessage | undefined> {
+    const channel = call.channel
+    if (channel === undefined) return undefined
+    const reader = new MessageReader({ channel: () => channel })
+    const read = await reader.readMessage(messageId, { signal: call.signal })
+    if (!read.ok) return undefined
+    const container = quoteItemsOf(read.value)
+    if (container === undefined || container.deleted) return undefined
+    if (container.senderOpenId !== call.route.senderOpenId) return undefined
+    if (!messageBelongsToRoute(call.route, container)) return undefined
+    return knownMessageOfItems(read.value)
   }
 
   /** Record the resolved message as known for later turns of this route. */
@@ -906,8 +879,8 @@ export class AttachmentFetchToolRuntime {
     message: KnownAttachmentMessage,
     resource: KnownAttachmentResource,
   ): Promise<AttachmentFetchResultItem> {
-    // `containerMessageId` is part of a trusted registration (pending record or
-    // admission-provided whitelist entry), never model input: the P0 rule makes
+    // `containerMessageId` is part of a trusted whitelist registration, never
+    // model input: the P0 rule makes
     // merged-forward child bytes downloadable only through the top-level
     // container id, so child ids are never used as download ids here.
     const downloadId = resource.containerMessageId ?? message.messageId
@@ -1505,22 +1478,6 @@ function isPostBody(record: Record<string, unknown>): boolean {
   return Array.isArray(record.content) || Array.isArray(record.files)
 }
 
-/** Pending registry record → known message (authorization snapshot). */
-function knownMessageOfPending(record: PendingAttachmentRecord): KnownAttachmentMessage {
-  return {
-    messageId: record.messageId,
-    kind: record.kind === 'merge_forward' ? 'merge_forward' : 'message',
-    senderOpenId: record.senderOpenId,
-    resources: record.resources.map((resource: PendingAttachmentResource): KnownAttachmentResource => ({
-      type: resource.type,
-      fileKey: resource.fileKey,
-      ...(resource.fileName === undefined ? {} : { fileName: resource.fileName }),
-      ...(resource.folder === true ? { folder: true } : {}),
-      ...(resource.containerMessageId === undefined ? {} : { containerMessageId: resource.containerMessageId }),
-    })),
-  }
-}
-
 /**
  * Wait for one cordis injection to settle, but never longer than `timeoutMs`:
  * a hard dependency on a service a deployment does not mount would otherwise
@@ -1722,7 +1679,7 @@ const TOPIC_MESSAGES_FAILURE_REASONS: Readonly<Record<TopicMessagesFailureCode, 
   TOOL_DISABLED: '话题消息读取工具已禁用',
   INVALID_ARGUMENT: '读取消息的参数不合法',
   MESSAGE_OUT_OF_ROUTE:
-    '该消息不在当前会话的飞书话题/聊天范围内（仅可读取当前话题的消息或本会话已登记的消息）',
+    '该消息不在当前会话的飞书话题/聊天范围内（仅可读取当前话题的消息、本人在本聊天主线发送的消息或本会话已知的消息）',
   MESSAGE_READ_FAILED: '读取飞书消息失败',
   PERMISSION_DENIED: '飞书应用缺少读取消息的权限（如 im:message:readonly），无法读取引用或话题消息',
   ABORTED: '读取飞书消息已取消',
@@ -1838,7 +1795,7 @@ export interface TopicMessagesRuntimeDeps {
     message: KnownAttachmentMessageInput,
     source: KnownAttachmentSource,
   ): void
-  /** Whether one message id is already authorized for the route (whitelist/pending). */
+  /** Whether one message id is already in the route's whitelist. */
   isKnownMessage(route: AttachmentFetchRoute, messageId: string): boolean
   /**
    * Whether `feishu_attachment_fetch` is usable in this deployment (native
@@ -2121,9 +2078,10 @@ export class TopicMessagesToolRuntime {
       }
     }
     // Route membership is enforced on the container: another chat, another
-    // topic of the same group, or an unregistered main-timeline message is
-    // refused. A message already admitted to this route (trigger/quote/pending)
-    // may be read even without a topic id (quotes happen before the topic).
+    // topic of the same group, or another sender's unregistered main-timeline
+    // message is refused. The owner's main-timeline messages and messages
+    // already admitted to this route (trigger/quote/recent) may be read even
+    // without a topic id (they precede the topic).
     const known = this.deps.isKnownMessage(route, messageId)
     if (!messageBelongsToRoute(route, container, known ? [messageId] : [])) {
       return {

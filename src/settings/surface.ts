@@ -201,7 +201,7 @@ const FIELD_META: Record<EditableKey, { label: string; help: string; min?: numbe
   },
   acceptAttachments: {
     label: '接收入站附件',
-    help: '接收飞书图片、文件与合并转发记录。native（默认）下入站附件存入 DSH 原生附件库：触发消息的图片预取进首轮、文件保持懒取，纯附件消息静默登记元数据；archive 下按旧版行为下载到工作区 attachments/。关闭后附件消息不保存、不触发模型、也不登记。',
+    help: '接收飞书图片、文件与合并转发记录。native（默认）下入站附件存入 DSH 原生附件库：触发消息的图片预取进首轮、文件保持懒取，纯附件消息不回复、不落地，下一次触发时从飞书历史读出并列入附件清单；archive 下按旧版行为下载到工作区 attachments/。关闭后附件消息不保存、不触发模型、也不列入清单。',
   },
   attachmentStore: {
     label: '入站附件存储后端',
@@ -239,17 +239,11 @@ const FIELD_META: Record<EditableKey, { label: string; help: string; min?: numbe
     max: 20,
     step: 1,
   },
-  pendingAttachmentTtlMs: {
-    label: '静默附件登记有效期（ms）',
-    help: '纯附件/未触发消息只登记元数据（不下载）。超过该时长的登记由周期 GC 清除；0 = 不按时间清理（每个 scope 仍有容量上限）。默认 604800000 = 7 天。',
-    min: 0,
-    step: 1,
-  },
-  pendingAttachmentLimit: {
-    label: '静默附件登记容量（每个 scope）',
-    help: '每个 (会话, 话题, 发送者) scope 最多保留的登记条数（1–100）；超出时淘汰该 scope 最旧的一条。',
+  recentAttachmentLimit: {
+    label: '近期附件条数',
+    help: '未触发回复的附件消息（纯附件、群里未 @ 的消息）不在本地登记；下一次触发时读取飞书消息历史，列出本人自上一轮之后发送的最近 N 条附件消息供 Agent 按需获取（1–20，默认 5）。读取使用被动读取预算，失败时静默省略。',
     min: 1,
-    max: 100,
+    max: 20,
     step: 1,
   },
   promptContextTimeoutMs: {
@@ -325,8 +319,7 @@ const GROUP_OF: Record<EditableKey, EditableFieldWire['group']> = {
   prefetchImageMaxBytes: 'content',
   prefetchTotalMaxBytes: 'content',
   historyBootstrapLimit: 'content',
-  pendingAttachmentTtlMs: 'content',
-  pendingAttachmentLimit: 'content',
+  recentAttachmentLimit: 'content',
   promptContextTimeoutMs: 'tools',
   'feishuTools.attachmentFetch': 'tools',
   'feishuTools.attachmentFetchMaxResources': 'tools',
