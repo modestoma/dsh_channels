@@ -453,12 +453,12 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
     }
   }, [applyAccess])
 
-  const onAddAccessUser = useCallback(async (openId: string, name: string): Promise<boolean> => {
+  const onAddAccessUser = useCallback(async (userId: string, name: string): Promise<boolean> => {
     setBusy('access')
     setAccessError(null)
     setAccessNotice(null)
     try {
-      const result = await addAccessUser(openId, name)
+      const result = await addAccessUser(userId, name)
       if (!result.ok) {
         setAccessError(result.error)
         return false
@@ -474,12 +474,12 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
     }
   }, [applyAccess])
 
-  const onRemoveAccessUser = useCallback(async (openId: string): Promise<void> => {
+  const onRemoveAccessUser = useCallback(async (userId: string): Promise<void> => {
     setBusy('access')
     setAccessError(null)
     setAccessNotice(null)
     try {
-      const result = await removeAccessUser(openId)
+      const result = await removeAccessUser(userId)
       if (!result.ok) {
         setAccessError(result.error)
         return
@@ -696,7 +696,7 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
                 onAddGroup={onAddAccessGroup}
                 onRemoveGroup={chatId => { void onRemoveAccessGroup(chatId) }}
                 onAddUser={onAddAccessUser}
-                onRemoveUser={openId => { void onRemoveAccessUser(openId) }}
+                onRemoveUser={userId => { void onRemoveAccessUser(userId) }}
                 onResolveRequest={(token, decision) => { void onResolveAccessRequest(token, decision) }}
               />
             )

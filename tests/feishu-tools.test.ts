@@ -216,7 +216,7 @@ const DEFAULT_ROUTE: AttachmentFetchRoute = {
   kind: 'thread',
   chatId: 'oc_chat',
   chatType: 'group',
-  senderOpenId: 'ou_user',
+  senderUserId: 'u_user',
 }
 
 interface RuntimeHarness {
@@ -613,7 +613,7 @@ describe('feishu attachment-fetch registration', () => {
       sessionId: 'session-resume',
       chatId: 'oc_chat',
       chatType: 'group',
-      senderOpenId: 'ou_user',
+      senderUserId: 'u_user',
       workspacePath: '/tmp/ws',
       cardMessageId: 'om_card',
       createdAt: 1,
@@ -683,9 +683,9 @@ describe('feishu attachment-fetch authorization', () => {
     })
     expect(whitelist.lookup(DEFAULT_ROUTE, 'om_1')?.messageId).toBe('om_1')
     expect(whitelist.lookup({ ...DEFAULT_ROUTE, chatId: 'oc_other' }, 'om_1')).toBeUndefined()
-    expect(whitelist.lookup({ ...DEFAULT_ROUTE, senderOpenId: 'ou_other' }, 'om_1')).toBeUndefined()
+    expect(whitelist.lookup({ ...DEFAULT_ROUTE, senderUserId: 'u_other' }, 'om_1')).toBeUndefined()
     expect(whitelist.lookup({
-      key: 'omt_other', kind: 'thread', chatId: 'oc_chat', chatType: 'group', senderOpenId: 'ou_user',
+      key: 'omt_other', kind: 'thread', chatId: 'oc_chat', chatType: 'group', senderUserId: 'u_user',
     }, 'om_1')).toBeUndefined()
     expect(whitelist.size(DEFAULT_ROUTE.key)).toBe(1)
   })
@@ -793,7 +793,7 @@ describe('feishu attachment-fetch authorization', () => {
     chat_id: DEFAULT_ROUTE.chatId,
     thread_id: DEFAULT_ROUTE.key,
     sender_type: 'user',
-    sender_id: DEFAULT_ROUTE.senderOpenId,
+    sender_id: DEFAULT_ROUTE.senderUserId,
     content: { file_key: `${messageId}_key`, file_name: 'owned.pdf' },
     ...partial,
   })
@@ -816,7 +816,7 @@ describe('feishu attachment-fetch authorization', () => {
 
   it('refuses read-back messages of another sender, topic, chat, or the main timeline, and deleted ones', async () => {
     const cases: Array<Parameters<typeof makeRawMessage>[0]> = [
-      ownerFile('om_foreign', { sender_id: 'ou_someone_else' }),
+      ownerFile('om_foreign', { sender_id: 'u_someone_else' }),
       ownerFile('om_foreign', { thread_id: 'omt_other_topic' }),
       // An unregistered main-timeline message never joins a topic route.
       ownerFile('om_foreign', { thread_id: undefined }),
@@ -1773,7 +1773,7 @@ describe('feishu topic-messages single read', () => {
       kind: 'chat',
       chatId: DEFAULT_ROUTE.chatId,
       chatType: 'group',
-      senderOpenId: DEFAULT_ROUTE.senderOpenId,
+      senderUserId: DEFAULT_ROUTE.senderUserId,
     }
     const harness = setupRuntime({
       route: chatRoute,
@@ -1820,7 +1820,7 @@ describe('feishu topic-messages single read', () => {
       kind: 'chat',
       chatId: DEFAULT_ROUTE.chatId,
       chatType: 'group',
-      senderOpenId: DEFAULT_ROUTE.senderOpenId,
+      senderUserId: DEFAULT_ROUTE.senderUserId,
     }
     const chatHarness = setupRuntime({
       route: chatRoute,
@@ -1856,7 +1856,7 @@ describe('feishu topic-messages single read', () => {
             chat_id: DEFAULT_ROUTE.chatId,
             thread_id: DEFAULT_ROUTE.key,
             create_time: TIME,
-            sender_id: 'ou_alice',
+            sender_id: 'u_alice',
             content: { text: 'quoted hello' },
           }),
         ]),
@@ -1958,7 +1958,7 @@ describe('feishu topic-messages single read', () => {
         msg_type: 'file',
         chat_id: DEFAULT_ROUTE.chatId,
         sender_type: 'user',
-        sender_id: DEFAULT_ROUTE.senderOpenId,
+        sender_id: DEFAULT_ROUTE.senderUserId,
         content: { file_key: 'file_key_owner_main', file_name: 'owner.pdf' },
       }),
     ])
@@ -2289,7 +2289,7 @@ describe('feishu topic-messages list', () => {
       kind: 'chat',
       chatId: DEFAULT_ROUTE.chatId,
       chatType: 'group',
-      senderOpenId: DEFAULT_ROUTE.senderOpenId,
+      senderUserId: DEFAULT_ROUTE.senderUserId,
     }
     const calls: RawMessageListParams[] = []
     const harness = setupRuntime({

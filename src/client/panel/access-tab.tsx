@@ -1,5 +1,5 @@
 /**
- * 「访问授权」tab：准入与授权字段表单（管理员 open_id / 准入模式 /
+ * 「访问授权」tab：准入与授权字段表单（管理员 user_id / 准入模式 /
  * 申请有效期）+ 白名单与待处理申请卡。表单保存走全局 draft，白名单
  * 增删是独立即时 mutation。
  *
@@ -17,8 +17,8 @@ export interface AccessTabProps {
   accessError: string | null
   onAddGroup: (chatId: string, name: string) => Promise<boolean>
   onRemoveGroup: (chatId: string) => void
-  onAddUser: (openId: string, name: string) => Promise<boolean>
-  onRemoveUser: (openId: string) => void
+  onAddUser: (userId: string, name: string) => Promise<boolean>
+  onRemoveUser: (userId: string) => void
   onResolveRequest: (token: string, decision: 'allow' | 'deny') => void
 }
 

@@ -87,6 +87,27 @@ describe('LarkChannelAdapter', () => {
     }))
   })
 
+  it('identifies message senders by user_id and drops senders without one', async () => {
+    const channel = defaultChannelFactory(options)
+    const received: unknown[] = []
+    channel.onMessage(message => { received.push(message) })
+    const calls = sdk.channel.on.mock.calls as unknown as Array<[string, (message: object) => unknown]>
+    const listener = calls.find(([event]) => event === 'message')?.[1]
+    expect(listener).toBeDefined()
+    const base = { messageId: 'om_1', chatId: 'oc_chat', chatType: 'p2p', senderId: 'ou_sender' }
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      await listener?.({ ...base, raw: { sender: { sender_id: { open_id: 'ou_sender', user_id: 'u_sender' } } } })
+      await listener?.({ ...base, raw: { sender: { sender_id: { open_id: 'ou_bot' } } } })
+      await listener?.({ ...base, raw: undefined })
+      expect(warn).toHaveBeenCalledTimes(2)
+    } finally {
+      warn.mockRestore()
+    }
+
+    expect(received).toEqual([expect.objectContaining({ messageId: 'om_1', senderId: 'u_sender' })])
+  })
+
   it('passes a Buffer-backed file payload to the official SDK', async () => {
     const channel = defaultChannelFactory(options)
     const source = Buffer.from('{"session":"test"}\n')
@@ -105,7 +126,10 @@ describe('LarkChannelAdapter', () => {
   it('exposes the raw message get/list read wrappers', async () => {
     const channel = defaultChannelFactory(options)
     await channel.messageGet?.('om_1')
-    expect(sdk.channel.rawClient.im.v1.message.get).toHaveBeenCalledWith({ path: { message_id: 'om_1' } })
+    expect(sdk.channel.rawClient.im.v1.message.get).toHaveBeenCalledWith({
+      path: { message_id: 'om_1' },
+      params: { user_id_type: 'user_id' },
+    })
 
     const params = {
       container_id_type: 'thread' as const,
@@ -122,7 +146,7 @@ describe('LarkChannelAdapter', () => {
     await channel.messageMget?.(['om_a', 'om_b'])
     expect(sdk.channel.rawClient.request).toHaveBeenCalledWith({
       method: 'GET',
-      url: '/open-apis/im/v1/messages/mget?message_ids=om_a&message_ids=om_b&card_msg_content_type=raw_card_content',
+      url: '/open-apis/im/v1/messages/mget?message_ids=om_a&message_ids=om_b&card_msg_content_type=raw_card_content&user_id_type=user_id',
     })
 
     await expect(channel.messageMget?.([])).rejects.toThrow(/1-50/)

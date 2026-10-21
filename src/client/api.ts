@@ -239,18 +239,18 @@ export async function removeAccessGroup(chatId: string): Promise<AccessMutationR
   return mutateAccess(ACCESS_GROUPS_ROUTE, 'DELETE', { chatId })
 }
 
-/** Authorize one user open_id (global across authorized groups). */
-export async function addAccessUser(openId: string, name?: string): Promise<AccessMutationResponse> {
+/** Authorize one user `user_id` (global across authorized groups). */
+export async function addAccessUser(userId: string, name?: string): Promise<AccessMutationResponse> {
   return mutateAccess(
     ACCESS_USERS_ROUTE,
     'POST',
-    name === undefined || name === '' ? { openId } : { openId, name },
+    name === undefined || name === '' ? { userId } : { userId, name },
   )
 }
 
 /** Revoke one user authorization (takes effect on the next message). */
-export async function removeAccessUser(openId: string): Promise<AccessMutationResponse> {
-  return mutateAccess(ACCESS_USERS_ROUTE, 'DELETE', { openId })
+export async function removeAccessUser(userId: string): Promise<AccessMutationResponse> {
+  return mutateAccess(ACCESS_USERS_ROUTE, 'DELETE', { userId })
 }
 
 /** Settle one pending authorization request (same resolver as the Feishu card). */

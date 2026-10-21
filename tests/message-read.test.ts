@@ -40,15 +40,15 @@ const ROUTE = {
   kind: 'thread',
   chatId: 'oc_chat',
   chatType: 'group',
-  senderOpenId: 'ou_user',
+  senderUserId: 'u_user',
 } as const
 
 const CHAT_ROUTE = {
-  key: 'chat:oc_chat:ou_user',
+  key: 'chat:oc_chat:u_user',
   kind: 'chat',
   chatId: 'oc_chat',
   chatType: 'p2p',
-  senderOpenId: 'ou_user',
+  senderUserId: 'u_user',
 } as const
 
 function item(partial: Parameters<typeof makeRawMessage>[0] = {}): RawMessageItem {
@@ -75,7 +75,7 @@ describe('raw response parsing', () => {
       thread_id: 'omt_topic',
       parent_id: 'om_parent',
       sender_type: 'user',
-      sender_id: 'ou_user',
+      sender_id: 'u_user',
       content: { text: '你好' },
     })
     const parsed = parseMessageItems({ data: { items: [raw] } })
@@ -87,11 +87,14 @@ describe('raw response parsing', () => {
       chatId: 'oc_chat',
       threadId: 'omt_topic',
       parentId: 'om_parent',
-      senderOpenId: 'ou_user',
+      senderUserId: 'u_user',
       senderType: 'user',
       deleted: false,
     })
     expect(parsed?.[0]?.content).toEqual({ text: '你好' })
+    // Only a `user_id`-typed sender id is a user identity.
+    const openIdSender = { ...raw, sender: { id: 'ou_x', id_type: 'open_id', sender_type: 'user' } }
+    expect(parseMessageItems({ data: { items: [openIdSender] } })?.[0]?.senderUserId).toBeUndefined()
     // mget answers with the same `data.items` shape.
     expect(parseMessageItems({ data: { items: [raw] } })).toEqual(parsed)
     // Tolerate a direct `{ items }` body used by stubs.
@@ -366,11 +369,11 @@ describe('route membership', () => {
   })
 
   it('never accepts unregistered main-line messages of the route owner in a thread route', () => {
-    const ownerMain = item({ message_id: 'om_owner', chat_id: 'oc_chat', sender_id: 'ou_user' })
+    const ownerMain = item({ message_id: 'om_owner', chat_id: 'oc_chat', sender_id: 'u_user' })
     const ownerOtherThread = item({
-      message_id: 'om_owner_other', chat_id: 'oc_chat', thread_id: 'omt_other', sender_id: 'ou_user',
+      message_id: 'om_owner_other', chat_id: 'oc_chat', thread_id: 'omt_other', sender_id: 'u_user',
     })
-    const ownerOtherChat = item({ message_id: 'om_owner_chat2', chat_id: 'oc_other', sender_id: 'ou_user' })
+    const ownerOtherChat = item({ message_id: 'om_owner_chat2', chat_id: 'oc_other', sender_id: 'u_user' })
     expect(messageBelongsToRoute(ROUTE, ownerMain)).toBe(false)
     expect(messageBelongsToRoute(ROUTE, ownerMain, ['om_owner'])).toBe(true)
     expect(messageBelongsToRoute(ROUTE, ownerOtherThread)).toBe(false)
@@ -574,7 +577,7 @@ describe('MessageReader wrappers', () => {
     const channel = makeChannel({ messageList: async () => threadPage })
     const threadReader = new MessageReader({ channel: () => channel })
     const threadResult = await threadReader.listRoute({
-      key: 'omt_1', kind: 'thread', chatId: 'oc_chat', chatType: 'group', senderOpenId: 'ou_user',
+      key: 'omt_1', kind: 'thread', chatId: 'oc_chat', chatType: 'group', senderUserId: 'u_user',
     })
     // A list read is container-scoped: foreign chat rows are dropped, while a
     // missing chat id (stub/older payload) is tolerated; the topic row stays.
@@ -582,7 +585,7 @@ describe('MessageReader wrappers', () => {
       .toEqual(['om_a', 'om_b', 'om_d'])
 
     const chatResult = await threadReader.listRoute({
-      key: 'chat:oc_chat:ou_user', kind: 'chat', chatId: 'oc_chat', chatType: 'p2p', senderOpenId: 'ou_user',
+      key: 'chat:oc_chat:u_user', kind: 'chat', chatId: 'oc_chat', chatType: 'p2p', senderUserId: 'u_user',
     })
     expect(chatResult.ok && chatResult.value.items.map(value => value.messageId)).toEqual(['om_b'])
   })

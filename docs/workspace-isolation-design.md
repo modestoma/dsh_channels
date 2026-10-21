@@ -23,14 +23,14 @@ DSH 本身允许这两个维度解耦，见下。
 
 ```
 <baseDir>/
-  p2p/<open_id>/                    # 私聊用户工作区（注册 workspace，header.cwd）
+  p2p/<user_id>/                    # 私聊用户工作区（注册 workspace，header.cwd）
     topics/<topic-token>/           # 话题目录（会话实际工作目录）
       attachments/                  # 仅 archive 后端：该话题的入站附件（v2 native 默认不写）
-  groups/<chat_id>/<open_id>/       # 群聊中某成员的工作区（注册 workspace）
+  groups/<chat_id>/<user_id>/       # 群聊中某成员的工作区（注册 workspace）
     topics/<topic-token>/
       attachments/                  # 同上
   topics/...                        # 旧版「话题=工作区」目录，原样保留，不自动迁移
-  _staging/<chatType>/<chatId>/<openId>/   # 仅旧版：话题建立前的附件暂存（v2 不再写入）
+  _staging/<chatType>/<chatId>/<userId>/   # 仅旧版：话题建立前的附件暂存（v2 不再写入）
 ```
 
 - 私聊一个用户一个工作区；群聊**一个群 × 一个用户**一个工作区（不能做成「用户全局一个」：否则同一个人在不同群之间会串文件，A 群会话可能把 B 群的文件内容贴给 A 群成员）。

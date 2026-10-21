@@ -20,8 +20,8 @@ export interface InteractionRoute {
   cardMessageId: string
   /** Whether the anchor lives in a real topic (replyInThread). */
   inThread: boolean
-  /** The session owner (open_id) — the only operator allowed to decide. */
-  senderOpenId: string
+  /** The session owner (user_id) — the only operator allowed to decide. */
+  senderUserId: string
 }
 
 /** Fields every pending interaction card carries. */
@@ -96,7 +96,7 @@ export class PendingCardTable<E extends PendingCardEntry> {
       }
     }
     if (entry === undefined || entry.settled) return undefined
-    if (event.operator.openId !== entry.route.senderOpenId) {
+    if (event.operator.userId !== entry.route.senderUserId) {
       onUnauthorized(entry)
       return undefined
     }

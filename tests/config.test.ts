@@ -32,6 +32,13 @@ describe('resolveConfig', () => {
     expect(config.reasoningEffort).toBeUndefined()
   })
 
+  it('accepts an administrator user_id and rejects open_id/union_id values', () => {
+    expect(resolveConfig({ adminUserId: 'a1b2c3d4' }).adminUserId).toBe('a1b2c3d4')
+    for (const adminUserId of ['ou_abc', 'on_abc', 'oc_abc', 'bad id', 'x/../y']) {
+      expect(() => resolveConfig({ adminUserId })).toThrow()
+    }
+  })
+
   it('ignores the removed workspace-retention keys in older profiles', () => {
     const config = resolveConfig({ workspaceRetention: '30d', workspaceRetentionAuto: true })
     expect(config).not.toHaveProperty('workspaceRetention')

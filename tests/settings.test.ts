@@ -233,13 +233,13 @@ class FakeTarget implements SettingsTarget {
     return { ok: true, access: this.accessSnapshot() }
   }
 
-  async addAccessUser(openId: string, name?: string): Promise<AccessMutationResponse> {
-    this.accessCalls.push({ op: 'add-user', openId, name })
+  async addAccessUser(userId: string, name?: string): Promise<AccessMutationResponse> {
+    this.accessCalls.push({ op: 'add-user', userId, name })
     const failed = this.accessFailure()
     if (failed !== undefined) return failed
-    if (!this.accessState.users.some(user => user.openId === openId)) {
+    if (!this.accessState.users.some(user => user.userId === userId)) {
       this.accessState.users.push({
-        openId,
+        userId,
         ...(name === undefined ? {} : { name }),
         source: 'panel',
         addedAt: 1_700_000_000_000,
@@ -248,11 +248,11 @@ class FakeTarget implements SettingsTarget {
     return { ok: true, access: this.accessSnapshot() }
   }
 
-  async removeAccessUser(openId: string): Promise<AccessMutationResponse> {
-    this.accessCalls.push({ op: 'remove-user', openId })
+  async removeAccessUser(userId: string): Promise<AccessMutationResponse> {
+    this.accessCalls.push({ op: 'remove-user', userId })
     const failed = this.accessFailure()
     if (failed !== undefined) return failed
-    this.accessState.users = this.accessState.users.filter(user => user.openId !== openId)
+    this.accessState.users = this.accessState.users.filter(user => user.userId !== userId)
     return { ok: true, access: this.accessSnapshot() }
   }
 
@@ -273,7 +273,7 @@ class FakeTarget implements SettingsTarget {
         })
       } else {
         this.accessState.users.push({
-          openId: request.targetId,
+          userId: request.targetId,
           ...(request.name === undefined ? {} : { name: request.name }),
           source: 'card',
           addedAt: 1_700_000_000_000,
@@ -549,16 +549,16 @@ describe('field descriptors', () => {
 
   it('describes the access-control fields without restarting the channel', () => {
     const byKey = new Map(FIELD_DESCRIPTORS.map(field => [field.key, field]))
-    for (const key of ['adminOpenId', 'accessMode', 'authRequestTtlDays'] as const) {
+    for (const key of ['adminUserId', 'accessMode', 'authRequestTtlDays'] as const) {
       expect(EDITABLE_KEYS).toContain(key)
       expect(byKey.get(key)).toMatchObject({ group: 'access', restartRequired: false })
     }
 
-    const admin = byKey.get('adminOpenId')
+    const admin = byKey.get('adminUserId')
     expect(admin).toMatchObject({ kind: 'text' })
     expect(admin?.label).toContain('管理员')
     expect(admin?.help).toContain('/userid')
-    expect(admin?.help).toContain('ou_')
+    expect(admin?.help).toContain('u_')
 
     const mode = byKey.get('accessMode')
     expect(mode).toMatchObject({ kind: 'select' })
@@ -1115,29 +1115,29 @@ describe('SettingsSurface', () => {
 
   it('saves the access-control config and clears the administrator override', async () => {
     const { surface, store } = makeSurface()
-    const saved = await surface.save({ adminOpenId: 'ou_admin', accessMode: 'open', authRequestTtlDays: 14 })
+    const saved = await surface.save({ adminUserId: 'u_admin', accessMode: 'open', authRequestTtlDays: 14 })
     expect(saved.ok).toBe(true)
     if (!saved.ok) return
     await expect(store.load()).resolves.toEqual({
-      adminOpenId: 'ou_admin',
+      adminUserId: 'u_admin',
       accessMode: 'open',
       authRequestTtlDays: 14,
     })
-    expect(saved.panel.config.effective.adminOpenId).toBe('ou_admin')
+    expect(saved.panel.config.effective.adminUserId).toBe('u_admin')
     expect(saved.panel.config.effective.accessMode).toBe('open')
     expect(saved.panel.config.effective.authRequestTtlDays).toBe(14)
     expect(saved.panel.config.restartPendingKeys).toEqual([])
 
-    const invalid = await surface.save({ adminOpenId: 'alice', authRequestTtlDays: 0 })
+    const invalid = await surface.save({ adminUserId: 'ou_alice', authRequestTtlDays: 0 })
     expect(invalid.ok).toBe(false)
     if (invalid.ok) return
     expect(invalid.issues?.map(issue => issue.key))
-      .toEqual(expect.arrayContaining(['adminOpenId', 'authRequestTtlDays']))
+      .toEqual(expect.arrayContaining(['adminUserId', 'authRequestTtlDays']))
 
-    const cleared = await surface.save({ adminOpenId: '' })
+    const cleared = await surface.save({ adminUserId: '' })
     expect(cleared.ok).toBe(true)
     const overlay = await store.load()
-    expect(overlay.adminOpenId).toBeUndefined()
+    expect(overlay.adminUserId).toBeUndefined()
     expect(overlay.accessMode).toBe('open')
   })
 
@@ -1232,10 +1232,10 @@ describe('SettingsSurface', () => {
 describe('SettingsSurface access control', () => {
   const SAMPLE_ACCESS: AccessWire = {
     mode: 'guarded',
-    admin: { openId: 'ou_admin', configured: true },
+    admin: { userId: 'u_admin', configured: true },
     loaded: true,
     groups: [{ chatId: 'oc_team', name: '研发群', source: 'card', addedAt: 1_700_000_000_000 }],
-    users: [{ openId: 'ou_alice', name: 'Alice', source: 'command', addedAt: 1_700_000_100_000 }],
+    users: [{ userId: 'u_alice', name: 'Alice', source: 'command', addedAt: 1_700_000_100_000 }],
     requests: [{
       token: 'tok_1',
       kind: 'group',
@@ -1282,18 +1282,18 @@ describe('SettingsSurface access control', () => {
       addedAt: 1_700_000_000_000,
     }])
 
-    const user = await surface.saveAccessUser(' ou_alice ', ' Alice ')
+    const user = await surface.saveAccessUser(' u_alice ', ' Alice ')
     expect(user.ok).toBe(true)
     if (!user.ok) return
     expect(user.access.users).toEqual([{
-      openId: 'ou_alice',
+      userId: 'u_alice',
       name: 'Alice',
       source: 'panel',
       addedAt: 1_700_000_000_000,
     }])
     expect(target.accessCalls).toEqual([
       { op: 'add-group', chatId: 'oc_team', name: '研发群' },
-      { op: 'add-user', openId: 'ou_alice', name: 'Alice' },
+      { op: 'add-user', userId: 'u_alice', name: 'Alice' },
     ])
   })
 
@@ -1303,13 +1303,13 @@ describe('SettingsSurface access control', () => {
       const result = await surface.saveAccessGroup(chatId)
       expect(result.ok).toBe(false)
     }
-    for (const openId of ['alice', 'user@example.com', 'ou_', 'ou_bad id']) {
-      const result = await surface.saveAccessUser(openId)
+    for (const userId of ['ou_alice', 'on_alice', 'user@example.com', 'bad id']) {
+      const result = await surface.saveAccessUser(userId)
       expect(result.ok).toBe(false)
       if (result.ok) return
       expect(result.error).toContain('ou_')
     }
-    const badName = await surface.saveAccessUser('ou_bob', 'x'.repeat(129))
+    const badName = await surface.saveAccessUser('u_bob', 'x'.repeat(129))
     expect(badName.ok).toBe(false)
     expect(target.accessCalls).toEqual([])
   })
@@ -1320,7 +1320,7 @@ describe('SettingsSurface access control', () => {
 
     const removedGroup = await surface.removeAccessGroup('oc_team')
     expect(removedGroup.ok).toBe(true)
-    const removedUser = await surface.removeAccessUser('ou_alice')
+    const removedUser = await surface.removeAccessUser('u_alice')
     expect(removedUser.ok).toBe(true)
     const allowed = await surface.resolveAccessRequest('tok_1', 'allow')
     expect(allowed.ok).toBe(true)
@@ -1329,7 +1329,7 @@ describe('SettingsSurface access control', () => {
     expect(allowed.access.groups.map(group => group.chatId)).toEqual(['oc_new'])
     expect(target.accessCalls).toEqual([
       { op: 'remove-group', chatId: 'oc_team' },
-      { op: 'remove-user', openId: 'ou_alice' },
+      { op: 'remove-user', userId: 'u_alice' },
       { op: 'resolve', token: 'tok_1', decision: 'allow' },
     ])
   })
@@ -1341,7 +1341,7 @@ describe('SettingsSurface access control', () => {
 
     target.failAccess = undefined
     target.throwAccess = 'domain not open'
-    await expect(surface.removeAccessUser('ou_bob')).resolves.toEqual({ ok: false, error: 'domain not open' })
+    await expect(surface.removeAccessUser('u_bob')).resolves.toEqual({ ok: false, error: 'domain not open' })
 
     target.throwAccess = undefined
     target.accessState = structuredClone(SAMPLE_ACCESS)
@@ -1706,7 +1706,7 @@ describe('settings routes', () => {
     const { surface, target } = makeSurface()
     target.accessState = {
       mode: 'guarded',
-      admin: { openId: 'ou_admin', configured: true },
+      admin: { userId: 'u_admin', configured: true },
       loaded: true,
       groups: [{ chatId: 'oc_team', name: '研发群', source: 'card', addedAt: 1_700_000_000_000 }],
       users: [],
@@ -1725,7 +1725,7 @@ describe('settings routes', () => {
     const read = await call(routes, ACCESS_ROUTE, makeRequest())
     expect(read.status).toBe(200)
     const snapshot = JSON.parse(read.body) as AccessWire
-    expect(snapshot.admin).toEqual({ openId: 'ou_admin', configured: true })
+    expect(snapshot.admin).toEqual({ userId: 'u_admin', configured: true })
     expect(snapshot.groups).toEqual(target.accessState.groups)
 
     const head = await call(routes, ACCESS_ROUTE, makeRequest({ method: 'HEAD', url: ACCESS_ROUTE }))
@@ -1735,8 +1735,8 @@ describe('settings routes', () => {
     const writes: Array<{ route: string; method: string; body: Record<string, unknown> }> = [
       { route: ACCESS_GROUPS_ROUTE, method: 'POST', body: { chatId: 'oc_team' } },
       { route: ACCESS_GROUPS_ROUTE, method: 'DELETE', body: { chatId: 'oc_team' } },
-      { route: ACCESS_USERS_ROUTE, method: 'POST', body: { openId: 'ou_alice' } },
-      { route: ACCESS_USERS_ROUTE, method: 'DELETE', body: { openId: 'ou_alice' } },
+      { route: ACCESS_USERS_ROUTE, method: 'POST', body: { userId: 'u_alice' } },
+      { route: ACCESS_USERS_ROUTE, method: 'DELETE', body: { userId: 'u_alice' } },
       { route: ACCESS_REQUESTS_ROUTE, method: 'POST', body: { token: 'tok_1', decision: 'allow' } },
     ]
     for (const write of writes) {
@@ -1762,7 +1762,7 @@ describe('settings routes', () => {
     const invalidUser = await call(routes, ACCESS_USERS_ROUTE, makeRequest({
       method: 'POST',
       headers: { 'content-type': 'application/json', host: 'h' },
-      body: JSON.stringify({ openId: 'alice' }),
+      body: JSON.stringify({ userId: 'ou_alice' }),
     }))
     expect(invalidUser.status).toBe(400)
     expect(JSON.parse(invalidUser.body).error).toContain('ou_')

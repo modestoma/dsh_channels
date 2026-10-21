@@ -34,7 +34,7 @@ describe('health snapshot', () => {
       fibers,
       dependencies: dependencies(missing),
       connection,
-      botOpenId: 'ou_bot_12345678',
+      botOpenId: 'u_bot_12345678',
       started: true,
       routeCount: 2,
       liveAgentCount: 1,
@@ -122,7 +122,7 @@ describe('health snapshot', () => {
       connection: {
         state: 'reconnecting', lastConnectTime: 100, nextConnectTime: 200, reconnectAttempts: 3,
       },
-      botOpenId: 'ou_secret_bot_12345678',
+      botOpenId: 'u_secret_bot_12345678',
       started: true,
       routeCount: 4,
       liveAgentCount: 2,
@@ -134,7 +134,7 @@ describe('health snapshot', () => {
     expect(json).toContain('reconnecting')
     expect(json).toContain('…5678')
     expect(json).toContain('持久化路由 4')
-    expect(json).not.toContain('ou_secret_bot_12345678')
+    expect(json).not.toContain('u_secret_bot_12345678')
     expect(json).not.toContain('secret-value')
     expect(json).not.toContain('appSecret')
     expect(json).not.toContain('stack')

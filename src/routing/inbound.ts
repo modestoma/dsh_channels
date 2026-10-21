@@ -191,7 +191,7 @@ export function knownAttachmentMessageOf(msg: NormalizedMessage): KnownAttachmen
     messageId: msg.messageId,
     kind: forwarded ? 'merge_forward' : 'message',
     resources,
-    senderOpenId: msg.senderId,
+    senderUserId: msg.senderId,
   }
 }
 
@@ -321,8 +321,6 @@ export class InboundRouter {
 
   /** Entry point: one normalized inbound message. */
   async handle(msg: NormalizedMessage): Promise<void> {
-    const botId = this.delivery.requireChannel().botOpenId()
-    if (botId !== undefined && msg.senderId === botId) return
     if (msg.chatType !== 'p2p' && msg.chatType !== 'group') return
     let content = (msg.content ?? '').trim()
     if (content === '') return
@@ -1016,7 +1014,7 @@ export class InboundRouter {
       sessionId,
       chatId: msg.chatId,
       chatType: msg.chatType,
-      senderOpenId: msg.senderId,
+      senderUserId: msg.senderId,
       workspacePath: workspace.path,
       sessionDir: placement.sessionDir,
       ...(placement.worktreeBranch === undefined ? {} : { worktreeBranch: placement.worktreeBranch }),

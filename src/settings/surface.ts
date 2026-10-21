@@ -12,6 +12,7 @@
 
 import { DSH_CHANNELS_VERSION } from '../session-export.ts'
 import type { FeishuConfig } from '../config.ts'
+import { FEISHU_USER_ID_PATTERN } from '../domain.ts'
 import type { HealthSnapshot } from '../health.ts'
 import { prepareWorkspaceBaseDir } from '../workspaces.ts'
 import {
@@ -94,10 +95,10 @@ export interface SettingsTarget {
   addAccessGroup(chatId: string, name?: string): Promise<AccessMutationResponse>
   /** Revoke one group authorization (takes effect on the next message). */
   removeAccessGroup(chatId: string): Promise<AccessMutationResponse>
-  /** Authorize one user `open_id` (global across authorized groups). */
-  addAccessUser(openId: string, name?: string): Promise<AccessMutationResponse>
+  /** Authorize one user `user_id` (global across authorized groups). */
+  addAccessUser(userId: string, name?: string): Promise<AccessMutationResponse>
   /** Revoke one user authorization (takes effect on the next message). */
-  removeAccessUser(openId: string): Promise<AccessMutationResponse>
+  removeAccessUser(userId: string): Promise<AccessMutationResponse>
   /** Settle one pending request (panel shares this path with the Feishu DM card). */
   resolveAccessRequest(token: string, decision: 'allow' | 'deny'): Promise<AccessMutationResponse>
 }
@@ -117,7 +118,7 @@ const OPTIONAL_TEXT_KEYS = new Set<EditableKey>([
   'model',
   'reasoningEffort',
   'agentPreset',
-  'adminOpenId',
+  'adminUserId',
 ])
 
 const BOOLEAN_KEYS = new Set<EditableKey>([
@@ -159,7 +160,7 @@ const SELECT_OPTIONS: Partial<Record<EditableKey, ReadonlyArray<{ value: string;
 const FIELD_META: Record<EditableKey, { label: string; help: string; min?: number; max?: number; step?: number; placeholder?: string; wide?: boolean }> = {
   baseDir: {
     label: '工作区根目录（文件落点）',
-    help: '每个用户/群成员一个工作区：私聊 <baseDir>/p2p/<open_id>/，群聊 <baseDir>/groups/<chat_id>/<open_id>/；每个话题在其中拥有独立工作目录 <工作区>/topics/<话题>/（Git 仓库工作区可自动改用 worktree）。必须是绝对路径（~ 开头按家目录展开），保存时会创建该目录；只影响之后新建立的会话 —— 已有话题即使 /renew 也沿用原目录，旧文件不会迁移。',
+    help: '每个用户/群成员一个工作区：私聊 <baseDir>/p2p/<user_id>/，群聊 <baseDir>/groups/<chat_id>/<user_id>/；每个话题在其中拥有独立工作目录 <工作区>/topics/<话题>/（Git 仓库工作区可自动改用 worktree）。必须是绝对路径（~ 开头按家目录展开），保存时会创建该目录；只影响之后新建立的会话 —— 已有话题即使 /renew 也沿用原目录，旧文件不会迁移。',
     placeholder: '/Users/you/.dsh/dsh-channels/workspaces',
     wide: true,
   },
@@ -168,10 +169,10 @@ const FIELD_META: Record<EditableKey, { label: string; help: string; min?: numbe
   threadFallback: { label: '话题被拒时的兜底', help: 'degrade 降级为会话级路由；strict 直接让回复失败。' },
   welcomeOnboarding: { label: '首次私聊引导卡', help: '每个私聊会话第一次触达时发送一张命令与用法引导卡，只发一次。' },
   allowPermissionSwitch: { label: '允许飞书侧切换权限预设', help: '安全敏感：开启后话题所有者可用 /permissions 切换沙箱与审批预设。' },
-  adminOpenId: {
-    label: '管理员 open_id',
-    help: '唯一管理员。私聊机器人发送 /userid 获取（ou_ 开头，不是 user_id/邮箱）；留空 = 清除 Web 覆盖。guarded 模式下未配置会拒绝所有对话。',
-    placeholder: 'ou_xxx',
+  adminUserId: {
+    label: '管理员 user_id',
+    help: '唯一管理员。私聊机器人发送 /userid 获取（不是 ou_ 开头的 open_id，也不是邮箱）；留空 = 清除 Web 覆盖。guarded 模式下未配置会拒绝所有对话。',
+    placeholder: 'user_id',
   },
   accessMode: {
     label: '准入模式',
@@ -283,7 +284,7 @@ const GROUP_OF: Record<EditableKey, EditableFieldWire['group']> = {
   threadFallback: 'behavior',
   welcomeOnboarding: 'behavior',
   allowPermissionSwitch: 'behavior',
-  adminOpenId: 'access',
+  adminUserId: 'access',
   accessMode: 'access',
   authRequestTtlDays: 'access',
   acceptAttachments: 'content',
@@ -451,8 +452,6 @@ export function normalizeCredentialValue(raw: unknown): { ok: true; value: strin
 /** Longest accepted whitelist identifier / display name. */
 const MAX_ACCESS_VALUE_LENGTH = 128
 
-/** Feishu user open_ids (`ou_` + URL-safe id). Identity is open_id only. */
-const OPEN_ID_PATTERN = /^ou_[A-Za-z0-9_-]+$/
 
 /** Trim one whitelist identifier, rejecting empty, oversized, or hostile input. */
 export function normalizeAccessId(
@@ -468,7 +467,7 @@ export function normalizeAccessId(
   }
   // eslint-disable-next-line no-control-regex
   if (/[\u0000-\u001f\u007f]/.test(value)) return { ok: false, message: `${label}包含非法控制字符` }
-  if (invalidFormat !== undefined && !OPEN_ID_PATTERN.test(value)) {
+  if (invalidFormat !== undefined && !FEISHU_USER_ID_PATTERN.test(value)) {
     return { ok: false, message: invalidFormat }
   }
   return { ok: true, value }
@@ -919,9 +918,9 @@ export class SettingsSurface {
     return this.mutateAccess(() => this.target.removeAccessGroup(id.value))
   }
 
-  /** Authorize one user `open_id`; `ou_` prefix is required (not user_id/email). */
-  async saveAccessUser(openId: unknown, name?: unknown): Promise<AccessMutationResponse> {
-    const id = normalizeAccessId(openId, '用户 open_id', '用户 open_id 必须形如 ou_xxx（不是 user_id/邮箱）')
+  /** Authorize one user `user_id` (not an open_id or email). */
+  async saveAccessUser(userId: unknown, name?: unknown): Promise<AccessMutationResponse> {
+    const id = normalizeAccessId(userId, '用户 user_id', '用户 user_id 只能包含字母、数字、_ 和 -（不是 ou_ 开头的 open_id，也不是邮箱）')
     if (!id.ok) return { ok: false, error: id.message }
     const label = normalizeAccessName(name)
     if (!label.ok) return { ok: false, error: label.message }
@@ -929,8 +928,8 @@ export class SettingsSurface {
   }
 
   /** Revoke one user authorization (immediate: the next message re-evaluates). */
-  async removeAccessUser(openId: unknown): Promise<AccessMutationResponse> {
-    const id = normalizeAccessId(openId, '用户 open_id', '用户 open_id 必须形如 ou_xxx（不是 user_id/邮箱）')
+  async removeAccessUser(userId: unknown): Promise<AccessMutationResponse> {
+    const id = normalizeAccessId(userId, '用户 user_id', '用户 user_id 只能包含字母、数字、_ 和 -（不是 ou_ 开头的 open_id，也不是邮箱）')
     if (!id.ok) return { ok: false, error: id.message }
     return this.mutateAccess(() => this.target.removeAccessUser(id.value))
   }

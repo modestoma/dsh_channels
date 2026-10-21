@@ -9,7 +9,7 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 - **入站附件（v2，零等待）**：收到消息时**会话、话题、流式卡片立即建立，不等附件下载**。触发消息中的图片自动预取为首轮原生 `ImageBlock`，模型直接可见；文件默认不下载，prompt 用 `<feishu_context>` 清单声明“附件未加载”，模型需要时调用 `feishu_attachment_fetch` 按 `message_id` 懒取；引用消息与话题历史以 `<feishu_quote>` / `<feishu_history>` 摘录，更早的消息用 `feishu_topic_messages` 翻页（发现的资源同时获得 fetch 授权）。**只发附件、不带说明的消息完全静默**：不回复、不建会话、不下载、不加表情，本地也不留任何状态；要让模型看到它，请引用那条消息再提问（多个文件可合并转发后引用），话题内的附件也可由模型用 `feishu_topic_messages` 读到。所有入站图片/文件统一存入 **DSH 原生附件库**（不可变、内容寻址去重、读取校验、随 Session 回放；插件不承担入站附件清理）。显式 `attachmentStore: 'archive'`、宿主未挂载原生附件服务或关闭 fetch 工具时退回旧版工作区 `attachments/` 落盘。完整设计见 [docs/attachment-pipeline-v2.md](docs/attachment-pipeline-v2.md)。
 - **HITL 审批**：当模型请求需要授权的动作（如 bash 沙箱升级 `sandbox_permissions`）时，插件监听主机 `approval/request` 事件，在同一话题里**新发一张独立审批决策卡**（✅ 允许 / ❌ 拒绝 按钮），用户点击后回填主机审批结果；超时（`approvalTimeoutMs`，默认 5 分钟）自动拒绝（fail-closed），非会话发起人点击无效
 - **结构化提问**：模型调用 `ask_user_question` 时，插件监听主机 `user-questions/request` 瀑布并发一张问答卡（每个问题一组选项按钮，多选先勾选再「提交本题选择」），答案回填给模型；主机自带的应答者只有 Web 客户端，没有本插件时纯飞书会话会以 `NO_PROVIDER` 失败。超时（`questionTimeoutMs`，默认 5 分钟）或回合取消时本轮提问失败（fail-closed）；没有可选项的问题直接提示用文字作答，**阻塞期间普通文本回复即作为该问题的自由文本答案**（同时支持多选后的自定义文本）
-- **准入与授权（默认开启）**：**管理员不受白名单限制**（私聊、任意群聊——包括尚未授权的群——都能直接发起会话）；其他人私聊只收到一条固定提示（`/userid` 例外），群聊需要「群已授权 + 用户在全局白名单」两层同时命中。机器人被拉进群后私聊管理员发**群信息卡**（未授权群附授权按钮，用于放行白名单用户）；已授权群里未授权用户 @ 会触发用户授权卡。授权入口：飞书 `/auth` 命令、授权卡、Web 设置面板；管理员 open_id 在面板配置（私聊 `/userid` 获取）
+- **准入与授权（默认开启）**：**管理员不受白名单限制**（私聊、任意群聊——包括尚未授权的群——都能直接发起会话）；其他人私聊只收到一条固定提示（`/userid` 例外），群聊需要「群已授权 + 用户在全局白名单」两层同时命中。机器人被拉进群后私聊管理员发**群信息卡**（未授权群附授权按钮，用于放行白名单用户）；已授权群里未授权用户 @ 会触发用户授权卡。授权入口：飞书 `/auth` 命令、授权卡、Web 设置面板；管理员 user_id 在面板配置（私聊 `/userid` 获取）
 - 全部基于飞书官方 SDK [`@larksuiteoapi/node-sdk`](https://www.npmjs.com/package/@larksuiteoapi/node-sdk)（WebSocket 长连接，免公网）
 - **Web 设置面板**：Web/桌面端 **设置 → 飞书渠道**，顶部状态头 + 6 个标签页（连接 / 会话与行为 / 模型 / 工作区 / 访问授权 / 高级）；凭据不完整时插件不连接、面板显示三步引导，填写保存后自动连接（保存写入本机覆盖文件，部分字段需重连生效）；详见下文「Web 设置面板」章节
 
@@ -18,7 +18,7 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 ## 斜杠命令
 
 - `/help`：列出当前支持的斜杠命令，无需绑定 Session
-- `/userid`：仅在私聊中直接回复**发送者自己的** open_id，无需绑定 Session，也不创建话题；**任何私聊用户都可以用**（准入配置/授权引导用，不消耗 token）
+- `/userid`：仅在私聊中直接回复**发送者自己的** user_id，无需绑定 Session，也不创建话题；**任何私聊用户都可以用**（准入配置/授权引导用，不消耗 token）
 - `/groupid`：仅在群聊中直接回复当前群组 ID，无需绑定 Session，也不创建话题；普通群聊遵循 `requireMention`，话题内无需重复 @
 - `/health`：显示 Harness 与飞书通道健康状态，无需绑定 Session
 - `/status`：显示当前 Session 状态与性能指标
@@ -29,7 +29,7 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 - `/renew`：在当前话题创建并绑定新 Session
 - `/stop`：中断当前正在运行的回合（不冷恢复 Session；没有运行中的回合时明确提示）
 - `/permissions`：查看当前 Session 的权限预设（沙箱 + 审批策略）与可选清单；仅在 `allowPermissionSwitch: true` 时支持 `/permissions <name>` 切换
-- `/auth`：**仅管理员**。`/auth status` 查看准入状态；`/auth allow` / `/auth revoke` 在群内授权/撤销当前群；`/auth user add <open_id>` / `/auth user remove <open_id>` 管理全局用户白名单；`/auth list` 列出白名单与待处理申请。即使群尚未授权，管理员也能在群内用 `/auth`（这是“通过对话授权群”的入口）
+- `/auth`：**仅管理员**。`/auth status` 查看准入状态；`/auth allow` / `/auth revoke` 在群内授权/撤销当前群；`/auth user add <user_id>` / `/auth user remove <user_id>` 管理全局用户白名单；`/auth list` 列出白名单与待处理申请。即使群尚未授权，管理员也能在群内用 `/auth`（这是“通过对话授权群”的入口）
 - `/history`：显示当前话题的 Session 历史（含 `ctx.sessionQuery` 折叠出的会话标题与 live 标记）
 - `/export`：导出当前 Session 的逻辑日志
 
@@ -69,7 +69,7 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 | 会话与行为 | 「行为」：私聊模式、普通群 @ 要求、话题兜底、首次私聊引导、权限切换；「内容与附件」：附件接收、存储后端、图片预取与上限、首轮历史；「模型工具」：`feishu_attachment_fetch` / `feishu_topic_messages` 开关与上限、被动读取预算 |
 | 模型 | 模型服务商、模型 id、推理档位、Agent 预设（宿主目录驱动的级联下拉） |
 | 工作区 | 工作区根目录（可点「选择目录…」调用系统目录选择框）；话题目录隔离方式（`topicIsolation`）在 profile 配置中设置 |
-| 访问授权 | 管理员 open_id、准入模式、申请有效期；已授权群 / 用户白名单与待处理申请 |
+| 访问授权 | 管理员 user_id、准入模式、申请有效期；已授权群 / 用户白名单与待处理申请 |
 | 高级 | 流式刷新 / 状态行 / SDK 日志级别、部署级只读参数、Web 覆盖文件路径与「清除 Web 覆盖」 |
 
 **入站附件与模型工具（v2）**：「会话与行为」标签页新增两组可编辑字段，与 profile 配置同名、写入同一 Web 覆盖文件（`$DSH_HOME/dsh-channels/settings.json`）：
@@ -87,11 +87,11 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 
 **模型选择器**：模型与推理在面板里是**独立的「模型」标签页**：宿主 LLM 服务可用时，`provider` / `model` / `reasoningEffort` 与 `agentPreset` 渲染为**下拉选择**而不是手填：provider 来自 `ctx.llm.listProviders()`，model 来自所选 provider 的 `listModels()`，推理档位来自 `resolveModelInfo(provider, model).reasoning.efforts`，Agent 预设来自 `agentPresets.list()`。每个选择器的首项是「留空 = 部署默认 / 适配器默认 / roster 默认」，有部署默认模型（`agentDefaultModel`）或 roster 默认预设时会在标签里带上具体值。选择按依赖级联：先选 provider 才会加载 model，选了 model 才会加载推理档位；宿主暂时无法枚举的项（服务未挂载、适配器查询失败/超时）自动退回原来的自由文本框，已保存但当前列表里没有的值会作为「当前配置，不在宿主机列表中」选项保留，不会在打开面板时被静默改掉。级联查询走只读的 `GET /dsh-channels/catalog?provider=…&model=…`（Host 侧短 TTL 缓存，单次查询 4 秒上限）。`provider` 与 `model` 在宿主侧是一条完整的请求路由，因此面板保存时要求**两者同时设置或同时留空**，不允许只选一半。
 
-`baseDir` 是**模型/工具产生文件的落点**（入站附件默认进 DSH 原生附件库、不落这里；仅 archive 后端才写话题目录）：**每个用户拥有一个独立工作区**（私聊 `<baseDir>/p2p/<open_id>/`，群聊 `<baseDir>/groups/<chat_id>/<open_id>/`，同一群里不同用户互不影响；旧版本的「用户 × 聊天」共享工作区正好复用为这个新工作区）。每个话题在工作区内拥有独立工作目录 `<工作区>/topics/<话题 id>/`（无话题的降级会话用 session id），所以话题之间的文件互不干扰，而工作区数量只随用户增长。面板里只接受**绝对路径**（`~` 开头按家目录展开，拒绝文件系统根目录），保存时会创建并校验该目录，不可用时当场报错，不会等到飞书里提示「会话创建失败」。已有 Session / 目录不会被迁移，因此切到新目录后旧话题继续用旧目录（话题内 `/renew` 也一样），只有之后新开的会话使用新目录。
+`baseDir` 是**模型/工具产生文件的落点**（入站附件默认进 DSH 原生附件库、不落这里；仅 archive 后端才写话题目录）：**每个用户拥有一个独立工作区**（私聊 `<baseDir>/p2p/<user_id>/`，群聊 `<baseDir>/groups/<chat_id>/<user_id>/`，同一群里不同用户互不影响；旧版本的「用户 × 聊天」共享工作区正好复用为这个新工作区）。每个话题在工作区内拥有独立工作目录 `<工作区>/topics/<话题 id>/`（无话题的降级会话用 session id），所以话题之间的文件互不干扰，而工作区数量只随用户增长。面板里只接受**绝对路径**（`~` 开头按家目录展开，拒绝文件系统根目录），保存时会创建并校验该目录，不可用时当场报错，不会等到飞书里提示「会话创建失败」。已有 Session / 目录不会被迁移，因此切到新目录后旧话题继续用旧目录（话题内 `/renew` 也一样），只有之后新开的会话使用新目录。
 
 **可视化选择工作区根目录**：输入框旁的「选择目录…」按钮会调用**宿主机的系统目录选择框**（macOS 的 NSOpenPanel / Windows 的文件夹对话框），选中后把绝对路径填进草稿，仍需点「保存更改」才落盘。该能力转发自宿主可选的 `ctx.directoryPicker` 服务：桌面端/本机 GUI 会话（native 后端）提供按钮；headless、远程或 SSH 会话没有可服务的显示会话（browse 后端），面板不显示按钮、保留手写输入，插件在缺少该服务的旧宿主上照常加载。选择框打开期间请求保持挂起；取消是正常结果，不会报错。
 
-**访问授权**：「访问授权」标签页集中管理准入：管理员 open_id（`ou_` 开头，私聊 `/userid` 获取）、准入模式、授权申请有效期；「已授权群」「已授权用户」列表支持增删（群 ID 可从入群群信息卡或 `/groupid` 获得，用户 open_id 可用 `/userid` 查看）；「待处理申请」可一键授权/忽略。白名单只约束非管理员：管理员在任何私聊/群聊都直接放行。`guarded` 且管理员未配置时标签页顶部会红字提示“当前会拒绝所有对话”。授权白名单与申请记录保存在插件 `storageDomain`（`channels_routes` 域），重启后保留；未建立飞书连接时白名单尚未加载，标签页会提示「连接建立后加载授权列表」并禁用写操作。
+**访问授权**：「访问授权」标签页集中管理准入：管理员 user_id（私聊 `/userid` 获取）、准入模式、授权申请有效期；「已授权群」「已授权用户」列表支持增删（群 ID 可从入群群信息卡或 `/groupid` 获得，用户 user_id 可用 `/userid` 查看）；「待处理申请」可一键授权/忽略。白名单只约束非管理员：管理员在任何私聊/群聊都直接放行。`guarded` 且管理员未配置时标签页顶部会红字提示“当前会拒绝所有对话”。授权白名单与申请记录保存在插件 `storageDomain`（`channels_routes_v2` 域），重启后保留；未建立飞书连接时白名单尚未加载，标签页会提示「连接建立后加载授权列表」并禁用写操作。
 
 **配置层级**：`configSchema` 默认值 < profile `cordis.patch.yml` 的 `config` < Web 面板覆盖。面板只把可编辑字段写入 `$DSH_HOME/dsh-channels/settings.json`；「高级 → 清除 Web 覆盖」删除该文件并回落到 profile 配置。`baseDir` 可在「工作区」标签页编辑（绝对路径；只影响之后新建的会话）；超时、路由 TTL 等仍只读展示。凭据**值**在「连接 → 飞书应用凭据」编辑，凭据**引用名**（`appId` / `appSecret` 配置项）仍由 profile 配置决定。已移除的目录清理配置 `workspaceRetention` / `workspaceRetentionAuto` 与覆盖文件路径配置 `settingsFile` 若仍留在 profile 或覆盖文件中会被静默忽略，面板下次保存时从覆盖文件中去掉。
 
@@ -256,7 +256,7 @@ npm 发行包已包含构建产物：Host 入口是 `lib/index.js`（profile 直
     welcomeOnboarding: true             # 私聊首次触达发一张引导卡（按 chat 持久化去重）
     allowPermissionSwitch: false        # 是否允许 /permissions <name> 从飞书侧切换权限预设（安全敏感）
     accessMode: 'guarded'               # 准入模式：guarded（默认，仅管理员+白名单）| open（旧行为，不安全）
-    adminOpenId: 'ou_xxx'               # 管理员 open_id（可留空，留空时 guarded 下拒绝所有对话；面板可改）
+    adminUserId: 'a1b2c3d4'            # 管理员 user_id（可留空，留空时 guarded 下拒绝所有对话；面板可改）
     authRequestTtlDays: 7               # 入群/用户授权申请卡有效期（天，1–30）
     loggerLevel: 'info'
 ```
@@ -292,6 +292,7 @@ FEISHU_APP_SECRET: xxxxxxxx
 2. 权限（至少）：
    - `im:message`（获取与发送单聊、群组消息；附件资源下载 `messageResource.get` 也走消息资源接口，具体 scope 以控制台该接口要求为准）
    - `im:message.p2p_msg:readonly`（读取用户发给机器人的单聊消息）
+   - `contact:user.employee_id:readonly`（获取用户 user ID，**必需**）：插件用 `user_id` 识别用户（准入、话题归属、工作区目录）。未开通时事件不带 `user_id`，所有用户消息都会被丢弃并打印 warn；外部联系人/跨租户用户没有本租户 `user_id`，同样无法使用
    - `im:message:readonly`（读取消息内容：引用摘录、话题历史、`feishu_topic_messages`）
    - `im:message.group_msg`（读取群组消息，**敏感权限**，需企业管理员审批）：读取群/话题历史（含机器人入群前的可见历史）。未开通时引用/历史块静默省略、普通对话不受影响，按“机器人可见范围”降级
    - 事件：**接收消息 im.message.receive_v1**（含“接收群聊中 @ 机器人消息”）
@@ -311,8 +312,8 @@ FEISHU_APP_SECRET: xxxxxxxx
 
 | 场景 | 工作区目录（header cwd） | 每个话题的工作目录（实际 cwd） |
 |---|---|---|
-| 私聊 | `<baseDir>/p2p/<open_id>/` | `<工作区>/topics/<话题 id>/` |
-| 群聊 | `<baseDir>/groups/<chat_id>/<open_id>/` | 同上 |
+| 私聊 | `<baseDir>/p2p/<user_id>/` | `<工作区>/topics/<话题 id>/` |
+| 群聊 | `<baseDir>/groups/<chat_id>/<user_id>/` | 同上 |
 
 - 群聊必须是「群 × 用户」：同一个人在不同群之间不共享文件，避免 A 群会话把 B 群内容带出来。
 - 会话创建时以工作区为 header cwd（保证 GUI 里归属该项目、沙箱边界稳定），随后通过 `ctx.workingDirectory` 把实际工作目录切到话题目录；冷恢复会从 Session 日志还原该目录。因此话题之间的文件互不干扰，而工作区数量只随用户增长。
@@ -339,12 +340,12 @@ FEISHU_APP_SECRET: xxxxxxxx
 - **DSH 0.2.0 兼容**：会话日志读取改用 `Session.snapshotEvents()`（整段 `Session.events` getter 已被 DSH 删除）；正文/推理增量改用瞬时事件 `agent/assistant-stream`（持久化 `assistant/chunk` 已不再产生，改为把流内嵌进 `assistant/message.stream`），并处理 `abandoned` 尝试的文本回滚；卡片 token / 缓存命中 / 上下文窗口优先读宿主 `sessionProjections`（`sessionStats` / `tokenUsage` / `contextPressure`），未挂载时回退到本地增量折叠 + `llm.resolveModelInfo`。完整评估、证据与实施状态见 [docs/review-dsh-0.2.0.md](docs/review-dsh-0.2.0.md)。
 - **话题创建**：通过回复消息接口 `reply_in_thread: true`（官方文档明示的“以话题方式回复（即创建话题）”）。响应后经 `im.v1.message.get` 取回 `thread_id` 写入路由表。
 - **话题延续**：`im.message.receive_v1` 事件自带 `thread_id`，命中路由表即 `agent.followup()`，无需 @。同一 (chat, user) 的**并发首消息会被串行化**：后到的消息等待在途的会话建立完成，再按串行语义续聊同一 session 或另起新话题——不会重复建 session、覆盖路由，也不会落入“无路由、无 @”的丢弃窗口。
-- **降级（`threadFallback: 'degrade'`）**：私聊或群聊拒绝话题回复（如 230071）时，自动改为普通回复，路由键退化为 `chat:p2p:<chat_id>:<open_id>` / `chat:group:<chat_id>:<open_id>`（会话级延续）；`strict` 则直接失败。
+- **降级（`threadFallback: 'degrade'`）**：私聊或群聊拒绝话题回复（如 230071）时，自动改为普通回复，路由键退化为 `chat:p2p:<chat_id>:<user_id>` / `chat:group:<chat_id>:<user_id>`（会话级延续）；`strict` 则直接失败。
 - **重启恢复**：路由表持久化在 `storageDomain`；消息到达时 `ctx.agents.resume()` 懒恢复 session。若会话已被其他 owner 恢复为 live（如 Web UI 打开过该会话、并发冷恢复竞态），插件**借用**该 live agent 直接 `followup()`，不再报 "cannot prepare session … while it is live"。借用的 agent 不归插件 dispose；shutdown 与在途 resume 竞态时，刚发布的 agent 会被立即 dispose 以避免泄漏进下一实例的 live 注册表。
-- **重启修复（流式中断）**：每条正在流式的 turn 会把自己的修复凭据（trigger 消息、Typing reaction id、全部段卡 id）写入 `channels_routes` 域的 `inflight` 表（键 = 主卡 message id，turn 结束即删）。重启后长连接一建立，插件就把上一实例留下的中途卡片 patch 成「⚠️ 服务已重启，本次回复中断，请重新发送消息。」终态并补 DONE 表情；patch 失败重试一次（上限 2 次）后放弃。持久化盘点与缺口清单见 [docs/persistence.md](docs/persistence.md)。
+- **重启修复（流式中断）**：每条正在流式的 turn 会把自己的修复凭据（trigger 消息、Typing reaction id、全部段卡 id）写入 `channels_routes_v2` 域的 `inflight` 表（键 = 主卡 message id，turn 结束即删）。重启后长连接一建立，插件就把上一实例留下的中途卡片 patch 成「⚠️ 服务已重启，本次回复中断，请重新发送消息。」终态并补 DONE 表情；patch 失败重试一次（上限 2 次）后放弃。持久化盘点与缺口清单见 [docs/persistence.md](docs/persistence.md)。
 - **消息去重（WS 重投幂等）**：飞书长连接重连会重投未 ack 的事件；每条消息在任何副作用之前先落一条 `processed` 记录（键 = message id，飞书全局唯一），重投消息被直接丢弃——同进程靠内存守卫、跨重启靠持久化记录，每条消息至多处理一次。记录保留 24 小时后由 GC 清扫。
 - **路由表 GC 与过期话题拒绝**：超过 `routeTtlMs`（默认 30 天）无活动的真实话题路由会先写入最小持久化墓碑，再删除活动路由；此后该话题中的普通消息和 Session 命令会收到「话题已过期」提示，插件不会恢复旧 Session，也不会在可见历史仍属于旧 Session 的话题里新建 Session（`/help`、`/userid`、`/groupid`、`/health` 仍可用）。墓碑跨重启保留，仅含 thread/chat/owner/工作区路径/会话目录/最后活动时间；旧 DSH Session、日志与话题目录都不删除。降级的 chat-scoped 路由没有独立话题边界，仍直接清理。陈年 in-flight 快照同时在启动时及每 6 小时清扫。`routeTtlMs: 0` 关闭后续路由过期处理，已产生的墓碑仍保持拒绝语义。
-- **准入与授权**：`accessMode: 'guarded'`（默认）下，入站先过频道准入：**管理员不受任何白名单限制**，私聊/任意群聊（含未授权群）都可直接开会话；**非管理员**私聊回固定提示（`/userid` 例外），群聊要求 **群在白名单** 且 **open_id 在全局用户白名单**，两者缺一不可。未授权消息不建 Session、不建话题目录、不落附件、不调模型；群里静默、私聊回固定文案。机器人被拉进任意群时（订阅 `im.chat.member.bot.added_v1`），插件私聊管理员发群信息卡（群名/`chat_id`/成员数/邀请人），未授权群附「授权本群 / 忽略」按钮；已授权群里未授权用户 @ 机器人时，管理员会收到用户授权申请卡（含昵称/open_id）。授权状态持久化在 `channels_routes` 域的 `access_groups` / `access_users` / `access_requests` 表，撤销立即生效。管理员 open_id 在 Web 面板配置；`/auth` 命令、授权卡、面板三种入口等价。
+- **准入与授权**：`accessMode: 'guarded'`（默认）下，入站先过频道准入：**管理员不受任何白名单限制**，私聊/任意群聊（含未授权群）都可直接开会话；**非管理员**私聊回固定提示（`/userid` 例外），群聊要求 **群在白名单** 且 **user_id 在全局用户白名单**，两者缺一不可。未授权消息不建 Session、不建话题目录、不落附件、不调模型；群里静默、私聊回固定文案。机器人被拉进任意群时（订阅 `im.chat.member.bot.added_v1`），插件私聊管理员发群信息卡（群名/`chat_id`/成员数/邀请人），未授权群附「授权本群 / 忽略」按钮；已授权群里未授权用户 @ 机器人时，管理员会收到用户授权申请卡（含昵称/user_id）。授权状态持久化在 `channels_routes_v2` 域的 `access_groups` / `access_users` / `access_requests` 表，撤销立即生效。管理员 user_id 在 Web 面板配置；`/auth` 命令、授权卡、面板三种入口等价。
 - **HITL 审批**：插件以 `prepend: true` 注册为宿主 `approval/request` 瀑布的应答者——本频道路由的 session 的审批请求**优先于** Web 网关的通用应答（其面板对飞书用户不可见），非本频道的请求原样 `next()` 交给其他应答者。审批卡是**独立消息**（锚定到该 session 最新流式卡、同话题），绝不嵌入流式卡（其全量替换 patch 会冲掉按钮）。待审批时允许/拒绝按钮以两列等宽方式排列在同一行；决策仅在会话发起人点击时生效：允许 → `allowed-once`、拒绝 → `rejected`、超时 → `rejected`（fail-closed，卡面显示「已超时」）、请求被撤回（abort）→ `cancelled`、卡片发送失败 → `unavailable`（fail-closed）；每次决策后卡片更新为终态并移除两个按钮。审批记录（`approval/asked`/`decided`）由宿主会话日志负责，插件不做持久化——重启后遗留问题随 turn 消亡，与 Web 网关一致。需要飞书应用订阅 **card.action.trigger** 回调（见「飞书侧准备」）；启动日志 `HITL 审批应答已就绪` 表示生效，`主机未挂载 approval 服务` 表示该部署未启用 HITL。
 - **终态与表情**：成功轮的面板标题变为「回复结束」（无推理内容时不渲染面板），并把 `Typing` 换成 `DONE`；`turn/end.kind = error` 时面板标题为「回复失败」（同样仅当有推理内容），错误只在正文出现一次（`❌ **本轮运行失败**` + 结构化错误消息与错误码），并把 `Typing` 换成 `No`。模型/推理强度/本轮缓存样本不会继承上一轮。
 - **限频**：卡片更新单条消息 5 QPS、应用级 1000 次/分钟；500ms（2 QPS）默认安全，`refreshMs` 下限 200ms；活动状态行的保活心跳默认 5s（`statusRefreshMs` 下限 1s），远低于限频。

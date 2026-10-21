@@ -13,6 +13,7 @@
  */
 
 import { z } from 'zod'
+import { FEISHU_USER_ID_PATTERN } from './domain.ts'
 
 export const FEISHU_LOGGER_LEVELS = ['debug', 'info', 'warn', 'error'] as const
 export type FeishuLoggerLevel = (typeof FEISHU_LOGGER_LEVELS)[number]
@@ -325,15 +326,15 @@ export const configSchema = z.object({
    */
   accessMode: z.enum(['open', 'guarded']).default('guarded'),
   /**
-   * The unique administrator's Feishu open_id (`ou_...`). Set it in the Web
+   * The unique administrator's Feishu `user_id`. Set it in the Web
    * settings panel (or the profile config). Get it by sending `/userid` to the
    * bot in a private chat. While `accessMode` is `guarded` and this is unset,
    * every conversation is refused (fail closed); `/userid` and a fixed notice
    * stay available so the deployment can be bootstrapped.
    */
-  adminOpenId: z.string().regex(
-    /^ou_[A-Za-z0-9_-]+$/,
-    'must be a Feishu open_id such as ou_xxx (send /userid to the bot in a private chat to see it)',
+  adminUserId: z.string().regex(
+    FEISHU_USER_ID_PATTERN,
+    'must be a Feishu user_id, not an open_id (send /userid to the bot in a private chat to see it)',
   ).optional(),
   /**
    * Lifetime of one pending authorization request and of the DM card that asks

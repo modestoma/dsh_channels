@@ -84,16 +84,16 @@ export class AccessStore {
     return this.groupKeys.has(chatId)
   }
 
-  hasUser(openId: string): boolean {
-    return this.userKeys.has(openId)
+  hasUser(userId: string): boolean {
+    return this.userKeys.has(userId)
   }
 
   getGroup(chatId: string): AccessGroupRecord | undefined {
     return this.groups.get(chatId)
   }
 
-  getUser(openId: string): AccessUserRecord | undefined {
-    return this.users.get(openId)
+  getUser(userId: string): AccessUserRecord | undefined {
+    return this.users.get(userId)
   }
 
   /** Every authorized group, oldest first. */
@@ -122,17 +122,17 @@ export class AccessStore {
   }
 
   async addUser(record: AccessUserRecord): Promise<AccessUserRecord> {
-    await this.requireDomain('add access user').accessUsers.put(record.openId, record)
-    this.users.set(record.openId, record)
-    this.userKeys.add(record.openId)
+    await this.requireDomain('add access user').accessUsers.put(record.userId, record)
+    this.users.set(record.userId, record)
+    this.userKeys.add(record.userId)
     return record
   }
 
-  async removeUser(openId: string): Promise<boolean> {
-    if (!this.users.has(openId)) return false
-    await this.requireDomain('remove access user').accessUsers.delete(openId)
-    this.users.delete(openId)
-    this.userKeys.delete(openId)
+  async removeUser(userId: string): Promise<boolean> {
+    if (!this.users.has(userId)) return false
+    await this.requireDomain('remove access user').accessUsers.delete(userId)
+    this.users.delete(userId)
+    this.userKeys.delete(userId)
     return true
   }
 

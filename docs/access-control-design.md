@@ -1,6 +1,8 @@
 # dsh-channels 准入与授权（Access Control）设计
 
 > 状态：已实现（P1 + 入群群信息卡/用户授权卡；P3 增强项仍待做）。
+>
+> 用户标识已从 open_id 改为 `user_id`：下文的 open_id / `ou_...` / `adminOpenId` 现在分别对应 `user_id` / `adminUserId`，存储域改为 `channels_routes_v2`，旧数据不迁移（见 README「飞书侧准备」的 `contact:user.employee_id:readonly` 权限）。
 > 目标：唯一管理员（Web 面板配置 open_id）**不受白名单限制**，在任意私聊/群聊（含未授权群）都能直接发起会话；**非管理员**需要「群已授权 + 用户在白名单」两层同时命中。机器人可以被拉进任意群，但非管理员未授权时不做任何回复、不产生任何会话。
 
 ## 0. 一句话方案

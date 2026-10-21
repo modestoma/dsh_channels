@@ -104,7 +104,7 @@ export interface AttachmentFetchRoute {
   readonly kind: 'thread' | 'chat'
   readonly chatId: string
   readonly chatType: 'p2p' | 'group'
-  readonly senderOpenId: string
+  readonly senderUserId: string
 }
 
 /** Why a message became known to one route. */
@@ -133,7 +133,7 @@ export interface KnownAttachmentMessage {
   readonly kind: 'message' | 'merge_forward'
   readonly resources: readonly KnownAttachmentResource[]
   /** Sender the message was attributed to when it entered the whitelist. */
-  readonly senderOpenId?: string
+  readonly senderUserId?: string
 }
 
 /** Registration input for the whitelist. */
@@ -157,7 +157,7 @@ function routesMatch(left: AttachmentFetchRoute, right: AttachmentFetchRoute): b
     && left.kind === right.kind
     && left.chatId === right.chatId
     && left.chatType === right.chatType
-    && left.senderOpenId === right.senderOpenId
+    && left.senderUserId === right.senderUserId
 }
 
 interface WhitelistedMessage {
@@ -200,7 +200,7 @@ export class RouteAttachmentWhitelist {
         messageId: message.messageId,
         kind: message.kind,
         resources: message.resources.map(resource => ({ ...resource })),
-        ...(message.senderOpenId === undefined ? {} : { senderOpenId: message.senderOpenId }),
+        ...(message.senderUserId === undefined ? {} : { senderUserId: message.senderUserId }),
       },
       source,
       registeredAt: now,
@@ -811,7 +811,7 @@ export class AttachmentFetchToolRuntime {
     if (!read.ok) return undefined
     const container = quoteItemsOf(read.value)
     if (container === undefined || container.deleted) return undefined
-    if (container.senderOpenId !== call.route.senderOpenId) return undefined
+    if (container.senderUserId !== call.route.senderUserId) return undefined
     if (!messageBelongsToRoute(call.route, container)) return undefined
     return knownMessageOfItems(read.value)
   }

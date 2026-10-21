@@ -795,8 +795,8 @@ export function makeRawMessage(
       ? {}
       : {
         sender: {
-          id: rest.sender_id ?? 'ou_test_user',
-          id_type: 'open_id',
+          id: rest.sender_id ?? 'u_test_user',
+          id_type: 'user_id',
           sender_type: rest.sender_type ?? 'user',
         },
       }),
@@ -927,7 +927,7 @@ export function makeMessage(partial: Partial<Omit<NormalizedMessage, 'content'>>
     messageId: `om_msg_${Math.random().toString(36).slice(2, 10)}`,
     chatId: 'oc_test_chat',
     chatType: 'group',
-    senderId: 'ou_test_user',
+    senderId: 'u_test_user',
     rawContentType: 'text',
     resources: [],
     mentions: [],

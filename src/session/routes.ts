@@ -144,7 +144,7 @@ export class RouteStore {
       key,
       chatId: record.chatId,
       chatType: record.chatType,
-      senderOpenId: record.senderOpenId,
+      senderUserId: record.senderUserId,
       expiredAt: now,
       workspacePath: record.workspacePath,
       ...(record.sessionDir === undefined ? {} : { sessionDir: record.sessionDir }),
