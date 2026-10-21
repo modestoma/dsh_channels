@@ -40,8 +40,6 @@ export interface ScopeCheckContext {
    * mode without `adminUserId`).
    */
   readonly ownerLookupFailed: boolean
-  /** Feishu rejected the native slash-command panel sync with an error code. */
-  readonly slashCommandSyncFailed: boolean
 }
 
 /** A requirement none of whose scopes is granted. */
@@ -72,6 +70,8 @@ const BASE_REQUIREMENTS: readonly ScopeRequirement[] = [
   { anyOf: ['im:message.reactions:write_only', 'im:message'], level: 'optional', purpose: '给消息添加/移除处理中表情' },
   { anyOf: ['im:message:readonly', 'im:message'], level: 'optional', purpose: '读取引用消息、话题历史与 feishu_topic_messages' },
   { anyOf: ['im:chat:readonly', 'im:chat'], level: 'optional', purpose: '机器人入群后读取群信息、发送群信息卡' },
+  { anyOf: ['application:app_slash_command:read'], level: 'optional', purpose: '读取飞书原生斜杠指令面板，连接后同步插件命令' },
+  { anyOf: ['application:app_slash_command:write'], level: 'optional', purpose: '写入飞书原生斜杠指令面板（输入 / 时列出插件命令）' },
 ]
 
 /** Group receive needs while ordinary group messages require an @ mention. */
@@ -99,16 +99,6 @@ const APP_INFO_REQUIREMENT: ScopeRequirement = {
   anyOf: ['admin:app.info:readonly', 'application:application:self_manage'],
   level: 'required',
   purpose: '查询应用所有者作为默认管理员；缺失且未配置管理员时所有对话都会被拒绝',
-}
-
-/**
- * Slash-command panel scope. Like the app-info need, the sync outcome is
- * authoritative and the name only feeds the deep link.
- */
-const SLASH_COMMAND_REQUIREMENT: ScopeRequirement = {
-  anyOf: ['application:app_slash_command:write'],
-  level: 'optional',
-  purpose: '同步飞书原生斜杠指令面板（输入 / 时列出插件命令）',
 }
 
 /**
@@ -150,7 +140,6 @@ export function checkScopes(grants: readonly ScopeGrant[], appId: string, contex
   const granted = new Set(grants.filter(grant => grant.granted && grant.type !== 'user').map(grant => grant.name))
   const unmet = scopeRequirements(context).filter(requirement => !requirement.anyOf.some(scope => granted.has(scope)))
   if (context.ownerLookupFailed) unmet.push(APP_INFO_REQUIREMENT)
-  if (context.slashCommandSyncFailed) unmet.push(SLASH_COMMAND_REQUIREMENT)
   const ordered = [
     ...unmet.filter(requirement => requirement.level === 'required'),
     ...unmet.filter(requirement => requirement.level === 'optional'),

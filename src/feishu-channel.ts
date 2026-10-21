@@ -264,66 +264,53 @@ async function feishuCall<T extends { code?: number; msg?: string }>(call: () =>
 
 /** Base path of the app slash-command endpoints (absent from SDK 1.76's typed client). */
 const SLASH_COMMANDS_PATH = '/open-apis/application/v7/app_slash_commands'
-/** Upper bound on list pages followed in one sync. */
-const SLASH_COMMAND_LIST_MAX_PAGES = 10
-/** Icon Feishu shows beside each command in the panel. */
-const SLASH_COMMAND_ICON_KEY = 'ai-agent_outlined'
 
-/** One `app_slash_commands` list response. */
+/** One `app_slash_commands` list response (unpaginated). */
 interface SlashCommandListResponse {
   code?: number
   msg?: string
   data?: {
     items?: Array<{ command_id?: string; command?: string; description?: { default_value?: string } }>
-    has_more?: boolean
-    page_token?: string
   }
 }
 
 /** `rawClient.request` as the slash-command endpoints use it. */
-type RawRequest = <T>(input: { method: string; url: string; data?: object; params?: Record<string, string> }) => Promise<T>
+type RawRequest = <T>(input: { method: string; url: string; data?: object }) => Promise<T>
+
+/**
+ * Create/update body. The panel icon stays at Feishu's default; PATCH
+ * replaces the whole `description` object.
+ */
+function slashCommandDescription(entry: SlashCommandEntry): object {
+  return { default_value: entry.description, i18n: { zh_cn: entry.description } }
+}
 
 /** {@link SlashCommandApi} over the SDK's generic authenticated request. */
 function slashCommandApi(request: RawRequest): SlashCommandApi {
+  const commandUrl = (id: string) => `${SLASH_COMMANDS_PATH}/${encodeURIComponent(id)}`
   return {
     async list(): Promise<readonly RemoteSlashCommand[]> {
-      const commands: RemoteSlashCommand[] = []
-      let pageToken: string | undefined
-      for (let page = 0; page < SLASH_COMMAND_LIST_MAX_PAGES; page++) {
-        const token = pageToken
-        const response = await feishuCall(() => request<SlashCommandListResponse>({
-          method: 'GET',
-          url: SLASH_COMMANDS_PATH,
-          ...(token === undefined ? {} : { params: { page_token: token } }),
-        }))
-        for (const item of response.data?.items ?? []) {
-          if (item.command_id === undefined || item.command === undefined) continue
-          commands.push({ id: item.command_id, command: item.command, description: item.description?.default_value ?? '' })
-        }
-        pageToken = response.data?.has_more === true ? response.data.page_token : undefined
-        if (pageToken === undefined || pageToken === '') break
-      }
-      return commands
+      const response = await feishuCall(() => request<SlashCommandListResponse>({ method: 'GET', url: SLASH_COMMANDS_PATH }))
+      return (response.data?.items ?? []).flatMap(item => item.command_id === undefined || item.command === undefined
+        ? []
+        : [{ id: item.command_id, command: item.command, description: item.description?.default_value ?? '' }])
     },
     async create(entry: SlashCommandEntry): Promise<void> {
       await feishuCall(() => request<{ code?: number; msg?: string }>({
         method: 'POST',
         url: SLASH_COMMANDS_PATH,
-        data: {
-          command: entry.command,
-          description: {
-            default_value: entry.description,
-            i18n: { zh_cn: entry.description },
-            icon: { icon_key: SLASH_COMMAND_ICON_KEY },
-          },
-        },
+        data: { command: entry.command, description: slashCommandDescription(entry) },
+      }))
+    },
+    async update(id: string, entry: SlashCommandEntry): Promise<void> {
+      await feishuCall(() => request<{ code?: number; msg?: string }>({
+        method: 'PATCH',
+        url: commandUrl(id),
+        data: { description: slashCommandDescription(entry) },
       }))
     },
     async delete(id: string): Promise<void> {
-      await feishuCall(() => request<{ code?: number; msg?: string }>({
-        method: 'DELETE',
-        url: `${SLASH_COMMANDS_PATH}/${encodeURIComponent(id)}`,
-      }))
+      await feishuCall(() => request<{ code?: number; msg?: string }>({ method: 'DELETE', url: commandUrl(id) }))
     },
   }
 }

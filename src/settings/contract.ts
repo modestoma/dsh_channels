@@ -290,7 +290,7 @@ export type ScopeCheckWire =
 /** Post-connect native slash-command panel sync outcome. */
 export type SlashCommandSyncWire =
   /** The panel lists exactly the registry commands; counts are this sync's writes. */
-  | { state: 'ok'; checkedAt: number; created: number; removed: number; total: number }
+  | { state: 'ok'; checkedAt: number; created: number; updated: number; removed: number; total: number }
   /** A Feishu call failed; `error` carries the Feishu reason. */
   | { state: 'error'; checkedAt: number; error: string }
 
@@ -539,9 +539,10 @@ export const PANEL_COPY = {
   scopeCheckRequired: '必需',
   scopeCheckError: '无法读取应用的权限授予状态：',
   slashCommandSyncTitle: '斜杠指令面板',
-  slashCommandSyncOk: '插件命令已同步到飞书原生斜杠指令面板，在聊天框输入 / 即可选择。',
+  slashCommandSyncOk: '插件命令已同步到飞书原生斜杠指令面板，在聊天框输入 / 即可选择（飞书客户端约 5 分钟后刷新）。',
   slashCommandSyncTotal: '命令数',
   slashCommandSyncCreated: '本次新增',
+  slashCommandSyncUpdated: '本次更新',
   slashCommandSyncRemoved: '本次删除',
   slashCommandSyncError: '同步飞书原生斜杠指令面板失败（不影响直接输入命令）：',
   missingConfig: '缺少配置',

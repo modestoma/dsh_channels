@@ -105,34 +105,30 @@ describe('LarkChannelAdapter', () => {
 
   describe('slashCommands', () => {
     const request = () => sdk.channel.rawClient.request
+    const base = '/open-apis/application/v7/app_slash_commands'
 
-    it('lists across pages and skips rows without an id or name', async () => {
-      request()
-        .mockResolvedValueOnce({ code: 0, data: { has_more: true, page_token: 'p2', items: [
-          { command_id: 'c1', command: 'help', description: { default_value: 'h' } },
-          { command: 'orphan' },
-        ] } })
-        .mockResolvedValueOnce({ code: 0, data: { items: [{ command_id: 'c2', command: 'stop' }] } })
+    it('lists commands and skips rows without an id or name', async () => {
+      request().mockResolvedValueOnce({ code: 0, data: { items: [
+        { command_id: 'c1', command: 'help', description: { default_value: 'h' } },
+        { command: 'orphan' },
+        { command_id: 'c2', command: 'stop' },
+      ] } })
       await expect(defaultChannelFactory(options).slashCommands?.list()).resolves.toEqual([
         { id: 'c1', command: 'help', description: 'h' },
         { id: 'c2', command: 'stop', description: '' },
       ])
-      expect(request()).toHaveBeenNthCalledWith(1, { method: 'GET', url: '/open-apis/application/v7/app_slash_commands' })
-      expect(request()).toHaveBeenNthCalledWith(2, {
-        method: 'GET', url: '/open-apis/application/v7/app_slash_commands', params: { page_token: 'p2' },
-      })
+      expect(request()).toHaveBeenLastCalledWith({ method: 'GET', url: base })
     })
 
-    it('creates with the zh_cn description and deletes by encoded id', async () => {
+    it('creates, patches, and deletes by encoded id', async () => {
       const api = defaultChannelFactory(options).slashCommands
+      const description = { default_value: '帮助', i18n: { zh_cn: '帮助' } }
       await api?.create({ command: 'help', description: '帮助' })
-      expect(request()).toHaveBeenLastCalledWith({
-        method: 'POST',
-        url: '/open-apis/application/v7/app_slash_commands',
-        data: { command: 'help', description: { default_value: '帮助', i18n: { zh_cn: '帮助' }, icon: { icon_key: 'ai-agent_outlined' } } },
-      })
+      expect(request()).toHaveBeenLastCalledWith({ method: 'POST', url: base, data: { command: 'help', description } })
+      await api?.update('a/b', { command: 'help', description: '帮助' })
+      expect(request()).toHaveBeenLastCalledWith({ method: 'PATCH', url: `${base}/a%2Fb`, data: { description } })
       await api?.delete('a/b')
-      expect(request()).toHaveBeenLastCalledWith({ method: 'DELETE', url: '/open-apis/application/v7/app_slash_commands/a%2Fb' })
+      expect(request()).toHaveBeenLastCalledWith({ method: 'DELETE', url: `${base}/a%2Fb` })
     })
 
     it('maps non-zero codes and thrown errors to FeishuApiError', async () => {

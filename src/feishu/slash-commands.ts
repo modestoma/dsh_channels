@@ -5,9 +5,10 @@
  *
  * The plugin owns the bot's whole command vocabulary (one dsh instance per
  * bot), so the sync is a full reconcile: missing commands are created,
- * commands whose description changed are recreated, and commands the
- * registry no longer has are deleted. A second run with an unchanged
- * registry issues no writes.
+ * commands whose description changed are updated in place, and commands the
+ * registry no longer has (or duplicates) are deleted. A second run with an
+ * unchanged registry issues no writes. Feishu clients cache the panel for
+ * about five minutes after a write.
  *
  * @module dsh-channels/feishu/slash-commands
  */
@@ -41,21 +42,26 @@ export interface SlashCommandApi {
   list(): Promise<readonly RemoteSlashCommand[]>
   /** Register one command. */
   create(entry: SlashCommandEntry): Promise<void>
+  /** Replace the description of the command with Feishu id `id`. */
+  update(id: string, entry: SlashCommandEntry): Promise<void>
   /** Delete one command by its Feishu id. */
   delete(id: string): Promise<void>
 }
 
 /** Writes a reconcile needs, in execution order (deletions first). */
 export interface SlashCommandSyncPlan {
-  /** Remote commands to delete: stale, duplicated, or with a changed description. */
+  /** Remote commands to delete: stale or duplicated. */
   readonly remove: readonly RemoteSlashCommand[]
-  /** Entries to create: missing or recreated after a description change. */
+  /** Remote commands whose description changed, with their new entry. */
+  readonly update: ReadonlyArray<{ readonly id: string; readonly entry: SlashCommandEntry }>
+  /** Entries Feishu does not list yet. */
   readonly create: readonly SlashCommandEntry[]
 }
 
 /** Outcome of one successful reconcile. */
 export interface SlashCommandSyncResult {
   readonly created: number
+  readonly updated: number
   readonly removed: number
   /** Commands the panel lists after the sync. */
   readonly total: number
@@ -84,33 +90,45 @@ export function planSlashCommandSync(
   desired: readonly SlashCommandEntry[],
 ): SlashCommandSyncPlan {
   const wanted = new Map(desired.map(entry => [entry.command, entry]))
-  const kept = new Set<string>()
+  const matched = new Set<string>()
   const remove: RemoteSlashCommand[] = []
+  const update: Array<{ id: string; entry: SlashCommandEntry }> = []
   for (const item of remote) {
     const entry = wanted.get(item.command)
-    if (entry !== undefined && entry.description === item.description && !kept.has(item.command)) {
-      kept.add(item.command)
-    } else {
+    if (entry === undefined || matched.has(item.command)) {
       remove.push(item)
+      continue
     }
+    matched.add(item.command)
+    if (entry.description !== item.description) update.push({ id: item.id, entry })
   }
-  return { remove, create: desired.filter(entry => !kept.has(entry.command)) }
+  return { remove, update, create: desired.filter(entry => !matched.has(entry.command)) }
 }
 
 /**
  * Reconcile the app's panel with `desired`. Stops at the first failed call
- * and rethrows it; a later run resumes from whatever state Feishu kept.
+ * and rethrows it; a later run resumes from whatever state Feishu kept. Once
+ * `signal` aborts, no further write starts (a write already sent completes).
  *
  * @param api The app's slash-command endpoints.
  * @param desired Entries the panel should list.
+ * @param signal Aborted when the caller stops waiting (timeout, shutdown).
  * @returns Write counts and the resulting panel size.
  */
 export async function syncSlashCommands(
   api: SlashCommandApi,
   desired: readonly SlashCommandEntry[],
+  signal?: AbortSignal,
 ): Promise<SlashCommandSyncResult> {
   const plan = planSlashCommandSync(await api.list(), desired)
-  for (const item of plan.remove) await api.delete(item.id)
-  for (const entry of plan.create) await api.create(entry)
-  return { created: plan.create.length, removed: plan.remove.length, total: desired.length }
+  const writes = [
+    ...plan.remove.map(item => () => api.delete(item.id)),
+    ...plan.update.map(item => () => api.update(item.id, item.entry)),
+    ...plan.create.map(entry => () => api.create(entry)),
+  ]
+  for (const write of writes) {
+    signal?.throwIfAborted()
+    await write()
+  }
+  return { created: plan.create.length, updated: plan.update.length, removed: plan.remove.length, total: desired.length }
 }

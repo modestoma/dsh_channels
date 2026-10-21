@@ -997,8 +997,8 @@ describe('SettingsSurface', () => {
   it('carries the slash-command panel sync only while the channel runs', async () => {
     const { surface, target } = makeSurface()
     expect((await surface.status()).slashCommandSync).toBeUndefined()
-    target.slashCommandSyncState = { state: 'ok', checkedAt: 5, created: 1, removed: 0, total: 15 }
-    expect((await surface.status()).slashCommandSync).toEqual({ state: 'ok', checkedAt: 5, created: 1, removed: 0, total: 15 })
+    target.slashCommandSyncState = { state: 'ok', checkedAt: 5, created: 1, updated: 0, removed: 0, total: 15 }
+    expect((await surface.status()).slashCommandSync).toEqual({ state: 'ok', checkedAt: 5, created: 1, updated: 0, removed: 0, total: 15 })
     target.runningFlag = false
     expect((await surface.status()).slashCommandSync).toBeUndefined()
   })

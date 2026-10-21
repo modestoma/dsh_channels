@@ -321,8 +321,8 @@ export class FeishuService {
   private scopeCheckState: ScopeCheckWire | undefined
   /** Post-connect slash-command panel sync; cleared on shutdown. */
   private slashCommandSyncState: SlashCommandSyncWire | undefined
-  /** Feishu answered the panel sync with an error code (feeds the scope check). */
-  private slashCommandSyncRejected = false
+  /** Aborts the running panel sync's remaining writes (timeout, shutdown, reconnect). */
+  private slashCommandSyncAbort: AbortController | undefined
 
   constructor(
     ctx: HostContext,
@@ -1085,33 +1085,36 @@ export class FeishuService {
    */
   private async runSlashCommandSync(channel: FeishuChannel): Promise<void> {
     this.slashCommandSyncState = undefined
-    this.slashCommandSyncRejected = false
+    this.slashCommandSyncAbort?.abort()
+    this.slashCommandSyncAbort = undefined
     const api = channel.slashCommands
     if (api === undefined) return
+    const abort = new AbortController()
+    this.slashCommandSyncAbort = abort
     let timer: ReturnType<typeof setTimeout> | undefined
     let state: SlashCommandSyncWire
-    let rejected = false
     try {
       const result = await Promise.race([
-        syncSlashCommands(api, desiredSlashCommands()),
+        syncSlashCommands(api, desiredSlashCommands(), abort.signal),
         new Promise<never>((_, reject) => {
           timer = setTimeout(() => reject(new Error(`超时（${SLASH_COMMAND_SYNC_TIMEOUT_MS} ms）`)), SLASH_COMMAND_SYNC_TIMEOUT_MS)
         }),
       ])
       state = { state: 'ok', checkedAt: Date.now(), ...result }
     } catch (error) {
-      rejected = error instanceof FeishuApiError && error.code !== undefined
       const detail = error instanceof FeishuApiError ? error.detail : messageOf(error)
       state = { state: 'error', checkedAt: Date.now(), error: detail }
     } finally {
       if (timer !== undefined) clearTimeout(timer)
+      // A timed-out sync must not keep writing behind a reported failure.
+      abort.abort()
+      if (this.slashCommandSyncAbort === abort) this.slashCommandSyncAbort = undefined
     }
     // A background sync can outlive its connection (shutdown/reconnect).
     if (this.channel !== channel) return
     this.slashCommandSyncState = state
-    this.slashCommandSyncRejected = rejected
     if (state.state === 'ok') {
-      this.ctx.logger?.info?.('dsh-channels: slash command panel synced (%d commands, %d created, %d removed)', state.total, state.created, state.removed)
+      this.ctx.logger?.info?.('dsh-channels: slash command panel synced (%d commands, %d created, %d updated, %d removed)', state.total, state.created, state.updated, state.removed)
     } else {
       this.ctx.logger?.warn?.('dsh-channels: 飞书原生斜杠指令面板同步失败（直接输入命令不受影响）：%s', state.error)
     }
@@ -1119,13 +1122,13 @@ export class FeishuService {
 
   /**
    * Compare the app's granted scopes with what the plugin uses and log the
-   * missing ones. Never throws; waits for the owner lookup and the panel sync
-   * so their outcome-driven needs are included.
+   * missing ones. Never throws; waits for the owner lookup so the app-info
+   * need reflects its outcome.
    */
-  private async runScopeCheck(channel: FeishuChannel, appId: string, ownerLookup: Promise<void>, slashCommandSync: Promise<void>): Promise<void> {
+  private async runScopeCheck(channel: FeishuChannel, appId: string, ownerLookup: Promise<void>): Promise<void> {
     this.scopeCheckState = undefined
     if (channel.grantedScopes === undefined) return
-    await Promise.all([ownerLookup, slashCommandSync])
+    await ownerLookup
     let timer: ReturnType<typeof setTimeout> | undefined
     let state: ScopeCheckWire
     try {
@@ -1141,7 +1144,6 @@ export class FeishuService {
         ownerLookupFailed: this.config.accessMode === 'guarded'
           && this.configuredAdminUserId() === undefined
           && this.appOwner !== undefined && 'error' in this.appOwner && this.appOwner.apiRejected,
-        slashCommandSyncFailed: this.slashCommandSyncRejected,
       })
       state = result.consoleUrl === undefined
         ? { state: 'ok', checkedAt: Date.now() }
@@ -1380,8 +1382,8 @@ export class FeishuService {
     if (this.configuredAdminUserId() === undefined) await ownerLookup
     await channel.connect()
     // Background: the results only feed the panel and the log.
-    const slashCommandSync = this.runSlashCommandSync(channel)
-    void this.runScopeCheck(channel, appId, ownerLookup, slashCommandSync)
+    void this.runScopeCheck(channel, appId, ownerLookup)
+    void this.runSlashCommandSync(channel)
     // Repair cards a previous instance left mid-flight (best-effort, background).
     void this.repair.repairAll().catch((error: unknown) => {
       this.ctx.logger?.warn?.('dsh-channels: inflight repair failed: %s', String(error))
@@ -1494,7 +1496,8 @@ export class FeishuService {
     this.appOwner = undefined
     this.scopeCheckState = undefined
     this.slashCommandSyncState = undefined
-    this.slashCommandSyncRejected = false
+    this.slashCommandSyncAbort?.abort()
+    this.slashCommandSyncAbort = undefined
   }
 
   // ---- inbound routing -------------------------------------------------

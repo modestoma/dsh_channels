@@ -242,7 +242,7 @@ function SlashCommandSyncCard(props: { sync: SlashCommandSyncWire }): JSX.Elemen
         ? (
             <div className="dsh-channels-cfg__notice dsh-channels-cfg__notice--ok">
               <span>{PANEL_COPY.slashCommandSyncOk} </span>
-              <span>{PANEL_COPY.slashCommandSyncTotal} {sync.total} · {PANEL_COPY.slashCommandSyncCreated} {sync.created} · {PANEL_COPY.slashCommandSyncRemoved} {sync.removed}</span>
+              <span>{PANEL_COPY.slashCommandSyncTotal} {sync.total} · {PANEL_COPY.slashCommandSyncCreated} {sync.created} · {PANEL_COPY.slashCommandSyncUpdated} {sync.updated} · {PANEL_COPY.slashCommandSyncRemoved} {sync.removed}</span>
             </div>
           )
         : (

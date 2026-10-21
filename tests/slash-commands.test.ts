@@ -1,14 +1,13 @@
 /**
  * Native slash-command panel sync: the registry-derived entries, the
  * reconcile plan, and the service running it after the handshake (panel
- * state, log, scope self-check feed).
+ * state, log, abort on timeout/shutdown).
  */
 
 import { describe, expect, it, vi } from 'vitest'
 import { CHANNEL_COMMANDS } from '../src/commands/registry.ts'
 import type { FeishuConfig } from '../src/config.ts'
 import { FeishuApiError } from '../src/feishu-channel.ts'
-import type { ScopeGrant } from '../src/feishu/scopes.ts'
 import { desiredSlashCommands, planSlashCommandSync, syncSlashCommands } from '../src/feishu/slash-commands.ts'
 import type { RemoteSlashCommand, SlashCommandApi, SlashCommandEntry } from '../src/feishu/slash-commands.ts'
 import { FeishuService } from '../src/service.ts'
@@ -25,6 +24,11 @@ function fakeApi(initial: readonly RemoteSlashCommand[] = []) {
     create: vi.fn(async (entry: SlashCommandEntry) => {
       writes.push(`create ${entry.command}`)
       remote.push({ id: `new_${++serial}`, ...entry })
+    }),
+    update: vi.fn(async (id: string, entry: SlashCommandEntry) => {
+      writes.push(`update ${id}`)
+      const index = remote.findIndex(item => item.id === id)
+      remote[index] = { id, ...entry }
     }),
     delete: vi.fn(async (id: string) => {
       writes.push(`delete ${id}`)
@@ -48,10 +52,10 @@ describe('planSlashCommandSync', () => {
 
   it('creates missing commands and keeps current ones', () => {
     expect(planSlashCommandSync([{ id: '1', command: 'help', description: 'h' }], desired))
-      .toEqual({ remove: [], create: [{ command: 'stop', description: 's' }] })
+      .toEqual({ remove: [], update: [], create: [{ command: 'stop', description: 's' }] })
   })
 
-  it('recreates changed descriptions and deletes stale and duplicate commands', () => {
+  it('updates changed descriptions in place and deletes stale and duplicate commands', () => {
     const remote = [
       { id: '1', command: 'help', description: 'old' },
       { id: '2', command: 'stop', description: 's' },
@@ -59,21 +63,37 @@ describe('planSlashCommandSync', () => {
       { id: '4', command: 'gone', description: 'g' },
     ]
     expect(planSlashCommandSync(remote, desired)).toEqual({
-      remove: [remote[0], remote[2], remote[3]],
-      create: [{ command: 'help', description: 'h' }],
+      remove: [remote[2], remote[3]],
+      update: [{ id: '1', entry: { command: 'help', description: 'h' } }],
+      create: [],
     })
   })
 })
 
 describe('syncSlashCommands', () => {
-  it('deletes before creating and is a no-op on the second run', async () => {
-    const { api, writes } = fakeApi([{ id: 'x', command: 'legacy', description: 'l' }])
+  it('deletes, then updates, then creates, and is a no-op on the second run', async () => {
+    const { api, writes } = fakeApi([
+      { id: 'x', command: 'legacy', description: 'l' },
+      { id: 'h', command: 'help', description: 'old' },
+    ])
     const desired = desiredSlashCommands()
-    await expect(syncSlashCommands(api, desired)).resolves.toEqual({ created: desired.length, removed: 1, total: desired.length })
-    expect(writes[0]).toBe('delete x')
+    await expect(syncSlashCommands(api, desired))
+      .resolves.toEqual({ created: desired.length - 1, updated: 1, removed: 1, total: desired.length })
+    expect(writes.slice(0, 3)).toEqual(['delete x', 'update h', `create ${desired[1]!.command}`])
     writes.length = 0
-    await expect(syncSlashCommands(api, desired)).resolves.toEqual({ created: 0, removed: 0, total: desired.length })
+    await expect(syncSlashCommands(api, desired)).resolves.toEqual({ created: 0, updated: 0, removed: 0, total: desired.length })
     expect(writes).toEqual([])
+  })
+
+  it('starts no write once the signal aborts', async () => {
+    const { api, writes } = fakeApi()
+    const abort = new AbortController()
+    vi.mocked(api.create).mockImplementationOnce(async entry => {
+      writes.push(`create ${entry.command}`)
+      abort.abort()
+    })
+    await expect(syncSlashCommands(api, desiredSlashCommands(), abort.signal)).rejects.toThrow()
+    expect(writes).toEqual(['create help'])
   })
 
   it('stops at the first failed write', async () => {
@@ -104,41 +124,35 @@ describe('FeishuService slash-command panel sync', () => {
     const { service, ctxState } = await boot({ slashCommands: api })
     await vi.waitFor(() => expect(service.slashCommandSync()?.state).toBe('ok'))
     const total = CHANNEL_COMMANDS.length
-    expect(service.slashCommandSync()).toMatchObject({ created: total, removed: 0, total })
+    expect(service.slashCommandSync()).toMatchObject({ created: total, updated: 0, removed: 0, total })
     expect(mock(ctxState.ctx.logger?.info).mock.calls).toContainEqual([
-      'dsh-channels: slash command panel synced (%d commands, %d created, %d removed)', total, total, 0,
+      'dsh-channels: slash command panel synced (%d commands, %d created, %d updated, %d removed)', total, total, 0, 0,
     ])
     await service.shutdown()
     expect(service.slashCommandSync()).toBeUndefined()
   })
 
-  it('records a Feishu rejection, warns, and lists the slash-command scope in the self-check', async () => {
+  it('records a failure and warns', async () => {
     const { api } = fakeApi()
     vi.mocked(api.list).mockRejectedValueOnce(new FeishuApiError('code=99991672 Access denied', 99991672))
-    const grants: readonly ScopeGrant[] = [
-      'im:message', 'im:message.p2p_msg:readonly', 'im:message.group_at_msg:readonly',
-      'im:message.group_msg', 'contact:user.employee_id:readonly', 'im:chat:readonly',
-    ].map(name => ({ name, granted: true }))
-    const { service, ctxState } = await boot({ slashCommands: api, grantedScopes: async () => grants })
-    await vi.waitFor(() => expect(service.scopeCheck()?.state).toBe('missing'))
-    expect(service.slashCommandSync()).toMatchObject({ state: 'error', error: 'code=99991672 Access denied' })
+    const { service, ctxState } = await boot({ slashCommands: api })
+    await vi.waitFor(() => expect(service.slashCommandSync()).toMatchObject({ state: 'error', error: 'code=99991672 Access denied' }))
     expect(mock(ctxState.ctx.logger?.warn).mock.calls).toContainEqual([
       'dsh-channels: 飞书原生斜杠指令面板同步失败（直接输入命令不受影响）：%s', 'code=99991672 Access denied',
     ])
-    const check = service.scopeCheck()
-    expect(check?.state === 'missing' ? check.missing.map(item => item.scopes[0]) : [])
-      .toEqual(['application:app_slash_command:write'])
     await service.shutdown()
   })
 
-  it('does not blame the scope for a transport failure', async () => {
-    const { api } = fakeApi()
-    vi.mocked(api.list).mockRejectedValueOnce(new Error('socket hang up'))
-    const { service } = await boot({ slashCommands: api, grantedScopes: async () => [] })
-    await vi.waitFor(() => expect(service.scopeCheck()?.state).toBe('missing'))
-    expect(service.slashCommandSync()).toMatchObject({ state: 'error', error: 'socket hang up' })
-    const check = service.scopeCheck()
-    expect(check?.state === 'missing' && check.missing.some(item => item.scopes[0] === 'application:app_slash_command:write')).toBe(false)
+  it('stops writing once shutdown aborts a running sync', async () => {
+    const { api, writes } = fakeApi()
+    let releaseList!: () => void
+    vi.mocked(api.list).mockImplementationOnce(() => new Promise(resolve => { releaseList = () => resolve([]) }))
+    const { service } = await boot({ slashCommands: api })
+    await vi.waitFor(() => expect(api.list).toHaveBeenCalled())
     await service.shutdown()
+    releaseList()
+    await new Promise(resolve => setTimeout(resolve, 10))
+    expect(writes).toEqual([])
+    expect(service.slashCommandSync()).toBeUndefined()
   })
 })
