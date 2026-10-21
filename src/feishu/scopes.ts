@@ -70,6 +70,8 @@ const BASE_REQUIREMENTS: readonly ScopeRequirement[] = [
   { anyOf: ['im:message.reactions:write_only', 'im:message'], level: 'optional', purpose: '给消息添加/移除处理中表情' },
   { anyOf: ['im:message:readonly', 'im:message'], level: 'optional', purpose: '读取引用消息、话题历史与 feishu_topic_messages' },
   { anyOf: ['im:chat:readonly', 'im:chat'], level: 'optional', purpose: '机器人入群后读取群信息、发送群信息卡' },
+  { anyOf: ['application:app_slash_command:read'], level: 'optional', purpose: '读取飞书原生斜杠指令面板，连接后同步插件命令' },
+  { anyOf: ['application:app_slash_command:write'], level: 'optional', purpose: '写入飞书原生斜杠指令面板（输入 / 时列出插件命令）' },
 ]
 
 /** Group receive needs while ordinary group messages require an @ mention. */

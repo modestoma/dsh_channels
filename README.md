@@ -35,6 +35,8 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 
 `/new` 是 `/renew` 的别名。`/help` 由命令注册表按分组生成，新增命令只需在注册表里加一行。
 
+**飞书原生斜杠指令面板**：每次连上飞书后，插件在后台调用 `application/v7/app_slash_commands` 把命令注册表同步到飞书原生面板，用户在聊天框输入 `/` 即可直接选择命令（飞书客户端有约 5 分钟缓存）。同步是全量对齐且幂等：缺的创建、描述变了的原地更新、注册表里已没有的或重复的删除（别名不单独列出），注册表不变时再次连接不产生任何写操作；超时（30 秒）或断开后不再发起新的写操作。需要可选权限 `application:app_slash_command:read`（读取现有命令）与 `application:app_slash_command:write`（增删改），两项都列在权限自检里。同步失败只影响面板列表，直接输入命令照常可用；失败原因显示在 Web 设置「连接」页并打印一条 warn。
+
 ## 流式卡片
 
 卡片 2.0，按**过程 → 正文 → 页脚**三层组织，默认 500ms 刷新（`refreshMs` 可调）：
@@ -65,7 +67,7 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 
 | 标签页 | 内容 |
 | --- | --- |
-| 连接 | 连接状态与连接信息（长连接状态、Bot open_id、运行时长、话题路由 / 活动会话 / 在途回复）、未配置时的三步引导、飞书应用凭据、最近一次连接失败原因、需重连的待生效提醒 |
+| 连接 | 连接状态与连接信息（长连接状态、Bot open_id、运行时长、话题路由 / 活动会话 / 在途回复）、权限自检、斜杠指令面板同步结果、未配置时的三步引导、飞书应用凭据、最近一次连接失败原因、需重连的待生效提醒 |
 | 会话与行为 | 「行为」：私聊模式、普通群 @ 要求、话题兜底、首次私聊引导、权限切换；「内容与附件」：附件接收、存储后端、图片预取与上限、首轮历史；「模型工具」：`feishu_attachment_fetch` / `feishu_topic_messages` 开关与上限、被动读取预算 |
 | 模型 | 模型服务商、模型 id、推理档位、Agent 预设（宿主目录驱动的级联下拉） |
 | 工作区 | 工作区根目录（可点「选择目录…」调用系统目录选择框）；话题目录隔离方式（`topicIsolation`）在 profile 配置中设置 |
@@ -159,6 +161,7 @@ src/
 │   ├── inbound-attachments.ts # 入站附件：不下载分类、图片预取、旧版工作区存档（archive）
 │   ├── manifest.ts        # <feishu_context> 清单：只列未加载附件、去重、转义、行上限
 │   ├── message-read.ts    # 消息读取：get/mget/list、引用摘录、首轮历史、统一渲染
+│   ├── slash-commands.ts  # 连接后把命令注册表幂等同步到飞书原生斜杠指令面板
 │   ├── tools.ts           # feishu_attachment_fetch / feishu_topic_messages 与每 route 白名单
 │   └── agent-context.ts   # agent 作用域 system prompt：native/archive 双模式附件指引
 ├── routing/

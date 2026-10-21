@@ -25,6 +25,7 @@
    | `im:message.reactions:write_only`（发送、删除消息表情回复） | Typing / DONE / No 表态 |
    | `im:message:update`（更新消息卡片） | 流式卡片刷新（patch） |
    | `im:chat:readonly` 一类（获取群信息） | 入群通知卡展示群名/成员数（具体 scope 以控制台要求为准） |
+   | `application:app_slash_command:read` 与 `application:app_slash_command:write`（读取/管理应用斜杠指令，可选） | 连接后把插件命令同步到飞书原生斜杠指令面板（输入 `/` 时列出，客户端约 5 分钟后刷新）；缺失时只是面板没有列表，直接输入命令不受影响 |
 
    > 卡片更新接口本身支持 `im:message` 一项即可，但建议把 `im:message:update` 也加上，避免组合差异。
    >
@@ -212,6 +213,8 @@ DSH_HOME=$DSH_HOME pnpm dsh web        # 默认 http://127.0.0.1:3080
 [dsh-channels] HITL 审批应答已就绪（决策卡片超时 300000 ms）
 [dsh-channels] 准入=guarded，管理员已配置
 ```
+
+> 斜杠指令面板：连接后日志出现 `slash command panel synced (N commands, x created, y updated, z removed)` 即同步成功，此时在飞书聊天框输入 `/` 应能看到插件命令；`飞书原生斜杠指令面板同步失败（直接输入命令不受影响）：…` 表示同步失败，原因同时显示在面板「连接」页。
 
 > 准入相关控制台输出：`准入=open`（不安全，仅调试）、`准入=guarded，管理员已配置`、`准入=guarded 但未配置管理员 user_id：所有对话都会被拒绝…`（此时按 §3.3 配置管理员即可）。
 

@@ -11,6 +11,7 @@
 import { createLarkChannel, LoggerLevel } from '@larksuiteoapi/node-sdk'
 import { SCOPE_GRANTED_STATUS } from './feishu/scopes.ts'
 import type { ScopeGrant } from './feishu/scopes.ts'
+import type { RemoteSlashCommand, SlashCommandApi, SlashCommandEntry } from './feishu/slash-commands.ts'
 import type {
   BotAddedEvent,
   ChatInfo,
@@ -74,6 +75,12 @@ export interface FeishuChannel {
    * the call fails. Optional so stubs can omit it; absence skips the check.
    */
   grantedScopes?(): Promise<readonly ScopeGrant[]>
+  /**
+   * The app's native slash-command panel endpoints
+   * (`application/v7/app_slash_commands`). Optional so stubs can omit it;
+   * absence skips the panel sync.
+   */
+  readonly slashCommands?: SlashCommandApi
   /** Current official-SDK WebSocket lifecycle snapshot, when initialized. */
   getConnectionStatus(): FeishuConnectionStatus | undefined
   /** Start the WebSocket long connection (resolves after the handshake). */
@@ -235,6 +242,79 @@ function thrownErrorFields(error: unknown): { detail: string; code?: number } {
 }
 
 /** Normalize a thrown SDK/Axios error into an {@link AppOwnerLookupError}. */
+/** Throw a {@link FeishuApiError} for a non-zero Feishu `code`. */
+function assertFeishuOk(response: { code?: number; msg?: string }): void {
+  if (response.code !== undefined && response.code !== 0) {
+    throw new FeishuApiError(`code=${response.code}${response.msg === undefined ? '' : ` ${response.msg}`}`, response.code)
+  }
+}
+
+/** Run one raw request, mapping thrown and non-zero-code failures to {@link FeishuApiError}. */
+async function feishuCall<T extends { code?: number; msg?: string }>(call: () => Promise<T>): Promise<T> {
+  let response: T
+  try {
+    response = await call()
+  } catch (error) {
+    const { detail, code } = thrownErrorFields(error)
+    throw new FeishuApiError(detail, code)
+  }
+  assertFeishuOk(response)
+  return response
+}
+
+/** Base path of the app slash-command endpoints (absent from SDK 1.76's typed client). */
+const SLASH_COMMANDS_PATH = '/open-apis/application/v7/app_slash_commands'
+
+/** One `app_slash_commands` list response (unpaginated). */
+interface SlashCommandListResponse {
+  code?: number
+  msg?: string
+  data?: {
+    items?: Array<{ command_id?: string; command?: string; description?: { default_value?: string } }>
+  }
+}
+
+/** `rawClient.request` as the slash-command endpoints use it. */
+type RawRequest = <T>(input: { method: string; url: string; data?: object }) => Promise<T>
+
+/**
+ * Create/update body. The panel icon stays at Feishu's default; PATCH
+ * replaces the whole `description` object.
+ */
+function slashCommandDescription(entry: SlashCommandEntry): object {
+  return { default_value: entry.description, i18n: { zh_cn: entry.description } }
+}
+
+/** {@link SlashCommandApi} over the SDK's generic authenticated request. */
+function slashCommandApi(request: RawRequest): SlashCommandApi {
+  const commandUrl = (id: string) => `${SLASH_COMMANDS_PATH}/${encodeURIComponent(id)}`
+  return {
+    async list(): Promise<readonly RemoteSlashCommand[]> {
+      const response = await feishuCall(() => request<SlashCommandListResponse>({ method: 'GET', url: SLASH_COMMANDS_PATH }))
+      return (response.data?.items ?? []).flatMap(item => item.command_id === undefined || item.command === undefined
+        ? []
+        : [{ id: item.command_id, command: item.command, description: item.description?.default_value ?? '' }])
+    },
+    async create(entry: SlashCommandEntry): Promise<void> {
+      await feishuCall(() => request<{ code?: number; msg?: string }>({
+        method: 'POST',
+        url: SLASH_COMMANDS_PATH,
+        data: { command: entry.command, description: slashCommandDescription(entry) },
+      }))
+    },
+    async update(id: string, entry: SlashCommandEntry): Promise<void> {
+      await feishuCall(() => request<{ code?: number; msg?: string }>({
+        method: 'PATCH',
+        url: commandUrl(id),
+        data: { description: slashCommandDescription(entry) },
+      }))
+    },
+    async delete(id: string): Promise<void> {
+      await feishuCall(() => request<{ code?: number; msg?: string }>({ method: 'DELETE', url: commandUrl(id) }))
+    },
+  }
+}
+
 function appOwnerLookupError(error: unknown): AppOwnerLookupError {
   if (error instanceof AppOwnerLookupError) return error
   const { detail, code } = thrownErrorFields(error)
@@ -254,6 +334,7 @@ class LarkChannelAdapter implements FeishuChannel {
   private readonly appId: string
   private readonly requireMention: boolean
   private readonly dmMode: 'open' | 'disabled'
+  readonly slashCommands: SlashCommandApi
 
   constructor(options: ChannelConnectOptions) {
     this.channel = createLarkChannel({
@@ -282,6 +363,8 @@ class LarkChannelAdapter implements FeishuChannel {
     this.appId = options.appId
     this.requireMention = options.requireMention
     this.dmMode = options.dmMode
+    const rawClient = this.channel.rawClient
+    this.slashCommands = slashCommandApi(async <T,>(input: Parameters<RawRequest>[0]) => await rawClient.request<T>(input))
   }
 
   onMessage(handler: (message: NormalizedMessage) => void | Promise<void>): () => void {
@@ -346,16 +429,7 @@ class LarkChannelAdapter implements FeishuChannel {
   }
 
   async grantedScopes(): Promise<readonly ScopeGrant[]> {
-    let response
-    try {
-      response = await this.channel.rawClient.application.v6.scope.list()
-    } catch (error) {
-      const { detail, code } = thrownErrorFields(error)
-      throw new FeishuApiError(detail, code)
-    }
-    if (response.code !== undefined && response.code !== 0) {
-      throw new FeishuApiError(`code=${response.code}${response.msg === undefined ? '' : ` ${response.msg}`}`, response.code)
-    }
+    const response = await feishuCall(() => this.channel.rawClient.application.v6.scope.list())
     return (response.data?.scopes ?? []).map(scope => ({
       name: scope.scope_name,
       granted: scope.grant_status === SCOPE_GRANTED_STATUS,

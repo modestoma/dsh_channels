@@ -12,7 +12,7 @@
  */
 
 import { PANEL_COPY } from '../../settings/contract.ts'
-import type { ChannelStatusWire, PanelWire, ScopeCheckWire } from '../../settings/contract.ts'
+import type { ChannelStatusWire, PanelWire, ScopeCheckWire, SlashCommandSyncWire } from '../../settings/contract.ts'
 import { CredentialsCard } from './credentials-card.tsx'
 import { connectionStateLabel, fieldLabel, formatUptime, phaseBadge, TabHelp } from './shared.tsx'
 import type { BusyAction, CredentialsView } from './shared.tsx'
@@ -37,6 +37,7 @@ export function ConnectionTab(props: ConnectionTabProps): JSX.Element {
         ? <OnboardingCard status={status} />
         : <ConnectionInfoCard status={status} busy={busy} onReconnect={onReconnect} />}
       {status.scopeCheck === undefined ? null : <ScopeCheckCard check={status.scopeCheck} />}
+      {status.slashCommandSync === undefined ? null : <SlashCommandSyncCard sync={status.slashCommandSync} />}
       <CredentialsCard panel={panel} credentials={credentials} />
     </div>
   )
@@ -225,6 +226,31 @@ function ScopeCheckCard(props: { check: ScopeCheckWire }): JSX.Element {
             </div>
           )
         : null}
+    </section>
+  )
+}
+
+/** Post-connect native slash-command panel sync: counts on success, the Feishu reason on failure. */
+function SlashCommandSyncCard(props: { sync: SlashCommandSyncWire }): JSX.Element {
+  const { sync } = props
+  return (
+    <section className="dsh-channels-cfg__card">
+      <div className="dsh-channels-cfg__cardHead">
+        <span className="dsh-channels-cfg__cardTitle">{PANEL_COPY.slashCommandSyncTitle}</span>
+      </div>
+      {sync.state === 'ok'
+        ? (
+            <div className="dsh-channels-cfg__notice dsh-channels-cfg__notice--ok">
+              <span>{PANEL_COPY.slashCommandSyncOk} </span>
+              <span>{PANEL_COPY.slashCommandSyncTotal} {sync.total} · {PANEL_COPY.slashCommandSyncCreated} {sync.created} · {PANEL_COPY.slashCommandSyncUpdated} {sync.updated} · {PANEL_COPY.slashCommandSyncRemoved} {sync.removed}</span>
+            </div>
+          )
+        : (
+            <div className="dsh-channels-cfg__notice dsh-channels-cfg__notice--error">
+              <strong>{PANEL_COPY.slashCommandSyncError}</strong>
+              <span className="dsh-channels-cfg__mono">{sync.error}</span>
+            </div>
+          )}
     </section>
   )
 }

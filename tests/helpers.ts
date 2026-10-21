@@ -25,6 +25,7 @@ import type {
 } from '../src/feishu-channel.ts'
 import type { RawDomainHandle } from '../src/domain.ts'
 import type { ScopeGrant } from '../src/feishu/scopes.ts'
+import type { SlashCommandApi } from '../src/feishu/slash-commands.ts'
 
 export function makeSession(
   id = `session-${Math.random().toString(36).slice(2, 10)}`,
@@ -762,6 +763,8 @@ export interface FakeChannelOptions {
   appOwnerUserId?: () => Promise<string | undefined>
   /** Scope-grant stub; omitted = the channel has no scope self-check. */
   grantedScopes?: () => Promise<readonly ScopeGrant[]>
+  /** Slash-command panel stub; omitted = the channel has no panel sync. */
+  slashCommands?: SlashCommandApi
 }
 
 /**
@@ -894,6 +897,7 @@ export function makeChannel(options: FakeChannelOptions = {}): FeishuChannel & {
     threadIdOfMessage: options.threadIdOfMessage ?? (async () => `omt_${serial}`),
     ...(options.appOwnerUserId === undefined ? {} : { appOwnerUserId: options.appOwnerUserId }),
     ...(options.grantedScopes === undefined ? {} : { grantedScopes: options.grantedScopes }),
+    ...(options.slashCommands === undefined ? {} : { slashCommands: options.slashCommands }),
     ...(options.messageGet === undefined
       ? {}
       : { messageGet: async (messageId: string): Promise<unknown> => await options.messageGet?.(messageId) }),

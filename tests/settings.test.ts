@@ -41,6 +41,7 @@ import type {
   CatalogWire,
   EditableValues,
   ScopeCheckWire,
+  SlashCommandSyncWire,
 } from '../src/settings/contract.ts'
 import {
   OverlayStore,
@@ -124,6 +125,7 @@ class FakeTarget implements SettingsTarget {
   failConnect: string | undefined
   healthState = healthySnapshot()
   scopeCheckState: ScopeCheckWire | undefined
+  slashCommandSyncState: SlashCommandSyncWire | undefined
   /** Admission snapshot handed to the panel (the real service keeps it in memory). */
   accessState: AccessWire = {
     mode: 'guarded',
@@ -166,6 +168,7 @@ class FakeTarget implements SettingsTarget {
   uptimeMs(): number | undefined { return this.runningFlag ? 60_000 : undefined }
   startError(): string | undefined { return this.startErrorText }
   scopeCheck(): ScopeCheckWire | undefined { return this.scopeCheckState }
+  slashCommandSync(): SlashCommandSyncWire | undefined { return this.slashCommandSyncState }
   configSnapshot(): FeishuConfig { return { ...this.config } }
   baseConfigSnapshot(): FeishuConfig { return { ...this.base } }
   runningConfigSnapshot(): FeishuConfig | undefined {
@@ -989,6 +992,15 @@ describe('SettingsSurface', () => {
     expect((await surface.status()).scopeCheck).toEqual({ state: 'ok', checkedAt: 5 })
     target.runningFlag = false
     expect((await surface.status()).scopeCheck).toBeUndefined()
+  })
+
+  it('carries the slash-command panel sync only while the channel runs', async () => {
+    const { surface, target } = makeSurface()
+    expect((await surface.status()).slashCommandSync).toBeUndefined()
+    target.slashCommandSyncState = { state: 'ok', checkedAt: 5, created: 1, updated: 0, removed: 0, total: 15 }
+    expect((await surface.status()).slashCommandSync).toEqual({ state: 'ok', checkedAt: 5, created: 1, updated: 0, removed: 0, total: 15 })
+    target.runningFlag = false
+    expect((await surface.status()).slashCommandSync).toBeUndefined()
   })
 
   it('surfaces the health reasons that explain a degraded level', async () => {

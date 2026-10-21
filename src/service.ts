@@ -88,9 +88,10 @@ import { ACTIVITY_BUILD_MARKER, TurnStreamer } from './streamer.ts'
 import type { ProjectedStats, StreamerHooks } from './streamer.ts'
 import type { FeishuConfig } from './config.ts'
 import type {
-  AccessMutationResponse, AccessRequestWire, AccessWire, ScopeCheckWire,
+  AccessMutationResponse, AccessRequestWire, AccessWire, ScopeCheckWire, SlashCommandSyncWire,
 } from './settings/contract.ts'
 import { checkScopes } from './feishu/scopes.ts'
+import { desiredSlashCommands, syncSlashCommands } from './feishu/slash-commands.ts'
 import { mergeOverlay } from './settings/overlay.ts'
 import type { OverlayPatch, OverlayStore } from './settings/overlay.ts'
 
@@ -105,6 +106,8 @@ const PROCESSED_RETENTION_MS = 24 * 60 * 60 * 1000
 const APP_OWNER_LOOKUP_TIMEOUT_MS = 10_000
 /** Upper bound on the post-connect scope grant query. */
 const SCOPE_CHECK_TIMEOUT_MS = 10_000
+/** Upper bound on the whole post-connect slash-command panel sync (one list plus per-command writes). */
+const SLASH_COMMAND_SYNC_TIMEOUT_MS = 30_000
 
 /** Outcome of the app-owner lookup for the current connection. */
 type AppOwnerState =
@@ -316,6 +319,10 @@ export class FeishuService {
   private appOwner: AppOwnerState | undefined
   /** Post-connect scope self-check; cleared on shutdown. */
   private scopeCheckState: ScopeCheckWire | undefined
+  /** Post-connect slash-command panel sync; cleared on shutdown. */
+  private slashCommandSyncState: SlashCommandSyncWire | undefined
+  /** Aborts the running panel sync's remaining writes (timeout, shutdown, reconnect). */
+  private slashCommandSyncAbort: AbortController | undefined
 
   constructor(
     ctx: HostContext,
@@ -1066,6 +1073,53 @@ export class FeishuService {
     return this.scopeCheckState
   }
 
+  /** Latest native slash-command panel sync, when one finished for this connection. */
+  slashCommandSync(): SlashCommandSyncWire | undefined {
+    return this.slashCommandSyncState
+  }
+
+  /**
+   * Reconcile Feishu's native `/` panel with the command registry and log the
+   * outcome. Never throws; a failure only loses the panel listing, typed
+   * commands keep working.
+   */
+  private async runSlashCommandSync(channel: FeishuChannel): Promise<void> {
+    this.slashCommandSyncState = undefined
+    this.slashCommandSyncAbort?.abort()
+    this.slashCommandSyncAbort = undefined
+    const api = channel.slashCommands
+    if (api === undefined) return
+    const abort = new AbortController()
+    this.slashCommandSyncAbort = abort
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let state: SlashCommandSyncWire
+    try {
+      const result = await Promise.race([
+        syncSlashCommands(api, desiredSlashCommands(), abort.signal),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`超时（${SLASH_COMMAND_SYNC_TIMEOUT_MS} ms）`)), SLASH_COMMAND_SYNC_TIMEOUT_MS)
+        }),
+      ])
+      state = { state: 'ok', checkedAt: Date.now(), ...result }
+    } catch (error) {
+      const detail = error instanceof FeishuApiError ? error.detail : messageOf(error)
+      state = { state: 'error', checkedAt: Date.now(), error: detail }
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
+      // A timed-out sync must not keep writing behind a reported failure.
+      abort.abort()
+      if (this.slashCommandSyncAbort === abort) this.slashCommandSyncAbort = undefined
+    }
+    // A background sync can outlive its connection (shutdown/reconnect).
+    if (this.channel !== channel) return
+    this.slashCommandSyncState = state
+    if (state.state === 'ok') {
+      this.ctx.logger?.info?.('dsh-channels: slash command panel synced (%d commands, %d created, %d updated, %d removed)', state.total, state.created, state.updated, state.removed)
+    } else {
+      this.ctx.logger?.warn?.('dsh-channels: 飞书原生斜杠指令面板同步失败（直接输入命令不受影响）：%s', state.error)
+    }
+  }
+
   /**
    * Compare the app's granted scopes with what the plugin uses and log the
    * missing ones. Never throws; waits for the owner lookup so the app-info
@@ -1327,8 +1381,9 @@ export class FeishuService {
     const ownerLookup = this.resolveAppOwner(channel)
     if (this.configuredAdminUserId() === undefined) await ownerLookup
     await channel.connect()
-    // Background: the result only feeds the panel and the log.
+    // Background: the results only feed the panel and the log.
     void this.runScopeCheck(channel, appId, ownerLookup)
+    void this.runSlashCommandSync(channel)
     // Repair cards a previous instance left mid-flight (best-effort, background).
     void this.repair.repairAll().catch((error: unknown) => {
       this.ctx.logger?.warn?.('dsh-channels: inflight repair failed: %s', String(error))
@@ -1440,6 +1495,9 @@ export class FeishuService {
     this.runningConfig = undefined
     this.appOwner = undefined
     this.scopeCheckState = undefined
+    this.slashCommandSyncState = undefined
+    this.slashCommandSyncAbort?.abort()
+    this.slashCommandSyncAbort = undefined
   }
 
   // ---- inbound routing -------------------------------------------------

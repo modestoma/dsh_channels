@@ -20,7 +20,7 @@ const sdk = vi.hoisted(() => {
           scope: { list: vi.fn(async (): Promise<unknown> => ({ code: 0, data: {} })) },
         },
       },
-      request: vi.fn(async () => ({ data: { items: [] } })),
+      request: vi.fn(async (): Promise<unknown> => ({ data: { items: [] } })),
       im: {
         v1: {
           message: {
@@ -100,6 +100,43 @@ describe('LarkChannelAdapter', () => {
       await expect(defaultChannelFactory(options).grantedScopes?.()).rejects.toMatchObject({ detail: 'bad' })
       list().mockRejectedValueOnce('down')
       await expect(defaultChannelFactory(options).grantedScopes?.()).rejects.toMatchObject({ detail: 'down' })
+    })
+  })
+
+  describe('slashCommands', () => {
+    const request = () => sdk.channel.rawClient.request
+    const base = '/open-apis/application/v7/app_slash_commands'
+
+    it('lists commands and skips rows without an id or name', async () => {
+      request().mockResolvedValueOnce({ code: 0, data: { items: [
+        { command_id: 'c1', command: 'help', description: { default_value: 'h' } },
+        { command: 'orphan' },
+        { command_id: 'c2', command: 'stop' },
+      ] } })
+      await expect(defaultChannelFactory(options).slashCommands?.list()).resolves.toEqual([
+        { id: 'c1', command: 'help', description: 'h' },
+        { id: 'c2', command: 'stop', description: '' },
+      ])
+      expect(request()).toHaveBeenLastCalledWith({ method: 'GET', url: base })
+    })
+
+    it('creates, patches, and deletes by encoded id', async () => {
+      const api = defaultChannelFactory(options).slashCommands
+      const description = { default_value: '帮助', i18n: { zh_cn: '帮助' } }
+      await api?.create({ command: 'help', description: '帮助' })
+      expect(request()).toHaveBeenLastCalledWith({ method: 'POST', url: base, data: { command: 'help', description } })
+      await api?.update('a/b', { command: 'help', description: '帮助' })
+      expect(request()).toHaveBeenLastCalledWith({ method: 'PATCH', url: `${base}/a%2Fb`, data: { description } })
+      await api?.delete('a/b')
+      expect(request()).toHaveBeenLastCalledWith({ method: 'DELETE', url: `${base}/a%2Fb` })
+    })
+
+    it('maps non-zero codes and thrown errors to FeishuApiError', async () => {
+      const api = defaultChannelFactory(options).slashCommands
+      request().mockResolvedValueOnce({ code: 99991672, msg: 'denied' })
+      await expect(api?.list()).rejects.toMatchObject({ code: 99991672, detail: 'code=99991672 denied' })
+      request().mockRejectedValueOnce(Object.assign(new Error('400'), { response: { data: { code: 40000000, msg: 'exists' } } }))
+      await expect(api?.create({ command: 'help', description: 'h' })).rejects.toBeInstanceOf(FeishuApiError)
     })
   })
 

@@ -19,6 +19,8 @@ const ALL_GRANTED: readonly ScopeGrant[] = [
   'im:message.group_msg',
   'contact:user.employee_id:readonly',
   'im:chat:readonly',
+  'application:app_slash_command:read',
+  'application:app_slash_command:write',
 ].map(name => ({ name, granted: true, type: 'tenant' as const }))
 
 const NO_OWNER_FALLBACK = { dmEnabled: true, requireMention: true, ownerLookupFailed: false }
