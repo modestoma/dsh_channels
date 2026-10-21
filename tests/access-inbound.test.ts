@@ -191,10 +191,26 @@ describe('guarded 模式：准入零副作用', () => {
     await h.service.shutdown()
   })
 
-  it('显式配置的管理员优先于应用所有者', async () => {
+  it('显式配置的管理员优先于应用所有者；清空后回落到所有者', async () => {
     const h = await setup({ adminUserId: ADMIN }, { appOwnerUserId: async () => 'u_owner' })
     expect(h.service.accessSnapshot().admin).toEqual({ userId: ADMIN, source: 'config', configured: true })
+    await flush()
+    h.config.adminUserId = undefined
+    expect(h.service.accessSnapshot().admin).toEqual({ userId: 'u_owner', source: 'owner', configured: true })
     await h.service.shutdown()
+  })
+
+  it('已配置管理员时所有者查询不阻塞连接，连接断开后迟到的结果被丢弃', async () => {
+    let settle: (userId: string | undefined) => void = () => {}
+    const h = await setup({ adminUserId: ADMIN }, {
+      appOwnerUserId: () => new Promise<string | undefined>(resolve => { settle = resolve }),
+    })
+    expect(h.channel.connect).toHaveBeenCalledOnce()
+    await h.service.shutdown()
+    settle('u_owner')
+    await flush()
+    h.config.adminUserId = undefined
+    expect(h.service.accessSnapshot().admin).toEqual({ configured: false })
   })
 
   it.each([

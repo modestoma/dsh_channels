@@ -1025,6 +1025,7 @@ export class FeishuService {
     this.appOwner = undefined
     if (channel.appOwnerUserId === undefined) return
     let timer: ReturnType<typeof setTimeout> | undefined
+    let state: AppOwnerState
     try {
       const userId = await Promise.race([
         channel.appOwnerUserId(),
@@ -1032,17 +1033,20 @@ export class FeishuService {
           timer = setTimeout(() => reject(new Error(`超时（${APP_OWNER_LOOKUP_TIMEOUT_MS} ms）`)), APP_OWNER_LOOKUP_TIMEOUT_MS)
         }),
       ])
-      this.appOwner = userId !== undefined && FEISHU_USER_ID_PATTERN.test(userId)
+      state = userId !== undefined && FEISHU_USER_ID_PATTERN.test(userId)
         ? { userId }
         : { error: '应用所有者不是企业内成员，或接口未返回其 user_id' }
     } catch (error) {
       const detail = error instanceof AppOwnerLookupError ? error.detail : messageOf(error)
-      this.appOwner = { error: `获取应用信息失败：${detail}；请在开发者后台为应用开通「获取应用信息」相关权限并发布版本` }
+      state = { error: `获取应用信息失败：${detail}；请在开发者后台为应用开通「获取应用信息」相关权限并发布版本` }
     } finally {
       if (timer !== undefined) clearTimeout(timer)
     }
-    if ('error' in this.appOwner && this.configuredAdminUserId() === undefined) {
-      this.ctx.logger?.warn?.('dsh-channels: app owner fallback unavailable: %s', this.appOwner.error)
+    // A background lookup can outlive its connection (shutdown/reconnect).
+    if (this.channel !== channel) return
+    this.appOwner = state
+    if ('error' in state && this.configuredAdminUserId() === undefined) {
+      this.ctx.logger?.warn?.('dsh-channels: app owner fallback unavailable: %s', state.error)
     }
   }
 
@@ -1247,9 +1251,11 @@ export class FeishuService {
           .catch(() => {})
       })
     })
-    // Before the handshake, so the first inbound message already sees the
-    // owner fallback instead of a fail-closed denial.
-    await this.resolveAppOwner(channel)
+    // Without a configured administrator, resolve the owner before the
+    // handshake so the first inbound message already sees the fallback; with
+    // one, the lookup only backs a later runtime clear and must not delay boot.
+    const ownerLookup = this.resolveAppOwner(channel)
+    if (this.configuredAdminUserId() === undefined) await ownerLookup
     await channel.connect()
     // Repair cards a previous instance left mid-flight (best-effort, background).
     void this.repair.repairAll().catch((error: unknown) => {
