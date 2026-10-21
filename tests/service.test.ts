@@ -1632,9 +1632,10 @@ describe('FeishuService', () => {
     expect(aliceWorkspace).not.toBe(bobWorkspace)
   })
 
-  it('ignores messages from the bot itself and empty content', async () => {
+  // Bot/app senders carry no user_id and are dropped by the channel adapter
+  // (tests/feishu-channel.test.ts) before they reach the service.
+  it('ignores empty content', async () => {
     const h = await setup()
-    await h.onMessage(makeMessage({ chatType: 'p2p', senderId: 'bot-open-id', content: 'self echo' }))
     await h.onMessage(makeMessage({ chatType: 'p2p', senderId: 'u_alice', content: '   ' }))
     await flush()
     expect(h.ctxState.agents.created).toHaveLength(0)
