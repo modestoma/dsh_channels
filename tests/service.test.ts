@@ -3179,10 +3179,13 @@ describe('inbound attachments', () => {
       rawContentType: 'merge_forward',
     }))
     const dir = path.join(h.config.baseDir, '_staging', 'group', 'oc_forward', 'ou_owner')
-    await waitUntil(() => expect(readdirSync(dir)).toHaveLength(1))
+    // The record file appears before its text is flushed: wait for the content.
+    await waitUntil(() => {
+      expect(readdirSync(dir)).toHaveLength(1)
+      expect(readFileSync(path.join(dir, readdirSync(dir)[0]!), 'utf8')).toContain('明天评审')
+    })
     const [name] = readdirSync(dir)
     expect(name).toMatch(/-forwarded-record\.txt$/)
-    expect(readFileSync(path.join(dir, name!), 'utf8')).toContain('明天评审')
     expect(h.ctxState.agents.created).toHaveLength(0)
     await h.service.shutdown()
   })
