@@ -93,7 +93,7 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 
 **访问授权**：「访问授权」标签页集中管理准入：管理员 open_id（`ou_` 开头，私聊 `/userid` 获取）、准入模式、授权申请有效期；「已授权群」「已授权用户」列表支持增删（群 ID 可从入群群信息卡或 `/groupid` 获得，用户 open_id 可用 `/userid` 查看）；「待处理申请」可一键授权/忽略。白名单只约束非管理员：管理员在任何私聊/群聊都直接放行。`guarded` 且管理员未配置时标签页顶部会红字提示“当前会拒绝所有对话”。授权白名单与申请记录保存在插件 `storageDomain`（`channels_routes` 域），重启后保留；未建立飞书连接时白名单尚未加载，标签页会提示「连接建立后加载授权列表」并禁用写操作。
 
-**配置层级**：`configSchema` 默认值 < profile `cordis.patch.yml` 的 `config` < Web 面板覆盖。面板只把可编辑字段写入 `$DSH_HOME/dsh-channels/settings.json`（可用配置项 `settingsFile` 改路径）；「高级 → 清除 Web 覆盖」删除该文件并回落到 profile 配置。`baseDir` 可在「工作区」标签页编辑（绝对路径；只影响之后新建的会话）；超时、路由 TTL 等仍只读展示。凭据**值**在「连接 → 飞书应用凭据」编辑，凭据**引用名**（`appId` / `appSecret` 配置项）仍由 profile 配置决定。已移除的目录清理配置 `workspaceRetention` / `workspaceRetentionAuto` 若仍留在 profile 或覆盖文件中会被静默忽略，面板下次保存时从覆盖文件中去掉。
+**配置层级**：`configSchema` 默认值 < profile `cordis.patch.yml` 的 `config` < Web 面板覆盖。面板只把可编辑字段写入 `$DSH_HOME/dsh-channels/settings.json`；「高级 → 清除 Web 覆盖」删除该文件并回落到 profile 配置。`baseDir` 可在「工作区」标签页编辑（绝对路径；只影响之后新建的会话）；超时、路由 TTL 等仍只读展示。凭据**值**在「连接 → 飞书应用凭据」编辑，凭据**引用名**（`appId` / `appSecret` 配置项）仍由 profile 配置决定。已移除的目录清理配置 `workspaceRetention` / `workspaceRetentionAuto` 与覆盖文件路径配置 `settingsFile` 若仍留在 profile 或覆盖文件中会被静默忽略，面板下次保存时从覆盖文件中去掉。
 
 **为什么落在插件自己的文件而不是 profile 的 `cordis.patch.yml`？** DSH 提供官方 `ctx.configEditor.edit()`，可以安全写 profile patch（完整 Config 校验、保留注释与 `!!js`、原子替换、失败回滚、与 HMR 串行）；但它是「完整配置编辑」通道——本插件的 Config 是 zod，没有 schemastery `.volatile()` 标记，普通字段写入会触发 Loader 重载插件，等于每次保存都断开并重连飞书；而且该服务只在有 `profileContext` 的启动器（桌面端 / `dsh web`）存在。`$DSH_HOME/<plugin>/` 是 DSH 插件保存运行时数据的惯例（如 dsh-pet 的 `$DSH_HOME/dsh-pet/`），因此面板偏好写入 `$DSH_HOME/dsh-channels/settings.json`：保存即生效（需重连字段除外）、可一键清除回退、不依赖 `profileContext`；profile 的 `cordis.patch.yml` 继续作为部署级基础配置层。若将来要求「所有配置统一进 profile」，迁移路径是改用 `ctx.configEditor.edit()` 并接受保存触发插件重载。
 
@@ -259,7 +259,6 @@ npm 发行包已包含构建产物：Host 入口是 `lib/index.js`（profile 直
     adminOpenId: 'ou_xxx'               # 管理员 open_id（可留空，留空时 guarded 下拒绝所有对话；面板可改）
     authRequestTtlDays: 7               # 入群/用户授权申请卡有效期（天，1–30）
     loggerLevel: 'info'
-    # settingsFile: '/custom/path/settings.json'  # 可选：Web 面板覆盖文件路径（默认 $DSH_HOME/dsh-channels/settings.json）
 ```
 
 `reasoningEffort` 是每个 Session 的初始/重置默认值，并在新建、恢复或借用 Agent 的作用域内以 `prepend` 外层覆盖 `agent/request`，因此胜过已存在的模型选择与 provider 默认；借用外部 Agent 时，插件关闭只移除这条频道策略，不销毁外部 Agent。话题所有者可用 `/effort <档位-id>` 覆盖当前 Session，`/effort` 查看生效来源，`/effort reset` 恢复该配置值（未配置时恢复模型适配器/provider 默认）。成功选择由 Session 自带的 `command/run` / `command/done` 日志恢复，重启后仍生效；新建 Session 不继承旧 Session 的覆盖。
