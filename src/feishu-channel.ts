@@ -9,6 +9,8 @@
  */
 
 import { createLarkChannel, LoggerLevel } from '@larksuiteoapi/node-sdk'
+import { SCOPE_GRANTED_STATUS } from './feishu/scopes.ts'
+import type { ScopeGrant } from './feishu/scopes.ts'
 import type {
   BotAddedEvent,
   ChatInfo,
@@ -66,6 +68,12 @@ export interface FeishuChannel {
    * and older channels can omit it; absence means no owner fallback.
    */
   appOwnerUserId?(): Promise<string | undefined>
+  /**
+   * Scopes the app requested from the tenant and their grant state
+   * (`application.v6.scope.list`). Rejects with a {@link FeishuApiError} when
+   * the call fails. Optional so stubs can omit it; absence skips the check.
+   */
+  grantedScopes?(): Promise<readonly ScopeGrant[]>
   /** Current official-SDK WebSocket lifecycle snapshot, when initialized. */
   getConnectionStatus(): FeishuConnectionStatus | undefined
   /** Start the WebSocket long connection (resolves after the handshake). */
@@ -192,28 +200,45 @@ export async function* downloadResourceInRanges(
 /** Owner type `2` = tenant member; `0`/`1` are Feishu itself or an ISV partner. */
 const APP_OWNER_TYPE_TENANT_MEMBER = 2
 
-/** Failed app-owner lookup, carrying the Feishu `code`/`msg` when present. */
-export class AppOwnerLookupError extends Error {
+/** Failed Feishu OpenAPI call, carrying the Feishu `code`/`msg` when present. */
+export class FeishuApiError extends Error {
   /**
    * @param detail Feishu `code=<n> <msg>` or the transport error text.
    * @param code Feishu API error code, when the response carried one.
    */
   constructor(readonly detail: string, readonly code?: number) {
-    super(`app owner lookup failed: ${detail}`)
+    super(`feishu api call failed: ${detail}`)
+    this.name = 'FeishuApiError'
+  }
+}
+
+/** Failed app-owner lookup, carrying the Feishu `code`/`msg` when present. */
+export class AppOwnerLookupError extends FeishuApiError {
+  /**
+   * @param detail Feishu `code=<n> <msg>` or the transport error text.
+   * @param code Feishu API error code, when the response carried one.
+   */
+  constructor(detail: string, code?: number) {
+    super(detail, code)
+    this.message = `app owner lookup failed: ${detail}`
     this.name = 'AppOwnerLookupError'
   }
+}
+
+/** `detail`/`code` of a thrown SDK/Axios error, preferring the Feishu error body. */
+function thrownErrorFields(error: unknown): { detail: string; code?: number } {
+  const data = (error as { response?: { data?: { code?: unknown; msg?: unknown } } } | undefined)?.response?.data
+  const code = typeof data?.code === 'number' ? data.code : undefined
+  const msg = typeof data?.msg === 'string' ? data.msg : undefined
+  if (code === undefined && msg === undefined) return { detail: error instanceof Error ? error.message : String(error) }
+  return { detail: [code === undefined ? undefined : `code=${code}`, msg].filter(Boolean).join(' '), code }
 }
 
 /** Normalize a thrown SDK/Axios error into an {@link AppOwnerLookupError}. */
 function appOwnerLookupError(error: unknown): AppOwnerLookupError {
   if (error instanceof AppOwnerLookupError) return error
-  const data = (error as { response?: { data?: { code?: unknown; msg?: unknown } } } | undefined)?.response?.data
-  const code = typeof data?.code === 'number' ? data.code : undefined
-  const msg = typeof data?.msg === 'string' ? data.msg : undefined
-  if (code !== undefined || msg !== undefined) {
-    return new AppOwnerLookupError([code === undefined ? undefined : `code=${code}`, msg].filter(Boolean).join(' '), code)
-  }
-  return new AppOwnerLookupError(error instanceof Error ? error.message : String(error))
+  const { detail, code } = thrownErrorFields(error)
+  return new AppOwnerLookupError(detail, code)
 }
 
 export interface ChannelConnectOptions {
@@ -318,6 +343,24 @@ class LarkChannelAdapter implements FeishuChannel {
     if (owner?.type !== APP_OWNER_TYPE_TENANT_MEMBER) return undefined
     const userId = owner.owner_id?.trim()
     return userId === undefined || userId === '' ? undefined : userId
+  }
+
+  async grantedScopes(): Promise<readonly ScopeGrant[]> {
+    let response
+    try {
+      response = await this.channel.rawClient.application.v6.scope.list()
+    } catch (error) {
+      const { detail, code } = thrownErrorFields(error)
+      throw new FeishuApiError(detail, code)
+    }
+    if (response.code !== undefined && response.code !== 0) {
+      throw new FeishuApiError(`code=${response.code}${response.msg === undefined ? '' : ` ${response.msg}`}`, response.code)
+    }
+    return (response.data?.scopes ?? []).map(scope => ({
+      name: scope.scope_name,
+      granted: scope.grant_status === SCOPE_GRANTED_STATUS,
+      ...(scope.scope_type === undefined ? {} : { type: scope.scope_type }),
+    }))
   }
 
   async connect(): Promise<void> {

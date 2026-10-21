@@ -43,6 +43,7 @@ import type {
   SaveConfigResponse,
   SaveCredentialsRequest,
   SaveCredentialsResponse,
+  ScopeCheckWire,
 } from './contract.ts'
 import {
   configValueOf,
@@ -69,6 +70,8 @@ export interface SettingsTarget {
   startedAtMs(): number | undefined
   uptimeMs(): number | undefined
   startError(): string | undefined
+  /** Post-connect scope self-check for the open connection, once it finished. */
+  scopeCheck(): ScopeCheckWire | undefined
   /**
    * Whether the Feishu application credentials resolve. A false value means the
    * plugin is loaded but deliberately holds no connection: the panel guides the
@@ -530,6 +533,7 @@ function phaseOf(target: SettingsTarget): ChannelPhaseWire {
 function buildStatus(target: SettingsTarget, overlayPath: string): ChannelStatusWire {
   const health = target.health()
   const connection = health.connection
+  const scopeCheck = target.isRunning() ? target.scopeCheck() : undefined
   return {
     running: target.isRunning(),
     configured: target.isConfigured(),
@@ -555,6 +559,7 @@ function buildStatus(target: SettingsTarget, overlayPath: string): ChannelStatus
     version: DSH_CHANNELS_VERSION,
     overlayPath,
     busy: target.isRestarting() || target.isConnecting(),
+    ...(scopeCheck === undefined ? {} : { scopeCheck }),
   }
 }
 
