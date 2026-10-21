@@ -9,6 +9,7 @@ import { existsSync } from 'node:fs'
 import path from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import type { FeishuConfig } from '../src/config.ts'
+import { AppOwnerLookupError } from '../src/feishu-channel.ts'
 import type { ChannelFactory, NormalizedMessage } from '../src/feishu-channel.ts'
 import type { RouteRecord } from '../src/domain.ts'
 import { ATTACHMENTS_DIR } from '../src/feishu/inbound-attachments.ts'
@@ -170,6 +171,83 @@ describe('guarded 模式：准入零副作用', () => {
     expect(h.ctxState.agents.created).toHaveLength(0)
     expect(h.channel.sent).toHaveLength(2)
     await h.service.shutdown()
+  })
+
+  it('管理员未配置时使用应用所有者兜底：所有者可私聊，面板与 /auth status 标注来源', async () => {
+    const h = await setup({ adminUserId: undefined }, { appOwnerUserId: async () => 'u_owner' })
+    expect(h.service.accessSnapshot().admin).toEqual({ userId: 'u_owner', source: 'owner', configured: true })
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_p2p_owner', senderId: 'u_owner',
+      mentionedBot: false, messageId: 'om_owner_status', content: '/auth status',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
+    expect(sentJson(h.channel.sent[0]!)).toContain('应用所有者，自动')
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_p2p_alice', senderId: 'u_alice',
+      mentionedBot: false, messageId: 'om_owner_other', content: '你好',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
+    expect(sentJson(h.channel.sent[1]!)).toContain('非管理员禁用私聊')
+    await h.service.shutdown()
+  })
+
+  it('显式配置的管理员优先于应用所有者；清空后回落到所有者', async () => {
+    const h = await setup({ adminUserId: ADMIN }, { appOwnerUserId: async () => 'u_owner' })
+    expect(h.service.accessSnapshot().admin).toEqual({ userId: ADMIN, source: 'config', configured: true })
+    await flush()
+    h.config.adminUserId = undefined
+    expect(h.service.accessSnapshot().admin).toEqual({ userId: 'u_owner', source: 'owner', configured: true })
+    await h.service.shutdown()
+  })
+
+  it('已配置管理员时所有者查询不阻塞连接，连接断开后迟到的结果被丢弃', async () => {
+    let settle: (userId: string | undefined) => void = () => {}
+    const h = await setup({ adminUserId: ADMIN }, {
+      appOwnerUserId: () => new Promise<string | undefined>(resolve => { settle = resolve }),
+    })
+    expect(h.channel.connect).toHaveBeenCalledOnce()
+    await h.service.shutdown()
+    settle('u_owner')
+    await flush()
+    h.config.adminUserId = undefined
+    expect(h.service.accessSnapshot().admin).toEqual({ configured: false })
+  })
+
+  it.each([
+    ['接口报错', async (): Promise<string | undefined> => { throw new AppOwnerLookupError('code=99991672 Access denied', 99991672) }, 'code=99991672 Access denied'],
+    ['非 AppOwnerLookupError', async (): Promise<string | undefined> => { throw new Error('boom') }, 'boom'],
+    ['所有者非企业成员', async (): Promise<string | undefined> => undefined, '不是企业内成员'],
+    ['返回 open_id', async (): Promise<string | undefined> => 'ou_owner', '不是企业内成员'],
+  ])('应用所有者查询失败（%s）时 fail closed 并给出原因', async (_name, lookup, reason) => {
+    const h = await setup({ adminUserId: undefined }, { appOwnerUserId: lookup })
+    const admin = h.service.accessSnapshot().admin
+    expect(admin.configured).toBe(false)
+    expect(admin.ownerLookupError).toContain(reason)
+    expect(mock(h.ctxState.ctx.logger?.warn).mock.calls)
+      .toContainEqual(['dsh-channels: app owner fallback unavailable: %s', expect.stringContaining(reason)])
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_p2p_alice', senderId: 'u_alice',
+      mentionedBot: false, messageId: 'om_owner_failed', content: '你好',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
+    expect(sentJson(h.channel.sent[0]!)).toContain('尚未配置管理员')
+    await h.service.shutdown()
+  })
+
+  it('应用所有者查询超时后按未配置处理', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const config = makeConfig({ adminUserId: undefined })
+      const channel = makeChannel({ appOwnerUserId: () => new Promise<string | undefined>(() => {}) })
+      const service = new FeishuService(makeHostContext().ctx, config, () => channel)
+      const started = service.start()
+      await vi.advanceTimersByTimeAsync(10_000)
+      await started
+      expect(service.accessSnapshot().admin.ownerLookupError).toContain('超时')
+      await service.shutdown()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('未授权群 @（非管理员）：群内静默、不建 Session，管理员 DM 收到群信息/授权卡', async () => {

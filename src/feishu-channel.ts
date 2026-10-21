@@ -58,6 +58,14 @@ export interface FeishuChannel {
   getChatInfo(chatId: string): Promise<ChatInfo>
   /** Bot open_id, available after `connect()` resolves. */
   botOpenId(): string | undefined
+  /**
+   * The app owner's `user_id` (`application.v6.application.get`), used as the
+   * administrator when none is configured. Resolves `undefined` when the owner
+   * is not a tenant member; rejects with an {@link AppOwnerLookupError} when
+   * the API call fails (typically a missing app-info scope). Optional so stubs
+   * and older channels can omit it; absence means no owner fallback.
+   */
+  appOwnerUserId?(): Promise<string | undefined>
   /** Current official-SDK WebSocket lifecycle snapshot, when initialized. */
   getConnectionStatus(): FeishuConnectionStatus | undefined
   /** Start the WebSocket long connection (resolves after the handshake). */
@@ -181,6 +189,33 @@ export async function* downloadResourceInRanges(
   }
 }
 
+/** Owner type `2` = tenant member; `0`/`1` are Feishu itself or an ISV partner. */
+const APP_OWNER_TYPE_TENANT_MEMBER = 2
+
+/** Failed app-owner lookup, carrying the Feishu `code`/`msg` when present. */
+export class AppOwnerLookupError extends Error {
+  /**
+   * @param detail Feishu `code=<n> <msg>` or the transport error text.
+   * @param code Feishu API error code, when the response carried one.
+   */
+  constructor(readonly detail: string, readonly code?: number) {
+    super(`app owner lookup failed: ${detail}`)
+    this.name = 'AppOwnerLookupError'
+  }
+}
+
+/** Normalize a thrown SDK/Axios error into an {@link AppOwnerLookupError}. */
+function appOwnerLookupError(error: unknown): AppOwnerLookupError {
+  if (error instanceof AppOwnerLookupError) return error
+  const data = (error as { response?: { data?: { code?: unknown; msg?: unknown } } } | undefined)?.response?.data
+  const code = typeof data?.code === 'number' ? data.code : undefined
+  const msg = typeof data?.msg === 'string' ? data.msg : undefined
+  if (code !== undefined || msg !== undefined) {
+    return new AppOwnerLookupError([code === undefined ? undefined : `code=${code}`, msg].filter(Boolean).join(' '), code)
+  }
+  return new AppOwnerLookupError(error instanceof Error ? error.message : String(error))
+}
+
 export interface ChannelConnectOptions {
   appId: string
   appSecret: string
@@ -191,6 +226,7 @@ export interface ChannelConnectOptions {
 
 class LarkChannelAdapter implements FeishuChannel {
   private readonly channel: LarkChannel
+  private readonly appId: string
   private readonly requireMention: boolean
   private readonly dmMode: 'open' | 'disabled'
 
@@ -218,6 +254,7 @@ class LarkChannelAdapter implements FeishuChannel {
         batch: { text: { delayMs: 0 } },
       },
     })
+    this.appId = options.appId
     this.requireMention = options.requireMention
     this.dmMode = options.dmMode
   }
@@ -262,6 +299,25 @@ class LarkChannelAdapter implements FeishuChannel {
 
   getConnectionStatus(): FeishuConnectionStatus | undefined {
     return this.channel.getConnectionStatus()
+  }
+
+  async appOwnerUserId(): Promise<string | undefined> {
+    let response
+    try {
+      response = await this.channel.rawClient.application.v6.application.get({
+        path: { app_id: this.appId },
+        params: { lang: 'zh_cn', user_id_type: 'user_id' },
+      })
+    } catch (error) {
+      throw appOwnerLookupError(error)
+    }
+    if (response.code !== undefined && response.code !== 0) {
+      throw new AppOwnerLookupError(`code=${response.code}${response.msg === undefined ? '' : ` ${response.msg}`}`, response.code)
+    }
+    const owner = response.data?.app?.owner
+    if (owner?.type !== APP_OWNER_TYPE_TENANT_MEMBER) return undefined
+    const userId = owner.owner_id?.trim()
+    return userId === undefined || userId === '' ? undefined : userId
   }
 
   async connect(): Promise<void> {

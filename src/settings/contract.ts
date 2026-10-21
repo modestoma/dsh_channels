@@ -331,9 +331,14 @@ export interface AccessRequestWire {
 export interface AccessWire {
   mode: 'open' | 'guarded'
   admin: {
+    /** The effective administrator: configured `adminUserId`, else the app owner. */
     userId?: string
+    /** Where `userId` came from: explicit config or the app-owner fallback. */
+    source?: 'config' | 'owner'
     /** false while guarded mode would refuse every conversation (fail closed). */
     configured: boolean
+    /** Why the app-owner fallback is unavailable, when its lookup failed. */
+    ownerLookupError?: string
   }
   /**
    * Whether the persisted whitelists were loaded. While the channel holds no
@@ -594,7 +599,8 @@ export const PANEL_COPY = {
   accessCard: '访问与授权',
   accessCardHelp: '准入采用 fail-closed：管理员不受白名单限制（私聊、任意群聊都可直接对话）；非管理员私聊会被拒绝，群聊需要「群已授权 + 用户在白名单」两层同时命中。管理员与准入模式在上方「准入与授权」中编辑；私聊机器人发送 /userid 获取自己的 user_id。',
   accessModeOpenWarning: '当前准入模式为开放（open）：应用可用范围内的任何人都能开启对话。该模式不安全，仅建议调试时使用。',
-  accessAdminMissingWarning: '当前准入=guarded 但未配置管理员，所有对话都会被拒绝。请在上方「准入与授权」填写管理员 user_id。',
+  accessAdminMissingWarning: '当前准入=guarded 但未配置管理员，也无法自动使用应用所有者，所有对话都会被拒绝。请在上方「准入与授权」填写管理员 user_id。',
+  accessAdminOwnerNotice: '未配置管理员，已自动使用应用所有者作为管理员：',
   accessGroupsTitle: '已授权群',
   accessGroupsEmpty: '尚未授权任何群。机器人被拉进群后，管理员会收到带 chat_id 的群信息卡；也可在群内发送 /groupid 获取。',
   accessUsersTitle: '已授权用户',

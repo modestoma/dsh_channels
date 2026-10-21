@@ -328,9 +328,11 @@ export const configSchema = z.object({
   /**
    * The unique administrator's Feishu `user_id`. Set it in the Web
    * settings panel (or the profile config). Get it by sending `/userid` to the
-   * bot in a private chat. While `accessMode` is `guarded` and this is unset,
-   * every conversation is refused (fail closed); `/userid` and a fixed notice
-   * stay available so the deployment can be bootstrapped.
+   * bot in a private chat. When unset, the Feishu app owner (looked up via
+   * `application.v6.application.get` at connect; needs an app-info read scope)
+   * is the administrator. While `accessMode` is `guarded` and neither is
+   * available, every conversation is refused (fail closed); `/userid` and a
+   * fixed notice stay available so the deployment can be bootstrapped.
    */
   adminUserId: z.string().regex(
     FEISHU_USER_ID_PATTERN,

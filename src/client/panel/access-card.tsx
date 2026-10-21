@@ -93,6 +93,15 @@ export function AccessCard(props: AccessCardProps): JSX.Element {
         ? (
             <div className="dsh-channels-cfg__notice dsh-channels-cfg__notice--error">
               <strong>{PANEL_COPY.accessAdminMissingWarning}</strong>
+              {access.admin.ownerLookupError === undefined ? null : <div>{access.admin.ownerLookupError}</div>}
+            </div>
+          )
+        : null}
+      {access.mode === 'guarded' && access.admin.source === 'owner' && access.admin.userId !== undefined
+        ? (
+            <div className="dsh-channels-cfg__notice dsh-channels-cfg__notice--ok">
+              {PANEL_COPY.accessAdminOwnerNotice}
+              <span className="dsh-channels-cfg__mono">{access.admin.userId}</span>
             </div>
           )
         : null}

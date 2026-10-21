@@ -171,7 +171,7 @@ const FIELD_META: Record<EditableKey, { label: string; help: string; min?: numbe
   allowPermissionSwitch: { label: '允许飞书侧切换权限预设', help: '安全敏感：开启后话题所有者可用 /permissions 切换沙箱与审批预设。' },
   adminUserId: {
     label: '管理员 user_id',
-    help: '唯一管理员。私聊机器人发送 /userid 获取（不是 ou_ 开头的 open_id，也不是邮箱）；留空 = 清除 Web 覆盖。guarded 模式下未配置会拒绝所有对话。',
+    help: '唯一管理员。私聊机器人发送 /userid 获取（不是 ou_ 开头的 open_id，也不是邮箱）；留空 = 清除 Web 覆盖。未配置时自动使用飞书应用所有者（需「获取应用信息」权限）；两者都没有时 guarded 模式会拒绝所有对话。',
     placeholder: 'user_id',
   },
   accessMode: {
