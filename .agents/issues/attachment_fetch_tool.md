@@ -60,7 +60,7 @@
 
 | AC | 验证方法 | 实际结果 | 结论 |
 | --- | --- | --- | --- |
-| AC1 工具注册 | 单元测试 + manager 集成测试 | 仅在 `inject(['tools','attachments'])` 回调内且两服务可解析时 `tools.register`；在 preset `mount` 之后注册（manager 测试断言 `['preset','tools']` 顺序与 sessionId 传递）；resume 挂载、borrow 补挂各一次；缺 tools/attachments、injection reject、真实 cordis「依赖缺失 settle 但不回调」均 no-op + 单次告警；服务 2s 内不可用不阻塞建会话（后续会话 250ms fast-fail），晚到服务仍会补注册；宿主服务 unload/reload 后同一 callback ctx 重跑会重新 `register`（回归测试）；功能开关关闭不注入/不注册 | ✅ 自动；⏳ 真机卡片工具行/手动待 admission 接线后验证 |
+| AC1 工具注册 | 单元测试 + manager 集成测试 + 真机冒烟 | 仅在 `inject(['tools','attachments'])` 回调内且两服务可解析时 `tools.register`；在 preset `mount` 之后注册（manager 测试断言 `['preset','tools']` 顺序与 sessionId 传递）；resume 挂载、borrow 补挂各一次；缺 tools/attachments、injection reject、真实 cordis「依赖缺失 settle 但不回调」均 no-op + 单次告警；服务 2s 内不可用不阻塞建会话（后续会话 250ms fast-fail），晚到服务仍会补注册；宿主服务 unload/reload 后同一 callback ctx 重跑会重新 `register`（回归测试）；功能开关关闭不注入/不注册。**真机 2026-10-21 冒烟**：工具出现在 `request/header.tools`、模型真实调用并得到可读拒绝、重启后同一 Session cold resume 并再次调用成功；卡片工具行是瞬时活动行（`tool/result` 清除，终态卡片不保留，既有 streamer 行为） | ✅ 自动 + ✅ 真机（注册/可读拒绝/重启恢复） |
 | AC2 白名单授权 | 单元测试 | 白名单按 route.key + kind/chat/chatType/sender 精确匹配；消息先白名单、再 durable pending registry（scope 绑定）；跨 chat/thread/sender、过期 pending、未登记 message_id 一律 `AUTHORIZATION_DENIED` 且不触达 channel；`file_key` 必须属于该消息已解析资源集，否则 `UNKNOWN_FILE_KEY`；topic route 可读同 chat+同 sender 的 chat 主时间线 pending 行（AC-4 回退）；子消息 id 未登记时明确拒绝；`pending.consume` 仅“至少一个资源成功”后执行且与 signal 竞速 | ✅ 单测；端到端写入方待 admission 接线（见下） |
 | AC3 图片结果 | 单元测试（stub 下载 + attachments） | 返回 `ImageBlock` + 文本元数据（name/bytes/尺寸/media type/只读路径）+ 文本模型占位说明；不支持格式 `UNSUPPORTED_IMAGE_TYPE`、超宿主 `maxImageBytes` `IMAGE_TOO_LARGE`、超总预算 `BYTES_LIMIT`；失败不产生 attachment | ✅ |
 | AC4 文件结果 | 单元测试 | 流式交给 `saveFileStream`（新增“源未结束 store 已拿到首块”测试），返回 `FileBlock` + 句柄文本（name/bytes/sha256 前缀/只读路径）；内容一致性断言（存储字节 == 下载字节）；宿主不映射路径时文本兜底 “cannot access a readable path”；执行期附件服务卸载返回结构化 `ATTACHMENT_SERVICE_UNMOUNTED` | ✅ |
@@ -109,11 +109,26 @@ render(value) -> text,image blocks
 4. **接线点**：admission 需要把登记回调注入 `InboundDeps`；其 plan 资源未列 `src/service.ts`，但实际需在该文件加一处 port（本次已提供 service 方法与 runtime），协调者已在 `runtime.json` resume 记录该交接项。
 5. 工具自带单次资源数/字节/超时/取消/逐资源失败，调用方无需重复处理；工具在无授权时 fail-closed 返回可读拒绝，不会抛异常中断回合。
 
+### 真机冒烟（2026-10-21 10:48–10:52，desktop profile）
+
+目的：验证 AC1 的真机部分（工具注册、模型可调用、卡片结果、重启恢复）与关键风险 `inject(['tools','attachments'])` 组合在真实 cordis 宿主中的行为（不改代码、不加探针）。
+
+- 环境：DSH 0.2.1-rc.2 desktop profile；profile `@modesto_ma/dsh-channels` 链接指向本仓库，`lib/index.js` 为 01:20 构建（包含 `feishu_attachment_fetch`）；冒烟前实例 03:20:51 启动、飞书 `phase=connected`、`routeCount=21`、`liveAgentCount=0`、`pending_attachments` 表为空。
+- 用户操作：飞书私聊发送「请直接调用 feishu_attachment_fetch 工具，message_id 传 om_real_smoke_001，file_key 不传；不要追问，直接调用，并把工具返回原文告诉我。」（10:48）。
+- 结果（会话 `8e781cca-835d-489f-9a7b-cb611fa058be`，话题 `omt_19bdaf2feb8f9a6d`）：
+  1. 新会话/话题/卡片正常建立，`turn/end=completed`；路由落盘（`routes` 21→22，`liveAgentCount=1`），未出现 setup 卡住——真实 `inject(['tools','attachments'])` 组合可用。
+  2. 首轮 `request/header.tools` 共 20 个工具，包含 `feishu_attachment_fetch`，参数 schema 与手写定义一致（`message_id` required，`file_key` optional）。
+  3. `tool/call` 参数 `{"message_id":"om_real_smoke_001"}`；`tool/result` 文本为「该消息不在本会话的附件授权范围内（仅可获取触发消息、引用消息或附件清单中登记的消息）（消息 om_real_smoke_001）」，`isError=false`，无 `unknown tool`/`[object Object]`；模型把结果原文回复给用户（用户卡片截图确认）。
+  4. 终态卡片不保留工具行：streamer 的 tool activity 行在 `tool/result` 时清除（既有行为），截图只能看到终态文本；工具行在流式期间展示（P0 已单独验证）。
+- 重启恢复（同一话题）：用户重启 DSH 桌面端（新实例 10:51:03 启动、飞书重新 connected），在同一话题回复「再调用一次 feishu_attachment_fetch 工具，message_id 还是 om_real_smoke_001，把返回原文发我。」。同一 Session `8e781cca…` 被 cold resume（未新建），`turn 2` 于 10:51:43 开始；`request/header` 再次为 20 个工具且包含 `feishu_attachment_fetch`（resume setup 重新挂载成功）；`tool/call`/`tool/result` 与首轮一致（可读拒绝），`turn/end=completed`。用户卡片截图（10:51）与 session id 一致。
+- 额外观测：用户另发的一条新私聊消息创建了新话题/新 Session `69aaf923-1303-4045-8991-cf747df3b911`（`omt_19bda07db68e9b90`，routes 22→23，liveAgentCount=2），同样注册工具并返回可读拒绝——新会话路径亦验证。
+- 结论：AC1 真机项（注册/可读拒绝/重启恢复）通过；`inject(['tools','attachments'])` 真实可用。取图片/文件成功路径仍需 admission 接线（当前 pending 表为空、任何 fetch 均 fail-closed）。
+
 ### 未验证项 / 已知限制
 
-1. **真机/手动未做**：本会话文件沙箱为 workspace-write，未修改 `~/.dsh` 触发 HMR/profile 重组合，故未做真实 profile 重载冒烟；AC1 的“卡片展示工具行、重启恢复后可调用”与 AC2/3/4/6 真机项待 `admission_manifest_flow` 接线后由用户手测（接线前工具对所有消息 fail-closed 拒绝）。
+1. **取文件真机成功路径未做**：AC1 的真机项已通过（见上方真机冒烟）；AC2/3/4/6 的真实图片/文件 → `ImageBlock`/`FileBlock` 成功路径需 `admission_manifest_flow` 把触发消息登记进白名单/pending 后验证。当前 `pending_attachments` 为空，工具对真实消息 fail-closed（冒烟已验证可读拒绝）。
 2. **端到端可用性依赖 admission**：主链路仍走旧 archive，白名单/pending 暂无生产写入方；本任务只交付工具、白名单与窄接口（与 roadmap 依赖顺序一致）。
-3. **`inject(['tools','attachments'])` 组合真机未验证**：P0 仅验证 `['tools']`。缺失服务时 mount 最多等待 2s（后续会话 250ms fast-fail）并单次告警，不阻塞建会话；真实 cordis “依赖缺失 settle 但不回调”路径已用宿主 cordis 包离线探针 + 单测覆盖；晚到服务可补注册。
+3. **`inject(['tools','attachments'])` 组合已真机验证**（2026-10-21 冒烟：setup 未阻塞、工具进入模型工具表并被调用）。缺失服务时 mount 最多等待 2s（后续会话 250ms fast-fail）并单次告警、不阻塞建会话；真实 cordis “依赖缺失 settle 但不回调”路径由宿主 cordis 离线探针 + 单测覆盖。
 4. **取消不下传飞书 HTTP 层**：`FeishuChannel.downloadResource` 无 signal 参数；工具在消费端按 chunk / await 竞速并及时返回、不提交半文件；宿主 `saveFileStream` staging→原子发布/清理已从本机安装包源码核验。但（a）已发出的 Range 请求/Node 流可能滞留到自身超时/GC；（b）staging 完成到发布之间 abort 会留下无引用、不自动回收的 content-addressed 完整对象（孤儿窗口）——不宣称“取消后零残留”。
 5. **白名单进程内、不重放 Session 历史**：重启后旧消息授权丢失；durable pending registry（TTL 内）覆盖已登记消息，admission/manifest 每轮重新登记当前消息；route 退休/GC/关闭已接 forget/clear/prune。
 6. **开关不动态摘除已注册会话**：`acceptAttachments=false` 时新会话不挂载；之后面板重新启用，已存在 live agent 不会补挂（新会话/`/renew` 后正常）。失败 mount 尝试按 agent 作用域缓存一次，不自动重试。
