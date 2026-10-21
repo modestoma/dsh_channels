@@ -42,7 +42,7 @@
 
 - 仓库 `/Users/moka/dev/project/dsh_ext/dsh_channels`，本地 `main`；开始基线 `main@59b62baee511b3296504b4a0b3a7d663406666c5`（P0 收官 `3f05d81` 之后的前置任务证据提交）。按 D9/D10 不创建平台 Issue/Milestone、不拉分支/worktree、不使用 PR，仅本地 `main` 提交，不推送。
 - Node v24.19.0 / pnpm 12.14.0；DSH 0.2.1-rc.2 desktop profile（`ctx.tools` / `ctx.attachments` 可用性沿用 P0 结论）。
-- 实现提交：`5e06718162eea68730cc4e1c5721b6020cf9e3a5`（feat，含实现、测试、配置与 onboarding 文档）；证据为本文件随后的 docs 提交。
+- 实现提交：`5e06718162eea68730cc4e1c5721b6020cf9e3a5`（feat，含实现、测试、配置与 onboarding 文档）；真机验证发现并修复提交 `7964c643960c570090620b6034ac6f4d5119d03d`（fix：topic 工具渲染补 cursor + 凭据安全 guidance）；证据为本文件随后的 docs 提交。
 - 写入范围说明：在 Issue 预计范围（`message-read.ts` / `tools.ts` / `routing/inbound.ts` / `config.ts` / `docs/feishu-onboarding.md` / 两个测试文件）之外，为满足 AC 做了必要接线与加固：`src/feishu/manifest.ts`（quote 行与 `manifestEntriesOfKnownMessage`）、`src/feishu/agent-context.ts`（guidance 增补 quote/history/topic 工具说明）、`src/feishu-channel.ts`（`messageMget` 薄包装）、`src/service.ts`（读端口/白名单/工具挂载/降级告警）、`tests/helpers.ts`、`tests/manifest.test.ts`、`tests/feishu-channel.test.ts`、`tests/config.test.ts`。均无对外产品范围变化。
 
 ### 实现落点
@@ -64,12 +64,12 @@
 
 | AC | 验证方法 | 实际结果 | 结论 |
 | --- | --- | --- | --- |
-| AC1 引用文本 | service 测试 + message-read 单测 + 同应用 bot 身份只读 API 探针 | 首轮/续聊 prompt 均含 `<feishu_quote>`（带 `message_id`）；被引用文件进入 `<feishu_context>` 清单（message_id/file_key/name）；测试从 prompt 提取 id 后执行真实 `feishu_attachment_fetch` 下载成功。API 探针：回复消息 parent_id 可定位到被引用消息且 message.get code=0。 | ✅ 自动 + ✅ API 真机（插件链路待用户手测） |
-| AC2 合并转发 | service 测试 + message-read 单测 + API 探针 | 引用合并转发时展开容器+子消息文本；容器以 `merge_forward` 行进入清单，`message_id` 展示于引用块；真实 fetch 以**顶层容器 id** 下载子图片成功、子消息 id 未被用于下载；message.get 乱序返回时仍按 `upper_message_id` 选中容器。API 探针：merge_forward `message.get` 返回 3 条扁平 items（容器+文本子+图片子）。 | ✅ 自动 + ✅ API 真机 |
-| AC3 话题历史 | service 测试 + tools 单测 + API 探针 | 工具默认 10/上限 50、newest-first、cursor=page_token、has_more/cursor 透传；thread/chat 两种容器；chat route 过滤其他 topic；输出 12k/50 行有界；service 首轮注入最近 N 条并支持工具翻页。API 探针：thread list（群/私聊）code=0；p2p `message.list(chat)` code=0（P0 遗留项补测通过）；群历史最早 2026-07-14 消息可读。 | ✅ 自动 + ✅ API 真机 |
-| AC4 首轮上下文 | service 测试 | 默认 10 条、`historyBootstrapLimit: 0` 完全不读、超长 `已截断` 标注、仅新会话首轮注入（续聊不重复）、被动读独立 3s 预算且与工具超时解耦（永不 resolve 的 list 在 50ms 预算测试中快速返回）、按块顺序 text→quote→image→manifest→history。 | ✅ 自动 |
-| AC5 授权隔离 | 单测 + service 测试 | 非本 chat 的 message_id 被拒；thread route 下未登记主时间线消息拒绝、已登记（quote/pending/trigger）可读；degraded chat route 拒绝 topic 消息（即使已登记）且 fetch 返回 AUTHORIZATION_DENIED；topic 工具发现的资源登记后 fetch 才成功（未发现前拒绝）；白名单按 route key/kind/chat/sender 复核；pending 按 (chat, thread?, sender) scope 隔离。 | ✅ 自动 |
-| AC6 权限降级 | service 测试 + 代码检查 + API 探针 | 读失败（throw 403 / resolved 99991672 / 通道不可用）时 quote/history 块静默省略、followup 照常、无失败卡；服务生命周期内首次降级输出一条 warn（含原因/scope 提示）；工具显式调用返回可读 PERMISSION_DENIED/ABORTED/TIMEOUT；onboarding 说明权限与降级。API 探针确认当前应用具备消息读取权限；缺 scope 场景需临时移除权限真机复现，标记**待用户手测**。 | ✅ 自动 + ⏳ 缺 scope 真机手测 |
+| AC1 引用文本 | service 测试 + message-read 单测 + 同应用 bot 身份只读 API 探针 | 首轮/续聊 prompt 均含 `<feishu_quote>`（带 `message_id`）；被引用文件进入 `<feishu_context>` 清单（message_id/file_key/name）；测试从 prompt 提取 id 后执行真实 `feishu_attachment_fetch` 下载成功。API 探针：回复消息 parent_id 可定位到被引用消息且 message.get code=0。 | ✅ 自动 + ✅ API 真机 + ✅ 插件链路真机（2026-10-21） |
+| AC2 合并转发 | service 测试 + message-read 单测 + API 探针 | 引用合并转发时展开容器+子消息文本；容器以 `merge_forward` 行进入清单，`message_id` 展示于引用块；真实 fetch 以**顶层容器 id** 下载子图片成功、子消息 id 未被用于下载；message.get 乱序返回时仍按 `upper_message_id` 选中容器。API 探针：merge_forward `message.get` 返回 3 条扁平 items（容器+文本子+图片子）。 | ✅ 自动 + ✅ API 真机 + ✅ 插件链路真机（2026-10-21，容器 id 下载子文件） |
+| AC3 话题历史 | service 测试 + tools 单测 + API 探针 | 工具默认 10/上限 50、newest-first、cursor=page_token、has_more/cursor 透传；thread/chat 两种容器；chat route 过滤其他 topic；输出 12k/50 行有界；service 首轮注入最近 N 条并支持工具翻页。API 探针：thread list（群/私聊）code=0；p2p `message.list(chat)` code=0（P0 遗留项补测通过）；群历史最早 2026-07-14 消息可读。 | ✅ 自动 + ✅ API 真机 + ✅ 插件链路真机（2026-10-21，分页/续聊） |
+| AC4 首轮上下文 | service 测试 + 真机 | 默认 10 条、`historyBootstrapLimit: 0` 完全不读、超长 `已截断` 标注、仅新会话首轮注入（续聊不重复）、被动读独立 3s 预算且与工具超时解耦（永不 resolve 的 list 在 50ms 预算测试中快速返回）、按块顺序 text→quote→image→manifest→history。真机：新话题首轮含 A/B/C 历史，续聊轮无 `<feishu_history>`；`0` 关闭与截断仅自动覆盖（用户决定不再做真机）。 | ✅ 自动 + ✅ 真机（首轮/续聊） |
+| AC5 授权隔离 | 单测 + service 测试（真机未单独做负向） | 非本 chat 的 message_id 被拒；thread route 下未登记主时间线消息拒绝、已登记（quote/pending/trigger）可读；degraded chat route 拒绝 topic 消息（即使已登记）且 fetch 返回 AUTHORIZATION_DENIED；topic 工具发现的资源登记后 fetch 才成功（未发现前拒绝）；白名单按 route key/kind/chat/sender 复核；pending 按 (chat, thread?, sender) scope 隔离。 | ✅ 自动 |
+| AC6 权限降级 | service 测试 + 代码检查 + API 探针 | 读失败（throw 403 / resolved 99991672 / 通道不可用）时 quote/history 块静默省略、followup 照常、无失败卡；服务生命周期内首次降级输出一条 warn（含原因/scope 提示）；工具显式调用返回可读 PERMISSION_DENIED/ABORTED/TIMEOUT；onboarding 说明权限与降级。API 探针确认当前应用具备消息读取权限；缺 scope 场景需临时移除权限真机复现，标记**待用户手测**。 | ✅ 自动 + ⏳ 缺 scope 真机未测（用户决定跳过；throw/resolved 降级已自动覆盖） |
 | AC7 构建 | `pnpm typecheck && pnpm test && pnpm build` | 全绿（数字见下）。 | ✅ 自动 |
 
 ### 真机 API 补测（只读探针，同一应用 bot 身份）
@@ -95,23 +95,32 @@
 ```text
 pnpm typecheck   -> exit 0（tsconfig.json + tsconfig.client.json）
 pnpm test        -> 31 files passed / 860 tests passed（基线 770；新增 90：message-read 31、feishu-tools 36、service 18、manifest 2、config/channel 等）
-pnpm build       -> host lib/index.js 622.20 kB（gzip 178.73 kB）+ client lib/client.js 125.40 kB（gzip 27.69 kB），均 Build complete
+pnpm build       -> host lib/index.js 622.76 kB（gzip 178.85 kB）+ client lib/client.js 125.40 kB（gzip 27.69 kB），均 Build complete
 git diff --check -> exit 0
 ```
 
-### 真实用户手测步骤（待用户执行）
+### 真机验证记录（2026-10-21，用户手动操作 + lead 判读）
 
-自动测试与 API 探针之外，插件链路的真机验收按下述步骤执行（已写入 [docs/feishu-onboarding.md](../../../docs/feishu-onboarding.md) §5.3）：
+**环境与生效方式**：运行中的 desktop profile 实例；因运行进程加载的是 13:42 前的旧 bundle，验证前通过临时给 `~/.dsh/profiles/desktop/cordis.patch.yml` 追加注释触发 profile HMR 重载（改前备份到 `/tmp/desktop-cordis.patch.backup-140229.yml`；验证结束后已按备份逐字节恢复并确认 `cmp` 一致）。新会话 `request/header` 出现 `feishu_topic_messages`（21 tools）即确认新构建生效。为固定文件内容，临时在工作区创建 `.p2-smoke/quote-file.txt`（内容 `P2-QUOTE-FILE-03/hello-from-smoke-test/line3: 42`，49 字节），验证后已删除，未进入任何提交。
 
-1. **引用文字**：私聊/已绑定话题内回复一条更早消息（飞书自动 @）并问“解释一下上面这条”→ 卡片正常开始，模型复述被引用内容而非“看不到引用”。
-2. **引用文件/图片**：引用带文件的消息问“这个文件里是什么”→ 被引用附件出现在 `<feishu_context>` 清单（有 message_id/file_key），模型可用 `feishu_attachment_fetch` 取回并回答。
-3. **引用合并转发**：引用合并转发问“总结转发内容”→ prompt 出现转发文本与容器 message_id；需要子资源时用容器 id 取回成功（子 id 400 属预期）。
-4. **话题历史 / @ 之前**：话题群已有讨论时 @ 机器人 → 首轮含 `<feishu_history>` 最近 10 条摘要（每行带 message_id），更早消息用 `feishu_topic_messages` 翻页；若缺 `im:message.group_msg` 等 scope，历史块静默省略、普通对话不受影响（首次 warn 日志，见 §1）。
-5. **入群前历史**：机器人入群前群内已有消息时重复第 4 步；能读到则权限覆盖可见范围，不能读按“机器人可见范围”降级。
-6. **关闭/调参**：`historyBootstrapLimit: 0` 重载后首轮不再带历史；`promptContextTimeoutMs` 控制被动读预算；`feishuTools.topicMessages: false` 只关工具、不影响被动摘录。
-7. **权限降级（可选/需谨慎）**：临时移除消息读取 scope（或换仅含发送权限的应用）发布版本后重复第 1/4 步 → 普通对话仍正常，引用/历史静默省略，`feishu_topic_messages` 返回可读 PERMISSION_DENIED；验证后恢复权限。
+| # | 用户操作 | 预期 | 实际（session 证据） | 结论 |
+| --- | --- | --- | --- | --- |
+| 1 | 私聊主聊天区发 `P2-SMOKE-01：请只回复 OK` | 新建会话；模型回 OK；工具注册 | 新 session `e37bb102-…`：`request/header` tools(21) 含 `feishu_topic_messages`；assistant=`OK`；turn completed | ✅ 新构建生效 |
+| 2 | 同话题内回复（引用）机器人上一条消息，发 `P2-QUOTE-02：请复述你被引用的那条消息原文。` | 续聊轮带 `<feishu_quote>` 与 message_id | turn 2 prompt 含 `<feishu_quote>`（`message_id=om_x100b62b1cdf7e4b4dd18c48e28b8074`、原文 `P2-SMOKE-01…`）；assistant 准确复述；turn completed | ✅ AC1 引用文字 |
+| 3a | 私聊主聊天区仅发送 `quote-file.txt`（不带文字） | 完全静默：无回复/无会话/无下载 | 无新 session、无回复；随后 pending 表新增该文件记录（scope `chat:oc_cc8…`，kind=file，fileKey/fileName 正确） | ✅ 纯附件静默 |
+| 3b | 再发普通文字 `P2-QUOTE-03：这个文件的文件名是什么？…`（未形成引用） | 清单列出静默登记文件；工具可懒取 | 新 session `50ccfe49-…`：`<feishu_context>` 列出该文件 `message_id/file_key/name`；模型调 `feishu_attachment_fetch` 取回 49 字节（sha256 `96437f27…`）并读出 `P2-QUOTE-FILE-03`；pending 行 consumed=true | ✅ 静默登记 + 懒取链路 |
+| 3c | 正确「回复/引用」该文件消息，发 `P2-QUOTE-03B：…` | quote 块 + 清单 quote 行；可取 | 新 session `96621adf-…`：`<feishu_quote>` 含 `message_id=om_x100b62b1f6b28488…` 与 `[文件 quote-file.txt]`；同一 message_id 出现在 manifest quote 行；模型 fetch 取回并确认 type=file/文件名/清单已列出 | ✅ AC1 引用文件（可发现+可取） |
+| 4a/4b | 多选两条消息（含 `quote-file.txt`）合并转发，再引用该合并转发问 `P2-QUOTE-04：…` | quote 块展开子消息 + 容器 id；按容器 id 取子资源 | 新 session `1bb9c2ef-…`：quote 块 `message_id=om_x100b62b18bf9e0accd3435b57a6b900（合并转发，共 2 条子消息）` + 两条子消息文本；manifest 容器行；模型先 `feishu_topic_messages(容器 id)` 展开，再 `feishu_attachment_fetch(容器 id)` 取回子文件并读出内容（未使用子消息 id） | ✅ AC2 合并转发 |
+| 5 | 话题群新建话题，先发 A/B/C 三条（不 @），再 @ 机器人发 `P2-HIST-05：请用 feishu_topic_messages…` | 首轮 `<feishu_history>` 含 A/B/C（@ 之前）；工具可读 | 新 session `99c0b9dd-…`：首轮 prompt 含 `<feishu_history>` A/B/C（带 message_id）；`feishu_topic_messages(limit=5)` 返回 4 条（含 A/B/C）；assistant 准确复述 | ✅ AC3/AC4 首轮历史 |
+| 6R | 干净新话题 A/B/C 后 @ 机器人 `P2-PAGE-05…`；再续聊 `P2-PAGE-06…` 用 cursor 翻页 | 首轮历史 + 第一页带 cursor；续聊不重复历史；cursor 翻页成功 | 新 session `9eddf59a-…`：首轮 `<feishu_history>` A/B/C；工具 `limit=2` 渲染文本含 `- 下一页 cursor: 4cXSlm…`（修复后）；续聊轮无 `<feishu_history>`；第 2 轮以原 cursor 翻页成功（C/B + 新 cursor），无 invalid page_token | ✅ 分页 + 续聊 |
 
-当前状态：**待用户手测**（本会话无法操作真实飞书客户端；API 能力与插件行为已分别由真机探针与自动测试覆盖，未用 mock 冒充）。
+**真机发现并已修复的问题（P1，提交 `7964c64`）**：`feishu_topic_messages` 列表结果的渲染文本原先只写“用 cursor 翻页”却**不输出 cursor token**（token 只在工具结构化 value 里，而宿主只把 render 文本交给模型）。用户第 6 步实测时模型拿 message id 当 cursor → 多次 `invalid page_token` → 转而用 bash 翻 `lib/index.js`、查会话目录、甚至用凭据直连 OpenAPI，其中一次 `grep /Users/moka` 跑满 300s 超时，表现为“回复超级慢”。修复：渲染结果新增 `- 下一页 cursor: <token>`（限长/清洗），补单测；同时 guidance 增加“不得读取/打印飞书凭据、不得直接调用 Feishu OpenAPI”。热重载后 6R 复测一次通过。
+
+**安全观察（需用户处置）**：上述绕路过程中模型读取了 `~/.dsh/.credentials.yaml` 并把 `FEISHU_APP_SECRET` 字面量写进了 bash 命令，该内容落在**本地会话日志** `99c0b9dd-…` 中（模型最终回复未包含 secret，未发到飞书聊天）。已加 guidance 约束；仍建议：① 轮换该应用 App Secret 并更新 `$DSH_HOME/.credentials.yaml`；② 评估 channel 会话的宿主沙箱/凭据保护（本次为 host 侧读取权限问题，非插件功能缺陷）。已作为已知风险记录。
+
+**恢复与清理**：profile 补丁已按备份恢复（`cmp` byte-identical），临时 smoke 文件已删除，工作树无测试残留；本次真机验证未产生新的平台对象/远端变更。
+
+**用户决定跳过的项**：`historyBootstrapLimit: 0` 真机关闭、权限缺失真机降级、非本 route 负向真机（这三项由自动测试覆盖；用户明确“不做了”，记录为真机未测）。
 
 ### 独立评审与修复（teammate 只读，未改工作树）
 
@@ -121,7 +130,7 @@ git diff --check -> exit 0
 
 ### 未验证项 / 已知限制
 
-1. **插件链路真机端到端**（引用文字/文件、合并转发、话题历史、入群前历史、权限降级）待用户按 §5.3 手测；API 层能力已用同应用 bot 身份真机探针验证（见上表），非 mock。
+1. **插件链路真机端到端**：引用文字/文件、合并转发（容器 id 取子文件）、话题历史（首轮/续聊/分页 cursor）已于 2026-10-21 用真实飞书客户端验证通过（见上节）；权限降级、`historyBootstrapLimit: 0`、非本 route 负向真机由用户决定跳过，仍由自动测试覆盖。API 层能力另用同应用 bot 身份真机探针验证，非 mock。
 2. **入群前历史**：同一应用真机探针可见早于机器人活动约 1 个月的群历史；无法直接查询“入群时间”，不同租户/敏感权限组合可能不同，文档按“机器人可见范围”降级，不绝对保证。
 3. **`/renew` 语义**：`/renew` 创建的新 Session 首轮不会注入 `<feishu_history>`（`firstTurn` 仅 `startSession` 路径）；若产品期望“新会话即带话题历史”，需确认后扩展。当前按既有语义保留。
 4. **degraded group chat route 容器语义**：topic 建话题失败降级为 chat 路由后，其容器是整群主时间线——同群他人主时间线消息可被读取/登记（topic 消息已明确拒绝）；AC-6“群内他人文件”边界建议产品确认是否按 sender 进一步收紧。
@@ -133,6 +142,7 @@ git diff --check -> exit 0
 10. **新配置未进 Web 面板**：`historyBootstrapLimit`、`promptContextTimeoutMs`、`feishuTools.topicMessages/topicMessagesTimeoutMs` 未加入 `EDITABLE_KEYS`；README/onboarding 的 archive 主路径描述仍待 P3 统一（本任务已更新 onboarding 的 P2 部分）。
 11. **权限降级真机**：缺 scope 场景需临时移除权限才能复现，标记待用户手测；已自动覆盖 throw/resolved 两种形态与可读错误。
 12. 慢网/大历史规模下的首字延迟体感、`im:message.group_msg` 审批后的入群前历史边界，待真机确认。
+13. **凭据与沙箱（真机暴露的 host 侧风险）**：channel 会话的 bash 可读取宿主 `~/.dsh/.credentials.yaml`；本次工具缺陷诱导下模型曾读取 App Secret 并写入本地会话日志。插件已加 guidance 禁止读取/打印凭据与直连 OpenAPI，但仍建议轮换 secret，并在宿主层限制 channel 会话对 `$DSH_HOME` 的读取（非本任务可改范围，已上报）。
 
 ### 下游接口与交接（`panel_docs_release`）
 
