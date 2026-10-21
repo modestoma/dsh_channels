@@ -2759,7 +2759,7 @@ describe('/stop, structured questions, and host projections', () => {
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
 
-    expect(cancel).toHaveBeenCalledWith({ kind: 'user' })
+    expect(cancel).toHaveBeenCalledWith({ kind: 'user' }, { keepInbox: true })
     const json = JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)
     expect(json).toContain('已请求停止当前回合')
     expect(mock(agent.followup)).not.toHaveBeenCalled()
@@ -2797,8 +2797,11 @@ describe('/stop, structured questions, and host projections', () => {
     const cancel = vi.fn()
     ;(agent as unknown as { status: string }).status = 'running'
     ;(agent as unknown as { cancel: unknown }).cancel = cancel
-    const card = JSON.stringify((h.channel.sent[0] as { input: object }).input)
-    expect(card).toContain('⏹ 停止')
+    // The first frame has no button; the active turn gains it on its first patch.
+    expect(JSON.stringify((h.channel.sent[0] as { input: object }).input)).not.toContain('⏹ 停止')
+    await waitUntil(() => expect(h.channel.updated.some(update =>
+      JSON.stringify((update as { card: object }).card).includes('⏹ 停止'),
+    )).toBe(true))
     const value = { decision: 'turn-stop' }
 
     // A stranger's click only adds the owner-only notice.
@@ -2829,7 +2832,7 @@ describe('/stop, structured questions, and host projections', () => {
       messageId: 'om_1', chatId: 'oc_stop_btn',
       operator: { openId: 'ou_o', userId: 'u_owner' }, action: { value, tag: 'button' },
     })
-    expect(cancel).toHaveBeenCalledWith({ kind: 'user' })
+    expect(cancel).toHaveBeenCalledWith({ kind: 'user' }, { keepInbox: true })
     await waitUntil(() => expect(h.channel.updated.some(update =>
       JSON.stringify((update as { card: object }).card).includes('正在停止'),
     )).toBe(true))

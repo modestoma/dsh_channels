@@ -615,15 +615,16 @@ export function splitBodyForCard(body: string, maxChars: number, maxTables: numb
 
 /**
  * The initial (empty) streaming card for one session: thinking phase, empty
- * body and reasoning, zeroed stats, and the stop button. The service sends it
- * as the topic-creating first reply and then streams into the same message.
+ * body and reasoning, zeroed stats. It has no stop button: the turn may still
+ * be preparing or queued behind another one, and the streamer adds the button
+ * once the turn is the active one. The service sends it as the topic-creating
+ * first reply and then streams into the same message.
  */
 export function initialStreamingCard(sessionId: string): object {
   const state: CardState = {
     phase: 'thinking',
     reasoning: '',
     body: '',
-    stop: 'ready',
     stats: { sessionId, inputTokens: 0, outputTokens: 0 },
   }
   return buildCard(state)

@@ -667,8 +667,8 @@ describe('streaming card stop button', () => {
     expect(buttonsOf(buildCard(baseState({ phase: 'done', body: 'x' })))).toHaveLength(0)
   })
 
-  it('offers the button on the first frame', () => {
-    expect(buttonsOf(initialStreamingCard('sess-1')).map(buttonLabel)).toEqual(['⏹ 停止'])
+  it('leaves the button off the first frame', () => {
+    expect(buttonsOf(initialStreamingCard('sess-1'))).toHaveLength(0)
   })
 
   it('settles a stopped turn with its own panel title and the footer', () => {

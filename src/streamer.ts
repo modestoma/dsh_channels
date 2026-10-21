@@ -28,8 +28,9 @@
  *     card and request the Typing → DONE/No reaction swap on the triggering
  *     message.
  *
- * Stop button: the card that is currently streaming carries a stop button
- * until the turn settles. `stopTargetOf()` resolves a clicked card to its
+ * Stop button: the card that is currently streaming in the session's active
+ * (front) turn carries a stop button until the turn settles; queued turns
+ * gain it when they become the front. `stopTargetOf()` resolves a clicked card to its
  * session; `markStopping()` / `markStopDenied()` record the click's outcome
  * on the card. Ownership checks and the cancellation itself belong to the
  * caller.
@@ -377,6 +378,9 @@ export class TurnStreamer {
     this.bySession.set(session.id, queue)
     const state = queue[queue.length - 1]!
     this.scheduleHeartbeat(session.id, state)
+    // The first frame is sent without a stop button; the front turn gains it
+    // on its first patch.
+    if (this.front(session.id) === state) this.markDirty(session.id, state)
   }
 
   /** Drop all state for a session (agent disposed / route removed). */
@@ -399,16 +403,15 @@ export class TurnStreamer {
   }
 
   /**
-   * The session whose unsettled turn streams into `messageId`, or undefined
-   * when the card belongs to no live turn (settled, detached, or unknown).
+   * The session whose active (front) turn streams into `messageId`, or
+   * undefined when the card belongs to no such turn (queued, settled,
+   * detached, or unknown). Only the front turn is the one `cancel` stops.
    * @param messageId Feishu message id of a clicked card.
    * @returns The owning session id.
    */
   stopTargetOf(messageId: string): string | undefined {
-    for (const [sessionId, queue] of this.bySession) {
-      for (const state of queue) {
-        if (!state.finalized && state.cards.some(card => card.messageId === messageId)) return sessionId
-      }
+    for (const sessionId of this.bySession.keys()) {
+      if (this.front(sessionId)?.cards.some(card => card.messageId === messageId) === true) return sessionId
     }
     return undefined
   }
@@ -930,7 +933,7 @@ export class TurnStreamer {
       const kind = this.noteKind('tool', tool, state.toolKind)
       if (kind !== undefined) state.toolKind = kind
     }
-    const stop: StopControl | undefined = !active || state.finalized
+    const stop: StopControl | undefined = !active || state.finalized || this.front(sessionId) !== state
       ? undefined
       : state.stopRequested ? 'stopping' : 'ready'
     return {
@@ -1116,7 +1119,9 @@ export class TurnStreamer {
   ): void {
     if (state.finalized) return
     state.finalized = true
-    state.phase = failure !== undefined ? 'error' : aborted ? 'stopped' : 'done'
+    // Only a stop this channel requested reads as 已停止; other cancellation
+    // causes (parent, hook, disposal) settle like a normal end.
+    state.phase = failure !== undefined ? 'error' : aborted && state.stopRequested ? 'stopped' : 'done'
     // A turn that ends inside a reasoning phase (e.g. no answer text) still
     // reports the time it spent reasoning.
     this.closeReasoning(state)
@@ -1169,6 +1174,9 @@ export class TurnStreamer {
       if (queue === undefined) return
       const index = queue.indexOf(state)
       if (index >= 0) queue.splice(index, 1)
+      // The next queued turn becomes the active one and gains the stop button.
+      const next = this.front(sessionId)
+      if (next !== undefined) this.markDirty(sessionId, next)
     })
 
     this.hooks.onTurnFinalized(sessionId, state.turn ?? 0, state.cards[0]?.messageId ?? '')

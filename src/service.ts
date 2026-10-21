@@ -1848,7 +1848,9 @@ export class FeishuService {
   }
 
   /**
-   * Cancel one Session's live turn without resuming anything.
+   * Cancel one Session's live turn without resuming anything. Queued
+   * messages stay in the inbox: each already has its own streaming card and
+   * runs next.
    * @param sessionId The Session to cancel.
    * @returns Whether a turn was running.
    */
@@ -1856,7 +1858,7 @@ export class FeishuService {
     const agent = this.sessions.get(sessionId)?.agent
       ?? this.ctx.agents.get(sessionId as SessionId)
     const running = agent?.status === 'running'
-    agent?.cancel?.({ kind: 'user' })
+    agent?.cancel?.({ kind: 'user' }, { keepInbox: true })
     if (running) this.streamer?.markStopping(sessionId)
     return running
   }

@@ -1121,4 +1121,36 @@ describe('TurnStreamer stop button', () => {
     streamer.markStopping('sess-stop-abort')
     streamer.markStopping('sess-unknown')
   })
+
+  it('offers the button only on the active turn, and moves it to the next queued turn', async () => {
+    const ch = channel()
+    const streamer = new TurnStreamer(ch, 500, hooks())
+    const session = makeSession('sess-stop-queue')
+    streamer.attach(session, 'om_first', 'om_t1', undefined)
+    streamer.attach(session, 'om_second', 'om_t2', undefined)
+    await vi.advanceTimersByTimeAsync(500)
+    const latest = (id: string) => ch.updated.filter(update => update.messageId === id).at(-1)
+    expect(buttonsOf(latest('om_first')!.card)).toHaveLength(1)
+    expect(latest('om_second')).toBeUndefined()
+    expect(streamer.stopTargetOf('om_second')).toBeUndefined()
+
+    streamer.onSessionEvent(session, { type: 'turn/end', seq: 1, data: { turn: 1, reason: { kind: 'completed' } } })
+    await vi.advanceTimersByTimeAsync(500)
+    expect(buttonsOf(latest('om_second')!.card)).toHaveLength(1)
+    expect(streamer.stopTargetOf('om_second')).toBe('sess-stop-queue')
+  })
+
+  it('settles a cancellation it did not request as a normal end', async () => {
+    const ch = channel()
+    const streamer = new TurnStreamer(ch, 500, hooks())
+    const session = makeSession('sess-stop-parent')
+    streamer.attach(session, 'om_card', 'om_trigger', undefined)
+    streamText(streamer, session, '进行中')
+    streamer.onSessionEvent(session, {
+      type: 'turn/end', seq: 2, data: { turn: 1, reason: { kind: 'aborted', reason: { kind: 'parent' } } },
+    })
+    const settled = JSON.stringify(ch.updated.at(-1)!.card)
+    expect(settled).not.toContain('已按请求停止')
+    expect(buttonsOf(ch.updated.at(-1)!.card)).toHaveLength(0)
+  })
 })
