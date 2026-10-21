@@ -64,13 +64,13 @@
 
 | AC | 验证方法 | 实际结果 | 结论 |
 | --- | --- | --- | --- |
-| AC1 零等待 | service 测试（阻塞下载桩）+ 代码顺序检查 + 独立只读探针 | `establishSession` 顺序：Typing → 首帧卡片/话题 → workspace/repair → createSession（preset setup 内挂工具）→ routes.put → streamer.attach → 预取图片（有界）→ followup；文件字节从不进准入路径。service 测试用可控 gate 断言“卡片/会话/路由已建立而 followup 尚未调用”，释放后首轮含 text+ImageBlock；archive 分支仍在会话前同步下载（旧语义）。新增顺序闸门测试：预取阻塞时同话题第二条消息等待，释放后 followup 顺序为 first→second。 | ✅ 自动 |
-| AC2 清单正确 | manifest 单测 + service 测试 + 探针 | 触发附件（文件/未预取图片/merge_forward 容器）与 pending 记录进入清单；已预取图片不出现；无附件/无 pending 时 followup 仅单 text 块（零清单 token）；行格式/去重/consumed/顺序/零 token/恶意元数据转义/50 行上限均有断言；service 断言 p2p 静默附件在下一轮清单出现、预取成功图片不入清单。 | ✅ 自动 |
-| AC3 纯附件静默 | service 测试 + 负向测试 + 探针 | 私聊纯附件、群未 @ 文件、已绑定话题内纯附件：准入后仅 pending 登记（可查 domain 表），无 Agent/无发送/无表情/无下载/无路由；`acceptAttachments=false` 纯附件完全惰性且不登记；外来 sender 在他人话题的纯附件/图文混合不登记、不回复（processed 屏障 + settle）；guarded 模式被拒发送者附件不登记（等拒绝通知为屏障）；foreign/denied 行为另经独立探针强 settle 复验。 | ✅ 自动 |
-| AC4 图片预取 | 单测 21 项 + service 测试 + 探针 | route 建立后、followup 前预取；成功时首轮第 2 块为 ImageBlock（顺序=消息顺序）；单图/总字节上限；整段短超时（stall 场景 100 ms 配置下回合照跑）；saveImage 失败/单图超限/超时/关闭开关/超总预算均降级为清单且不阻塞会话；单图超限只跳过该图继续后续；底层 stream 不可取消已在注释记录；`prefetchImageAttachments` 永不抛、外层再兜底。 | ✅ 自动（真机手动项见未验证） |
-| AC5 文件懒取 | service 测试（执行真实工具定义）+ 探针 | 未调用工具前 `channel.downloadResource` 零调用；followup 含 message_id/file_key/文件名清单；service 测试直接执行真实 `feishu_attachment_fetch` 定义，断言下载、原生库入库字节一致、渲染含 FileBlock/text；触发消息授权在 route put 之后用持久化 RouteRecord 登记（非按 msg.threadId 手拼）；续聊/重启 pending 授权另有前置任务测试与独立探针。 | ✅ 自动 |
-| AC6 话题/群行 | service 测试三类会话 | p2p：附件+文字触发、纯附件静默；对话群：@ 触发、未 @ 纯附件静默登记、未 @ 文件后续 @ 后可从清单引用；话题群：首条 @ 建话题、话题内纯附件静默、话题内无 @ 文字续聊正常且清单含静默附件；D3“引用但未 @ 不触发”未引入隐式寻址。 | ✅ 自动 |
-| AC7 archive 降级 | service 测试 + 探针 | 显式 `attachmentStore: 'archive'`（即使宿主 native 服务已挂载）→ 旧同步下载到 `_staging`/话题 `attachments/`、占位符剥离、纯文本 prompt、无清单、失败通知与 Typing/DONE/No 表情保持旧语义、不挂 fetch 工具；native 配置但宿主无 attachments 服务 → 同旧行为 + 一次性 warn；`feishuTools.attachmentFetch=false` → 同样整体回退 archive（guidance/工具/落点一致，字节实际落到工作区且 native 库零写入；该断言经“回退 mode 行→测试红”变异验证）；`acceptAttachments=false` → archive/inert（无下载、纯附件不建会话/不回复/不登记、不挂 guidance/工具）；native 主链路不写 `_staging`（探针）；旧 `_staging` 仅保留一次性迁入。 | ✅ 自动 |
+| AC1 零等待 | service 测试（阻塞下载桩）+ 代码顺序检查 + 独立只读探针 | `establishSession` 顺序：Typing → 首帧卡片/话题 → workspace/repair → createSession（preset setup 内挂工具）→ routes.put → streamer.attach → 预取图片（有界）→ followup；文件字节从不进准入路径。service 测试用可控 gate 断言“卡片/会话/路由已建立而 followup 尚未调用”，释放后首轮含 text+ImageBlock；archive 分支仍在会话前同步下载（旧语义）。新增顺序闸门测试：预取阻塞时同话题第二条消息等待，释放后 followup 顺序为 first→second。 | ✅ 自动 + ✅ 真机（第 2 步卡片先于预取完成） |
+| AC2 清单正确 | manifest 单测 + service 测试 + 探针 | 触发附件（文件/未预取图片/merge_forward 容器）与 pending 记录进入清单；已预取图片不出现；无附件/无 pending 时 followup 仅单 text 块（零清单 token）；行格式/去重/consumed/顺序/零 token/恶意元数据转义/50 行上限均有断言；service 断言 p2p 静默附件在下一轮清单出现、预取成功图片不入清单。 | ✅ 自动 + ✅ 真机（第 2 步首轮含 ImageBlock，清单被模型使用） |
+| AC3 纯附件静默 | service 测试 + 负向测试 + 探针 | 私聊纯附件、群未 @ 文件、已绑定话题内纯附件：准入后仅 pending 登记（可查 domain 表），无 Agent/无发送/无表情/无下载/无路由；`acceptAttachments=false` 纯附件完全惰性且不登记；外来 sender 在他人话题的纯附件/图文混合不登记、不回复（processed 屏障 + settle）；guarded 模式被拒发送者附件不登记（等拒绝通知为屏障）；foreign/denied 行为另经独立探针强 settle 复验。 | ✅ 自动 + ✅ 真机（第 1/6/8 步静默，第 4 步 pending 引用） |
+| AC4 图片预取 | 单测 21 项 + service 测试 + 探针 | route 建立后、followup 前预取；成功时首轮第 2 块为 ImageBlock（顺序=消息顺序）；单图/总字节上限；整段短超时（stall 场景 100 ms 配置下回合照跑）；saveImage 失败/单图超限/超时/关闭开关/超总预算均降级为清单且不阻塞会话；单图超限只跳过该图继续后续；底层 stream 不可取消已在注释记录；`prefetchImageAttachments` 永不抛、外层再兜底。 | ✅ 自动 + ✅ 真机（第 2/5 步首轮图片进入 prompt） |
+| AC5 文件懒取 | service 测试（执行真实工具定义）+ 探针 | 未调用工具前 `channel.downloadResource` 零调用；followup 含 message_id/file_key/文件名清单；service 测试直接执行真实 `feishu_attachment_fetch` 定义，断言下载、原生库入库字节一致、渲染含 FileBlock/text；触发消息授权在 route put 之后用持久化 RouteRecord 登记（非按 msg.threadId 手拼）；续聊/重启 pending 授权另有前置任务测试与独立探针。 | ✅ 自动 + ✅ 真机（第 3/4 步 FileBlock 懒取 + 只读路径） |
+| AC6 话题/群行 | service 测试三类会话 | p2p：附件+文字触发、纯附件静默；对话群：@ 触发、未 @ 纯附件静默登记、未 @ 文件后续 @ 后可从清单引用；话题群：首条 @ 建话题、话题内纯附件静默、话题内无 @ 文字续聊正常且清单含静默附件；D3“引用但未 @ 不触发”未引入隐式寻址。 | ✅ 自动 + ✅ 真机（第 5 步群 @ + 话题续聊；第 6 步群未 @ 静默） |
+| AC7 archive 降级 | service 测试 + 探针 | 显式 `attachmentStore: 'archive'`（即使宿主 native 服务已挂载）→ 旧同步下载到 `_staging`/话题 `attachments/`、占位符剥离、纯文本 prompt、无清单、失败通知与 Typing/DONE/No 表情保持旧语义、不挂 fetch 工具；native 配置但宿主无 attachments 服务 → 同旧行为 + 一次性 warn；`feishuTools.attachmentFetch=false` → 同样整体回退 archive（guidance/工具/落点一致，字节实际落到工作区且 native 库零写入；该断言经“回退 mode 行→测试红”变异验证）；`acceptAttachments=false` → archive/inert（无下载、纯附件不建会话/不回复/不登记、不挂 guidance/工具）；native 主链路不写 `_staging`（探针）；旧 `_staging` 仅保留一次性迁入。 | ✅ 自动 + ✅ 真机（第 7 步 DONE 表情 + staging 落盘；第 8 步恢复 native） |
 | AC8 构建 | `pnpm typecheck && pnpm test && pnpm build` | 全绿（数字见下）。 | ✅ 自动 |
 
 ### 三类会话行为矩阵（AC6/AC3）
@@ -80,6 +80,27 @@
 | 纯附件消息 | 静默登记，不建会话/不回复/不下载 | 静默登记（后续 @ 建话题可引用） | 静默登记（纯附件不触发） | 静默登记（话题 scope） |
 | 文字+附件 | 立即建会话+卡片，图片预取/文件清单 | 不触发、静默登记（旧行为同样不触发） | 立即建会话+卡片 | 续聊：建卡片，图片预取/文件清单，不新建会话 |
 | 纯文字 | 建会话 | 不触发 | 建会话 | 续聊 |
+
+### 真机手动验证（2026-10-21 12:34–12:54，desktop profile）
+
+**部署与重载方式**：运行中实例为 10:51 启动的旧构建；在 `~/.dsh/profiles/desktop/cordis.patch.yml` 临时追加/恢复注释触发 HMR profile recompose（改前备份到 `/tmp`，验证后已恢复原文件；仅 `lib/index.js` 为 01:31 提交后的新构建，未重新 install）。12:34:46 插件条目被重载、`include:dsh-channels` fiberPhase=active，飞书 WS 由本地端口 56695 重连为 59075；后续 AC7 临时切 `attachmentStore: archive` 再恢复 native，WS 端口依次 59580 → 59609，最终 profile 为 `attachmentStore: native`、插件 active、飞书连接正常。**本轮未重启 DSH 进程**（用 HMR 重载），因此“冷重启回放”仍为未验证项（P0 已覆盖附件路径的冷回放）。
+
+| # | 用户操作 | 预期 | 实际证据 | 结论 |
+| --- | --- | --- | --- | --- |
+| 1 | 私聊仅发图片（无文字） | 完全静默；仅 pending 登记 | 用户确认无回复/无表情；`pending_attachments` 新增 1 行（`om_x100b62b05624ade0c08485ec3c92f6c`，scope `chat:oc_cc8…:ou_a5d6…`，kind=image，含 fileKey），路由仍 23、无新 Session、native 对象 68 不变、无 `_staging`/工作区落盘 | ✅ AC3 + 新构建生效判定 |
+| 2 | 私聊图片 + 文字（“给我讲讲这张图片”） | 卡片立即出现；首轮含 ImageBlock，无需 fetch 工具 | 新话题 `omt_19bdc931c70fda5e`、Session `faf20bd0-a43b-4158-b9d7-8179e961e721`、卡片 `om_x100b62b0516810a4ce484a61930e49d`；首轮 user content = `[text, image, text(清单)]`，清单列出第 1 步 pending 图片；模型未调 `feishu_attachment_fetch`（另用 `read_image` 看原图属允许行为）即准确描述图片；native objects 68→69；无工作区 attachments | ✅ AC1/AC4 + 清单 |
+| 3 | 私聊发送 48 MB `dsh_channels.zip` + 文字（“给我讲讲这个压缩包”） | 卡片立即；清单列文件；工具懒取后才下载 | 新话题 `omt_19bdcab9684f5a54`、Session `df916035-1d15-4383-9353-901485dfe984`、卡片 `om_x100b62b069d148b8cef9a11921faee0`；首轮清单含触发文件（`message_id=om_x100b62b069c968a4df86f6c945d1c48`、`file_key=file_v3_0016m_…`、`name="dsh_channels.zip"`）与第 1 步 pending 图片；模型 `feishu_attachment_fetch(message_id,file_key)` 结果含 `[text, file]` 块 + 只读路径；文件对象 48,146,086 字节、sha256 `82e33d67…` 落 native 库；Session/卡片创建于 12:41:22.880，工具调用 12:41:24.091，文件对象 birth 12:41:24（**下载发生在回合开始之后**）；模型解压到话题可写 work/ 目录后总结；新话题无 `attachments/`、无 `_staging` | ✅ AC2/AC5 + 懒取时序 |
+| 4 | 私聊主时间线发文字（“看一下我刚发的文件，给我讲一讲”） | 清单列出静默图片；工具取回后描述 | 新话题 `omt_19bdcbea6e0fda7f`、Session `abc60b1c-281e-43a2-97e5-c8990f449250`；首轮清单仅列第 1 步 pending 图片；模型 `feishu_attachment_fetch` 取回该图片，结果 `[text, image]`（227,767 字节，1344×671 JPEG），随后描述正确；pending 行 `consumed=true`；该图片与第 2 步预取内容寻址去重（同一个 native 对象 `…1e89f29b…`，objects 数不变） | ✅ AC2/AC3 引用 + 图片懒取 + 去重 |
+| 5 | 测试群 @机器人 发图片+文字；随后在话题内无 @ 回复一次 | 群 @ 建话题/预取；话题内无 @ 续聊同一 Session | 群 `oc_ede093b6…` 新话题路由 `omt_19bdcbb6c18f1a51`、Session `539714ec-7fbb-4dce-98c7-2f80f56130ec`；首轮 user content 含 image 块（预取成功，无需工具）；话题内第二条消息无 @ → 同一 Session 第二轮，`turn/end=completed` 两轮，路由数只 +1、未新建 Session；模型用 `read_image`/`bash` 分析亮度均正常 | ✅ AC6（群 @ + 话题续聊） |
+| 6 | 同一测试群内不 @ 只发一张图片 | 完全静默；只新增群 scope pending | 用户确认无回复/无表情；`pending_attachments` 新增群 scope 行（`om_x100b62b008309c98de0923f37a5f6c0`，scope `chat:oc_ede…:ou_a5d6…`，threadId 为空，kind=image）；路由仍 27、无新 Session、无工作区/native 落盘 | ✅ AC3（群未 @） |
+| 7 | 临时 `attachmentStore: archive` + HMR 后，私聊仅发图片 | 旧 archive 行为：DONE 表情 + 工作区落盘，不写 native/pending | 用户确认“无回复但加了 DONE 表情”；`_staging/p2p/oc_cc8…/ou_a5d6…/20261021-045238-image.jpg` 新增；路由/pending 不变、native objects 仍 69、无新 Session | ✅ AC7（缺省 native 之外的显式 archive 降级真机） |
+| 8 | 恢复 `attachmentStore: native` + HMR 后，私聊仅发图片 | 回到新版静默行为 | 用户确认“无回复也无表情”；新增 p2p pending 行 `om_x100b62b01a6dc0a4deac5f33d15ae14`；无 `_staging` 新文件、native objects 不变；最终 profile `attachmentStore: native`、插件 active、飞书 WS 正常（本地端口 59609） | ✅ 最终部署状态确认 |
+
+**时间线要点（零等待与懒取）**：第 2 步 Session 创建于 12:39:23.467、预取图片对象写入 12:39:24（卡片先于图片预取完成）；第 3 步 Session/卡片 12:41:22.880、`feishu_attachment_fetch` 调用 12:41:24.091、文件对象 birth 12:41:24（文件字节在回合开始后才下载）。第 6 步群静默与第 8 步 p2p 静默均无 Session/卡片/下载。
+
+**本次真机留下的事实/工件**：3 条 pending 记录（2 条 p2p 测试静默 + 1 条群测试静默，TTL 7 天自动清理）；1 个 archive 降级测试的 staging 图片；第 3 步模型按“只读副本复制到工作区再修改”的指引把 196 MB 解压内容放在话题 `work/` 目录（模型行为，非入站落盘）；以上均为测试工件，未修改 profile（已恢复）与代码。
+
+**本轮新增未验证项**：冷重启回放（本轮用 HMR 重载而非整机重启；P0 已覆盖 native 附件历史回放的冷启动）；`feishuTools.attachmentFetch=false` / `acceptAttachments=false` 的真机降级；1 GB 级文件在 admission 懒取链路下的真机表现（P0 已覆盖 980 MB 下载/取消）；群静默附件在后续 @ 新话题中的跨 scope 引用（p2p chat→thread 回退已真机验证，群逻辑同源）；archive 模式下“文字+文件”混合消息的真机行为（自动测试覆盖）。
 
 ### 命令与结果（2026-10-21 本机）
 
@@ -105,8 +126,8 @@ git diff --check -> exit 0
 
 ### 未验证项 / 已知限制
 
-1. **真机手动验收未执行**（AC1/AC4 的手动项；本机仅跑自动测试与只读探针）：需在 desktop profile 验证 native 激活（`ctx.get('attachments')` 解析、日志无 `attachment-service-unmounted`）、图片首轮 ImageBlock、文件清单+工具懒取、纯附件静默、archive 降级、重启回放（从历史读回图片/文件路径）。提交后由用户执行并回填。
-2. **宿主级服务解析**：cordis 4.0.5 真实探针与 P0 证据支持，但宿主 app.asar 内 cordis 版本/组合若不同（极端 isolate 场景）可能解析失败 → 静默回退 archive（v2 不生效但不崩、不丢附件）；真机 smoke 为最终确认。
+1. **真机手动验收已完成主链路**（2026-10-21 12:34–12:54，见上“真机手动验证”）：HMR 重载新构建后，p2p 纯附件静默、图片首轮 ImageBlock、48 MB 文件清单+Fetched/FileBlock 懒取、pending 跨轮引用、群 @ + 话题内无 @ 续聊、群未 @ 静默、显式 archive 降级（DONE+staging）、恢复 native 均通过。**仍待补**：冷重启回放（本轮用 HMR 重载而非整机重启；P0 已覆盖 native 附件历史回放的冷启动）；`feishuTools.attachmentFetch=false`/`acceptAttachments=false` 真机降级；1 GB 级文件在 admission 链路真机（P0 已覆盖 980 MB 下载/取消）；群静默附件在后续 @ 新话题中的跨 scope 引用；archive 模式“文字+文件”混合消息真机。
+2. **宿主级服务解析**：已由“真机 native 行为全部生效”确认（静默登记/预取/懒取/清单均按 native 路径工作），此前 cordis 4.0.5 真实探针与 P0 证据一致；极端 isolate 场景仍会静默回退 archive（不崩、不丢附件）。
 3. **图片预取等待窗口**：默认单段 10 s（可配 100 ms–120 s）；预取期间卡片已可见但 followup 延后（设计）；底层飞书下载流无法在传输层取消，超时后 in-flight `saveImage` 无法召回，可能留下无引用原生对象（沿用工具任务已知限制）。
 4. **触发消息白名单进程内**：重启后旧触发消息的即时授权丢失；静默登记走 durable pending（TTL 7 天）可跨重启授权（前置任务测试 + 探针）。Session 历史中的清单文本仍可提示模型，但 fetch 需重新登记/在 TTL 内。
 5. **merge_forward 转写文本**：native 主链路只登记容器元数据（清单行 `type=merge_forward`），转写文本不再落盘；子资源可由工具按容器 id 取。转写读取明确交接 `quote_history_tools`（P2）。这是相对前置任务 `native_attachment_store` 已知限制 #4（native 仍写 forwarded-record 文本）的行为收紧，按本 Issue“新流程不再写 staging”与 P2 范围取舍。
