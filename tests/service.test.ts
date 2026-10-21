@@ -60,7 +60,6 @@ function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
     prefetchImageMaxBytes: 20 * 1024 * 1024,
     prefetchTotalMaxBytes: 50 * 1024 * 1024,
     prefetchTimeoutMs: 10_000,
-    recentAttachmentLimit: 5,
     // First-turn topic history bootstrap; 0 disables it (bounded, silent on failure).
     historyBootstrapLimit: 10,
     promptContextTimeoutMs: 3_000,
@@ -3534,30 +3533,22 @@ describe('native attachment pipeline', () => {
     return { calls, messageList }
   }
 
-  it('keeps an attachment-only p2p message inert and lists it next turn (AC2/AC3)', async () => {
+  it('keeps attachment-only and un-mentioned messages inert and out of later manifests (AC2/AC3)', async () => {
     const downloads: string[] = []
+    // The main timeline still holds the earlier files: only a quote brings them in.
     const history = scriptedHistory({
       chat: [
-        makeRawMessage({
-          message_id: 'om_silent_text', msg_type: 'text', chat_id: 'oc_silent', thread_id: 'omt_new',
-          sender_id: 'ou_alice', content: { text: '刚才那张图是什么' },
-        }),
         makeRawMessage({
           message_id: 'om_silent_image', msg_type: 'image', chat_id: 'oc_silent',
           sender_id: 'ou_alice', content: { image_key: 'img_1' },
         }),
-        // An earlier trigger roots its own topic: older files belong to it.
         makeRawMessage({
-          message_id: 'om_old_trigger', msg_type: 'text', chat_id: 'oc_silent', thread_id: 'omt_old',
-          sender_id: 'ou_alice', content: { text: '上一轮' },
-        }),
-        makeRawMessage({
-          message_id: 'om_old_image', msg_type: 'image', chat_id: 'oc_silent',
-          sender_id: 'ou_alice', content: { image_key: 'img_old' },
+          message_id: 'om_group_silent', msg_type: 'file', chat_id: 'oc_group',
+          sender_id: 'ou_alice', content: { file_key: 'g1', file_name: 'a.txt' },
         }),
       ],
     })
-    const { h, tools } = await setupNative({}, {
+    const { h } = await setupNative({}, {
       messageList: history.messageList,
       downloadResource: (_messageId, fileKey) => {
         downloads.push(fileKey)
@@ -3568,63 +3559,6 @@ describe('native attachment pipeline', () => {
       chatType: 'p2p', chatId: 'oc_silent', senderId: 'ou_alice', mentionedBot: false,
       messageId: 'om_silent_image', rawContentType: 'image', content: '![image](img_1)', resources: pngResources,
     }))
-    await flush()
-    expect(h.ctxState.agents.created).toHaveLength(0)
-    expect(h.channel.sent).toHaveLength(0)
-    expect(h.channel.reactions).toEqual([])
-    expect(downloads).toEqual([])
-    expect(routesOf(h)).toHaveLength(0)
-    expect(history.calls).toEqual([])
-
-    // The later text trigger reads the main timeline and lists the image the
-    // owner sent since the previous turn.
-    await h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_silent', senderId: 'ou_alice', mentionedBot: false,
-      messageId: 'om_silent_text', content: '刚才那张图是什么',
-    }))
-    await waitForEstablishedSession(h)
-    const manifest = manifestOf(firstPromptOf(h))
-    expect(manifest).toContain('message_id=om_silent_image')
-    expect(manifest).toContain('file_key=img_1')
-    expect(manifest).toContain('type=image')
-    expect(manifest).not.toContain('om_old_image')
-    expect(history.calls).toContainEqual(expect.objectContaining({
-      container_id_type: 'chat', container_id: 'oc_silent', sort_type: 'ByCreateTimeDesc',
-    }))
-    expect(downloads).toEqual([])
-
-    // The listed message is authorized for the fetch tool.
-    const result = await tools.definitions.get(ATTACHMENT_FETCH_TOOL_NAME)!.execute(
-      { message_id: 'om_silent_image' },
-      { signal: new AbortController().signal },
-    ) as { ok: boolean }
-    expect(result.ok).toBe(true)
-    expect(downloads).toEqual(['img_1'])
-    await h.service.shutdown()
-  })
-
-  it('keeps un-mentioned group attachments inert and lists them in the @-created topic (AC3/AC4)', async () => {
-    const downloads: string[] = []
-    const history = scriptedHistory({
-      chat: [
-        makeRawMessage({
-          message_id: 'om_group_silent', msg_type: 'file', chat_id: 'oc_group',
-          sender_id: 'ou_alice', content: { file_key: 'g1', file_name: 'a.txt' },
-        }),
-        // Another member's file in the same chat never reaches Alice's topic.
-        makeRawMessage({
-          message_id: 'om_group_bob', msg_type: 'file', chat_id: 'oc_group',
-          sender_id: 'ou_bob', content: { file_key: 'g2', file_name: 'b.txt' },
-        }),
-      ],
-    })
-    const { h } = await setupNative({}, {
-      messageList: history.messageList,
-      downloadResource: (_messageId, fileKey) => {
-        downloads.push(fileKey)
-        return [new TextEncoder().encode('bytes')]
-      },
-    })
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_group', senderId: 'ou_alice', mentionedBot: false,
       messageId: 'om_group_silent', rawContentType: 'file', content: '<file key="g1" name="a.txt"/>',
@@ -3635,51 +3569,18 @@ describe('native attachment pipeline', () => {
     expect(h.channel.sent).toHaveLength(0)
     expect(h.channel.reactions).toEqual([])
     expect(downloads).toEqual([])
+    expect(routesOf(h)).toHaveLength(0)
+    expect(history.calls).toEqual([])
 
+    // A later un-quoted trigger never reads the main timeline for them.
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_group', senderId: 'ou_alice', mentionedBot: true,
-      messageId: 'om_group_trigger', content: '看下刚才的文件',
+      chatType: 'p2p', chatId: 'oc_silent', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_silent_text', content: '刚才那张图是什么',
     }))
     await waitForEstablishedSession(h)
-    const manifest = manifestOf(firstPromptOf(h))
-    expect(manifest).toContain('message_id=om_group_silent')
-    expect(manifest).toContain('name="a.txt"')
-    expect(manifest).not.toContain('om_group_bob')
+    expect(manifestOf(firstPromptOf(h))).toBe('')
+    expect(history.calls.filter(call => call.container_id_type === 'chat')).toEqual([])
     expect(downloads).toEqual([])
-    await h.service.shutdown()
-  })
-
-  it('keeps a topic-group trigger to its own topic (AC3/AC5)', async () => {
-    const history = scriptedHistory({
-      chat: [
-        makeRawMessage({
-          message_id: 'om_main_image', msg_type: 'image', chat_id: 'oc_topic_group',
-          sender_id: 'ou_alice', content: { image_key: 'img_main' },
-        }),
-      ],
-      thread: [
-        makeRawMessage({
-          message_id: 'om_topic_image', msg_type: 'image', chat_id: 'oc_topic_group', thread_id: 'omt_group_topic',
-          sender_id: 'ou_alice', content: { image_key: 'img_topic' },
-        }),
-      ],
-    })
-    // A reply inside a topic stays in that topic.
-    const { h } = await setupNative({}, {
-      messageList: history.messageList,
-      downloadResource: () => [PNG],
-      threadIdOfMessage: async () => 'omt_group_topic',
-    })
-    await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_topic_group', senderId: 'ou_alice', mentionedBot: true,
-      threadId: 'omt_group_topic', messageId: 'om_topic_group_trigger', content: '这张图是什么',
-    }))
-    await waitForEstablishedSession(h)
-    const manifest = manifestOf(firstPromptOf(h))
-    expect(manifest).toContain('message_id=om_topic_image')
-    expect(manifest).not.toContain('om_main_image')
-    const recentScans = history.calls.filter(call => call.page_size === 50)
-    expect(recentScans.map(call => call.container_id_type)).toEqual(['thread'])
     await h.service.shutdown()
   })
 
@@ -3703,33 +3604,17 @@ describe('native attachment pipeline', () => {
     expect(h.ctxState.agents.created).toHaveLength(1)
     expect(h.channel.reactions).toEqual([{ messageId: 'om_topic_first', emojiType: 'Typing' }])
 
-    // The topic now holds: the text trigger, the silent image, the first
-    // turn's card (a bot message ends the scan), and an image before it.
-    const thread = (messageId: string, partial: Parameters<typeof makeRawMessage>[0]) => makeRawMessage({
-      message_id: messageId, chat_id: 'oc_topic', thread_id: route.key, sender_id: 'ou_alice', ...partial,
-    })
-    const pages = {
-      thread: [
-        thread('om_topic_text', { msg_type: 'text', content: { text: '刚才的图是什么' } }),
-        thread('om_topic_silent', { msg_type: 'image', content: { image_key: 'img_1' } }),
-        thread(route.cardMessageId, { msg_type: 'interactive', sender_type: 'app', sender_id: 'cli_bot' }),
-        thread('om_topic_before', { msg_type: 'image', content: { image_key: 'img_before' } }),
-      ],
-    }
-    Object.assign(history, scriptedHistory(pages))
-    h.channel.messageList = history.messageList
+    const callsBefore = history.calls.length
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_topic', senderId: 'ou_alice', mentionedBot: false,
       threadId: route.key, messageId: 'om_topic_text', content: '刚才的图是什么',
     }))
     await waitUntil(() => expect(mock(h.ctxState.agents.created[0]!.handle.agent.followup)).toHaveBeenCalledTimes(2))
     const followups = followupMessagesOf(h.ctxState.agents.created[0]!.handle.agent)
-    const manifest = manifestOf(followups[1]!.content)
-    expect(manifest).toContain('message_id=om_topic_silent')
-    expect(manifest).toContain('file_key=img_1')
-    expect(manifest).not.toContain('om_topic_before')
-    // Continuations scan the topic only.
-    expect(history.calls.map(call => call.container_id_type)).toEqual(['thread'])
+    // The silent image is reachable through a quote or feishu_topic_messages,
+    // never through a history scan on the continuation turn.
+    expect(manifestOf(followups[1]!.content)).toBe('')
+    expect(history.calls).toHaveLength(callsBefore)
     await h.service.shutdown()
   })
 
@@ -4383,8 +4268,7 @@ describe('quote excerpts and first-turn topic history', () => {
     }))
     await waitForEstablishedSession(h)
     expect(blockWith(promptOf(h), '<feishu_history>')).toBe('')
-    // Only the recent-attachment scans read (full pages), never the history page.
-    expect(list.mock.calls.map(([params]) => params.page_size)).toEqual([50, 50])
+    expect(list).not.toHaveBeenCalled()
     await h.service.shutdown()
   })
 

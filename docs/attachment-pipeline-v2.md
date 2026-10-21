@@ -11,7 +11,7 @@
 - 飞书私聊 / 对话群 / 话题群收到消息时，**会话、话题、流式卡片零等待**：不再等附件下载完才开始模型回合。
 - 触发消息中的图片预取为原生 `ImageBlock`，模型首轮即可看见；预取有上限与短超时，失败降级为清单。
 - 文件默认**不下载**；prompt 用结构化清单声明“附件未加载”，模型需要时调用 `feishu_attachment_fetch` 按 `message_id` 懒取。
-- 纯附件消息（私聊仅附件、群未 @、已绑定话题内仅附件）**保持静默**：不回复、不建会话、不下载、不加表情、本地不留状态；下一条触发消息从飞书历史读出它们，列入清单并可懒取。
+- 纯附件消息（私聊仅附件、群未 @、已绑定话题内仅附件）**保持静默**：不回复、不建会话、不下载、不加表情、本地不留状态；用户引用该消息（多个文件可合并转发后引用）再提问时进入清单并可懒取。
 - 引用消息与话题历史可读：`<feishu_quote>` 摘录、首轮 `<feishu_history>`、`feishu_topic_messages` 工具翻页；发现的资源同时获得 fetch 授权。
 - 所有入站附件（图片与文件）统一存入 DSH 原生附件库：不可变、内容寻址去重、读取校验、随 Session 回放；插件不再承担入站附件清理。
 
@@ -29,7 +29,7 @@
 | 决定 | 内容 |
 | --- | --- |
 | D1 | 采用“立即建会话 + 清单/摘录进 prompt + 图片预取 + 文件懒取”总体方案 |
-| D2 | 仅附件消息保持静默：不下载、不回复、不建会话、不加表情；下一次触发时读取飞书历史找回（2026-10-21 起取代本地 `pending_attachments` 登记表） |
+| D2 | 仅附件消息保持静默：不下载、不回复、不建会话、不加表情；不登记、不扫描历史，靠引用进入下一轮（2026-10-21 起取代本地 `pending_attachments` 登记表） |
 | D3 | 引用机器人消息但未 @ 不触发模型（对话群主聊天区）；已绑定话题 / 话题群内保持“无需 @ 续聊” |
 | D4 | 模型漏调工具用工具与 prompt 优化收敛，不做预下载兜底 |
 | D5 | 大文件懒取 + 单次资源数 / 字节上限 + 超时 / 取消；工具内流式写入 |
@@ -48,7 +48,7 @@
 3. 发出卡片第一帧并以 `reply_in_thread` 创建话题（飞书拒绝时按 `threadFallback: degrade` 退化为会话级路由）。
 4. 确保用户工作区（`<baseDir>/p2p/<open_id>/` 或 `<baseDir>/groups/<chat_id>/<open_id>/`），规划话题目录（子目录或 Git worktree）。
 5. 写入重启修复快照 → 创建 Session（preset `setup` 内挂载工具与 guidance）→ 进入话题目录 → 迁入旧版 `_staging` 遗留文件（仅兼容升级）。
-6. **持久化路由记录后**、`followup` 前组装首轮消息：登记触发消息的附件白名单 → 并发读取引用摘录与首轮话题历史（各自独立 3s 预算）→ 并发读取近期附件（§3.2，同一被动预算）→ 预取触发消息图片（有界、短超时）→ 按固定顺序拼块。
+6. **持久化路由记录后**、`followup` 前组装首轮消息：登记触发消息的附件白名单 → 并发读取引用摘录与首轮话题历史（各自独立 3s 预算）→ 预取触发消息图片（有界、短超时）→ 按固定顺序拼块。
 7. `followup` 投递后关闭首回合投递闸门；预取窗口内到达的同话题消息等待该闸门，避免乱序。
 
 首轮消息的块顺序固定为：
@@ -63,25 +63,20 @@
 
 空块直接省略，因此无附件 / 无引用 / 无历史的回合不产生额外 token。archive 后端只使用文本 + 引用摘录 + 首轮历史（无图片块、无清单）。
 
-### 3.2 纯附件消息 / 未触发消息（静默 + 触发时读历史）
+### 3.2 纯附件消息 / 未触发消息（静默 + 引用）
 
 native 后端下，准入通过后由 `inboundAttachmentState` 做**不下载的分类**（是否携带资源、剥离占位符后的剩余文本、`attachmentOnly`）：
 
 | 场景 | 行为 |
 | --- | --- |
 | 私聊仅附件 | 静默；不回复、不建会话、不加表情、不下载 |
-| 对话群未 @ 的纯附件 | 同上；后续 @ 建话题时从聊天主线读出并列入清单 |
-| 已绑定话题内的纯附件 | 同上；下一次续聊时从本话题读出并列入清单 |
+| 对话群未 @ 的纯附件 | 同上；引用它 @ 机器人时列入清单 |
+| 已绑定话题内的纯附件 | 同上；引用它续聊时列入清单，模型也可用 `feishu_topic_messages` 读到 |
 | 文字 + 附件（触发） | 立即建会话；图片预取，文件进清单懒取 |
-| 文字 + 附件（群未 @、无话题） | 不触发；后续 @ 建话题时列入清单 |
-| 问答阻塞期间收到的文字 + 附件 | 文字作为 `ask_user_question` 的回答被消费；附件在下一轮从本话题读出 |
+| 文字 + 附件（群未 @、无话题） | 不触发；引用它 @ 机器人时列入清单 |
+| 问答阻塞期间收到的文字 + 附件 | 文字作为 `ask_user_question` 的回答被消费；附件可由引用或 `feishu_topic_messages` 读到 |
 
-本地不写任何记录。触发消息组装 prompt 时，[src/feishu/recent-attachments.ts](../src/feishu/recent-attachments.ts) 对一页 newest-first 的 `message.list`（页大小 50）做扫描：
-
-- 读取范围：话题路由读本话题；触发消息在聊天主线上（私聊、普通群）时首轮另读聊天主线（话题建立前发的文件在主线上），触发消息已在话题内（话题群的每条消息）时只读本话题；degraded chat 路由读聊天主线。各页并发，使用 `promptContextTimeoutMs` 被动预算，失败的页不贡献条目。
-- 先排除触发消息与本回合流式卡片；话题内遇到**机器人消息**即停（更早的消息已在上一轮之前）；聊天主线上遇到**机器人对本页本人消息的回复**（会话级路由的上一轮）或**本人发出且带 `thread_id` 的消息**（上一次触发建的话题根）即停，其他机器人消息（别人的回合、命令卡、引导卡）跳过。
-- 只选本人（route owner）、未撤回、非合并转发子消息、带图片/文件资源或为合并转发容器的消息；其他人、其他话题、其他 chat 的消息跳过。
-- 最多 `recentAttachmentLimit`（默认 5，1–20）条，newest-first 列入清单，并以 `source='recent'` 加入本 route 白名单。
+本地不写任何记录，也不在下一轮扫描聊天主线或话题历史去找回这类消息：引用意图明确，不需要猜“上一轮之后”的边界，也不会跨话题读取。被引用消息的附件进入清单与 fetch 白名单（§7.1）；话题内首轮的 `<feishu_history>` 与 `feishu_topic_messages` 读到的附件同样获得授权。首次私聊引导卡提示用户“引用文件消息再提问”。
 
 ### 3.3 archive 后端（旧行为）
 
@@ -137,9 +132,9 @@ native 后端下，准入通过后由 `inboundAttachmentState` 做**不下载的
 - 固定英文尾部：不要获取用户未提及的附件，绝不访问其他会话的附件。
 - **无条目时整块不产生**（零 token）。
 
-**条目来源与顺序**：触发消息未加载资源 → 引用消息资源 → 近期附件消息（§3.2）资源。合并转发触发消息 / 引用消息 / 近期消息都只出**容器行**（子资源按容器 id 下载，P0 规则）。
+**条目来源与顺序**：触发消息未加载资源 → 引用消息资源。合并转发触发消息 / 引用消息都只出**容器行**（子资源按容器 id 下载，P0 规则）。
 
-**去重**：按 `(message_id, file_key)` 去重（保留首次出现）；已成功预取的图片按 `file_key` 从触发条目中排除。近期附件只列上一轮之后的消息，机器人回复后它们不会在下一轮重复出现。
+**去重**：按 `(message_id, file_key)` 去重（保留首次出现）；已成功预取的图片按 `file_key` 从触发条目中排除。
 
 **边界与防注入**：最多渲染 `MANIFEST_MAX_ROWS = 50` 行，超出追加 `- ... (N more attachments omitted)`；id 只保留 `[A-Za-z0-9_:.-]` 并截断到 128；文件名截断到 80 个码点后对 `"`、`\`、`<>`、C0/C1 控制字符、Unicode 格式控制符（bidi / 零宽等）、行/段分隔符做 `\uXXXX` 转义，单行无法被注入换行。
 
@@ -152,7 +147,7 @@ native 后端下，准入通过后由 `inboundAttachmentState` 做**不下载的
 - 参数：`message_id`（必填）；`file_key`（可选，只取该消息的某个资源，缺省取全部）。
 - 输出：`{ message_id, ok, summary, results[] }`；每个结果含 `ok / kind(image|file) / name / file_key / bytes / media_type / width / height / read_path / handle_text / code / reason / attachment`。渲染为文本 + 每个成功资源的 `ImageBlock` / `FileBlock`；文本始终存在（文本模型或宿主不支持 `FileBlock` 时的兜底）。
 - **授权链**：先查本 route 的进程内白名单（LRU，每 route 128 条）；未命中时用 `message.get` 回读该消息，只有 route owner 本人发出、未撤回、属于本 route 容器（同 chat；话题路由只认本话题，chat 路由为主线）的消息才授权；别的话题与未登记的主线消息一律拒绝，话题之间不互通，回读失败一律拒绝。`message_id` 单独出现在参数里不足以授权；跨 chat / 跨话题、他人未登记的消息一律 `AUTHORIZATION_DENIED`，不下载任何字节。`file_key` 必须属于该消息已解析的资源集，否则 `UNKNOWN_FILE_KEY`。
-- **授权来源**：触发消息（准入层登记，`source='trigger'`）、引用消息（`quote`）、首轮历史（`history`）、近期附件（`recent`）、工具自身成功解析的消息（`tool-result`）进入本 route 的进程内白名单；回读授权的消息以 `tool-result` 记入白名单。`containerMessageId` 只能来自可信登记，绝不从模型参数取下载 id。
+- **授权来源**：触发消息（准入层登记，`source='trigger'`）、引用消息（`quote`）、首轮历史（`history`）、工具自身成功解析的消息（`tool-result`）进入本 route 的进程内白名单；回读授权的消息以 `tool-result` 记入白名单。`containerMessageId` 只能来自可信登记，绝不从模型参数取下载 id。
 - **合并转发**：用顶层容器 `message_id` 展开子消息并下载子资源；子消息 id 不能作为下载 id（P0：子 id 返回 400）。
 - **限制与取消**：单次资源数、总字节预算（文件在流式写入中逐 chunk 计量）、整段 `timeoutMs`；遵守 `exec.signal`，超时/取消把当前与剩余资源标记 `TIMEOUT` / `ABORTED`，不提交半文件、逐资源失败不中断整体调用。图片受宿主 `maxImageBytes` 额外约束。
 - **挂载**：仅在 native 生效后端、`feishuTools.attachmentFetch=true` 且 `acceptAttachments=true` 时注册；注册在 preset `setup` 之后，`inject(['tools','attachments'])` 任一服务缺失则 no-op + 一次性告警，不阻塞会话；缺服务时最多等待 2 s（后续会话 250 ms 快速失败），晚到的服务仍可补注册。卡片用 `presentCall` 展示“获取飞书附件 …”。
@@ -196,15 +191,13 @@ native 后端下，准入通过后由 `inboundAttachmentState` 做**不下载的
 | 图片预取失败 / 单图超限 / 超总预算 / 超时 | 已成功图片保留，其余进入清单由工具懒取，不阻塞回合 |
 | 文件下载失败 / 文件已过期 / 文件夹消息 | 工具按资源返回可读失败（`DOWNLOAD_FAILED` / `FOLDER_UNSUPPORTED` 等），其余资源继续 |
 | 工具超时 / 回合取消 | 剩余资源标记 `TIMEOUT` / `ABORTED`，不留下半文件；已知限制：飞书 HTTP 层不可取消 |
-| 近期附件读取失败 / 超时 | 清单只少近期附件行，回合照常运行 |
-| 缺消息读取 scope（`im:message:readonly` 等） | 引用 / 历史块与近期附件行静默省略（首次一条 warn）；显式调用 `feishu_topic_messages` 返回可读 `PERMISSION_DENIED`；普通对话不受影响 |
+| 缺消息读取 scope（`im:message:readonly` 等） | 引用 / 历史块静默省略（首次一条 warn）；显式调用 `feishu_topic_messages` 返回可读 `PERMISSION_DENIED`；普通对话不受影响 |
 | 话题回复被拒（非主题群等） | `threadFallback: degrade` 退化为会话级路由；degraded 路由拒绝 topic 消息的引用/读取 |
 | 重启 | 路由懒恢复；进程内白名单不重放；本人在本话题的消息由 fetch 回读授权；首轮从主线列出的附件与他人的引用/历史消息需重新出现才可取 |
 
 ## 9. 隐私与安全边界
 
 - **按 route 授权**：所有附件获取都必须同时满足“route 精确匹配（key/kind/chat/chatType/sender）+ 该消息已被可信来源登记或回读确认为 route owner 本人在本 route 容器里的消息”。只有 message id 无法解锁任何资源；跨会话、跨话题、跨用户一律拒绝。
-- **近期附件的范围**：只选 route owner 本人在本 route 容器（话题路由另含聊天主线）中的消息；其他 sender / topic / chat 的消息跳过。
 - **白名单容量与失效**：每 route LRU 128；route 退休 / GC / 关闭 / 清理时回收；进程内不重放 Session 历史（重启后由准入 / 引用 / 历史层按当前回合重新登记）。
 - **不读凭据、不直连 OpenAPI**：guidance 明确禁止读取 / 打印飞书凭据（如 `$DSH_HOME/.credentials.yaml`）和直接调用飞书 OpenAPI；插件只通过注入的飞书 channel 与宿主服务访问数据。P2 真机曾暴露“模型绕路读取凭据”的宿主侧风险，已加 guidance，建议轮换 secret 并在宿主层限制 channel 会话读取 `$DSH_HOME`（非插件可改范围）。
 - **附件字节不进提示**：prompt 只含元数据清单 / 引用摘录 / 历史摘要与原生 `ImageBlock`；文件字节只经工具写入原生库，模型通过只读路径按需读取；清单与工具输出对 id / 文件名做字符白名单与转义，防止换行注入与提示注入。
@@ -232,7 +225,6 @@ native 后端下，准入通过后由 `inboundAttachmentState` 做**不下载的
 | `prefetchTotalMaxBytes` | `52428800`（50 MiB） | 1 B – 1 GiB | 内容与附件 |
 | `prefetchTimeoutMs` | `10000` | 100 – 120000 ms（注意：Issue 早期草稿写作 `prefetchImageTimeoutMs`，实际配置键以代码为准） | 内容与附件 |
 | `historyBootstrapLimit` | `10` | 0 – 20；`0` 关闭首轮历史 | 内容与附件 |
-| `recentAttachmentLimit` | `5` | 1 – 20；触发时列出的近期附件消息数 | 内容与附件 |
 | `promptContextTimeoutMs` | `3000` | 100 – 10000 ms；被动引用/历史预算 | 模型工具 |
 | `feishuTools.attachmentFetch` | `true` | 关闭即整体回退 archive | 模型工具 |
 | `feishuTools.attachmentFetchMaxResources` | `10` | 1 – 50 | 模型工具 |
@@ -250,13 +242,12 @@ native 后端下，准入通过后由 `inboundAttachmentState` 做**不下载的
 | 测试文件 | 覆盖内容 |
 | --- | --- |
 | `tests/native-attachments.test.ts` | 存储层：服务发现/未挂载、图片类型嗅探与上限、文件流式与取消、只读路径兜底、archive 回退与三态 plan、句柄文本 |
-| `tests/recent-attachments.test.ts` | 近期附件扫描：本人过滤、机器人/上一轮话题根边界、排除 id、话题容器、条数上限 |
 | `tests/feishu-tools.test.ts` | 两个工具：白名单授权、合并转发容器、资源/字节/超时/取消、逐资源失败、JSON 无损、渲染、分页/cursor、参数注入 |
 | `tests/manifest.test.ts` | 清单行格式、顺序、去重、零 token、转义、50 行上限、quote 行 |
 | `tests/inbound-image-prefetch.test.ts` | 预取顺序、单图/总字节上限、整段超时、失败降级、不抛异常、无悬挂 timer |
 | `tests/inbound-attachments.test.ts` | 不下载分类、占位符剥离、post `files[]` 恢复、旧 archive 行为回归 |
 | `tests/message-read.test.ts` | get/mget/list 与渲染、引用/历史块边界、route 归属矩阵、失败与权限降级 |
-| `tests/service.test.ts` | 零等待、首回合闸门、静默附件与近期附件清单、懒取、archive 降级、问答拦截 |
+| `tests/service.test.ts` | 零等待、首回合闸门、静默附件不进后续清单、懒取、archive 降级、问答拦截 |
 | `tests/config.test.ts` / `tests/cleanup.test.ts` / `tests/settings.test.ts` | 新配置默认值/边界、清理边界、面板读写与嵌套合并 |
 
 各 Issue 交付时记录的测试规模（作为历史证据，不代替当前 `pnpm check`）：P1 原生存储 47 项；pending 33 项；fetch 工具 66 项；admission 后全量 30 files / 770 tests；P2 后 31 files / 860 tests。P3 的回归以实际 `pnpm check` 结果为准。
@@ -305,7 +296,7 @@ native 后端下，准入通过后由 `inboundAttachmentState` 做**不下载的
 - 文件懒取依赖模型主动调用工具；prompt 已用“未加载”措辞、工具描述与清单提示收敛漏调风险，但不做预下载兜底（D4）。
 - 白名单为进程内 LRU（128/route），重启后清空；本人在本话题的消息由 fetch 回读授权，首轮从主线列出的附件与他人的引用/历史消息需重新出现才可取。
 - 单 route 容量、manifest 50 行、历史 N≤20、工具输出 12k/50 行等均为有界设计，超限时给出显式截断/省略标注。
-- 近期附件只列本人上一轮之后的消息、最多 `recentAttachmentLimit` 条，依赖消息读取权限（群聊需 `im:message.group_msg`），每回合多一到两次 `message.list`；续聊回合只读本话题、不回看主线；问答回答附带的附件若之后机器人又发了新消息，会被扫描边界挡住。
+- 只发附件、不带文字的消息不会在下一轮自动列出；“先发文件、再单独提问”而不引用时模型看不到该文件，需要引用（多个文件可合并转发后引用）。
 - 合并转发单条读取子消息 >50 条时截断（summary 标注），无翻页。
 - archive 后端会阻塞会话建立（旧语义），且入口/清理语义与 native 不同（见 §8、§10）。
 - `_staging` 仅旧版一次性迁入兼容（成功时 warn），v2 发布后的下一个 minor 版本移除（D12）；该目录不受保留期清理影响。

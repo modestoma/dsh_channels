@@ -14,9 +14,8 @@
  * against a per-route whitelist of messages the channel has already admitted
  * as relevant:
  *
- * - the triggering message, a quoted message, history rows, and the owner's
- *   recent attachment messages, registered by the inbound layer through
- *   {@link AttachmentFetchToolRuntime.noteKnownMessage};
+ * - the triggering message, a quoted message, and history rows, registered by
+ *   the inbound layer through {@link AttachmentFetchToolRuntime.noteKnownMessage};
  * - messages this tool already resolved (successful or failed attempts), so a
  *   later turn in the same session keeps its authorized resources;
  * - on a whitelist miss, a message the tool reads back from Feishu and finds to
@@ -112,8 +111,6 @@ export interface AttachmentFetchRoute {
 export type KnownAttachmentSource =
   | 'trigger'
   | 'quote'
-  /** An attachment message the route owner sent after the previous turn. */
-  | 'recent'
   | 'tool-result'
   | 'manual'
   /** A message discovered while reading topic history/quote context (P2). */

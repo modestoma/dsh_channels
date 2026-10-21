@@ -74,8 +74,6 @@ import {
   readQuoteItems,
 } from './feishu/message-read.ts'
 import type { MessageReadRoute, RawMessageItem } from './feishu/message-read.ts'
-import { recentAttachmentMessagesOf } from './feishu/recent-attachments.ts'
-import type { RecentAttachmentContainer } from './feishu/recent-attachments.ts'
 import type { AttachmentStore } from './host/attachments.ts'
 import { InboundRouter } from './routing/inbound.ts'
 import type { RequestPolicyController } from './session/request-policy.ts'
@@ -511,7 +509,6 @@ export class FeishuService {
       messageRead: {
         quote: input => this.readQuoteContext(input),
         history: input => this.readHistoryContext(input),
-        recentAttachments: input => this.readRecentAttachments(input),
       },
       prefetchImages: () => ({
         enabled: this.config.prefetchImages,
@@ -715,59 +712,6 @@ export class FeishuService {
       )
       return undefined
     }
-  }
-
-  /**
-   * Read the route owner's attachment messages sent after the previous turn
-   * (see `feishu/recent-attachments`). A thread route scans its topic and, when
-   * `includeMainTimeline` is set, also the chat main timeline, where loose files
-   * posted before the topic existed live; a degraded chat route scans the main
-   * timeline. Both pages are read concurrently under the passive prompt budget,
-   * and a failed page contributes nothing.
-   */
-  private async readRecentAttachments(input: {
-    record: RouteRecord
-    includeMainTimeline: boolean
-    excludeMessageIds: readonly string[]
-  }): Promise<readonly KnownAttachmentMessageInput[]> {
-    const { record } = input
-    const containers: RecentAttachmentContainer[] = record.kind === 'thread'
-      ? [
-        { type: 'thread', threadId: record.key },
-        ...(input.includeMainTimeline ? [{ type: 'chat' } as const] : []),
-      ]
-      : [{ type: 'chat' }]
-    const limit = this.config.recentAttachmentLimit
-    const pages = await Promise.all(containers.map(async container => {
-      try {
-        const options = {
-          pageSize: TOPIC_MESSAGES_MAX_LIMIT,
-          order: 'newest-first' as const,
-          timeoutMs: this.config.promptContextTimeoutMs,
-        }
-        const result = container.type === 'thread'
-          ? await this.messageReader.listThread(container.threadId, options)
-          : await this.messageReader.listChat(record.chatId, options)
-        if (!result.ok) {
-          this.reportDegradedRead('recent attachments', record.key, result.reason)
-          return []
-        }
-        return recentAttachmentMessagesOf({
-          items: result.value.items,
-          container,
-          chatId: record.chatId,
-          senderOpenId: record.senderOpenId,
-          excludeMessageIds: input.excludeMessageIds,
-          limit,
-        })
-      } catch (error) {
-        this.ctx.logger?.debug?.(
-          'dsh-channels: reading recent attachments of %s failed: %s', record.key, String(error),
-        )
-        return []
-      }
-    }))
-    return pages.flat().slice(0, limit)
   }
 
   /** Whether this deployment mounts the lazy attachment fetch tool. */

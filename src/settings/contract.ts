@@ -76,7 +76,6 @@ export const EDITABLE_KEYS = [
   'prefetchImageMaxBytes',
   'prefetchTotalMaxBytes',
   'historyBootstrapLimit',
-  'recentAttachmentLimit',
   // 模型工具（feishuTools 子项）
   'feishuTools.attachmentFetch',
   'feishuTools.attachmentFetchMaxResources',
@@ -587,7 +586,7 @@ export const PANEL_COPY = {
   credentialsPendingHint: '填写后点「保存凭据」；两项齐全时插件会自动连接飞书。',
   // ---- tabs / forms -------------------------------------------------------
   connectionTabHelp: '连接状态与飞书应用凭据。凭据不完整时不会连接飞书。',
-  sessionsTabHelp: '私聊、群聊触发方式与入站内容：附件存储/预取、近期附件条数、模型工具开关与读取预算；「需重连」项在下次连接时读取。',
+  sessionsTabHelp: '私聊、群聊触发方式与入站内容：附件存储/预取、模型工具开关与读取预算；「需重连」项在下次连接时读取。',
   modelTabHelp: '飞书会话使用的模型服务商、模型、推理档位与 Agent 预设；下拉选项来自宿主机实时目录，保存后对新会话生效。',
   workspaceTabHelp: '每个用户一个工作区（模型/工具产生文件的落点），每个话题在其中拥有独立工作目录；只影响之后新建的话题。入站附件默认存于 DSH 原生附件库，不占用话题目录，也不会被这里的目录清理删除。',
   accessTabHelp: '准入采用 fail-closed：管理员不受白名单限制，非管理员私聊会被拒绝，群聊需要「群已授权 + 用户在白名单」两层同时命中。',

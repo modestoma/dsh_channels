@@ -94,17 +94,6 @@ export interface InboundMessageReadPort {
     limit: number
     excludeMessageIds: readonly string[]
   }): Promise<{ block: string; messages: readonly KnownAttachmentMessageInput[] } | undefined>
-  /**
-   * Resolve the route owner's attachment messages sent after the previous turn,
-   * newest first, at most `recentAttachmentLimit`. A failed read resolves to an
-   * empty list.
-   */
-  recentAttachments(input: {
-    record: RouteRecord
-    /** Also scan the chat main timeline (only a topic created from a main-timeline trigger). */
-    includeMainTimeline: boolean
-    excludeMessageIds: readonly string[]
-  }): Promise<readonly KnownAttachmentMessageInput[]>
 }
 
 /** Live trigger-image prefetch policy (see `prefetchImages` config). */
@@ -645,9 +634,6 @@ export class InboundRouter {
     // read runs CONCURRENTLY with the bounded image prefetch below: neither
     // waits for the other, and a failed read degrades to its absence (AC6).
     const contextPromise = this.readTurnContext(msg, record, options)
-    const recentPromise = attachmentPipeline
-      ? this.readRecentAttachments(msg, record, options)
-      : Promise.resolve([])
 
     const loadedFileKeys = new Set<string>()
     const prefetchedBlocks: ContentBlock[] = []
@@ -681,7 +667,6 @@ export class InboundRouter {
     if (context.quoteBlock !== undefined) blocks.push({ type: 'text', text: context.quoteBlock })
     blocks.push(...prefetchedBlocks)
 
-    const recent = await recentPromise
     const manifest = attachmentPipeline
       ? buildFeishuContextBlock({
         trigger: triggerManifestAttachments(msg, loadedFileKeys),
@@ -691,7 +676,6 @@ export class InboundRouter {
         ...(context.quoteMessage === undefined
           ? {}
           : { quote: manifestEntriesOfKnownMessage(context.quoteMessage) }),
-        recent,
       })
       : ''
     if (manifest !== '') blocks.push({ type: 'text', text: manifest })
@@ -857,39 +841,6 @@ export class InboundRouter {
       )
       return undefined
     }
-  }
-
-
-  /**
-   * Read the owner's attachment messages sent after the previous turn and
-   * register each in the route's attachment whitelist, so the manifest rows
-   * they produce are fetchable. A failed read or registration degrades to
-   * fewer rows; the turn always runs.
-   */
-  private async readRecentAttachments(
-    msg: NormalizedMessage,
-    record: RouteRecord,
-    options: TurnDeliveryOptions,
-  ): Promise<readonly KnownAttachmentMessageInput[]> {
-    // A trigger already inside a topic (every message of a topic group) keeps
-    // the scan to that topic; only a main-timeline trigger (p2p, normal group)
-    // has loose main-timeline files in front of it.
-    const messages = await this.deps.messageRead.recentAttachments({
-      record,
-      includeMainTimeline: options.firstTurn === true && msg.threadId === undefined,
-      excludeMessageIds: options.excludeMessageIds ?? [msg.messageId],
-    })
-    for (const message of messages) {
-      try {
-        this.deps.noteKnownAttachments(record, message, 'recent')
-      } catch (error) {
-        this.ctx.logger?.debug?.(
-          'dsh-channels: registering recent attachments of %s failed: %s',
-          message.messageId, String(error),
-        )
-      }
-    }
-    return messages
   }
 
   /** Live channel accessor for best-effort prefetch; undefined when gone. */

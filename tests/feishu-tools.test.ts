@@ -1965,15 +1965,13 @@ describe('feishu topic-messages single read', () => {
     expect(harness.runtime.isKnownMessage(DEFAULT_ROUTE, knownId)).toBe(true)
     expect(harness.runtime.isKnownMessage({ ...DEFAULT_ROUTE, key: 'omt_other' }, knownId)).toBe(false)
 
-    // 'history' and 'recent' are valid registration sources for the shared whitelist.
-    for (const source of ['history', 'recent'] as const) {
-      harness.runtime.noteKnownMessage(
-        DEFAULT_ROUTE,
-        { messageId: `om_${source}_known`, kind: 'message', resources: [] },
-        source,
-      )
-      expect(harness.runtime.isKnownMessage(DEFAULT_ROUTE, `om_${source}_known`)).toBe(true)
-    }
+    // 'history' is a valid registration source for the shared whitelist.
+    harness.runtime.noteKnownMessage(
+      DEFAULT_ROUTE,
+      { messageId: 'om_history_known', kind: 'message', resources: [] },
+      'history',
+    )
+    expect(harness.runtime.isKnownMessage(DEFAULT_ROUTE, 'om_history_known')).toBe(true)
   })
 
   it('expands a merged-forward container into child messages and notes the child count', async () => {
