@@ -29,7 +29,7 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 - `/renew`：在当前话题创建并绑定新 Session
 - `/stop`：中断当前正在运行的回合（不冷恢复 Session；排队中的后续消息保留并接着运行；没有运行中的回合时明确提示）。流式卡片上的「⏹ 停止」按钮效果相同
 - `/permissions`：查看当前 Session 的权限预设（沙箱 + 审批策略）与可选清单；仅在 `allowPermissionSwitch: true` 时支持 `/permissions <name>` 切换，此时回复卡附预设按钮
-- `/auth`：**仅管理员**。`/auth status` 查看准入状态；`/auth allow` / `/auth revoke` 在群内授权/撤销当前群；`/auth user add <user_id>` / `/auth user remove <user_id>` 管理全局用户白名单；`/auth list` 列出白名单与待处理申请。即使群尚未授权，管理员也能在群内用 `/auth`（这是“通过对话授权群”的入口）
+- `/auth`：**仅管理员**。`/auth status` 查看准入状态；`/auth allow` / `/auth revoke` 在群内授权/撤销当前群；`/auth user add @用户` / `/auth user remove @用户`（也可直接写 `user_id`）管理全局用户白名单，@ 时自动取被 @ 成员的 user_id、忽略对机器人的 @；`/auth list` 列出白名单与待处理申请。即使群尚未授权，管理员也能在群内用 `/auth`（这是“通过对话授权群”的入口）
 - `/history`：显示当前话题的 Session 历史（含 `ctx.sessionQuery` 折叠出的会话标题与 live 标记）
 - `/export`：导出当前 Session 的逻辑日志
 

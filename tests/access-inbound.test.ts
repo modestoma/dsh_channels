@@ -436,6 +436,36 @@ describe('guarded 模式：/auth 用户管理', () => {
     await restarted.service.shutdown()
   })
 
+  it('/auth user add|remove @成员：取被 @ 用户的 user_id 并记下姓名，拒绝没有 user_id 的用户', async () => {
+    const h = await setup()
+    const bot = { key: '@_user_1', openId: 'bot-open-id', name: 'DSH', isBot: true }
+    const carol = { key: '@_user_2', openId: 'ou_carol', userId: 'u_carol', name: 'Carol' }
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_group', senderId: ADMIN, mentionedBot: true,
+      mentions: [bot, carol], messageId: 'om_auth_add_mention', content: '/auth user add @Carol',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
+    expect(sentJson(h.channel.sent[0]!)).toContain('已授权用户 Carol')
+    expect(h.service.accessSnapshot().users).toMatchObject([{ userId: 'u_carol', name: 'Carol' }])
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_group', senderId: ADMIN, mentionedBot: true,
+      mentions: [bot, { key: '@_user_3', openId: 'ou_guest', name: 'Guest' }],
+      messageId: 'om_auth_add_external', content: '/auth user add @Guest',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
+    expect(sentJson(h.channel.sent[1]!)).toContain('没有 user_id')
+    expect(h.service.accessSnapshot().users).toHaveLength(1)
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_group', senderId: ADMIN, mentionedBot: true,
+      mentions: [bot, carol], messageId: 'om_auth_remove_mention', content: '/auth user remove @Carol',
+    }))
+    await waitUntil(() => expect(h.service.accessSnapshot().users).toEqual([]))
+    await h.service.shutdown()
+  })
+
   it('撤销用户与撤销群立即生效（非管理员被拒；管理员仍直通）', async () => {
     const h = await setup()
     await h.service.addAccessGroup('oc_group')

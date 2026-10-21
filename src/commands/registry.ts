@@ -72,8 +72,8 @@ export const CHANNEL_COMMANDS = [
     usage: '[name]', channelPlane: true, agentScoped: false,
   },
   {
-    name: 'auth', group: '会话', description: '查看/管理访问授权（仅管理员）',
-    usage: '[status|allow|revoke|list|user add <user_id>|user remove <user_id>]',
+    name: 'auth', group: '会话', description: '查看/管理访问授权，可 @ 成员授权（仅管理员）',
+    usage: '[status|allow|revoke|list|user add <@用户|user_id>|user remove <@用户|user_id>]',
     routeFree: true, channelPlane: true, agentScoped: false,
   },
   {

@@ -186,7 +186,7 @@ chmod 600 $DSH_HOME/.credentials.yaml
    - Web 面板「访问与授权 → 已授权群」手动添加 `chat_id`（可用 `/groupid` 查看）；
 5. **给用户授权**（三种入口任选）：
    - 已授权群里未授权用户 @ 机器人 → 管理员收到**用户授权申请卡**（含昵称/user_id）→ 点「授权用户」；
-   - 管理员发 `/auth user add <user_id>`；`/auth user remove <user_id>` 撤销；
+   - 管理员在群里发 `/auth user add @用户`（或 `/auth user add <user_id>`）；`/auth user remove @用户` 撤销；外部用户没有 user_id，无法授权；
    - Web 面板「访问与授权 → 已授权用户」手动添加 user_id（用户可用 `/userid` 查看）；
 6. 授权/撤销**立即生效**；白名单与待处理申请持久化在插件 `channels_routes_v2` 域，重启不丢。`/auth list` 可随时查看白名单与待处理申请。
 
