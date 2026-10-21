@@ -880,13 +880,14 @@ export function topicMessageViewOf(
  *   always rejected: a missing id must fail closed, never open;
  * - a thread route accepts messages of its own topic, plus main-timeline
  *   messages only when they were already admitted to this route (a quote of a
- *   main-timeline message happens before the bot creates the topic);
+ *   main-timeline message, or a file listed on the topic's first turn, happens
+ *   before the bot creates the topic); other topics never match;
  * - a degraded chat route accepts main-timeline messages only (topic messages
  *   belong to other topics of the same chat and must never leak in), even when
  *   they were somehow referenced by id.
  *
  * `knownMessageIds` is the route's authorization whitelist (trigger, quote,
- * pending, or previously resolved history rows).
+ * recent, or previously resolved history rows).
  */
 export function messageBelongsToRoute(
   route: MessageReadRoute,

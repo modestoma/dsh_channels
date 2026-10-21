@@ -365,6 +365,18 @@ describe('route membership', () => {
     expect(messageBelongsToRoute(ROUTE, missingChat)).toBe(false)
   })
 
+  it('never accepts unregistered main-line messages of the route owner in a thread route', () => {
+    const ownerMain = item({ message_id: 'om_owner', chat_id: 'oc_chat', sender_id: 'ou_user' })
+    const ownerOtherThread = item({
+      message_id: 'om_owner_other', chat_id: 'oc_chat', thread_id: 'omt_other', sender_id: 'ou_user',
+    })
+    const ownerOtherChat = item({ message_id: 'om_owner_chat2', chat_id: 'oc_other', sender_id: 'ou_user' })
+    expect(messageBelongsToRoute(ROUTE, ownerMain)).toBe(false)
+    expect(messageBelongsToRoute(ROUTE, ownerMain, ['om_owner'])).toBe(true)
+    expect(messageBelongsToRoute(ROUTE, ownerOtherThread)).toBe(false)
+    expect(messageBelongsToRoute(ROUTE, ownerOtherChat)).toBe(false)
+  })
+
   it('filters topic messages out of a degraded chat route', () => {
     expect(messageBelongsToRoute(CHAT_ROUTE, mainLine)).toBe(true)
     expect(messageBelongsToRoute(CHAT_ROUTE, inThread)).toBe(false)

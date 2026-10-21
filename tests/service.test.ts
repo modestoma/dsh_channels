@@ -60,8 +60,6 @@ function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
     prefetchImageMaxBytes: 20 * 1024 * 1024,
     prefetchTotalMaxBytes: 50 * 1024 * 1024,
     prefetchTimeoutMs: 10_000,
-    pendingAttachmentTtlMs: 7 * 24 * 60 * 60 * 1000,
-    pendingAttachmentLimit: 10,
     // First-turn topic history bootstrap; 0 disables it (bounded, silent on failure).
     historyBootstrapLimit: 10,
     promptContextTimeoutMs: 3_000,
@@ -2544,37 +2542,6 @@ describe('FeishuService', () => {
     })
     await service.shutdown()
   })
-
-  it('prunes expired pending attachment metadata in the periodic GC sweep', async () => {
-    const ctxState = makeHostContext()
-    const raw = ctxState.domain.raw
-    const now = Date.now()
-    const pendingRecord = (messageId: string, receivedAt: number) => ({
-      key: messageId,
-      scopeKey: 'chat:oc_gc:ou_user',
-      messageId,
-      chatId: 'oc_gc',
-      chatType: 'p2p',
-      senderOpenId: 'ou_user',
-      receivedAt,
-      kind: 'image',
-      resources: [{ type: 'image', fileKey: `img_${messageId}` }],
-    })
-    await raw.table('pending_attachments').put('om_pending_old', pendingRecord('om_pending_old', now - 8 * 24 * 3600 * 1000))
-    await raw.table('pending_attachments').put('om_pending_new', pendingRecord('om_pending_new', now))
-    const channel = makeChannel()
-    const service = new FeishuService(ctxState.ctx, makeConfig({
-      routeTtlMs: 0,
-      pendingAttachmentTtlMs: 7 * 24 * 3600 * 1000,
-    }), () => channel)
-    await service.start()
-
-    await waitUntil(() => {
-      const entries = [...(raw.table('pending_attachments').entries() as IterableIterator<[string, unknown]>)]
-      expect(entries.map(([key]) => key)).toEqual(['om_pending_new'])
-    })
-    await service.shutdown()
-  })
 })
 
 describe('HITL approval wiring', () => {
@@ -3212,10 +3179,13 @@ describe('inbound attachments', () => {
       rawContentType: 'merge_forward',
     }))
     const dir = path.join(h.config.baseDir, '_staging', 'group', 'oc_forward', 'ou_owner')
-    await waitUntil(() => expect(readdirSync(dir)).toHaveLength(1))
+    // The record file appears before its text is flushed: wait for the content.
+    await waitUntil(() => {
+      expect(readdirSync(dir)).toHaveLength(1)
+      expect(readFileSync(path.join(dir, readdirSync(dir)[0]!), 'utf8')).toContain('明天评审')
+    })
     const [name] = readdirSync(dir)
     expect(name).toMatch(/-forwarded-record\.txt$/)
-    expect(readFileSync(path.join(dir, name!), 'utf8')).toContain('明天评审')
     expect(h.ctxState.agents.created).toHaveLength(0)
     await h.service.shutdown()
   })
@@ -3424,8 +3394,6 @@ describe('native attachment pipeline', () => {
   const routesOf = (h: SetupResult): RouteRecord[] =>
     [...(h.ctxState.domain.raw.table('routes').entries() as Iterable<[string, RouteRecord]>)]
       .map(([, value]) => value)
-  const pendingRowsOf = (h: SetupResult): unknown[] =>
-    [...(h.ctxState.domain.raw.table('pending_attachments').entries() as Iterable<[string, unknown]>)]
   const firstPromptOf = (h: SetupResult) =>
     followupMessagesOf(h.ctxState.agents.created[0]!.handle.agent)[0]!.content
   const textBlocksOf = (content: Array<{ type: string; text?: string }>): string[] =>
@@ -3557,9 +3525,34 @@ describe('native attachment pipeline', () => {
     await h.service.shutdown()
   })
 
-  it('silently registers an attachment-only p2p message and lists it next turn (AC2/AC3)', async () => {
+  /** Recording `message.list` stub serving one scripted page per container type. */
+  const scriptedHistory = (pages: { chat?: unknown[]; thread?: unknown[] }) => {
+    const calls: RawMessageListParams[] = []
+    const messageList = async (params: RawMessageListParams) => {
+      calls.push(params)
+      const items = params.container_id_type === 'chat' ? pages.chat : pages.thread
+      return makeMessageListResponse(items ?? [])
+    }
+    return { calls, messageList }
+  }
+
+  it('keeps attachment-only and un-mentioned messages inert and out of later manifests (AC2/AC3)', async () => {
     const downloads: string[] = []
+    // The main timeline still holds the earlier files: only a quote brings them in.
+    const history = scriptedHistory({
+      chat: [
+        makeRawMessage({
+          message_id: 'om_silent_image', msg_type: 'image', chat_id: 'oc_silent',
+          sender_id: 'ou_alice', content: { image_key: 'img_1' },
+        }),
+        makeRawMessage({
+          message_id: 'om_group_silent', msg_type: 'file', chat_id: 'oc_group',
+          sender_id: 'ou_alice', content: { file_key: 'g1', file_name: 'a.txt' },
+        }),
+      ],
+    })
     const { h } = await setupNative({}, {
+      messageList: history.messageList,
       downloadResource: (_messageId, fileKey) => {
         downloads.push(fileKey)
         return [PNG]
@@ -3569,54 +3562,34 @@ describe('native attachment pipeline', () => {
       chatType: 'p2p', chatId: 'oc_silent', senderId: 'ou_alice', mentionedBot: false,
       messageId: 'om_silent_image', rawContentType: 'image', content: '![image](img_1)', resources: pngResources,
     }))
-
-    await waitUntil(() => expect(pendingRowsOf(h)).toHaveLength(1))
-    expect(h.ctxState.agents.created).toHaveLength(0)
-    expect(h.channel.sent).toHaveLength(0)
-    expect(h.channel.reactions).toEqual([])
-    expect(downloads).toEqual([])
-    expect(routesOf(h)).toHaveLength(0)
-
-    // A later text trigger surfaces the silently registered attachment in the
-    // manifest of the session it creates (chat-scope rows visible to the topic).
-    await h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_silent', senderId: 'ou_alice', mentionedBot: false,
-      messageId: 'om_silent_text', content: '刚才那张图是什么',
-    }))
-    await waitForEstablishedSession(h)
-    const manifest = manifestOf(firstPromptOf(h))
-    expect(manifest).toContain('message_id=om_silent_image')
-    expect(manifest).toContain('file_key=img_1')
-    expect(manifest).toContain('type=image')
-    // The later trigger itself carries no bytes: still nothing downloaded.
-    expect(downloads).toEqual([])
-    await h.service.shutdown()
-  })
-
-  it('silently registers un-mentioned group attachments and topic-bound attachments (AC3/AC6)', async () => {
-    const downloads: string[] = []
-    const { h } = await setupNative({}, {
-      downloadResource: (_messageId, fileKey) => {
-        downloads.push(fileKey)
-        return [new TextEncoder().encode('bytes')]
-      },
-    })
-    // Un-mentioned group message: metadata only, no turn, no reply.
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_group', senderId: 'ou_alice', mentionedBot: false,
       messageId: 'om_group_silent', rawContentType: 'file', content: '<file key="g1" name="a.txt"/>',
       resources: [{ type: 'file', fileKey: 'g1', fileName: 'a.txt' }] as never,
     }))
-    await waitUntil(() => expect(pendingRowsOf(h)).toHaveLength(1))
+    await flush()
     expect(h.ctxState.agents.created).toHaveLength(0)
     expect(h.channel.sent).toHaveLength(0)
     expect(h.channel.reactions).toEqual([])
+    expect(downloads).toEqual([])
+    expect(routesOf(h)).toHaveLength(0)
+    expect(history.calls).toEqual([])
+
+    // A later un-quoted trigger never reads the main timeline for them.
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_silent', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_silent_text', content: '刚才那张图是什么',
+    }))
+    await waitForEstablishedSession(h)
+    expect(manifestOf(firstPromptOf(h))).toBe('')
+    expect(history.calls.filter(call => call.container_id_type === 'chat')).toEqual([])
     expect(downloads).toEqual([])
     await h.service.shutdown()
   })
 
   it('keeps a bound topic quiet for attachment-only messages but continues on text (AC3/AC6)', async () => {
-    const { h } = await setupNative({}, { downloadResource: () => [PNG] })
+    const history = scriptedHistory({})
+    const { h } = await setupNative({}, { messageList: history.messageList, downloadResource: () => [PNG] })
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_topic', senderId: 'ou_alice', mentionedBot: true,
       messageId: 'om_topic_first', content: '开始',
@@ -3633,17 +3606,18 @@ describe('native attachment pipeline', () => {
     expect(h.channel.sent).toHaveLength(1)
     expect(h.ctxState.agents.created).toHaveLength(1)
     expect(h.channel.reactions).toEqual([{ messageId: 'om_topic_first', emojiType: 'Typing' }])
-    await waitUntil(() => expect(pendingRowsOf(h)).toHaveLength(1))
 
+    const callsBefore = history.calls.length
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_topic', senderId: 'ou_alice', mentionedBot: false,
       threadId: route.key, messageId: 'om_topic_text', content: '刚才的图是什么',
     }))
     await waitUntil(() => expect(mock(h.ctxState.agents.created[0]!.handle.agent.followup)).toHaveBeenCalledTimes(2))
     const followups = followupMessagesOf(h.ctxState.agents.created[0]!.handle.agent)
-    const manifest = manifestOf(followups[1]!.content)
-    expect(manifest).toContain('message_id=om_topic_silent')
-    expect(manifest).toContain('file_key=img_1')
+    // The silent image is reachable through a quote or feishu_topic_messages,
+    // never through a history scan on the continuation turn.
+    expect(manifestOf(followups[1]!.content)).toBe('')
+    expect(history.calls).toHaveLength(callsBefore)
     await h.service.shutdown()
   })
 
@@ -3728,7 +3702,6 @@ describe('native attachment pipeline', () => {
     expect(h.channel.sent).toHaveLength(0)
     expect(h.channel.reactions).toEqual([])
     expect(downloads).toEqual([])
-    expect(pendingRowsOf(h)).toHaveLength(0)
 
     // A text turn is still served, with the inert/archive guidance (attachments
     // are disabled, so the native manifest and fetch tool must not be advertised).
@@ -3769,7 +3742,6 @@ describe('native attachment pipeline', () => {
     await waitUntil(() => expect(readdirSync(staging).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1))
     expect(mock(archived.channel.downloadResource)).toHaveBeenCalled()
     expect(archived.ctxState.agents.created).toHaveLength(0)
-    expect(pendingRowsOf(archived)).toHaveLength(0)
     // A text turn in archive mode must not advertise the lazy fetch tool.
     await archived.onMessage(makeMessage({
       chatType: 'p2p', chatId: 'oc_archive', senderId: 'ou_alice', mentionedBot: false,
@@ -3866,7 +3838,6 @@ describe('native attachment pipeline', () => {
     await flush()
     await flush()
 
-    expect(pendingRowsOf(h)).toHaveLength(0)
     expect(h.ctxState.agents.created).toHaveLength(1)
     expect(h.channel.sent).toHaveLength(sentBefore)
     expect(h.channel.reactions).toHaveLength(reactionsBefore)
@@ -3874,7 +3845,7 @@ describe('native attachment pipeline', () => {
     await h.service.shutdown()
   })
 
-  it('never registers attachments of a denied sender (AC3)', async () => {
+  it('keeps a denied sender\'s attachments inert (AC3)', async () => {
     const downloads: string[] = []
     const { h } = await setupNative({ accessMode: 'guarded', adminOpenId: 'ou_admin' }, {
       downloadResource: (_messageId, fileKey) => {
@@ -3892,7 +3863,6 @@ describe('native attachment pipeline', () => {
     await waitUntil(() => expect(h.channel.sent.length).toBeGreaterThan(0))
     await flush()
 
-    expect(pendingRowsOf(h)).toHaveLength(0)
     expect(h.ctxState.agents.created).toHaveLength(0)
     expect(h.channel.reactions).toEqual([])
     expect(downloads).toEqual([])
@@ -4201,7 +4171,8 @@ describe('quote excerpts and first-turn topic history', () => {
     await waitUntil(() => expect(mock(agent.followup)).toHaveBeenCalledTimes(2))
     const followup = promptOf(h, 1)
     expect(textBlocksOf(followup)).toEqual(['第二句'])
-    expect(listCalls).toHaveLength(1)
+    // Only the recent-attachment scans (one full page each) read again.
+    expect(listCalls.filter(call => call.page_size === 12)).toHaveLength(1)
     await h.service.shutdown()
   })
 
@@ -4292,7 +4263,7 @@ describe('quote excerpts and first-turn topic history', () => {
   })
 
   it('honors historyBootstrapLimit: 0 by never reading history (AC4)', async () => {
-    const list = vi.fn(async () => makeMessageListResponse([]))
+    const list = vi.fn(async (_params: RawMessageListParams) => makeMessageListResponse([]))
     const { h } = await setupTurnReader({ historyBootstrapLimit: 0 }, { messageList: list })
     await h.onMessage(makeMessage({
       chatType: 'p2p', chatId: 'oc_hist_off', senderId: 'ou_alice', mentionedBot: false,
