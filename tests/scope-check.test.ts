@@ -21,7 +21,7 @@ const ALL_GRANTED: readonly ScopeGrant[] = [
   'im:chat:readonly',
 ].map(name => ({ name, granted: true, type: 'tenant' as const }))
 
-const NO_OWNER_FALLBACK = { dmEnabled: true, requireMention: true, ownerLookupFailed: false }
+const NO_OWNER_FALLBACK = { dmEnabled: true, requireMention: true, ownerLookupFailed: false, slashCommandSyncFailed: false }
 
 describe('checkScopes', () => {
   it('reports nothing when every applicable need is granted', () => {
@@ -57,9 +57,14 @@ describe('checkScopes', () => {
 
   it('skips the DM scope when DMs are disabled and adds the app-info need when the owner lookup was rejected', () => {
     const grants = ALL_GRANTED.filter(grant => grant.name !== 'im:message.p2p_msg:readonly')
-    expect(scopeRequirements({ dmEnabled: false, requireMention: true, ownerLookupFailed: false }).some(item => item.anyOf.includes('im:message.p2p_msg:readonly'))).toBe(false)
-    const result = checkScopes(grants, 'cli_x', { dmEnabled: false, requireMention: true, ownerLookupFailed: true })
+    expect(scopeRequirements({ ...NO_OWNER_FALLBACK, dmEnabled: false }).some(item => item.anyOf.includes('im:message.p2p_msg:readonly'))).toBe(false)
+    const result = checkScopes(grants, 'cli_x', { ...NO_OWNER_FALLBACK, dmEnabled: false, ownerLookupFailed: true })
     expect(result.missing.map(item => item.anyOf[0])).toEqual(['admin:app.info:readonly'])
+  })
+
+  it('adds the optional slash-command need only when Feishu rejected the panel sync', () => {
+    expect(checkScopes(ALL_GRANTED, 'cli_x', { ...NO_OWNER_FALLBACK, slashCommandSyncFailed: true }).missing)
+      .toEqual([expect.objectContaining({ anyOf: ['application:app_slash_command:write'], level: 'optional' })])
   })
 
   it('requires group_msg when unmentioned group messages are answered', () => {

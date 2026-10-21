@@ -40,6 +40,8 @@ export interface ScopeCheckContext {
    * mode without `adminUserId`).
    */
   readonly ownerLookupFailed: boolean
+  /** Feishu rejected the native slash-command panel sync with an error code. */
+  readonly slashCommandSyncFailed: boolean
 }
 
 /** A requirement none of whose scopes is granted. */
@@ -100,6 +102,16 @@ const APP_INFO_REQUIREMENT: ScopeRequirement = {
 }
 
 /**
+ * Slash-command panel scope. Like the app-info need, the sync outcome is
+ * authoritative and the name only feeds the deep link.
+ */
+const SLASH_COMMAND_REQUIREMENT: ScopeRequirement = {
+  anyOf: ['application:app_slash_command:write'],
+  level: 'optional',
+  purpose: '同步飞书原生斜杠指令面板（输入 / 时列出插件命令）',
+}
+
+/**
  * Developer-console permission page for `appId`, searched for `scopes`.
  *
  * @param appId Resolved Feishu app id (`cli_...`).
@@ -138,6 +150,7 @@ export function checkScopes(grants: readonly ScopeGrant[], appId: string, contex
   const granted = new Set(grants.filter(grant => grant.granted && grant.type !== 'user').map(grant => grant.name))
   const unmet = scopeRequirements(context).filter(requirement => !requirement.anyOf.some(scope => granted.has(scope)))
   if (context.ownerLookupFailed) unmet.push(APP_INFO_REQUIREMENT)
+  if (context.slashCommandSyncFailed) unmet.push(SLASH_COMMAND_REQUIREMENT)
   const ordered = [
     ...unmet.filter(requirement => requirement.level === 'required'),
     ...unmet.filter(requirement => requirement.level === 'optional'),

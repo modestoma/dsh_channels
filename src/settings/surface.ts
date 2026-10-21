@@ -44,6 +44,7 @@ import type {
   SaveCredentialsRequest,
   SaveCredentialsResponse,
   ScopeCheckWire,
+  SlashCommandSyncWire,
 } from './contract.ts'
 import {
   configValueOf,
@@ -72,6 +73,8 @@ export interface SettingsTarget {
   startError(): string | undefined
   /** Post-connect scope self-check for the open connection, once it finished. */
   scopeCheck(): ScopeCheckWire | undefined
+  /** Post-connect native slash-command panel sync for the open connection, once it finished. */
+  slashCommandSync(): SlashCommandSyncWire | undefined
   /**
    * Whether the Feishu application credentials resolve. A false value means the
    * plugin is loaded but deliberately holds no connection: the panel guides the
@@ -534,6 +537,7 @@ function buildStatus(target: SettingsTarget, overlayPath: string): ChannelStatus
   const health = target.health()
   const connection = health.connection
   const scopeCheck = target.isRunning() ? target.scopeCheck() : undefined
+  const slashCommandSync = target.isRunning() ? target.slashCommandSync() : undefined
   return {
     running: target.isRunning(),
     configured: target.isConfigured(),
@@ -560,6 +564,7 @@ function buildStatus(target: SettingsTarget, overlayPath: string): ChannelStatus
     overlayPath,
     busy: target.isRestarting() || target.isConnecting(),
     ...(scopeCheck === undefined ? {} : { scopeCheck }),
+    ...(slashCommandSync === undefined ? {} : { slashCommandSync }),
   }
 }
 

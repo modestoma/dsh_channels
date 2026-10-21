@@ -262,6 +262,8 @@ export interface ChannelStatusWire {
   busy: boolean
   /** 连接后的权限自检结果；未连接或自检尚未完成时缺省。 */
   scopeCheck?: ScopeCheckWire
+  /** 连接后飞书原生斜杠指令面板的同步结果；未连接或同步尚未完成时缺省。 */
+  slashCommandSync?: SlashCommandSyncWire
 }
 
 /** One plugin need whose scopes are all missing. */
@@ -283,6 +285,13 @@ export type ScopeCheckWire =
   /** Some needs are missing; `consoleUrl` opens the console filtered to all of them. */
   | { state: 'missing'; checkedAt: number; missing: MissingScopeWire[]; consoleUrl: string }
   /** The grant list could not be read; `error` carries the Feishu reason. */
+  | { state: 'error'; checkedAt: number; error: string }
+
+/** Post-connect native slash-command panel sync outcome. */
+export type SlashCommandSyncWire =
+  /** The panel lists exactly the registry commands; counts are this sync's writes. */
+  | { state: 'ok'; checkedAt: number; created: number; removed: number; total: number }
+  /** A Feishu call failed; `error` carries the Feishu reason. */
   | { state: 'error'; checkedAt: number; error: string }
 
 /** The whole editable configuration surface, with provenance. */
@@ -529,6 +538,12 @@ export const PANEL_COPY = {
   scopeCheckOptional: '可选',
   scopeCheckRequired: '必需',
   scopeCheckError: '无法读取应用的权限授予状态：',
+  slashCommandSyncTitle: '斜杠指令面板',
+  slashCommandSyncOk: '插件命令已同步到飞书原生斜杠指令面板，在聊天框输入 / 即可选择。',
+  slashCommandSyncTotal: '命令数',
+  slashCommandSyncCreated: '本次新增',
+  slashCommandSyncRemoved: '本次删除',
+  slashCommandSyncError: '同步飞书原生斜杠指令面板失败（不影响直接输入命令）：',
   missingConfig: '缺少配置',
   statusHintUnconfigured: '配置完成后插件会自动连接；也可以稍后在本页手动连接。',
   connectionInfo: '连接信息',
