@@ -109,6 +109,17 @@ pnpm verify:host      # 以纯 ESM 导入 Host bundle，检查 Cordis 插件面
 pnpm verify:client    # 用 __ModuleLoader__ shim 做 loader 冒烟
 ```
 
+## 发布
+
+版本号由 semantic-release 按 Conventional Commits 计算，**只在手动触发时发布**；推送到 `main` / `dev` 只跑检查，可以先累积多笔提交。
+
+| 分支 | 版本 | npm dist-tag |
+| --- | --- | --- |
+| `main` | 正式版，如 `0.5.0` | `latest` |
+| `dev` | 预发布版，如 `0.5.0-beta.1` | `beta` |
+
+在 GitHub Actions 的 `pipeline` workflow 点击 **Run workflow**，选择 `main` 或 `dev`：`dry_run` 默认勾选，只预览下一个版本号；取消勾选才真正发布 npm 包、打 tag 并创建 GitHub Release。安装 beta 版用 `@modesto_ma/dsh-channels@beta`。
+
 ## 目录结构
 
 ```

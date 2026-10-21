@@ -2,14 +2,19 @@ name: pipeline
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
-    branches: [main]
-  # Manual runs are preview-only; the release job uses --dry-run for this event.
+    branches: [main, dev]
+  # Releases run only from a manual dispatch on main (stable) or dev (beta).
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Preview the next version without publishing
+        type: boolean
+        default: true
 
 concurrency:
-  # Keep manual previews independent from production pushes.
+  # Keep manual releases independent from push and pull request checks.
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
@@ -43,12 +48,12 @@ jobs:
       - name: Typecheck, test, build, and verify loaders
         run: pnpm check
 
-  # A green push to main publishes automatically. A manual run executes the
-  # same release analysis in dry-run mode without creating external state.
+  # Pushes only run checks, so commits accumulate until a manual dispatch.
+  # Dispatching on main publishes a stable version; on dev, a beta prerelease.
   release:
     if: >-
-      github.ref == 'refs/heads/main' &&
-      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      github.event_name == 'workflow_dispatch' &&
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
     needs: check
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -56,7 +61,7 @@ jobs:
       contents: write
       id-token: write
     concurrency:
-      group: dsh-channels-release-${{ github.event_name }}
+      group: dsh-channels-release
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -80,12 +85,12 @@ jobs:
       - name: Verify package contents
         run: pnpm pack --dry-run
       - name: Preview release
-        if: github.event_name == 'workflow_dispatch'
+        if: inputs.dry_run
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: pnpm exec semantic-release --dry-run
       - name: Publish release
-        if: github.event_name == 'push'
+        if: ${{ !inputs.dry_run }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: pnpm exec semantic-release
