@@ -210,6 +210,14 @@ class LarkChannelAdapter implements FeishuChannel {
         dmMode: options.dmMode === 'open' ? 'open' : 'disabled',
         respondToMentionAll: false,
       },
+      safety: {
+        // The SDK debounces messages per chatId and merges a burst into one
+        // message carrying the LAST sender/thread/message id. In a group that
+        // attributes one user's text and files to another, bypassing admission
+        // and topic ownership. Flush every message on its own; per-chat
+        // serialization and dedup stay in place.
+        batch: { text: { delayMs: 0 } },
+      },
     })
     this.requireMention = options.requireMention
     this.dmMode = options.dmMode
