@@ -21,6 +21,7 @@
 import { AccessController } from './access/controller.ts'
 import { AccessRequests } from './access/requests.ts'
 import { AccessStore } from './access/store.ts'
+import { AUTH_USER_TARGET_ERRORS, resolveAuthUserTarget } from './access/targets.ts'
 import { ApprovalAnswerer } from './approvals.ts'
 import type { ApprovalRoute } from './approvals.ts'
 import { QuestionAnswerer } from './questions.ts'
@@ -1626,7 +1627,7 @@ export class FeishuService {
             ? [`**本群**：${this.accessStore.hasGroup(msg.chatId) ? '已授权' : '未授权'}（\`${msg.chatId}\`）`]
             : []),
           `**白名单**：群 ${groups.length} 个 · 用户 ${users.length} 个 · 待处理申请 ${pending.length} 个`,
-          '群授权：`/auth allow` 或 `/auth revoke`（在目标群内发）；用户授权：`/auth user add <user_id>`。',
+          '群授权：`/auth allow` 或 `/auth revoke`（在目标群内发）；用户授权：`/auth user add @用户` 或 `/auth user add <user_id>`。',
         ]), direct)
         return
       }
@@ -1673,35 +1674,39 @@ export class FeishuService {
       }
       if (action === 'user') {
         const sub = words[1]
-        const userId = words[2]
-        if ((sub !== 'add' && sub !== 'remove') || userId === undefined
-          || !FEISHU_USER_ID_PATTERN.test(userId)) {
+        const target = sub === 'add' || sub === 'remove'
+          ? resolveAuthUserTarget(words.slice(2).join(' '), msg.mentions, this.channel?.botOpenId())
+          : { ok: false as const, reason: 'usage' as const }
+        if (!target.ok) {
           await this.delivery.commandCard(msg, {
-            kind: 'input-error', command: 'auth',
-            text: '用法：/auth user add <user_id> 或 /auth user remove <user_id>（可用 /userid 查看）。',
+            kind: 'input-error', command: 'auth', text: AUTH_USER_TARGET_ERRORS[target.reason],
           }, direct)
           return
         }
+        const { userId } = target
+        const label = target.name === undefined ? `\`${userId}\`` : `${target.name}（\`${userId}\`）`
         if (sub === 'add') {
           if (this.accessStore.hasUser(userId)) {
             await this.delivery.commandCard(msg, {
-              kind: 'success', command: 'auth', text: `该用户已在白名单中（\`${userId}\`）。`,
+              kind: 'success', command: 'auth', text: `该用户已在白名单中：${label}。`,
             }, direct)
             return
           }
           await this.accessStore.addUser({
-            userId, source: 'command', addedBy: msg.senderId, addedAt: now,
+            userId,
+            ...(target.name === undefined ? {} : { name: target.name }),
+            source: 'command', addedBy: msg.senderId, addedAt: now,
           })
           await this.delivery.commandCard(msg, {
             kind: 'success', command: 'auth',
-            text: `✅ 已授权用户 \`${userId}\`（在所有已授权群里生效）。`,
+            text: `✅ 已授权用户 ${label}（在所有已授权群里生效）。`,
           }, direct)
           return
         }
         const removed = await this.accessStore.removeUser(userId)
         await this.delivery.commandCard(msg, {
           kind: removed ? 'success' : 'unavailable', command: 'auth',
-          text: removed ? `已移除用户 \`${userId}\`，立即生效。` : `用户 \`${userId}\` 不在白名单中。`,
+          text: removed ? `已移除用户 ${label}，立即生效。` : `用户 ${label} 不在白名单中。`,
         }, direct)
         return
       }
@@ -1726,7 +1731,7 @@ export class FeishuService {
       }
       await this.delivery.commandCard(msg, {
         kind: 'input-error', command: 'auth',
-        text: '用法：/auth [status|allow|revoke|list|user add <user_id>|user remove <user_id>]',
+        text: '用法：/auth [status|allow|revoke|list|user add <@用户|user_id>|user remove <@用户|user_id>]',
       }, direct)
     } catch (error) {
       this.ctx.logger?.warn?.('dsh-channels: /auth failed: %s', String(error))

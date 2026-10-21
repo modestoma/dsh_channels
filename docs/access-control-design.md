@@ -322,8 +322,8 @@ bot 回显过滤 / chatType / 空内容 / dmMode
 
 ```ts
 {
-  name: 'auth', group: '会话', description: '查看/管理访问授权（仅管理员）',
-  usage: '[status|allow|revoke|list|user add <open_id>|user remove <open_id>]',
+  name: 'auth', group: '会话', description: '查看/管理访问授权，可 @ 成员授权（仅管理员）',
+  usage: '[status|allow|revoke|list|user add <@用户|user_id>|user remove <@用户|user_id>]',
   channelPlane: true, agentScoped: false,
 }
 ```
@@ -333,7 +333,7 @@ bot 回显过滤 / chatType / 空内容 / dmMode
 | `/auth` / `/auth status` | 任意 | 显示：当前是否管理员、本群/本私聊是否已授权、白名单数量 |
 | `/auth allow` | 群聊（管理员） | 把**当前群**加入群白名单，回执“已授权本群” |
 | `/auth revoke` | 群聊（管理员） | 把当前群移出白名单，立即生效 |
-| `/auth user add <open_id>` | 私聊/群聊（管理员） | 加入用户白名单（也支持后续的 `@成员` 形式，P3） |
+| `/auth user add <@用户\|user_id>` | 私聊/群聊（管理员） | 加入用户白名单；`@成员` 取 mention 里的 user_id，忽略对机器人的 @，没有 user_id 的外部用户被拒绝 |
 | `/auth user remove <open_id>` | 同上 | 移出用户白名单 |
 | `/auth list` | 任意（管理员） | 列出群白名单、用户白名单与待处理申请 |
 
@@ -526,7 +526,7 @@ UI：
 ### P3：增强
 
 - [ ] 审计表 + 面板最近记录
-- [ ] `/auth user add @成员`（用 mention 里的 openId）
+- [x] `/auth user add @成员`（用 mention 里的 user_id）
 - [ ] 逐群用户授权（`access_users.chatId` 可选作用域）
 - [ ] bot removed / 群解散的授权回收（评估直接订阅原始事件）
 - [ ] health/status 暴露 `accessMode`、`adminConfigured`、pending 数
@@ -549,4 +549,4 @@ UI：
 - 管理员未配置时收到入群事件只记日志，不落申请记录（面板看不到）；
 - 面板结算的 grant `source` 记为 `card`（与飞书卡片共用结算函数），若要区分来源可加参数；
 - 授权申请过期目前只在启动时清扫一次；运行中依赖结算时判断；
-- 逐群用户授权、`/auth user add @成员`、bot removed 自动回收、审计表与面板最近记录等按 §10 P3 处理。
+- 逐群用户授权、bot removed 自动回收、审计表与面板最近记录等按 §10 P3 处理。
