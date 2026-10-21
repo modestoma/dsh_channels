@@ -3441,6 +3441,8 @@ describe('inbound attachments', () => {
       chatType: 'group', chatId, senderId, messageId: 'om_iso_b', content: '开始 B',
     }))
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
+    // The route record commits after the Agent is created.
+    await waitUntil(() => expect(routes().some(route => route.sessionId !== routeA.sessionId)).toBe(true))
     const routeB = routes().find(route => route.sessionId !== routeA.sessionId)!
     await h.onMessage(makeMessage({
       chatType: 'group', chatId, senderId, threadId: routeB.key, mentionedBot: false,

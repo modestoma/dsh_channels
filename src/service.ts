@@ -1495,6 +1495,7 @@ export class FeishuService {
       // Already disconnected is fine.
     }
     this.channel = undefined
+    this.streamer?.detachAll()
     this.streamer = undefined
     await this.domain?.close()
     this.domain = undefined

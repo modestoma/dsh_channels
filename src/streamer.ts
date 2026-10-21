@@ -398,6 +398,11 @@ export class TurnStreamer {
     this.segmentChains.delete(sessionId)
   }
 
+  /** Drop every session's state and timers (service shutdown). */
+  detachAll(): void {
+    for (const sessionId of [...this.bySession.keys()]) this.detach(sessionId)
+  }
+
   hasSession(sessionId: string): boolean {
     return this.bySession.has(sessionId)
   }
