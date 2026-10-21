@@ -1627,9 +1627,12 @@ describe('FeishuService', () => {
     const bobWorkspace = path.join(h.config.baseDir, 'groups', 'oc_grp', 'ou_bob')
     expect(new Set(cwds)).toEqual(new Set([aliceWorkspace, bobWorkspace]))
     // Each user's Session works in its own topic directory below its workspace.
-    const dirs = h.ctxState.workingDirectory.sets.map(entry => entry.path)
-    expect(dirs).toContainEqual(path.join(aliceWorkspace, 'topics', 'omt_1'))
-    expect(dirs).toContainEqual(path.join(bobWorkspace, 'topics', 'omt_2'))
+    // The topic directory is entered after the Agent exists, so wait for both.
+    await waitUntil(() => {
+      const dirs = h.ctxState.workingDirectory.sets.map(entry => entry.path)
+      expect(dirs).toContainEqual(path.join(aliceWorkspace, 'topics', 'omt_1'))
+      expect(dirs).toContainEqual(path.join(bobWorkspace, 'topics', 'omt_2'))
+    })
     expect(aliceWorkspace).not.toBe(bobWorkspace)
   })
 
