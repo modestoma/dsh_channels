@@ -311,6 +311,9 @@ function failure(code: AttachmentFetchFailureCode, reason?: string): AttachmentF
  * schema is the authoritative argument gate; it also gives tests and
  * embedded/non-native callers a typed value.
  */
+/** Feishu message id accepted from model arguments before any Feishu request. */
+const MESSAGE_ID_PATTERN = /^om_[A-Za-z0-9_-]{1,128}$/
+
 export const attachmentFetchArgsSchema = z.object({
   message_id: z.string().min(1),
   file_key: z.string().min(1).optional(),
@@ -801,6 +804,8 @@ export class AttachmentFetchToolRuntime {
   ): Promise<KnownAttachmentMessage | undefined> {
     const channel = call.channel
     if (channel === undefined) return undefined
+    // The id comes from model arguments: never send a malformed one to Feishu.
+    if (!MESSAGE_ID_PATTERN.test(messageId)) return undefined
     const reader = new MessageReader({ channel: () => channel })
     const read = await reader.readMessage(messageId, { signal: call.signal })
     if (!read.ok) return undefined
@@ -1619,7 +1624,7 @@ const TOPIC_MESSAGES_FETCH_UNAVAILABLE_DESCRIPTION =
  * Chinese error rather than a schema message.
  */
 export const topicMessagesArgsSchema = z.object({
-  message_id: z.string().min(1).max(160).regex(/^om_[A-Za-z0-9_-]{1,128}$/).optional(),
+  message_id: z.string().min(1).max(160).regex(MESSAGE_ID_PATTERN).optional(),
   limit: z.number().int().min(1).max(TOPIC_MESSAGES_MAX_LIMIT).optional(),
   cursor: z.string().min(1).max(2048).optional(),
 }).strict()

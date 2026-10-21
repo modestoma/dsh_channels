@@ -846,6 +846,18 @@ describe('feishu attachment-fetch authorization', () => {
     expect(harness.channel.downloaded).toEqual([])
   })
 
+  it('never reads back a malformed or oversized message id', async () => {
+    for (const messageId of ['om_x/../chats?page_size=1', 'not_a_message', `om_${'a'.repeat(200)}`]) {
+      const harness = setupRuntime()
+      const definition = await harness.mount()
+      const { calls } = readBack(harness, ownerFile(messageId))
+      const value = await runTool(definition, { message_id: messageId })
+      expect(value.ok).toBe(false)
+      expect(value.summary).toContain(attachmentFetchFailureReason('AUTHORIZATION_DENIED'))
+      expect(calls).toEqual([])
+    }
+  })
+
   it('validates the arguments with zod (message_id required, unknown keys rejected)', () => {
     expect(attachmentFetchArgsSchema.safeParse({ message_id: 'om_1' }).success).toBe(true)
     expect(attachmentFetchArgsSchema.safeParse({ file_key: 'k1' }).success).toBe(false)

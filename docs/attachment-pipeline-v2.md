@@ -146,7 +146,7 @@ native 后端下，准入通过后由 `inboundAttachmentState` 做**不下载的
 
 - 参数：`message_id`（必填）；`file_key`（可选，只取该消息的某个资源，缺省取全部）。
 - 输出：`{ message_id, ok, summary, results[] }`；每个结果含 `ok / kind(image|file) / name / file_key / bytes / media_type / width / height / read_path / handle_text / code / reason / attachment`。渲染为文本 + 每个成功资源的 `ImageBlock` / `FileBlock`；文本始终存在（文本模型或宿主不支持 `FileBlock` 时的兜底）。
-- **授权链**：先查本 route 的进程内白名单（LRU，每 route 128 条）；未命中时用 `message.get` 回读该消息，只有 route owner 本人发出、未撤回、属于本 route 容器（同 chat；话题路由只认本话题，chat 路由为主线）的消息才授权；别的话题与未登记的主线消息一律拒绝，话题之间不互通，回读失败一律拒绝。`message_id` 单独出现在参数里不足以授权；跨 chat / 跨话题、他人未登记的消息一律 `AUTHORIZATION_DENIED`，不下载任何字节。`file_key` 必须属于该消息已解析的资源集，否则 `UNKNOWN_FILE_KEY`。
+- **授权链**：先查本 route 的进程内白名单（LRU，每 route 128 条）；未命中时，`message_id` 符合 `^om_[A-Za-z0-9_-]{1,128}$` 才用 `message.get` 回读该消息（格式不符直接拒绝，不发请求），只有 route owner 本人发出、未撤回、属于本 route 容器（同 chat；话题路由只认本话题，chat 路由为主线）的消息才授权；别的话题与未登记的主线消息一律拒绝，话题之间不互通，回读失败一律拒绝。`message_id` 单独出现在参数里不足以授权；跨 chat / 跨话题、他人未登记的消息一律 `AUTHORIZATION_DENIED`，不下载任何字节。`file_key` 必须属于该消息已解析的资源集，否则 `UNKNOWN_FILE_KEY`。
 - **授权来源**：触发消息（准入层登记，`source='trigger'`）、引用消息（`quote`）、首轮历史（`history`）、工具自身成功解析的消息（`tool-result`）进入本 route 的进程内白名单；回读授权的消息以 `tool-result` 记入白名单。`containerMessageId` 只能来自可信登记，绝不从模型参数取下载 id。
 - **合并转发**：用顶层容器 `message_id` 展开子消息并下载子资源；子消息 id 不能作为下载 id（P0：子 id 返回 400）。
 - **限制与取消**：单次资源数、总字节预算（文件在流式写入中逐 chunk 计量）、整段 `timeoutMs`；遵守 `exec.signal`，超时/取消把当前与剩余资源标记 `TIMEOUT` / `ABORTED`，不提交半文件、逐资源失败不中断整体调用。图片受宿主 `maxImageBytes` 额外约束。
