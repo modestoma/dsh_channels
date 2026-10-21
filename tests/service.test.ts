@@ -3,7 +3,7 @@
  * topic replies, degradation, and lazy resume.
  */
 
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, utimesSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
@@ -72,8 +72,6 @@ function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
       topicMessagesTimeoutMs: 20_000,
     },
     topicIsolation: 'auto',
-    workspaceRetention: 'off',
-    workspaceRetentionAuto: false,
     ...partial,
   }
 }
@@ -3518,8 +3516,7 @@ describe('native attachment pipeline', () => {
     expect(attachments.savedImages).toHaveLength(1)
     const topicDir = sessionDirOf(routesOf(h)[0]!)
     // The native pipeline writes only the native attachment library: no
-    // workspace copy and no legacy staging, so directory cleanup can never
-    // delete an inbound Session attachment.
+    // workspace copy and no legacy staging.
     expect(existsSync(path.join(topicDir, 'attachments'))).toBe(false)
     expect(existsSync(path.join(h.config.baseDir, '_staging'))).toBe(false)
     await h.service.shutdown()
@@ -4547,140 +4544,6 @@ describe('quote excerpts and first-turn topic history', () => {
     // advertise an operation that cannot work there.
     expect(blocks[1]).not.toContain('feishu_attachment_fetch')
     expect(blocks[2]).not.toContain('feishu_attachment_fetch')
-    await h.service.shutdown()
-  })
-})
-
-
-describe('directory retention cleanup', () => {
-  const STALE = 10 * 24 * 60 * 60 * 1000
-
-  it('previews and deletes a stale legacy topic workspace while retiring its route', async () => {
-    const h = await setup({ workspaceRetention: '7d' })
-    // Legacy layout: one registered workspace per topic below <baseDir>/topics.
-    const dir = path.join(h.config.baseDir, 'topics', 'groups', 'oc_stale', 'ou_old')
-    mkdirSync(path.join(dir, 'attachments'), { recursive: true })
-    writeFileSync(path.join(dir, 'attachments', 'old.txt'), 'stale bytes')
-    const old = new Date(Date.now() - STALE)
-    utimesSync(dir, old, old)
-    await h.ctxState.workspaces.registry.create(dir, '飞书群聊 · oc_stale · ou_old')
-    const record: RouteRecord = {
-      key: 'omt_stale',
-      kind: 'thread',
-      sessionId: 'session-stale',
-      chatId: 'oc_stale',
-      chatType: 'group',
-      senderOpenId: 'ou_old',
-      workspacePath: dir,
-      cardMessageId: 'om_stale_card',
-      createdAt: old.getTime(),
-      lastActivityAt: old.getTime(),
-      sessionHistory: [{ sessionId: 'session-stale', createdAt: old.getTime() }],
-    }
-    await h.ctxState.domain.raw.table('routes').put('omt_stale', record)
-
-    const preview = await h.service.cleanupPreview()
-    expect(preview.retention).toBe('7d')
-    expect(preview.workspaces).toBe(1)
-    expect(preview.candidates).toBe(1)
-    expect(preview.candidateBytes).toBeGreaterThan(0)
-
-    const result = await h.service.runWorkspaceCleanup()
-    expect(result.ok).toBe(true)
-    expect(result.deletedWorkspaces).toBe(1)
-    expect(result.deletedSessionDirs).toBe(0)
-    expect(result.retiredRoutes).toBe(1)
-    expect(result.freedBytes).toBeGreaterThan(0)
-    expect(existsSync(dir)).toBe(false)
-    expect(h.ctxState.workspaces.workspaces.size).toBe(0)
-    expect(h.ctxState.domain.raw.table('routes').get('omt_stale')).toBeUndefined()
-    expect(h.ctxState.domain.raw.table('expired_routes').get('omt_stale')).toMatchObject({
-      workspacePath: dir,
-    })
-    await h.service.shutdown()
-  })
-
-  it('deletes a stale topic directory but keeps the user workspace registered', async () => {
-    const h = await setup({ workspaceRetention: '7d' })
-    // Current layout, seeded without a live Agent (retention never offers a
-    // directory whose Session is still live).
-    const workspaceDir = path.join(h.config.baseDir, 'groups', 'oc_topic_ws', 'ou_owner')
-    const topicDir = path.join(workspaceDir, 'topics', 'omt_topic')
-    mkdirSync(path.join(topicDir, 'attachments'), { recursive: true })
-    writeFileSync(path.join(topicDir, 'attachments', 'old.txt'), 'stale bytes')
-    const old = new Date(Date.now() - STALE)
-    utimesSync(topicDir, old, old)
-    await h.ctxState.workspaces.registry.create(workspaceDir, '飞书群聊 · oc_topic_ws · ou_owner')
-    const record: RouteRecord = {
-      key: 'omt_topic',
-      kind: 'thread',
-      sessionId: 'session-topic',
-      chatId: 'oc_topic_ws',
-      chatType: 'group',
-      senderOpenId: 'ou_owner',
-      workspacePath: workspaceDir,
-      sessionDir: topicDir,
-      cardMessageId: 'om_topic_card',
-      createdAt: old.getTime(),
-      lastActivityAt: old.getTime(),
-      sessionHistory: [{ sessionId: 'session-topic', createdAt: old.getTime() }],
-    }
-    await h.ctxState.domain.raw.table('routes').put(record.key, record)
-
-    const preview = await h.service.cleanupPreview()
-    expect(preview.workspaces).toBe(1)
-    expect(preview.candidates).toBe(1)
-    expect(preview.candidateBytes).toBeGreaterThan(0)
-
-    const result = await h.service.runWorkspaceCleanup()
-    expect(result.ok).toBe(true)
-    expect(result.deletedWorkspaces).toBe(0)
-    expect(result.deletedSessionDirs).toBe(1)
-    expect(result.retiredRoutes).toBe(1)
-    expect(existsSync(topicDir)).toBe(false)
-    expect(existsSync(workspaceDir)).toBe(true)
-    // The user workspace stays registered; the old topic is tombstoned.
-    expect(h.ctxState.workspaces.workspaces.get(workspaceDir)).toBeDefined()
-    expect(h.ctxState.domain.raw.table('routes').get(record.key)).toBeUndefined()
-    expect(h.ctxState.domain.raw.table('expired_routes').get(record.key)).toMatchObject({
-      workspacePath: workspaceDir,
-      sessionDir: topicDir,
-    })
-    await h.service.shutdown()
-  })
-
-  it('never offers a topic directory whose session is still live', async () => {
-    const h = await setup({ workspaceRetention: '7d' })
-    await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_live_ws', senderId: 'ou_owner',
-      messageId: 'om_live_ws', content: '开始',
-    }))
-    await waitForEstablishedSession(h)
-    const record = [...(h.ctxState.domain.raw.table('routes').entries() as Iterable<[string, RouteRecord]>)]
-      .map(([, value]) => value)[0]!
-    const topicDir = sessionDirOf(record)
-    const old = new Date(Date.now() - STALE)
-    utimesSync(topicDir, old, old)
-    await h.ctxState.domain.raw.table('routes').put(record.key, {
-      ...record, lastActivityAt: old.getTime(),
-    })
-
-    const preview = await h.service.cleanupPreview()
-    expect(preview.candidates).toBe(0)
-    const result = await h.service.runWorkspaceCleanup()
-    expect(result.deletedSessionDirs).toBe(0)
-    expect(existsSync(topicDir)).toBe(true)
-    await h.service.shutdown()
-  })
-
-  it('refuses to run while retention is off', async () => {
-    const h = await setup({ workspaceRetention: 'off' })
-    const preview = await h.service.cleanupPreview()
-    expect(preview.candidates).toBe(0)
-    expect(preview.thresholdMs).toBeUndefined()
-    const result = await h.service.runWorkspaceCleanup()
-    expect(result.ok).toBe(false)
-    expect(result.error).toContain('off')
     await h.service.shutdown()
   })
 })

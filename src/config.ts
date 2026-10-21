@@ -13,7 +13,6 @@
  */
 
 import { z } from 'zod'
-import { WORKSPACE_RETENTION_VALUES } from './cleanup.ts'
 
 export const FEISHU_LOGGER_LEVELS = ['debug', 'info', 'warn', 'error'] as const
 export type FeishuLoggerLevel = (typeof FEISHU_LOGGER_LEVELS)[number]
@@ -310,22 +309,6 @@ export const configSchema = z.object({
     topicMessages: true,
     topicMessagesTimeoutMs: DEFAULT_TOPIC_MESSAGES_TIMEOUT_MS,
   }),
-  /**
-   * Delete the topic directories of stale conversations, plus legacy
-   * one-workspace-per-topic directories written by older plugin versions.
-   * `off` (default) never deletes; `7d`/`30d`/`90d`/`180d` remove those
-   * directories when their last activity is older than the threshold. User
-   * workspaces themselves are never deleted. The managed Web panel exposes
-   * this as a select, previews the candidates, and can run one cleanup
-   * manually. DSH Session logs are never deleted.
-   */
-  workspaceRetention: z.enum(WORKSPACE_RETENTION_VALUES).default('off'),
-  /**
-   * Run the retention cleanup at startup and once per day. Off by default:
-   * deletion is irreversible, so it stays an explicit opt-in even when a
-   * retention threshold is configured.
-   */
-  workspaceRetentionAuto: z.boolean().default(false),
   /**
    * Send a one-time onboarding card on the first private message of a chat
    * (facts + command cheat sheet). Persisted per chat; never repeats.

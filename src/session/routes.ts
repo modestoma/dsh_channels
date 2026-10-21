@@ -135,8 +135,7 @@ export class RouteStore {
 
   /**
    * Retire one active thread route into a persistent tombstone regardless of
-   * the configured TTL. Used by the workspace-retention cleanup, which may
-   * close topics earlier than the route TTL.
+   * the configured TTL.
    */
   async retire(key: string, now = Date.now()): Promise<ExpiredRouteRecord | undefined> {
     const record = this.get(key)

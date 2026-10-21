@@ -68,7 +68,7 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 | 连接 | 连接状态与连接信息（长连接状态、Bot open_id、运行时长、话题路由 / 活动会话 / 在途回复）、未配置时的三步引导、飞书应用凭据、最近一次连接失败原因、需重连的待生效提醒 |
 | 会话与行为 | 「行为」：私聊模式、普通群 @ 要求、话题兜底、首次私聊引导、权限切换；「内容与附件」：附件接收、存储后端、图片预取与上限、首轮历史；「模型工具」：`feishu_attachment_fetch` / `feishu_topic_messages` 开关与上限、被动读取预算 |
 | 模型 | 模型服务商、模型 id、推理档位、Agent 预设（宿主目录驱动的级联下拉） |
-| 工作区 | 工作区根目录（可点「选择目录…」调用系统目录选择框）、过期目录保留期、自动清理、「目录清理」预览与手动执行；话题目录隔离方式（`topicIsolation`）在 profile 配置中设置 |
+| 工作区 | 工作区根目录（可点「选择目录…」调用系统目录选择框）；话题目录隔离方式（`topicIsolation`）在 profile 配置中设置 |
 | 访问授权 | 管理员 open_id、准入模式、申请有效期；已授权群 / 用户白名单与待处理申请 |
 | 高级 | 流式刷新 / 状态行 / SDK 日志级别、部署级只读参数、Web 覆盖文件路径与「清除 Web 覆盖」 |
 
@@ -91,15 +91,13 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 
 **可视化选择工作区根目录**：输入框旁的「选择目录…」按钮会调用**宿主机的系统目录选择框**（macOS 的 NSOpenPanel / Windows 的文件夹对话框），选中后把绝对路径填进草稿，仍需点「保存更改」才落盘。该能力转发自宿主可选的 `ctx.directoryPicker` 服务：桌面端/本机 GUI 会话（native 后端）提供按钮；headless、远程或 SSH 会话没有可服务的显示会话（browse 后端），面板不显示按钮、保留手写输入，插件在缺少该服务的旧宿主上照常加载。选择框打开期间请求保持挂起；取消是正常结果，不会报错。
 
-**目录清理**：「工作区」标签页内提供保留期与「目录清理」卡片，用于回收长期不用的话题目录。保留期可选 `off / 7 天 / 30 天 / 90 天 / 180 天`（默认 `off`）；卡片实时预览「插件工作区数量 / 可清理目录 / 预计释放空间」，点「立即清理」需二次确认；也可开启 `workspaceRetentionAuto` 在启动后与每日自动执行一次。清理动作针对 `<baseDir>` 下的话题工作目录（当前布局）以及旧版本按话题建立、标题以 `飞书私聊 ·` / `飞书群聊 ·` 开头的工作区：删除目录，旧版工作区额外注销 workspace registry；并把仍指向它们的活跃路由退休为墓碑（该旧话题收到消息会明确提示「话题已过期」，不会恢复到一个已删除的目录）。**清理只删工作区与 Agent 产物，不影响 Session 附件与会话日志**：默认 native 后端下入站附件存放在 DSH 原生附件库，不在这些目录中，且原生库不提供插件侧清理（DSH 语义为不自动删除，磁盘增长由用户接受）；**用户工作区本身永不删除，Harness Session 日志与事件记录也不删除**。若显式使用 archive 后端，旧版 `attachments/` 副本位于话题目录内，会随目录清理一起删除。删除不可恢复，`off` 时按钮禁用。未建立飞书连接时（存储域未打开）预览不可用，卡片会提示先连接。
-
 **访问授权**：「访问授权」标签页集中管理准入：管理员 open_id（`ou_` 开头，私聊 `/userid` 获取）、准入模式、授权申请有效期；「已授权群」「已授权用户」列表支持增删（群 ID 可从入群群信息卡或 `/groupid` 获得，用户 open_id 可用 `/userid` 查看）；「待处理申请」可一键授权/忽略。白名单只约束非管理员：管理员在任何私聊/群聊都直接放行。`guarded` 且管理员未配置时标签页顶部会红字提示“当前会拒绝所有对话”。授权白名单与申请记录保存在插件 `storageDomain`（`channels_routes` 域），重启后保留；未建立飞书连接时白名单尚未加载，标签页会提示「连接建立后加载授权列表」并禁用写操作。
 
-**配置层级**：`configSchema` 默认值 < profile `cordis.patch.yml` 的 `config` < Web 面板覆盖。面板只把可编辑字段写入 `$DSH_HOME/dsh-channels/settings.json`（可用配置项 `settingsFile` 改路径）；「高级 → 清除 Web 覆盖」删除该文件并回落到 profile 配置。`baseDir` 可在「工作区」标签页编辑（绝对路径；只影响之后新建的会话）；超时、路由 TTL 等仍只读展示。凭据**值**在「连接 → 飞书应用凭据」编辑，凭据**引用名**（`appId` / `appSecret` 配置项）仍由 profile 配置决定。
+**配置层级**：`configSchema` 默认值 < profile `cordis.patch.yml` 的 `config` < Web 面板覆盖。面板只把可编辑字段写入 `$DSH_HOME/dsh-channels/settings.json`（可用配置项 `settingsFile` 改路径）；「高级 → 清除 Web 覆盖」删除该文件并回落到 profile 配置。`baseDir` 可在「工作区」标签页编辑（绝对路径；只影响之后新建的会话）；超时、路由 TTL 等仍只读展示。凭据**值**在「连接 → 飞书应用凭据」编辑，凭据**引用名**（`appId` / `appSecret` 配置项）仍由 profile 配置决定。已移除的目录清理配置 `workspaceRetention` / `workspaceRetentionAuto` 若仍留在 profile 或覆盖文件中会被静默忽略，面板下次保存时从覆盖文件中去掉。
 
 **为什么落在插件自己的文件而不是 profile 的 `cordis.patch.yml`？** DSH 提供官方 `ctx.configEditor.edit()`，可以安全写 profile patch（完整 Config 校验、保留注释与 `!!js`、原子替换、失败回滚、与 HMR 串行）；但它是「完整配置编辑」通道——本插件的 Config 是 zod，没有 schemastery `.volatile()` 标记，普通字段写入会触发 Loader 重载插件，等于每次保存都断开并重连飞书；而且该服务只在有 `profileContext` 的启动器（桌面端 / `dsh web`）存在。`$DSH_HOME/<plugin>/` 是 DSH 插件保存运行时数据的惯例（如 dsh-pet 的 `$DSH_HOME/dsh-pet/`），因此面板偏好写入 `$DSH_HOME/dsh-channels/settings.json`：保存即生效（需重连字段除外）、可一键清除回退、不依赖 `profileContext`；profile 的 `cordis.patch.yml` 继续作为部署级基础配置层。若将来要求「所有配置统一进 profile」，迁移路径是改用 `ctx.configEditor.edit()` 并接受保存触发插件重载。
 
-**安全边界**：面板路由与其他本机 DSH 路由一样**不带鉴权**；写操作（PUT / DELETE / POST）额外校验 `Origin` 与 `Host` 同源，拒绝跨站页面改写配置或凭据。**授权白名单与待处理申请同样面板可写，因此“本机访问面板 = 可授权”**；不要把 DSH Web 服务绑定到不可信网络。凭据值只走写路径、响应永不回显，也不会写进 Web 覆盖文件。`baseDir` 可写意味着同源页面能改变模型文件的落点（面板已拒绝文件系统根目录）；清理动作会在同源校验通过后**递归删除** `<baseDir>` 下命中的飞书工作区目录，且不可恢复（只删插件标题的目录、删除前做路径/符号链接逃逸复核），不要把 DSH Web 服务绑定到不可信网络。
+**安全边界**：面板路由与其他本机 DSH 路由一样**不带鉴权**；写操作（PUT / DELETE / POST）额外校验 `Origin` 与 `Host` 同源，拒绝跨站页面改写配置或凭据。**授权白名单与待处理申请同样面板可写，因此“本机访问面板 = 可授权”**；不要把 DSH Web 服务绑定到不可信网络。凭据值只走写路径、响应永不回显，也不会写进 Web 覆盖文件。`baseDir` 可写意味着同源页面能改变模型文件的落点（面板已拒绝文件系统根目录）。
 
 **构建**：DSH 只加载已构建的浏览器 bundle，改了 `src/client/` 或 `src/settings/contract.ts` 后需要重新构建并重启应用：
 
@@ -171,7 +169,6 @@ src/
 ├── stats.ts               # 宿主投影优先的 token / 缓存 / 上下文折叠
 ├── domain.ts              # storageDomain 域声明与路由记录 schema
 ├── health.ts              # 健康快照与卡片
-├── cleanup.ts             # 过期话题目录 / 旧版工作区清理策略（纯逻辑，无 I/O）
 ├── session-export.ts      # 逻辑日志导出
 ├── feishu-channel.ts      # 官方 SDK Channel 适配（可注入 stub）
 ├── client/                # 浏览器半区：设置 →「飞书渠道」页面（构建到 lib/client.js）
@@ -182,7 +179,7 @@ src/
 │   │   ├── connection-tab.tsx #   连接：三步引导 / 连接信息 / 待生效提醒 / 凭据卡
 │   │   ├── credentials-card.tsx  #  App ID / App Secret 编辑（不回显）
 │   │   ├── sessions-tab.tsx / model-tab.tsx / workspace-tab.tsx / access-tab.tsx / advanced-tab.tsx
-│   │   └── cleanup-card.tsx / access-card.tsx
+│   │   └── access-card.tsx
 │   ├── catalog.ts         #   选择器目录折叠：Host 字段 + 实时目录 → 表单字段
 │   ├── api.ts             #   同源 /dsh-channels/* 请求封装
 │   └── styles.ts          #   语义 token 样式（注入一次）
@@ -256,8 +253,6 @@ npm 发行包已包含构建产物：Host 入口是 `lib/index.js`（profile 直
       attachmentFetchTimeoutMs: 120000  # 单次工具调用整段超时（120 s）
       topicMessages: true               # feishu_topic_messages：读取引用消息 / 话题历史并授权其附件
       topicMessagesTimeoutMs: 20000     # 单次话题读取整段超时（20 s；被动摘录用独立 3 s 预算）
-    workspaceRetention: 'off'           # 过期话题目录清理阈值：off / 7d / 30d / 90d / 180d（只清理工作区与 Agent 产物）
-    workspaceRetentionAuto: false       # 每日自动执行一次清理（默认关；删除不可恢复；用户工作区永不删除）
     welcomeOnboarding: true             # 私聊首次触达发一张引导卡（按 chat 持久化去重）
     allowPermissionSwitch: false        # 是否允许 /permissions <name> 从飞书侧切换权限预设（安全敏感）
     accessMode: 'guarded'               # 准入模式：guarded（默认，仅管理员+白名单）| open（旧行为，不安全）
@@ -324,9 +319,9 @@ FEISHU_APP_SECRET: xxxxxxxx
 - 会话创建时以工作区为 header cwd（保证 GUI 里归属该项目、沙箱边界稳定），随后通过 `ctx.workingDirectory` 把实际工作目录切到话题目录；冷恢复会从 Session 日志还原该目录。因此话题之间的文件互不干扰，而工作区数量只随用户增长。
 - `topicIsolation` 控制隔离形式：`auto`（默认）在用户工作区是 Git 仓库（含 `.git`）时给每个话题建一个 `feishu-<话题>` 分支 + worktree（适合多个话题并发改同一个代码仓库），否则用普通子目录；`subdir` 一律子目录；`worktree` 一律尝试 worktree，失败告警并回退子目录。
 - 隔离强度：这是**默认工作目录层面**的隔离（bash / fs / 终端都从话题目录出发），不是防恶意的硬沙箱——沙箱写边界仍是用户工作区。若需要硬边界，可把话题目录直接作为 Session cwd，但会话会失去工作区归属（GUI 显示为未分组）。
-- **入站附件（v2）**：native 后端下图片/文件存入 DSH 原生附件库，**不写入话题目录**，因此工作区与话题目录只承载 Agent 产物；仅显式 `archive` 后端（或宿主缺原生附件服务）才写当前话题目录的 `attachments/`，话题建立前先暂存 `<baseDir>/_staging/...`。v2 主路径不再写 `_staging`；旧版遗留的暂存文件仅保留一次性迁入，按 D12 在 v2 发布后的下一个 minor 版本移除，该目录不受保留期清理。`/renew` 复用同一话题目录。
-- worktree 模式下清理只删除 checkout 目录；Git 分支与管理记录按 DSH 语义保留（需要时可在仓库里 `git worktree prune` / `git branch -D` 回收）。
-- 旧版本「一个话题一个工作区」（`<baseDir>/topics/...`）不会自动迁移：旧话题继续用原目录，保留期清理可回收；旧版「用户 × 聊天」共享工作区正好作为新的用户工作区复用。
+- **入站附件（v2）**：native 后端下图片/文件存入 DSH 原生附件库，**不写入话题目录**，因此工作区与话题目录只承载 Agent 产物；仅显式 `archive` 后端（或宿主缺原生附件服务）才写当前话题目录的 `attachments/`，话题建立前先暂存 `<baseDir>/_staging/...`。v2 主路径不再写 `_staging`；旧版遗留的暂存文件仅保留一次性迁入，按 D12 在 v2 发布后的下一个 minor 版本移除。`/renew` 复用同一话题目录。
+- **插件不删除任何工作区或话题目录**。需要回收磁盘时手动删除不再需要的话题目录即可：该话题下次对话时会重建一个空目录继续使用（worktree 模式下改建新的 worktree 分支）。手动删除 worktree checkout 后，可在仓库里 `git worktree prune` / `git branch -D` 回收 Git 记录。
+- 旧版本「一个话题一个工作区」（`<baseDir>/topics/...`）不会自动迁移：旧话题继续用原目录；旧版「用户 × 聊天」共享工作区正好作为新的用户工作区复用。
 - 设计取舍与约束详见 [docs/workspace-isolation-design.md](docs/workspace-isolation-design.md)。
 
 ## 行为与降级
@@ -334,7 +329,7 @@ FEISHU_APP_SECRET: xxxxxxxx
 - **入站附件（v2：零等待 + 清单 + 图片预取 + 文件懒取）**：收到触发消息时先建会话 / 话题 / 卡片第一帧并持久化路由，**不在建立前下载任何附件字节**。随后组装的 prompt 依次为：说明文字 → `<feishu_quote>` 引用摘录 → 预取成功的 `ImageBlock` → `<feishu_context>` 未加载附件清单 → （首轮）`<feishu_history>` 话题历史；空块不产生 token。触发消息中的图片在路由建立后、`followup` 前**预取**进首轮（单图 `prefetchImageMaxBytes`、总量 `prefetchTotalMaxBytes`、整段 `prefetchTimeoutMs`，失败/超限/超时降级为清单项）；文件**默认不下载**，清单只给 `message_id / file_key / 类型 / 文件名`，模型需要时调用 `feishu_attachment_fetch` 懒取（图片回 `ImageBlock`，文件流式入库 + `FileBlock` + 只读路径兜底）。富文本（post）消息 `files[]` 里 SDK 归一化会丢的文件也会被恢复并进入清单/预取。**只发附件、不带说明的消息完全静默**：不回复、不建会话、不下载、不加表情，本地不写任何记录。插件不扫描历史去找这类消息：用户需要引用那条消息再提问（多个文件先合并转发再引用），被引用消息的附件进入清单与 fetch 白名单；话题内的附件也可由模型调用 `feishu_topic_messages` 读到并获得授权。
 - **引用与话题历史**：触发消息的 `parent_id` 解析为 `<feishu_quote>` 摘录（单条 ≤400 字符、整块 ≤4k，合并转发展开子消息并标注容器 id），被引用消息的附件同时进入清单与 fetch 白名单；新 Session 首轮自动带最近 `historyBootstrapLimit` 条（默认 10、上限 20、0 关闭）的 `<feishu_history>`（单条 ≤400 字符、整块 ≤8k，排除触发消息与卡片）。更早的消息用 `feishu_topic_messages` 按 `limit`（默认 10、上限 50）与 `cursor` 翻页；读到的消息与附件即获得 fetch 授权。被动读取使用独立的 `promptContextTimeoutMs`（默认 3 s）预算，缺权限/超时/失败时对应块静默省略，回合照常运行（首次降级一条 warn）。
 - **入站附件存储后端与降级矩阵**：`attachmentStore: 'native'`（默认）且宿主挂载 `ctx.attachments`、`feishuTools.attachmentFetch=true`、`acceptAttachments=true` 时走 native 懒取；以下任一条件成立即整体回退旧版 archive（同步下载到工作区 `attachments/`、纯文本 prompt、无清单、不挂 fetch 工具）：显式 `attachmentStore: 'archive'`；宿主未挂载原生附件库（一次性 warn）；`feishuTools.attachmentFetch=false`（文件无法懒取）。`acceptAttachments=false` 时走 archive 的惰性分支：附件消息完全不保存、不触发、不列入清单，混合消息只保留剥离占位符后的文字。`feishu_topic_messages` 两个后端都挂载（archive 下描述会标注附件不可取）。archive 保留旧实现细节：文件流式落盘且文件名前缀 `YYYYMMDD-HHmmss-`，合并转发记录写 `*-forwarded-record.txt`，成功加 `DONE`、失败加 `No` 并回一条纯文字失败提示，>100 MB 文件先探测大小再按 32 MiB `Range` 分块下载；该路径会在会话建立前下载，属于降级而非默认体验。
-- **附件清理与保留**：DSH 原生附件库**永不自动清理，插件也不提供清理入口**（D6；磁盘增长用户已接受）。「目录清理」只删插件创建的过期话题工作目录与旧版话题工作区，**用户工作区永不删除、Session 日志与事件永不删除**；native 附件在原生库中，不受目录清理影响。若显式使用 archive，`attachments/` 副本位于话题目录，会随目录清理一起删除。旧 `_staging` 目录**显式排除在目录清理之外**（避免误删待迁入的遗留附件）；v2 主路径不再写 `_staging`，仅对旧版遗留文件做一次性迁入（成功时一条 warn），按 D12 在 v2 发布后的下一个 minor 版本移除。切换到 native 后，历史话题里的旧 archive 附件目录不会被新会话枚举，但 Session 历史仍可按原路径读取。
+- **附件与目录保留**：DSH 原生附件库**永不自动清理，插件也不提供清理入口**（D6；磁盘增长用户已接受）。插件同样不删除工作区、话题目录、`_staging` 与 Session 日志；archive 后端的 `attachments/` 副本位于话题目录，随运维手动删除目录一起删除。v2 主路径不再写 `_staging`，仅对旧版遗留文件做一次性迁入（成功时一条 warn），按 D12 在 v2 发布后的下一个 minor 版本移除。切换到 native 后，历史话题里的旧 archive 附件目录不会被新会话枚举，但 Session 历史仍可按原路径读取。
 - **三类会话行为矩阵（v2）**：
 
   | 场景 | 私聊 | 对话群（未 @） | 对话群（@） | 已绑定话题（无 @） |
@@ -349,7 +344,7 @@ FEISHU_APP_SECRET: xxxxxxxx
 - **重启恢复**：路由表持久化在 `storageDomain`；消息到达时 `ctx.agents.resume()` 懒恢复 session。若会话已被其他 owner 恢复为 live（如 Web UI 打开过该会话、并发冷恢复竞态），插件**借用**该 live agent 直接 `followup()`，不再报 "cannot prepare session … while it is live"。借用的 agent 不归插件 dispose；shutdown 与在途 resume 竞态时，刚发布的 agent 会被立即 dispose 以避免泄漏进下一实例的 live 注册表。
 - **重启修复（流式中断）**：每条正在流式的 turn 会把自己的修复凭据（trigger 消息、Typing reaction id、全部段卡 id）写入 `channels_routes` 域的 `inflight` 表（键 = 主卡 message id，turn 结束即删）。重启后长连接一建立，插件就把上一实例留下的中途卡片 patch 成「⚠️ 服务已重启，本次回复中断，请重新发送消息。」终态并补 DONE 表情；patch 失败重试一次（上限 2 次）后放弃。持久化盘点与缺口清单见 [docs/persistence.md](docs/persistence.md)。
 - **消息去重（WS 重投幂等）**：飞书长连接重连会重投未 ack 的事件；每条消息在任何副作用之前先落一条 `processed` 记录（键 = message id，飞书全局唯一），重投消息被直接丢弃——同进程靠内存守卫、跨重启靠持久化记录，每条消息至多处理一次。记录保留 24 小时后由 GC 清扫。
-- **路由表 GC 与过期话题拒绝**：超过 `routeTtlMs`（默认 30 天）无活动的真实话题路由会先写入最小持久化墓碑，再删除活动路由；此后该话题中的普通消息和 Session 命令会收到「话题已过期」提示，插件不会恢复旧 Session，也不会在可见历史仍属于旧 Session 的话题里新建 Session（`/help`、`/userid`、`/groupid`、`/health` 仍可用）。墓碑跨重启保留，仅含 thread/chat/owner/工作区路径/会话目录/最后活动时间；旧 DSH Session 与日志不删除，话题目录仅在「目录清理」显式启用时按保留期删除（用户工作区永不删除）。降级的 chat-scoped 路由没有独立话题边界，仍直接清理。陈年 in-flight 快照同时在启动时及每 6 小时清扫。`routeTtlMs: 0` 关闭后续路由过期处理，已产生的墓碑仍保持拒绝语义。
+- **路由表 GC 与过期话题拒绝**：超过 `routeTtlMs`（默认 30 天）无活动的真实话题路由会先写入最小持久化墓碑，再删除活动路由；此后该话题中的普通消息和 Session 命令会收到「话题已过期」提示，插件不会恢复旧 Session，也不会在可见历史仍属于旧 Session 的话题里新建 Session（`/help`、`/userid`、`/groupid`、`/health` 仍可用）。墓碑跨重启保留，仅含 thread/chat/owner/工作区路径/会话目录/最后活动时间；旧 DSH Session、日志与话题目录都不删除。降级的 chat-scoped 路由没有独立话题边界，仍直接清理。陈年 in-flight 快照同时在启动时及每 6 小时清扫。`routeTtlMs: 0` 关闭后续路由过期处理，已产生的墓碑仍保持拒绝语义。
 - **准入与授权**：`accessMode: 'guarded'`（默认）下，入站先过频道准入：**管理员不受任何白名单限制**，私聊/任意群聊（含未授权群）都可直接开会话；**非管理员**私聊回固定提示（`/userid` 例外），群聊要求 **群在白名单** 且 **open_id 在全局用户白名单**，两者缺一不可。未授权消息不建 Session、不建话题目录、不落附件、不调模型；群里静默、私聊回固定文案。机器人被拉进任意群时（订阅 `im.chat.member.bot.added_v1`），插件私聊管理员发群信息卡（群名/`chat_id`/成员数/邀请人），未授权群附「授权本群 / 忽略」按钮；已授权群里未授权用户 @ 机器人时，管理员会收到用户授权申请卡（含昵称/open_id）。授权状态持久化在 `channels_routes` 域的 `access_groups` / `access_users` / `access_requests` 表，撤销立即生效。管理员 open_id 在 Web 面板配置；`/auth` 命令、授权卡、面板三种入口等价。
 - **HITL 审批**：插件以 `prepend: true` 注册为宿主 `approval/request` 瀑布的应答者——本频道路由的 session 的审批请求**优先于** Web 网关的通用应答（其面板对飞书用户不可见），非本频道的请求原样 `next()` 交给其他应答者。审批卡是**独立消息**（锚定到该 session 最新流式卡、同话题），绝不嵌入流式卡（其全量替换 patch 会冲掉按钮）。待审批时允许/拒绝按钮以两列等宽方式排列在同一行；决策仅在会话发起人点击时生效：允许 → `allowed-once`、拒绝 → `rejected`、超时 → `rejected`（fail-closed，卡面显示「已超时」）、请求被撤回（abort）→ `cancelled`、卡片发送失败 → `unavailable`（fail-closed）；每次决策后卡片更新为终态并移除两个按钮。审批记录（`approval/asked`/`decided`）由宿主会话日志负责，插件不做持久化——重启后遗留问题随 turn 消亡，与 Web 网关一致。需要飞书应用订阅 **card.action.trigger** 回调（见「飞书侧准备」）；启动日志 `HITL 审批应答已就绪` 表示生效，`主机未挂载 approval 服务` 表示该部署未启用 HITL。
 - **终态与表情**：成功轮的面板标题变为「回复结束」（无推理内容时不渲染面板），并把 `Typing` 换成 `DONE`；`turn/end.kind = error` 时面板标题为「回复失败」（同样仅当有推理内容），错误只在正文出现一次（`❌ **本轮运行失败**` + 结构化错误消息与错误码），并把 `Typing` 换成 `No`。模型/推理强度/本轮缓存样本不会继承上一轮。
@@ -362,10 +357,10 @@ FEISHU_APP_SECRET: xxxxxxxx
 - **v2 附件（图片预取的等待窗口）**：卡片、话题与会话先建立，但首轮 `followup` 会等图片预取（默认整段 ≤10 s，`prefetchTimeoutMs` 可调）；这是“首轮图片直接可见”与首字延迟之间的取舍，慢网下可调小或关闭 `prefetchImages`。不做后台预取/预下载。
 - **v2 附件（文件懒取依赖模型调用）**：文件默认不在 prompt 里，模型必须主动调用 `feishu_attachment_fetch`；插件用清单“未加载”措辞、工具描述与 guidance 收敛漏调风险，但不做预下载兜底（决定 D4）。
 - **v2 附件（授权白名单进程内）**：每 route 的已知消息 LRU 上限 128，进程重启后白名单清空；本人在本话题（会话级路由为聊天主线）发的消息由 fetch 工具回读飞书校验后仍可授权；话题之间不互通；他人的引用/历史消息需要重新出现在引用或历史中才可取。附件密集翻页仍可能挤掉更早条目。
-- **v2 附件（清理与保留）**：DSH 原生附件库不可自动清理、插件不提供清理入口，磁盘随使用增长；「目录清理」只回收工作区与 Agent 产物（archive 副本位于话题目录会随目录删除）。旧 `_staging` 仅一次性迁入兼容（成功时 warn）、不受目录清理，按 D12 在 v2 发布后的下一个 minor 版本移除。
+- **v2 附件（清理与保留）**：DSH 原生附件库不可自动清理、插件不提供清理入口，磁盘随使用增长；插件也不删除工作区与话题目录，需要时由运维手动删除。旧 `_staging` 仅一次性迁入兼容（成功时 warn），按 D12 在 v2 发布后的下一个 minor 版本移除。
 - **v2 附件（未触发的附件需要引用）**：只发附件、不带文字的消息不登记、也不在下一轮自动列出；“先发文件、再单独提问”而不引用时模型看不到该文件。私聊与普通群需要引用那条消息（多个文件可合并转发后引用）；话题内模型还可以用 `feishu_topic_messages` 读到。首次私聊引导卡写明了这一用法。
 - **v2 附件（权限降级）**：缺 `im:message:readonly` / `im:message.group_msg` 时引用摘录与首轮历史静默省略（首次一条 warn），显式调用 `feishu_topic_messages` 返回可读 `PERMISSION_DENIED`；普通对话不受影响。入群前历史只保证“机器人可见范围”。
-- **v2 附件（升级连续性）**：旧 archive 部署切到 native 后，历史话题里已有的 `attachments/` 不会被新会话枚举；Session 历史仍可按原路径读取，旧目录由保留期清理回收。
+- **v2 附件（升级连续性）**：旧 archive 部署切到 native 后，历史话题里已有的 `attachments/` 不会被新会话枚举；Session 历史仍可按原路径读取，旧目录可手动删除。
 - **`/renew` 的会话语义**：同一话题内新建 Session 沿用话题目录、复用附件；但新 Session 首轮不注入 `<feishu_history>`（仅 `startSession` 路径注入首轮历史，当前语义保留，若产品期望“新会话即带话题历史”需另行确认）。
 - **degraded 群会话的读取容器**：话题创建失败降级为 chat 路由后，其容器是整群主时间线——同群他人主时间线消息可被读取/登记（topic 消息已明确拒绝）；是否按 sender 进一步收紧待产品确认。
 - **合并转发读取有界**：单条读取子消息超过 50 条时截断（summary 标注数量）、无翻页；工具输出渲染上限 50 行 / 12k 字符。

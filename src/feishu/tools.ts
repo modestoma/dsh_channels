@@ -538,15 +538,15 @@ export class AttachmentFetchToolRuntime {
     }
   }
 
-  /** Drop the whitelist entries of one retired route (record GC / cleanup). */
+  /** Drop the whitelist entries of one retired route (record GC). */
   forgetRoute(routeKey: string): void {
     this.whitelist.forget(routeKey)
   }
 
   /**
    * Drop whitelist routes that no longer resolve as active route records. The
-   * inbound TTL path retires a thread route without going through the service
-   * cleanup callback, so the periodic GC reconciles the whitelist afterwards.
+   * inbound TTL path retires a thread route without calling `forgetRoute`, so
+   * the periodic GC reconciles the whitelist afterwards.
    * @returns number of route buckets dropped.
    */
   pruneRoutes(stillActive: (routeKey: string) => boolean): number {

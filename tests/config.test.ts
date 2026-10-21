@@ -32,6 +32,12 @@ describe('resolveConfig', () => {
     expect(config.reasoningEffort).toBeUndefined()
   })
 
+  it('ignores the removed workspace-retention keys in older profiles', () => {
+    const config = resolveConfig({ workspaceRetention: '30d', workspaceRetentionAuto: true })
+    expect(config).not.toHaveProperty('workspaceRetention')
+    expect(config).not.toHaveProperty('workspaceRetentionAuto')
+  })
+
   it('accepts an optional agentPreset id', () => {
     const config = resolveConfig({
       appId: 'FEISHU_APP_ID',

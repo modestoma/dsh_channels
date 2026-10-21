@@ -11,8 +11,9 @@
  * The per-topic directory is where the tools actually work (see
  * `./session/isolation.ts`), so files produced by different topics never mix.
  * Older versions registered one workspace per topic under `<baseDir>/topics/`;
- * those directories are kept verbatim for legacy routes and are only removed
- * by the retention cleanup, never migrated.
+ * those directories are kept verbatim for legacy routes and never migrated.
+ * The plugin never deletes workspace or topic directories; operators remove
+ * stale ones by hand (a missing topic directory is recreated on the next turn).
  *
  * Attachments received before a topic exists were staged by older plugin
  * versions below `<baseDir>/_staging/<chatType>/<chat_id>/<open_id>/` and
@@ -169,19 +170,10 @@ export function topicDirFor(workspacePath: string, topicToken: string): string {
 }
 
 /**
- * Root of the legacy (one workspace per topic) directories. Legacy workspaces
- * live strictly below this path, which is how the retention cleanup tells them
- * apart from user workspaces that must never be deleted.
- */
-export function legacyTopicWorkspaceRoot(baseDir: string): string {
-  return path.join(baseDir, 'topics')
-}
-
-/**
  * Legacy pre-topic attachment staging root.
  *
- * Only older plugin versions wrote here; the v2 native pipeline never does and
- * the retention cleanup never deletes it. Scheduled for removal together with
+ * Only older plugin versions wrote here; the v2 native pipeline never does.
+ * Scheduled for removal together with
  * the one-time adoption in the release cycle after attachment_pipeline_v2
  * (decisions D12).
  *

@@ -41,7 +41,7 @@ export type * from './questions.ts'
 export type * from './settings/contract.ts'
 export * from './access/index.ts'
 export type { AccessGroupRecord, AccessRequestRecord, AccessUserRecord } from './domain.ts'
-export { CATALOG_ROUTE, CLEANUP_ROUTE, CONFIG_ROUTE, CREDENTIALS_ROUTE, EDITABLE_KEYS, PANEL_COPY, PANEL_ROUTE, PICK_DIRECTORY_ROUTE, RECONNECT_ROUTE, RESTART_KEYS, STATUS_ROUTE } from './settings/contract.ts'
+export { CATALOG_ROUTE, CONFIG_ROUTE, CREDENTIALS_ROUTE, EDITABLE_KEYS, PANEL_COPY, PANEL_ROUTE, PICK_DIRECTORY_ROUTE, RECONNECT_ROUTE, RESTART_KEYS, STATUS_ROUTE } from './settings/contract.ts'
 export type { PickDirectoryResponse } from './settings/contract.ts'
 export { defaultOverlayPath, mergeOverlay, normalizeOverlay, OverlayStore, parseOverlay, pickEditable, resolveDshHome } from './settings/overlay.ts'
 export { applyCatalog, emptyCatalog, FIELD_DESCRIPTORS, normalizeCredentialValue, readOnlyFields, SettingsSurface, withDirectoryBrowse } from './settings/surface.ts'
@@ -63,7 +63,7 @@ export { createLogicalSessionExport, DSH_CHANNELS_VERSION, LOGICAL_EXPORT_FORMAT
 export { addUsage, applyProjectionViews, averageDecodeTokensPerSecond, averageTtftMs, cacheHitPct, EMPTY_TOTALS, foldAll, foldEvent, foldSessionStats, measureSessionContext, readProjectionViews, usageFromBuckets } from './stats.ts'
 export { FeishuService } from './service.ts'
 export { TurnStreamer } from './streamer.ts'
-export { ensureWorkspace, legacyTopicWorkspaceRoot, stagingPathFor, stagingRoot, topicDirFor, topicTokenFor, workspacePathFor, workspaceTitleFor, worktreeBranchFor } from './workspaces.ts'
+export { ensureWorkspace, stagingPathFor, stagingRoot, topicDirFor, topicTokenFor, workspacePathFor, workspaceTitleFor, worktreeBranchFor } from './workspaces.ts'
 export { accessGroupRecordSchema, accessRequestRecordSchema, accessUserRecordSchema, appendSessionHistory, chatRouteKey, expiredRouteRecordSchema, feishuDomain, normalizeRouteRecord, normalizeSessionHistory, routeRecordSchema, sessionDirOf, sessionHistoryEntrySchema, inflightSnapshotSchema, processedRecordSchema } from './domain.ts'
 
 /** Cordis function-plugin name. */

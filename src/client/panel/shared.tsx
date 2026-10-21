@@ -13,7 +13,6 @@ import { FIELD_GROUP_LABELS, PANEL_COPY, TAB_FIELD_GROUPS } from '../../settings
 import type {
   AccessWire,
   ChannelPhaseWire,
-  CleanupPreviewWire,
   ConfigValue,
   CredentialField,
   EditableFieldWire,
@@ -46,7 +45,6 @@ export type BusyAction =
   | 'reconnect'
   | 'credentials'
   | 'credentials-clear'
-  | 'cleanup'
   | 'access'
 
 /** Tone of a small badge; maps onto `dsh-channels-cfg__badge--*` classes. */
@@ -54,20 +52,6 @@ export type BadgeTone = 'ok' | 'warn' | 'bad' | 'muted'
 
 export function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
-}
-
-/** Human-readable byte size for the cleanup preview/result (base-2 units). */
-export function formatBytes(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B'
-  const units = ['B', 'KB', 'MB', 'GB', 'TB']
-  let value = bytes
-  let unit = 0
-  while (value >= 1024 && unit < units.length - 1) {
-    value /= 1024
-    unit += 1
-  }
-  const digits = unit === 0 || value >= 10 ? 0 : 1
-  return `${value.toFixed(digits)} ${units[unit] ?? 'B'}`
 }
 
 /** Compact duration for the connection card. */
@@ -478,11 +462,4 @@ export function connectionStateLabel(state: string | undefined): { text: string;
     case 'idle': return { text: PANEL_COPY.phaseIdle, tone: 'muted' }
     default: return { text: state ?? PANEL_COPY.unknownValue, tone: 'muted' }
   }
-}
-
-/** Retention label, reusing the Host field options so the copy stays on the Host. */
-export function retentionLabel(panel: PanelWire, cleanup: CleanupPreviewWire): string {
-  const field = panel.config.fields.find(item => item.key === 'workspaceRetention')
-  return field?.options?.find(option => option.value === cleanup.retention)?.label
-    ?? (cleanup.retention === 'off' ? PANEL_COPY.cleanupRetentionOff : cleanup.retention)
 }

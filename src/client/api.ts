@@ -11,7 +11,6 @@ import {
   ACCESS_ROUTE,
   ACCESS_USERS_ROUTE,
   CATALOG_ROUTE,
-  CLEANUP_ROUTE,
   CONFIG_ROUTE,
   CREDENTIALS_ROUTE,
   PANEL_ROUTE,
@@ -24,7 +23,6 @@ import type {
   AccessWire,
   CatalogWire,
   ChannelStatusWire,
-  CleanupResponse,
   ClearConfigResponse,
   ClearCredentialResponse,
   CredentialField,
@@ -141,24 +139,6 @@ export async function reconnect(): Promise<ReconnectResponse> {
     }
   }
   return JSON.parse(text) as ReconnectResponse
-}
-
-/**
- * Run one workspace cleanup. No request body: the Host derives the candidate
- * set from the effective retention config. Irreversible, so the caller asks
- * for confirmation first; partial failures come back inside `result.failures`.
- */
-export async function runCleanup(): Promise<CleanupResponse> {
-  const response = await request(CLEANUP_ROUTE, { method: 'POST' })
-  const text = await response.text()
-  if (!response.ok) {
-    try {
-      return JSON.parse(text) as CleanupResponse
-    } catch {
-      return { ok: false, error: errorFromBody(response.status, text) }
-    }
-  }
-  return JSON.parse(text) as CleanupResponse
 }
 
 /**

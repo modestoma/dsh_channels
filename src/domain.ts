@@ -88,8 +88,7 @@ export const expiredRouteRecordSchema = z.object({
    *  older plugin versions, so the field must stay optional. */
   workspacePath: z.string().min(1).optional(),
   /** Effective working directory the retired route's Session used; absent in
-   *  legacy tombstones (retention cleanup then treats `workspacePath` as the
-   *  directory, matching pre-v2 routes). */
+   *  legacy tombstones, where `workspacePath` was the directory (pre-v2 routes). */
   sessionDir: z.string().min(1).optional(),
   /** Git branch of that directory when it was a worktree checkout. */
   worktreeBranch: z.string().min(1).optional(),
