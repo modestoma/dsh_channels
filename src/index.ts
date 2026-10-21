@@ -105,9 +105,10 @@ export function apply(ctx: HostContext, config?: unknown): void {
   const resolved = resolveConfig(config)
   const factory: ChannelFactory = (config as FeishuPluginOptions | undefined)?.channelFactory
     ?? defaultChannelFactory
-  // Web settings overlay (optional file; degrades to "no overrides").
+  // Web settings overlay at `$DSH_HOME/dsh-channels/settings.json` (optional
+  // file; degrades to "no overrides").
   const overlay = new OverlayStore(
-    resolved.settingsFile ?? defaultOverlayPath(),
+    defaultOverlayPath(),
     { warn: (message, ...args) => ctx.logger?.warn?.(message, ...args) },
   )
   const service = new FeishuService(ctx, resolved, factory, undefined, overlay)

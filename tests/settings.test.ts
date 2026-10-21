@@ -1863,10 +1863,11 @@ describe('apply() web wiring', () => {
     } as unknown as HostContext
 
     const channel = makeChannel()
+    const dshHome = mkdtempSync(path.join(tmpdir(), 'dsh-channels-home-'))
+    vi.stubEnv('DSH_HOME', dshHome)
     apply(ctx, {
       appId: 'FEISHU_APP_ID',
       appSecret: 'FEISHU_APP_SECRET',
-      settingsFile: tempOverlayFile(),
       baseDir: mkdtempSync(path.join(tmpdir(), 'dsh-channels-apply-')),
       channelFactory: () => channel,
     })
@@ -1903,8 +1904,11 @@ describe('apply() web wiring', () => {
       body: JSON.stringify({ values: { requireMention: false } }),
     }))
     expect(saved.status).toBe(200)
+    expect(JSON.parse(readFileSync(path.join(dshHome, 'dsh-channels', 'settings.json'), 'utf8')))
+      .toMatchObject({ requireMention: false })
 
     for (const cleanup of cleanups.reverse()) await cleanup()
+    vi.unstubAllEnvs()
   })
 })
 

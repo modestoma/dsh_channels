@@ -38,6 +38,11 @@ describe('resolveConfig', () => {
     expect(config).not.toHaveProperty('workspaceRetentionAuto')
   })
 
+  it('ignores the removed settingsFile key in older profiles', () => {
+    const config = resolveConfig({ settingsFile: '/custom/path/settings.json' })
+    expect(config).not.toHaveProperty('settingsFile')
+  })
+
   it('accepts an optional agentPreset id', () => {
     const config = resolveConfig({
       appId: 'FEISHU_APP_ID',
