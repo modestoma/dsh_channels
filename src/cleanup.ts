@@ -28,11 +28,17 @@
  * A directory with no usable activity evidence at all (missing/unreadable) is
  * never offered for deletion: irreversible removal requires positive evidence.
  *
+ * Scope boundary (attachment_pipeline_v2, decisions D6/D12): cleanup only
+ * removes workspace / Agent-artifact directories. Inbound attachments are not
+ * workspace files — the native backend keeps them in the DSH attachment
+ * library, and the legacy `_staging` adoption area is explicitly excluded so a
+ * pending one-time adoption can never be destroyed by a retention sweep.
+ *
  * @module dsh-channels/cleanup
  */
 
 import path from 'node:path'
-import { legacyTopicWorkspaceRoot } from './workspaces.ts'
+import { legacyTopicWorkspaceRoot, stagingRoot } from './workspaces.ts'
 
 /** Values the `workspaceRetention` config accepts. `off` disables cleanup. */
 export const WORKSPACE_RETENTION_VALUES = ['off', '7d', '30d', '90d', '180d'] as const
@@ -330,6 +336,7 @@ export async function planWorkspaceCleanup(deps: CleanupDeps): Promise<CleanupPl
     return undefined
   }
   const legacyRoot = legacyTopicWorkspaceRoot(baseDir)
+  const stagingDir = stagingRoot(baseDir)
 
   const now = deps.now?.() ?? Date.now()
   const cutoff = now - window
@@ -414,6 +421,8 @@ export async function planWorkspaceCleanup(deps: CleanupDeps): Promise<CleanupPl
     if (isFilesystemRoot(resolved)) return false
     if (!isPathInside(baseDir, resolved)) return false
     if (resolved === legacyRoot || isPathInside(legacyRoot, resolved)) return false
+    // Legacy pre-topic staging (one-time adoption area): never a cleanup target.
+    if (resolved === stagingDir || isPathInside(stagingDir, resolved)) return false
     if (userWorkspacePaths.has(resolved)) return false
     return true
   }
@@ -486,6 +495,7 @@ export async function applyWorkspaceCleanup(
   const baseDir = path.resolve(deps.baseDir)
   const baseDirIsRoot = isFilesystemRoot(baseDir)
   const legacyRoot = legacyTopicWorkspaceRoot(baseDir)
+  const stagingDir = stagingRoot(baseDir)
   const registered = new Set(
     (await deps.listWorkspaces())
       .filter(workspace => pluginWorkspaceTitle(workspace.title))
@@ -503,9 +513,10 @@ export async function applyWorkspaceCleanup(
     // Defense in depth: never trust a plan object for the destructive step.
     const insideBase = !baseDirIsRoot && isPathInside(baseDir, targetPath)
     const inLegacyRoot = isPathInside(legacyRoot, targetPath)
+    const inStaging = isPathInside(stagingDir, targetPath)
     const valid = target.kind === 'workspace'
       ? insideBase && inLegacyRoot
-      : insideBase && !inLegacyRoot && !registered.has(path.resolve(targetPath))
+      : insideBase && !inLegacyRoot && !inStaging && !registered.has(path.resolve(targetPath))
     if (!valid) {
       failures.push({ path: targetPath, message: 'refused: path is not a cleanable plugin directory' })
       continue

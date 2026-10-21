@@ -3,7 +3,7 @@
  * routes, and FeishuService config hot-apply / reconnect integration.
  */
 
-import { mkdtempSync, statSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import path from 'node:path'
 import { Readable } from 'node:stream'
@@ -46,13 +46,18 @@ import type {
 } from '../src/settings/contract.ts'
 import {
   OverlayStore,
+  configValueOf,
   defaultOverlayPath,
+  deleteOverlayKey,
   mergeOverlay,
+  mergeOverlayPatch,
   normalizeOverlay,
+  overlayValues,
   parseOverlay,
   pickEditable,
   resolveDshHome,
 } from '../src/settings/overlay.ts'
+import type { OverlayPatch } from '../src/settings/overlay.ts'
 import {
   FIELD_DESCRIPTORS,
   SettingsSurface,
@@ -113,7 +118,7 @@ class FakeTarget implements SettingsTarget {
     appSecret: { configured: true, writable: true, source: 'file' },
   }
   credentialCalls: Array<{ field: string; value?: string }> = []
-  applied: Partial<FeishuConfig> | undefined
+  applied: OverlayPatch | undefined
   restartCalls = 0
   connectCalls = 0
   connecting = false
@@ -186,9 +191,9 @@ class FakeTarget implements SettingsTarget {
     return this.running === undefined ? undefined : { ...this.running }
   }
 
-  applyOverlay(overlay: Partial<FeishuConfig>): void {
+  applyOverlay(overlay: OverlayPatch): void {
     this.applied = overlay
-    this.config = { ...this.base, ...overlay }
+    this.config = mergeOverlay(this.base, overlay)
   }
 
   async restart(): Promise<void> {
@@ -407,11 +412,82 @@ describe('overlay paths and validation', () => {
     await expect(prepareWorkspaceBaseDir(occupied)).resolves.toMatch(/不是目录|无法创建工作区目录/)
   })
 
-  it('merges over the profile config and keeps empty optional text out of the overlay', () => {    const base = makeConfig({ provider: 'deepseek-official' })
+  it('merges over the profile config and keeps empty optional text out of the overlay', () => {
+    const base = makeConfig({ provider: 'deepseek-official' })
     const merged = mergeOverlay(base, normalizeOverlay({ provider: '', dmMode: 'disabled' }))
     expect(merged.provider).toBe('deepseek-official')
     expect(merged.dmMode).toBe('disabled')
     expect(pickEditable(merged).dmMode).toBe('disabled')
+  })
+
+  it('validates nested feishuTools keys and stores only the edited sub-fields', () => {
+    const ok = parseOverlay({
+      dmMode: 'disabled',
+      feishuTools: { attachmentFetch: false, attachmentFetchTimeoutMs: 60_000 },
+    })
+    expect(ok.ok).toBe(true)
+    if (!ok.ok) return
+    expect(ok.patch).toEqual({
+      dmMode: 'disabled',
+      feishuTools: { attachmentFetch: false, attachmentFetchTimeoutMs: 60_000 },
+    })
+
+    // Canonical schema defaults must not leak into the overlay.
+    const single = parseOverlay({ feishuTools: { topicMessages: false } })
+    expect(single.ok).toBe(true)
+    if (!single.ok) return
+    expect(single.patch).toEqual({ feishuTools: { topicMessages: false } })
+
+    const invalid = parseOverlay({
+      feishuTools: { topicMessagesTimeoutMs: 10, attachmentFetchMaxResources: 0 },
+    })
+    expect(invalid.ok).toBe(false)
+    if (invalid.ok) return
+    expect(invalid.issues.map(issue => issue.path)).toEqual(expect.arrayContaining([
+      'feishuTools.topicMessagesTimeoutMs',
+      'feishuTools.attachmentFetchMaxResources',
+    ]))
+
+    const notObject = parseOverlay({ feishuTools: 'yes' })
+    expect(notObject.ok).toBe(false)
+    if (notObject.ok) return
+    expect(notObject.issues.map(issue => issue.path)).toContain('feishuTools')
+  })
+
+  it('merges nested feishuTools over the profile config without dropping sibling keys', () => {
+    const base = makeConfig({ attachmentStore: 'native' })
+    const merged = mergeOverlay(base, { feishuTools: { attachmentFetch: false } })
+    expect(merged.feishuTools.attachmentFetch).toBe(false)
+    expect(merged.feishuTools.topicMessages).toBe(true)
+    expect(merged.feishuTools.attachmentFetchMaxBytes).toBe(base.feishuTools.attachmentFetchMaxBytes)
+    expect(configValueOf(merged, 'feishuTools.attachmentFetch')).toBe(false)
+    expect(configValueOf(merged, 'attachmentStore')).toBe('native')
+
+    // A pre-v2 overlay (flat keys only) still validates, and every new key
+    // falls back to the profile/default layer.
+    const old = normalizeOverlay({ requireMention: false, workspaceRetention: '30d' })
+    const migrated = mergeOverlay(base, old)
+    expect(migrated.requireMention).toBe(false)
+    expect(migrated.attachmentStore).toBe('native')
+    expect(migrated.prefetchImages).toBe(true)
+    expect(migrated.pendingAttachmentLimit).toBe(base.pendingAttachmentLimit)
+    expect(migrated.feishuTools.attachmentFetch).toBe(true)
+  })
+
+  it('deep-merges and clears nested overlay keys', () => {
+    const first = normalizeOverlay({ feishuTools: { attachmentFetch: false, topicMessages: false } })
+    const second = normalizeOverlay({ feishuTools: { attachmentFetch: true } })
+    const merged = mergeOverlayPatch(first, second)
+    expect(merged.feishuTools).toEqual({ attachmentFetch: true, topicMessages: false })
+    deleteOverlayKey(merged, 'feishuTools.topicMessages')
+    expect(merged.feishuTools).toEqual({ attachmentFetch: true })
+    deleteOverlayKey(merged, 'feishuTools.attachmentFetch')
+    expect(merged.feishuTools).toBeUndefined()
+    // Wire projection uses the flat dotted key space the form renders.
+    expect(overlayValues(first)).toEqual({
+      'feishuTools.attachmentFetch': false,
+      'feishuTools.topicMessages': false,
+    })
   })
 })
 
@@ -427,6 +503,19 @@ describe('OverlayStore', () => {
     await expect(store.load()).resolves.toEqual({ requireMention: false, refreshMs: 750 })
     await store.clear()
     await expect(store.load()).resolves.toEqual({})
+  })
+
+  it('round-trips nested feishuTools overrides in the hand-editable nested shape', async () => {
+    const file = tempOverlayFile()
+    const store = new OverlayStore(file)
+    await store.save({ feishuTools: { attachmentFetch: false, attachmentFetchMaxBytes: 2048 } })
+    await expect(store.load()).resolves.toEqual({
+      feishuTools: { attachmentFetch: false, attachmentFetchMaxBytes: 2048 },
+    })
+    // The file mirrors the profile config shape, so an operator can edit it by hand.
+    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({
+      feishuTools: { attachmentFetch: false, attachmentFetchMaxBytes: 2048 },
+    })
   })
 
   it('degrades corrupt or schema-invalid files with a warning', async () => {
@@ -543,6 +632,62 @@ describe('field descriptors', () => {
       group: 'content',
       restartRequired: false,
     })
+  })
+
+  it('describes the v2 attachment pipeline and model-tool fields with bounds', () => {
+    const byKey = new Map(FIELD_DESCRIPTORS.map(field => [field.key, field]))
+    const store = byKey.get('attachmentStore')
+    expect(store).toMatchObject({ kind: 'select', group: 'content', restartRequired: false })
+    expect(store?.options?.map(option => option.value)).toEqual(['native', 'archive'])
+    expect(store?.options?.find(option => option.value === 'native')?.label).toContain('原生')
+    expect(store?.help).toContain('不可变')
+
+    expect(byKey.get('prefetchImages')).toMatchObject({ kind: 'boolean', group: 'content' })
+    expect(byKey.get('prefetchTimeoutMs')).toMatchObject({
+      kind: 'number', group: 'content', min: 100, max: 120_000,
+    })
+    expect(byKey.get('prefetchImageMaxBytes')).toMatchObject({ kind: 'number', min: 1 })
+    expect(byKey.get('prefetchTotalMaxBytes')).toMatchObject({ kind: 'number', min: 1 })
+    expect(byKey.get('pendingAttachmentTtlMs')).toMatchObject({ kind: 'number', min: 0 })
+    expect(byKey.get('pendingAttachmentLimit')).toMatchObject({ kind: 'number', min: 1, max: 100 })
+    expect(byKey.get('historyBootstrapLimit')).toMatchObject({ kind: 'number', min: 0, max: 20 })
+    expect(byKey.get('promptContextTimeoutMs')).toMatchObject({ kind: 'number', group: 'tools' })
+    expect(byKey.get('feishuTools.attachmentFetch')).toMatchObject({
+      kind: 'boolean', group: 'tools', restartRequired: false,
+    })
+    expect(byKey.get('feishuTools.attachmentFetchMaxResources')).toMatchObject({
+      kind: 'number', min: 1, max: 50,
+    })
+    expect(byKey.get('feishuTools.attachmentFetchMaxBytes')).toMatchObject({ kind: 'number', min: 1 })
+    expect(byKey.get('feishuTools.attachmentFetchTimeoutMs')).toMatchObject({
+      kind: 'number', min: 1_000, max: 600_000,
+    })
+    expect(byKey.get('feishuTools.topicMessages')).toMatchObject({ kind: 'boolean', group: 'tools' })
+    expect(byKey.get('feishuTools.topicMessagesTimeoutMs')).toMatchObject({
+      kind: 'number', min: 1_000, max: 120_000,
+    })
+    // Every new descriptor renders under the「会话与行为」tab.
+    const toolOrContent = new Set([
+      'attachmentStore', 'prefetchImages', 'prefetchTimeoutMs', 'pendingAttachmentTtlMs',
+      'historyBootstrapLimit', 'feishuTools.attachmentFetch', 'feishuTools.topicMessages',
+    ])
+    for (const field of FIELD_DESCRIPTORS) {
+      if (!toolOrContent.has(field.key)) continue
+      expect(TAB_FIELD_GROUPS.sessions).toContain(field.group)
+    }
+  })
+
+  it('describes the cleanup boundary as workspace/agent artifacts only', () => {
+    expect(PANEL_COPY.cleanupCardHelp).toContain('只清理工作区与 Agent 产物')
+    expect(PANEL_COPY.cleanupCardHelp).toContain('不影响 Session 附件')
+    expect(PANEL_COPY.cleanupConfirm).toContain('不影响 Session 附件')
+    expect(PANEL_COPY.cleanupConfirm).toContain('不可恢复')
+    expect(PANEL_COPY.workspaceTabHelp).toContain('原生附件库')
+
+    const byKey = new Map(FIELD_DESCRIPTORS.map(field => [field.key, field]))
+    expect(byKey.get('workspaceRetention')?.help).toContain('不影响 Session 附件')
+    expect(byKey.get('workspaceRetentionAuto')?.help).toContain('不影响 Session 附件')
+    expect(byKey.get('acceptAttachments')?.help).toContain('原生附件库')
   })
 })
 
@@ -942,6 +1087,65 @@ describe('SettingsSurface', () => {
     expect(invalid.ok).toBe(false)
     if (invalid.ok) return
     expect(invalid.issues?.map(issue => issue.key)).toContain('workspaceRetention')
+  })
+
+  it('saves the v2 attachment pipeline fields, including nested feishuTools keys', async () => {
+    const { surface, target, store } = makeSurface()
+    const result = await surface.save({
+      attachmentStore: 'archive',
+      prefetchImages: false,
+      prefetchTimeoutMs: 5_000,
+      prefetchImageMaxBytes: 1024,
+      prefetchTotalMaxBytes: 4096,
+      historyBootstrapLimit: 3,
+      pendingAttachmentTtlMs: 0,
+      pendingAttachmentLimit: 5,
+      promptContextTimeoutMs: 1_500,
+      'feishuTools.attachmentFetch': false,
+      'feishuTools.attachmentFetchMaxResources': 4,
+      'feishuTools.attachmentFetchMaxBytes': 2048,
+      'feishuTools.attachmentFetchTimeoutMs': 30_000,
+      'feishuTools.topicMessages': false,
+      'feishuTools.topicMessagesTimeoutMs': 15_000,
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    // The overlay file keeps the nested profile shape; untouched siblings stay out.
+    await expect(store.load()).resolves.toEqual({
+      attachmentStore: 'archive',
+      prefetchImages: false,
+      prefetchTimeoutMs: 5_000,
+      prefetchImageMaxBytes: 1024,
+      prefetchTotalMaxBytes: 4096,
+      historyBootstrapLimit: 3,
+      pendingAttachmentTtlMs: 0,
+      pendingAttachmentLimit: 5,
+      promptContextTimeoutMs: 1_500,
+      feishuTools: {
+        attachmentFetch: false,
+        attachmentFetchMaxResources: 4,
+        attachmentFetchMaxBytes: 2048,
+        attachmentFetchTimeoutMs: 30_000,
+        topicMessages: false,
+        topicMessagesTimeoutMs: 15_000,
+      },
+    })
+    expect(result.panel.config.effective.attachmentStore).toBe('archive')
+    expect(result.panel.config.effective['feishuTools.attachmentFetch']).toBe(false)
+    expect(target.applied?.feishuTools?.attachmentFetch).toBe(false)
+    expect(result.panel.config.overriddenKeys).toContain('feishuTools.attachmentFetch')
+    // The wire projection uses the same dotted keys as the form.
+    expect(result.panel.config.overlay['feishuTools.topicMessages']).toBe(false)
+
+    // A later partial edit deep-merges instead of replacing the tools object.
+    const later = await surface.save({ 'feishuTools.topicMessages': true })
+    expect(later.ok).toBe(true)
+    const overlay = await store.load()
+    expect(overlay.feishuTools).toMatchObject({
+      attachmentFetch: false,
+      topicMessages: true,
+      attachmentFetchTimeoutMs: 30_000,
+    })
   })
 
   it('rejects the removed image keys as unknown configuration', async () => {
@@ -1919,6 +2123,25 @@ describe('FeishuService settings integration', () => {
     expect(service.health().level).toBe('degraded') // fake channel exposes no connection status
 
     expect(await service.credentialStates()).toMatchObject({ appId: { configured: true }, appSecret: { configured: true } })
+    await service.shutdown()
+  })
+
+  it('deep-merges a nested feishuTools overlay over the profile config', async () => {
+    const h = harness({ feishuTools: { attachmentFetch: false } })
+    const service = new FeishuService(h.ctx, h.config, () => h.channel, undefined, h.store)
+    await service.boot()
+    const config = service.configSnapshot()
+    expect(config.feishuTools.attachmentFetch).toBe(false)
+    // Sibling tool settings keep their profile/default values.
+    expect(config.feishuTools.topicMessages).toBe(true)
+    expect(config.feishuTools.attachmentFetchMaxBytes).toBe(h.config.feishuTools.attachmentFetchMaxBytes)
+    expect(service.runningConfigSnapshot()?.feishuTools.attachmentFetch).toBe(false)
+
+    // A live panel write starts from the profile base (not from the previous
+    // overlay) and applies only the sub-fields it carries.
+    service.applyOverlay({ feishuTools: { topicMessages: false } })
+    expect(service.configSnapshot().feishuTools.topicMessages).toBe(false)
+    expect(service.configSnapshot().feishuTools.attachmentFetch).toBe(true)
     await service.shutdown()
   })
 

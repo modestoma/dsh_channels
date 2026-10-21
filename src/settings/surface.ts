@@ -47,8 +47,15 @@ import type {
   SaveCredentialsResponse,
 } from './contract.ts'
 import {
+  configValueOf,
+  deleteOverlayKey,
+  mergeOverlay,
+  mergeOverlayPatch,
+  overlayValueOf,
+  overlayValues,
   parseOverlay,
   pickEditable,
+  setOverlayValue,
 } from './overlay.ts'
 import type { OverlayLogger, OverlayPatch, OverlayStore } from './overlay.ts'
 import type { SettingsCatalog } from './catalog.ts'
@@ -79,7 +86,7 @@ export interface SettingsTarget {
   configSnapshot(): FeishuConfig
   baseConfigSnapshot(): FeishuConfig
   runningConfigSnapshot(): FeishuConfig | undefined
-  applyOverlay(overlay: Partial<FeishuConfig>): void
+  applyOverlay(overlay: OverlayPatch): void
   restart(): Promise<void>
   credentialStates(): Promise<{ appId: CredentialInfo; appSecret: CredentialInfo }>
   setCredential(field: CredentialField, value: string): Promise<void>
@@ -125,10 +132,17 @@ const BOOLEAN_KEYS = new Set<EditableKey>([
   'welcomeOnboarding',
   'allowPermissionSwitch',
   'acceptAttachments',
+  'prefetchImages',
   'workspaceRetentionAuto',
+  'feishuTools.attachmentFetch',
+  'feishuTools.topicMessages',
 ])
 
 const SELECT_OPTIONS: Partial<Record<EditableKey, ReadonlyArray<{ value: string; label: string }>>> = {
+  attachmentStore: [
+    { value: 'native', label: 'DSH 原生附件库（默认）' },
+    { value: 'archive', label: '工作区 attachments/（旧版）' },
+  ],
   dmMode: [
     { value: 'open', label: '开放私聊' },
     { value: 'disabled', label: '禁用私聊' },
@@ -185,9 +199,104 @@ const FIELD_META: Record<EditableKey, { label: string; help: string; min?: numbe
     max: 30,
     step: 1,
   },
-  acceptAttachments: { label: '接收并保存附件', help: '接收飞书图片、文件与合并转发记录，保存到工作区的 attachments/ 目录；模型不会自动读取，需要时用文件工具自行查看。关闭后附件消息不保存、不触发回复。' },
-  workspaceRetention: { label: '过期目录保留期', help: '超过所选天数没有活动的飞书话题目录（以及旧版本按话题建立的工作区目录）会进入下方清理列表；用户工作区本身永不删除。DSH 会话日志不受影响。' },
-  workspaceRetentionAuto: { label: '自动执行目录清理', help: '开启后插件在启动时及每天执行一次过期目录清理；关闭时只能在下方卡片手动清理。开启前请确认保留期已设置。' },
+  acceptAttachments: {
+    label: '接收入站附件',
+    help: '接收飞书图片、文件与合并转发记录。native（默认）下入站附件存入 DSH 原生附件库：触发消息的图片预取进首轮、文件保持懒取，纯附件消息静默登记元数据；archive 下按旧版行为下载到工作区 attachments/。关闭后附件消息不保存、不触发模型、也不登记。',
+  },
+  attachmentStore: {
+    label: '入站附件存储后端',
+    help: 'native（默认）：图片与文件存入 DSH 原生附件库（不可变、内容寻址去重、读取校验、随 Session 回放；不自动清理）。archive：旧版下载到话题工作区 attachments/（可清理但会阻塞会话）。宿主未挂载附件服务时 native 自动降级 archive。',
+  },
+  prefetchImages: {
+    label: '预取触发消息的图片',
+    help: 'native 下把触发消息的图片预取为首轮 ImageBlock，会话/话题/卡片不等下载；失败、超限或超时的图片降级为清单中的懒取项。关闭后图片也需用 feishu_attachment_fetch 获取。',
+  },
+  prefetchTimeoutMs: {
+    label: '图片预取整段超时（ms）',
+    help: '一次触发消息图片预取的总超时（默认 10000 ms，100–120000）；到期后已取回的图片保留，其余降级为清单，不阻塞回合。',
+    min: 100,
+    max: 120_000,
+    step: 100,
+  },
+  prefetchImageMaxBytes: {
+    label: '单张预取图片上限（字节）',
+    help: '单张图片超过该字节数即不入首轮图片、留在清单懒取（默认 20971520 = 20 MiB）。',
+    min: 1,
+    max: 200 * 1024 * 1024,
+    step: 1,
+  },
+  prefetchTotalMaxBytes: {
+    label: '单次预取总量上限（字节）',
+    help: '一次触发消息图片预取的总字节预算（默认 52428800 = 50 MiB）；用尽后剩余图片降级为清单懒取。',
+    min: 1,
+    max: 1024 * 1024 * 1024,
+    step: 1,
+  },
+  historyBootstrapLimit: {
+    label: '首轮话题历史条数',
+    help: '新 Session 首轮自动附带本话题最近 N 条消息摘要（0 = 关闭，上限 20）；被动读取使用短预算，缺权限/失败时静默省略。更早的消息用 feishu_topic_messages 工具翻页。',
+    min: 0,
+    max: 20,
+    step: 1,
+  },
+  pendingAttachmentTtlMs: {
+    label: '静默附件登记有效期（ms）',
+    help: '纯附件/未触发消息只登记元数据（不下载）。超过该时长的登记由周期 GC 清除；0 = 不按时间清理（每个 scope 仍有容量上限）。默认 604800000 = 7 天。',
+    min: 0,
+    step: 1,
+  },
+  pendingAttachmentLimit: {
+    label: '静默附件登记容量（每个 scope）',
+    help: '每个 (会话, 话题, 发送者) scope 最多保留的登记条数（1–100）；超出时淘汰该 scope 最旧的一条。',
+    min: 1,
+    max: 100,
+    step: 1,
+  },
+  promptContextTimeoutMs: {
+    label: '被动读取预算（ms）',
+    help: '引用摘录与首轮话题历史这类被动 prompt 增强的整段预算（默认 3000 ms，100–10000）；超时即省略对应块、回合照跑。模型主动调用工具的读取超时另由 feishu_tools 超时控制。',
+    min: 100,
+    max: 10_000,
+    step: 100,
+  },
+  'feishuTools.attachmentFetch': {
+    label: '启用 feishu_attachment_fetch 工具',
+    help: '让模型按 message_id/file_key 懒取已授权消息的图片/文件。关闭后文件无法懒取，插件整体回退 archive 后端（入站文件直接下载到工作区）。对新会话生效。',
+  },
+  'feishuTools.attachmentFetchMaxResources': {
+    label: '单次取回资源数上限',
+    help: '一次工具调用最多取回的附件数量（默认 10，1–50）；超出会返回可读原因，模型可按 file_key 拆分重试。',
+    min: 1,
+    max: 50,
+    step: 1,
+  },
+  'feishuTools.attachmentFetchMaxBytes': {
+    label: '单次取回字节预算（字节）',
+    help: '一次工具调用的总下载字节预算（默认 104857600 = 100 MiB）；文件流式写入原生库，不整文件缓冲。',
+    min: 1,
+    max: 1024 * 1024 * 1024,
+    step: 1,
+  },
+  'feishuTools.attachmentFetchTimeoutMs': {
+    label: '单次取回超时（ms）',
+    help: '一次 feishu_attachment_fetch 的整段超时（默认 120000 ms，1000–600000）；到期取消下载并逐项报告可读原因。',
+    min: 1_000,
+    max: 600_000,
+    step: 1_000,
+  },
+  'feishuTools.topicMessages': {
+    label: '启用 feishu_topic_messages 工具',
+    help: '让模型按需读取引用消息与话题内更早的消息/附件。关闭只影响模型工具；被动的引用摘录与首轮历史仍由 historyBootstrapLimit 控制。',
+  },
+  'feishuTools.topicMessagesTimeoutMs': {
+    label: '单次话题读取超时（ms）',
+    help: '一次 feishu_topic_messages 的整段超时（默认 20000 ms，1000–120000）；被动摘录使用独立的短预算。',
+    min: 1_000,
+    max: 120_000,
+    step: 1_000,
+  },
+  workspaceRetention: { label: '过期目录保留期', help: '只清理工作区与 Agent 产物目录，不影响 Session 附件：默认 native 存储下附件在 DSH 原生附件库，不参与目录清理；仅当显式使用 archive 后端时，附件副本位于话题目录、会随目录清理。用户工作区本身永不删除，DSH 会话日志不受影响。' },
+  workspaceRetentionAuto: { label: '自动执行目录清理', help: '开启后插件在启动时及每天执行一次过期目录清理；关闭时只能在下方卡片手动清理。开启前请确认保留期已设置；清理只清理工作区与 Agent 产物目录，不影响 Session 附件。' },
   provider: { label: '模型服务商', help: '留空 = 使用部署默认；例如 deepseek-official。', placeholder: '留空 = 部署默认' },
   model: { label: '模型 id', help: '留空 = 使用部署默认；例如 deepseek-v4-flash。', placeholder: '留空 = 部署默认' },
   reasoningEffort: { label: '推理档位', help: '模型声明的精确档位 id（如 high / max）；留空 = 适配器默认。', placeholder: '留空 = 适配器默认' },
@@ -210,6 +319,21 @@ const GROUP_OF: Record<EditableKey, EditableFieldWire['group']> = {
   accessMode: 'access',
   authRequestTtlDays: 'access',
   acceptAttachments: 'content',
+  attachmentStore: 'content',
+  prefetchImages: 'content',
+  prefetchTimeoutMs: 'content',
+  prefetchImageMaxBytes: 'content',
+  prefetchTotalMaxBytes: 'content',
+  historyBootstrapLimit: 'content',
+  pendingAttachmentTtlMs: 'content',
+  pendingAttachmentLimit: 'content',
+  promptContextTimeoutMs: 'tools',
+  'feishuTools.attachmentFetch': 'tools',
+  'feishuTools.attachmentFetchMaxResources': 'tools',
+  'feishuTools.attachmentFetchMaxBytes': 'tools',
+  'feishuTools.attachmentFetchTimeoutMs': 'tools',
+  'feishuTools.topicMessages': 'tools',
+  'feishuTools.topicMessagesTimeoutMs': 'tools',
   provider: 'model',
   model: 'model',
   reasoningEffort: 'model',
@@ -536,9 +660,11 @@ export class SettingsSurface {
     const effective = this.target.configSnapshot()
     const overlay = await this.store.load()
     const running = this.target.runningConfigSnapshot()
-    const overriddenKeys = EDITABLE_KEYS.filter(key => overlay[key] !== undefined)
+    const overriddenKeys = EDITABLE_KEYS.filter(
+      key => overlayValueOf(overlay as Record<string, unknown>, key) !== undefined,
+    )
     const restartPendingKeys = this.target.isRunning() && running !== undefined
-      ? RESTART_KEYS.filter(key => effective[key] !== running[key])
+      ? RESTART_KEYS.filter(key => configValueOf(effective, key) !== configValueOf(running, key))
       : []
     const catalog = await this.catalogFor(effective.provider, effective.model)
     const fields = withDirectoryBrowse(
@@ -611,7 +737,7 @@ export class SettingsSurface {
       config: {
         base: pickEditable(base) as Record<string, ConfigValue | undefined>,
         effective: pickEditable(effective) as Record<string, ConfigValue | undefined>,
-        overlay: overlay as EditableValues,
+        overlay: overlayValues(overlay),
         overriddenKeys,
         restartPendingKeys,
         fields,
@@ -641,7 +767,7 @@ export class SettingsSurface {
         clearedKeys.push(key)
         continue
       }
-      raw[key] = value
+      setOverlayValue(raw, key, value)
     }
 
     const parsed = parseOverlay(raw)
@@ -670,9 +796,8 @@ export class SettingsSurface {
 
     let merged: OverlayPatch
     try {
-      merged = { ...await this.store.load() }
-      for (const key of clearedKeys) delete merged[key]
-      Object.assign(merged, parsed.patch)
+      merged = mergeOverlayPatch(await this.store.load(), parsed.patch)
+      for (const key of clearedKeys) deleteOverlayKey(merged, key)
     } catch (error) {
       return { ok: false, error: `写入覆盖配置失败：${messageOf(error)}` }
     }
@@ -681,7 +806,7 @@ export class SettingsSurface {
     // provider (or lone model) leaves the session without a complete route,
     // so an edit to either side must end with both set or both cleared.
     if (values.provider !== undefined || values.model !== undefined) {
-      const prospective = { ...this.target.baseConfigSnapshot(), ...merged }
+      const prospective = mergeOverlay(this.target.baseConfigSnapshot(), merged)
       const hasProvider = (prospective.provider ?? '') !== ''
       const hasModel = (prospective.model ?? '') !== ''
       if (hasProvider !== hasModel) {

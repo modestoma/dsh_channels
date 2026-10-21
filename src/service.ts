@@ -97,7 +97,8 @@ import type { FeishuConfig } from './config.ts'
 import type {
   AccessMutationResponse, AccessRequestWire, AccessWire,
 } from './settings/contract.ts'
-import type { OverlayStore } from './settings/overlay.ts'
+import { mergeOverlay } from './settings/overlay.ts'
+import type { OverlayPatch, OverlayStore } from './settings/overlay.ts'
 import { legacyTopicWorkspaceRoot } from './workspaces.ts'
 
 /** Periodic route-GC sweep cadence (a long-running instance also accumulates
@@ -885,7 +886,7 @@ export class FeishuService {
   /** Re-read the Web overlay over the profile config (no channel touch). */
   private async loadOverlay(): Promise<void> {
     const overlay = this.overlay === undefined ? {} : await this.overlay.load()
-    this.replaceConfig({ ...this.baseConfig, ...overlay })
+    this.replaceConfig(mergeOverlay(this.baseConfig, overlay))
   }
 
   /**
@@ -904,8 +905,8 @@ export class FeishuService {
    * Apply an already-validated overlay over the profile config. Fields read
    * per event/turn take effect immediately; `RESTART_KEYS` need `restart()`.
    */
-  applyOverlay(overlay: Partial<FeishuConfig>): void {
-    this.replaceConfig({ ...this.baseConfig, ...overlay })
+  applyOverlay(overlay: OverlayPatch): void {
+    this.replaceConfig(mergeOverlay(this.baseConfig, overlay))
     this.refreshRetentionTimer()
   }
 

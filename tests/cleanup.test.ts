@@ -278,6 +278,23 @@ describe('cleanup planning', () => {
     expect(plan.candidates).toEqual([])
   })
 
+  it('never offers the legacy _staging adoption area for deletion', async () => {
+    const stagingDir = `${BASE_DIR}/_staging/p2p/oc_1/ou_1`
+    // A hand-built scan or route record naming staging must not make it a
+    // candidate: the one-time adoption of pre-v2 files depends on it (D12).
+    const scanned = harness({
+      workspaces: [userWorkspace('ou_1')],
+      sessionDirs: [{ path: stagingDir, mtimeMs: NOW - 60 * DAY_MS }],
+    })
+    expect(defined(await planWorkspaceCleanup(scanned.deps)).candidates).toEqual([])
+
+    const routed = harness({
+      workspaces: [userWorkspace('ou_1')],
+      routes: [route({ workspacePath: USER_WORKSPACE, sessionDir: stagingDir })],
+    })
+    expect(defined(await planWorkspaceCleanup(routed.deps)).candidates).toEqual([])
+  })
+
   it('does not resurrect a tombstoned topic dir that is already gone', async () => {
     const h = harness({
       tombstones: [{
@@ -371,6 +388,18 @@ describe('cleanup application', () => {
     expect(outcome.deletedSessionDirs).toBe(0)
     expect(outcome.failures).toHaveLength(1)
     expect(outcome.failures[0]?.message).toContain('refused')
+  })
+
+  it('refuses the legacy _staging adoption area even from a stale plan', async () => {
+    const stagingDir = `${BASE_DIR}/_staging/p2p/oc_1/ou_1`
+    const h = harness()
+    const outcome = await applyWorkspaceCleanup(h.deps, planOf(
+      candidateOf({ kind: 'session-dir', path: stagingDir }),
+    ))
+    expect(outcome.deletedSessionDirs).toBe(0)
+    expect(outcome.failures).toHaveLength(1)
+    expect(outcome.failures[0]?.message).toContain('refused')
+    expect(h.calls).toEqual([])
   })
 
   it('refuses paths outside baseDir and never trusts a stale plan', async () => {

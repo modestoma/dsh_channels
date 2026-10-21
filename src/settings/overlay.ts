@@ -20,10 +20,89 @@ import { configSchema } from '../config.ts'
 import type { FeishuConfig } from '../config.ts'
 import { normalizeWorkspaceBaseDir } from '../workspaces.ts'
 import { EDITABLE_KEYS } from './contract.ts'
-import type { ConfigValue, EditableKey } from './contract.ts'
+import type { ConfigValue, EditableKey, EditableValues } from './contract.ts'
 
-/** The subset of `FeishuConfig` the Web panel may override. */
-export type OverlayPatch = Partial<Pick<FeishuConfig, EditableKey>>
+/** Prefix of a nested panel key that addresses one `feishuTools` field. */
+const FEISHU_TOOLS_PREFIX = 'feishuTools.'
+
+/** Panel keys that address a nested `feishuTools` field (e.g. `feishuTools.topicMessages`). */
+export type NestedEditableKey = Extract<EditableKey, `feishuTools.${string}`>
+
+/** Panel keys that address a top-level config field. */
+export type TopLevelEditableKey = Exclude<EditableKey, NestedEditableKey>
+
+/** One partial `feishuTools` object inside the overlay layer. */
+export type FeishuToolsOverlay = Partial<FeishuConfig['feishuTools']>
+
+/**
+ * The subset of `FeishuConfig` the Web panel may override. `feishuTools` stays
+ * partial: the overlay only records the sub-fields the operator actually
+ * changed, and the merge keeps every other value from the profile layer.
+ */
+export type OverlayPatch = Partial<Pick<FeishuConfig, TopLevelEditableKey>> & {
+  feishuTools?: FeishuToolsOverlay
+}
+
+/** Whether one editable key addresses a nested `feishuTools` field. */
+export function isNestedEditableKey(key: EditableKey): key is NestedEditableKey {
+  return key.startsWith(FEISHU_TOOLS_PREFIX)
+}
+
+/** `attachmentFetch` for the panel key `feishuTools.attachmentFetch`. */
+function nestedFieldOf(key: NestedEditableKey): keyof FeishuConfig['feishuTools'] {
+  return key.slice(FEISHU_TOOLS_PREFIX.length) as keyof FeishuConfig['feishuTools']
+}
+
+/** The `feishuTools` object of an untyped overlay/config record, when usable. */
+function toolsRecordOf(container: Record<string, unknown>): Record<string, unknown> | undefined {
+  const tools = container.feishuTools
+  if (typeof tools !== 'object' || tools === null || Array.isArray(tools)) return undefined
+  return tools as Record<string, unknown>
+}
+
+/** Read one editable value out of an untyped overlay record (nested-aware). */
+export function overlayValueOf(source: Record<string, unknown>, key: EditableKey): unknown {
+  if (!isNestedEditableKey(key)) return source[key]
+  return toolsRecordOf(source)?.[nestedFieldOf(key)]
+}
+
+/** Write one editable value into an untyped overlay record (nested-aware). */
+export function setOverlayValue(target: Record<string, unknown>, key: EditableKey, value: unknown): void {
+  if (!isNestedEditableKey(key)) {
+    target[key] = value
+    return
+  }
+  const tools = toolsRecordOf(target) ?? {}
+  tools[nestedFieldOf(key)] = value
+  target.feishuTools = tools
+}
+
+/** Read one editable value out of a resolved config (nested-aware). */
+export function configValueOf(config: FeishuConfig, key: EditableKey): ConfigValue | undefined {
+  if (!isNestedEditableKey(key)) return config[key] as ConfigValue | undefined
+  return config.feishuTools[nestedFieldOf(key)] as ConfigValue | undefined
+}
+
+/** Deep-merge one overlay patch over another (only `feishuTools` is nested). */
+export function mergeOverlayPatch(base: OverlayPatch, addition: OverlayPatch): OverlayPatch {
+  const merged: OverlayPatch = { ...base, ...addition }
+  if (base.feishuTools !== undefined || addition.feishuTools !== undefined) {
+    merged.feishuTools = { ...base.feishuTools, ...addition.feishuTools }
+  }
+  return merged
+}
+
+/** Remove one editable key from an overlay patch (nested-aware). */
+export function deleteOverlayKey(patch: OverlayPatch, key: EditableKey): void {
+  if (!isNestedEditableKey(key)) {
+    delete patch[key as TopLevelEditableKey]
+    return
+  }
+  const tools = patch.feishuTools
+  if (tools === undefined) return
+  delete tools[nestedFieldOf(key)]
+  if (Object.keys(tools).length === 0) delete patch.feishuTools
+}
 
 /** Fields whose empty string means "clear the override" (optional text config). */
 const OPTIONAL_TEXT_KEYS = new Set<EditableKey>(['provider', 'model', 'reasoningEffort', 'agentPreset'])
@@ -43,24 +122,38 @@ export function parseOverlay(raw: unknown): { ok: true; patch: OverlayPatch } | 
   const issues: Array<{ path: string; message: string }> = []
   const patch: Record<string, unknown> = {}
   const shape = configSchema.shape as unknown as Record<string, z.ZodType>
+  const toolsShape = configSchema.shape.feishuTools
+  if (Object.hasOwn(source, 'feishuTools') && source.feishuTools !== undefined
+    && toolsRecordOf(source) === undefined) {
+    issues.push({ path: 'feishuTools', message: '必须是 JSON 对象' })
+  }
   for (const key of EDITABLE_KEYS) {
-    if (!Object.hasOwn(source, key)) continue
-    const value = source[key]
+    // Nested keys have no own property on the root object, so read through the
+    // shared accessor instead of `Object.hasOwn`.
+    const value = overlayValueOf(source, key)
     if (value === undefined) continue
     // `baseDir` needs location semantics the shared string schema cannot
     // express (absolute only, `~` expansion, no filesystem root).
     if (key === 'baseDir') {
       const checked = normalizeWorkspaceBaseDir(value)
       if (!checked.ok) issues.push({ path: key, message: checked.message })
-      else patch[key] = checked.value
+      else setOverlayValue(patch, key, checked.value)
       continue
     }
-    const parsed = shape[key]!.safeParse(value)
+    // Nested `feishuTools` values validate against the canonical sub-object
+    // schema; only the edited sub-field is copied out of the parsed result so
+    // schema defaults never leak into the overlay.
+    const parsed = isNestedEditableKey(key)
+      ? toolsShape.safeParse({ [nestedFieldOf(key)]: value })
+      : shape[key]!.safeParse(value)
     if (!parsed.success) {
       issues.push({ path: key, message: parsed.error.issues[0]?.message ?? '非法值' })
       continue
     }
-    patch[key] = parsed.data
+    const normalizedValue = isNestedEditableKey(key)
+      ? (parsed.data as FeishuConfig['feishuTools'])[nestedFieldOf(key)]
+      : parsed.data
+    setOverlayValue(patch, key, normalizedValue)
   }
   if (issues.length > 0) return { ok: false, issues }
   return { ok: true, patch: normalizeOverlay(patch) }
@@ -86,24 +179,42 @@ export interface OverlayLogger {
 export function normalizeOverlay(patch: Record<string, unknown>): OverlayPatch {
   const normalized: Record<string, unknown> = {}
   for (const key of EDITABLE_KEYS) {
-    const value = patch[key]
+    const value = overlayValueOf(patch, key)
     if (value === undefined) continue
     if (OPTIONAL_TEXT_KEYS.has(key) && value === '') continue
-    normalized[key] = value
+    setOverlayValue(normalized, key, value)
   }
   return normalized as OverlayPatch
 }
 
 /** Merge the Web overlay over the profile-provided base config. */
 export function mergeOverlay(base: FeishuConfig, overlay: OverlayPatch): FeishuConfig {
-  return { ...base, ...overlay }
+  const { feishuTools, ...topLevel } = overlay
+  const merged: FeishuConfig = { ...base, ...topLevel }
+  if (feishuTools !== undefined) merged.feishuTools = { ...base.feishuTools, ...feishuTools }
+  return merged
 }
 
-/** Project one config onto the editable-key subset (wire shape). */
+/** Project one config onto the editable-key subset (wire shape, nested keys dotted). */
 export function pickEditable(config: FeishuConfig): Record<EditableKey, ConfigValue | undefined> {
   const picked: Record<string, ConfigValue | undefined> = {}
-  for (const key of EDITABLE_KEYS) picked[key] = config[key] as ConfigValue | undefined
+  for (const key of EDITABLE_KEYS) picked[key] = configValueOf(config, key)
   return picked as Record<EditableKey, ConfigValue | undefined>
+}
+
+/**
+ * Project an overlay patch onto flat editable keys (nested `feishuTools.*`
+ * values become dotted keys). The panel wire uses the same key space as
+ * `fields` / `overriddenKeys`, so the client never has to know the nested
+ * storage layout.
+ */
+export function overlayValues(patch: OverlayPatch): EditableValues {
+  const values: Record<string, ConfigValue> = {}
+  for (const key of EDITABLE_KEYS) {
+    const value = overlayValueOf(patch as Record<string, unknown>, key)
+    if (value !== undefined) values[key] = value as ConfigValue
+  }
+  return values as EditableValues
 }
 
 /**

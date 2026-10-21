@@ -519,6 +519,38 @@ export class InboundRouter {
   }
 
   /**
+   * One-time legacy migration: move files older plugin versions staged below
+   * `<baseDir>/_staging/...` into this conversation's topic directory.
+   *
+   * The v2 pipeline stores inbound attachments in the DSH native library and
+   * never writes staging, so this path only adopts files left by a pre-v2
+   * deployment. It is kept for one release cycle after attachment_pipeline_v2
+   * ships and is then removed together with `stagingPathFor` (decisions D12).
+   * A successful adoption logs one warning so operators can retire the old
+   * data instead of relying on this compatibility path indefinitely.
+   */
+  private async adoptLegacyStagedAttachments(
+    msg: NormalizedMessage,
+    sessionDir: string,
+    warn: (message: string, ...args: unknown[]) => void,
+  ): Promise<void> {
+    const adopted = await adoptStagedAttachments(
+      stagingPathFor(this.config.baseDir, msg.chatType, msg.chatId, msg.senderId),
+      sessionDir,
+    ).catch((error: unknown) => {
+      warn('dsh-channels: adopting staged attachments failed: %s', String(error))
+      return 0
+    })
+    if (adopted > 0) {
+      warn(
+        'dsh-channels: adopted %d legacy staged attachment(s) into %s; the one-time _staging migration is deprecated and will be removed after one release cycle (decisions D12)',
+        adopted,
+        sessionDir,
+      )
+    }
+  }
+
+  /**
    * Effective inbound attachment backend for the live deployment.
    *
    * The lazy native pipeline can only deliver files through
@@ -1031,13 +1063,9 @@ export class InboundRouter {
           warn('dsh-channels: attaching initial session %s to workspace failed: %s', sessionId, String(error))
         })
       }
-      // Files staged before this topic existed belong to this conversation.
-      await adoptStagedAttachments(
-        stagingPathFor(this.config.baseDir, msg.chatType, msg.chatId, msg.senderId),
-        placement.sessionDir,
-      ).catch((error: unknown) => {
-        warn('dsh-channels: adopting staged attachments failed: %s', String(error))
-      })
+      // Files staged before this topic existed by a pre-v2 deployment belong
+      // to this conversation (one-time legacy adoption, see decisions D12).
+      await this.adoptLegacyStagedAttachments(msg, placement.sessionDir, warn)
       await this.sessions.mountGuidance(handle.agent, placement.sessionDir)
     } catch (error) {
       // The card lands in a final failure state — no repair needed later. A
@@ -1115,14 +1143,9 @@ export class InboundRouter {
       delete current.worktreeBranch
       if (placement.worktreeBranch !== undefined) current = { ...current, worktreeBranch: placement.worktreeBranch }
     }
-    // Files staged before this conversation's topic existed follow its next
-    // turn (for example a file sent in the chat before the first prompt).
-    await adoptStagedAttachments(
-      stagingPathFor(this.config.baseDir, msg.chatType, msg.chatId, msg.senderId),
-      placement.sessionDir,
-    ).catch((error: unknown) => {
-      this.ctx.logger?.warn?.('dsh-channels: adopting staged attachments failed: %s', String(error))
-    })
+    // Files staged before this conversation's topic existed by a pre-v2
+    // deployment follow its next turn (one-time legacy adoption, D12).
+    await this.adoptLegacyStagedAttachments(msg, placement.sessionDir, warn)
 
     const sent = await this.delivery.replyFirstCard(msg, initialStreamingCard(current.sessionId))
     const typingId = await typingPromise

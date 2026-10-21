@@ -40,9 +40,10 @@ export const ACCESS_REQUESTS_ROUTE = '/dsh-channels/access/requests'
 export const PICK_DIRECTORY_ROUTE = '/dsh-channels/pick-directory'
 
 /**
- * 可由 Web 面板覆盖的配置项。全部是 `src/config.ts` 里已存在的字段；
- * 覆盖值写进 `$DSH_HOME/dsh-channels/settings.json`，优先级高于 profile
- * 的 `cordis.patch.yml`（见 README「Web 设置面板」）。
+ * 可由 Web 面板覆盖的配置项。顶层键对应 `src/config.ts` 的字段；`feishuTools.*`
+ * 是嵌套字段（覆盖层里仍写成 `{ "feishuTools": { ... } }` 对象）。覆盖值写进
+ * `$DSH_HOME/dsh-channels/settings.json`，优先级高于 profile 的
+ * `cordis.patch.yml`（见 README「Web 设置面板」）。
  *
  * 刻意不包含 `appId` / `appSecret`：它们是**凭据引用名**，面板改为直接
  * 编辑引用背后的值（`PUT /dsh-channels/credentials`，经 DSH 凭据服务写入），
@@ -67,8 +68,24 @@ export const EDITABLE_KEYS = [
   'adminOpenId',
   'accessMode',
   'authRequestTtlDays',
-  // 内容
+  // 内容与附件（v2 管线；`feishuTools.*` 是嵌套配置，覆盖层仍写成嵌套对象）
   'acceptAttachments',
+  'attachmentStore',
+  'prefetchImages',
+  'prefetchTimeoutMs',
+  'prefetchImageMaxBytes',
+  'prefetchTotalMaxBytes',
+  'historyBootstrapLimit',
+  'pendingAttachmentTtlMs',
+  'pendingAttachmentLimit',
+  // 模型工具（feishuTools 子项）
+  'feishuTools.attachmentFetch',
+  'feishuTools.attachmentFetchMaxResources',
+  'feishuTools.attachmentFetchMaxBytes',
+  'feishuTools.attachmentFetchTimeoutMs',
+  'feishuTools.topicMessages',
+  'feishuTools.topicMessagesTimeoutMs',
+  'promptContextTimeoutMs',
   // 模型
   'provider',
   'model',
@@ -104,7 +121,7 @@ export type FieldKind = 'boolean' | 'number' | 'text' | 'select'
  * panel tab (see {@link TAB_FIELD_GROUPS}); the Host is the source of truth for
  * which key belongs to which group.
  */
-export type FieldGroup = 'workspace' | 'behavior' | 'content' | 'model' | 'streaming' | 'access'
+export type FieldGroup = 'workspace' | 'behavior' | 'content' | 'tools' | 'model' | 'streaming' | 'access'
 
 /** One selectable value rendered by the generic form. */
 export interface FieldOptionWire {
@@ -486,7 +503,7 @@ export type PanelTabId = (typeof PANEL_TABS)[number]['id']
 /** Which editable field groups each tab renders (the tabs own one or two). */
 export const TAB_FIELD_GROUPS: Readonly<Record<PanelTabId, readonly FieldGroup[]>> = {
   connection: [],
-  sessions: ['behavior', 'content'],
+  sessions: ['behavior', 'content', 'tools'],
   model: ['model'],
   workspace: ['workspace'],
   access: ['access'],
@@ -498,6 +515,7 @@ export const FIELD_GROUP_LABELS: Readonly<Record<FieldGroup, string>> = {
   workspace: '工作区与文件',
   behavior: '行为',
   content: '内容与附件',
+  tools: '模型工具',
   model: '模型与推理',
   streaming: '流式卡片与日志',
   access: '准入与授权',
@@ -570,9 +588,9 @@ export const PANEL_COPY = {
   credentialsPendingHint: '填写后点「保存凭据」；两项齐全时插件会自动连接飞书。',
   // ---- tabs / forms -------------------------------------------------------
   connectionTabHelp: '连接状态与飞书应用凭据。凭据不完整时不会连接飞书。',
-  sessionsTabHelp: '私聊、群聊触发方式与入站内容；「需重连」项在下次连接时读取。',
+  sessionsTabHelp: '私聊、群聊触发方式与入站内容：附件存储/预取、静默登记保留、模型工具开关与读取预算；「需重连」项在下次连接时读取。',
   modelTabHelp: '飞书会话使用的模型服务商、模型、推理档位与 Agent 预设；下拉选项来自宿主机实时目录，保存后对新会话生效。',
-  workspaceTabHelp: '每个用户一个工作区（模型/工具产生文件的落点），每个话题在其中拥有独立工作目录；只影响之后新建的话题。',
+  workspaceTabHelp: '每个用户一个工作区（模型/工具产生文件的落点），每个话题在其中拥有独立工作目录；只影响之后新建的话题。入站附件默认存于 DSH 原生附件库，不占用话题目录，也不会被这里的目录清理删除。',
   accessTabHelp: '准入采用 fail-closed：管理员不受白名单限制，非管理员私聊会被拒绝，群聊需要「群已授权 + 用户在白名单」两层同时命中。',
   advancedTabHelp: '流式刷新等低层参数、Web 覆盖文件与只读信息。',
   save: '保存更改',
@@ -621,7 +639,7 @@ export const PANEL_COPY = {
   // ---- model --------------------------------------------------------------
   // ---- cleanup ------------------------------------------------------------
   cleanupCard: '目录清理',
-  cleanupCardHelp: '删除超过保留期且不再活跃的飞书话题目录（以及旧版本按话题建立的工作区目录）；用户工作区本身、DSH 会话日志都不会删除。删除不可恢复：相关旧话题会失效并提示已过期。',
+  cleanupCardHelp: '只清理工作区与 Agent 产物：删除超过保留期且不再活跃的飞书话题目录、旧版本按话题建立的工作区目录，以及这些目录内 Agent 产生的文件；不影响 Session 附件——入站图片/文件默认存于 DSH 原生附件库，不随目录清理删除。用户工作区本身与 DSH 会话日志也不会删除。删除不可恢复：相关旧话题会失效并提示已过期。',
   cleanupRetention: '保留期',
   cleanupAutoLabel: '自动清理',
   cleanupCandidates: '可清理目录',
@@ -633,7 +651,7 @@ export const PANEL_COPY = {
   cleanupAutoInactive: '未执行（保留期为关闭）',
   cleanupNow: '立即清理',
   cleanupRunning: '清理中…',
-  cleanupConfirm: '确定清理过期目录吗？该操作不可恢复，会删除这些目录内的全部文件（包括 attachments/ 附件）。',
+  cleanupConfirm: '确定清理过期目录吗？只清理工作区与 Agent 产物，不影响 Session 附件；但这些目录内未提交的文件会被删除，且操作不可恢复。',
   cleanupConfirmHint: '删除前会再次确认；保留期为「关闭」或没有过期目录时按钮不可用。',
   cleanupDisabledOff: '保留策略为「关闭」：请先在上方「过期目录保留期」中选择保留天数。',
   cleanupDisabledEmpty: '没有超过保留期的过期目录。',

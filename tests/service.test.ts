@@ -2541,6 +2541,37 @@ describe('FeishuService', () => {
     })
     await service.shutdown()
   })
+
+  it('prunes expired pending attachment metadata in the periodic GC sweep', async () => {
+    const ctxState = makeHostContext()
+    const raw = ctxState.domain.raw
+    const now = Date.now()
+    const pendingRecord = (messageId: string, receivedAt: number) => ({
+      key: messageId,
+      scopeKey: 'chat:oc_gc:ou_user',
+      messageId,
+      chatId: 'oc_gc',
+      chatType: 'p2p',
+      senderOpenId: 'ou_user',
+      receivedAt,
+      kind: 'image',
+      resources: [{ type: 'image', fileKey: `img_${messageId}` }],
+    })
+    await raw.table('pending_attachments').put('om_pending_old', pendingRecord('om_pending_old', now - 8 * 24 * 3600 * 1000))
+    await raw.table('pending_attachments').put('om_pending_new', pendingRecord('om_pending_new', now))
+    const channel = makeChannel()
+    const service = new FeishuService(ctxState.ctx, makeConfig({
+      routeTtlMs: 0,
+      pendingAttachmentTtlMs: 7 * 24 * 3600 * 1000,
+    }), () => channel)
+    await service.start()
+
+    await waitUntil(() => {
+      const entries = [...(raw.table('pending_attachments').entries() as IterableIterator<[string, unknown]>)]
+      expect(entries.map(([key]) => key)).toEqual(['om_pending_new'])
+    })
+    await service.shutdown()
+  })
 })
 
 describe('HITL approval wiring', () => {
@@ -3161,6 +3192,9 @@ describe('inbound attachments', () => {
     await waitUntil(() => expect(readdirSync(workspaceAttachments).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1))
     expect(readdirSync(workspaceAttachments).filter(name => !name.startsWith('.tmp-'))[0]).toMatch(/report\.pdf$/)
     expect(readdirSync(staging)).toEqual([])
+    // The one-time legacy adoption announces its own removal window (D12).
+    expect(mock(h.ctxState.ctx.logger!.warn!).mock.calls.map(call => String(call[0])).join(' '))
+      .toContain('_staging migration is deprecated')
     const agent = h.ctxState.agents.created[0]!.handle.agent
     const message = mock(agent.followup).mock.calls[0]![0] as { content: Array<{ type: string; text?: string }> }
     expect(message.content).toEqual([{ type: 'text', text: '看 report.pdf 的第一页' }])
@@ -3500,6 +3534,23 @@ describe('native attachment pipeline', () => {
     expect(prompt[1]).toMatchObject({ type: 'image' })
     expect(manifestOf(prompt)).toBe('')
     expect(attachments.savedImages).toHaveLength(1)
+    await h.service.shutdown()
+  })
+
+  it('keeps native inbound attachments out of the workspace and staging (AC7)', async () => {
+    const { h, attachments } = await setupNative({}, { downloadResource: () => [PNG] })
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_native_cleanup', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_native_cleanup', content: '看这张图 ![image](img_1)', resources: pngResources,
+    }))
+    await waitForEstablishedSession(h)
+    expect(attachments.savedImages).toHaveLength(1)
+    const topicDir = sessionDirOf(routesOf(h)[0]!)
+    // The native pipeline writes only the native attachment library: no
+    // workspace copy and no legacy staging, so directory cleanup can never
+    // delete an inbound Session attachment.
+    expect(existsSync(path.join(topicDir, 'attachments'))).toBe(false)
+    expect(existsSync(path.join(h.config.baseDir, '_staging'))).toBe(false)
     await h.service.shutdown()
   })
 
