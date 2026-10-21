@@ -93,6 +93,19 @@
 - 平台对象缺失时的运行记录约定：roadmap-workflow schema 要求 running/merged 任务有已发布 issue_url/PR；本项目按 D9 不创建平台对象，因此 `runtime.json` 无法表达 running/merged。执行状态以任务 `resume` 记录，交付证据以 main 提交 SHA + Issue 证据 + 本条决定为准；`validate` 保持通过，不伪造平台字段。
 - 对应 revision、批准范围与理由：revision 1；无需求变化，不提升任何任务 revision。
 
+## D11 P2 真机补测结论与执行记录
+
+- 决定标识、时间与用户确认来源：D11，2026-10-21，quote_history_tools 执行会话由协调者记录；执行方式沿用 D9/D10 的用户授权（本地 `main`、无平台对象、不推送/合并/发布）。
+- 用户原意，性质为疑问 / 提案 / 明确决定：事实记录与执行取舍（非需求变化）；无新增用户确认事项。
+- 本次变化摘要：
+  - **P0 遗留补测（同一应用 bot 身份、只读 REST 探针）**：p2p `message.list(chat)` 可用（code=0、分页正常）；群历史可读且返回早于机器人首条消息约 1 个月的消息（入群前历史在机器人可见范围内可读，不绝对保证；入群时间无法直接查询）；`message.list(thread)` 群/私聊均可用；引用消息 `parent_id→message.get` 可定位；`merge_forward` 的 `message.get` 返回容器+子消息扁平 items（容器在前、子项带 `upper_message_id`）；`mget` 端点必须**重复** `message_ids` query（逗号拼接 400/99992354），上限 50（51 个 400/99992402），SDK 1.76 无 typed `mget`，通道层用 `Client.request` 包装。
+  - **实现取舍**：引用/历史附件通过 `<feishu_context>` 的 quote 行与摘录行上的 `message_id` 同时“可发现+可取”；被动读使用独立 `promptContextTimeoutMs`（默认 3s）并与图片预取并发，不复用工具超时；degraded chat route 拒绝 topic 消息的引用/读取（安全加固）；每 route 白名单容量 128，topic 列表只登记带资源/合并转发行以免 LRU 挤出；archive 后端被动块不提示 fetch 工具。
+  - **验证**：自动测试 typecheck/test（31 files / 860 tests）/build 全绿；真机 API 探针已记录在 Issue 证据；插件链路真机验收列为**待用户手测**（已给操作步骤，未用 mock 冒充）。两位独立只读评审两轮后均放行（无 P0/P1）。
+- 受影响的目标与任务：`quote_history_tools`（完成；revision 1 不变）、`panel_docs_release`（新配置键、README/面板与文档交接）。
+- 暂停、继续、返工和验证安排：无暂停；两处产品待确认项记录在 Issue“未验证项/已知限制”：① `/renew` 后新 Session 首轮是否注入话题历史；② degraded group chat route 的“容器=整群主时间线”是否需按 sender 进一步收紧。
+- 对应 revision、批准范围与理由：revision 1 不变；无需求范围变化。入群前历史在可见范围内可读，未缩小能力，故无需用户重新确认提示文案；缺权限仍静默降级并输出一次性 warn，onboarding 已说明。
+- 影响分析：无下游 revision 提升。`runtime.json` 中本任务按 D10 以 planned+resume 记录完成状态，`roadmap validate` 保持通过；平台对象仍为空。
+
 ## 批准与执行授权
 
 - 内容批准：revision 1（2026-10-20，本会话用户逐项确认并要求落盘）；`plan.json` 的 `approved_revision=1`，`approval_ref` 引用本会话与 Note。
