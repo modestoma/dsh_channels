@@ -65,10 +65,11 @@ describe('recent attachment scan', () => {
     ])
   })
 
-  it('stops at a bot message and at an earlier owner trigger rooting a topic', () => {
+  it('stops at a bot reply to the owner and at an earlier owner trigger rooting a topic', () => {
     expect(scan(page(
       image('om_after'),
-      { message_id: 'om_bot', msg_type: 'interactive', sender_type: 'app', sender_id: 'cli_bot' },
+      { message_id: 'om_bot', msg_type: 'interactive', sender_type: 'app', sender_id: 'cli_bot', parent_id: 'om_old_ask' },
+      { message_id: 'om_old_ask', msg_type: 'text', content: { text: '上一轮' } },
       image('om_before_bot'),
     ))).toEqual(['om_after'])
     expect(scan(page(
@@ -76,6 +77,19 @@ describe('recent attachment scan', () => {
       { message_id: 'om_old_trigger', msg_type: 'text', thread_id: 'omt_old', content: { text: '上一轮' } },
       image('om_before_trigger'),
     ))).toEqual(['om_after'])
+  })
+
+  it('skips main-timeline bot messages that answer someone else', () => {
+    expect(scan(page(
+      image('om_after'),
+      { message_id: 'om_help_card', msg_type: 'interactive', sender_type: 'app', sender_id: 'cli_bot' },
+      {
+        message_id: 'om_other_turn', msg_type: 'interactive', sender_type: 'app', sender_id: 'cli_bot',
+        parent_id: 'om_bob_question',
+      },
+      { message_id: 'om_bob_question', msg_type: 'text', sender_id: 'ou_bob', content: { text: '@bot' } },
+      image('om_before'),
+    ))).toEqual(['om_after', 'om_before'])
   })
 
   it('never stops at an excluded id (the trigger and the current card)', () => {

@@ -13,10 +13,12 @@
  * Scan rules, applied newest-first after dropping the excluded ids (the
  * trigger and this turn's streaming card):
  *
- * - a bot message ends the scan: older messages were in front of an earlier
- *   turn already;
- * - in a chat main timeline, an owner message that roots a topic ends the scan:
- *   it was an earlier trigger;
+ * - in a topic, a bot message ends the scan: older messages were in front of
+ *   an earlier turn already;
+ * - in a chat main timeline, a bot reply to one of the owner's messages on the
+ *   page (a degraded chat route's earlier turn) or an owner message that roots
+ *   a topic (an earlier trigger) ends the scan; other bot messages there
+ *   (other members' turns, command cards, onboarding) are skipped;
  * - other senders' messages, deleted messages, merged-forward children, other
  *   topics' messages and messages without attachments are skipped.
  *
@@ -59,13 +61,20 @@ export interface RecentAttachmentScan {
 export function recentAttachmentMessagesOf(scan: RecentAttachmentScan): MessageReadKnownMessage[] {
   const excluded = new Set(scan.excludeMessageIds)
   const limit = Math.max(1, scan.limit)
+  const ownerMessageIds = new Set(scan.items
+    .filter(item => item.senderOpenId === scan.senderOpenId)
+    .map(item => item.messageId))
   const selected: MessageReadKnownMessage[] = []
   for (const item of scan.items) {
     if (selected.length >= limit) break
     if (excluded.has(item.messageId)) continue
     if (item.chatId !== undefined && item.chatId !== scan.chatId) continue
     if (item.upperMessageId !== undefined) continue
-    if (item.senderType === 'app') break
+    if (item.senderType === 'app') {
+      if (scan.container.type === 'thread') break
+      if (item.parentId !== undefined && ownerMessageIds.has(item.parentId)) break
+      continue
+    }
     if (!inContainer(item, scan.container)) {
       // An owner message rooting a topic was an earlier trigger.
       if (scan.container.type === 'chat' && item.senderOpenId === scan.senderOpenId) break

@@ -79,7 +79,7 @@ native 后端下，准入通过后由 `inboundAttachmentState` 做**不下载的
 本地不写任何记录。触发消息组装 prompt 时，[src/feishu/recent-attachments.ts](../src/feishu/recent-attachments.ts) 对一页 newest-first 的 `message.list`（页大小 50）做扫描：
 
 - 读取范围：话题路由读本话题，首轮另读聊天主线（话题建立前发的文件在主线上）；degraded chat 路由读聊天主线。各页并发，使用 `promptContextTimeoutMs` 被动预算，失败的页不贡献条目。
-- 先排除触发消息与本回合流式卡片；之后遇到**机器人消息**即停（更早的消息已在上一轮之前），在聊天主线上遇到**本人发出且带 `thread_id` 的消息**（上一次触发建的话题根）也停。
+- 先排除触发消息与本回合流式卡片；话题内遇到**机器人消息**即停（更早的消息已在上一轮之前）；聊天主线上遇到**机器人对本页本人消息的回复**（会话级路由的上一轮）或**本人发出且带 `thread_id` 的消息**（上一次触发建的话题根）即停，其他机器人消息（别人的回合、命令卡、引导卡）跳过。
 - 只选本人（route owner）、未撤回、非合并转发子消息、带图片/文件资源或为合并转发容器的消息；其他人、其他话题、其他 chat 的消息跳过。
 - 最多 `recentAttachmentLimit`（默认 5，1–20）条，newest-first 列入清单，并以 `source='recent'` 加入本 route 白名单。
 
