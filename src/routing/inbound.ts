@@ -26,13 +26,13 @@ import {
 import type {
   AttachmentFailure, InboundAttachmentState,
 } from '../feishu/inbound-attachments.ts'
-import { buildFeishuContextBlock, triggerManifestAttachments } from '../feishu/manifest.ts'
+import { buildFeishuContextBlock, manifestEntriesOfKnownMessage, triggerManifestAttachments } from '../feishu/manifest.ts'
 import {
   InboundAttachmentStore, NativeAttachmentStore, effectiveAttachmentMode,
 } from '../feishu/native-attachments.ts'
 import type { InboundAttachmentStoreResult } from '../feishu/native-attachments.ts'
 import type { PendingAttachmentScope, PendingAttachmentStore } from '../feishu/pending-attachments.ts'
-import type { KnownAttachmentMessageInput } from '../feishu/tools.ts'
+import type { KnownAttachmentMessageInput, KnownAttachmentSource } from '../feishu/tools.ts'
 import type { FeishuChannel, NormalizedMessage } from '../feishu-channel.ts'
 import type { QuestionAnswerer } from '../interactions/questions.ts'
 import type { InflightRepair } from '../session/repair.ts'
@@ -66,6 +66,37 @@ export interface InboundAccessPort {
   ownsRoute(msg: NormalizedMessage, record: RouteRecord): boolean
 }
 
+/**
+ * Read-only message access the inbound turn assembly needs: the quoted message
+ * of the triggering message and the bounded first-turn topic history.
+ *
+ * Both methods return `undefined` for "nothing to show" (no quoted message,
+ * read failed, missing permission); implementations never throw for expected
+ * failures, and a silently degraded read must never block the turn (AC6).
+ */
+export interface InboundMessageReadPort {
+  /**
+   * Resolve the message the triggering message replies to. The returned
+   * `block` is the ready-to-inject `<feishu_quote>` prompt block and `message`
+   * the quoted message's whitelist registration (merged-forward containers are
+   * registered by container id).
+   */
+  quote(input: {
+    messageId: string
+    record: RouteRecord
+  }): Promise<{ block: string; message?: KnownAttachmentMessageInput } | undefined>
+  /**
+   * Resolve the most recent topic messages for the first turn of a new
+   * Session: the ready-to-inject `<feishu_history>` block plus the per-message
+   * whitelist registrations in chronological order.
+   */
+  history(input: {
+    record: RouteRecord
+    limit: number
+    excludeMessageIds: readonly string[]
+  }): Promise<{ block: string; messages: readonly KnownAttachmentMessageInput[] } | undefined>
+}
+
 /** Live trigger-image prefetch policy (see `prefetchImages` config). */
 export interface AttachmentPrefetchPolicy {
   readonly enabled: boolean
@@ -91,8 +122,22 @@ export interface InboundDeps {
   attachmentStore: InboundAttachmentStore
   /** Durable metadata registry for silently registered attachments. */
   pendingAttachments: PendingAttachmentStore
-  /** Pre-authorize the triggering message for `feishu_attachment_fetch`. */
-  noteKnownAttachments(record: RouteRecord, message: KnownAttachmentMessageInput): void
+  /**
+   * Pre-authorize a message's attachments for `feishu_attachment_fetch`:
+   * `trigger` (the triggering message) by default, `quote`/`history` for the
+   * messages this turn's excerpt/history blocks name.
+   */
+  noteKnownAttachments(
+    record: RouteRecord,
+    message: KnownAttachmentMessageInput,
+    source?: KnownAttachmentSource,
+  ): void
+  /**
+   * Read-only message access: quoted-message excerpt and first-turn topic
+   * history. Failures degrade silently to a `undefined` value (never a throw
+   * into the turn).
+   */
+  messageRead: InboundMessageReadPort
   /** Live image-prefetch policy for triggering messages. */
   prefetchImages(): AttachmentPrefetchPolicy
   /** Channel-plane access control (administrator + whitelist gates). */
@@ -151,6 +196,27 @@ export function knownAttachmentMessageOf(msg: NormalizedMessage): KnownAttachmen
     resources,
     senderOpenId: msg.senderId,
   }
+}
+
+/** Feishu message-id shape accepted for quote resolution (`om_...`). */
+const QUOTE_MESSAGE_ID = /^om_[A-Za-z0-9_-]{1,128}$/u
+
+/** Read-only prompt context assembled for one turn (quote excerpt + history). */
+interface TurnReadContext {
+  /** Ready `<feishu_quote>` text block, when the message quotes something. */
+  quoteBlock?: string
+  /** Whitelist registration of the quoted message (manifest/discoverability). */
+  quoteMessage?: KnownAttachmentMessageInput
+  /** Ready `<feishu_history>` text block, first turn only. */
+  historyBlock?: string
+}
+
+/** First-turn-only inputs of the prompt assembly. */
+interface TurnDeliveryOptions {
+  /** New Session's first turn: attach the bounded topic history bootstrap. */
+  firstTurn?: boolean
+  /** Message ids never shown in the history block (trigger + streaming card). */
+  excludeMessageIds?: readonly string[]
 }
 
 export class InboundRouter {
@@ -544,18 +610,21 @@ export class InboundRouter {
   }
   /**
    * Build the first-turn user message for the native pipeline: the caption
-   * text, the prefetched trigger images, and the `<feishu_context>` manifest
-   * block listing every attachment still unloaded. The manifest is omitted
-   * entirely (no token cost) when nothing is unloaded.
+   * text, the quoted-message excerpt, the prefetched trigger images, the
+   * `<feishu_context>` manifest block listing every attachment still unloaded,
+   * and (first turn only) the `<feishu_history>` topic bootstrap. Optional
+   * blocks are omitted entirely (no token cost) when empty.
    *
    * Runs after the session/card/route exist and before `followup`; only the
    * triggering message's images are prefetched (bounded and short-timeout),
-   * files never are.
+   * files never are. Block order is stable: text, quote, images, manifest,
+   * history.
    */
   private async nativeTurnMessage(
     msg: NormalizedMessage,
     record: RouteRecord,
     content: string,
+    options: TurnDeliveryOptions,
   ): Promise<UserMessage> {
     const message = feishuUserMessage(content)
     const blocks: ContentBlock[] = content === '' ? [] : [{ type: 'text', text: content }]
@@ -575,7 +644,15 @@ export class InboundRouter {
       }
     }
 
+    // Quote excerpt + first-turn history: read only after the trigger message
+    // is durable and whitelisted (the record exists and the message is known),
+    // so a quoted/earlier attachment can reference the trigger's route. The
+    // read runs CONCURRENTLY with the bounded image prefetch below: neither
+    // waits for the other, and a failed read degrades to its absence (AC6).
+    const contextPromise = this.readTurnContext(msg, record, options)
+
     const loadedFileKeys = new Set<string>()
+    const prefetchedBlocks: ContentBlock[] = []
     const policy = this.deps.prefetchImages()
     const images = state.resources.filter(resource => resource.type === 'image')
     if (state.hasPayload && attachmentPipeline && policy.enabled && images.length > 0) {
@@ -598,9 +675,13 @@ export class InboundRouter {
       // Spread each block into a plain object literal: the host `ContentBlock`
       // union carries an index signature that the named `ImageBlock` interface
       // does not declare, and the clone is structurally identical.
-      blocks.push(...prefetched.blocks.map(block => ({ ...block })))
+      prefetchedBlocks.push(...prefetched.blocks.map(block => ({ ...block })))
       for (const fileKey of prefetched.loadedFileKeys) loadedFileKeys.add(fileKey)
     }
+    // Stable block order: text, quote, image blocks, manifest, history.
+    const context = await contextPromise
+    if (context.quoteBlock !== undefined) blocks.push({ type: 'text', text: context.quoteBlock })
+    blocks.push(...prefetchedBlocks)
 
     let pending: readonly PendingAttachmentRecord[] = []
     if (attachmentPipeline) {
@@ -616,10 +697,17 @@ export class InboundRouter {
     const manifest = attachmentPipeline
       ? buildFeishuContextBlock({
         trigger: triggerManifestAttachments(msg, loadedFileKeys),
+        // A quoted file must be DISCOVERABLE in the manifest (AC1): the quote
+        // block names it, and this row carries the message_id/file_key the
+        // model needs for feishu_attachment_fetch.
+        ...(context.quoteMessage === undefined
+          ? {}
+          : { quote: manifestEntriesOfKnownMessage(context.quoteMessage) }),
         pending,
       })
       : ''
     if (manifest !== '') blocks.push({ type: 'text', text: manifest })
+    if (context.historyBlock !== undefined) blocks.push({ type: 'text', text: context.historyBlock })
     // A trigger always carries caption text, but keep the message well-formed
     // if a future call path ever reaches here with nothing to say.
     if (blocks.length === 0) blocks.push({ type: 'text', text: '' })
@@ -628,18 +716,26 @@ export class InboundRouter {
   }
 
   /**
-   * First-turn delivery: the lazy native pipeline assembles blocks + manifest,
-   * every other deployment keeps the legacy single text block. A failure in
-   * prompt assembly degrades to the plain text prompt (the turn must run).
+   * Deliver the prompt for one turn. The lazy native pipeline assembles the
+   * attachment blocks + manifest; every other deployment keeps the plain text
+   * prompt. Both backends still carry the quoted-message excerpt and (first
+   * turn only) the bounded topic history: those are read-only text context and
+   * remain useful without the lazy fetch tool.
+   *
+   * A failure in prompt assembly degrades to the plain text prompt (the turn
+   * must run); a failed quote/history read degrades silently to its absence.
    */
   private async deliverTurnMessage(
     msg: NormalizedMessage,
     record: RouteRecord,
     content: string,
+    options: TurnDeliveryOptions = {},
   ): Promise<UserMessage> {
-    if (this.attachmentBackend() !== 'native') return feishuUserMessage(content)
     try {
-      return await this.nativeTurnMessage(msg, record, content)
+      if (this.attachmentBackend() !== 'native') {
+        return await this.textTurnMessage(msg, record, content, options)
+      }
+      return await this.nativeTurnMessage(msg, record, content, options)
     } catch (error) {
       this.ctx.logger?.warn?.(
         'dsh-channels: assembling the attachment manifest for %s failed: %s',
@@ -648,6 +744,133 @@ export class InboundRouter {
       return feishuUserMessage(content)
     }
   }
+
+  /**
+   * Text-only turn prompt (archive/fallback deployments): the legacy single
+   * text block, extended with the quote excerpt and the first-turn history
+   * block when they exist. With nothing extra this is byte-identical to
+   * {@link feishuUserMessage}.
+   */
+  private async textTurnMessage(
+    msg: NormalizedMessage,
+    record: RouteRecord,
+    content: string,
+    options: TurnDeliveryOptions,
+  ): Promise<UserMessage> {
+    const context = await this.readTurnContext(msg, record, options)
+    if (context.quoteBlock === undefined && context.historyBlock === undefined) {
+      return feishuUserMessage(content)
+    }
+    const blocks: ContentBlock[] = content === '' ? [] : [{ type: 'text', text: content }]
+    if (context.quoteBlock !== undefined) blocks.push({ type: 'text', text: context.quoteBlock })
+    if (context.historyBlock !== undefined) blocks.push({ type: 'text', text: context.historyBlock })
+    const message = feishuUserMessage(content)
+    message.content = blocks
+    return message
+  }
+
+  /**
+   * Read the read-only prompt context of one turn: the quoted-message excerpt
+   * (every triggered message, per D3) and the bounded topic history (new
+   * Session's first turn only). Both reads run concurrently and are bounded by
+   * a short prompt budget, so a slow/stalled read can delay the turn by at
+   * most {@link PROMPT_CONTEXT_TIMEOUT} — never by a model-tool timeout (AC4:
+   * the first turn is not blocked by enrichment).
+   */
+  private async readTurnContext(
+    msg: NormalizedMessage,
+    record: RouteRecord,
+    options: TurnDeliveryOptions,
+  ): Promise<TurnReadContext> {
+    const [quote, historyBlock] = await Promise.all([
+      this.readQuoteBlock(msg, record),
+      this.readHistoryBlock(record, options),
+    ])
+    return {
+      ...(quote === undefined
+        ? {}
+        : {
+          quoteBlock: quote.block,
+          ...(quote.message === undefined ? {} : { quoteMessage: quote.message }),
+        }),
+      ...(historyBlock === undefined ? {} : { historyBlock }),
+    }
+  }
+
+  /**
+   * Resolve the quoted message into a `<feishu_quote>` block and register the
+   * quoted message (including a merged-forward container, by container id) in
+   * the route's attachment whitelist. Only messages that already triggered a
+   * turn reach this point (D3: quoting the bot without @ never triggers).
+   */
+  private async readQuoteBlock(
+    msg: NormalizedMessage,
+    record: RouteRecord,
+  ): Promise<{ block: string; message?: KnownAttachmentMessageInput } | undefined> {
+    const messageId = msg.replyToMessageId
+    if (messageId === undefined || !QUOTE_MESSAGE_ID.test(messageId)) return undefined
+    try {
+      const quote = await this.deps.messageRead.quote({ messageId, record })
+      if (quote === undefined) return undefined
+      if (quote.message !== undefined) {
+        try {
+          this.deps.noteKnownAttachments(record, quote.message, 'quote')
+        } catch (error) {
+          // Best-effort whitelist registration: the excerpt is still useful.
+          this.ctx.logger?.debug?.(
+            'dsh-channels: registering quoted attachments of %s failed: %s',
+            messageId, String(error),
+          )
+        }
+      }
+      return quote.block === '' ? undefined : quote
+    } catch (error) {
+      // Missing read scope / deleted message / channel down: no excerpt.
+      this.ctx.logger?.debug?.(
+        'dsh-channels: reading quoted message %s failed: %s', messageId, String(error),
+      )
+      return undefined
+    }
+  }
+
+  /**
+   * Resolve the first-turn topic history into a `<feishu_history>` block and
+   * register every message it shows in the route's attachment whitelist.
+   * Disabled by `historyBootstrapLimit: 0`; continuations never read history.
+   */
+  private async readHistoryBlock(
+    record: RouteRecord,
+    options: TurnDeliveryOptions,
+  ): Promise<string | undefined> {
+    if (options.firstTurn !== true) return undefined
+    const limit = this.config.historyBootstrapLimit
+    if (!Number.isFinite(limit) || limit <= 0) return undefined
+    try {
+      const history = await this.deps.messageRead.history({
+        record,
+        limit,
+        excludeMessageIds: options.excludeMessageIds ?? [],
+      })
+      if (history === undefined) return undefined
+      for (const message of history.messages) {
+        try {
+          this.deps.noteKnownAttachments(record, message, 'history')
+        } catch (error) {
+          this.ctx.logger?.debug?.(
+            'dsh-channels: registering history attachments of %s failed: %s',
+            message.messageId, String(error),
+          )
+        }
+      }
+      return history.block === '' ? undefined : history.block
+    } catch (error) {
+      this.ctx.logger?.debug?.(
+        'dsh-channels: reading topic history for %s failed: %s', record.key, String(error),
+      )
+      return undefined
+    }
+  }
+
 
   /** Pending-registry isolation scope for one persisted route. */
   private pendingScopeOfRecord(record: RouteRecord): PendingAttachmentScope {
@@ -854,10 +1077,15 @@ export class InboundRouter {
       // 6. Stream into the card and hand the message to the driver. The prompt
       //    is assembled only now (after the route is durable and tools are
       //    mounted): images may be prefetched, files stay lazy behind the
-      //    manifest. `routes.put` and `followup` stay synchronous with respect
-      //    to other turns because later messages wait on the delivery gate.
+      //    manifest, and the (first turn only) bounded topic history plus the
+      //    quoted-message excerpt are attached as text blocks. `routes.put` and
+      //    `followup` stay synchronous with respect to other turns because
+      //    later messages wait on the delivery gate.
       this.streamer?.attach(handle.agent.session, sent.messageId, msg.messageId, typingId)
-      handle.agent.followup(await this.deliverTurnMessage(msg, record, content))
+      handle.agent.followup(await this.deliverTurnMessage(msg, record, content, {
+        firstTurn: true,
+        excludeMessageIds: [msg.messageId, sent.messageId],
+      }))
     } finally {
       closeDeliveryGate()
     }

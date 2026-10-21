@@ -11,16 +11,19 @@ import { gunzip } from 'node:zlib'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { FeishuService } from '../src/service.ts'
 import type { FeishuConfig } from '../src/config.ts'
-import type { CardActionEvent, ChannelFactory, FeishuChannel, NormalizedMessage } from '../src/feishu-channel.ts'
+import type {
+  CardActionEvent, ChannelFactory, FeishuChannel, NormalizedMessage, RawMessageListParams,
+} from '../src/feishu-channel.ts'
 import { CordisFiberState } from '../src/dsh-types.ts'
 import type { AgentHandle, ApprovalOutcome, CordisPluginRuntime, SessionId, SessionProjections } from '../src/dsh-types.ts'
 import type { RouteRecord } from '../src/domain.ts'
 import { sessionDirOf } from '../src/domain.ts'
 import { FEISHU_ATTACHMENTS_SECTION } from '../src/feishu/agent-context.ts'
-import { ATTACHMENT_FETCH_TOOL_NAME } from '../src/feishu/tools.ts'
+import { ATTACHMENT_FETCH_TOOL_NAME, TOPIC_MESSAGES_TOOL_NAME } from '../src/feishu/tools.ts'
 import type { SessionExportBuilder } from '../src/session-export.ts'
 import {
-  dispatchAgentRequest, makeHostContext, makeChannel, makeMessage, makeAgentPresets, makeSession, makeAgent, promptSectionsOf, sessionEvents,
+  dispatchAgentRequest, makeHostContext, makeChannel, makeMessage, makeAgentPresets, makeSession, makeAgent,
+  makeMessageGetResponse, makeMessageListResponse, makeRawMessage, promptSectionsOf, sessionEvents,
   followupMessagesOf, makeAttachmentStore, makeToolsRuntime,
 } from './helpers.ts'
 import type { FakeAgentPresets, FakeAgentPresetsOptions, FakeAgentsOptions } from './helpers.ts'
@@ -59,11 +62,16 @@ function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
     prefetchTimeoutMs: 10_000,
     pendingAttachmentTtlMs: 7 * 24 * 60 * 60 * 1000,
     pendingAttachmentLimit: 10,
+    // First-turn topic history bootstrap; 0 disables it (bounded, silent on failure).
+    historyBootstrapLimit: 10,
+    promptContextTimeoutMs: 3_000,
     feishuTools: {
       attachmentFetch: true,
       attachmentFetchMaxResources: 10,
       attachmentFetchMaxBytes: 100 * 1024 * 1024,
       attachmentFetchTimeoutMs: 120_000,
+      topicMessages: true,
+      topicMessagesTimeoutMs: 20_000,
     },
     topicIsolation: 'auto',
     workspaceRetention: 'off',
@@ -3679,7 +3687,10 @@ describe('native attachment pipeline', () => {
     const guidance = promptSectionsOf(h.ctxState.agents.created[0]!.setupCtx)
       .find(section => section.name === FEISHU_ATTACHMENTS_SECTION)?.text
     expect(guidance).toBeUndefined()
-    expect(tools.definitions.size).toBe(0)
+    // The lazy fetch tool is not advertised; the read-only topic tool is
+    // backend-independent and stays available (it self-gates on config).
+    expect(tools.definitions.has(ATTACHMENT_FETCH_TOOL_NAME)).toBe(false)
+    expect(tools.definitions.has(TOPIC_MESSAGES_TOOL_NAME)).toBe(true)
     await h.service.shutdown()
   })
 
@@ -3711,7 +3722,8 @@ describe('native attachment pipeline', () => {
       messageId: 'om_archive_text', content: '开始',
     }))
     await waitForEstablishedSession(archived)
-    expect(archiveTools.definitions.size).toBe(0)
+    expect(archiveTools.definitions.has(ATTACHMENT_FETCH_TOOL_NAME)).toBe(false)
+    expect(archiveTools.definitions.has(TOPIC_MESSAGES_TOOL_NAME)).toBe(true)
     await archived.service.shutdown()
 
     // Native configuration without the host service falls back to the legacy
@@ -3843,6 +3855,8 @@ describe('native attachment pipeline', () => {
           attachmentFetchMaxResources: 10,
           attachmentFetchMaxBytes: 100 * 1024 * 1024,
           attachmentFetchTimeoutMs: 120_000,
+          topicMessages: true,
+          topicMessagesTimeoutMs: 20_000,
         },
       },
       { downloadResource: () => [PNG] },
@@ -3868,7 +3882,8 @@ describe('native attachment pipeline', () => {
     await waitUntil(() => expect(readdirSync(dir).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1))
     expect(attachments.savedImages).toHaveLength(0)
     // The lazy pipeline (and its fetch tool) is not advertised to the model.
-    expect(tools.definitions.size).toBe(0)
+    expect(tools.definitions.has(ATTACHMENT_FETCH_TOOL_NAME)).toBe(false)
+    expect(tools.definitions.has(TOPIC_MESSAGES_TOOL_NAME)).toBe(true)
     const guidance = promptSectionsOf(h.ctxState.agents.created[0]!.setupCtx)
       .find(section => section.name === FEISHU_ATTACHMENTS_SECTION)?.text ?? ''
     expect(guidance).toContain('attachments/')
@@ -3892,6 +3907,625 @@ describe('native attachment pipeline', () => {
     await h.service.shutdown()
   })
 })
+
+
+describe('quote excerpts and first-turn topic history', () => {
+  const routesOf = (h: SetupResult): RouteRecord[] =>
+    [...(h.ctxState.domain.raw.table('routes').entries() as Iterable<[string, RouteRecord]>)]
+      .map(([, value]) => value)
+  const promptOf = (h: SetupResult, index = 0) =>
+    followupMessagesOf(h.ctxState.agents.created[0]!.handle.agent)[index]!.content
+  const textBlocksOf = (content: Array<{ type: string; text?: string }>): string[] =>
+    content.filter(block => block.type === 'text').map(block => block.text ?? '')
+  const blockWith = (content: Array<{ type: string; text?: string }>, marker: string): string =>
+    textBlocksOf(content).find(text => text.includes(marker)) ?? ''
+  /** Every outbound payload as JSON text (error-card / failure-notice scan). */
+  const sentTextsOf = (h: SetupResult): string[] =>
+    h.channel.sent.map(item => JSON.stringify((item as { input: object }).input))
+  /** Native harness: host attachments library + Agent tools scope (both tools mount). */
+  const setupTurnReader = async (
+    partial: Partial<FeishuConfig> = {},
+    channelOptions: Parameters<typeof makeChannel>[0] = {},
+    attachmentOptions: Parameters<typeof makeAttachmentStore>[0] = {},
+  ) => {
+    const attachments = makeAttachmentStore(attachmentOptions)
+    const tools = makeToolsRuntime()
+    const h = await setup(
+      partial,
+      channelOptions,
+      undefined,
+      { agentExtras: { attachments, tools } },
+      undefined,
+      undefined,
+      { attachments },
+    )
+    return { h, attachments, tools }
+  }
+
+  it('injects the quoted message as a feishu_quote block in the first prompt (AC1)', async () => {
+    const { h } = await setupTurnReader({}, {
+      messageGet: async messageId => messageId === 'om_quoted_text'
+        ? makeMessageGetResponse([makeRawMessage({
+          message_id: 'om_quoted_text', msg_type: 'text', chat_id: 'oc_quote_text',
+          content: { text: '被引用的上一句话' },
+        })])
+        : makeMessageGetResponse([]),
+    })
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_quote_text', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_quote_trigger', replyToMessageId: 'om_quoted_text', content: '接着这个说',
+    }))
+    await waitForEstablishedSession(h)
+
+    const prompt = promptOf(h)
+    expect(prompt[0]).toEqual({ type: 'text', text: '接着这个说' })
+    // Block order: caption, quote (no image / manifest / history extras here).
+    const quote = blockWith(prompt, '<feishu_quote>')
+    expect(quote).toContain('被引用的上一句话')
+    expect(quote).toContain('</feishu_quote>')
+    expect(textBlocksOf(prompt)).toHaveLength(2)
+    await h.service.shutdown()
+  })
+
+  it('injects a quote excerpt on a continuation turn too (AC1)', async () => {
+    const { h } = await setupTurnReader({}, {
+      messageGet: async messageId => makeMessageGetResponse([makeRawMessage({
+        message_id: messageId, msg_type: 'text', chat_id: 'oc_cont_quote',
+        content: { text: messageId === 'om_cont_quote' ? '被引用的第二句' : '被引用的第一句' },
+      })]),
+    })
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_cont_quote', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_cont_trigger', replyToMessageId: 'om_first_quote', content: '第一轮',
+    }))
+    await waitForEstablishedSession(h)
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    expect(blockWith(promptOf(h), '<feishu_quote>')).toContain('被引用的第一句')
+
+    const record = routesOf(h)[0]!
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_cont_quote', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_cont_followup', threadId: record.key, replyToMessageId: 'om_cont_quote',
+      content: '第二轮也引用',
+    }))
+    await waitUntil(() => expect(mock(agent.followup)).toHaveBeenCalledTimes(2))
+    const continuation = blockWith(promptOf(h, 1), '<feishu_quote>')
+    expect(continuation).toContain('被引用的第二句')
+    await h.service.shutdown()
+  })
+
+  it('authorizes a quoted file so the fetch tool can download it (AC1)', async () => {
+    const downloads: Array<{ messageId: string; fileKey: string }> = []
+    const { h, attachments, tools } = await setupTurnReader({}, {
+      messageGet: async messageId => messageId === 'om_quoted_file'
+        ? makeMessageGetResponse([makeRawMessage({
+          message_id: 'om_quoted_file', msg_type: 'file', chat_id: 'oc_quote_file',
+          content: { file_key: 'file_q1', file_name: 'quoted.pdf' },
+        })])
+        : makeMessageGetResponse([]),
+      downloadResource: (messageId, fileKey) => {
+        downloads.push({ messageId, fileKey })
+        return [new TextEncoder().encode('quoted-file-bytes')]
+      },
+    })
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_quote_file', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_quote_file_trigger', replyToMessageId: 'om_quoted_file', content: '看下引用的文件',
+    }))
+    await waitForEstablishedSession(h)
+    expect(blockWith(promptOf(h), '<feishu_quote>')).toContain('quoted.pdf')
+
+    // AC1 discoverability: the quoted file is listed in the manifest with a
+    // real message_id/file_key, not just named in the excerpt. The model must
+    // be able to reach it without the test hardcoding the id.
+    const manifest = blockWith(promptOf(h), '<feishu_context>')
+    expect(manifest).toContain('message_id=om_quoted_file')
+    expect(manifest).toContain('file_key=file_q1')
+    expect(manifest).toContain('name="quoted.pdf"')
+    const discoveredId = /message_id=(om_[A-Za-z0-9_-]+)/u.exec(manifest)?.[1]
+    expect(discoveredId).toBe('om_quoted_file')
+
+    const definition = tools.definitions.get(ATTACHMENT_FETCH_TOOL_NAME)
+    expect(definition).toBeDefined()
+    const result = await definition!.execute(
+      { message_id: discoveredId },
+      { signal: new AbortController().signal },
+    ) as { ok: boolean; results: Array<{ ok: boolean; kind?: string }> }
+    expect(result.ok).toBe(true)
+    expect(result.results[0]).toMatchObject({ ok: true, kind: 'file' })
+    expect(downloads).toEqual([{ messageId: 'om_quoted_file', fileKey: 'file_q1' }])
+    expect(attachments.savedFiles).toHaveLength(1)
+    expect(new TextDecoder().decode(attachments.savedFiles[0]!.data)).toBe('quoted-file-bytes')
+    await h.service.shutdown()
+  })
+
+  it('expands a quoted merged forward and downloads children through the container id (AC2)', async () => {
+    const containerId = 'om_forward_container'
+    const imageChildId = 'om_forward_image_child'
+    const downloads: Array<{ messageId: string; fileKey: string }> = []
+    const { h, tools } = await setupTurnReader({}, {
+      messageGet: async messageId => messageId === containerId
+        ? makeMessageGetResponse([
+          makeRawMessage({
+            message_id: containerId, msg_type: 'merge_forward', chat_id: 'oc_forward_quote',
+          }),
+          makeRawMessage({
+            message_id: 'om_forward_text_child', msg_type: 'text', chat_id: 'oc_forward_quote',
+            upper_message_id: containerId, content: { text: '转发里的讨论内容' },
+          }),
+          makeRawMessage({
+            message_id: imageChildId, msg_type: 'image', chat_id: 'oc_forward_quote',
+            upper_message_id: containerId, content: { image_key: 'img_forward_1' },
+          }),
+        ])
+        : makeMessageGetResponse([]),
+      downloadResource: (messageId, fileKey) => {
+        downloads.push({ messageId, fileKey })
+        return [new Uint8Array([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])]
+      },
+    })
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_forward_quote', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_forward_trigger', replyToMessageId: containerId, content: '看下这条转发',
+    }))
+    await waitForEstablishedSession(h)
+
+    const quote = blockWith(promptOf(h), '<feishu_quote>')
+    expect(quote).toContain('转发里的讨论内容')
+    expect(quote).toContain('合并转发')
+    expect(quote).toContain(`message_id=${containerId}`)
+    // AC2 discoverability: the container id is listed in the manifest and is
+    // the id the fetch tool must download the children through.
+    const manifest = blockWith(promptOf(h), '<feishu_context>')
+    expect(manifest).toContain(`message_id=${containerId} type=merge_forward`)
+
+    const definition = tools.definitions.get(ATTACHMENT_FETCH_TOOL_NAME)
+    const result = await definition!.execute(
+      { message_id: containerId },
+      { signal: new AbortController().signal },
+    ) as { ok: boolean; results: Array<{ ok: boolean; kind?: string }> }
+    expect(result.ok).toBe(true)
+    expect(result.results[0]).toMatchObject({ ok: true, kind: 'image' })
+    // P0 rule: children download through the container's own message id.
+    expect(downloads).toEqual([{ messageId: containerId, fileKey: 'img_forward_1' }])
+    expect(downloads.some(entry => entry.messageId === imageChildId)).toBe(false)
+    await h.service.shutdown()
+  })
+
+  it('attaches the bounded topic history to the first turn only (AC3/AC4)', async () => {
+    const listCalls: RawMessageListParams[] = []
+    const { h } = await setupTurnReader({}, {
+      messageList: async params => {
+        listCalls.push(params)
+        const now = Date.now()
+        return makeMessageListResponse([
+          makeRawMessage({
+            message_id: 'om_hist_newest', msg_type: 'text', create_time: now,
+            content: { text: '最新一条讨论' },
+          }),
+          makeRawMessage({
+            message_id: 'om_hist_older', msg_type: 'text', create_time: now - 60_000,
+            content: { text: '更早的讨论' },
+          }),
+          // Excluded: the trigger itself and the streaming card the bot just sent.
+          makeRawMessage({
+            message_id: 'om_hist_trigger', msg_type: 'text', create_time: now - 120_000,
+            content: { text: '当前问题' },
+          }),
+          makeRawMessage({
+            message_id: 'om_1', msg_type: 'text', create_time: now - 180_000,
+            content: { text: '流式卡片' },
+          }),
+        ])
+      },
+    })
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_history', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_hist_trigger', content: '当前问题',
+    }))
+    await waitForEstablishedSession(h)
+
+    const history = blockWith(promptOf(h), '<feishu_history>')
+    expect(history).toContain('更早的讨论')
+    expect(history).toContain('最新一条讨论')
+    // Chronological order (oldest first) inside the block.
+    expect(history.indexOf('更早的讨论')).toBeLessThan(history.indexOf('最新一条讨论'))
+    expect(history).not.toContain('当前问题')
+    expect(history).not.toContain('流式卡片')
+    // One page sized for the bootstrap limit plus the two excluded ids.
+    expect(listCalls[0]).toMatchObject({
+      container_id_type: 'thread', page_size: 12, sort_type: 'ByCreateTimeDesc',
+    })
+
+    // Continuing the same topic must not inject the history again.
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    const record = routesOf(h)[0]!
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_history', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_hist_followup', threadId: record.key, content: '第二句',
+    }))
+    await waitUntil(() => expect(mock(agent.followup)).toHaveBeenCalledTimes(2))
+    const followup = promptOf(h, 1)
+    expect(textBlocksOf(followup)).toEqual(['第二句'])
+    expect(listCalls).toHaveLength(1)
+    await h.service.shutdown()
+  })
+
+  it('reads degraded chat-route history through message.list(chat) (AC3)', async () => {
+    const listCalls: RawMessageListParams[] = []
+    const { h } = await setupTurnReader({}, {
+      // Feishu refuses the topic reply → degraded chat-scoped route.
+      failReplyInThread: true,
+      messageList: async params => {
+        listCalls.push(params)
+        return makeMessageListResponse([
+          makeRawMessage({
+            message_id: 'om_chat_hist', msg_type: 'text', chat_id: 'oc_chat_route',
+            create_time: Date.now(), content: { text: '聊天主线上的历史' },
+          }),
+        ])
+      },
+    })
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_chat_route', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_chat_route_trigger', content: '降级会话',
+    }))
+    await waitForEstablishedSession(h)
+    expect(routesOf(h)[0]!.kind).toBe('chat')
+    expect(blockWith(promptOf(h), '<feishu_history>')).toContain('聊天主线上的历史')
+    // A degraded (topic-less) route reads the chat main timeline.
+    expect(listCalls[0]).toMatchObject({
+      container_id_type: 'chat', container_id: 'oc_chat_route',
+    })
+    await h.service.shutdown()
+  })
+
+  it('authorizes attachments discovered in the history bootstrap (AC3)', async () => {
+    const downloads: Array<{ messageId: string; fileKey: string }> = []
+    const { h, attachments, tools } = await setupTurnReader({}, {
+      messageList: async () => makeMessageListResponse([
+        makeRawMessage({
+          message_id: 'om_hist_file', msg_type: 'file', create_time: Date.now(),
+          chat_id: 'oc_hist_file', content: { file_key: 'file_hist', file_name: 'earlier.pdf' },
+        }),
+      ]),
+      downloadResource: (messageId, fileKey) => {
+        downloads.push({ messageId, fileKey })
+        return [new TextEncoder().encode('history-file-bytes')]
+      },
+    })
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_hist_file', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_hist_file_trigger', content: '之前那个文件是什么',
+    }))
+    await waitForEstablishedSession(h)
+    const history = blockWith(promptOf(h), '<feishu_history>')
+    expect(history).toContain('earlier.pdf')
+    // AC3 discoverability: the history line carries the message id the model
+    // needs to fetch the attachment later.
+    expect(history).toContain('message_id=om_hist_file')
+    const discoveredId = /message_id=(om_[A-Za-z0-9_-]+)/u.exec(history)?.[1]
+    expect(discoveredId).toBe('om_hist_file')
+
+    const definition = tools.definitions.get(ATTACHMENT_FETCH_TOOL_NAME)
+    const result = await definition!.execute(
+      { message_id: discoveredId },
+      { signal: new AbortController().signal },
+    ) as { ok: boolean; results: Array<{ ok: boolean; kind?: string }> }
+    expect(result.ok).toBe(true)
+    expect(result.results[0]).toMatchObject({ ok: true, kind: 'file' })
+    expect(downloads).toEqual([{ messageId: 'om_hist_file', fileKey: 'file_hist' }])
+    expect(attachments.savedFiles).toHaveLength(1)
+    await h.service.shutdown()
+  })
+
+  it('caps passive reads with promptContextTimeoutMs, not the tool timeout (AC4/AC6)', async () => {
+    const { h } = await setupTurnReader({ promptContextTimeoutMs: 50 }, {
+      // The passive read never settles: only the short prompt budget may end it.
+      messageList: async () => new Promise(() => {}),
+    })
+    const started = Date.now()
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_prompt_budget', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_prompt_budget', content: '历史读慢一点也没关系',
+    }))
+    await waitForEstablishedSession(h)
+    const elapsed = Date.now() - started
+    expect(elapsed).toBeLessThan(1_000)
+    expect(blockWith(promptOf(h), '<feishu_history>')).toBe('')
+    expect(mock(h.ctxState.agents.created[0]!.handle.agent.followup)).toHaveBeenCalledTimes(1)
+    await h.service.shutdown()
+  })
+
+  it('honors historyBootstrapLimit: 0 by never reading history (AC4)', async () => {
+    const list = vi.fn(async () => makeMessageListResponse([]))
+    const { h } = await setupTurnReader({ historyBootstrapLimit: 0 }, { messageList: list })
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_hist_off', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_hist_off', content: '不用历史',
+    }))
+    await waitForEstablishedSession(h)
+    expect(blockWith(promptOf(h), '<feishu_history>')).toBe('')
+    expect(list).not.toHaveBeenCalled()
+    await h.service.shutdown()
+  })
+
+  it('marks oversized history lines as truncated (AC4)', async () => {
+    const { h } = await setupTurnReader({}, {
+      messageList: async () => makeMessageListResponse([
+        makeRawMessage({
+          message_id: 'om_hist_long', msg_type: 'text', create_time: Date.now(),
+          content: { text: '甲'.repeat(600) },
+        }),
+      ]),
+    })
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_hist_long', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_hist_long_trigger', content: '很长吗',
+    }))
+    await waitForEstablishedSession(h)
+    expect(blockWith(promptOf(h), '<feishu_history>')).toContain('已截断')
+    await h.service.shutdown()
+  })
+
+  it('degrades permission failures of the history read silently (AC6)', async () => {
+    const denied = await setupTurnReader({}, {
+      messageList: async () => {
+        throw Object.assign(new Error('permission denied'), { status: 403 })
+      },
+    })
+    await denied.h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_hist_denied', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_hist_denied', content: '还能继续吗',
+    }))
+    await waitForEstablishedSession(denied.h)
+    expect(blockWith(promptOf(denied.h), '<feishu_history>')).toBe('')
+    expect(mock(denied.h.ctxState.agents.created[0]!.handle.agent.followup)).toHaveBeenCalledTimes(1)
+    expect(sentTextsOf(denied.h).some(text => text.includes('处理失败'))).toBe(false)
+    // One audible warn per service lifetime makes a missing scope findable
+    // without turning every degraded turn into log spam.
+    const degradedWarn = mock(denied.h.ctxState.ctx.logger?.warn)
+    expect(degradedWarn.mock.calls.some(call => String(call[0]).includes('静默降级'))).toBe(true)
+    await denied.h.service.shutdown()
+
+    // Feishu scope error code shape (`{ code: 99991672 }`).
+    const missingScope = await setupTurnReader({}, {
+      messageList: async () => {
+        throw { code: 99991672, msg: 'no permission to read messages' }
+      },
+    })
+    await missingScope.h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_hist_scope', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_hist_scope', content: '也没有权限',
+    }))
+    await waitForEstablishedSession(missingScope.h)
+    expect(blockWith(promptOf(missingScope.h), '<feishu_history>')).toBe('')
+    expect(mock(missingScope.h.ctxState.agents.created[0]!.handle.agent.followup)).toHaveBeenCalledTimes(1)
+    expect(sentTextsOf(missingScope.h).some(text => text.includes('处理失败'))).toBe(false)
+    await missingScope.h.service.shutdown()
+  })
+
+  it('degrades a failed quote read silently and still runs the turn (AC6)', async () => {
+    const { h } = await setupTurnReader({}, {
+      messageGet: async () => {
+        throw Object.assign(new Error('forbidden'), { status: 403 })
+      },
+    })
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_quote_denied', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_quote_denied_trigger', replyToMessageId: 'om_missing_quote', content: '引用读不到',
+    }))
+    await waitForEstablishedSession(h)
+    expect(blockWith(promptOf(h), '<feishu_quote>')).toBe('')
+    expect(mock(h.ctxState.agents.created[0]!.handle.agent.followup)).toHaveBeenCalledTimes(1)
+    expect(sentTextsOf(h).some(text => text.includes('处理失败'))).toBe(false)
+    await h.service.shutdown()
+  })
+
+  it('drops quoted messages that belong to another chat or topic (AC5)', async () => {
+    const foreignChat = await setupTurnReader({}, {
+      messageGet: async messageId => messageId === 'om_foreign_quote'
+        ? makeMessageGetResponse([makeRawMessage({
+          message_id: 'om_foreign_quote', msg_type: 'file', chat_id: 'oc_another_chat',
+          content: { file_key: 'file_foreign', file_name: 'secret.pdf' },
+        })])
+        : makeMessageGetResponse([]),
+    })
+    await foreignChat.h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_quote_guard', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_quote_guard_trigger', replyToMessageId: 'om_foreign_quote', content: '看引用',
+    }))
+    await waitForEstablishedSession(foreignChat.h)
+    expect(blockWith(promptOf(foreignChat.h), '<feishu_quote>')).toBe('')
+    const fetchTool = foreignChat.tools.definitions.get(ATTACHMENT_FETCH_TOOL_NAME)
+    const denied = await fetchTool!.execute(
+      { message_id: 'om_foreign_quote' },
+      { signal: new AbortController().signal },
+    ) as { ok: boolean; summary: string }
+    expect(denied.ok).toBe(false)
+    expect(denied.summary).toContain('授权范围')
+    await foreignChat.h.service.shutdown()
+
+    // Same chat, but the quoted message belongs to a *different* topic.
+    const foreignThread = await setupTurnReader({}, {
+      messageGet: async messageId => messageId === 'om_other_topic_quote'
+        ? makeMessageGetResponse([makeRawMessage({
+          message_id: 'om_other_topic_quote', msg_type: 'text', chat_id: 'oc_quote_guard_thread',
+          thread_id: 'omt_other_topic', content: { text: '别的主题内容' },
+        })])
+        : makeMessageGetResponse([]),
+    })
+    await foreignThread.h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_quote_guard_thread', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_quote_guard_thread_trigger', replyToMessageId: 'om_other_topic_quote',
+      content: '看引用',
+    }))
+    await waitForEstablishedSession(foreignThread.h)
+    expect(blockWith(promptOf(foreignThread.h), '<feishu_quote>')).toBe('')
+    await foreignThread.h.service.shutdown()
+  })
+
+  it('rejects a quoted topic message on a degraded chat route (AC6)', async () => {
+    const { h, tools } = await setupTurnReader({}, {
+      // Feishu refuses the topic reply → the session runs on a chat-scoped route.
+      failReplyInThread: true,
+      messageGet: async () => makeMessageGetResponse([makeRawMessage({
+        message_id: 'om_degraded_quote', msg_type: 'file', chat_id: 'oc_degraded_quote',
+        thread_id: 'omt_other_topic',
+        content: { file_key: 'file_leak', file_name: 'leak.pdf' },
+      })]),
+    })
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_degraded_quote', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_degraded_trigger', replyToMessageId: 'om_degraded_quote', content: '看这个引用',
+    }))
+    await waitForEstablishedSession(h)
+    expect(routesOf(h)[0]!.kind).toBe('chat')
+    // A chat route must not pull another topic's message into the prompt...
+    expect(blockWith(promptOf(h), '<feishu_quote>')).toBe('')
+    // ...nor authorize its attachment for the fetch tool.
+    const fetchTool = tools.definitions.get(ATTACHMENT_FETCH_TOOL_NAME)
+    const denied = await fetchTool!.execute(
+      { message_id: 'om_degraded_quote' },
+      { signal: new AbortController().signal },
+    ) as { ok: boolean; summary: string }
+    expect(denied.ok).toBe(false)
+    expect(denied.summary).toContain('授权范围')
+    await h.service.shutdown()
+  })
+
+  it('drops a quoted message whose response has no chat id (fail closed)', async () => {
+    const { h } = await setupTurnReader({}, {
+      messageGet: async () => makeMessageGetResponse([makeRawMessage({
+        message_id: 'om_no_chat_quote', msg_type: 'text', content: { text: '没有 chat id' },
+      })]),
+    })
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_no_chat_quote', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_no_chat_trigger', replyToMessageId: 'om_no_chat_quote', content: '看引用',
+    }))
+    await waitForEstablishedSession(h)
+    expect(blockWith(promptOf(h), '<feishu_quote>')).toBe('')
+    await h.service.shutdown()
+  })
+
+  it('mounts feishu_topic_messages and lets it authorize what it discovers (AC3/AC5)', async () => {
+    const downloads: Array<{ messageId: string; fileKey: string }> = []
+    const { h, attachments, tools } = await setupTurnReader({}, {
+      messageList: async () => makeMessageListResponse([
+        makeRawMessage({
+          message_id: 'om_topic_file', msg_type: 'file', chat_id: 'oc_topic_tool',
+          create_time: Date.now(),
+          content: { file_key: 'file_topic', file_name: 'topic.pdf' },
+        }),
+        makeRawMessage({
+          message_id: 'om_topic_text', msg_type: 'text', chat_id: 'oc_topic_tool',
+          create_time: Date.now() - 1_000, content: { text: '更早的文本' },
+        }),
+      ]),
+      downloadResource: (messageId, fileKey) => {
+        downloads.push({ messageId, fileKey })
+        return [new TextEncoder().encode('topic-file-bytes')]
+      },
+    })
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_topic_tool', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_topic_tool_trigger', content: '看看话题历史',
+    }))
+    await waitForEstablishedSession(h)
+
+    // The service wires the real runtime into the Agent tools scope.
+    const topicTool = tools.definitions.get(TOPIC_MESSAGES_TOOL_NAME)
+    expect(topicTool).toBeDefined()
+    const listed = await topicTool!.execute(
+      { limit: 5 },
+      { signal: new AbortController().signal },
+    ) as { ok: boolean; messages: Array<{ message_id: string }> }
+    expect(listed.ok).toBe(true)
+    expect(listed.messages.map(message => message.message_id))
+      .toEqual(expect.arrayContaining(['om_topic_file', 'om_topic_text']))
+
+    // Discovered resources become fetchable, but only for this route.
+    const fetchTool = tools.definitions.get(ATTACHMENT_FETCH_TOOL_NAME)
+    const fetched = await fetchTool!.execute(
+      { message_id: 'om_topic_file' },
+      { signal: new AbortController().signal },
+    ) as { ok: boolean; results: Array<{ ok: boolean; kind?: string }> }
+    expect(fetched.ok).toBe(true)
+    expect(fetched.results[0]).toMatchObject({ ok: true, kind: 'file' })
+    expect(downloads).toEqual([{ messageId: 'om_topic_file', fileKey: 'file_topic' }])
+    expect(attachments.savedFiles).toHaveLength(1)
+    await h.service.shutdown()
+  })
+
+  it('orders native blocks as text, quote, prefetched image, manifest, history (AC1/AC2/AC4)', async () => {
+    const PNG = new Uint8Array([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+    const { h } = await setupTurnReader({}, {
+      messageGet: async messageId => messageId === 'om_order_quote'
+        ? makeMessageGetResponse([makeRawMessage({
+          message_id: 'om_order_quote', msg_type: 'text', chat_id: 'oc_order_quote',
+          content: { text: '引用内容' },
+        })])
+        : makeMessageGetResponse([]),
+      messageList: async () => makeMessageListResponse([makeRawMessage({
+        message_id: 'om_order_hist', msg_type: 'text', create_time: Date.now(),
+        chat_id: 'oc_order_quote', content: { text: '历史内容' },
+      })]),
+      downloadResource: () => [PNG],
+    })
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_order_quote', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_order_trigger', replyToMessageId: 'om_order_quote',
+      content: '图文一起看',
+      resources: [
+        { type: 'image', fileKey: 'img_order' },
+        { type: 'file', fileKey: 'file_order', fileName: 'order.pdf' },
+      ] as never,
+    }))
+    await waitForEstablishedSession(h)
+
+    const prompt = promptOf(h)
+    expect(prompt[0]).toEqual({ type: 'text', text: '图文一起看' })
+    expect((prompt[1]?.text ?? '')).toContain('<feishu_quote>')
+    expect(prompt[2]).toMatchObject({ type: 'image' })
+    expect((prompt[3]?.text ?? '')).toContain('<feishu_context>')
+    expect((prompt[4]?.text ?? '')).toContain('<feishu_history>')
+    expect(prompt).toHaveLength(5)
+    await h.service.shutdown()
+  })
+
+  it('injects quote and history text blocks in the archive backend too (AC1/AC4)', async () => {
+    // No host attachments library mounted → effective backend is `archive`.
+    const h = await setup({}, {
+      messageGet: async messageId => messageId === 'om_arch_quote'
+        ? makeMessageGetResponse([makeRawMessage({
+          message_id: 'om_arch_quote', msg_type: 'text', chat_id: 'oc_archive_quote',
+          content: { text: '归档模式引用' },
+        })])
+        : makeMessageGetResponse([]),
+      messageList: async () => makeMessageListResponse([makeRawMessage({
+        message_id: 'om_arch_hist', msg_type: 'text', create_time: Date.now(),
+        chat_id: 'oc_archive_quote', content: { text: '归档模式历史' },
+      })]),
+    })
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_archive_quote', senderId: 'ou_alice', mentionedBot: false,
+      messageId: 'om_arch_trigger', replyToMessageId: 'om_arch_quote', content: '归档模式',
+    }))
+    await waitForEstablishedSession(h)
+    const blocks = textBlocksOf(promptOf(h))
+    expect(blocks).toHaveLength(3)
+    expect(blocks[0]).toBe('归档模式')
+    expect(blocks[1]).toContain('<feishu_quote>')
+    expect(blocks[2]).toContain('<feishu_history>')
+    // Archive deployments mount no fetch tool: the passive blocks must not
+    // advertise an operation that cannot work there.
+    expect(blocks[1]).not.toContain('feishu_attachment_fetch')
+    expect(blocks[2]).not.toContain('feishu_attachment_fetch')
+    await h.service.shutdown()
+  })
+})
+
 
 describe('directory retention cleanup', () => {
   const STALE = 10 * 24 * 60 * 60 * 1000

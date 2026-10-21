@@ -62,6 +62,26 @@ export const DEFAULT_PREFETCH_TOTAL_MAX_BYTES = 50 * 1024 * 1024
 /** Default short timeout for one trigger-message image prefetch (10 s). */
 export const DEFAULT_PREFETCH_TIMEOUT_MS = 10_000
 
+/**
+ * Default number of recent topic messages attached to a new Session's first
+ * turn (0 disables the history bootstrap). Mirrors
+ * `HISTORY_BOOTSTRAP_DEFAULT` in `feishu/message-read.ts`.
+ */
+export const DEFAULT_HISTORY_BOOTSTRAP_LIMIT = 10
+
+/** Hard cap of the first-turn history bootstrap. */
+export const MAX_HISTORY_BOOTSTRAP_LIMIT = 20
+
+/** Default whole-call timeout of `feishu_topic_messages` (20 s). */
+export const DEFAULT_TOPIC_MESSAGES_TIMEOUT_MS = 20_000
+
+/**
+ * Default budget of one passive prompt-enrichment message read (quoted excerpt
+ * / first-turn topic history). Kept short: the turn must not wait long for an
+ * optional context block.
+ */
+export const DEFAULT_PROMPT_CONTEXT_TIMEOUT_MS = 3_000
+
 /** A credential reference: `FEISHU_APP_ID`-style name resolved through ctx.credentials. */
 const credentialRefSchema = z.string().regex(
   CREDENTIAL_REF_PATTERN,
@@ -222,6 +242,28 @@ export const configSchema = z.object({
    */
   prefetchTimeoutMs: z.number().int().min(100).max(120_000).default(DEFAULT_PREFETCH_TIMEOUT_MS),
   /**
+   * Number of recent messages of the current topic automatically attached to
+   * the FIRST turn of a new Session (decision D1: the model should see the
+   * discussion before @ without asking). The `<feishu_history>` block is
+   * bounded and truncated with an explicit marker and each line carries the
+   * message_id needed to fetch a named attachment; older messages remain
+   * reachable through the `feishu_topic_messages` tool. `0` disables the
+   * bootstrap entirely. Reads use a short (~3 s) prompt-enrichment budget and a
+   * failure (missing scope, p2p history unavailable, channel down) degrades
+   * silently: the turn still runs.
+   */
+  historyBootstrapLimit: z.number().int().min(0).max(MAX_HISTORY_BOOTSTRAP_LIMIT)
+    .default(DEFAULT_HISTORY_BOOTSTRAP_LIMIT),
+  /**
+   * Whole-read budget (milliseconds) of the passive prompt enrichment: the
+   * quoted-message excerpt and the first-turn topic history. Deliberately short
+   * (default 3 s) and independent from `feishuTools.topicMessagesTimeoutMs`:
+   * on expiry the block is omitted and the turn runs. Model-initiated reads
+   * through `feishu_topic_messages` use the tool timeout instead.
+   */
+  promptContextTimeoutMs: z.number().int().min(100).max(10_000)
+    .default(DEFAULT_PROMPT_CONTEXT_TIMEOUT_MS),
+  /**
    * Retention of silently registered attachment metadata (the
    * `pending_attachments` table). A message that does not trigger a model turn
    * (attachment-only p2p message, un-mentioned group message, attachment-only
@@ -257,10 +299,21 @@ export const configSchema = z.object({
    *   limit is enforced while streaming rather than buffered first.
    * - `attachmentFetchTimeoutMs`: whole-call timeout (default 120 s). On expiry
    *   the in-flight download is cancelled and reported per attachment.
+   * - `topicMessages` (default on): register `feishu_topic_messages` in
+   *   channel sessions so the model can read the quoted message / earlier
+   *   topic messages on demand and authorize their attachments for fetch.
+   *   Reads require the Feishu message-read scopes; a missing scope degrades to
+   *   a readable tool failure and never fails the turn. This switch only
+   *   controls the model-facing tool: the passive `<feishu_quote>` /
+   *   `<feishu_history>` prompt excerpts stay enabled (they are bounded and
+   *   degrade silently) and are configured by `historyBootstrapLimit`. On the
+   *   archive backend the tool is still mounted for history text, while its
+   *   description states that `feishu_attachment_fetch` is unavailable.
+   * - `topicMessagesTimeoutMs`: whole-call timeout of one model-initiated
+   *   topic read (default 20 s). Passive prompt excerpts use a separate short
+   *   (~3 s) budget and never wait this long.
    *
-   * The remaining tool toggles (`feishu_topic_messages`) arrive with the
-   * `quote_history_tools` task; the Web panel/metrics ship with
-   * `panel_docs_release`.
+   * The Web panel/metrics ship with `panel_docs_release`.
    */
   feishuTools: z.object({
     attachmentFetch: z.boolean().default(true),
@@ -270,11 +323,16 @@ export const configSchema = z.object({
       .default(DEFAULT_ATTACHMENT_FETCH_MAX_BYTES),
     attachmentFetchTimeoutMs: z.number().int().min(1_000).max(600_000)
       .default(DEFAULT_ATTACHMENT_FETCH_TIMEOUT_MS),
+    topicMessages: z.boolean().default(true),
+    topicMessagesTimeoutMs: z.number().int().min(1_000).max(120_000)
+      .default(DEFAULT_TOPIC_MESSAGES_TIMEOUT_MS),
   }).default({
     attachmentFetch: true,
     attachmentFetchMaxResources: DEFAULT_ATTACHMENT_FETCH_MAX_RESOURCES,
     attachmentFetchMaxBytes: DEFAULT_ATTACHMENT_FETCH_MAX_BYTES,
     attachmentFetchTimeoutMs: DEFAULT_ATTACHMENT_FETCH_TIMEOUT_MS,
+    topicMessages: true,
+    topicMessagesTimeoutMs: DEFAULT_TOPIC_MESSAGES_TIMEOUT_MS,
   }),
   /**
    * Delete the topic directories of stale conversations, plus legacy

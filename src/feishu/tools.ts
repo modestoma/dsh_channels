@@ -1,6 +1,7 @@
 /**
- * Model-facing Feishu attachment tool (`feishu_attachment_fetch`) and its
- * per-route authorization whitelist.
+ * Model-facing Feishu tools: `feishu_attachment_fetch` (lazy attachment
+ * download) and `feishu_topic_messages` (quoted/topic history reads), plus the
+ * per-route authorization whitelist they share.
  *
  * Product shape (Roadmap attachment_pipeline_v2): a triggered message creates
  * the Session immediately; files stay unloaded until the model asks for them.
@@ -49,6 +50,20 @@ import type {
 import type { FeishuChannel, ResourceChunkStream } from '../feishu-channel.ts'
 import { describeFailure } from './inbound-attachments.ts'
 import {
+  MessageReader,
+  TOPIC_MESSAGES_DEFAULT_LIMIT,
+  TOPIC_MESSAGES_MAX_LIMIT,
+  clampInt,
+  describeReadError,
+  knownMessageOfItems,
+  messageBelongsToRoute,
+  quoteItemsOf,
+  topicMessageViewOf,
+} from './message-read.ts'
+import type {
+  MessageReadFailureCode, TopicMessageResourceView, TopicMessageView,
+} from './message-read.ts'
+import {
   attachmentFailureReason, FALLBACK_MAX_IMAGE_BYTES, nativeAttachmentStoreOf,
   resolveAttachmentService,
 } from './native-attachments.ts'
@@ -62,8 +77,12 @@ import type { PendingAttachmentScope, PendingAttachmentStore } from './pending-a
 /** Model-facing tool name; stable across releases (session history references it). */
 export const ATTACHMENT_FETCH_TOOL_NAME = 'feishu_attachment_fetch'
 
-/** Default number of known messages kept per route (LRU). */
-export const DEFAULT_KNOWN_MESSAGES_PER_ROUTE = 64
+/**
+ * Default number of known messages kept per route (LRU). Sized well above one
+ * history page (≤50 rows): a dense attachment page plus the trigger/quote
+ * entries of the current turn must not evict each other.
+ */
+export const DEFAULT_KNOWN_MESSAGES_PER_ROUTE = 128
 
 /**
  * Maximum time agent setup waits for the host `tools`/`attachments` services
@@ -93,7 +112,14 @@ export interface AttachmentFetchRoute {
 }
 
 /** Why a message became known to one route. */
-export type KnownAttachmentSource = 'trigger' | 'quote' | 'pending' | 'tool-result' | 'manual'
+export type KnownAttachmentSource =
+  | 'trigger'
+  | 'quote'
+  | 'pending'
+  | 'tool-result'
+  | 'manual'
+  /** A message discovered while reading topic history/quote context (P2). */
+  | 'history'
 
 /** One downloadable resource of a known message. */
 export interface KnownAttachmentResource {
@@ -467,6 +493,28 @@ export class AttachmentFetchToolRuntime {
   ): void {
     if (!this.enabled()) return
     this.whitelist.register(route, message, source, this.now())
+  }
+
+  /**
+   * Whether one message id is authorized for one route: the in-memory whitelist
+   * first, then the durable pending registry — the same sources
+   * {@link resolveKnownMessage} uses when a fetch is executed. The
+   * `feishu_topic_messages` tool calls this to decide whether a main-timeline
+   * message (no `thread_id`) may be detached into the current topic route.
+   *
+   * Never throws: an unavailable registry fails closed.
+   */
+  isKnownMessage(route: AttachmentFetchRoute, messageId: string): boolean {
+    if (this.whitelist.lookup(route, messageId) !== undefined) return true
+    const pending = this.deps.pending?.()
+    if (pending === undefined) return false
+    try {
+      return pending.get(pendingScopeOfRoute(route), messageId) !== undefined
+    } catch {
+      // Authorization lookups fail closed; a storage hiccup must not throw into
+      // the topic tool's read path.
+      return false
+    }
   }
 
   /**
@@ -1576,4 +1624,715 @@ export function presentAttachmentFetchResult(value: unknown): string {
  */
 function imageByteCapOf(agentCtx: AgentContext): number {
   return imageByteCap(resolveAttachmentService(agentCtx))
+}
+
+// ---- Topic messages tool ------------------------------------------------
+
+/** Model-facing tool name; stable across releases (session history references it). */
+export const TOPIC_MESSAGES_TOOL_NAME = 'feishu_topic_messages'
+
+/**
+ * Model-facing description of {@link TOPIC_MESSAGES_TOOL_NAME}: the vocabulary
+ * the model needs to choose between one quoted-message read and paging through
+ * the discussion that precedes the @.
+ */
+const TOPIC_MESSAGES_DESCRIPTION =
+  'Read messages of the CURRENT Feishu conversation: the topic/thread history, or the chat main timeline on '
+  + 'a degraded (non-topic) route. Pass message_id to read one message (a quoted message, or a merged-forward '
+  + 'message which is expanded into its child messages); omit message_id to list the most recent messages '
+  + 'newest-first and page with limit/cursor. Every message carries its message_id (usable with '
+  + 'feishu_attachment_fetch), text, time, sender and attachment metadata. Only messages of this conversation '
+  + 'are readable: a message id from another chat/topic, or one this session never admitted, is refused. '
+  + 'Reading a message also authorizes its images/files for feishu_attachment_fetch. Output is bounded; use '
+  + 'limit (default 10, maximum 50) and cursor to continue. Merged-forward child message ids are NOT '
+  + 'downloadable; fetch their attachments with the top-level container message_id shown for the container row.'
+
+/** Extra model guidance appended when this deployment cannot fetch attachments (archive backend). */
+const TOPIC_MESSAGES_FETCH_UNAVAILABLE_DESCRIPTION =
+  ' In this deployment feishu_attachment_fetch is unavailable; report attachment metadata to the user '
+  + 'instead of fetching.'
+
+/**
+ * Runtime argument validation of `feishu_topic_messages`.
+ *
+ * The host projects {@link TOPIC_MESSAGES_PARAMETERS} to the model but does not
+ * re-validate arguments (the same finding as the attachment tool), so this zod
+ * schema is the authoritative argument gate. `message_id` is shape-checked
+ * (Feishu ids are `om_` + URL-safe characters; no path/query injection reaches
+ * the read API), and `message_id` (single read) / `cursor` (list paging) are
+ * mutually exclusive; the execute path rejects that combination with a readable
+ * Chinese error rather than a schema message.
+ */
+export const topicMessagesArgsSchema = z.object({
+  message_id: z.string().min(1).max(160).regex(/^om_[A-Za-z0-9_-]{1,128}$/).optional(),
+  limit: z.number().int().min(1).max(TOPIC_MESSAGES_MAX_LIMIT).optional(),
+  cursor: z.string().min(1).max(2048).optional(),
+}).strict()
+
+export type TopicMessagesArgs = z.infer<typeof topicMessagesArgsSchema>
+
+/** Model-facing parameter schema (hand-written; no DSH runtime import). */
+export const TOPIC_MESSAGES_PARAMETERS: Record<string, unknown> = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    message_id: {
+      type: 'string',
+      minLength: 1,
+      maxLength: 160,
+      pattern: '^om_[A-Za-z0-9_-]{1,128}$',
+      description:
+        'Feishu message id (om_...) of one message to read. Omit to list the current topic/chat history instead.',
+    },
+    limit: {
+      type: 'integer',
+      minimum: 1,
+      maximum: TOPIC_MESSAGES_MAX_LIMIT,
+      default: TOPIC_MESSAGES_DEFAULT_LIMIT,
+      description:
+        'Page size when listing history, default 10 and maximum 50. Ignored in message_id mode.',
+    },
+    cursor: {
+      type: 'string',
+      minLength: 1,
+      maxLength: 2048,
+      description:
+        'Opaque page token from a previous result (its cursor field) used to continue an older page. '
+        + 'Only for list mode; never combine it with message_id.',
+    },
+  },
+}
+
+// ---- Topic messages results ---------------------------------------------
+
+/** Stable failure codes of `feishu_topic_messages` (one readable reason each). */
+export type TopicMessagesFailureCode =
+  | 'ROUTE_NOT_FOUND'
+  | 'TOOL_DISABLED'
+  | 'INVALID_ARGUMENT'
+  | 'MESSAGE_OUT_OF_ROUTE'
+  | 'MESSAGE_READ_FAILED'
+  | 'PERMISSION_DENIED'
+  | 'ABORTED'
+  | 'TIMEOUT'
+  | 'INTERNAL_ERROR'
+
+const TOPIC_MESSAGES_FAILURE_REASONS: Readonly<Record<TopicMessagesFailureCode, string>> = {
+  ROUTE_NOT_FOUND: '当前会话尚未绑定飞书话题或聊天，无法读取消息',
+  TOOL_DISABLED: '话题消息读取工具已禁用',
+  INVALID_ARGUMENT: '读取消息的参数不合法',
+  MESSAGE_OUT_OF_ROUTE:
+    '该消息不在当前会话的飞书话题/聊天范围内（仅可读取当前话题的消息或本会话已登记的消息）',
+  MESSAGE_READ_FAILED: '读取飞书消息失败',
+  PERMISSION_DENIED: '飞书应用缺少读取消息的权限（如 im:message:readonly），无法读取引用或话题消息',
+  ABORTED: '读取飞书消息已取消',
+  TIMEOUT: '读取飞书消息超时',
+  INTERNAL_ERROR: '读取话题消息失败',
+}
+
+/** `single` for one message_id read, `newest_first` for a history page. */
+export type TopicMessagesOrder = 'newest_first' | 'single'
+
+/** The container the result belongs to (the current route's read scope). */
+export interface TopicMessagesContainer {
+  readonly type: 'thread' | 'chat'
+  readonly id: string
+}
+
+/**
+ * Result value of `feishu_topic_messages`. Lossless JSON by construction:
+ * optional keys are omitted instead of set to `undefined`.
+ */
+export interface TopicMessagesValue {
+  readonly ok: boolean
+  readonly summary: string
+  readonly container: TopicMessagesContainer
+  readonly order: TopicMessagesOrder
+  readonly message_count: number
+  readonly has_more: boolean
+  /** Opaque page token of the next older page (`has_more` pages only). */
+  readonly cursor?: string
+  readonly messages: readonly TopicMessageView[]
+  readonly code?: TopicMessagesFailureCode
+  readonly reason?: string
+}
+
+/** Model-facing output schema; mirrors {@link TopicMessagesValue}. */
+export const TOPIC_MESSAGES_OUTPUT_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['ok', 'summary', 'container', 'order', 'message_count', 'has_more', 'messages'],
+  properties: {
+    ok: { type: 'boolean' },
+    summary: { type: 'string' },
+    container: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['type', 'id'],
+      properties: {
+        type: { type: 'string', enum: ['thread', 'chat'] },
+        id: { type: 'string' },
+      },
+    },
+    order: { type: 'string', enum: ['newest_first', 'single'] },
+    message_count: { type: 'number' },
+    has_more: { type: 'boolean' },
+    cursor: { type: 'string' },
+    messages: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['message_id', 'type', 'sender', 'text'],
+        properties: {
+          message_id: { type: 'string' },
+          type: { type: 'string' },
+          sender: { type: 'string', enum: ['user', 'bot', 'system'] },
+          time: { type: 'string' },
+          deleted: { type: 'boolean' },
+          text: { type: 'string' },
+          parent_message_id: { type: 'string' },
+          resources: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              required: ['type', 'file_key'],
+              properties: {
+                type: { type: 'string', enum: ['image', 'file'] },
+                file_key: { type: 'string' },
+                name: { type: 'string' },
+                folder: { type: 'boolean' },
+              },
+            },
+          },
+        },
+      },
+    },
+    code: { type: 'string' },
+    reason: { type: 'string' },
+  },
+}
+
+// ---- Topic messages runtime deps ----------------------------------------
+
+/**
+ * Everything the topic-messages tool runtime needs, injected by the service.
+ *
+ * `noteKnownMessage` / `isKnownMessage` MUST be the attachment-fetch runtime's
+ * methods: both tools share one per-route whitelist, so a message discovered
+ * here can immediately be fetched by `feishu_attachment_fetch` (AC5), and a
+ * main-timeline message the fetch/quote layers already admitted stays readable
+ * from a topic route.
+ */
+export interface TopicMessagesRuntimeDeps {
+  /** Live plugin configuration (switch, timeout). */
+  config(): FeishuConfig
+  /** Live Feishu channel; undefined while disconnected/shut down. */
+  channel(): FeishuChannel | undefined
+  /** Resolve the route currently bound to one session. */
+  routeOfSession(sessionId: string): AttachmentFetchRoute | undefined
+  /** Register one discovered message's resources for the shared fetch whitelist. */
+  noteKnownMessage(
+    route: AttachmentFetchRoute,
+    message: KnownAttachmentMessageInput,
+    source: KnownAttachmentSource,
+  ): void
+  /** Whether one message id is already authorized for the route (whitelist/pending). */
+  isKnownMessage(route: AttachmentFetchRoute, messageId: string): boolean
+  /**
+   * Whether `feishu_attachment_fetch` is usable in this deployment (native
+   * backend + tool enabled). `false` makes the tool description tell the model
+   * to report attachment metadata instead of fetching. Absent = available.
+   */
+  fetchAvailable?(): boolean
+  /** Structured warning sink (mount degradation, unexpected failures). */
+  warn(message: string, ...args: unknown[]): void
+}
+
+type TopicReadOutcome =
+  | { readonly ok: true; readonly value: TopicMessagesValue }
+  | { readonly ok: false; readonly code: TopicMessagesFailureCode; readonly reason: string }
+
+/**
+ * The `feishu_topic_messages` runtime: mounts the tool into Agent scopes and
+ * executes message reads against the session's current route.
+ *
+ * It deliberately owns no per-route state: the authorization whitelist lives in
+ * the attachment-fetch runtime (shared through {@link TopicMessagesRuntimeDeps}),
+ * so this runtime only needs its mount bookkeeping.
+ */
+export class TopicMessagesToolRuntime {
+  /** Agent scope → its one mount attempt (cordis callbacks get distinct ctx objects). */
+  private readonly mountAttempts = new WeakMap<AgentContext, Promise<void>>()
+  private warnedMissingTools = false
+  private warnedMountFailure = false
+  private warnedUnavailable = false
+
+  constructor(private readonly deps: TopicMessagesRuntimeDeps) {}
+
+  /** Whether the feature switch currently allows tool registration/execution. */
+  enabled(): boolean {
+    return this.deps.config().feishuTools.topicMessages
+  }
+
+  /**
+   * Register the tool inside one Agent scope. Mirrors the attachment tool's
+   * mount: `inject(['tools'])` is the P0-proven path, missing services are a
+   * no-op with one readable warning, and a slow host never blocks session
+   * creation (bounded 2 s wait, the pending injection can still backfill).
+   */
+  async mount(agentCtx: AgentContext, sessionId: string): Promise<void> {
+    if (!this.enabled()) return
+    // Cordis hands the inject callback a DIFFERENT context object than the
+    // agent ctx, so dedupe on the outer scope and reuse its single attempt.
+    const existing = this.mountAttempts.get(agentCtx)
+    if (existing !== undefined) return await existing
+    const attempt = this.mountAttempt(agentCtx, sessionId)
+    this.mountAttempts.set(agentCtx, attempt)
+    await attempt
+  }
+
+  /** No process-local state to drop; kept for symmetry with the fetch runtime. */
+  clear(): void {
+    // Intentionally empty: this runtime registers a tool per Agent scope only.
+  }
+
+  private async mountAttempt(agentCtx: AgentContext, sessionId: string): Promise<void> {
+    let injected = false
+    const outcome = await waitForAvailability(
+      Promise.resolve(agentCtx.inject(['tools'], (ctx) => {
+        injected = true
+        this.registerInScope(ctx, sessionId)
+      })),
+      // A deployment that already timed out once is unlikely to gain the
+      // services a moment later: fail fast on later sessions while the pending
+      // injection can still backfill registration if they do appear.
+      this.warnedUnavailable ? MOUNT_INJECT_RETRY_WAIT_MS : MOUNT_INJECT_WAIT_MS,
+    )
+    if (outcome === 'failed') {
+      this.warnMountFailure(`dsh-channels: mounting ${TOPIC_MESSAGES_TOOL_NAME} failed`)
+      return
+    }
+    // Real cordis settles an injection whose dependencies never appear WITHOUT
+    // calling the callback; treat "settled but never injected" as unavailable.
+    // The fiber stays pending so a late service still backfills registration.
+    if (!injected && !this.warnedUnavailable) {
+      this.warnedUnavailable = true
+      this.deps.warn(
+        'dsh-channels: %s 未挂载：宿主 tools 服务不可用（会话继续）',
+        TOPIC_MESSAGES_TOOL_NAME,
+      )
+    }
+  }
+
+  private registerInScope(agentCtx: AgentContext, sessionId: string): void {
+    // No per-callback-context dedupe: when a host service unloads/reloads,
+    // cordis disposes the injection fiber's effects (including our
+    // `tools.register`) and invokes this callback again with the same ctx
+    // object. Skipping the re-registration would silently lose the tool.
+    const tools = agentCtx.tools
+    if (tools === undefined || typeof tools.register !== 'function') {
+      if (!this.warnedMissingTools) {
+        this.warnedMissingTools = true
+        this.deps.warn(
+          'dsh-channels: %s 未注册：宿主 tools 服务不可用（话题消息工具已禁用）',
+          TOPIC_MESSAGES_TOOL_NAME,
+        )
+      }
+      return
+    }
+    try {
+      tools.register(this.definitionFor(sessionId))
+    } catch (error) {
+      this.warnMountFailure(
+        `dsh-channels: registering ${TOPIC_MESSAGES_TOOL_NAME} failed: ${describeFetchError(error)}`,
+      )
+    }
+  }
+
+  private warnMountFailure(message: string): void {
+    if (this.warnedMountFailure) return
+    this.warnedMountFailure = true
+    this.deps.warn(message)
+  }
+
+  private definitionFor(sessionId: string): ToolDefinition {
+    return {
+      name: TOPIC_MESSAGES_TOOL_NAME,
+      description: TOPIC_MESSAGES_DESCRIPTION
+        + (this.isFetchUnavailable() ? TOPIC_MESSAGES_FETCH_UNAVAILABLE_DESCRIPTION : ''),
+      parameters: TOPIC_MESSAGES_PARAMETERS,
+      output: {
+        schema: TOPIC_MESSAGES_OUTPUT_SCHEMA,
+        render: (_args, value) => renderTopicMessagesResult(value),
+      },
+      execute: async (rawArgs, exec) => await this.execute(sessionId, rawArgs, exec),
+      presentCall: args => presentTopicMessagesCall(args),
+      presentResult: (_args, value) => presentTopicMessagesResult(value),
+      isConcurrencySafe: () => true,
+    }
+  }
+
+  /**
+   * Whether the deployment cannot fetch attachments (archive backend / fetch
+   * tool disabled). A probe failure keeps the model guidance unchanged (the
+   * tool still works; a fetch attempt returns its own readable failure).
+   */
+  private isFetchUnavailable(): boolean {
+    try {
+      return this.deps.fetchAvailable?.() === false
+    } catch {
+      return false
+    }
+  }
+
+  // ---- Execution --------------------------------------------------------
+
+  private async execute(
+    sessionId: string,
+    rawArgs: Record<string, unknown>,
+    exec: ToolExecution,
+  ): Promise<TopicMessagesValue> {
+    const parsed = topicMessagesArgsSchema.safeParse(rawArgs)
+    if (!parsed.success) {
+      // A thrown, readable error is the correct shape for invalid arguments:
+      // the host turns it into a failed tool call with a text message (never a
+      // raw object rendered as `[object Object]`).
+      const issue = parsed.error.issues[0]
+      const path = issue === undefined || issue.path.length === 0 ? 'arguments' : issue.path.join('.')
+      throw new Error(
+        `${TOPIC_MESSAGES_TOOL_NAME}: invalid ${path}: ${issue?.message ?? 'invalid arguments'}`,
+      )
+    }
+    const args = parsed.data
+    if (args.message_id !== undefined && args.cursor !== undefined) {
+      throw new Error(
+        `${TOPIC_MESSAGES_TOOL_NAME}: invalid arguments: message_id 与 cursor 不能同时使用`
+        + '（message_id 是单条读取，cursor 只用于列表翻页）',
+      )
+    }
+    if (!this.enabled()) return topicFailureValue(args, undefined, 'TOOL_DISABLED')
+
+    // The route is re-read on every execution: a session can be re-bound (chat
+    // route replaced by a topic route) between the mount and a later call.
+    const route = this.deps.routeOfSession(sessionId)
+    if (route === undefined) return topicFailureValue(args, undefined, 'ROUTE_NOT_FOUND')
+
+    const config = this.deps.config().feishuTools
+    const reader = new MessageReader({ channel: () => this.deps.channel() })
+    try {
+      const outcome = args.message_id === undefined
+        ? await this.listMessages(reader, route, args, exec, config.topicMessagesTimeoutMs)
+        : await this.readMessageById(reader, route, args.message_id, exec, config.topicMessagesTimeoutMs)
+      if (outcome.ok) return outcome.value
+      return topicFailureValue(args, route, outcome.code, outcome.reason)
+    } catch (error) {
+      if (exec.signal.aborted) return topicFailureValue(args, route, 'ABORTED')
+      const detail = describeReadError(error)
+      this.deps.warn(
+        'dsh-channels: %s failed unexpectedly: %s',
+        TOPIC_MESSAGES_TOOL_NAME,
+        detail,
+      )
+      return topicFailureValue(
+        args,
+        route,
+        'INTERNAL_ERROR',
+        `${TOPIC_MESSAGES_FAILURE_REASONS.INTERNAL_ERROR}：${detail}`,
+      )
+    }
+  }
+
+  /** `message.list` mode: newest-first page of the current route's container. */
+  private async listMessages(
+    reader: MessageReader,
+    route: AttachmentFetchRoute,
+    args: TopicMessagesArgs,
+    exec: ToolExecution,
+    timeoutMs: number,
+  ): Promise<TopicReadOutcome> {
+    const limit = args.limit ?? TOPIC_MESSAGES_DEFAULT_LIMIT
+    const listed = await reader.listRoute(route, {
+      pageSize: limit,
+      ...(args.cursor === undefined ? {} : { cursor: args.cursor }),
+      order: 'newest-first',
+      signal: exec.signal,
+      timeoutMs,
+    })
+    if (!listed.ok) {
+      return { ok: false, code: topicFailureCodeOf(listed.code), reason: listed.reason }
+    }
+    const page = listed.value
+    const messages: TopicMessageView[] = []
+    for (const item of page.items) {
+      messages.push(topicMessageViewOf(item))
+      // Registering every row of a long history would churn the shared LRU
+      // whitelist (a couple of 50-row pages evict the trigger/quote attachments
+      // that ARE fetchable). Plain-text rows carry no downloadable resource, so
+      // only attachment rows and merged-forward containers are noted.
+      if (item.resources.length === 0 && item.msgType !== 'merge_forward') continue
+      const known = knownMessageOfItems([item])
+      if (known !== undefined) this.noteKnown(route, known)
+    }
+    const container = topicContainerOf(route)
+    const label = topicContainerLabel(container.type)
+    const more = page.hasMore ? '，还有更多（用 cursor 翻页）' : ''
+    const summary = messages.length === 0
+      ? `没有可读取的消息（${label} ${displayText(container.id)}）`
+      : `已读取 ${messages.length} 条消息${more}（${label} ${displayText(container.id)}，按时间倒序）`
+    return {
+      ok: true,
+      value: {
+        ok: true,
+        summary,
+        container,
+        order: 'newest_first',
+        message_count: messages.length,
+        has_more: page.hasMore,
+        ...(page.pageToken === undefined ? {} : { cursor: page.pageToken }),
+        messages,
+      },
+    }
+  }
+
+  /** `message.get` mode: one message, a merged-forward container expanded. */
+  private async readMessageById(
+    reader: MessageReader,
+    route: AttachmentFetchRoute,
+    messageId: string,
+    exec: ToolExecution,
+    timeoutMs: number,
+  ): Promise<TopicReadOutcome> {
+    const read = await reader.readMessage(messageId, { signal: exec.signal, timeoutMs })
+    if (!read.ok) {
+      return { ok: false, code: topicFailureCodeOf(read.code), reason: read.reason }
+    }
+    const items = read.value
+    // The container is NOT necessarily the first item: a merged-forward
+    // `message.get` returns a flat list whose children carry `upper_message_id`,
+    // so the shared resolver picks the top-level item independent of order.
+    const container = quoteItemsOf(items)
+    if (container === undefined) {
+      return {
+        ok: false,
+        code: 'MESSAGE_READ_FAILED',
+        reason: `飞书未返回该消息（${displayText(messageId)}），可能已被撤回或无权访问`,
+      }
+    }
+    // Route membership is enforced on the container: another chat, another
+    // topic of the same group, or an unregistered main-timeline message is
+    // refused. A message already admitted to this route (trigger/quote/pending)
+    // may be read even without a topic id (quotes happen before the topic).
+    const known = this.deps.isKnownMessage(route, messageId)
+    if (!messageBelongsToRoute(route, container, known ? [messageId] : [])) {
+      return {
+        ok: false,
+        code: 'MESSAGE_OUT_OF_ROUTE',
+        reason: TOPIC_MESSAGES_FAILURE_REASONS.MESSAGE_OUT_OF_ROUTE,
+      }
+    }
+    // The read succeeded: register the container (merged-forward resources are
+    // downloadable only through the top-level container id) so the fetch tool
+    // can serve them without a second discovery round-trip.
+    const knownMessage = knownMessageOfItems(items)
+    if (knownMessage !== undefined) this.noteKnown(route, knownMessage)
+
+    // Container first, then its children in the order Feishu returned them.
+    // The value is bounded by the same cap as rendering: one huge merged
+    // forward must not flood the tool result/session history.
+    const children = items.filter(item => item !== container)
+    const ordered = [container, ...children]
+    const shown = ordered.slice(0, TOPIC_MESSAGES_RENDER_MAX_MESSAGES)
+    const hidden = ordered.length - shown.length
+    const messages = shown.map(item => topicMessageViewOf(item))
+    const resourceCount = ordered.reduce((total, item) => total + item.resources.length, 0)
+    const containerInfo = topicContainerOf(route)
+    const label = topicContainerLabel(containerInfo.type)
+    const childCount = container.msgType === 'merge_forward' ? children.length : 0
+    const mergeNote = container.msgType === 'merge_forward'
+      ? `（合并转发，已展开 ${childCount} 条子消息）`
+      : ''
+    const resourceNote = resourceCount > 0 ? `，含 ${resourceCount} 个附件` : ''
+    const hiddenNote = hidden > 0 ? `（另有 ${hidden} 条消息未展示）` : ''
+    return {
+      ok: true,
+      value: {
+        ok: true,
+        summary: `已读取消息 ${displayText(container.messageId)}${mergeNote}${resourceNote}${hiddenNote}`
+          + `（${label} ${displayText(containerInfo.id)}）`,
+        container: containerInfo,
+        order: 'single',
+        message_count: messages.length,
+        has_more: false,
+        messages,
+      },
+    }
+  }
+
+  /**
+   * Record one discovered message in the shared fetch whitelist. Bookkeeping
+   * failures are warnings only: the model already has the read result and the
+   * turn must not fail because the whitelist is momentarily unavailable.
+   */
+  private noteKnown(route: AttachmentFetchRoute, message: KnownAttachmentMessageInput): void {
+    try {
+      this.deps.noteKnownMessage(route, message, 'tool-result')
+    } catch (error) {
+      this.deps.warn(
+        'dsh-channels: %s failed to register a known message: %s',
+        TOPIC_MESSAGES_TOOL_NAME,
+        describeReadError(error),
+      )
+    }
+  }
+}
+
+/** The route's read container: the thread id for a topic, the chat id otherwise. */
+function topicContainerOf(route: AttachmentFetchRoute | undefined): TopicMessagesContainer {
+  if (route === undefined) {
+    // No route means no read scope; the empty id keeps the value shape uniform
+    // for replay/rendering without inventing an authorization fact.
+    return { type: 'chat', id: '' }
+  }
+  return route.kind === 'thread'
+    ? { type: 'thread', id: route.key }
+    : { type: 'chat', id: route.chatId }
+}
+
+function topicContainerLabel(type: TopicMessagesContainer['type']): string {
+  return type === 'thread' ? '话题' : '聊天'
+}
+
+/** Map one `message-read` failure code into the tool's stable code set. */
+function topicFailureCodeOf(code: MessageReadFailureCode): TopicMessagesFailureCode {
+  switch (code) {
+    case 'PERMISSION_DENIED':
+      return 'PERMISSION_DENIED'
+    case 'INVALID_ARGUMENT':
+      return 'INVALID_ARGUMENT'
+    case 'ABORTED':
+      return 'ABORTED'
+    case 'TIMEOUT':
+      return 'TIMEOUT'
+    case 'CHANNEL_UNAVAILABLE':
+    case 'MESSAGE_READ_FAILED':
+    default:
+      return 'MESSAGE_READ_FAILED'
+  }
+}
+
+/** One structured failure value (never thrown as a business error). */
+function topicFailureValue(
+  args: TopicMessagesArgs | undefined,
+  route: AttachmentFetchRoute | undefined,
+  code: TopicMessagesFailureCode,
+  reasonOverride?: string,
+): TopicMessagesValue {
+  const reason = reasonOverride ?? TOPIC_MESSAGES_FAILURE_REASONS[code]
+  const container = topicContainerOf(route)
+  const where = container.id === ''
+    ? ''
+    : `（${topicContainerLabel(container.type)} ${displayText(container.id)}）`
+  return {
+    ok: false,
+    summary: `${reason}${where}`,
+    container,
+    order: args?.message_id === undefined ? 'newest_first' : 'single',
+    message_count: 0,
+    has_more: false,
+    messages: [],
+    code,
+    reason,
+  }
+}
+
+// ---- Topic messages rendering -------------------------------------------
+
+/** Rendered message lines are bounded (whole-block character guard below). */
+const TOPIC_MESSAGES_RENDER_MAX_MESSAGES = TOPIC_MESSAGES_MAX_LIMIT
+const TOPIC_MESSAGES_RENDER_MAX_CHARS = 12_000
+
+/** One model-facing line for a message view (id first so it is fetchable). */
+function topicMessageLine(view: TopicMessageView): string {
+  const messageId = typeof view.message_id === 'string' ? displayText(view.message_id) : ''
+  const sender = view.sender === 'bot' ? '机器人' : view.sender === 'system' ? '系统' : '用户'
+  const time = typeof view.time === 'string' && view.time !== '' ? `[${view.time}] ` : ''
+  const text = typeof view.text === 'string' ? view.text : ''
+  const resources = Array.isArray(view.resources) ? view.resources : []
+  const idPart = messageId === '' ? '' : `${messageId} `
+  return `- ${idPart}${time}${sender}: ${text}${topicResourcesSuffix(resources)}`
+}
+
+/** Compact attachment suffix of one rendered line (mirrors the prompt blocks). */
+function topicResourcesSuffix(resources: readonly TopicMessageResourceView[]): string {
+  if (resources.length === 0) return ''
+  const images = resources.filter(resource => resource.type === 'image').length
+  const files = resources.filter(resource => resource.type === 'file')
+  const parts: string[] = []
+  if (images > 0) parts.push(`图片×${images}`)
+  if (files.length > 0) {
+    const named = files
+      .filter(resource => typeof resource.name === 'string' && resource.name !== '')
+      .slice(0, 2)
+      .map(resource => `"${displayText(resource.name ?? '')}"`)
+    parts.push(named.length === 0 ? `文件×${files.length}` : `文件 ${named.join('、')}`)
+  }
+  return `（附件：${parts.join('；')}）`
+}
+
+/**
+ * Turn one tool result into model content: the summary plus one bounded line
+ * per message. Rendering never throws on a replayed/malformed value (session
+ * history projection) and the whole text block is length-bounded.
+ */
+export function renderTopicMessagesResult(value: unknown): readonly ToolContentBlock[] {
+  const result = (typeof value === 'object' && value !== null ? value : {}) as Partial<TopicMessagesValue>
+  const summary = typeof result.summary === 'string' && result.summary !== ''
+    ? result.summary
+    : TOPIC_MESSAGES_TOOL_NAME
+  const lines: string[] = [summary]
+  if (typeof result.code === 'string') lines.push(`错误码：${result.code}`)
+  if (typeof result.reason === 'string' && result.reason !== '' && result.reason !== summary) {
+    lines.push(`原因：${result.reason}`)
+  }
+  const messages = (Array.isArray(result.messages) ? result.messages : [])
+    .filter((message): message is TopicMessageView => typeof message === 'object' && message !== null)
+  let used = lines.join('\n').length
+  let shown = 0
+  for (const view of messages) {
+    if (shown >= TOPIC_MESSAGES_RENDER_MAX_MESSAGES) break
+    const line = topicMessageLine(view)
+    // Keep room for the truncation marker so the whole block stays bounded.
+    if (used + line.length + 1 > TOPIC_MESSAGES_RENDER_MAX_CHARS - 120) break
+    lines.push(line)
+    used += line.length + 1
+    shown += 1
+  }
+  const hidden = messages.length - shown
+  if (hidden > 0) {
+    lines.push(`- …（其余 ${hidden} 条消息未展示；可用 message_id 或 limit/cursor 继续读取）`)
+  }
+  return [{ type: 'text', text: lines.join('\n') }]
+}
+
+/** Host-local card call projection: "read one message" / "list recent messages". */
+export function presentTopicMessagesCall(args: Record<string, unknown>): string {
+  const messageId = typeof args.message_id === 'string' && args.message_id !== ''
+    ? args.message_id
+    : undefined
+  if (messageId !== undefined) return `读取飞书消息 ${displayText(messageId)}`
+  const rawLimit = args.limit
+  const limit = typeof rawLimit === 'number' && Number.isFinite(rawLimit)
+    ? clampInt(rawLimit, 1, TOPIC_MESSAGES_MAX_LIMIT)
+    : TOPIC_MESSAGES_DEFAULT_LIMIT
+  return typeof args.cursor === 'string' && args.cursor !== ''
+    ? `读取飞书话题消息（最近 ${limit} 条，翻页）`
+    : `读取飞书话题消息（最近 ${limit} 条）`
+}
+
+/** Host-local card result projection: the one-line outcome. */
+export function presentTopicMessagesResult(value: unknown): string {
+  const result = (typeof value === 'object' && value !== null ? value : {}) as Partial<TopicMessagesValue>
+  return typeof result.summary === 'string' ? result.summary : TOPIC_MESSAGES_TOOL_NAME
 }

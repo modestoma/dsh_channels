@@ -10,7 +10,8 @@ import { describe, expect, it } from 'vitest'
 import type { PendingAttachmentRecord } from '../src/domain.ts'
 import type { NormalizedMessage } from '../src/feishu-channel.ts'
 import {
-  FEISHU_CONTEXT_TAG, MANIFEST_MAX_ROWS, buildFeishuContextBlock, triggerManifestAttachments,
+  FEISHU_CONTEXT_TAG, MANIFEST_MAX_ROWS, buildFeishuContextBlock, manifestEntriesOfKnownMessage,
+  triggerManifestAttachments,
 } from '../src/feishu/manifest.ts'
 import type { ManifestAttachmentEntry } from '../src/feishu/manifest.ts'
 import { makeMessage } from './helpers.ts'
@@ -131,6 +132,49 @@ describe('feishu context manifest', () => {
     expect(block).not.toContain('om_consumed')
     expect(block).not.toContain('img_v3_old')
     expect(block).not.toContain('om_empty_post')
+  })
+
+  it('converts a known quoted message into fetchable manifest rows (AC1)', () => {
+    // A quoted file is discoverable: its message_id/file_key become a row.
+    expect(manifestEntriesOfKnownMessage({
+      messageId: 'om_quoted_file',
+      kind: 'message',
+      resources: [{ type: 'file', fileKey: 'file_v3_quoted', fileName: 'quoted.pdf' }],
+    })).toEqual([{
+      messageId: 'om_quoted_file',
+      type: 'file',
+      fileKey: 'file_v3_quoted',
+      fileName: 'quoted.pdf',
+    }])
+    // A quoted merged-forward becomes one container row (P0 download rule).
+    expect(manifestEntriesOfKnownMessage({
+      messageId: 'om_quoted_forward',
+      kind: 'merge_forward',
+      resources: [{ type: 'image', fileKey: 'img_v3_child' }],
+    })).toEqual([{ messageId: 'om_quoted_forward', type: 'merge_forward' }])
+    // A resource-less quoted message contributes no row.
+    expect(manifestEntriesOfKnownMessage({
+      messageId: 'om_quoted_text',
+      kind: 'message',
+      resources: [],
+    })).toEqual([])
+  })
+
+  it('orders quoted rows after trigger rows and before pending rows', () => {
+    const block = buildFeishuContextBlock({
+      trigger: [{ messageId: 'om_trigger', type: 'file', fileKey: 'file_v3_t' }],
+      quote: [{ messageId: 'om_quote', type: 'file', fileKey: 'file_v3_q', fileName: 'quoted.pdf' }],
+      pending: [pending({
+        messageId: 'om_pending',
+        kind: 'image',
+        resources: [{ type: 'image', fileKey: 'img_v3_p' }],
+      })],
+    })
+    expect(rows(block)).toEqual([
+      '- message_id=om_trigger file_key=file_v3_t type=file',
+      '- message_id=om_quote file_key=file_v3_q type=file name="quoted.pdf"',
+      '- message_id=om_pending file_key=img_v3_p type=image',
+    ])
   })
 
   it('puts trigger rows first and deduplicates by message id and file key', () => {

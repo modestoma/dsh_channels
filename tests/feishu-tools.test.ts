@@ -18,24 +18,29 @@ import type {
   ImageAttachmentRef, ImageAttachmentLimits,
 } from '../src/host/attachments.ts'
 import type { AgentContext, ToolDefinition, ToolRuntime } from '../src/host/agent.ts'
-import type { FeishuChannel } from '../src/feishu-channel.ts'
+import type { FeishuChannel, RawMessageListParams } from '../src/feishu-channel.ts'
 import { PendingAttachmentStore } from '../src/feishu/pending-attachments.ts'
 import {
   ATTACHMENT_FETCH_TOOL_NAME,
   AttachmentFetchToolRuntime,
   RouteAttachmentWhitelist,
+  TOPIC_MESSAGES_TOOL_NAME,
+  TopicMessagesToolRuntime,
   attachmentFetchArgsSchema,
   presentAttachmentFetchResult,
   renderAttachmentFetchResult,
+  renderTopicMessagesResult,
+  topicMessagesArgsSchema,
   type AttachmentFetchRoute,
   type AttachmentFetchValue,
   type KnownAttachmentResource,
+  type TopicMessagesValue,
 } from '../src/feishu/tools.ts'
 import { SessionManager } from '../src/session/manager.ts'
 import type { SessionId } from '../src/dsh-types.ts'
 import {
   makeAgent, makeAgentContext, makeAgentPresets, makeChannel, makeHostContext, makeMessage,
-  makeSession,
+  makeMessageGetResponse, makeMessageListResponse, makeRawMessage, makeSession,
 } from './helpers.ts'
 
 // ---- Shared fakes -------------------------------------------------------
@@ -172,6 +177,8 @@ interface TestChannel extends FeishuChannel {
 function makeTestChannel(handlers: {
   download?: DownloadHandler
   messageGet?: (messageId: string) => Promise<unknown>
+  messageMget?: (messageIds: readonly string[]) => Promise<unknown>
+  messageList?: (params: RawMessageListParams) => Promise<unknown>
 } = {}): TestChannel {
   const base = makeChannel()
   const channel = base as unknown as TestChannel
@@ -185,6 +192,13 @@ function makeTestChannel(handlers: {
   channel.messageGet = async (messageId: string) => {
     if (handlers.messageGet === undefined) throw new Error('unexpected message.get')
     return await handlers.messageGet(messageId)
+  }
+  if (handlers.messageMget !== undefined) {
+    channel.messageMget = async (messageIds: readonly string[]) =>
+      await handlers.messageMget?.(messageIds)
+  }
+  if (handlers.messageList !== undefined) {
+    channel.messageList = async (params: RawMessageListParams) => await handlers.messageList?.(params)
   }
   return channel
 }
@@ -217,6 +231,7 @@ const DEFAULT_ROUTE: AttachmentFetchRoute = {
 
 interface RuntimeHarness {
   runtime: AttachmentFetchToolRuntime
+  topic: TopicMessagesToolRuntime
   ctx: AgentContext
   definitions: Map<string, ToolDefinition>
   register: ReturnType<typeof vi.fn>
@@ -228,6 +243,8 @@ interface RuntimeHarness {
   warn: ReturnType<typeof vi.fn>
   mount(): Promise<ToolDefinition>
   definition(): ToolDefinition
+  mountTopic(): Promise<ToolDefinition>
+  topicDefinition(): ToolDefinition
 }
 
 interface SetupOptions {
@@ -242,6 +259,8 @@ interface SetupOptions {
   unbound?: boolean
   includeTools?: boolean
   includeAttachments?: boolean
+  /** Whether the deployment offers `feishu_attachment_fetch` (topic tool hint). */
+  fetchAvailable?: () => boolean
 }
 
 function setupRuntime(options: SetupOptions = {}): RuntimeHarness {
@@ -269,18 +288,40 @@ function setupRuntime(options: SetupOptions = {}): RuntimeHarness {
     warn,
     now: () => 1_700_000_000_000,
   })
+  // The topic-messages runtime shares the fetch runtime's whitelist, exactly as
+  // the service wires it (AC5: a message discovered by the tool is fetchable).
+  const topic = new TopicMessagesToolRuntime({
+    config: () => config,
+    channel: () => configuredChannel ?? undefined,
+    routeOfSession: id => (options.unbound === true || id !== sessionId ? undefined : route),
+    noteKnownMessage: (knownRoute, message, source) =>
+      runtime.noteKnownMessage(knownRoute, message, source),
+    isKnownMessage: (knownRoute, messageId) => runtime.isKnownMessage(knownRoute, messageId),
+    ...(options.fetchAvailable === undefined ? {} : { fetchAvailable: options.fetchAvailable }),
+    warn,
+  })
   const definition = (): ToolDefinition => {
     const found = definitions.get(ATTACHMENT_FETCH_TOOL_NAME)
     if (found === undefined) throw new Error('tool was not mounted')
     return found
   }
+  const topicDefinition = (): ToolDefinition => {
+    const found = definitions.get(TOPIC_MESSAGES_TOOL_NAME)
+    if (found === undefined) throw new Error('topic tool was not mounted')
+    return found
+  }
   return {
-    runtime, ctx, definitions, register, route, config, channel, store, pending, warn,
+    runtime, topic, ctx, definitions, register, route, config, channel, store, pending, warn,
     definition,
     async mount(): Promise<ToolDefinition> {
       await runtime.mount(ctx, sessionId)
       return definition()
     },
+    async mountTopic(): Promise<ToolDefinition> {
+      await topic.mount(ctx, sessionId)
+      return topicDefinition()
+    },
+    topicDefinition,
   }
 }
 
@@ -320,6 +361,15 @@ async function runTool(
 ): Promise<AttachmentFetchValue> {
   const value = await definition.execute(args, { signal: signal ?? new AbortController().signal })
   return value as AttachmentFetchValue
+}
+
+async function runTopicTool(
+  definition: ToolDefinition,
+  args: Record<string, unknown>,
+  signal?: AbortSignal,
+): Promise<TopicMessagesValue> {
+  const value = await definition.execute(args, { signal: signal ?? new AbortController().signal })
+  return value as TopicMessagesValue
 }
 
 /** Assert a tool value is lossless JSON (P0 lesson: no `undefined`). */
@@ -1616,6 +1666,994 @@ describe('feishu attachment-fetch merged forward', () => {
   })
 })
 
+// ---- P2: feishu_topic_messages registration ---------------------------
+
+describe('feishu topic-messages registration', () => {
+  it('registers the model-facing tool after the tools injection', async () => {
+    const harness = setupRuntime()
+    const definition = await harness.mountTopic()
+
+    expect(harness.register).toHaveBeenCalledTimes(1)
+    expect(definition.name).toBe(TOPIC_MESSAGES_TOOL_NAME)
+    expect(definition.description).toContain('Feishu')
+    expect(definition.description).toContain('message_id')
+    expect(definition.parameters).toMatchObject({
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        message_id: { type: 'string' },
+        limit: { type: 'integer', minimum: 1, maximum: 50, default: 10 },
+        cursor: { type: 'string' },
+      },
+    })
+    const limitParameter = (definition.parameters as {
+      properties: { limit: { description: string } }
+    }).properties.limit
+    expect(limitParameter.description).toContain('default 10')
+    expect(limitParameter.description).toContain('maximum 50')
+    expect(definition.output.schema).toMatchObject({
+      type: 'object',
+      required: ['ok', 'summary', 'container', 'order', 'message_count', 'has_more', 'messages'],
+    })
+    expect(definition.isConcurrencySafe?.()).toBe(true)
+    expect(JSON.parse(JSON.stringify(definition.parameters))).toEqual(definition.parameters)
+
+    // Mounting the same scope twice must not register a duplicate row.
+    await harness.topic.mount(harness.ctx, 'session-tools')
+    expect(harness.register).toHaveBeenCalledTimes(1)
+  })
+
+  it('warns once and skips registration when the tools service is missing', async () => {
+    const harness = setupRuntime({ includeTools: false })
+    await harness.topic.mount(harness.ctx, 'session-tools')
+    expect(harness.definitions.size).toBe(0)
+    expect(harness.warn).toHaveBeenCalledTimes(1)
+    expect(String(harness.warn.mock.calls[0]?.[0])).toContain('tools')
+  })
+
+  it('does not inject or register when the feature switch is off', async () => {
+    const harness = setupRuntime({ config: makeConfig({}, { topicMessages: false }) })
+    const inject = vi.spyOn(harness.ctx, 'inject')
+    await harness.topic.mount(harness.ctx, 'session-tools')
+    expect(inject).not.toHaveBeenCalled()
+    expect(harness.definitions.size).toBe(0)
+  })
+
+  it('reports a readable TOOL_DISABLED failure when the switch turns off after mount', async () => {
+    const harness = setupRuntime()
+    const definition = await harness.mountTopic()
+    const config = harness.config as FeishuConfig & { feishuTools: FeishuConfig['feishuTools'] }
+    config.feishuTools = { ...config.feishuTools, topicMessages: false }
+
+    const value = await runTopicTool(definition, {})
+    expect(value.ok).toBe(false)
+    expect(value.code).toBe('TOOL_DISABLED')
+    expect(value.summary).toContain('已禁用')
+    expect(value.messages).toEqual([])
+    expectLosslessJson(value)
+  })
+
+  it('warns once when real cordis settles an injection without calling back', async () => {
+    const harness = setupRuntime()
+    vi.spyOn(harness.ctx, 'inject').mockImplementation((() => Promise.resolve()) as typeof harness.ctx.inject)
+    await harness.topic.mount(harness.ctx, 'session-tools')
+    expect(harness.definitions.size).toBe(0)
+    expect(harness.warn).toHaveBeenCalledTimes(1)
+    expect(String(harness.warn.mock.calls[0]?.[0])).toContain('不可用')
+  })
+
+  it('logs one warning and keeps the session alive when the injection fails', async () => {
+    const harness = setupRuntime()
+    vi.spyOn(harness.ctx, 'inject').mockRejectedValueOnce(new Error('no such service'))
+    await expect(harness.topic.mount(harness.ctx, 'session-tools')).resolves.toBeUndefined()
+    expect(harness.definitions.size).toBe(0)
+    expect(harness.warn).toHaveBeenCalledTimes(1)
+    expect(String(harness.warn.mock.calls[0]?.[0])).toContain('mounting')
+  })
+
+  it('does not block session creation when the tools service never appears in time', async () => {
+    vi.useFakeTimers()
+    try {
+      const harness = setupRuntime()
+      let release!: () => void
+      const injection = new Promise<void>((resolve) => { release = resolve })
+      vi.spyOn(harness.ctx, 'inject').mockImplementation(((
+        _deps: readonly string[],
+        _callback: (ctx: AgentContext) => void,
+      ) => injection) as typeof harness.ctx.inject)
+
+      const mounting = harness.topic.mount(harness.ctx, 'session-tools')
+      await vi.advanceTimersByTimeAsync(2_100)
+      await mounting
+      expect(harness.definitions.size).toBe(0)
+      expect(harness.warn).toHaveBeenCalledTimes(1)
+      expect(String(harness.warn.mock.calls[0]?.[0])).toContain('不可用')
+      release()
+      await vi.advanceTimersByTimeAsync(0)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+// ---- P2: feishu_topic_messages argument validation ---------------------
+
+describe('feishu topic-messages argument validation', () => {
+  it('validates the arguments with zod (bounds, integers, unknown keys)', () => {
+    expect(topicMessagesArgsSchema.safeParse({}).success).toBe(true)
+    expect(topicMessagesArgsSchema.safeParse({ message_id: 'om_1' }).success).toBe(true)
+    expect(topicMessagesArgsSchema.safeParse({ limit: 1 }).success).toBe(true)
+    expect(topicMessagesArgsSchema.safeParse({ limit: 50 }).success).toBe(true)
+    expect(topicMessagesArgsSchema.safeParse({ cursor: 'page_token' }).success).toBe(true)
+    expect(topicMessagesArgsSchema.safeParse({ limit: 0 }).success).toBe(false)
+    expect(topicMessagesArgsSchema.safeParse({ limit: 51 }).success).toBe(false)
+    expect(topicMessagesArgsSchema.safeParse({ limit: 2.5 }).success).toBe(false)
+    expect(topicMessagesArgsSchema.safeParse({ message_id: '' }).success).toBe(false)
+    expect(topicMessagesArgsSchema.safeParse({ message_id: 'om_1', cursor: 't' }).success).toBe(true)
+    expect(topicMessagesArgsSchema.safeParse({ message_id: 'om_1', extra: 1 }).success).toBe(false)
+  })
+
+  it('throws readable errors for invalid arguments instead of a raw object', async () => {
+    const harness = setupRuntime()
+    const definition = await harness.mountTopic()
+
+    await expect(runTopicTool(definition, { limit: 0 })).rejects.toThrow(/invalid limit/u)
+    await expect(runTopicTool(definition, { limit: 51 })).rejects.toThrow(/invalid limit/u)
+    await expect(runTopicTool(definition, { limit: 2.5 })).rejects.toThrow(/invalid limit/u)
+    await expect(runTopicTool(definition, { message_id: 'om_1', cursor: 'page_token' }))
+      .rejects.toThrow(/不能同时/u)
+    await expect(runTopicTool(definition, { unknown_argument: true }))
+      .rejects.toThrow(/feishu_topic_messages: invalid/u)
+  })
+
+  it('rejects a malformed or oversized message_id before touching the channel', async () => {
+    const harness = setupRuntime()
+    const definition = await harness.mountTopic()
+
+    for (const messageId of [
+      '../../chats?x=1',
+      'om_x?foo=1',
+      'om_x/../other',
+      'x'.repeat(5_000),
+    ]) {
+      await expect(runTopicTool(definition, { message_id: messageId }))
+        .rejects.toThrow(/invalid message_id/u)
+    }
+    // The shape gate is part of the schema, not of the read path.
+    expect(topicMessagesArgsSchema.safeParse({ message_id: '../../chats?x=1' }).success).toBe(false)
+    expect(topicMessagesArgsSchema.safeParse({ message_id: 'om_x?foo=1' }).success).toBe(false)
+    expect(topicMessagesArgsSchema.safeParse({ message_id: 'x'.repeat(5_000) }).success).toBe(false)
+    expect(topicMessagesArgsSchema.safeParse({ message_id: 'om_Abc-123_xyz' }).success).toBe(true)
+    // Oversized cursors are refused as well; Feishu page tokens are short.
+    expect(topicMessagesArgsSchema.safeParse({ cursor: 'x'.repeat(2_049) }).success).toBe(false)
+    await expect(runTopicTool(definition, { cursor: 'x'.repeat(2_049) }))
+      .rejects.toThrow(/invalid cursor/u)
+  })
+})
+
+// ---- P2: feishu_topic_messages single read ----------------------------
+
+describe('feishu topic-messages single read', () => {
+  const TIME = 1792508690777
+
+  it('reports a missing route binding as a readable ROUTE_NOT_FOUND', async () => {
+    const harness = setupRuntime({ unbound: true })
+    const definition = await harness.mountTopic()
+
+    const value = await runTopicTool(definition, {})
+    expect(value.ok).toBe(false)
+    expect(value.code).toBe('ROUTE_NOT_FOUND')
+    expect(value.summary).toContain('尚未绑定飞书话题')
+    expect(value.messages).toEqual([])
+    expectLosslessJson(value)
+  })
+
+  it('reads a main-timeline message on a degraded chat route', async () => {
+    const chatRoute: AttachmentFetchRoute = {
+      key: 'chat:oc_chat',
+      kind: 'chat',
+      chatId: DEFAULT_ROUTE.chatId,
+      chatType: 'group',
+      senderOpenId: DEFAULT_ROUTE.senderOpenId,
+    }
+    const harness = setupRuntime({
+      route: chatRoute,
+      channel: makeTestChannel({
+        messageGet: async () => makeMessageGetResponse([
+          makeRawMessage({
+            message_id: 'om_chat_main',
+            chat_id: DEFAULT_ROUTE.chatId,
+            content: { text: 'chat main timeline' },
+          }),
+        ]),
+      }),
+    })
+    const definition = await harness.mountTopic()
+
+    const value = await runTopicTool(definition, { message_id: 'om_chat_main' })
+    expect(value.ok).toBe(true)
+    expect(value.container).toEqual({ type: 'chat', id: DEFAULT_ROUTE.chatId })
+    expect(value.messages[0]?.text).toBe('chat main timeline')
+  })
+
+  it('fails closed without a chat_id and never admits topic rows on a chat route', async () => {
+    // A raw item without chat_id has no membership proof: refused on a topic route too.
+    const topicHarness = setupRuntime({
+      channel: makeTestChannel({
+        messageGet: async () => makeMessageGetResponse([
+          makeRawMessage({
+            message_id: 'om_no_chat_id',
+            thread_id: DEFAULT_ROUTE.key,
+            content: { text: 'missing chat id' },
+          }),
+        ]),
+      }),
+    })
+    const topicDefinition = await topicHarness.mountTopic()
+    const noChatId = await runTopicTool(topicDefinition, { message_id: 'om_no_chat_id' })
+    expect(noChatId.ok).toBe(false)
+    expect(noChatId.code).toBe('MESSAGE_OUT_OF_ROUTE')
+
+    // Degraded chat route: a topic message is refused even when it was already
+    // admitted to this route (the tightened membership rule has no known bypass).
+    const chatRoute: AttachmentFetchRoute = {
+      key: 'chat:oc_chat',
+      kind: 'chat',
+      chatId: DEFAULT_ROUTE.chatId,
+      chatType: 'group',
+      senderOpenId: DEFAULT_ROUTE.senderOpenId,
+    }
+    const chatHarness = setupRuntime({
+      route: chatRoute,
+      channel: makeTestChannel({
+        messageGet: async () => makeMessageGetResponse([
+          makeRawMessage({
+            message_id: 'om_known_topic_row',
+            chat_id: chatRoute.chatId,
+            thread_id: 'omt_any_topic',
+            content: { text: 'topic row' },
+          }),
+        ]),
+      }),
+    })
+    chatHarness.runtime.noteKnownMessage(
+      chatRoute,
+      { messageId: 'om_known_topic_row', kind: 'message', resources: [] },
+      'quote',
+    )
+    const chatDefinition = await chatHarness.mountTopic()
+    const refused = await runTopicTool(chatDefinition, { message_id: 'om_known_topic_row' })
+    expect(refused.ok).toBe(false)
+    expect(refused.code).toBe('MESSAGE_OUT_OF_ROUTE')
+  })
+
+  it('reads one message by id and returns lossless JSON with bounded text', async () => {
+    const harness = setupRuntime({
+      channel: makeTestChannel({
+        messageGet: async () => makeMessageGetResponse([
+          makeRawMessage({
+            message_id: 'om_quoted',
+            msg_type: 'text',
+            chat_id: DEFAULT_ROUTE.chatId,
+            thread_id: DEFAULT_ROUTE.key,
+            create_time: TIME,
+            sender_id: 'ou_alice',
+            content: { text: 'quoted hello' },
+          }),
+        ]),
+      }),
+    })
+    const definition = await harness.mountTopic()
+
+    const value = await runTopicTool(definition, { message_id: 'om_quoted' })
+    expect(value.ok).toBe(true)
+    expect(value.order).toBe('single')
+    expect(value.container).toEqual({ type: 'thread', id: DEFAULT_ROUTE.key })
+    expect(value.message_count).toBe(1)
+    expect(value.has_more).toBe(false)
+    expect(value.code).toBeUndefined()
+    expect(value.reason).toBeUndefined()
+    expect(value.messages[0]).toEqual({
+      message_id: 'om_quoted',
+      type: 'text',
+      sender: 'user',
+      time: '10-20 23:04',
+      text: 'quoted hello',
+    })
+    expectLosslessJson(value)
+
+    const blocks = definition.output.render({}, value)
+    expect(blocks[0]?.type).toBe('text')
+    const text = String((blocks[0] as { text?: unknown }).text)
+    expect(text).toContain('quoted hello')
+    expect(text).toContain('om_quoted')
+    expect(text).not.toContain('[object Object]')
+  })
+
+  it('refuses a message id from another chat or another topic (AC5 isolation)', async () => {
+    let response: unknown = makeMessageGetResponse([
+      makeRawMessage({
+        message_id: 'om_other_chat',
+        chat_id: 'oc_other_chat',
+        content: { text: 'not here' },
+      }),
+    ])
+    const harness = setupRuntime({
+      channel: makeTestChannel({ messageGet: async () => response }),
+    })
+    const definition = await harness.mountTopic()
+
+    const otherChat = await runTopicTool(definition, { message_id: 'om_other_chat' })
+    expect(otherChat.ok).toBe(false)
+    expect(otherChat.code).toBe('MESSAGE_OUT_OF_ROUTE')
+    expect(otherChat.summary).toContain('不在当前会话')
+    expect(otherChat.messages).toEqual([])
+    expectLosslessJson(otherChat)
+
+    // Same chat, but another topic of it: must not leak into this thread route.
+    response = makeMessageGetResponse([
+      makeRawMessage({
+        message_id: 'om_other_topic',
+        chat_id: DEFAULT_ROUTE.chatId,
+        thread_id: 'omt_other_topic',
+        content: { text: 'other topic' },
+      }),
+    ])
+    const otherTopic = await runTopicTool(definition, { message_id: 'om_other_topic' })
+    expect(otherTopic.code).toBe('MESSAGE_OUT_OF_ROUTE')
+    // An out-of-route read is not registered for fetches.
+    expect(harness.runtime.isKnownMessage(DEFAULT_ROUTE, 'om_other_topic')).toBe(false)
+  })
+
+  it('allows an admitted main-timeline message in a topic route (known quote)', async () => {
+    const harness = setupRuntime({
+      channel: makeTestChannel({
+        messageGet: async () => makeMessageGetResponse([
+          makeRawMessage({
+            message_id: 'om_quoted_main',
+            chat_id: DEFAULT_ROUTE.chatId,
+            content: { text: 'main timeline quote' },
+          }),
+        ]),
+      }),
+    })
+    // A quote happens before the topic exists: the message has no thread id but
+    // the admission/quote layer already authorized it for this route.
+    harness.runtime.noteKnownMessage(
+      DEFAULT_ROUTE,
+      { messageId: 'om_quoted_main', kind: 'message', resources: [] },
+      'quote',
+    )
+    const definition = await harness.mountTopic()
+
+    const value = await runTopicTool(definition, { message_id: 'om_quoted_main' })
+    expect(value.ok).toBe(true)
+    expect(value.messages[0]?.text).toBe('main timeline quote')
+  })
+
+  it('allows a pending-registry main-timeline message in a topic route', async () => {
+    const harness = setupRuntime()
+    const message = makeMessage({
+      messageId: 'om_pending_main',
+      chatId: DEFAULT_ROUTE.chatId,
+      senderId: DEFAULT_ROUTE.senderOpenId,
+      rawContentType: 'file',
+      content: '',
+      resources: [{ type: 'file', fileKey: 'file_key_pending_main' }],
+    })
+    await harness.pending.registerMessage(message, { admitted: true })
+    harness.channel.messageGet = async () => makeMessageGetResponse([
+      makeRawMessage({
+        message_id: 'om_pending_main',
+        msg_type: 'file',
+        chat_id: DEFAULT_ROUTE.chatId,
+        content: { file_key: 'file_key_pending_main', file_name: 'pending.pdf' },
+      }),
+    ])
+    const definition = await harness.mountTopic()
+
+    const value = await runTopicTool(definition, { message_id: 'om_pending_main' })
+    expect(value.ok).toBe(true)
+    expect(value.messages[0]?.resources?.[0]).toEqual({
+      type: 'file', file_key: 'file_key_pending_main', name: 'pending.pdf',
+    })
+    // The read also refreshes the shared whitelist for the fetch tool.
+    expect(harness.runtime.isKnownMessage(DEFAULT_ROUTE, 'om_pending_main')).toBe(true)
+  })
+
+  it('exposes isKnownMessage over the whitelist and durable pending registry', async () => {
+    const harness = setupRuntime()
+    expect(harness.runtime.isKnownMessage(DEFAULT_ROUTE, 'om_unknown')).toBe(false)
+
+    const knownId = knownFile(harness)
+    expect(harness.runtime.isKnownMessage(DEFAULT_ROUTE, knownId)).toBe(true)
+    expect(harness.runtime.isKnownMessage({ ...DEFAULT_ROUTE, key: 'omt_other' }, knownId)).toBe(false)
+
+    const pendingMessage = makeMessage({
+      messageId: 'om_pending_known',
+      chatId: DEFAULT_ROUTE.chatId,
+      threadId: DEFAULT_ROUTE.key,
+      senderId: DEFAULT_ROUTE.senderOpenId,
+      rawContentType: 'file',
+      content: '',
+      resources: [{ type: 'file', fileKey: 'file_key_known' }],
+    })
+    await harness.pending.registerMessage(pendingMessage, { admitted: true })
+    expect(harness.runtime.isKnownMessage(DEFAULT_ROUTE, 'om_pending_known')).toBe(true)
+
+    // 'history' is a valid registration source for the shared whitelist.
+    harness.runtime.noteKnownMessage(
+      DEFAULT_ROUTE,
+      { messageId: 'om_history_known', kind: 'message', resources: [] },
+      'history',
+    )
+    expect(harness.runtime.isKnownMessage(DEFAULT_ROUTE, 'om_history_known')).toBe(true)
+  })
+
+  it('expands a merged-forward container into child messages and notes the child count', async () => {
+    const harness = setupRuntime({
+      channel: makeTestChannel({
+        messageGet: async () => makeMessageGetResponse([
+          makeRawMessage({
+            message_id: 'om_fwd',
+            msg_type: 'merge_forward',
+            chat_id: DEFAULT_ROUTE.chatId,
+            thread_id: DEFAULT_ROUTE.key,
+            content: {},
+          }),
+          makeRawMessage({
+            message_id: 'om_fwd_text',
+            msg_type: 'text',
+            chat_id: DEFAULT_ROUTE.chatId,
+            upper_message_id: 'om_fwd',
+            content: { text: '子消息文本' },
+          }),
+          makeRawMessage({
+            message_id: 'om_fwd_image',
+            msg_type: 'image',
+            chat_id: DEFAULT_ROUTE.chatId,
+            upper_message_id: 'om_fwd',
+            content: { image_key: 'img_fwd' },
+          }),
+        ]),
+      }),
+    })
+    const definition = await harness.mountTopic()
+
+    const value = await runTopicTool(definition, { message_id: 'om_fwd' })
+    expect(value.ok).toBe(true)
+    expect(value.message_count).toBe(3)
+    expect(value.summary).toContain('合并转发')
+    expect(value.summary).toContain('2 条子消息')
+    expect(value.messages.map(message => message.message_id))
+      .toEqual(['om_fwd', 'om_fwd_text', 'om_fwd_image'])
+    expectLosslessJson(value)
+
+    const text = String((definition.output.render({}, value)[0] as { text?: unknown }).text)
+    expect(text).toContain('子消息文本')
+    expect(text).toContain('图片×1')
+    // The container is registered (merged-forward child bytes download through it).
+    expect(harness.runtime.isKnownMessage(DEFAULT_ROUTE, 'om_fwd')).toBe(true)
+  })
+
+  it('finds the merged-forward container even when children are returned first', async () => {
+    const harness = setupRuntime({
+      channel: makeTestChannel({
+        messageGet: async () => makeMessageGetResponse([
+          makeRawMessage({
+            message_id: 'om_child_text_first',
+            msg_type: 'text',
+            upper_message_id: 'om_shuffled_container',
+            chat_id: DEFAULT_ROUTE.chatId,
+            content: { text: '乱序子消息' },
+          }),
+          makeRawMessage({
+            message_id: 'om_child_image_first',
+            msg_type: 'image',
+            upper_message_id: 'om_shuffled_container',
+            chat_id: DEFAULT_ROUTE.chatId,
+            content: { image_key: 'img_shuffled' },
+          }),
+          makeRawMessage({
+            message_id: 'om_shuffled_container',
+            msg_type: 'merge_forward',
+            chat_id: DEFAULT_ROUTE.chatId,
+            thread_id: DEFAULT_ROUTE.key,
+            content: {},
+          }),
+        ]),
+      }),
+    })
+    const definition = await harness.mountTopic()
+
+    const value = await runTopicTool(definition, { message_id: 'om_shuffled_container' })
+    expect(value.ok).toBe(true)
+    expect(value.summary).toContain('2 条子消息')
+    expect(value.messages.map(message => message.message_id)).toEqual([
+      'om_shuffled_container',
+      'om_child_text_first',
+      'om_child_image_first',
+    ])
+    expect(harness.runtime.isKnownMessage(DEFAULT_ROUTE, 'om_shuffled_container')).toBe(true)
+    expectLosslessJson(value)
+  })
+
+  it('bounds a single merged-forward read to 50 messages and notes the hidden count', async () => {
+    const items: unknown[] = [makeRawMessage({
+      message_id: 'om_huge_fwd',
+      msg_type: 'merge_forward',
+      chat_id: DEFAULT_ROUTE.chatId,
+      thread_id: DEFAULT_ROUTE.key,
+      content: {},
+    })]
+    for (let index = 0; index < 200; index += 1) {
+      items.push(makeRawMessage({
+        message_id: `om_huge_child_${index}`,
+        msg_type: 'text',
+        chat_id: DEFAULT_ROUTE.chatId,
+        upper_message_id: 'om_huge_fwd',
+        content: { text: `child ${index}` },
+      }))
+    }
+    const harness = setupRuntime({
+      channel: makeTestChannel({ messageGet: async () => makeMessageGetResponse(items) }),
+    })
+    const definition = await harness.mountTopic()
+
+    const value = await runTopicTool(definition, { message_id: 'om_huge_fwd' })
+    expect(value.ok).toBe(true)
+    expect(value.messages.length).toBe(50)
+    expect(value.message_count).toBe(value.messages.length)
+    expect(value.summary).toContain('另有 151 条消息未展示')
+    expectLosslessJson(value)
+
+    const text = String((definition.output.render({}, value)[0] as { text?: unknown }).text)
+    expect(text).toContain('未展示')
+  })
+
+  it('reports a missing message as a readable failure', async () => {
+    const harness = setupRuntime({
+      channel: makeTestChannel({ messageGet: async () => makeMessageGetResponse([]) }),
+    })
+    const definition = await harness.mountTopic()
+
+    const value = await runTopicTool(definition, { message_id: 'om_gone' })
+    expect(value.ok).toBe(false)
+    expect(value.code).toBe('MESSAGE_READ_FAILED')
+    expect(value.reason).toContain('未返回该消息')
+    expect(value.messages).toEqual([])
+    expectLosslessJson(value)
+  })
+
+  it('maps a Feishu permission failure to a readable PERMISSION_DENIED', async () => {
+    const harness = setupRuntime({
+      channel: makeTestChannel({
+        messageGet: async () => {
+          throw Object.assign(new Error('request failed'), {
+            response: { status: 403, data: { code: 99991672, msg: 'No permission to read messages' } },
+          })
+        },
+      }),
+    })
+    const definition = await harness.mountTopic()
+
+    const value = await runTopicTool(definition, { message_id: 'om_denied' })
+    expect(value.ok).toBe(false)
+    expect(value.code).toBe('PERMISSION_DENIED')
+    expect(value.reason).toContain('权限')
+    expect(value.summary).toContain('权限')
+    const serialized = JSON.stringify(value)
+    expect(serialized).not.toContain('[object Object]')
+    expect(serialized).not.toContain('undefined')
+    expectLosslessJson(value)
+    const text = String((definition.output.render({}, value)[0] as { text?: unknown }).text)
+    expect(text).toContain('PERMISSION_DENIED')
+    expect(text).not.toContain('[object Object]')
+  })
+
+  it('keeps non-Error SDK rejects readable (never [object Object])', async () => {
+    const harness = setupRuntime({
+      channel: makeTestChannel({
+        messageGet: async () => {
+          throw { code: 234003, msg: 'message not found' }
+        },
+      }),
+    })
+    const definition = await harness.mountTopic()
+
+    const value = await runTopicTool(definition, { message_id: 'om_plain_object' })
+    expect(value.ok).toBe(false)
+    expect(value.code).toBe('MESSAGE_READ_FAILED')
+    expect(value.reason).toContain('234003')
+    expect(value.reason).not.toContain('[object Object]')
+    expectLosslessJson(value)
+  })
+
+  it('reports ABORTED with a readable reason when exec.signal is aborted mid-read', async () => {
+    let release!: (value: unknown) => void
+    const harness = setupRuntime({
+      channel: makeTestChannel({
+        messageGet: () => new Promise((resolve) => { release = resolve }),
+      }),
+    })
+    const definition = await harness.mountTopic()
+    const controller = new AbortController()
+    const execution = runTopicTool(definition, { message_id: 'om_slow' }, controller.signal)
+    controller.abort()
+
+    const value = await execution
+    expect(value.ok).toBe(false)
+    expect(value.code).toBe('ABORTED')
+    expect(value.summary).toContain('取消')
+    expect(value.reason).not.toContain('[object Object]')
+    expectLosslessJson(value)
+    release(makeMessageGetResponse([]))
+  })
+
+  it('reports TIMEOUT with a readable reason on the configured deadline', async () => {
+    vi.useFakeTimers()
+    try {
+      const harness = setupRuntime({
+        config: makeConfig({}, { topicMessagesTimeoutMs: 1_000 }),
+        channel: makeTestChannel({ messageGet: () => new Promise(() => {}) }),
+      })
+      const definition = await harness.mountTopic()
+      const execution = runTopicTool(definition, { message_id: 'om_timeout' })
+      await vi.advanceTimersByTimeAsync(1_100)
+
+      const value = await execution
+      expect(value.ok).toBe(false)
+      expect(value.code).toBe('TIMEOUT')
+      expect(value.summary).toContain('超时')
+      expectLosslessJson(value)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+// ---- P2: feishu_topic_messages list -----------------------------------
+
+describe('feishu topic-messages list', () => {
+  const listedItems = (): unknown[] => [
+    makeRawMessage({
+      message_id: 'om_new',
+      chat_id: DEFAULT_ROUTE.chatId,
+      thread_id: DEFAULT_ROUTE.key,
+      create_time: 1792508690777,
+      content: { text: 'newest message' },
+    }),
+    makeRawMessage({
+      message_id: 'om_old',
+      msg_type: 'file',
+      chat_id: DEFAULT_ROUTE.chatId,
+      thread_id: DEFAULT_ROUTE.key,
+      create_time: 1792508600000,
+      content: { file_key: 'file_key_listed', file_name: 'older.pdf' },
+    }),
+  ]
+
+  it('lists the topic newest-first with page size, sort and cursor passthrough', async () => {
+    const calls: RawMessageListParams[] = []
+    const harness = setupRuntime({
+      channel: makeTestChannel({
+        messageList: async (params) => {
+          calls.push(params)
+          return makeMessageListResponse(listedItems(), { hasMore: true, pageToken: 'token_next' })
+        },
+      }),
+    })
+    const definition = await harness.mountTopic()
+
+    const value = await runTopicTool(definition, { limit: 2 })
+    expect(value.ok).toBe(true)
+    expect(value.order).toBe('newest_first')
+    expect(value.container).toEqual({ type: 'thread', id: DEFAULT_ROUTE.key })
+    expect(value.message_count).toBe(2)
+    expect(value.has_more).toBe(true)
+    expect(value.cursor).toBe('token_next')
+    expect(value.messages.map(message => message.message_id)).toEqual(['om_new', 'om_old'])
+    expect(calls[0]).toMatchObject({
+      container_id_type: 'thread',
+      container_id: DEFAULT_ROUTE.key,
+      page_size: 2,
+      sort_type: 'ByCreateTimeDesc',
+    })
+    expect(calls[0]?.page_token).toBeUndefined()
+    expectLosslessJson(value)
+
+    const text = String((definition.output.render({}, value)[0] as { text?: unknown }).text)
+    expect(text).toContain('newest message')
+    expect(text).toContain('om_new')
+
+    // The cursor is forwarded as page_token; the default page size is 10.
+    const secondPage = await runTopicTool(definition, { cursor: 'token_next' })
+    expect(secondPage.ok).toBe(true)
+    expect(calls[1]?.page_token).toBe('token_next')
+    expect(calls[1]?.page_size).toBe(10)
+
+    // The documented maximum is accepted as-is.
+    await runTopicTool(definition, { limit: 50 })
+    expect(calls[2]?.page_size).toBe(50)
+
+    // Attachment rows discovered in the listing are registered for the fetch
+    // tool (AC5); plain-text rows are not (they carry nothing to fetch and
+    // would churn the shared LRU).
+    expect(harness.runtime.isKnownMessage(DEFAULT_ROUTE, 'om_new')).toBe(false)
+    expect(harness.runtime.isKnownMessage(DEFAULT_ROUTE, 'om_old')).toBe(true)
+  })
+
+  it('lists the chat main timeline on a degraded chat route and filters other topics', async () => {
+    const chatRoute: AttachmentFetchRoute = {
+      key: 'chat:oc_chat',
+      kind: 'chat',
+      chatId: DEFAULT_ROUTE.chatId,
+      chatType: 'group',
+      senderOpenId: DEFAULT_ROUTE.senderOpenId,
+    }
+    const calls: RawMessageListParams[] = []
+    const harness = setupRuntime({
+      route: chatRoute,
+      channel: makeTestChannel({
+        messageList: async (params) => {
+          calls.push(params)
+          return makeMessageListResponse([
+            makeRawMessage({
+              message_id: 'om_main',
+              chat_id: DEFAULT_ROUTE.chatId,
+              content: { text: 'main timeline' },
+            }),
+            makeRawMessage({
+              message_id: 'om_other_topic',
+              chat_id: DEFAULT_ROUTE.chatId,
+              thread_id: 'omt_other_topic',
+              content: { text: 'other topic' },
+            }),
+            makeRawMessage({
+              message_id: 'om_other_chat',
+              chat_id: 'oc_other_chat',
+              content: { text: 'other chat' },
+            }),
+          ])
+        },
+      }),
+    })
+    const definition = await harness.mountTopic()
+
+    const value = await runTopicTool(definition, {})
+    expect(value.ok).toBe(true)
+    expect(calls[0]).toMatchObject({
+      container_id_type: 'chat',
+      container_id: DEFAULT_ROUTE.chatId,
+      page_size: 10,
+      sort_type: 'ByCreateTimeDesc',
+    })
+    expect(value.container).toEqual({ type: 'chat', id: DEFAULT_ROUTE.chatId })
+    expect(value.order).toBe('newest_first')
+    // Topic messages and other chats never leak into a chat route.
+    expect(value.messages.map(message => message.message_id)).toEqual(['om_main'])
+  })
+
+  it('maps a list failure to a readable structured value', async () => {
+    const harness = setupRuntime({
+      channel: makeTestChannel({
+        messageList: async () => {
+          throw Object.assign(new Error('request failed'), {
+            response: { status: 403, data: { code: 99991672, msg: 'No permission' } },
+          })
+        },
+      }),
+    })
+    const definition = await harness.mountTopic()
+
+    const value = await runTopicTool(definition, {})
+    expect(value.ok).toBe(false)
+    expect(value.code).toBe('PERMISSION_DENIED')
+    expect(value.summary).toContain('权限')
+    expect(value.messages).toEqual([])
+    expectLosslessJson(value)
+  })
+
+  it('does not let plain-text history evict authorized resources from the whitelist', async () => {
+    const textPage = (prefix: string): unknown[] => Array.from({ length: 50 }, (_, index) =>
+      makeRawMessage({
+        message_id: `om_${prefix}_${index}`,
+        chat_id: DEFAULT_ROUTE.chatId,
+        thread_id: DEFAULT_ROUTE.key,
+        content: { text: `${prefix} ${index}` },
+      }))
+    let page = 0
+    const harness = setupRuntime({
+      channel: makeTestChannel({
+        messageList: async () => {
+          page += 1
+          return makeMessageListResponse(textPage(`page${page}`), {
+            hasMore: page === 1,
+            ...(page === 1 ? { pageToken: 'token_2' } : {}),
+          })
+        },
+      }),
+    })
+    const triggerMessageId = knownFile(harness)
+    const topicDefinition = await harness.mountTopic()
+    const fetchDefinition = await harness.mount()
+
+    await runTopicTool(topicDefinition, { limit: 50 })
+    await runTopicTool(topicDefinition, { limit: 50, cursor: 'token_2' })
+
+    // 100 plain-text rows must not churn the shared LRU (cap 128 per route):
+    // the trigger registration survives and its attachment stays fetchable.
+    expect(harness.runtime.whitelist.size(DEFAULT_ROUTE.key)).toBe(1)
+    expect(harness.runtime.isKnownMessage(DEFAULT_ROUTE, 'om_page1_0')).toBe(false)
+    expect(harness.runtime.isKnownMessage(DEFAULT_ROUTE, triggerMessageId)).toBe(true)
+
+    const fetched = await runTool(fetchDefinition, { message_id: triggerMessageId })
+    expect(fetched.ok).toBe(true)
+    expect(harness.channel.downloaded).toEqual([
+      { messageId: triggerMessageId, fileKey: 'file_key_1', type: 'file' },
+    ])
+  })
+
+  it('still registers history rows that carry attachments or merged-forward containers', async () => {
+    const harness = setupRuntime({
+      channel: makeTestChannel({
+        messageList: async () => makeMessageListResponse([
+          makeRawMessage({
+            message_id: 'om_text_row',
+            chat_id: DEFAULT_ROUTE.chatId,
+            thread_id: DEFAULT_ROUTE.key,
+            content: { text: 'plain row' },
+          }),
+          makeRawMessage({
+            message_id: 'om_file_row',
+            msg_type: 'file',
+            chat_id: DEFAULT_ROUTE.chatId,
+            thread_id: DEFAULT_ROUTE.key,
+            content: { file_key: 'file_key_row', file_name: 'row.pdf' },
+          }),
+          makeRawMessage({
+            message_id: 'om_fwd_row',
+            msg_type: 'merge_forward',
+            chat_id: DEFAULT_ROUTE.chatId,
+            thread_id: DEFAULT_ROUTE.key,
+            content: {},
+          }),
+        ]),
+      }),
+    })
+    const definition = await harness.mountTopic()
+
+    await runTopicTool(definition, {})
+    expect(harness.runtime.isKnownMessage(DEFAULT_ROUTE, 'om_file_row')).toBe(true)
+    expect(harness.runtime.isKnownMessage(DEFAULT_ROUTE, 'om_fwd_row')).toBe(true)
+    expect(harness.runtime.isKnownMessage(DEFAULT_ROUTE, 'om_text_row')).toBe(false)
+  })
+})
+
+// ---- P2: AC5 authorization chain --------------------------------------
+
+describe('feishu topic-messages authorization chain (AC5)', () => {
+  it('makes a discovered file fetchable and keeps undiscovered ids refused', async () => {
+    const harness = setupRuntime({
+      channel: makeTestChannel({
+        messageGet: async () => makeMessageGetResponse([
+          makeRawMessage({
+            message_id: 'om_topic_file',
+            msg_type: 'file',
+            chat_id: DEFAULT_ROUTE.chatId,
+            thread_id: DEFAULT_ROUTE.key,
+            content: { file_key: 'file_key_topic', file_name: 'topic.pdf' },
+          }),
+        ]),
+      }),
+    })
+    const topicDefinition = await harness.mountTopic()
+    const fetchDefinition = await harness.mount()
+
+    // 1. Before discovery a message id is not a capability: the fetch tool refuses.
+    const denied = await runTool(fetchDefinition, { message_id: 'om_topic_file' })
+    expect(denied.ok).toBe(false)
+    expect(denied.summary).toContain('授权范围')
+    expect(harness.channel.downloaded).toEqual([])
+
+    // 2. The topic tool reads the message and registers its resource.
+    const read = await runTopicTool(topicDefinition, { message_id: 'om_topic_file' })
+    expect(read.ok).toBe(true)
+    expect(read.messages[0]?.resources?.[0]).toMatchObject({
+      type: 'file', file_key: 'file_key_topic',
+    })
+
+    // 3. The REAL attachment-fetch tool definition can now download it.
+    const fetched = await runTool(fetchDefinition, { message_id: 'om_topic_file' })
+    expect(fetched.ok).toBe(true)
+    expect(fetched.results[0]?.ok).toBe(true)
+    expect(harness.channel.downloaded).toEqual([
+      { messageId: 'om_topic_file', fileKey: 'file_key_topic', type: 'file' },
+    ])
+  })
+})
+
+// ---- P2: rendering and presentation -----------------------------------
+
+describe('feishu topic-messages rendering and presentation', () => {
+  it('projects concise call and result lines for host-local cards', async () => {
+    const harness = setupRuntime({
+      channel: makeTestChannel({
+        messageList: async () => makeMessageListResponse([]),
+      }),
+    })
+    const definition = await harness.mountTopic()
+
+    expect(definition.presentCall?.({})).toBe('读取飞书话题消息（最近 10 条）')
+    expect(definition.presentCall?.({ limit: 3 })).toBe('读取飞书话题消息（最近 3 条）')
+    expect(definition.presentCall?.({ limit: 3, cursor: 't' }))
+      .toBe('读取飞书话题消息（最近 3 条，翻页）')
+    expect(definition.presentCall?.({ message_id: 'om_1' })).toBe('读取飞书消息 om_1')
+    const value = await runTopicTool(definition, {})
+    expect(definition.presentResult?.({}, value)).toBe(value.summary)
+  })
+
+  it('bounds the rendered transcript of a long merged-forward message', async () => {
+    const items: unknown[] = [makeRawMessage({
+      message_id: 'om_long_fwd',
+      msg_type: 'merge_forward',
+      chat_id: DEFAULT_ROUTE.chatId,
+      thread_id: DEFAULT_ROUTE.key,
+      content: {},
+    })]
+    for (let index = 0; index < 60; index += 1) {
+      items.push(makeRawMessage({
+        message_id: `om_fwd_child_${index}`,
+        msg_type: 'text',
+        chat_id: DEFAULT_ROUTE.chatId,
+        upper_message_id: 'om_long_fwd',
+        content: { text: `child ${index} ${'x'.repeat(300)}` },
+      }))
+    }
+    const harness = setupRuntime({
+      channel: makeTestChannel({ messageGet: async () => makeMessageGetResponse(items) }),
+    })
+    const definition = await harness.mountTopic()
+
+    const value = await runTopicTool(definition, { message_id: 'om_long_fwd' })
+    expect(value.ok).toBe(true)
+    const text = String((definition.output.render({}, value)[0] as { text?: unknown }).text)
+    expect(text.length).toBeLessThanOrEqual(12_000 + 200)
+    expect(text.split('\n').length).toBeLessThanOrEqual(52)
+    expect(text).toContain('其余')
+  })
+
+  it('renders a safe fallback for replayed or malformed values', () => {
+    const absent = renderTopicMessagesResult(undefined)
+    expect(absent).toHaveLength(1)
+    expect(absent[0]?.type).toBe('text')
+    const malformed = renderTopicMessagesResult({
+      ok: false,
+      summary: '读取失败',
+      messages: [null, { message_id: 'om_1' }],
+    })
+    expect(malformed).toHaveLength(1)
+    expect(String((malformed[0] as { text?: unknown }).text)).toContain('读取失败')
+  })
+
+  it('documents the merged-forward container rule and the archive fetch hint', async () => {
+    const available = await setupRuntime().mountTopic()
+    // The refuted child-id assumption is stated explicitly (P0 rule).
+    expect(available.description).toContain('Merged-forward child message ids are NOT downloadable')
+    expect(available.description).toContain('top-level container message_id')
+    expect(available.description).not.toContain('feishu_attachment_fetch is unavailable')
+
+    // A deployment without the fetch tool gets one extra actionable sentence.
+    const archive = await setupRuntime({ fetchAvailable: () => false }).mountTopic()
+    expect(archive.description).toContain('feishu_attachment_fetch is unavailable')
+    expect(archive.description).toContain('report attachment metadata')
+
+    // Default (undefined) is treated as available.
+    const undefinedProbe = await setupRuntime({ fetchAvailable: () => true }).mountTopic()
+    expect(undefinedProbe.description).not.toContain('feishu_attachment_fetch is unavailable')
+  })
+})
+
 // ---- Presentation and configuration -----------------------------------
 
 describe('feishu attachment-fetch presentation and configuration', () => {
@@ -1657,6 +2695,8 @@ describe('feishu attachment-fetch presentation and configuration', () => {
       attachmentFetchMaxResources: 10,
       attachmentFetchMaxBytes: 100 * 1024 * 1024,
       attachmentFetchTimeoutMs: 120_000,
+      topicMessages: true,
+      topicMessagesTimeoutMs: 20_000,
     })
   })
 

@@ -14,9 +14,13 @@ const sdk = vi.hoisted(() => {
     addReaction: vi.fn(async () => 'reaction-1'),
     removeReaction: vi.fn(async () => {}),
     rawClient: {
+      request: vi.fn(async () => ({ data: { items: [] } })),
       im: {
         v1: {
-          message: { get: vi.fn(async () => ({ data: { items: [] } })) },
+          message: {
+            get: vi.fn(async () => ({ data: { items: [] } })),
+            list: vi.fn(async () => ({ data: { items: [], has_more: false } })),
+          },
           messageResource: { get: vi.fn() },
         },
       },
@@ -88,6 +92,34 @@ describe('LarkChannelAdapter', () => {
       { file: { source, fileName: 'session.jsonl.gz' } },
       { replyTo: 'om_trigger', replyInThread: true },
     )
+  })
+
+  it('exposes the raw message get/list read wrappers', async () => {
+    const channel = defaultChannelFactory(options)
+    await channel.messageGet?.('om_1')
+    expect(sdk.channel.rawClient.im.v1.message.get).toHaveBeenCalledWith({ path: { message_id: 'om_1' } })
+
+    const params = {
+      container_id_type: 'thread' as const,
+      container_id: 'omt_1',
+      page_size: 10,
+      sort_type: 'ByCreateTimeDesc' as const,
+    }
+    await channel.messageList?.(params)
+    expect(sdk.channel.rawClient.im.v1.message.list).toHaveBeenCalledWith({ params })
+  })
+
+  it('batches message.mget with repeated query params (SDK 1.76 has no typed mget)', async () => {
+    const channel = defaultChannelFactory(options)
+    await channel.messageMget?.(['om_a', 'om_b'])
+    expect(sdk.channel.rawClient.request).toHaveBeenCalledWith({
+      method: 'GET',
+      url: '/open-apis/im/v1/messages/mget?message_ids=om_a&message_ids=om_b&card_msg_content_type=raw_card_content',
+    })
+
+    await expect(channel.messageMget?.([])).rejects.toThrow(/1-50/)
+    await expect(channel.messageMget?.(Array.from({ length: 51 }, (_, index) => `om_${index}`)))
+      .rejects.toThrow(/1-50/)
   })
 })
 

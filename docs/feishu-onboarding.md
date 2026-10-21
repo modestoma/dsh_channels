@@ -18,12 +18,16 @@
    | 权限 | 用途 |
    |------|------|
    | `im:message`（获取与发送单聊、群组消息） | 收发消息、回复话题 |
+   | `im:message:readonly`（读取单聊、群组消息内容） | 引用摘录、话题历史、`feishu_topic_messages` 的消息读取（message.get / mget / list） |
    | `im:message.p2p_msg:readonly`（读取用户发给机器人的单聊消息） | 私聊通道 |
+   | `im:message.group_msg`（读取群组中所有消息，**敏感权限**） | 读取群/话题中机器人入群前或未 @ 机器人的历史消息；控制台要求时申请并由企业管理员审批，未开通时按“机器人可见范围”降级 |
    | `im:message.reactions:write_only`（发送、删除消息表情回复） | Typing / DONE / No 表态 |
    | `im:message:update`（更新消息卡片） | 流式卡片刷新（patch） |
    | `im:chat:readonly` 一类（获取群信息） | 入群通知卡展示群名/成员数（具体 scope 以控制台要求为准） |
 
    > 卡片更新接口本身支持 `im:message` 一项即可，但建议把 `im:message:update` 也加上，避免组合差异。
+   >
+   > **引用与话题历史（P2）的权限降级**：`feishu_topic_messages`、引用摘录、新会话首轮话题历史都依赖消息读取 scope。若权限未随版本发布或 `im:message.group_msg` 审批未通过，普通对话**不受影响**：引用/历史块静默省略，模型仍会正常回答；显式调用 `feishu_topic_messages` 时返回可读的 `PERMISSION_DENIED`（缺失 `im:message:readonly` 一类权限），不会报死错。被动引用/历史读取使用 **默认 3 秒**的短预算（`promptContextTimeoutMs`，不复用工具超时），首次降级会输出一条 **warn** 级日志（含原因与 scope 提示，之后同类降级仅 debug 级；`/status` 不报告读取 scope 状态）。控制台若提示“读取群消息需要敏感权限”，先申请并审批 `im:message.group_msg` 后再验证入群前历史。
 4. **事件与回调** → 事件订阅方式选择 **使用长连接接收事件**（WebSocket，免公网 IP）。
    - 添加事件：**接收消息 im.message.receive_v1**（勾选“接收群聊中 @ 机器人消息”）。
    - 添加事件：**机器人进群 im.chat.member.bot.added_v1**（机器人被拉进群后私聊管理员发群信息卡；未订阅时退化为“群里第一次未授权 @ 时补发”）。
@@ -132,7 +136,11 @@ chmod 600 $DSH_HOME/.credentials.yaml
 | `accessMode` | `guarded` | 准入模式：`guarded` 仅管理员+白名单；`open` 保留旧行为（任何可用范围用户可对话，不安全） |
 | `adminOpenId` | 未设置 | 唯一管理员 open_id（`ou_` 开头）；留空 + guarded = 拒绝一切对话（`/userid` 引导仍可用）。面板可改 |
 | `authRequestTtlDays` | `7` | 入群/用户授权申请卡有效期（1–30 天） |
+| `historyBootstrapLimit` | `10` | 新会话首轮自动附带本话题最近 N 条消息摘要（0 关闭，上限 20；失败静默降级）；更早的消息用 `feishu_topic_messages` 翻页 |
+| `promptContextTimeoutMs` | `3000` | 被动引用/首轮历史读取的整段预算（100–10000 ms）；超时即省略对应块、回合照跑。模型主动调用工具的读取超时另由 `feishuTools.topicMessagesTimeoutMs` 控制 |
 | `loggerLevel` | `info` | 官方 SDK 日志级别 |
+
+> `feishuTools` 子项（`attachmentFetch` / `topicMessages` 及各自超时/上限）目前需写在 profile 补丁层，Web 面板暂未暴露（P3 面板任务）。其中 `feishuTools.topicMessages=false` 只关闭模型工具，被动的引用/历史 prompt 摘录仍生效；要完全关闭首轮历史请设 `historyBootstrapLimit: 0`。archive 后端下 `feishu_attachment_fetch` 不挂载，`feishu_topic_messages` 仍可读取历史文本，但工具描述会提示附件不可取。
 
 ### 3.3 初始化管理员与授权（默认准入）
 
@@ -240,6 +248,17 @@ DSH_HOME=$DSH_HOME pnpm dsh web        # 默认 http://127.0.0.1:3080
 ```
 
 每个新话题在该工作区内创建独立的话题工作目录 `<工作区>/topics/<话题 id>/`，会话列表仍归属该项目；同一话题内 `/renew` 复用同一话题目录。也可在飞书里用 `/workspace` 查看当前会话的实际工作目录。
+
+### 5.3 引用与话题历史（P2）验证点
+
+需要真机操作；自动测试已覆盖 prompt 组装与工具行为，但飞书侧权限/历史范围仍需人工确认。
+
+1. **引用文字**：在私聊或已绑定话题内，长按一条更早的机器人/用户消息 → 回复（飞书会自动 @ 被回复消息的发送方）→ 发送“解释一下上面这条”。预期：卡片正常开始；模型能复述被引用消息的内容（引用摘录已进 prompt），而不是回答“看不到引用”。
+2. **引用文件/图片**：先发一条带文件（或图片）的消息，再引用它问“这个文件里是什么”。预期：引用消息的附件会出现在 `<feishu_context>` 清单（`message_id` / `file_key` 为被引用消息），模型用 `feishu_attachment_fetch` 取回后回答；若模型未调用工具，可要求它“用 feishu_attachment_fetch 取一下清单里被引用那条消息的附件”。
+3. **引用合并转发**：把几条消息合并转发到聊天里，然后引用该合并转发问“总结一下转发内容”。预期：prompt 中出现被引用的转发文本，且容器 `message_id` 同时出现在引用块与清单；模型需要子资源时用**顶层容器 message_id** 调用 `feishu_attachment_fetch` 成功（子消息 id 会 400，属预期）。
+4. **话题历史 / @ 之前**：在已有讨论的话题群里，先让其他成员（或自己）在话题内发几条消息，再 @ 机器人提问。预期：新会话首轮 prompt 含最近的 `<feishu_history>` 摘要（默认最近 10 条，每行带 `message_id`，附件可按该 id 懒取）；更早的消息用 `feishu_topic_messages` 翻页查看。若缺 `im:message.group_msg` 等权限，历史块会静默省略但普通对话不受影响——首次降级有一条 warn 日志（含义见 §1 权限说明），按 §1 申请权限后重新发布版本。
+5. **入群前历史**：机器人入群前该群已有消息时，重复第 4 步；若能看到入群前的消息，说明当前应用权限覆盖了机器人可见范围，否则按“机器人可见范围”降级（文档已注明，不保证入群前历史）。
+6. **关闭首轮历史**：把 `historyBootstrapLimit` 设为 `0` 并重载插件，新建会话确认首轮不再附带 `<feishu_history>`；`feishu_topic_messages` 仍可显式读取。
 
 ## 6. 常见问题排查
 

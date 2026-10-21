@@ -67,8 +67,14 @@ import { CardDelivery } from './feishu/delivery.ts'
 import { AttachmentIntake } from './feishu/inbound-attachments.ts'
 import { InboundAttachmentStore, effectiveAttachmentMode, resolveAttachmentService } from './feishu/native-attachments.ts'
 import { PendingAttachmentStore } from './feishu/pending-attachments.ts'
-import { AttachmentFetchToolRuntime } from './feishu/tools.ts'
+import { AttachmentFetchToolRuntime, TopicMessagesToolRuntime } from './feishu/tools.ts'
 import type { KnownAttachmentMessageInput, KnownAttachmentSource } from './feishu/tools.ts'
+import {
+  MessageReader, TOPIC_MESSAGES_MAX_LIMIT, buildHistoryContextBlock,
+  buildQuoteContextBlock, clampInt, knownMessageOfItems, knownMessagesOfHistory, quoteItemsOf,
+  readQuoteItems,
+} from './feishu/message-read.ts'
+import type { MessageReadRoute, RawMessageItem } from './feishu/message-read.ts'
 import type { AttachmentStore } from './host/attachments.ts'
 import { InboundRouter } from './routing/inbound.ts'
 import type { RequestPolicyController } from './session/request-policy.ts'
@@ -312,16 +318,23 @@ export class FeishuService {
    * whitelist, and the TTL/cap sweep wired into the periodic record GC.
    */
   private readonly pendingAttachments: PendingAttachmentStore
+  /**
+   * Read-only Feishu message access (P2): the quoted-message excerpt and the
+   * first-turn topic history. Constructed before the inbound router so the
+   * turn assembly can reach it; it resolves the live channel lazily.
+   */
+  private readonly messageReader = new MessageReader({ channel: () => this.channel })
   /** Inbound routing: dedup, admission, decision tree, session establishment. */
   private readonly inbound: InboundRouter
   /** Agent/session lifecycle: live registry, resume, presets, renew. */
   private readonly sessions: SessionManager
   /**
-   * Model-facing Feishu tools. Today only `feishu_attachment_fetch`; the
-   * runtime also owns the per-route known-message whitelist the admission and
-   * quote layers populate.
+   * Model-facing Feishu tools. `feishu_attachment_fetch` plus the shared
+   * per-route known-message whitelist the admission, quote and history layers
+   * populate; `feishu_topic_messages` reads the current topic on demand.
    */
   private readonly attachmentFetchTools: AttachmentFetchToolRuntime
+  private readonly topicMessagesTools: TopicMessagesToolRuntime
   /** FIFO admission for ordinary turns and commands targeting one route. */
   private readonly routeOperations = new RouteOperationQueue()
   /** Active Host command executions, aborted before shutdown tears peers down. */
@@ -348,6 +361,8 @@ export class FeishuService {
   private restarting = false
   /** One-shot warning for a native deployment without the host attachment library. */
   private warnedNativeAttachmentsUnmounted = false
+  /** One-shot warning for silently degraded quote/history reads (missing scope). */
+  private warnedPromptReadDegraded = false
   private unlisten: (() => void) | undefined
   /** Disposers for host-scoped listeners registered by `start()`. */
   private readonly unlistenHost: Array<() => boolean> = []
@@ -411,8 +426,17 @@ export class FeishuService {
         // disabled) every attachment is downloaded before the turn and the
         // Agent reads the workspace copy, so mounting the tool would only
         // advertise an operation that can never be authorized.
-        if (this.effectiveAttachmentBackend() !== 'native') return
-        return this.attachmentFetchTools.mount(agentCtx, sessionId)
+        //
+        // The topic-messages tool is backend-independent: quoted excerpts and
+        // topic history are read-only, so it is mounted for both backends and
+        // self-gates on `feishuTools.topicMessages`. Both mounts start
+        // together and resolve as one promise (no serial blocking).
+        const mounts: Array<Promise<void>> = []
+        if (this.effectiveAttachmentBackend() === 'native') {
+          mounts.push(this.attachmentFetchTools.mount(agentCtx, sessionId))
+        }
+        mounts.push(this.topicMessagesTools.mount(agentCtx, sessionId))
+        return Promise.all(mounts).then(() => undefined)
       },
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
     })
@@ -457,6 +481,29 @@ export class FeishuService {
       },
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
     })
+    this.topicMessagesTools = new TopicMessagesToolRuntime({
+      config: () => this.config,
+      channel: () => this.channel,
+      routeOfSession: sessionId => {
+        const record = this.routes.findBySession(sessionId)
+        if (record === undefined) return undefined
+        return {
+          key: record.key,
+          kind: record.kind,
+          chatId: record.chatId,
+          chatType: record.chatType,
+          senderOpenId: record.senderOpenId,
+        }
+      },
+      noteKnownMessage: (route, message, source) => {
+        this.attachmentFetchTools.noteKnownMessage(route, message, source)
+      },
+      isKnownMessage: (route, messageId) => this.attachmentFetchTools.isKnownMessage(route, messageId),
+      // The tool description must not promise a fetch tool that archive
+      // deployments do not mount; the runtime appends a degradation note.
+      fetchAvailable: () => this.effectiveAttachmentBackend() === 'native',
+      warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
+    })
     this.delivery = new CardDelivery({
       channel: () => this.channel,
       started: () => this.started,
@@ -496,8 +543,12 @@ export class FeishuService {
       nativeAttachments: () => this.nativeAttachmentService(),
       attachmentStore: this.inboundAttachmentStore,
       pendingAttachments: this.pendingAttachments,
-      noteKnownAttachments: (record, message) => {
-        this.noteKnownAttachmentMessage(record, message, 'trigger')
+      noteKnownAttachments: (record, message, source) => {
+        this.noteKnownAttachmentMessage(record, message, source ?? 'trigger')
+      },
+      messageRead: {
+        quote: input => this.readQuoteContext(input),
+        history: input => this.readHistoryContext(input),
       },
       prefetchImages: () => ({
         enabled: this.config.prefetchImages,
@@ -567,6 +618,166 @@ export class FeishuService {
       chatType: record.chatType,
       senderOpenId: record.senderOpenId,
     }, message, source)
+  }
+
+  // ---- read-only message context (quoted excerpt / topic history) -------
+
+  /**
+   * Channel-plane identity of one route for message reads (structurally the
+   * same as the attachment-tool route: key/kind/chat/sender).
+   */
+  private messageReadRouteOf(record: RouteRecord): MessageReadRoute {
+    return {
+      key: record.key,
+      kind: record.kind,
+      chatId: record.chatId,
+      chatType: record.chatType,
+      senderOpenId: record.senderOpenId,
+    }
+  }
+
+  /**
+   * Resolve one quoted message into the bounded `<feishu_quote>` block and the
+   * whitelist registration of the quoted message (merged-forward containers
+   * keep their container id, per the P0 download rule).
+   *
+   * The quoted message must belong to this route's visible container: another
+   * chat is always rejected; on a thread route a quoted message of a
+   * *different* topic is rejected as well (a main-timeline message carries no
+   * thread id and stays allowed — quotes happen before the bot owns a topic);
+   * on a degraded chat route any topic message is rejected (a chat route must
+   * not read another topic of the same group).
+   *
+   * The read budget is the short prompt-enrichment budget, never the model
+   * tool timeout. Read failures (missing scope, deleted message, channel down)
+   * degrade to `undefined`: the turn runs without an excerpt (AC6).
+   */
+  private async readQuoteContext(input: {
+    messageId: string
+    record: RouteRecord
+  }): Promise<{ block: string; message?: KnownAttachmentMessageInput } | undefined> {
+    try {
+      const result = await readQuoteItems(this.messageReader, input.messageId, {
+        timeoutMs: this.config.promptContextTimeoutMs,
+      })
+      if (!result.ok) {
+        this.reportDegradedRead('quoted message', input.messageId, result.reason)
+        return undefined
+      }
+      const container: RawMessageItem | undefined = quoteItemsOf(result.value)
+      if (container === undefined) return undefined
+      if (!this.quotedMessageBelongsToRoute(input.record, container)) {
+        this.ctx.logger?.debug?.(
+          'dsh-channels: dropping quoted message %s from another chat/topic', input.messageId,
+        )
+        return undefined
+      }
+      const block = buildQuoteContextBlock(result.value, {
+        attachmentFetchAvailable: this.attachmentFetchMounted(),
+      })
+      if (block === '') return undefined
+      const message = knownMessageOfItems(result.value)
+      return { block, ...(message === undefined ? {} : { message }) }
+    } catch (error) {
+      // Defensive: the reader reports structured failures; a raw throw is still
+      // only ever a missing excerpt, never a failed turn.
+      this.ctx.logger?.debug?.(
+        'dsh-channels: reading quoted message %s failed: %s', input.messageId, String(error),
+      )
+      return undefined
+    }
+  }
+
+  /** Whether one quoted message may be shown/authorized for one route. */
+  private quotedMessageBelongsToRoute(record: RouteRecord, container: RawMessageItem): boolean {
+    // Fail closed on a missing/foreign chat id: every real Feishu item carries
+    // one, so an absent id is a malformed response, never a legitimate quote.
+    if (container.chatId === undefined || container.chatId !== record.chatId) return false
+    // A main-timeline message has no thread id; a message of another topic must
+    // never leak into this route's excerpt or whitelist. A degraded chat route
+    // (no topic) must reject topic messages entirely, even in the same chat.
+    if (record.kind === 'thread') {
+      return container.threadId === undefined || container.threadId === record.key
+    }
+    return container.threadId === undefined
+  }
+
+  /**
+   * Resolve the bounded first-turn `<feishu_history>` block plus the whitelist
+   * registrations of the history messages (chronological order).
+   *
+   * `limit` is `historyBootstrapLimit` (0/negative → no read at all). The page
+   * is requested newest-first so a long topic yields the most recent messages;
+   * excluded ids (the trigger and the streaming card), deleted messages, and
+   * messages outside the route container are filtered before the newest
+   * `limit` rows are reversed into chronological order for rendering. The read
+   * uses the short prompt-enrichment budget and degrades to `undefined` (AC6).
+   */
+  private async readHistoryContext(input: {
+    record: RouteRecord
+    limit: number
+    excludeMessageIds: readonly string[]
+  }): Promise<{ block: string; messages: readonly KnownAttachmentMessageInput[] } | undefined> {
+    if (!Number.isFinite(input.limit) || input.limit <= 0) return undefined
+    try {
+      const route = this.messageReadRouteOf(input.record)
+      const pageSize = clampInt(
+        input.limit + input.excludeMessageIds.length,
+        1,
+        TOPIC_MESSAGES_MAX_LIMIT,
+      )
+      const result = await this.messageReader.listRoute(route, {
+        pageSize,
+        order: 'newest-first',
+        timeoutMs: this.config.promptContextTimeoutMs,
+      })
+      if (!result.ok) {
+        this.reportDegradedRead('topic history', input.record.key, result.reason)
+        return undefined
+      }
+      const excluded = new Set(input.excludeMessageIds)
+      const recent = result.value.items
+        .filter(item => !item.deleted && !excluded.has(item.messageId))
+        .slice(0, input.limit)
+        .reverse()
+      const block = buildHistoryContextBlock(recent, {
+        maxMessages: input.limit,
+        attachmentFetchAvailable: this.attachmentFetchMounted(),
+      })
+      if (block === '') return undefined
+      return { block, messages: knownMessagesOfHistory(recent) }
+    } catch (error) {
+      this.ctx.logger?.debug?.(
+        'dsh-channels: reading topic history of %s failed: %s', input.record.key, String(error),
+      )
+      return undefined
+    }
+  }
+
+  /** Whether this deployment mounts the lazy attachment fetch tool. */
+  private attachmentFetchMounted(): boolean {
+    return this.effectiveAttachmentBackend() === 'native'
+  }
+
+  /**
+   * Report one silently degraded prompt read: debug per occurrence (expected
+   * when a deployment misses a scope) plus ONE warn per service lifetime so an
+   * operator can find the cause without log spam.
+   */
+  private reportDegradedRead(kind: string, target: string, reason: string): void {
+    if (this.warnedPromptReadDegraded) {
+      this.ctx.logger?.debug?.(
+        'dsh-channels: %s read of %s failed (degraded): %s', kind, target, reason,
+      )
+      return
+    }
+    this.warnedPromptReadDegraded = true
+    this.ctx.logger?.warn?.(
+      'dsh-channels: %s（%s）读取失败，已静默降级（不带引用/历史上下文继续回合）：%s。'
+      + '如持续出现请检查飞书应用的消息读取权限（如 im:message:readonly / im:message.group_msg），'
+      + '或确认该消息未被撤回、网络正常',
+      kind, target, reason,
+    )
   }
 
   // ---- lifecycle / Web settings panel ----------------------------------

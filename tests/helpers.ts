@@ -20,7 +20,8 @@ import type {
   CreatedWorktree, WorkingDirectoryService, WorktreeService,
 } from '../src/session/isolation.ts'
 import type {
-  BotAddedEvent, CardActionEvent, ChatInfo, FeishuChannel, FeishuConnectionStatus, NormalizedMessage, SendResult,
+  BotAddedEvent, CardActionEvent, ChatInfo, FeishuChannel, FeishuConnectionStatus, NormalizedMessage,
+  RawMessageListParams, SendResult,
 } from '../src/feishu-channel.ts'
 import type { RawDomainHandle } from '../src/domain.ts'
 
@@ -734,6 +735,12 @@ export function makeHostContext(
 
 export interface FakeChannelOptions {
   threadIdOfMessage?: (messageId: string) => Promise<string | undefined>
+  /** Raw `im.v1.message.get` stub (quoted message / merged-forward container). */
+  messageGet?: (messageId: string) => Promise<unknown>
+  /** Raw `im.v1.message.mget` stub (batch read). */
+  messageMget?: (messageIds: readonly string[]) => Promise<unknown>
+  /** Raw `im.v1.message.list` stub (thread / chat history). */
+  messageList?: (params: RawMessageListParams) => Promise<unknown>
   /** Resource chunks returned by `downloadResource` (one message's payload). */
   downloadResource?: (
     messageId: string,
@@ -750,6 +757,73 @@ export interface FakeChannelOptions {
   connectionStatus?: FeishuConnectionStatus
   /** Chat info returned by the `getChatInfo` stub (defaults to a group shell). */
   chatInfo?: (chatId: string) => ChatInfo | Promise<ChatInfo>
+}
+
+/**
+ * One raw `im.v1.message.*` item in the shape the SDK returns. `body.content`
+ * is JSON-encoded exactly like Feishu; tests override only the fields they
+ * assert on.
+ */
+export function makeRawMessage(
+  partial: {
+    message_id?: string
+    msg_type?: string
+    create_time?: string | number
+    thread_id?: string
+    parent_id?: string
+    upper_message_id?: string
+    chat_id?: string
+    sender_type?: string
+    sender_id?: string
+    deleted?: boolean
+    content?: string | Record<string, unknown>
+  } = {},
+): Record<string, unknown> {
+  const { content, ...rest } = partial
+  const encoded = content === undefined
+    ? undefined
+    : typeof content === 'string' ? content : JSON.stringify(content)
+  return {
+    message_id: rest.message_id ?? `om_raw_${Math.random().toString(36).slice(2, 10)}`,
+    msg_type: rest.msg_type ?? 'text',
+    create_time: String(rest.create_time ?? Date.now()),
+    ...(rest.thread_id === undefined ? {} : { thread_id: rest.thread_id }),
+    ...(rest.parent_id === undefined ? {} : { parent_id: rest.parent_id }),
+    ...(rest.upper_message_id === undefined ? {} : { upper_message_id: rest.upper_message_id }),
+    ...(rest.chat_id === undefined ? {} : { chat_id: rest.chat_id }),
+    ...(rest.sender_type === undefined && rest.sender_id === undefined
+      ? {}
+      : {
+        sender: {
+          id: rest.sender_id ?? 'ou_test_user',
+          id_type: 'open_id',
+          sender_type: rest.sender_type ?? 'user',
+        },
+      }),
+    ...(rest.deleted === undefined ? {} : { deleted: rest.deleted }),
+    ...(encoded === undefined ? {} : { body: { content: encoded } }),
+  }
+}
+
+/** Raw `message.get` / `message.mget` envelope around the given items. */
+export function makeMessageGetResponse(items: readonly unknown[]): unknown {
+  return { code: 0, msg: 'success', data: { items } }
+}
+
+/** Raw `message.list` envelope around the given items. */
+export function makeMessageListResponse(
+  items: readonly unknown[],
+  options: { hasMore?: boolean; pageToken?: string } = {},
+): unknown {
+  return {
+    code: 0,
+    msg: 'success',
+    data: {
+      items,
+      has_more: options.hasMore ?? false,
+      ...(options.pageToken === undefined ? {} : { page_token: options.pageToken }),
+    },
+  }
 }
 
 export function makeChannel(options: FakeChannelOptions = {}): FeishuChannel & {
@@ -813,6 +887,21 @@ export function makeChannel(options: FakeChannelOptions = {}): FeishuChannel & {
       removedReactions.push({ messageId, reactionId })
     }),
     threadIdOfMessage: options.threadIdOfMessage ?? (async () => `omt_${serial}`),
+    ...(options.messageGet === undefined
+      ? {}
+      : { messageGet: async (messageId: string): Promise<unknown> => await options.messageGet?.(messageId) }),
+    ...(options.messageMget === undefined
+      ? {}
+      : {
+        messageMget: async (messageIds: readonly string[]): Promise<unknown> =>
+          await options.messageMget?.(messageIds),
+      }),
+    ...(options.messageList === undefined
+      ? {}
+      : {
+        messageList: async (params: RawMessageListParams): Promise<unknown> =>
+          await options.messageList?.(params),
+      }),
     downloadResource: vi.fn(async (messageId: string, fileKey: string, type: 'image' | 'file') => {
       const chunks = options.downloadResource === undefined
         ? [new Uint8Array([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])]

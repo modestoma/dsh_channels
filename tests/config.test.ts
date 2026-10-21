@@ -4,8 +4,10 @@
 
 import { describe, expect, it } from 'vitest'
 import {
-  DEFAULT_PREFETCH_IMAGE_MAX_BYTES, DEFAULT_PREFETCH_TIMEOUT_MS, DEFAULT_PREFETCH_TOTAL_MAX_BYTES,
-  DEFAULT_ROUTE_TTL_MS, resolveConfig,
+  DEFAULT_HISTORY_BOOTSTRAP_LIMIT, DEFAULT_PREFETCH_IMAGE_MAX_BYTES, DEFAULT_PREFETCH_TIMEOUT_MS,
+  DEFAULT_PROMPT_CONTEXT_TIMEOUT_MS,
+  DEFAULT_PREFETCH_TOTAL_MAX_BYTES, DEFAULT_ROUTE_TTL_MS, DEFAULT_TOPIC_MESSAGES_TIMEOUT_MS,
+  MAX_HISTORY_BOOTSTRAP_LIMIT, resolveConfig,
 } from '../src/config.ts'
 
 describe('resolveConfig', () => {
@@ -99,6 +101,43 @@ describe('resolveConfig', () => {
     })).toThrow(/invalid configuration/)
     expect(() => resolveConfig({
       appId: 'FEISHU_APP_ID', appSecret: 'FEISHU_APP_SECRET', prefetchTimeoutMs: 1,
+    })).toThrow(/invalid configuration/)
+  })
+
+  it('defaults history bootstrap and topic-message tool settings, enforcing bounds', () => {
+    const config = resolveConfig({ appId: 'FEISHU_APP_ID', appSecret: 'FEISHU_APP_SECRET' })
+    expect(config.historyBootstrapLimit).toBe(DEFAULT_HISTORY_BOOTSTRAP_LIMIT)
+    expect(config.promptContextTimeoutMs).toBe(DEFAULT_PROMPT_CONTEXT_TIMEOUT_MS)
+    expect(resolveConfig({
+      appId: 'FEISHU_APP_ID', appSecret: 'FEISHU_APP_SECRET', promptContextTimeoutMs: 100,
+    }).promptContextTimeoutMs).toBe(100)
+    expect(() => resolveConfig({
+      appId: 'FEISHU_APP_ID', appSecret: 'FEISHU_APP_SECRET', promptContextTimeoutMs: 50,
+    })).toThrow(/invalid configuration/)
+    expect(config.feishuTools.topicMessages).toBe(true)
+    expect(config.feishuTools.topicMessagesTimeoutMs).toBe(DEFAULT_TOPIC_MESSAGES_TIMEOUT_MS)
+    // 0 disables the first-turn history bootstrap.
+    expect(resolveConfig({
+      appId: 'FEISHU_APP_ID', appSecret: 'FEISHU_APP_SECRET', historyBootstrapLimit: 0,
+    }).historyBootstrapLimit).toBe(0)
+    expect(resolveConfig({
+      appId: 'FEISHU_APP_ID', appSecret: 'FEISHU_APP_SECRET',
+      historyBootstrapLimit: MAX_HISTORY_BOOTSTRAP_LIMIT,
+    }).historyBootstrapLimit).toBe(MAX_HISTORY_BOOTSTRAP_LIMIT)
+    expect(() => resolveConfig({
+      appId: 'FEISHU_APP_ID', appSecret: 'FEISHU_APP_SECRET',
+      historyBootstrapLimit: MAX_HISTORY_BOOTSTRAP_LIMIT + 1,
+    })).toThrow(/invalid configuration/)
+    expect(() => resolveConfig({
+      appId: 'FEISHU_APP_ID', appSecret: 'FEISHU_APP_SECRET', historyBootstrapLimit: -1,
+    })).toThrow(/invalid configuration/)
+    expect(resolveConfig({
+      appId: 'FEISHU_APP_ID', appSecret: 'FEISHU_APP_SECRET',
+      feishuTools: { topicMessages: false },
+    }).feishuTools.topicMessages).toBe(false)
+    expect(() => resolveConfig({
+      appId: 'FEISHU_APP_ID', appSecret: 'FEISHU_APP_SECRET',
+      feishuTools: { topicMessagesTimeoutMs: 10 },
     })).toThrow(/invalid configuration/)
   })
 

@@ -90,6 +90,13 @@ export interface FeishuChannel {
   ): Promise<ResourceChunkStream>
   /** P0 probe surface: raw `im.v1.message.get` (quoted / merged-forward container). */
   messageGet?(messageId: string): Promise<unknown>
+  /**
+   * Batch read surface: raw `im.v1.message.mget` (≤50 message ids). The SDK
+   * 1.76 client does not expose this endpoint as a typed method, so the
+   * adapter calls it through `Client.request`; every caller must tolerate the
+   * method being absent (older channels / stubs) and fall back to `message.get`.
+   */
+  messageMget?(messageIds: readonly string[]): Promise<unknown>
   /** P0 probe surface: raw `im.v1.message.list` (thread / chat history). */
   messageList?(params: RawMessageListParams): Promise<unknown>
 }
@@ -274,6 +281,27 @@ class LarkChannelAdapter implements FeishuChannel {
       get(input: { path: { message_id: string } }): Promise<unknown>
     }
     return await message.get({ path: { message_id: messageId } })
+  }
+
+  async messageMget(messageIds: readonly string[]): Promise<unknown> {
+    // SDK 1.76 has no typed `im.v1.message.mget`; the endpoint is
+    // `GET /open-apis/im/v1/messages/mget` with *repeated* `message_ids`
+    // query params (comma-separated ids are rejected by Feishu with 99992354).
+    // Axios would serialize an array with brackets, so the query string is
+    // built explicitly inside the URL.
+    if (messageIds.length === 0 || messageIds.length > 50) {
+      throw new Error(`message.mget accepts 1-50 message ids (got ${messageIds.length})`)
+    }
+    const query = messageIds
+      .map(messageId => `message_ids=${encodeURIComponent(messageId)}`)
+      .join('&')
+    const client = this.channel.rawClient as unknown as {
+      request(input: { method: string; url: string }): Promise<unknown>
+    }
+    return await client.request({
+      method: 'GET',
+      url: `/open-apis/im/v1/messages/mget?${query}&card_msg_content_type=raw_card_content`,
+    })
   }
 
   async messageList(params: RawMessageListParams): Promise<unknown> {

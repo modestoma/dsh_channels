@@ -49,6 +49,8 @@ Inbound Feishu images and files are stored in the DSH native attachment library 
 - Images that arrived in the message which triggered this turn are already visible to you as image blocks. Never load them again.
 - Files are not loaded by default: the conversation only carries their metadata, not their bytes.
 - The user message may carry a manifest in a \`<${FEISHU_CONTEXT_TAG}>\` block. It lists attachments that are not loaded yet, each with its message_id, type, and, when known, file_key and file name. A line with type=merge_forward is a forwarded-chat container: use its message_id without file_key. An image that could not be prefetched is listed the same way as a file.
+- The user message may also carry \`<feishu_quote>\` (the message this one replies to) and, on a new session's first turn, \`<feishu_history>\` (bounded recent topic messages). Attachments named there are not loaded; fetch one with \`feishu_attachment_fetch\` using the message_id shown on its line.
+- Use the \`feishu_topic_messages\` tool to read a quoted message in full, or to page through earlier messages of this topic (newest first, limit/cursor). Messages and attachments it returns are authorized for \`feishu_attachment_fetch\`.
 
 When the user's request genuinely needs an attachment, fetch it with the \`feishu_attachment_fetch\` tool: pass message_id, and add file_key to fetch one specific file of that message. Fetch nothing when the request can be answered without the bytes, and do not proactively enumerate or fetch attachments the user did not mention.
 
@@ -66,7 +68,9 @@ Attachments are never inserted into the conversation automatically. Read them on
 - images: use \`read_image\` with the file path;
 - text and code: use \`read\` when the session mounts that tool, otherwise \`bash\` (for example \`sed -n '1,200p' <file>\`);
 - other formats (PDF, Office, archives, ...): inspect or convert them with \`bash\`.
-If the user refers to "the file/image I just sent" without a name, list this conversation's attachments directory and pick the most recent matching attachment. Other Feishu conversations work in separate directories: never read outside this conversation's working directory, and never mention files from another conversation.`
+If the user refers to "the file/image I just sent" without a name, list this conversation's attachments directory and pick the most recent matching attachment. Other Feishu conversations work in separate directories: never read outside this conversation's working directory, and never mention files from another conversation.
+
+A message may also carry \`<feishu_quote>\` / \`<feishu_history>\` text excerpts. Attachments named there arrive lazily and are not in this directory in this deployment; describe what the excerpt says instead of claiming to have read the file.`
 
 /**
  * Full guidance text for one Session.
