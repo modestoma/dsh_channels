@@ -3,8 +3,10 @@
  * credentials(PUT,DELETE) / reconnect / access。
  *
  * 路由注册进宿主可选的 `webServer` 服务（headless profile 没有它时面板自然
- * 不存在，飞书通道不受影响）。写操作额外做同源校验 —— 本机非回环绑定下
- * 防止跨站页面改写插件配置或授权白名单；读取不敏感，保持只读 GET。凭据值
+ * 不存在，飞书通道不受影响）。每个路由（读写都算）先交给宿主 `connection`
+ * 服务的 `requestRejection`：与 DSH 自己的 `/api` 同一套 Host/Origin 校验和
+ * 浏览器登录 cookie 鉴权，未通过返回 403 / 401，请求体不会被读取。没有
+ * `connection` 服务的组合不挂载这些路由。写操作另保留同源校验。凭据值
  * 只走写路径，响应永远不包含它们。`catalog` 只读宿主 LLM / preset roster 的
  * 枚举结果，用于面板的 provider → model → 推理档位级联选择。`access` 提供
  * 准入快照与白名单/授权申请的写入口（与飞书卡片共用同一结算函数）。
@@ -42,6 +44,18 @@ export interface HostWebServer {
     path: string
     handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
   }): () => void
+}
+
+/**
+ * The narrow `ctx.connection` surface this module consumes: DSH's own
+ * Host/Origin fence plus browser (login cookie) or API authentication.
+ */
+export interface HostRequestGate {
+  /**
+   * @param request - incoming request headers.
+   * @returns 403 (untrusted Host/Origin), 401 (unauthenticated), or undefined when allowed.
+   */
+  requestRejection(request: { readonly headers: IncomingMessage['headers'] }): 401 | 403 | undefined
 }
 
 type WebHandler = (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
@@ -151,9 +165,20 @@ async function readAccessBody(
   return body as Record<string, unknown>
 }
 
-/** Wrap a handler so thrown errors become JSON instead of a dropped socket. */
-function guarded(handler: WebHandler): WebHandler {
+/**
+ * Wrap a handler so the host gate runs before anything else and thrown
+ * errors become JSON instead of a dropped socket.
+ */
+function guardedBy(gate: HostRequestGate, handler: WebHandler): WebHandler {
   return async (req, res) => {
+    const rejection = gate.requestRejection(req)
+    if (rejection !== undefined) {
+      sendJson(res, rejection, {
+        ok: false,
+        error: rejection === 401 ? '未登录 DSH，请从 DSH 启动链接打开页面' : '请求来源不受信任',
+      })
+      return
+    }
     try {
       await handler(req, res)
     } catch (error) {
@@ -175,7 +200,12 @@ function forbiddenWrite(res: ServerResponse): void {
 }
 
 /** Register the panel routes; the returned disposer removes all of them. */
-export function registerSettingsRoutes(server: HostWebServer, surface: SettingsSurface): () => void {
+export function registerSettingsRoutes(
+  server: HostWebServer,
+  gate: HostRequestGate,
+  surface: SettingsSurface,
+): () => void {
+  const guarded = (handler: WebHandler): WebHandler => guardedBy(gate, handler)
   const disposers = [
     server.register({
       kind: 'exact',
@@ -417,17 +447,20 @@ export function registerSettingsRoutes(server: HostWebServer, surface: SettingsS
 }
 
 /**
- * Mount the routes once the host carries a Web server. The optional
- * `ctx.inject` keeps headless profiles from waiting on a service they will
+ * Mount the routes once the host carries both a Web server and the
+ * `connection` service that authenticates its browser requests. The optional
+ * `ctx.inject` keeps headless profiles from waiting on services they will
  * never have; embedded/test hosts that resolve services synchronously fall
- * back to the direct attach path.
+ * back to the direct attach path. Without `connection` nothing is mounted, so
+ * the panel never serves unauthenticated requests.
  */
 export function mountSettingsRoutes(ctx: HostContext, surface: SettingsSurface): void {
   const attach = (webCtx: HostContext): void => {
     const server = webCtx.get?.('webServer') as HostWebServer | undefined
-    if (server === undefined) return
+    const gate = webCtx.get?.('connection') as HostRequestGate | undefined
+    if (server === undefined || gate === undefined) return
     webCtx.effect(
-      () => registerSettingsRoutes(server, surface),
+      () => registerSettingsRoutes(server, gate, surface),
       'dsh-channels: settings panel routes',
     )
   }
@@ -435,7 +468,7 @@ export function mountSettingsRoutes(ctx: HostContext, surface: SettingsSurface):
     inject?: (dependencies: string[], callback: (child: HostContext) => void) => unknown
   }).inject
   if (typeof inject === 'function') {
-    inject.call(ctx, ['webServer'], attach)
+    inject.call(ctx, ['webServer', 'connection'], attach)
     return
   }
   attach(ctx)

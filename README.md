@@ -104,7 +104,7 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 
 **为什么落在插件自己的文件而不是 profile 的 `cordis.patch.yml`？** DSH 提供官方 `ctx.configEditor.edit()`，可以安全写 profile patch（完整 Config 校验、保留注释与 `!!js`、原子替换、失败回滚、与 HMR 串行）；但它是「完整配置编辑」通道——本插件的 Config 是 zod，没有 schemastery `.volatile()` 标记，普通字段写入会触发 Loader 重载插件，等于每次保存都断开并重连飞书；而且该服务只在有 `profileContext` 的启动器（桌面端 / `dsh web`）存在。`$DSH_HOME/<plugin>/` 是 DSH 插件保存运行时数据的惯例（如 dsh-pet 的 `$DSH_HOME/dsh-pet/`），因此面板偏好写入 `$DSH_HOME/dsh-channels/settings.json`：保存即生效（需重连字段除外）、可一键清除回退、不依赖 `profileContext`；profile 的 `cordis.patch.yml` 继续作为部署级基础配置层。若将来要求「所有配置统一进 profile」，迁移路径是改用 `ctx.configEditor.edit()` 并接受保存触发插件重载。
 
-**安全边界**：面板路由与其他本机 DSH 路由一样**不带鉴权**；写操作（PUT / DELETE / POST）额外校验 `Origin` 与 `Host` 同源，拒绝跨站页面改写配置或凭据。**授权白名单与待处理申请同样面板可写，因此“本机访问面板 = 可授权”**；不要把 DSH Web 服务绑定到不可信网络。凭据值只走写路径、响应永不回显，也不会写进 Web 覆盖文件。`baseDir` 可写意味着同源页面能改变模型文件的落点（面板已拒绝文件系统根目录）。
+**安全边界**：每个面板路由（读和写）都复用 DSH 宿主 `connection` 服务的 `requestRejection`，与 DSH 自己的 `/api` 走同一套 Host/Origin 校验和登录 cookie 鉴权：未登录返回 401，Host/Origin 不受信任返回 403，请求体不会被读取；宿主没有 `connection` 服务时面板路由不挂载。写操作（PUT / DELETE / POST）另保留 `Origin` 与 `Host` 同源校验。**授权白名单与待处理申请同样面板可写，因此“已登录 DSH Web = 可授权”**；非回环绑定时登录 cookie 走明文 HTTP，建议给 DSH Web 服务配置 TLS。凭据值只走写路径、响应永不回显，也不会写进 Web 覆盖文件。`baseDir` 可写意味着同源页面能改变模型文件的落点（面板已拒绝文件系统根目录）。
 
 **构建**：DSH 只加载已构建的浏览器 bundle，改了 `src/client/` 或 `src/settings/contract.ts` 后需要重新构建并重启应用：
 
@@ -200,7 +200,7 @@ src/
 │   ├── catalog.ts         #   宿主选择目录：provider/model/推理档位/preset
 │   ├── directory-picker.ts #  系统目录选择框适配（ctx.directoryPicker native 后端）
 │   ├── surface.ts         #   状态 / 面板视图模型 + 保存 / 清除 / 重连 / 选目录
-│   └── routes.ts          #   HTTP 路由 + 同源写保护
+│   └── routes.ts          #   HTTP 路由 + DSH 登录鉴权 + 同源写保护
 └── workspaces.ts          # 用户工作区 / 话题目录 / 旧版 _staging 路径解析
 ```
 
@@ -412,4 +412,4 @@ pnpm verify:client    # client loader 冒烟
 pnpm check            # 以上全部
 ```
 
-测试以 stub 替换官方 SDK 与 DSH 宿主服务，无需真实凭据。附件管线相关测试：`tests/native-attachments.test.ts`（存储层与 archive 降级）、`tests/feishu-tools.test.ts`（两个工具的白名单 / 上限 / 取消）、`tests/manifest.test.ts`（清单格式与转义）、`tests/inbound-image-prefetch.test.ts`（预取降级）、`tests/message-read.test.ts`（引用 / 历史读取）；接入链路由 `tests/service.test.ts` / `tests/inbound-attachments.test.ts` 覆盖。`tests/settings.test.ts` 覆盖：覆盖层 schema/层级、面板视图模型、连接阶段（待配置/未连接/已连接/失败）、凭据保存按就绪度连接、HTTP 路由（含同源写保护）、`apply()` 的 webServer 接线、模型选择器的宿主目录与降级行为；`tests/client-catalog.test.ts` 覆盖浏览器半区的目录折叠（含依赖项解禁回归）；以及 `FeishuService` 的覆盖加载 / 热更新 / 重启 / 连接失败记录 / 监听器释放。
+测试以 stub 替换官方 SDK 与 DSH 宿主服务，无需真实凭据。附件管线相关测试：`tests/native-attachments.test.ts`（存储层与 archive 降级）、`tests/feishu-tools.test.ts`（两个工具的白名单 / 上限 / 取消）、`tests/manifest.test.ts`（清单格式与转义）、`tests/inbound-image-prefetch.test.ts`（预取降级）、`tests/message-read.test.ts`（引用 / 历史读取）；接入链路由 `tests/service.test.ts` / `tests/inbound-attachments.test.ts` 覆盖。`tests/settings.test.ts` 覆盖：覆盖层 schema/层级、面板视图模型、连接阶段（待配置/未连接/已连接/失败）、凭据保存按就绪度连接、HTTP 路由（含 DSH 登录鉴权与同源写保护）、`apply()` 的 webServer + connection 接线、模型选择器的宿主目录与降级行为；`tests/client-catalog.test.ts` 覆盖浏览器半区的目录折叠（含依赖项解禁回归）；以及 `FeishuService` 的覆盖加载 / 热更新 / 重启 / 连接失败记录 / 监听器释放。
