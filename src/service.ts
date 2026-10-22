@@ -444,7 +444,6 @@ export class FeishuService {
         const record = this.routes.findBySession(sessionId)
         if (record === undefined) return undefined
         return {
-          chatId: record.chatId,
           replyTo: record.cardMessageId,
           inThread: record.kind === 'thread',
           rootDir: sessionDirOf(record),

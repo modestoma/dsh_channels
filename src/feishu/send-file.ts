@@ -6,13 +6,16 @@
  * working directory (`RouteRecord.sessionDir`, or `workspacePath` for records
  * written before per-topic directories) is sent. Both the root and the target
  * are resolved with `realpath`, so `..` segments and symlinks cannot reach
- * another topic's directory or the rest of the filesystem. The plugin reads the
- * bytes itself and hands the SDK a Buffer, so the SDK's own local-path reader
- * is never reached with a model-controlled string.
+ * another topic's directory or the rest of the filesystem. The bytes are read
+ * through one file handle whose device/inode must match the contained path
+ * re-resolved after opening, so swapping a directory for a symlink between the
+ * check and the read is detected.
  *
  * Delivery: the message replies to the route's latest card. A topic route
  * replies inside its topic; a chat route replies on the main timeline. The
- * tool never creates a topic and never targets another chat.
+ * tool never creates a topic and never targets another chat: a recalled or
+ * deleted reply target fails the call instead of falling back to a fresh
+ * chat message.
  *
  * Feishu limits (`im.v1.image.create` / `im.v1.file.create`): images up to
  * 10 MB in JPEG/PNG/WEBP/GIF/TIFF/BMP/ICO, files up to 30 MB, zero-byte
@@ -22,15 +25,16 @@
  * @module dsh-channels/feishu/send-file
  */
 
-import { realpath, readFile, stat } from 'node:fs/promises'
+import { constants } from 'node:fs'
+import { open, realpath, stat } from 'node:fs/promises'
 import path from 'node:path'
 import { z } from 'zod'
 import type { FeishuConfig } from '../config.ts'
 import type {
   AgentContext, ToolContentBlock, ToolDefinition, ToolExecution,
 } from '../host/agent.ts'
-import type { FeishuChannel } from '../feishu-channel.ts'
-import { sniffImageMediaType } from '../feishu-channel.ts'
+import type { FeishuChannel, OutboundMedia } from '../feishu-channel.ts'
+import { FeishuApiError, sniffImageMediaType } from '../feishu-channel.ts'
 import {
   MOUNT_INJECT_RETRY_WAIT_MS, MOUNT_INJECT_WAIT_MS, waitForAvailability,
 } from './tools.ts'
@@ -98,6 +102,7 @@ export type SendFileFailureCode =
   | 'FILE_TOO_LARGE'
   | 'NOT_AN_IMAGE'
   | 'PERMISSION_DENIED'
+  | 'REPLY_TARGET_GONE'
   | 'SEND_FAILED'
   | 'ABORTED'
 
@@ -112,6 +117,7 @@ const FAILURE_REASONS: Readonly<Record<SendFileFailureCode, string>> = {
   FILE_TOO_LARGE: '文件超过飞书上传上限',
   NOT_AN_IMAGE: '文件内容不是飞书支持的图片格式（JPEG/PNG/WEBP/GIF/TIFF/BMP/ICO）；可用 kind=file 以文件发送',
   PERMISSION_DENIED: '飞书拒绝上传：应用缺少 im:resource（获取与上传图片或文件资源）权限，请管理员在开发者后台开通并发布版本',
+  REPLY_TARGET_GONE: '当前话题用于回复的卡片已被撤回或删除；为避免把文件发到群主时间线，已取消发送。请用户在话题里再发一条消息后重试',
   SEND_FAILED: '飞书上传或发送失败',
   ABORTED: '已取消；如果上传已经开始，消息仍可能送达',
 }
@@ -150,8 +156,6 @@ export const SEND_FILE_OUTPUT_SCHEMA: Record<string, unknown> = {
 
 /** Where one Session's outbound files go and where they may come from. */
 export interface SendFileTarget {
-  /** Feishu chat of the route. */
-  readonly chatId: string
   /** Message the upload replies to (the route's latest card). */
   readonly replyTo: string
   /** Whether the reply stays inside a topic (`kind: 'thread'` route). */
@@ -287,14 +291,10 @@ export class SendFileToolRuntime {
     if (channel === undefined) return failure('CHANNEL_UNAVAILABLE')
 
     const { kind, fileName, data } = loaded
-    const input = kind === 'image'
-      ? { image: { source: data } }
-      : { file: { source: data, fileName } }
+    const media: OutboundMedia = kind === 'image' ? { kind, data } : { kind, data, fileName }
     let sent: Promise<{ messageId: string }> | undefined
     try {
-      sent = channel.send(target.chatId, input, target.inThread
-        ? { replyTo: target.replyTo, replyInThread: true }
-        : { replyTo: target.replyTo })
+      sent = channel.replyMedia(target.replyTo, media, { replyInThread: target.inThread })
       const result = await abortable(sent, exec.signal)
       const label = kind === 'image' ? '图片' : '文件'
       return {
@@ -313,6 +313,9 @@ export class SendFileToolRuntime {
       }
       const detail = describeError(error)
       if (isPermissionError(error)) return failure('PERMISSION_DENIED', `${FAILURE_REASONS.PERMISSION_DENIED}（${detail}）`)
+      if (error instanceof FeishuApiError && error.code !== undefined && REPLY_TARGET_GONE_CODES.has(error.code)) {
+        return failure('REPLY_TARGET_GONE')
+      }
       this.deps.warn('dsh-channels: %s failed: %s', SEND_FILE_TOOL_NAME, detail)
       return failure('SEND_FAILED', `${FAILURE_REASONS.SEND_FAILED}：${detail}`)
     }
@@ -350,21 +353,33 @@ export async function loadWorkspaceFile(rootDir: string, args: SendFileArgs): Pr
   }
   if (!isInside(root, real)) return failure('PATH_OUTSIDE_WORKSPACE')
 
-  const info = await stat(real).catch(() => undefined)
-  if (info === undefined) return failure('FILE_NOT_FOUND')
-  if (!info.isFile()) return failure('NOT_A_FILE')
-  if (info.size === 0) return failure('EMPTY_FILE')
   const requested = args.kind ?? 'auto'
   const ceiling = requested === 'image' ? FEISHU_IMAGE_MAX_BYTES : FEISHU_FILE_MAX_BYTES
-  if (info.size > ceiling) return tooLarge(requested === 'image' ? 'image' : 'file', info.size)
-
-  let data: Buffer
+  let handle
   try {
-    data = await readFile(real)
+    handle = await open(real, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
   } catch (error) {
     return failure('FILE_NOT_FOUND', `${FAILURE_REASONS.FILE_NOT_FOUND}：${describeError(error)}`)
   }
-  // The file may have changed between stat and read.
+  let data: Buffer
+  try {
+    const info = await handle.stat()
+    if (!info.isFile()) return failure('NOT_A_FILE')
+    // A directory swapped for a symlink after the realpath check would open a
+    // different inode than the contained path resolves to now.
+    const recheck = await realpath(real).then(again => (isInside(root, again) ? stat(again) : undefined), () => undefined)
+    if (recheck === undefined || recheck.dev !== info.dev || recheck.ino !== info.ino) {
+      return failure('PATH_OUTSIDE_WORKSPACE')
+    }
+    if (info.size === 0) return failure('EMPTY_FILE')
+    if (info.size > ceiling) return tooLarge(requested === 'image' ? 'image' : 'file', info.size)
+    data = await handle.readFile()
+  } catch (error) {
+    return failure('FILE_NOT_FOUND', `${FAILURE_REASONS.FILE_NOT_FOUND}：${describeError(error)}`)
+  } finally {
+    await handle.close().catch(() => undefined)
+  }
+  // The file may have grown or shrunk between stat and read.
   if (data.length === 0) return failure('EMPTY_FILE')
   if (data.length > ceiling) return tooLarge(requested === 'image' ? 'image' : 'file', data.length)
 
@@ -411,6 +426,9 @@ function failure(code: SendFileFailureCode, reason?: string): Extract<SendFileVa
 
 // ---- Errors -------------------------------------------------------------
 
+/** Feishu codes for a recalled/deleted reply target (the SDK's `target_revoked`). */
+const REPLY_TARGET_GONE_CODES: ReadonlySet<number> = new Set([230020, 230017])
+
 /** Feishu codes for a missing app scope. */
 const PERMISSION_CODES: ReadonlySet<number> = new Set([99991672, 99991679, 230027])
 
@@ -428,6 +446,7 @@ function errorChain(error: unknown): unknown[] {
 /** Feishu `{ code, msg }` of an SDK/axios error, when present. */
 function feishuBody(error: unknown): { code?: number; msg?: string } | undefined {
   if (typeof error !== 'object' || error === null) return undefined
+  if (error instanceof FeishuApiError) return { ...(error.code === undefined ? {} : { code: error.code }), msg: error.detail }
   const record = error as { code?: unknown; msg?: unknown; response?: { data?: unknown } }
   const data = record.response?.data
   const source = typeof data === 'object' && data !== null ? data as { code?: unknown; msg?: unknown } : record

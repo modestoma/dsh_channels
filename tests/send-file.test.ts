@@ -9,6 +9,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { resolveConfig } from '../src/config.ts'
 import type { FeishuConfig } from '../src/config.ts'
 import type { ToolDefinition, ToolRuntime } from '../src/host/agent.ts'
+import { FeishuApiError } from '../src/feishu-channel.ts'
 import type { FeishuChannel } from '../src/feishu-channel.ts'
 import {
   FEISHU_FILE_MAX_BYTES, FEISHU_IMAGE_MAX_BYTES, SEND_FILE_TOOL_NAME, SendFileToolRuntime,
@@ -42,7 +43,7 @@ async function setup(options: {
   const warn = vi.fn()
   const config = options.config ?? resolveConfig({})
   const target: SendFileTarget | undefined = options.target === null ? undefined : {
-    chatId: 'oc_chat', replyTo: 'om_card', inThread: true, rootDir: root, ...options.target,
+    replyTo: 'om_card', inThread: true, rootDir: root, ...options.target,
   }
   const runtime = new SendFileToolRuntime({
     config: () => config,
@@ -70,10 +71,10 @@ describe('feishu_send_file', () => {
     writeFileSync(path.join(h.root, 'chart.png'), PNG)
     const value = await h.run({ path: 'chart.png' })
     expect(value).toMatchObject({ ok: true, kind: 'image', file_name: 'chart.png', bytes: PNG.length, message_id: 'om_1' })
-    expect(h.channel.sent).toEqual([{
-      chatId: 'oc_chat',
-      input: { image: { source: PNG } },
-      options: { replyTo: 'om_card', replyInThread: true },
+    expect(h.channel.repliedMedia).toEqual([{
+      replyTo: 'om_card',
+      media: { kind: 'image', data: PNG },
+      options: { replyInThread: true },
     }])
   })
 
@@ -82,10 +83,10 @@ describe('feishu_send_file', () => {
     writeFileSync(path.join(h.root, 'report.csv'), 'a,b\n1,2\n')
     const value = await h.run({ path: path.join(h.root, 'report.csv'), file_name: '季度报表.csv' })
     expect(value).toMatchObject({ ok: true, kind: 'file', file_name: '季度报表.csv' })
-    expect(h.channel.sent[0]).toEqual({
-      chatId: 'oc_chat',
-      input: { file: { source: Buffer.from('a,b\n1,2\n'), fileName: '季度报表.csv' } },
-      options: { replyTo: 'om_card' },
+    expect(h.channel.repliedMedia[0]).toEqual({
+      replyTo: 'om_card',
+      media: { kind: 'file', data: Buffer.from('a,b\n1,2\n'), fileName: '季度报表.csv' },
+      options: { replyInThread: false },
     })
   })
 
@@ -103,7 +104,7 @@ describe('feishu_send_file', () => {
     for (const target of ['../t2/secret.txt', path.join(h.outside, 'secret.txt'), 'link.txt', '/etc/hostname', '../t2/missing.txt']) {
       expect(await h.run({ path: target })).toMatchObject({ ok: false, code: 'PATH_OUTSIDE_WORKSPACE' })
     }
-    expect(h.channel.sent).toEqual([])
+    expect(h.channel.repliedMedia).toEqual([])
   })
 
   it('reports missing, directory and empty files', async () => {
@@ -129,17 +130,26 @@ describe('feishu_send_file', () => {
     expect(await h.run({ path: 'big.png' })).toMatchObject({ ok: true, kind: 'file' })
   })
 
+  it('fails closed with REPLY_TARGET_GONE when the reply card was recalled', async () => {
+    const channel = makeChannel()
+    const h = await setup({ channel })
+    writeFileSync(path.join(h.root, 'a.txt'), 'x')
+    vi.mocked(channel.replyMedia).mockRejectedValueOnce(new FeishuApiError('code=230020 message recalled', 230020))
+    expect(await h.run({ path: 'a.txt' })).toMatchObject({ ok: false, code: 'REPLY_TARGET_GONE' })
+    expect(channel.send).not.toHaveBeenCalled()
+  })
+
   it('maps a Feishu scope rejection to PERMISSION_DENIED and other failures to SEND_FAILED', async () => {
     const channel = makeChannel()
     const h = await setup({ channel })
     writeFileSync(path.join(h.root, 'a.txt'), 'x')
-    vi.mocked(channel.send).mockRejectedValueOnce(Object.assign(new Error('file upload failed'), {
+    vi.mocked(channel.replyMedia).mockRejectedValueOnce(Object.assign(new Error('file upload failed'), {
       cause: { response: { data: { code: 99991672, msg: 'Access denied. One of the following scopes is required: [im:resource]' } } },
     }))
     const denied = await h.run({ path: 'a.txt' })
     expect(denied).toMatchObject({ ok: false, code: 'PERMISSION_DENIED' })
     expect(denied.ok === false && denied.reason).toContain('im:resource')
-    vi.mocked(channel.send).mockRejectedValueOnce(new Error('network down'))
+    vi.mocked(channel.replyMedia).mockRejectedValueOnce(new Error('network down'))
     expect(await h.run({ path: 'a.txt' })).toMatchObject({ ok: false, code: 'SEND_FAILED', reason: '飞书上传或发送失败：network down' })
     expect(h.warn).toHaveBeenCalledTimes(1)
   })
@@ -159,7 +169,7 @@ describe('feishu_send_file', () => {
     const channel = makeChannel()
     const h = await setup({ channel })
     writeFileSync(path.join(h.root, 'a.txt'), 'x')
-    vi.mocked(channel.send).mockReturnValueOnce(new Promise(() => {}))
+    vi.mocked(channel.replyMedia).mockReturnValueOnce(new Promise(() => {}))
     const controller = new AbortController()
     const pending = h.run({ path: 'a.txt' }, controller.signal)
     await new Promise(resolve => setTimeout(resolve, 10))

@@ -83,6 +83,7 @@ interface Harness {
   service: FeishuService
   channel: FeishuChannel & {
     sent: unknown[]
+    repliedMedia: unknown[]
     updated: unknown[]
     reactions: unknown[]
     removedReactions: unknown[]
@@ -4699,11 +4700,11 @@ describe('quote excerpts and first-turn topic history', () => {
     expect(sendTool).toBeDefined()
     const value = await sendTool!.execute({ path: 'chart.png' }, { signal: new AbortController().signal })
     expect(value).toMatchObject({ ok: true, kind: 'image' })
-    expect(h.channel.sent.at(-1)).toMatchObject({
-      chatId: 'oc_send_file',
-      input: { image: { source: expect.any(Buffer) } },
-      options: { replyTo: record.cardMessageId, replyInThread: record.kind === 'thread' ? true : undefined },
-    })
+    expect(h.channel.repliedMedia).toEqual([{
+      replyTo: record.cardMessageId,
+      media: { kind: 'image', data: expect.any(Buffer) },
+      options: { replyInThread: record.kind === 'thread' },
+    }])
     await h.service.shutdown()
   })
 

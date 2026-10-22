@@ -21,6 +21,7 @@ function channel(): FeishuChannel & { updated: Array<{ messageId: string; card: 
     connect: vi.fn(async () => {}),
     disconnect: vi.fn(async () => {}),
     send: vi.fn(async () => ({ messageId: 'om_1' })),
+    replyMedia: vi.fn(async () => ({ messageId: 'om_1' })),
     updateCard: vi.fn(async (messageId: string, card: object) => {
       updated.push({ messageId, card })
     }),
