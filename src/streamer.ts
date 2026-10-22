@@ -147,23 +147,18 @@ interface SegmentCard {
   nextRetryAt: number
 }
 
-/** Per-turn rendering options of {@link TurnStreamer.attach}. */
+/** Settled outcome of one turn, as its card shows it. */
+export type TurnOutcome = 'done' | 'stopped' | 'error'
+
+/** Per-turn options of {@link TurnStreamer.attach}. */
 export interface AttachOptions {
-  /**
-   * Render only the settled result: no intermediate patches, heartbeat, or
-   * stop button; the card (and any overflow segment) is written once when the
-   * turn ends.
-   */
-  readonly quiet?: boolean
-  /** Fixed line at the top of the main card (see `CardState.preface`). */
-  readonly preface?: string
+  /** Called once when the turn's card reaches its final state. */
+  readonly onSettled?: (outcome: TurnOutcome) => void
 }
 
 interface TurnState {
-  /** Whether the turn renders only its settled result (`AttachOptions.quiet`). */
-  quiet: boolean
-  /** Fixed main-card line (`AttachOptions.preface`). */
-  preface: string | undefined
+  /** `AttachOptions.onSettled`. */
+  onSettled: ((outcome: TurnOutcome) => void) | undefined
   /** Turn number once known; undefined until the first `step/start`. */
   turn: number | undefined
   /** Message whose reaction carries Typing → DONE/No. */
@@ -349,7 +344,7 @@ export class TurnStreamer {
    * @param cardMessageId - the main card message (patched in place).
    * @param triggerMessageId - the message carrying the Typing → DONE/No reaction.
    * @param reactionId - the Typing reaction to remove, when one was added.
-   * @param options - per-turn rendering options.
+   * @param options - per-turn options.
    */
   attach(
     session: Session,
@@ -366,8 +361,7 @@ export class TurnStreamer {
     }
     const queue = this.bySession.get(session.id) ?? []
     queue.push({
-      quiet: options.quiet === true,
-      preface: options.preface,
+      onSettled: options.onSettled,
       turn: undefined,
       triggerMessageId,
       reactionId,
@@ -732,8 +726,6 @@ export class TurnStreamer {
   private markDirty(sessionId: string, state: TurnState): void {
     if (state.disposed) return
     state.dirty = true
-    // A quiet turn keeps its card untouched until `finalize` writes the result.
-    if (state.quiet && !state.finalized) return
     if (state.timer !== undefined) return
     const wait = state.lastPatchAt === 0
       ? this.refreshMs
@@ -957,7 +949,7 @@ export class TurnStreamer {
    * itself while the turn is pending; `finalize`/`detach` cancel it.
    */
   private scheduleHeartbeat(sessionId: string, state: TurnState): void {
-    if (state.quiet || state.disposed || state.finalized || state.heartbeatTimer !== undefined) return
+    if (state.disposed || state.finalized || state.heartbeatTimer !== undefined) return
     state.heartbeatTimer = setTimeout(() => {
       state.heartbeatTimer = undefined
       if (state.disposed || state.finalized) return
@@ -995,7 +987,6 @@ export class TurnStreamer {
       ? undefined
       : state.stopRequested ? 'stopping' : 'ready'
     return {
-      ...(state.preface === undefined ? {} : { preface: state.preface }),
       phase: state.phase,
       reasoning: state.reasoning,
       body,
@@ -1239,6 +1230,13 @@ export class TurnStreamer {
     })
 
     this.hooks.onTurnFinalized(sessionId, state.turn ?? 0, state.cards[0]?.messageId ?? '')
+    if (state.onSettled !== undefined) {
+      try {
+        state.onSettled(state.phase === 'error' ? 'error' : state.phase === 'stopped' ? 'stopped' : 'done')
+      } catch (error) {
+        this.hooks.onError(sessionId, error)
+      }
+    }
   }
 
   private async swapReaction(state: TurnState, failed: boolean): Promise<void> {

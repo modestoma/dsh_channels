@@ -2,19 +2,21 @@
  * Log-platform analysis launcher: the business side of the analyze API.
  *
  * Synchronously (before the `202`): service state, target-group permission,
- * `Idempotency-Key` replay, and the placeholder card. In the background: the
- * topic (opened by a hint reply below the placeholder), the
- * `<baseDir>/analyze/<app>/<errorCode>` workspace and its per-topic directory,
- * the Session, the group-shared route, and the first turn: the platform prompt
- * verbatim, rendered quietly (once, when it ends) into the placeholder. Log
- * packages are fetched by the analysis skill the prompt invokes.
+ * `Idempotency-Key` replay, and the root card (分析中). In the background: the
+ * topic (opened by the first streaming card, replied in thread below the root
+ * card), the `<baseDir>/analyze/<app>/<errorCode>` workspace and its per-topic
+ * directory, the Session, the group-shared route, and the first turn: the
+ * platform prompt verbatim, streamed into that card like any topic turn. When
+ * the first turn settles, the root card's status follows it (已完成 / 已停止 /
+ * 失败). Log packages are fetched by the analysis skill the prompt invokes.
  *
  * The topic is reserved in the inbound router from its creation until the
  * route and the first prompt are published, so replies posted meanwhile queue
  * behind the first turn. Follow-ups then use the ordinary topic routing: the
  * route is `shared`, so every member admitted in the group may continue it. A
- * failure before the first turn (including a disconnect meanwhile) replaces
- * the placeholder with a failure card and leaves no route.
+ * failure before the first turn (including a disconnect meanwhile) marks the
+ * root card failed with the reason, closes the streaming card, and leaves no
+ * route.
  *
  * @module dsh-channels/analyze/launcher
  */
@@ -22,10 +24,8 @@
 import { randomUUID } from 'node:crypto'
 import type { AgentHandle, HostContext, SessionId } from '../dsh-types.ts'
 import type { FeishuConfig } from '../config.ts'
-import {
-  ANALYZE_TOPIC_HINT, analyzePreface, buildAnalyzeFailureCard, buildAnalyzePlaceholderCard,
-} from '../cards.ts'
-import type { AnalyzeSubject } from '../cards.ts'
+import { buildAnalyzeRootCard, buildCard, initialStreamingCard } from '../cards.ts'
+import type { AnalyzeStatus, AnalyzeSubject } from '../cards.ts'
 import type { RouteOperationQueue } from '../commands.ts'
 import type { FeishuDomainHandle, RouteRecord } from '../domain.ts'
 import type { FeishuChannel } from '../feishu-channel.ts'
@@ -129,46 +129,55 @@ export class AnalyzeLauncher implements AnalyzeHandler {
       return refused(403, '目标群未授权：请管理员在该群发送 /auth group add，或在设置面板「访问与授权」中添加')
     }
     const subject = subjectOf(request)
-    let placeholderId: string
+    let rootId: string
     try {
-      placeholderId = (await channel.send(request.chatId, { card: buildAnalyzePlaceholderCard(subject) })).messageId
+      rootId = (await channel.send(request.chatId, {
+        card: buildAnalyzeRootCard(subject, { kind: 'running' }),
+      })).messageId
     } catch (error) {
-      return refused(502, `占位卡片发送失败（机器人需在目标群内）：${messageOf(error)}`)
+      return refused(502, `分析卡片发送失败（机器人需在目标群内）：${messageOf(error)}`)
     }
-    const body: AnalyzeAccepted = { ok: true, chatId: request.chatId, messageId: placeholderId }
+    const body: AnalyzeAccepted = { ok: true, chatId: request.chatId, messageId: rootId }
     try {
       await domain.analyzeRequests.put(key, {
-        key, bodyHash, chatId: request.chatId, messageId: placeholderId, acceptedAt: Date.now(),
+        key, bodyHash, chatId: request.chatId, messageId: rootId, acceptedAt: Date.now(),
       })
     } catch (error) {
       // The card is visible already; a lost record only means a retry of this
       // key would post a second analysis.
       this.deps.ctx.logger?.warn?.('dsh-channels: recording analyze request %s failed: %s', key, String(error))
     }
-    const run = this.launch(channel, request, subject, placeholderId)
+    const run = this.launch(channel, request, subject, rootId)
     this.running.add(run)
     void run.finally(() => { this.running.delete(run) })
     return { status: 202, body }
   }
 
-  /** Start the analysis below an accepted placeholder; every failure ends on the card. */
+  /** Start the analysis below an accepted root card; every failure ends on the cards. */
   private async launch(
     channel: FeishuChannel,
     request: AnalyzeRequest,
     subject: AnalyzeSubject,
-    placeholderId: string,
+    rootId: string,
   ): Promise<void> {
     const warn = (message: string, ...args: unknown[]): void => {
       this.deps.ctx.logger?.warn?.(message, ...args)
     }
+    const showStatus = (status: AnalyzeStatus): Promise<void> =>
+      channel.updateCard(rootId, buildAnalyzeRootCard(subject, status)).catch((error: unknown) => {
+        warn('dsh-channels: updating analysis card %s failed: %s', rootId, String(error))
+      })
+    const sessionId = randomUUID() as SessionId
     let handle: AgentHandle | undefined
+    let cardId: string | undefined
     let threadId: string | undefined
     let releaseTopic: (() => void) | undefined
     let published = false
     try {
-      threadId = await this.openTopic(channel, request.chatId, placeholderId)
+      const topic = await this.openTopic(channel, request.chatId, rootId, sessionId)
+      cardId = topic.cardId
+      threadId = topic.threadId
       releaseTopic = this.deps.reserveTopic(threadId)
-      const sessionId = randomUUID() as SessionId
       const services = placementServices(this.deps.ctx)
       const workspace = await ensureAnalyzeWorkspace(
         this.deps.ctx, this.deps.config.baseDir, request.app, request.errorCode,
@@ -199,62 +208,85 @@ export class AnalyzeLauncher implements AnalyzeHandler {
         workspacePath: workspace.path,
         sessionDir: placement.sessionDir,
         ...(placement.worktreeBranch === undefined ? {} : { worktreeBranch: placement.worktreeBranch }),
-        cardMessageId: placeholderId,
+        cardMessageId: cardId,
         createdAt,
         lastActivityAt: createdAt,
         sessionHistory: [{ sessionId, createdAt }],
         shared: true,
       }
       await this.deps.repair.write({
-        key: placeholderId,
+        key: cardId,
         sessionId,
         chatId: request.chatId,
-        triggerMessageId: placeholderId,
-        cards: [{ messageId: placeholderId, mode: 'card' }],
+        triggerMessageId: rootId,
+        cards: [{ messageId: cardId, mode: 'card' }],
         startedAt: Date.now(),
         attempts: 0,
       })
       const agent = handle.agent
+      const key = threadId
+      const streamCardId = cardId
       // Route, stream binding, and prompt land in one queue slot, so a reply
       // posted in the topic meanwhile is delivered after the first turn.
-      const key = threadId
       await this.deps.queue.run(key, async () => {
         this.assertStarted()
         await this.deps.routes.put(key, record)
         published = true
-        this.deps.streamer()?.attach(agent.session, placeholderId, placeholderId, undefined, {
-          quiet: true,
-          preface: analyzePreface(subject),
+        this.deps.streamer()?.attach(agent.session, streamCardId, rootId, undefined, {
+          onSettled: outcome => { void showStatus({ kind: outcome }) },
         })
         agent.followup(feishuUserMessage(request.prompt))
       })
     } catch (error) {
-      warn('dsh-channels: analysis for %s/%s failed to start: %s', request.app, request.errorCode, String(error))
+      const reason = messageOf(error)
+      warn('dsh-channels: analysis for %s/%s failed to start: %s', request.app, request.errorCode, reason)
       if (published && threadId !== undefined) {
         await this.deps.routes.remove(threadId).catch((removeError: unknown) => {
           warn('dsh-channels: removing analysis route %s failed: %s', threadId, String(removeError))
         })
       }
       await handle?.dispose().catch(() => {})
-      void this.deps.repair.clear(placeholderId)
-      await channel.updateCard(placeholderId, buildAnalyzeFailureCard(subject, messageOf(error))).catch(() => {})
+      if (cardId !== undefined) {
+        void this.deps.repair.clear(cardId)
+        await channel.updateCard(cardId, buildCard({
+          phase: 'error',
+          reasoning: '',
+          body: `❌ 分析未能开始：${reason}`,
+          stats: { sessionId, inputTokens: 0, outputTokens: 0 },
+        })).catch(() => {})
+      }
+      await showStatus({ kind: 'failed', reason })
     } finally {
       releaseTopic?.()
     }
   }
 
   /**
-   * Open the analysis topic: a hint reply in thread below the placeholder. The
-   * topic id is read from the reply (or the placeholder, in topic groups).
+   * Open the analysis topic: the first streaming card, replied in thread below
+   * the root card. The topic id is read from that card (or the root card, in
+   * topic groups).
    */
-  private async openTopic(channel: FeishuChannel, chatId: string, placeholderId: string): Promise<string> {
-    const hint = await channel.send(chatId, { text: ANALYZE_TOPIC_HINT }, {
-      replyTo: placeholderId, replyInThread: true,
+  private async openTopic(
+    channel: FeishuChannel,
+    chatId: string,
+    rootId: string,
+    sessionId: SessionId,
+  ): Promise<{ cardId: string; threadId: string }> {
+    const sent = await channel.send(chatId, { card: initialStreamingCard(sessionId) }, {
+      replyTo: rootId, replyInThread: true,
     })
-    const threadId = await channel.threadIdOfMessage(hint.messageId).catch(() => undefined)
-      ?? await channel.threadIdOfMessage(placeholderId).catch(() => undefined)
-    if (threadId === undefined) throw new Error('无法在目标群创建话题（读取话题 id 失败）')
-    return threadId
+    const threadId = await channel.threadIdOfMessage(sent.messageId).catch(() => undefined)
+      ?? await channel.threadIdOfMessage(rootId).catch(() => undefined)
+    if (threadId === undefined) {
+      await channel.updateCard(sent.messageId, buildCard({
+        phase: 'error',
+        reasoning: '',
+        body: '❌ 无法在目标群创建话题',
+        stats: { sessionId, inputTokens: 0, outputTokens: 0 },
+      })).catch(() => {})
+      throw new Error('无法在目标群创建话题（读取话题 id 失败）')
+    }
+    return { cardId: sent.messageId, threadId }
   }
 
   private assertStarted(): void {
@@ -265,8 +297,10 @@ export class AnalyzeLauncher implements AnalyzeHandler {
 function subjectOf(request: AnalyzeRequest): AnalyzeSubject {
   return {
     requesterUserId: request.requesterUserId,
+    triggeredAt: request.triggeredAt,
     app: request.app,
     errorCode: request.errorCode,
+    logDetails: request.logDetails,
   }
 }
 

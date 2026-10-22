@@ -14,6 +14,7 @@ import type { AnalyzeRequest, AnalyzeResponse } from '../src/analyze/contract.ts
 import type { AnalyzeLauncher } from '../src/analyze/launcher.ts'
 import { parseListenAddress, startAnalyzeServer } from '../src/analyze/server.ts'
 import type { AnalyzeHandler, AnalyzeServer } from '../src/analyze/server.ts'
+import { buildAnalyzeRootCard } from '../src/cards.ts'
 import { resolveConfig } from '../src/config.ts'
 import type { FeishuConfig } from '../src/config.ts'
 import type { RouteRecord } from '../src/domain.ts'
@@ -28,13 +29,13 @@ afterEach(async () => {
   for (const server of servers.splice(0)) await server.close()
 })
 
-/** Serve fixed responses per path on 127.0.0.1 (log package fixtures). */
-
 function request(partial: Partial<AnalyzeRequest> = {}): AnalyzeRequest {
   return {
     requesterUserId: 'u_alice',
+    triggeredAt: '2026-10-22 19:30',
     app: 'camera',
     errorCode: 'E1001',
+    logDetails: [{ name: '设备 A 崩溃日志', url: 'https://logs.example/detail/1' }],
     chatId: 'oc_group',
     prompt: '/log-analyze https://logs.example/a.zip 分析这些日志',
     ...partial,
@@ -52,6 +53,7 @@ describe('analyze contract', () => {
     const result = parseAnalyzeRequest({
       ...request(),
       requesterUserId: 'ou_open_id',
+      triggeredAt: ' ',
       app: '../etc',
       chatId: 'not-a-chat',
       errorCode: '..',
@@ -59,14 +61,36 @@ describe('analyze contract', () => {
     })
     expect(result.ok).toBe(false)
     if (result.ok) return
-    for (const field of ['requesterUserId', 'app', 'errorCode', 'chatId', 'prompt']) {
+    for (const field of ['requesterUserId', 'triggeredAt', 'app', 'errorCode', 'chatId', 'prompt']) {
       expect(result.error).toContain(field)
+    }
+  })
+
+  it('requires one to fifty http(s) detail pages', () => {
+    const details = (count: number, url = 'https://logs.example/d') =>
+      Array.from({ length: count }, (_, index) => ({ name: `日志 ${index}`, url }))
+    expect(parseAnalyzeRequest(request({ logDetails: details(50) })).ok).toBe(true)
+    for (const logDetails of [details(0), details(51), details(1, 'javascript:alert(1)'), details(1, 'ftp://logs')]) {
+      const result = parseAnalyzeRequest(request({ logDetails }))
+      expect(result.ok).toBe(false)
+      if (!result.ok) expect(result.error).toContain('logDetails')
     }
   })
 
   it('hashes the request content, not the object identity', () => {
     expect(analyzeRequestHash(request())).toBe(analyzeRequestHash(request()))
     expect(analyzeRequestHash(request({ prompt: 'other' }))).not.toBe(analyzeRequestHash(request()))
+    expect(analyzeRequestHash(request({ triggeredAt: 'other' }))).not.toBe(analyzeRequestHash(request()))
+    expect(analyzeRequestHash(request({ logDetails: [{ name: 'other', url: 'https://logs.example/detail/1' }] })))
+      .not.toBe(analyzeRequestHash(request()))
+  })
+
+  it('renders the root card status and keeps detail links intact', () => {
+    const subject = { ...request(), logDetails: [{ name: 'a', url: 'https://logs.example/d (1)' }] }
+    const stopped = JSON.stringify(buildAnalyzeRootCard(subject, { kind: 'stopped' }))
+    expect(stopped).toContain('[查看](https://logs.example/d%20%281%29)')
+    expect(stopped).toContain('已停止')
+    expect(stopped).toContain('"template":"grey"')
   })
 
   it('validates the listen address and token reference in config', () => {
@@ -196,7 +220,11 @@ describe('analyze service flow', () => {
     await vi.waitFor(assert, { timeout: 3000, interval: 5 })
   }
 
-  it('posts the placeholder, opens a shared topic, and forwards the prompt verbatim', async () => {
+  /** Card JSON of the latest update of one message. */
+  const lastCard = (h: { channel: ReturnType<typeof makeChannel> }, messageId: string): string =>
+    JSON.stringify(h.channel.updated.filter(entry => entry.messageId === messageId).at(-1)?.card)
+
+  it('posts the root card, opens a shared topic with a streaming card, and forwards the prompt verbatim', async () => {
     const h = await setup()
     await h.service.addAccessGroup('oc_group')
     const response = await h.launcher.analyze(request(), 'key-1')
@@ -207,39 +235,54 @@ describe('analyze service flow', () => {
         ok: true, chatId: 'oc_group', messageId: 'om_1',
       },
     })
-    const placeholder = h.channel.sent[0]!
-    expect(placeholder.options).toBeUndefined()
-    expect(JSON.stringify(placeholder.input)).toContain('<at id=u_alice></at> 正在分析 **camera** 应用的 **E1001** 问题。')
+    const root = h.channel.sent[0]!
+    expect(root.options).toBeUndefined()
+    const rootCard = JSON.stringify(root.input)
+    expect(rootCard).toContain('<at id=u_alice></at> 于 2026-10-22 19:30 发起了对 **camera** 应用 **E1001** 错误码不良日志的分析。')
+    expect(rootCard).toContain('"name":"设备 A 崩溃日志","link":"[查看](https://logs.example/detail/1)"')
+    expect(rootCard).toContain('分析中')
 
     await waitUntil(() => expect(h.routes()).toHaveLength(1))
-    const hint = h.channel.sent[1]!
-    expect(hint.options).toEqual({ replyTo: 'om_1', replyInThread: true })
+    const streaming = h.channel.sent[1]!
+    expect(streaming.options).toEqual({ replyTo: 'om_1', replyInThread: true })
+    expect(JSON.stringify(streaming.input)).toContain('推理中')
     expect(h.routes()[0]).toMatchObject({
       key: 'omt_2', kind: 'thread', chatId: 'oc_group', senderUserId: 'u_alice',
-      cardMessageId: 'om_1', shared: true,
+      cardMessageId: 'om_2', shared: true,
       workspacePath: path.join(h.config.baseDir, 'analyze', 'camera', 'E1001'),
     })
     const agent = h.ctxState.agents.created[0]!.handle.agent
     expect(followupMessagesOf(agent).map(message => message.content[0]!.text)).toEqual([request().prompt])
   })
 
-  it('renders the first turn once, into the placeholder, with the preface', async () => {
+  it('streams the first turn in the topic and marks the root card when it settles', async () => {
     const h = await setup()
     await h.service.addAccessGroup('oc_group')
     await h.launcher.analyze(request(), 'key-1')
     await waitUntil(() => expect(h.routes()).toHaveLength(1))
     const agent = h.ctxState.agents.created[0]!.handle.agent
     h.ctxState.assistantStreamListeners[0]!({ agent, frame: { type: 'chunk', attemptId: 'attempt-1', revision: 1, index: 0, time: 1, chunk: { type: 'text-delta', index: 0, text: '根因：内存溢出' } } })
-    await new Promise(resolve => setTimeout(resolve, 700))
-    expect(h.channel.updated).toHaveLength(0)
+    await waitUntil(() => expect(lastCard(h, 'om_2')).toContain('根因：内存溢出'))
+    expect(lastCard(h, 'om_1')).toBeUndefined()
 
     h.ctxState.sessionListeners[0]!(agent.session, { type: 'turn/end', seq: 1, data: { turn: 1, reason: 'stop' } })
-    await waitUntil(() => expect(h.channel.updated).toHaveLength(1))
-    const result = JSON.stringify(h.channel.updated[0]!)
-    expect(h.channel.updated[0]!.messageId).toBe('om_1')
-    expect(result).toContain('根因：内存溢出')
-    expect(result).toContain('发起的日志分析 · 应用 **camera** · 错误码 **E1001**')
+    await waitUntil(() => expect(lastCard(h, 'om_1')).toContain('已完成'))
+    expect(lastCard(h, 'om_1')).toContain('"template":"green"')
     expect(h.channel.reactions).toContainEqual({ messageId: 'om_1', emojiType: 'DONE' })
+  })
+
+  it('marks the root card failed when the first turn fails', async () => {
+    const h = await setup()
+    await h.service.addAccessGroup('oc_group')
+    await h.launcher.analyze(request(), 'key-1')
+    await waitUntil(() => expect(h.routes()).toHaveLength(1))
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    h.ctxState.sessionListeners[0]!(agent.session, {
+      type: 'turn/end', seq: 1, data: { turn: 1, reason: { kind: 'error', error: { message: 'model down', code: 'DOWN' } } },
+    })
+    await waitUntil(() => expect(lastCard(h, 'om_1')).toContain('失败'))
+    expect(lastCard(h, 'om_1')).toContain('原因见话题')
+    expect(lastCard(h, 'om_2')).toContain('model down')
   })
 
   it('replays a retried key and refuses a reused one', async () => {
@@ -271,10 +314,9 @@ describe('analyze service flow', () => {
     await h.service.addAccessGroup('oc_group')
     sessionsOf(h.launcher).mountGuidance = async () => { throw new Error('mount failed') }
     await h.launcher.analyze(request(), 'key-1')
-    await waitUntil(() => expect(h.channel.updated).toHaveLength(1))
-    expect(h.channel.updated[0]!.messageId).toBe('om_1')
-    expect(JSON.stringify(h.channel.updated[0]!.card)).toContain('日志分析未能开始')
-    expect(JSON.stringify(h.channel.updated[0]!.card)).toContain('mount failed')
+    await waitUntil(() => expect(lastCard(h, 'om_1')).toContain('分析未能开始：mount failed'))
+    expect(lastCard(h, 'om_1')).toContain('"template":"red"')
+    expect(lastCard(h, 'om_2')).toContain('分析未能开始：mount failed')
     expect(h.routes()).toHaveLength(0)
     expect(h.ctxState.agents.created[0]!.handle.dispose).toHaveBeenCalled()
   })
@@ -310,8 +352,7 @@ describe('analyze service flow', () => {
     vi.mocked(handle.agent.followup).mockImplementationOnce(() => { throw new Error('session closed') })
 
     held.release()
-    await waitUntil(() => expect(h.channel.updated).toHaveLength(1))
-    expect(JSON.stringify(h.channel.updated[0]!.card)).toContain('session closed')
+    await waitUntil(() => expect(lastCard(h, 'om_1')).toContain('session closed'))
     expect(h.routes()).toHaveLength(0)
     expect(handle.dispose).toHaveBeenCalled()
   })
@@ -326,7 +367,7 @@ describe('analyze service flow', () => {
     const shutdown = h.service.shutdown()
     held.release()
     await shutdown
-    expect(JSON.stringify(h.channel.updated.at(-1)!.card)).toContain('飞书渠道已断开')
+    expect(lastCard(h, 'om_1')).toContain('飞书渠道已断开')
     expect(h.routes()).toHaveLength(0)
   })
 
@@ -346,9 +387,9 @@ describe('analyze service flow', () => {
 
     const cancel = vi.fn()
     ;(agent as unknown as { cancel: unknown }).cancel = cancel
-    // The quiet first turn is still the active one: its card is the placeholder.
+    // The first turn is still the active one: its card carries the stop button.
     const stop = (userId: string): CardActionEvent => ({
-      messageId: 'om_1',
+      messageId: 'om_2',
       chatId: 'oc_group',
       operator: { openId: `ou_${userId}`, userId },
       action: { value: { decision: 'turn-stop' }, tag: 'button' },
