@@ -35,6 +35,12 @@
  * on the card. Ownership checks and the cancellation itself belong to the
  * caller.
  *
+ * Queued turns: a turn attached behind the session's active turn renders as
+ * a queued card (notice + steer button) until it becomes the front.
+ * `steerTargetOf()` resolves a clicked queued card; `mergeQueued()` lets the
+ * caller move the queued message into the running turn and retires the
+ * queued card, handing its trigger reaction to the running turn.
+ *
  * The first visible text delta flips the panel title 推理中 → 回复中; the
  * final patch flips it to 回复结束 or 回复失败. Patching is throttled to `refreshMs` and
  * only runs when the content actually changed. Segment sends are serialized
@@ -48,8 +54,8 @@
  * @module dsh-channels/streamer
  */
 
-import type { AssistantStreamFrame, Session, SessionEvent, TurnEndReason } from './dsh-types.ts'
-import { buildCard, segmentCardContent, segmentCardOptions } from './cards.ts'
+import type { AssistantStreamFrame, Session, SessionEvent, TurnEndReason, UserMessage } from './dsh-types.ts'
+import { buildCard, buildMergedCard, segmentCardContent, segmentCardOptions } from './cards.ts'
 import type { CardState, PanelPhase, StopControl } from './cards.ts'
 import type { FeishuChannel } from './feishu-channel.ts'
 import { cacheHitPct, foldAll, foldEvent } from './stats.ts'
@@ -147,6 +153,13 @@ interface SegmentCard {
   nextRetryAt: number
 }
 
+/** A Feishu message whose Typing reaction swaps to DONE/No when a turn settles. */
+interface TriggerReaction {
+  triggerMessageId: string
+  /** Reaction id of the Typing reaction (undefined when the add failed). */
+  reactionId: string | undefined
+}
+
 /** Settled outcome of one turn, as its card shows it. */
 export type TurnOutcome = 'done' | 'stopped' | 'error'
 
@@ -154,6 +167,11 @@ export type TurnOutcome = 'done' | 'stopped' | 'error'
 export interface AttachOptions {
   /** Called once when the turn's card reaches its final state. */
   readonly onSettled?: (outcome: TurnOutcome) => void
+  /**
+   * The prompt this turn will run; only a turn that carries it can be
+   * steered into the running turn while queued.
+   */
+  readonly message?: UserMessage
 }
 
 interface TurnState {
@@ -165,6 +183,10 @@ interface TurnState {
   triggerMessageId: string
   /** Reaction id of the Typing reaction (undefined when the add failed). */
   reactionId: string | undefined
+  /** Prompt queued for this turn; a queued card can steer it into the running turn. */
+  message: UserMessage | undefined
+  /** Triggers of queued messages merged into this turn (settle together). */
+  mergedTriggers: TriggerReaction[]
   phase: PanelPhase
   reasoning: string
   /** Request header produced during THIS turn; never inherited from history. */
@@ -227,6 +249,8 @@ interface TurnState {
   stopRequested: boolean
   /** A non-owner clicked stop; the owner-only notice renders under the button. */
   stopDenied: boolean
+  /** A non-owner clicked the queued card's steer button. */
+  queuedDenied: boolean
 }
 
 /** Card/body lengths captured at one stream attempt's `start` frame. */
@@ -365,6 +389,8 @@ export class TurnStreamer {
       turn: undefined,
       triggerMessageId,
       reactionId,
+      message: options.message,
+      mergedTriggers: [],
       phase: 'thinking',
       reasoning: '',
       header: undefined,
@@ -402,6 +428,7 @@ export class TurnStreamer {
       attempts: new Map(),
       stopRequested: false,
       stopDenied: false,
+      queuedDenied: false,
     })
     this.bySession.set(session.id, queue)
     const state = queue[queue.length - 1]!
@@ -447,6 +474,94 @@ export class TurnStreamer {
       if (this.front(sessionId)?.cards.some(card => card.messageId === messageId) === true) return sessionId
     }
     return undefined
+  }
+
+  /**
+   * Whether the session has an unsettled turn that a new message would queue
+   * behind.
+   * @param sessionId - the session to inspect.
+   * @returns true while a turn is streaming or queued.
+   */
+  hasLiveTurn(sessionId: string): boolean {
+    return this.front(sessionId) !== undefined
+  }
+
+  /**
+   * The queued turn whose card is `messageId`, or undefined when the card is
+   * not a queued card (active, settled, merged, detached, or unknown).
+   * @param messageId Feishu message id of a clicked card.
+   * @returns The owning session id and the queued prompt.
+   */
+  steerTargetOf(messageId: string): { sessionId: string; message: UserMessage } | undefined {
+    const queued = this.queuedState(messageId)
+    return queued === undefined ? undefined : { sessionId: queued.sessionId, message: queued.message }
+  }
+
+  /** The steerable queued turn whose main card is `messageId`. */
+  private queuedState(messageId: string): { sessionId: string; state: TurnState; message: UserMessage } | undefined {
+    for (const [sessionId, queue] of this.bySession) {
+      const front = this.front(sessionId)
+      const state = queue.find(entry => !entry.finalized && entry !== front && entry.cards[0]?.messageId === messageId)
+      if (state?.message !== undefined) return { sessionId, state, message: state.message }
+    }
+    return undefined
+  }
+
+  /**
+   * Move the queued turn of `messageId` into the session's running turn.
+   * Refused (false) while the running turn is stopping, or when `steer`
+   * reports the message was no longer pending. On success the queued card
+   * becomes the merged notice, and its trigger reaction settles with the
+   * running turn.
+   * @param messageId - the queued card the owner clicked.
+   * @param steer - moves the message in the agent inbox; returns false when
+   *   the driver already claimed it.
+   * @returns whether the message moved.
+   */
+  mergeQueued(messageId: string, steer: (sessionId: string, message: UserMessage) => boolean): boolean {
+    const target = this.queuedState(messageId)
+    if (target === undefined) return false
+    const { sessionId, state } = target
+    const front = this.front(sessionId)!
+    if (front.stopRequested || !steer(sessionId, target.message)) return false
+    const queue = this.bySession.get(sessionId)!
+    queue.splice(queue.indexOf(state), 1)
+    state.disposed = true
+    if (state.timer !== undefined) clearTimeout(state.timer)
+    if (state.heartbeatTimer !== undefined) clearTimeout(state.heartbeatTimer)
+    front.mergedTriggers.push(
+      { triggerMessageId: state.triggerMessageId, reactionId: state.reactionId },
+      ...state.mergedTriggers,
+    )
+    void this.settleMergedCard(sessionId, messageId)
+    return true
+  }
+
+  /**
+   * Patch a merged queued card into its terminal notice, with up to two
+   * retries (1s / 2s backoff) so a transient failure does not leave a stale
+   * queued card whose button no longer acts.
+   */
+  private async settleMergedCard(sessionId: string, messageId: string): Promise<void> {
+    let lastError: unknown
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        await this.channel.updateCard(messageId, buildMergedCard())
+        return
+      } catch (error) {
+        lastError = error
+        if (attempt < 2) await this.delay(1_000 * 2 ** attempt)
+      }
+    }
+    this.hooks.onError(sessionId, lastError)
+  }
+
+  /** Add the owner-only notice under a queued card's steer button (once). */
+  markQueuedDenied(messageId: string): void {
+    const target = this.queuedState(messageId)
+    if (target === undefined || target.state.queuedDenied) return
+    target.state.queuedDenied = true
+    this.markDirty(target.sessionId, target.state)
   }
 
   /**
@@ -983,7 +1098,8 @@ export class TurnStreamer {
       const kind = this.noteKind('tool', tool, state.toolKind)
       if (kind !== undefined) state.toolKind = kind
     }
-    const stop: StopControl | undefined = !active || state.finalized || this.front(sessionId) !== state
+    const queued = !state.finalized && this.front(sessionId) !== state
+    const stop: StopControl | undefined = !active || state.finalized || queued
       ? undefined
       : state.stopRequested ? 'stopping' : 'ready'
     return {
@@ -993,6 +1109,7 @@ export class TurnStreamer {
       status: active ? state.status : '',
       tool: active ? state.tool : '',
       ...(stop === undefined ? {} : { stop, stopDenied: state.stopDenied }),
+      ...(queued ? { queued, queuedDenied: state.queuedDenied } : {}),
       stats: this.statsFor(sessionId, state),
     }
   }
@@ -1215,7 +1332,7 @@ export class TurnStreamer {
     }
 
     // Reaction swap: Typing → DONE on success, Typing → No on failure.
-    void this.swapReaction(state, failure !== undefined)
+    for (const trigger of [state, ...state.mergedTriggers]) void this.swapReaction(trigger, failure !== undefined)
 
     // Prune the finalized state lazily (kept until the next attach so the
     // front-scan skips it, then removed).
@@ -1239,7 +1356,7 @@ export class TurnStreamer {
     }
   }
 
-  private async swapReaction(state: TurnState, failed: boolean): Promise<void> {
+  private async swapReaction(state: TriggerReaction, failed: boolean): Promise<void> {
     try {
       if (state.reactionId !== undefined) {
         await this.channel.removeReaction(state.triggerMessageId, state.reactionId)

@@ -39,7 +39,7 @@ import type {
   SessionProjections,
   TokenMeter,
 } from './dsh-types.ts'
-import { buildPickerCard, parsePickAction, standaloneInfoCard, STOP_ACTION } from './cards.ts'
+import { buildPickerCard, parsePickAction, standaloneInfoCard, STEER_ACTION, STOP_ACTION } from './cards.ts'
 import type { PickerOption } from './cards.ts'
 import {
   armEffortCommand, armModelCommand, armRenewCommand, registerModelCommand, commandResultCardKind, parseSlashCommand,
@@ -1455,6 +1455,7 @@ export class FeishuService {
       questions.onCardAction(event)
       this.wikiConsent.onCardAction(event)
       this.onStopAction(event)
+      this.onSteerAction(event)
       void this.onPickAction(event).catch((error: unknown) => {
         this.ctx.logger?.warn?.('dsh-channels: picker card action failed: %s', String(error))
       })
@@ -2057,6 +2058,37 @@ export class FeishuService {
       return
     }
     this.cancelTurn(sessionId)
+  }
+
+  /**
+   * Queued-card steer button: a user who may act on the route (the owner, or
+   * any admitted member of a group-shared route), clicking inside the
+   * session's own chat, moves the queued message out of the next-turn queue
+   * and into the running turn's next step; another operator gets the
+   * owner-only notice instead. A message the driver already claimed (its turn
+   * started) or a turn that is stopping leaves the card to its own turn.
+   */
+  private onSteerAction(event: CardActionEvent): void {
+    if (!this.started) return
+    if ((event.action.value as { decision?: unknown } | undefined)?.decision !== STEER_ACTION) return
+    const target = this.streamer?.steerTargetOf(event.messageId)
+    if (target === undefined) return
+    const route = this.routes.findBySession(target.sessionId)
+    if (route === undefined) return
+    if (!this.accessController.mayActOnRoute(event.operator.userId, event.chatId, route)) {
+      this.streamer?.markQueuedDenied(event.messageId)
+      return
+    }
+    const agent = this.sessions.get(target.sessionId)?.agent
+      ?? this.ctx.agents.get(target.sessionId as SessionId)
+    if (agent?.status !== 'running') return
+    const merged = this.streamer?.mergeQueued(event.messageId, (_sessionId, message) => {
+      if (!agent.inbox.remove(message.id)) return false
+      agent.steer(message)
+      return true
+    }) === true
+    // The queued card no longer owns a turn: retire its restart-repair snapshot.
+    if (merged) void this.repair.clear(event.messageId)
   }
 
   /**

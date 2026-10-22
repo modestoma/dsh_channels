@@ -2869,6 +2869,84 @@ describe('/stop, structured questions, and host projections', () => {
     await h.service.shutdown()
   })
 
+  it('queues a topic message behind the running turn and steers it in from its card, owner only', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_steer', senderId: 'u_owner', messageId: 'om_steer_start', content: '开始',
+    }))
+    await waitForEstablishedSession(h)
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    ;(agent as unknown as { status: string }).status = 'running'
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_steer', senderId: 'u_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_steer_more', content: '再补充一点',
+    }))
+    await waitUntil(() => expect(mock(agent.followup)).toHaveBeenCalledTimes(2))
+    const queuedCard = h.channel.sent[1] as { input: object }
+    expect(JSON.stringify(queuedCard.input)).toContain('排队中')
+    const message = mock(agent.followup).mock.calls[1]![0] as { id: string }
+    const value = { decision: 'turn-steer' }
+
+    // A stranger's click only adds the owner-only notice.
+    await h.channel.fireCardAction({
+      messageId: 'om_2', chatId: 'oc_steer',
+      operator: { openId: 'ou_x', userId: 'u_stranger' }, action: { value, tag: 'button' },
+    })
+    expect(mock(agent.steer)).not.toHaveBeenCalled()
+    await waitUntil(() => expect(h.channel.updated.some(update =>
+      JSON.stringify((update as { card: object }).card).includes('仅发起该会话的用户可补充'),
+    )).toBe(true))
+
+    // The running turn's own card is not a queued card.
+    await h.channel.fireCardAction({
+      messageId: 'om_1', chatId: 'oc_steer',
+      operator: { openId: 'ou_o', userId: 'u_owner' }, action: { value, tag: 'button' },
+    })
+    expect(mock(agent.steer)).not.toHaveBeenCalled()
+
+    await h.channel.fireCardAction({
+      messageId: 'om_2', chatId: 'oc_steer',
+      operator: { openId: 'ou_o', userId: 'u_owner' }, action: { value, tag: 'button' },
+    })
+    expect(mock(agent.inbox.remove)).toHaveBeenCalledWith(message.id)
+    expect(mock(agent.steer)).toHaveBeenCalledWith(message)
+    await waitUntil(() => expect(h.channel.updated.some(update =>
+      (update as { messageId: string }).messageId === 'om_2'
+      && JSON.stringify((update as { card: object }).card).includes('已补充到当前回复'),
+    )).toBe(true))
+    expect(h.channel.sent).toHaveLength(2)
+    await h.service.shutdown()
+  })
+
+  it('leaves a queued card alone when the agent is idle or the prompt was already claimed', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_steer_late', senderId: 'u_owner', content: '开始',
+    }))
+    await waitForEstablishedSession(h)
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_steer_late', senderId: 'u_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_steer_late', content: '补充',
+    }))
+    await waitUntil(() => expect(mock(agent.followup)).toHaveBeenCalledTimes(2))
+    const click = () => h.channel.fireCardAction({
+      messageId: 'om_2', chatId: 'oc_steer_late',
+      operator: { openId: 'ou_o', userId: 'u_owner' }, action: { value: { decision: 'turn-steer' }, tag: 'button' },
+    })
+
+    await click()
+    expect(mock(agent.inbox.remove)).not.toHaveBeenCalled()
+
+    ;(agent as unknown as { status: string }).status = 'running'
+    mock(agent.inbox.remove).mockReturnValueOnce(false)
+    await click()
+    expect(mock(agent.inbox.remove)).toHaveBeenCalledTimes(1)
+    expect(mock(agent.steer)).not.toHaveBeenCalled()
+    await h.service.shutdown()
+  })
+
   it('renders card tokens from host projections when mounted', async () => {
     const projections: SessionProjections = {
       stateOf: (_session, key) => {

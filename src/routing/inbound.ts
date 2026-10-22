@@ -14,7 +14,7 @@ import type {
   AgentHandle, AttachmentStore, ContentBlock, HostContext, SessionId, UserMessage, Workspace,
 } from '../dsh-types.ts'
 import type { AttachmentStoreMode, FeishuConfig } from '../config.ts'
-import { buildCard, buildOnboardingCard, initialStreamingCard } from '../cards.ts'
+import { buildCard, buildOnboardingCard, initialStreamingCard, queuedStreamingCard } from '../cards.ts'
 import { RouteOperationQueue } from '../commands.ts'
 import { chatRouteKey, sessionDirOf } from '../domain.ts'
 import type { FeishuDomainHandle, RouteRecord } from '../domain.ts'
@@ -1149,7 +1149,12 @@ export class InboundRouter {
     // deployment follow its next turn (one-time legacy adoption, D12).
     await this.adoptLegacyStagedAttachments(msg, placement.sessionDir, warn)
 
-    const sent = await this.delivery.replyFirstCard(msg, initialStreamingCard(current.sessionId))
+    // A message behind a running turn opens as a queued card whose button can
+    // move it into that turn instead (see `TurnStreamer.mergeQueued`).
+    const firstCard = this.streamer?.hasLiveTurn(current.sessionId) === true
+      ? queuedStreamingCard(current.sessionId)
+      : initialStreamingCard(current.sessionId)
+    const sent = await this.delivery.replyFirstCard(msg, firstCard)
     const typingId = await typingPromise
 
     // Repair snapshot first — same crash-window reasoning as `startSession`.
@@ -1169,9 +1174,10 @@ export class InboundRouter {
       cardMessageId: sent.messageId,
       lastActivityAt: Date.now(),
     })
-    this.streamer?.attach(live.agent.session, sent.messageId, msg.messageId, typingId)
-    live.agent.followup(await this.deliverTurnMessage(msg, current, content, {
+    const message = await this.deliverTurnMessage(msg, current, content, {
       excludeMessageIds: [msg.messageId, sent.messageId],
-    }))
+    })
+    this.streamer?.attach(live.agent.session, sent.messageId, msg.messageId, typingId, { message })
+    live.agent.followup(message)
   }
 }
