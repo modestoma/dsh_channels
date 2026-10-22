@@ -228,8 +228,8 @@ native 后端下，准入通过后由 `inboundAttachmentState` 做**不下载的
 | `promptContextTimeoutMs` | `3000` | 100 – 10000 ms；被动引用/历史预算 | 模型工具 |
 | `feishuTools.attachmentFetch` | `true` | 关闭即整体回退 archive | 模型工具 |
 | `feishuTools.attachmentFetchMaxResources` | `10` | 1 – 50 | 模型工具 |
-| `feishuTools.attachmentFetchMaxBytes` | `104857600`（100 MiB） | 1 B – 1 GiB | 模型工具 |
-| `feishuTools.attachmentFetchTimeoutMs` | `120000` | 1000 – 600000 ms | 模型工具 |
+| `feishuTools.attachmentFetchMaxBytes` | `104857600`（100 MiB） | ≥ 1 B，无上限 | 模型工具 |
+| `feishuTools.attachmentFetchTimeoutMs` | `120000` | 1000 – 2147483647 ms | 模型工具 |
 | `feishuTools.topicMessages` | `true` | 关闭只关模型工具，被动摘录仍生效 | 模型工具 |
 | `feishuTools.topicMessagesTimeoutMs` | `20000` | 1000 – 120000 ms | 模型工具 |
 

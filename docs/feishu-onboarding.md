@@ -168,8 +168,8 @@ chmod 600 $DSH_HOME/.credentials.yaml
 | `promptContextTimeoutMs` | `3000` | 被动引用/首轮历史读取的整段预算（100–10000 ms）；超时即省略对应块、回合照跑。模型主动调用工具的读取超时另由 `feishuTools.topicMessagesTimeoutMs` 控制 |
 | `feishuTools.attachmentFetch` | `true` | 是否挂载 `feishu_attachment_fetch`；关闭后文件无法懒取，插件**整体回退 archive 后端** |
 | `feishuTools.attachmentFetchMaxResources` | `10` | 单次工具调用最多取回的附件数（1–50）；超出返回可读原因，可按 `file_key` 拆分重试 |
-| `feishuTools.attachmentFetchMaxBytes` | `104857600` | 单次工具调用的总下载字节预算（100 MiB，1 B–1 GiB）；文件流式写入、不整文件缓冲 |
-| `feishuTools.attachmentFetchTimeoutMs` | `120000` | 单次 `feishu_attachment_fetch` 整段超时（1000–600000 ms）；到期取消并逐项报告 |
+| `feishuTools.attachmentFetchMaxBytes` | `104857600` | 单次工具调用的总下载字节预算（100 MiB，≥ 1 B，无上限）；文件流式写入、不整文件缓冲 |
+| `feishuTools.attachmentFetchTimeoutMs` | `120000` | 单次 `feishu_attachment_fetch` 整段超时（1000–2147483647 ms）；到期取消并逐项报告；大文件需同步调大 |
 | `feishuTools.topicMessages` | `true` | 是否挂载 `feishu_topic_messages`；只影响模型工具，被动引用/历史摘录仍生效 |
 | `feishuTools.topicMessagesTimeoutMs` | `20000` | 单次 `feishu_topic_messages` 整段超时（1000–120000 ms） |
 | `loggerLevel` | `info` | 官方 SDK 日志级别 |

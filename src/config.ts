@@ -48,6 +48,9 @@ export const DEFAULT_ATTACHMENT_FETCH_MAX_BYTES = 100 * 1024 * 1024
 /** Default whole-call timeout of `feishu_attachment_fetch` (120 s). */
 export const DEFAULT_ATTACHMENT_FETCH_TIMEOUT_MS = 120_000
 
+/** Largest delay Node's `setTimeout` honors (2^31 − 1 ms, about 24.8 days); longer delays fire at once. */
+export const MAX_TIMER_DELAY_MS = 2_147_483_647
+
 /** Default per-image byte cap for trigger-message prefetch (20 MiB). */
 export const DEFAULT_PREFETCH_IMAGE_MAX_BYTES = 20 * 1024 * 1024
 
@@ -265,10 +268,12 @@ export const configSchema = z.object({
    *   fetch (1–50). A message with more attachments is refused with a readable
    *   reason so the model can retry per `file_key`.
    * - `attachmentFetchMaxBytes`: total download budget of one tool call
-   *   (default 100 MiB). Files stream to the native attachment library, so the
-   *   limit is enforced while streaming rather than buffered first.
-   * - `attachmentFetchTimeoutMs`: whole-call timeout (default 120 s). On expiry
-   *   the in-flight download is cancelled and reported per attachment.
+   *   (default 100 MiB, no upper bound). Files stream to the native attachment
+   *   library, so the limit is enforced while streaming rather than buffered
+   *   first, and multi-GiB files need only disk space.
+   * - `attachmentFetchTimeoutMs`: whole-call timeout (default 120 s, at most
+   *   {@link MAX_TIMER_DELAY_MS}). On expiry the in-flight download is
+   *   cancelled and reported per attachment.
    * - `topicMessages` (default on): register `feishu_topic_messages` in
    *   channel sessions so the model can read the quoted message / earlier
    *   topic messages on demand and authorize their attachments for fetch.
@@ -309,9 +314,9 @@ export const configSchema = z.object({
     attachmentFetch: z.boolean().default(true),
     attachmentFetchMaxResources: z.number().int().min(1).max(50)
       .default(DEFAULT_ATTACHMENT_FETCH_MAX_RESOURCES),
-    attachmentFetchMaxBytes: z.number().int().min(1).max(1024 * 1024 * 1024)
+    attachmentFetchMaxBytes: z.number().int().min(1)
       .default(DEFAULT_ATTACHMENT_FETCH_MAX_BYTES),
-    attachmentFetchTimeoutMs: z.number().int().min(1_000).max(600_000)
+    attachmentFetchTimeoutMs: z.number().int().min(1_000).max(MAX_TIMER_DELAY_MS)
       .default(DEFAULT_ATTACHMENT_FETCH_TIMEOUT_MS),
     topicMessages: z.boolean().default(true),
     topicMessagesTimeoutMs: z.number().int().min(1_000).max(120_000)
