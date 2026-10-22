@@ -59,6 +59,7 @@ export const EDITABLE_KEYS = [
   'requireMention',
   'threadFallback',
   'welcomeOnboarding',
+  'slashCommandPanel',
   'allowPermissionSwitch',
   // 准入与授权（管理员/准入模式/申请有效期；白名单由「访问与授权」卡片管理）
   'adminUserId',
@@ -100,6 +101,7 @@ export type EditableKey = (typeof EDITABLE_KEYS)[number]
 export const RESTART_KEYS = [
   'dmMode',
   'requireMention',
+  'slashCommandPanel',
   'refreshMs',
   'statusRefreshMs',
   'loggerLevel',

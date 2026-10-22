@@ -37,7 +37,7 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 
 `/new` 是 `/renew` 的别名。`/help` 由命令注册表按分组生成，新增命令只需在注册表里加一行。
 
-**飞书原生斜杠指令面板**：每次连上飞书后，插件在后台调用 `application/v7/app_slash_commands` 把命令注册表同步到飞书原生面板，用户在聊天框输入 `/` 即可直接选择命令（飞书客户端有约 5 分钟缓存）。同步是全量对齐且幂等：缺的创建、描述变了的原地更新、注册表里已没有的或重复的删除（别名不单独列出），注册表不变时再次连接不产生任何写操作；超时（30 秒）或断开后不再发起新的写操作。需要可选权限 `application:app_slash_command:read`（读取现有命令）与 `application:app_slash_command:write`（增删改），两项都列在权限自检里。同步失败只影响面板列表，直接输入命令照常可用；失败原因显示在 Web 设置「连接」页并打印一条 warn。
+**飞书原生斜杠指令面板**（可选，`slashCommandPanel: true` 开启，默认关闭；部分企业不允许应用添加斜杠指令）：开启后每次连上飞书，插件在后台调用 `application/v7/app_slash_commands` 把命令注册表同步到飞书原生面板，用户在聊天框输入 `/` 即可直接选择命令（飞书客户端有约 5 分钟缓存）。同步是全量对齐且幂等：缺的创建、描述变了的原地更新、注册表里已没有的或重复的删除（别名不单独列出），注册表不变时再次连接不产生任何写操作；超时（30 秒）或断开后不再发起新的写操作。需要可选权限 `application:app_slash_command:read`（读取现有命令）与 `application:app_slash_command:write`（增删改），两项只在开启时列入权限自检。关闭时插件不读写面板。同步失败只影响面板列表，直接输入命令照常可用；失败原因显示在 Web 设置「连接」页并打印一条 warn。
 
 ## 流式卡片
 
@@ -71,7 +71,7 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 | 标签页 | 内容 |
 | --- | --- |
 | 连接 | 连接状态与连接信息（长连接状态、Bot open_id、运行时长、话题路由 / 活动会话 / 在途回复）、权限自检、斜杠指令面板同步结果、未配置时的三步引导、飞书应用凭据、最近一次连接失败原因、需重连的待生效提醒 |
-| 会话与行为 | 「行为」：私聊模式、普通群 @ 要求、话题兜底、首次私聊引导、权限切换；「内容与附件」：附件接收、存储后端、图片预取与上限、首轮历史；「模型工具」：`feishu_attachment_fetch` / `feishu_topic_messages` 开关与上限、被动读取预算 |
+| 会话与行为 | 「行为」：私聊模式、普通群 @ 要求、话题兜底、首次私聊引导、原生斜杠指令面板同步、权限切换；「内容与附件」：附件接收、存储后端、图片预取与上限、首轮历史；「模型工具」：`feishu_attachment_fetch` / `feishu_topic_messages` 开关与上限、被动读取预算 |
 | 模型 | 模型服务商、模型 id、推理档位、Agent 预设（宿主目录驱动的级联下拉） |
 | 工作区 | 工作区根目录（可点「选择目录…」调用系统目录选择框）；话题目录隔离方式（`topicIsolation`）在 profile 配置中设置 |
 | 访问授权 | 管理员 user_id、准入模式、申请有效期；已授权群 / 用户白名单与待处理申请 |
@@ -261,6 +261,7 @@ npm 发行包已包含构建产物：Host 入口是 `lib/index.js`（profile 直
       topicMessages: true               # feishu_topic_messages：读取引用消息 / 话题历史并授权其附件
       topicMessagesTimeoutMs: 20000     # 单次话题读取整段超时（20 s；被动摘录用独立 3 s 预算）
     welcomeOnboarding: true             # 私聊首次触达发一张引导卡（按 chat 持久化去重）
+    slashCommandPanel: false            # 连接时把命令同步到飞书原生 / 面板（需 app_slash_command 读写权限；改后需重连）
     allowPermissionSwitch: false        # 是否允许 /permissions <name> 从飞书侧切换权限预设（安全敏感）
     accessMode: 'guarded'               # 准入模式：guarded（默认，仅管理员+白名单）| open（旧行为，不安全）
     adminUserId: 'a1b2c3d4'            # 管理员 user_id（可留空，留空时自动使用应用所有者；都没有时 guarded 下拒绝所有对话；面板可改）

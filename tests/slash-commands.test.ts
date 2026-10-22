@@ -110,15 +110,24 @@ function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
 
 const mock = (fn: unknown) => fn as ReturnType<typeof vi.fn>
 
-async function boot(options: Parameters<typeof makeChannel>[0]) {
+async function boot(options: Parameters<typeof makeChannel>[0], partial: Partial<FeishuConfig> = { slashCommandPanel: true }) {
   const ctxState = makeHostContext()
   const channel = makeChannel(options)
-  const service = new FeishuService(ctxState.ctx, makeConfig(), () => channel)
+  const service = new FeishuService(ctxState.ctx, makeConfig(partial), () => channel)
   await service.start()
   return { service, ctxState }
 }
 
 describe('FeishuService slash-command panel sync', () => {
+  it('neither reads nor writes the panel while slashCommandPanel is off (the default)', async () => {
+    const { api } = fakeApi()
+    const { service } = await boot({ slashCommands: api }, {})
+    await new Promise(resolve => setTimeout(resolve, 10))
+    expect(api.list).not.toHaveBeenCalled()
+    expect(service.slashCommandSync()).toBeUndefined()
+    await service.shutdown()
+  })
+
   it('syncs after connecting, records the counts, and clears them on shutdown', async () => {
     const { api } = fakeApi()
     const { service, ctxState } = await boot({ slashCommands: api })
