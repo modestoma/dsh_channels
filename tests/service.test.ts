@@ -20,6 +20,7 @@ import type { RouteRecord } from '../src/domain.ts'
 import { sessionDirOf } from '../src/domain.ts'
 import { FEISHU_ATTACHMENTS_SECTION } from '../src/feishu/agent-context.ts'
 import { ATTACHMENT_FETCH_TOOL_NAME, TOPIC_MESSAGES_TOOL_NAME } from '../src/feishu/tools.ts'
+import { SEND_FILE_TOOL_NAME } from '../src/feishu/send-file.ts'
 import type { SessionExportBuilder } from '../src/session-export.ts'
 import {
   dispatchAgentRequest, makeHostContext, makeChannel, makeMessage, makeAgentPresets, makeSession, makeAgent,
@@ -71,6 +72,7 @@ function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
       attachmentFetchTimeoutMs: 120_000,
       topicMessages: true,
       topicMessagesTimeoutMs: 20_000,
+      sendFile: true,
     },
     topicIsolation: 'auto',
     ...partial,
@@ -4080,6 +4082,7 @@ describe('native attachment pipeline', () => {
           attachmentFetchTimeoutMs: 120_000,
           topicMessages: true,
           topicMessagesTimeoutMs: 20_000,
+          sendFile: true,
         },
       },
       { downloadResource: () => [PNG] },
@@ -4679,6 +4682,28 @@ describe('quote excerpts and first-turn topic history', () => {
     expect(fetched.results[0]).toMatchObject({ ok: true, kind: 'file' })
     expect(downloads).toEqual([{ messageId: 'om_topic_file', fileKey: 'file_topic' }])
     expect(attachments.savedFiles).toHaveLength(1)
+    await h.service.shutdown()
+  })
+
+  it('mounts feishu_send_file and sends a topic-directory file as a reply to the route card', async () => {
+    const { h, tools } = await setupTurnReader({}, {})
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_send_file', senderId: 'u_owner',
+      messageId: 'om_send_file_trigger', content: '生成一张图',
+    }))
+    await waitForEstablishedSession(h)
+    const record = [...(h.ctxState.domain.raw.table('routes').entries() as Iterable<[string, RouteRecord]>)]
+      .map(([, value]) => value)[0]!
+    writeFileSync(path.join(sessionDirOf(record), 'chart.png'), Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]))
+    const sendTool = tools.definitions.get(SEND_FILE_TOOL_NAME)
+    expect(sendTool).toBeDefined()
+    const value = await sendTool!.execute({ path: 'chart.png' }, { signal: new AbortController().signal })
+    expect(value).toMatchObject({ ok: true, kind: 'image' })
+    expect(h.channel.sent.at(-1)).toMatchObject({
+      chatId: 'oc_send_file',
+      input: { image: { source: expect.any(Buffer) } },
+      options: { replyTo: record.cardMessageId, replyInThread: record.kind === 'thread' ? true : undefined },
+    })
     await h.service.shutdown()
   })
 

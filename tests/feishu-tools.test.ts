@@ -2597,6 +2597,7 @@ describe('feishu attachment-fetch presentation and configuration', () => {
       attachmentFetchTimeoutMs: 120_000,
       topicMessages: true,
       topicMessagesTimeoutMs: 20_000,
+      sendFile: true,
     })
   })
 

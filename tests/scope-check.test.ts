@@ -21,9 +21,10 @@ const ALL_GRANTED: readonly ScopeGrant[] = [
   'im:chat:readonly',
   'application:app_slash_command:read',
   'application:app_slash_command:write',
+  'im:resource',
 ].map(name => ({ name, granted: true, type: 'tenant' as const }))
 
-const NO_OWNER_FALLBACK = { dmEnabled: true, requireMention: true, ownerLookupFailed: false, slashCommandPanel: true }
+const NO_OWNER_FALLBACK = { dmEnabled: true, requireMention: true, ownerLookupFailed: false, slashCommandPanel: true, sendFile: true }
 
 describe('checkScopes', () => {
   it('reports nothing when every applicable need is granted', () => {
@@ -69,6 +70,14 @@ describe('checkScopes', () => {
     expect(checkScopes(grants, 'cli_x', NO_OWNER_FALLBACK).missing.map(item => item.anyOf[0]))
       .toEqual(['application:app_slash_command:read', 'application:app_slash_command:write'])
     expect(checkScopes(grants, 'cli_x', { ...NO_OWNER_FALLBACK, slashCommandPanel: false }).missing).toEqual([])
+  })
+
+  it('lists the upload scope only while feishu_send_file is enabled and accepts im:resource:upload', () => {
+    const grants = ALL_GRANTED.filter(grant => grant.name !== 'im:resource')
+    expect(checkScopes(grants, 'cli_x', NO_OWNER_FALLBACK).missing.map(item => [item.level, item.anyOf.join('|')]))
+      .toEqual([['optional', 'im:resource|im:resource:upload']])
+    expect(checkScopes(grants, 'cli_x', { ...NO_OWNER_FALLBACK, sendFile: false }).missing).toEqual([])
+    expect(checkScopes(grants.concat([{ name: 'im:resource:upload', granted: true }]), 'cli_x', NO_OWNER_FALLBACK).missing).toEqual([])
   })
 
   it('requires group_msg when unmentioned group messages are answered', () => {

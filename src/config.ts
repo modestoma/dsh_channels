@@ -281,6 +281,11 @@ export const configSchema = z.object({
    * - `topicMessagesTimeoutMs`: whole-call timeout of one model-initiated
    *   topic read (default 20 s). Passive prompt excerpts use a separate short
    *   (~3 s) budget and never wait this long.
+   * - `sendFile` (default on): register `feishu_send_file` in channel sessions
+   *   so the model can send an image or file from the topic's working
+   *   directory back to the current conversation. Needs the Feishu
+   *   `im:resource` (or `im:resource:upload`) scope; without it a call returns
+   *   a readable failure and the turn continues.
    *
    * The Web panel/metrics ship with `panel_docs_release`.
    */
@@ -295,6 +300,7 @@ export const configSchema = z.object({
     topicMessages: z.boolean().default(true),
     topicMessagesTimeoutMs: z.number().int().min(1_000).max(120_000)
       .default(DEFAULT_TOPIC_MESSAGES_TIMEOUT_MS),
+    sendFile: z.boolean().default(true),
   }).default({
     attachmentFetch: true,
     attachmentFetchMaxResources: DEFAULT_ATTACHMENT_FETCH_MAX_RESOURCES,
@@ -302,6 +308,7 @@ export const configSchema = z.object({
     attachmentFetchTimeoutMs: DEFAULT_ATTACHMENT_FETCH_TIMEOUT_MS,
     topicMessages: true,
     topicMessagesTimeoutMs: DEFAULT_TOPIC_MESSAGES_TIMEOUT_MS,
+    sendFile: true,
   }),
   /**
    * Send a one-time onboarding card on the first private message of a chat

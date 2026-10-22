@@ -86,10 +86,10 @@ export const DEFAULT_KNOWN_MESSAGES_PER_ROUTE = 128
  * must not block session creation; if they appear later the pending injection
  * still registers the tool.
  */
-const MOUNT_INJECT_WAIT_MS = 2_000
+export const MOUNT_INJECT_WAIT_MS = 2_000
 
 /** Retry wait for later sessions once the first mount timed out (fast-fail). */
-const MOUNT_INJECT_RETRY_WAIT_MS = 250
+export const MOUNT_INJECT_RETRY_WAIT_MS = 250
 
 // ---- Route / whitelist vocabulary ---------------------------------------
 
@@ -1486,7 +1486,7 @@ function isPostBody(record: Record<string, unknown>): boolean {
  * a hard dependency on a service a deployment does not mount would otherwise
  * block agent creation forever.
  */
-function waitForAvailability(
+export function waitForAvailability(
   task: PromiseLike<unknown>,
   timeoutMs: number,
 ): Promise<'ready' | 'failed' | 'timeout'> {

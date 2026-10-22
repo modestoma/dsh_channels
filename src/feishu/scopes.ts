@@ -42,6 +42,8 @@ export interface ScopeCheckContext {
   readonly ownerLookupFailed: boolean
   /** The native slash-command panel sync is enabled (`slashCommandPanel`). */
   readonly slashCommandPanel: boolean
+  /** The `feishu_send_file` tool is enabled (`feishuTools.sendFile`). */
+  readonly sendFile: boolean
 }
 
 /** A requirement none of whose scopes is granted. */
@@ -79,6 +81,11 @@ const SLASH_COMMAND_REQUIREMENTS: readonly ScopeRequirement[] = [
   { anyOf: ['application:app_slash_command:read'], level: 'optional', purpose: '读取飞书原生斜杠指令面板，连接后同步插件命令' },
   { anyOf: ['application:app_slash_command:write'], level: 'optional', purpose: '写入飞书原生斜杠指令面板（输入 / 时列出插件命令）' },
 ]
+
+/** Upload need of `feishu_send_file`, applicable while `feishuTools.sendFile` is on. */
+const SEND_FILE_REQUIREMENT: ScopeRequirement = {
+  anyOf: ['im:resource', 'im:resource:upload'], level: 'optional', purpose: '上传图片/文件，让模型用 feishu_send_file 把生成的文件发给用户',
+}
 
 /** Group receive needs while ordinary group messages require an @ mention. */
 const MENTION_GROUP_REQUIREMENTS: readonly ScopeRequirement[] = [
@@ -123,7 +130,7 @@ export function scopeConsoleUrl(appId: string, scopes: readonly string[]): strin
 /**
  * The requirements that apply under `context`, in display order.
  *
- * @param context Runtime facts (DM mode, mention requirement, panel sync, owner-fallback need).
+ * @param context Runtime facts (DM mode, mention requirement, send-file tool, panel sync, owner-fallback need).
  * @returns Requirement table for this connection.
  */
 export function scopeRequirements(context: ScopeCheckContext): readonly ScopeRequirement[] {
@@ -131,6 +138,7 @@ export function scopeRequirements(context: ScopeCheckContext): readonly ScopeReq
     ...(context.dmEnabled ? [DM_REQUIREMENT] : []),
     ...(context.requireMention ? MENTION_GROUP_REQUIREMENTS : [ALL_GROUP_REQUIREMENT]),
     ...BASE_REQUIREMENTS,
+    ...(context.sendFile ? [SEND_FILE_REQUIREMENT] : []),
     ...(context.slashCommandPanel ? SLASH_COMMAND_REQUIREMENTS : []),
   ]
 }

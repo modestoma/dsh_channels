@@ -136,6 +136,7 @@ const BOOLEAN_KEYS = new Set<EditableKey>([
   'prefetchImages',
   'feishuTools.attachmentFetch',
   'feishuTools.topicMessages',
+  'feishuTools.sendFile',
 ])
 
 const SELECT_OPTIONS: Partial<Record<EditableKey, ReadonlyArray<{ value: string; label: string }>>> = {
@@ -276,6 +277,10 @@ const FIELD_META: Record<EditableKey, { label: string; help: string; min?: numbe
     max: 120_000,
     step: 1_000,
   },
+  'feishuTools.sendFile': {
+    label: '启用 feishu_send_file 工具',
+    help: '让模型把当前话题工作目录里生成的图片/文件发回当前会话（图片 ≤10 MB，文件 ≤30 MB）。需开通 im:resource 权限。对新会话生效。',
+  },
   provider: { label: '模型服务商', help: '留空 = 使用部署默认；例如 deepseek-official。', placeholder: '留空 = 部署默认' },
   model: { label: '模型 id', help: '留空 = 使用部署默认；例如 deepseek-v4-flash。', placeholder: '留空 = 部署默认' },
   reasoningEffort: { label: '推理档位', help: '模型声明的精确档位 id（如 high / max）；留空 = 适配器默认。', placeholder: '留空 = 适配器默认' },
@@ -310,6 +315,7 @@ const GROUP_OF: Record<EditableKey, EditableFieldWire['group']> = {
   'feishuTools.attachmentFetchTimeoutMs': 'tools',
   'feishuTools.topicMessages': 'tools',
   'feishuTools.topicMessagesTimeoutMs': 'tools',
+  'feishuTools.sendFile': 'tools',
   provider: 'model',
   model: 'model',
   reasoningEffort: 'model',

@@ -24,10 +24,11 @@ import type {
 export type { BotAddedEvent, ChatInfo, NormalizedMessage, SendResult } from '@larksuiteoapi/node-sdk'
 export type FeishuConnectionStatus = WSConnectionStatus
 
-/** Outbound payloads used by this plugin, including Buffer-backed file upload. */
+/** Outbound payloads used by this plugin, including Buffer-backed image and file uploads. */
 export type FeishuSendInput =
   | { card: object }
   | { text: string }
+  | { image: { source: Buffer } }
   | { file: { source: string | Buffer; fileName: string } }
 
 /**
@@ -87,7 +88,7 @@ export interface FeishuChannel {
   connect(): Promise<void>
   /** Stop the connection. */
   disconnect(): Promise<void>
-  /** Send one message (text or card) with optional reply targeting. */
+  /** Send one message (text, card, image or file) with optional reply targeting. */
   send(
     chatId: string,
     input: FeishuSendInput,
