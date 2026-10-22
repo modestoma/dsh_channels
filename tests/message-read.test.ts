@@ -183,6 +183,42 @@ describe('unified rendering', () => {
     expect(messageTextOf(item({ msg_type: 'text', deleted: true, content: '{}' }))).toBe('[已撤回]')
   })
 
+  it('flattens card messages into text', () => {
+    // Default read-API structure: title plus rows of elements.
+    const simplified = item({
+      msg_type: 'interactive',
+      content: {
+        title: '构建失败',
+        elements: [
+          [{ tag: 'text', text: '分支 dev ' }, { tag: 'a', text: '查看日志', href: 'https://x' }],
+          [{ tag: 'at', user_name: '张三' }],
+          [{ tag: 'img', image_key: 'img_1' }],
+          [{ tag: 'button', text: '重试' }],
+        ],
+      },
+    })
+    expect(messageTextOf(simplified)).toBe('[卡片] 构建失败 分支 dev 查看日志 @张三 [图片] 重试')
+    // Sent JSON 2.0: header title, nested markdown, button labels; callback
+    // values and links are not text.
+    const raw = item({
+      msg_type: 'interactive',
+      content: {
+        schema: '2.0',
+        header: { title: { tag: 'plain_text', content: '审批' } },
+        body: {
+          elements: [
+            { tag: 'markdown', content: '**金额** 100' },
+            {
+              tag: 'column_set',
+              columns: [{ elements: [{ tag: 'button', text: { tag: 'plain_text', content: '同意' }, value: { action: 'ok' } }] }],
+            },
+          ],
+        },
+      },
+    })
+    expect(messageTextOf(raw)).toBe('[卡片] 审批 **金额** 100 同意')
+  })
+
   it('renders empty text as empty, not as raw JSON', () => {
     expect(messageTextOf(item({ msg_type: 'text', content: { text: '' } }))).toBe('')
     expect(messageTextOf(item({ msg_type: 'text', content: '{"text":""}' }))).toBe('')
