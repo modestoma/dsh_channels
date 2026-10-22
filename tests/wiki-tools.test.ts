@@ -14,7 +14,7 @@ import { createBaseApi } from '../src/feishu/wiki/base-api.ts'
 import type { BaseApi, BaseField, BaseRecordFields, BaseRecordPage, BaseTable } from '../src/feishu/wiki/base-api.ts'
 import { WikiConsent } from '../src/feishu/wiki/consent.ts'
 import { createSheetApi } from '../src/feishu/wiki/sheet-api.ts'
-import type { SheetApi, SheetCsv, SheetCsvRequest, SheetWorkbook, SheetWriteRequest } from '../src/feishu/wiki/sheet-api.ts'
+import type { SheetApi, SheetCsv, SheetCsvRequest, SheetWorkbook, SheetWriteRequest, SheetWriteResult } from '../src/feishu/wiki/sheet-api.ts'
 import { parseWikiRef, parseWikiRootLink } from '../src/feishu/wiki/links.ts'
 import {
   WIKI_CREATE_TOOL_NAME, WIKI_EDIT_TOOL_NAME, WIKI_LIST_TOOL_NAME, WIKI_READ_TOOL_NAME, WikiToolRuntime,
@@ -95,9 +95,10 @@ function fakeSheets() {
       currentRegion: 'A1:B2',
       hasMore: false,
     })),
-    writeCells: vi.fn(async (token: string, request: SheetWriteRequest) => {
+    writeCells: vi.fn(async (token: string, request: SheetWriteRequest): Promise<SheetWriteResult> => {
       sheets.writes.push({ token, request })
       sheets.revision += 1
+      return { formulaErrors: [] }
     }),
   }
   return sheets satisfies SheetApi
@@ -483,6 +484,18 @@ describe('feishu_wiki_sheet_edit', () => {
     expect(h.sheets.readCsv.mock.calls.map(([, request]) => request.range)).toEqual(['A1:F200', 'A3:F200', 'A6:F200'])
   })
 
+  it('reports formulas that did not compile', async () => {
+    const h = await setup()
+    h.sheets.writeCells.mockResolvedValueOnce({ formulaErrors: [{ cell: 'A1', formula: '=X(', errorType: 'compile_failed' }] })
+    const pending = h.run('feishu_wiki_sheet_edit', {
+      doc: 'wikcnSheetOwned01', revision_id: 30, operations: [{ command: 'write', start_cell: 'A1', values: [['=X(']] }],
+    })
+    await h.click('allow')
+    expect(await pending).toMatchObject({
+      ok: true, formula_errors: [{ sheet_id: 'sh1', cell: 'A1', formula: '=X(', error_type: 'compile_failed' }],
+    })
+  })
+
   it('refuses an append when a scan page does not advance', async () => {
     const h = await setup()
     h.sheets.readCsv
@@ -607,7 +620,7 @@ describe('createSheetApi', () => {
       { code: 0, data: { output: JSON.stringify({ revision: 60, sheets: [{ sheet_id: 'sh1', title: 'S', row_count: 10, column_count: 3, is_hidden: true }, { sheet_id: '' }] }) } },
       { code: 0, data: { output: JSON.stringify({ annotated_csv: '[row=1] a', actual_range: 'A1', has_more: true, warning_message: 'w' }) } },
       { code: 0, data: { output: '' } },
-      { code: 0, data: { output: '' } },
+      { code: 0, data: { output: JSON.stringify({ formula_errors: [{ cell: 'A2', formula: '=X(', error_type: 'compile_failed', detail: 'd' }, { cell: 'B2' }, {}, 1] }) } },
       { code: 0, data: { output: 'not json' } },
     ]
     const request = (async (input: Parameters<WikiRawRequest>[0]) => {
@@ -621,8 +634,10 @@ describe('createSheetApi', () => {
     })
     expect(await api.readCsv('sht1', { sheetId: 'sh1', range: 'A1:C10', maxChars: 1000 }))
       .toEqual({ csv: '[row=1] a', actualRange: 'A1', hasMore: true, warning: 'w' })
-    await api.writeCells('sht1', { sheetId: 'sh1', range: 'A1:C1', rows: [['=A2', null, 3]] })
-    await api.writeCells('sht1', { sheetId: 'sh1', range: 'A2:A2', rows: [['x']], allowOverwrite: false })
+    expect(await api.writeCells('sht1', { sheetId: 'sh1', range: 'A1:C1', rows: [['=A2', null, 3]] })).toEqual({ formulaErrors: [] })
+    expect(await api.writeCells('sht1', { sheetId: 'sh1', range: 'A2:B2', rows: [['=X(', '=Y(']], allowOverwrite: false })).toEqual({
+      formulaErrors: [{ cell: 'A2', formula: '=X(', errorType: 'compile_failed', detail: 'd' }, { cell: 'B2' }],
+    })
     await expect(api.workbook('sht1')).rejects.toThrow(/not JSON/u)
     expect(calls[0]).toEqual({
       method: 'POST',
@@ -636,7 +651,7 @@ describe('createSheetApi', () => {
     expect(JSON.parse((calls[2]?.data as { input: string }).input)).toEqual({
       excel_id: 'sht1', sheet_id: 'sh1', range: 'A1:C1', cells: [[{ formula: '=A2' }, {}, { value: 3 }]],
     })
-    expect(JSON.parse((calls[3]?.data as { input: string }).input)).toMatchObject({ range: 'A2:A2', allow_overwrite: false })
+    expect(JSON.parse((calls[3]?.data as { input: string }).input)).toMatchObject({ range: 'A2:B2', allow_overwrite: false })
   })
 })
 

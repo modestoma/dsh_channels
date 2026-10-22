@@ -74,6 +74,20 @@ export interface SheetWriteRequest {
   readonly allowOverwrite?: boolean
 }
 
+/** One formula `set_cell_range` stored as text because it did not compile. */
+export interface SheetFormulaError {
+  readonly cell: string
+  readonly formula?: string
+  /** `compile_failed` or `non_formula`. */
+  readonly errorType?: string
+  readonly detail?: string
+}
+
+/** Outcome of one `set_cell_range`; the cells are written even when formulas fail to compile. */
+export interface SheetWriteResult {
+  readonly formulaErrors: readonly SheetFormulaError[]
+}
+
 /** The `sheet_ai` spreadsheet tools the wiki sheet tools consume. */
 export interface SheetApi {
   /**
@@ -93,8 +107,9 @@ export interface SheetApi {
    * Write one rectangle of values and formulas.
    * @param token Spreadsheet token.
    * @param request Sheet, rectangle, and values.
+   * @returns Formulas that failed to compile.
    */
-  writeCells(token: string, request: SheetWriteRequest): Promise<void>
+  writeCells(token: string, request: SheetWriteRequest): Promise<SheetWriteResult>
 }
 
 interface RawSheet {
@@ -174,6 +189,22 @@ function cellOf(value: SheetCellValue): object {
  * @param request `Client.request` of the connected SDK client.
  * @returns The API.
  */
+function formulaError(raw: unknown): SheetFormulaError[] {
+  if (typeof raw !== 'object' || raw === null) return []
+  const entry = raw as Record<string, unknown>
+  const cell = optionalString(entry.cell)
+  if (cell === undefined) return []
+  const formula = optionalString(entry.formula)
+  const errorType = optionalString(entry.error_type)
+  const detail = optionalString(entry.detail)
+  return [{
+    cell,
+    ...(formula === undefined ? {} : { formula }),
+    ...(errorType === undefined ? {} : { errorType }),
+    ...(detail === undefined ? {} : { detail }),
+  }]
+}
+
 export function createSheetApi(request: WikiRawRequest): SheetApi {
   return {
     async workbook(token) {
@@ -206,12 +237,14 @@ export function createSheetApi(request: WikiRawRequest): SheetApi {
       }
     },
     async writeCells(token, write) {
-      await invoke(request, token, 'write', 'set_cell_range', {
+      const output = await invoke(request, token, 'write', 'set_cell_range', {
         sheet_id: write.sheetId,
         range: write.range,
         cells: write.rows.map(row => row.map(cellOf)),
         ...(write.allowOverwrite === false ? { allow_overwrite: false } : {}),
       })
+      const raw: readonly unknown[] = Array.isArray(output.formula_errors) ? output.formula_errors : []
+      return { formulaErrors: raw.flatMap(formulaError) }
     },
   }
 }

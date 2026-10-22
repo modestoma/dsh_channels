@@ -123,6 +123,14 @@ export interface WikiSheetEditValue {
   /** Written rectangles, in operation order. */
   readonly written: ReadonlyArray<{ readonly sheet_id: string; readonly range: string }>
   readonly revision_id?: number
+  /** Formulas stored as text because they did not compile; present only when some failed. */
+  readonly formula_errors?: ReadonlyArray<{
+    readonly sheet_id: string
+    readonly cell: string
+    readonly formula?: string
+    readonly error_type?: string
+    readonly detail?: string
+  }>
 }
 
 // ---- Descriptions -------------------------------------------------------
@@ -138,7 +146,7 @@ const READ_DESCRIPTION =
 const EDIT_DESCRIPTION =
   '修改知识库中由本应用创建的飞书电子表格（sheet）的单元格值。先用 feishu_wiki_sheet_read 读取，把读到的 revision_id 原样传入；表格在此之后被改过会被拒绝，需要重新读取。'
   + `operations 按顺序执行（最多 ${WIKI_SHEET_EDIT_MAX_OPERATIONS} 个，合计不超过 ${WIKI_SHEET_EDIT_MAX_CELLS} 个单元格）：`
-  + 'write（从 start_cell 如 B3 开始写入二维数组 values）、append（在子表现有数据的最后一行之后追加 values，start_column 默认 A；目标单元格非空时失败，不会覆盖）。'
+  + 'write（从 start_cell 如 B3 开始写入二维数组 values）、append（在子表现有数据的最后一行之后追加 values，start_column 默认 A；目标单元格非空时失败，不会覆盖）。返回 formula_errors 时，这些公式没有编译成功、已按文本写入，需要修正后重写。'
   + 'values 每个元素是一行；单元格可以是字符串、数字、布尔或 null（null 表示保持原值不变）；以 = 开头的字符串作为公式写入。'
   + '数字、金额、百分比（0.4 表示 40%）写成数字；编号、前导零、身份证号写成字符串。不会修改样式、图表、行列结构。'
   + 'sheet 传子表 sheet_id 或标题，只有一个可见子表时可省略。每次修改都会在话题里弹出授权卡，由话题发起人确认后才执行；等待期间不要重复调用。'
@@ -411,6 +419,7 @@ async function edit(kit: WikiToolKit, sessionId: string, rawArgs: Record<string,
       return { ...failure('REVISION_CONFLICT', `${failure('REVISION_CONFLICT').reason}（等待授权期间表格被修改）`), revision_id: after.revision }
     }
     const written: Array<{ sheet_id: string; range: string }> = []
+    const formulaErrors: Array<NonNullable<WikiSheetEditValue['formula_errors']>[number]> = []
     for (const [index, write] of planned.entries()) {
       if (signal.aborted) return { ...failure('ABORTED', `已取消；前 ${index} 个操作已执行`), applied: index }
       try {
@@ -423,13 +432,22 @@ async function edit(kit: WikiToolKit, sessionId: string, rawArgs: Record<string,
           start = { column: write.start.column, row }
         }
         const range = rectangle(start, write.rows.length, write.columns)
-        await sheets.writeCells(node.objToken, {
+        const result = await sheets.writeCells(node.objToken, {
           sheetId: write.sheet.sheetId,
           range,
           rows: write.rows,
           ...(write.operation.command === 'append' ? { allowOverwrite: false } : {}),
         })
         written.push({ sheet_id: write.sheet.sheetId, range })
+        for (const error of result.formulaErrors) {
+          formulaErrors.push({
+            sheet_id: write.sheet.sheetId,
+            cell: error.cell,
+            ...(error.formula === undefined ? {} : { formula: error.formula }),
+            ...(error.errorType === undefined ? {} : { error_type: error.errorType }),
+            ...(error.detail === undefined ? {} : { detail: error.detail }),
+          })
+        }
       } catch (error) {
         const reason = failureOf(error).reason
         return { ...failure('EDIT_FAILED', `第 ${index + 1} 个操作失败：${reason}；前 ${index} 个操作已执行`), applied: index }
@@ -447,6 +465,7 @@ async function edit(kit: WikiToolKit, sessionId: string, rawArgs: Record<string,
       applied: planned.length,
       written,
       ...(revision === undefined ? {} : { revision_id: revision }),
+      ...(formulaErrors.length === 0 ? {} : { formula_errors: formulaErrors }),
     }
   })
 }
