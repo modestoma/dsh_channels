@@ -64,6 +64,8 @@ import { AttachmentIntake } from './feishu/inbound-attachments.ts'
 import { InboundAttachmentStore, effectiveAttachmentMode, resolveAttachmentService } from './feishu/native-attachments.ts'
 import { AttachmentFetchToolRuntime, TopicMessagesToolRuntime } from './feishu/tools.ts'
 import { SendFileToolRuntime } from './feishu/send-file.ts'
+import { WikiConsent } from './feishu/wiki/consent.ts'
+import { WikiToolRuntime } from './feishu/wiki/tools.ts'
 import type { KnownAttachmentMessageInput, KnownAttachmentSource } from './feishu/tools.ts'
 import {
   MessageReader, TOPIC_MESSAGES_MAX_LIMIT, buildHistoryContextBlock,
@@ -146,6 +148,7 @@ async function openFeishuDomain(ctx: HostContext): Promise<FeishuDomainHandle> {
   const accessGroupsRaw = domain.table('access_groups')
   const accessUsersRaw = domain.table('access_users')
   const accessRequestsRaw = domain.table('access_requests')
+  const accessWikiUsersRaw = domain.table('access_wiki_users')
   return {
     routes: {
       get: key => table.get(key) as RouteRecord | undefined,
@@ -189,11 +192,20 @@ async function openFeishuDomain(ctx: HostContext): Promise<FeishuDomainHandle> {
       delete: key => accessRequestsRaw.delete(key),
       entries: () => accessRequestsRaw.entries() as IterableIterator<[string, AccessRequestRecord]>,
     },
+    accessWikiUsers: {
+      get: key => accessWikiUsersRaw.get(key) as AccessUserRecord | undefined,
+      put: (key, value) => accessWikiUsersRaw.put(key, value),
+      delete: key => accessWikiUsersRaw.delete(key),
+      entries: () => accessWikiUsersRaw.entries() as IterableIterator<[string, AccessUserRecord]>,
+    },
     getGlobal: () => (domain.global.get() ?? {}) as FeishuDomainGlobal,
     setGlobal: value => domain.global.set(value),
     close: () => domain.close(),
   }
 }
+
+/** `/auth wiki` usage line (input-error card). */
+const AUTH_WIKI_USAGE = '用法：/auth wiki add <@用户|user_id> 或 /auth wiki remove <@用户|user_id>。知识库白名单里的用户（以及管理员）发起的话题可以使用知识库工具。'
 
 /**
  * Resolve one credential reference through the host credentials seam.
@@ -268,6 +280,8 @@ export class FeishuService {
   private readonly attachmentFetchTools: AttachmentFetchToolRuntime
   private readonly topicMessagesTools: TopicMessagesToolRuntime
   private readonly sendFileTools: SendFileToolRuntime
+  private readonly wikiConsent: WikiConsent
+  private readonly wikiTools: WikiToolRuntime
   /** FIFO admission for ordinary turns and commands targeting one route. */
   private readonly routeOperations = new RouteOperationQueue()
   /** Active Host command executions, aborted before shutdown tears peers down. */
@@ -378,6 +392,7 @@ export class FeishuService {
         }
         mounts.push(this.topicMessagesTools.mount(agentCtx, sessionId))
         mounts.push(this.sendFileTools.mount(agentCtx, sessionId))
+        mounts.push(this.wikiTools.mount(agentCtx, sessionId))
         return Promise.all(mounts).then(() => undefined)
       },
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
@@ -435,6 +450,21 @@ export class FeishuService {
       // The tool description must not promise a fetch tool that archive
       // deployments do not mount; the runtime appends a degradation note.
       fetchAvailable: () => this.effectiveAttachmentBackend() === 'native',
+      warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
+    })
+    this.wikiConsent = new WikiConsent({
+      channel: () => (this.started ? this.channel : undefined),
+      timeoutMs: () => this.config.approvalTimeoutMs,
+      onError: (sessionId, error) => {
+        this.ctx.logger?.warn?.('dsh-channels wiki consent error (session %s): %s', sessionId, String(error))
+      },
+    })
+    this.wikiTools = new WikiToolRuntime({
+      config: () => this.config,
+      channel: () => (this.started ? this.channel : undefined),
+      routeOfSession: sessionId => this.approvalRouteFor(sessionId),
+      mayUseWiki: userId => this.accessController.isAdmin(userId) || this.accessStore.hasWikiUser(userId),
+      consent: this.wikiConsent,
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
     })
     this.sendFileTools = new SendFileToolRuntime({
@@ -1168,6 +1198,8 @@ export class FeishuService {
           && this.appOwner !== undefined && 'error' in this.appOwner && this.appOwner.apiRejected,
         slashCommandPanel: this.config.slashCommandPanel,
         sendFile: this.config.feishuTools.sendFile,
+        wikiRead: this.config.feishuTools.wikiRead && this.config.wikiRoots.length > 0,
+        wikiWrite: this.config.feishuTools.wikiWrite && this.config.wikiRoots.length > 0,
       })
       state = result.consoleUrl === undefined
         ? { state: 'ok', checkedAt: Date.now() }
@@ -1383,6 +1415,7 @@ export class FeishuService {
       void accessRequests.onCardAction(event)
       answerer.onCardAction(event)
       questions.onCardAction(event)
+      this.wikiConsent.onCardAction(event)
       this.onStopAction(event)
       void this.onPickAction(event).catch((error: unknown) => {
         this.ctx.logger?.warn?.('dsh-channels: picker card action failed: %s', String(error))
@@ -1504,6 +1537,7 @@ export class FeishuService {
     this.approvalAnswerer?.dispose()
     this.approvalAnswerer = undefined
     this.questionAnswerer?.dispose()
+    this.wikiConsent.dispose()
     this.questionAnswerer = undefined
     if (this.gcTimer !== undefined) {
       clearInterval(this.gcTimer)
@@ -1651,8 +1685,8 @@ export class FeishuService {
           ...(msg.chatType === 'group'
             ? [`**本群**：${this.accessStore.hasGroup(msg.chatId) ? '已授权' : '未授权'}（\`${msg.chatId}\`）`]
             : []),
-          `**白名单**：群 ${groups.length} 个 · 用户 ${users.length} 个 · 待处理申请 ${pending.length} 个`,
-          '群授权：`/auth allow` 或 `/auth revoke`（在目标群内发）；用户授权：`/auth user add @用户` 或 `/auth user add <user_id>`。',
+          `**白名单**：群 ${groups.length} 个 · 用户 ${users.length} 个 · 知识库 ${this.accessStore.wikiUserRecords().length} 个 · 待处理申请 ${pending.length} 个`,
+          '群授权：`/auth allow` 或 `/auth revoke`（在目标群内发）；用户授权：`/auth user add @用户` 或 `/auth user add <user_id>`；知识库授权：`/auth wiki add @用户`。',
         ]), direct)
         return
       }
@@ -1735,6 +1769,45 @@ export class FeishuService {
         }, direct)
         return
       }
+      if (action === 'wiki') {
+        const sub = words[1]
+        const target = sub === 'add' || sub === 'remove'
+          ? resolveAuthUserTarget(words.slice(2).join(' '), msg.mentions, this.channel?.botOpenId())
+          : { ok: false as const, reason: 'usage' as const }
+        if (!target.ok) {
+          await this.delivery.commandCard(msg, {
+            kind: 'input-error', command: 'auth',
+            text: target.reason === 'usage' ? AUTH_WIKI_USAGE : AUTH_USER_TARGET_ERRORS[target.reason],
+          }, direct)
+          return
+        }
+        const { userId } = target
+        const label = target.name === undefined ? `\`${userId}\`` : `${target.name}（\`${userId}\`）`
+        if (sub === 'add') {
+          if (this.accessStore.hasWikiUser(userId)) {
+            await this.delivery.commandCard(msg, {
+              kind: 'success', command: 'auth', text: `该用户已在知识库白名单中：${label}。`,
+            }, direct)
+            return
+          }
+          await this.accessStore.addWikiUser({
+            userId,
+            ...(target.name === undefined ? {} : { name: target.name }),
+            source: 'command', addedBy: msg.senderId, addedAt: now,
+          })
+          await this.delivery.commandCard(msg, {
+            kind: 'success', command: 'auth',
+            text: `✅ 已把 ${label} 加入知识库白名单：他发起的话题里可以使用知识库工具（每次读取、新建、修改仍需他在授权卡上确认）。`,
+          }, direct)
+          return
+        }
+        const removed = await this.accessStore.removeWikiUser(userId)
+        await this.delivery.commandCard(msg, {
+          kind: removed ? 'success' : 'unavailable', command: 'auth',
+          text: removed ? `已把 ${label} 移出知识库白名单，立即生效。` : `用户 ${label} 不在知识库白名单中。`,
+        }, direct)
+        return
+      }
       if (action === 'list') {
         const groups = this.accessStore.groupRecords()
         const users = this.accessStore.userRecords()
@@ -1745,18 +1818,24 @@ export class FeishuService {
         const userLines = users.length === 0
           ? ['（暂无）']
           : users.slice(0, 30).map(user => `- ${user.name ?? user.userId} \`${user.userId}\``)
+        const wikiUsers = this.accessStore.wikiUserRecords()
+        const wikiLines = wikiUsers.length === 0
+          ? ['（暂无；管理员始终可用）']
+          : wikiUsers.slice(0, 30).map(user => `- ${user.name ?? user.userId} \`${user.userId}\``)
         await this.delivery.standaloneReply(msg, standaloneInfoCard('**🔐 访问授权清单**', [
           `**已授权群（${groups.length}）**`,
           ...groupLines,
           `**已授权用户（${users.length}）**`,
           ...userLines,
+          `**知识库白名单（${wikiUsers.length}）**`,
+          ...wikiLines,
           `**待处理申请**：${pending.length} 个（可在 Web 设置面板处理）`,
         ]), direct)
         return
       }
       await this.delivery.commandCard(msg, {
         kind: 'input-error', command: 'auth',
-        text: '用法：/auth [status|allow|revoke|list|user add <@用户|user_id>|user remove <@用户|user_id>]',
+        text: '用法：/auth [status|allow|revoke|list|user add <@用户|user_id>|user remove <@用户|user_id>|wiki add <@用户|user_id>|wiki remove <@用户|user_id>]',
       }, direct)
     } catch (error) {
       this.ctx.logger?.warn?.('dsh-channels: /auth failed: %s', String(error))

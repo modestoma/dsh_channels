@@ -25,6 +25,7 @@
    | `im:message.reactions:write_only`（发送、删除消息表情回复） | Typing / DONE / No 表态 |
    | `im:resource`（获取与上传图片或文件资源，**可选**；`im:resource:upload` 亦可） | 模型用 `feishu_send_file` 把生成的图片/文件发给用户；不开通时该工具返回可读错误 |
    | `im:message:update`（更新消息卡片） | 流式卡片刷新（patch） |
+   | `wiki:wiki` 与 `docx:document`（**可选**，只读可用 `wiki:wiki:readonly` / `docx:document:readonly`） | 知识库工具（`feishuTools.wikiRead` / `wikiWrite` + `wikiRoots`）：浏览知识库、读取/新建/修改飞书文档；应用还需是目标知识空间的成员 |
    | `im:chat:readonly` 一类（获取群信息） | 入群通知卡展示群名/成员数（具体 scope 以控制台要求为准） |
    | 「获取应用信息」一类（如 `admin:app.info:readonly` / `application:application:self_manage`，**可选**，以控制台要求为准） | 未配置 `adminUserId` 时连接后自动把应用所有者设为管理员；不便申请时跳过即可，按 3.3 手动设置管理员 |
    | `application:app_slash_command:read` 与 `application:app_slash_command:write`（读取/管理应用斜杠指令，可选，仅 `slashCommandPanel: true` 时需要） | 连接后把插件命令同步到飞书原生斜杠指令面板（输入 `/` 时列出，客户端约 5 分钟后刷新）；缺失时只是面板没有列表，直接输入命令不受影响 |
@@ -190,6 +191,7 @@ chmod 600 $DSH_HOME/.credentials.yaml
    - 已授权群里未授权用户 @ 机器人 → 管理员收到**用户授权申请卡**（含昵称/user_id）→ 点「授权用户」；
    - 管理员在群里发 `/auth user add @用户`（或 `/auth user add <user_id>`）；`/auth user remove @用户` 撤销；外部用户没有 user_id，无法授权；
    - Web 面板「访问与授权 → 已授权用户」手动添加 user_id（用户可用 `/userid` 查看）；
+   - 知识库工具另有一份**知识库白名单**：管理员发 `/auth wiki add @用户`（或 `<user_id>`）后，该用户发起的话题才能使用知识库工具，`/auth wiki remove @用户` 撤销；管理员始终可用；
 6. 授权/撤销**立即生效**；白名单与待处理申请持久化在插件 `channels_routes_v2` 域，重启不丢。`/auth list` 可随时查看白名单与待处理申请。
 
 > 说明：**管理员不受白名单限制**——机器人被拉进新群后，管理员可以直接 @ 机器人开会话，不需要先授权该群；授权群/用户只影响**非管理员**。管理员在任意群里都可以使用 `/auth`、`/groupid` 等命令。
@@ -268,6 +270,7 @@ DSH_HOME=$DSH_HOME pnpm dsh web        # 默认 http://127.0.0.1:3080
 | 14 | 管理员直通（免群授权） | 刚被拉进未授权群时，管理员直接 @ 机器人发消息 | 正常开会话（管理员不受白名单限制）；不授权该群也不影响管理员使用 |
 | 14a | 群授权与群内准入 | 管理员点「授权本群」（或在群内发 `/auth allow`）；未授权用户 @；管理员 `/auth user add <user_id>` 后该用户再 @ | 授权前非管理员 @ 无响应（管理员除外）；授权后白名单用户可分别开会话；未授权用户 @ 不建会话且管理员收到用户授权卡；授权该用户后可正常开会话 |
 | 15 | 撤销与持久化 | `/auth revoke`（群内）/ `/auth user remove <user_id>`；重启 dsh 后再试 | 撤销后对应主体立即无法开启对话；重启后已授权群/用户仍有效（持久化） |
+| 15a | 知识库读写 | 开启 `wikiRead`/`wikiWrite`、配置 `wikiRoots`；白名单用户在话题里让模型列目录、读一篇文档、新建一篇、再修改它 | 列目录不弹卡；第一次读取弹「📚 知识库授权」卡，只有话题发起人能点，允许后同一篇再读不弹卡；新建、修改每次都弹卡；修改人工创建的文档返回 `NOT_OWNED`；不在白名单的用户发起的话题返回 `NOT_AUTHORIZED` |
 | 16 | 话题越权防护 | 授权群里用户 A 创建话题后，用户 B 在 A 的话题里发普通消息/附件/回答提问 | B 的消息被静默丢弃，不会进入 A 的 Session、不会写入 A 的话题目录；A 自己发言正常 |
 
 ### 5.0 HITL 审批验证点（重点）

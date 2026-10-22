@@ -12,6 +12,8 @@ import { createLarkChannel, LoggerLevel } from '@larksuiteoapi/node-sdk'
 import { SCOPE_GRANTED_STATUS } from './feishu/scopes.ts'
 import type { ScopeGrant } from './feishu/scopes.ts'
 import type { RemoteSlashCommand, SlashCommandApi, SlashCommandEntry } from './feishu/slash-commands.ts'
+import { createWikiApi } from './feishu/wiki/api.ts'
+import type { WikiApi, WikiRawRequest } from './feishu/wiki/api.ts'
 import type {
   BotAddedEvent,
   ChatInfo,
@@ -87,6 +89,12 @@ export interface FeishuChannel {
    * absence skips the panel sync.
    */
   readonly slashCommands?: SlashCommandApi
+  /**
+   * Wiki and docx endpoints used by the wiki tools, called with the app
+   * identity. Optional so stubs can omit it; absence fails wiki calls with
+   * a channel-unavailable result.
+   */
+  readonly wiki?: WikiApi
   /** Current official-SDK WebSocket lifecycle snapshot, when initialized. */
   getConnectionStatus(): FeishuConnectionStatus | undefined
   /** Start the WebSocket long connection (resolves after the handshake). */
@@ -361,6 +369,7 @@ class LarkChannelAdapter implements FeishuChannel {
   private readonly requireMention: boolean
   private readonly dmMode: 'open' | 'disabled'
   readonly slashCommands: SlashCommandApi
+  readonly wiki: WikiApi
 
   constructor(options: ChannelConnectOptions) {
     this.channel = createLarkChannel({
@@ -391,6 +400,7 @@ class LarkChannelAdapter implements FeishuChannel {
     this.dmMode = options.dmMode
     const rawClient = this.channel.rawClient
     this.slashCommands = slashCommandApi(async <T,>(input: Parameters<RawRequest>[0]) => await rawClient.request<T>(input))
+    this.wiki = createWikiApi(async <T,>(input: Parameters<WikiRawRequest>[0]) => await rawClient.request<T>(input))
   }
 
   onMessage(handler: (message: NormalizedMessage) => void | Promise<void>): () => void {

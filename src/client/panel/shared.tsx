@@ -23,6 +23,15 @@ import type {
   PanelTabId,
   PanelWire,
 } from '../../settings/contract.ts'
+import {
+  listIsFull,
+  listItems,
+  listRows,
+  stringListDraftValue,
+  withBlankListEntry,
+  withListEntry,
+  withoutListEntry,
+} from '../string-list.ts'
 
 /** Initial panel load: one request, retried from the error card. */
 export type LoadState =
@@ -124,6 +133,12 @@ export function validateDraft(
     }
     if (field.kind === 'boolean') {
       values[field.key] = raw === true
+      continue
+    }
+    if (field.kind === 'string-list') {
+      const list = stringListDraftValue(field, raw)
+      if (list.ok) values[field.key] = list.value
+      else issues.push(...list.issues)
       continue
     }
     values[field.key] = String(raw ?? '')
@@ -236,6 +251,73 @@ function DirectoryTextInput(props: {
   )
 }
 
+/**
+ * `string-list` control: one single-line input per entry, each with a remove
+ * button, and an add button below (disabled at `maxItems` inputs). An empty
+ * list renders one blank input so the first entry can be typed directly.
+ * Issues carrying an `index` mark that input and show the reason under it.
+ */
+function StringListInput(props: {
+  field: EditableFieldWire
+  value: ConfigValue | undefined
+  issues: readonly FieldIssueWire[]
+  disabled: boolean
+  onChange: (key: EditableKey, value: ConfigValue) => void
+}): JSX.Element {
+  const { field, value, issues, disabled, onChange } = props
+  const empty = listItems(value).length === 0
+  const rows = listRows(value)
+  return (
+    <div className="dsh-channels-cfg__list">
+      {rows.map((item, index) => {
+        const issue = issues.find(entry => entry.index === index)
+        const position = PANEL_COPY.listEntry.replace('{n}', String(index + 1))
+        // Entries have no identity beyond their position, so the index is the key.
+        return (
+          <div className="dsh-channels-cfg__listItem" key={index}>
+            <div className="dsh-channels-cfg__inputRow">
+              <input
+                type="text"
+                className={`dsh-channels-cfg__input${issue === undefined ? '' : ' dsh-channels-cfg__input--invalid'}`}
+                value={item}
+                placeholder={field.placeholder}
+                aria-label={`${field.label} ${position}`}
+                aria-invalid={issue === undefined ? undefined : true}
+                disabled={disabled}
+                onChange={event => onChange(field.key, withListEntry(rows, index, event.target.value))}
+              />
+              {empty
+                ? null
+                : (
+                    <button
+                      type="button"
+                      className="dsh-channels-cfg__btn dsh-channels-cfg__btn--listRemove"
+                      aria-label={`${PANEL_COPY.listRemove} ${position}`}
+                      disabled={disabled}
+                      onClick={() => onChange(field.key, withoutListEntry(rows, index))}
+                    >
+                      {PANEL_COPY.listRemove}
+                    </button>
+                  )}
+            </div>
+            {issue === undefined ? null : <span className="dsh-channels-cfg__fieldError">{issue.message}</span>}
+          </div>
+        )
+      })}
+      <div>
+        <button
+          type="button"
+          className="dsh-channels-cfg__btn"
+          disabled={disabled || listIsFull(field, rows)}
+          onClick={() => onChange(field.key, withBlankListEntry(rows))}
+        >
+          {PANEL_COPY.listAdd}
+        </button>
+      </div>
+    </div>
+  )
+}
+
 /** One generic form control driven by the Host field descriptor. */
 export function FieldRow(props: {
   field: EditableFieldWire
@@ -247,7 +329,9 @@ export function FieldRow(props: {
   onPickDirectory?: () => Promise<void>
 }): JSX.Element {
   const { field, value, issues, disabled = false, onChange, onPickDirectory } = props
-  const issue = issues.find(item => item.key === field.key)
+  // Entry issues (`index` set) are rendered next to their input by StringListInput.
+  const issue = issues.find(item => item.key === field.key && item.index === undefined)
+  const entryIssues = issues.filter(item => item.key === field.key && item.index !== undefined)
   const inputClass = `dsh-channels-cfg__input${issue === undefined ? '' : ' dsh-channels-cfg__input--invalid'}`
   const fieldClass = `dsh-channels-cfg__field${field.wide === true ? ' dsh-channels-cfg__field--wide' : ''}`
   return (
@@ -326,6 +410,17 @@ export function FieldRow(props: {
                   onChange={event => onChange(field.key, event.target.value)}
                 />
               ))
+        : null}
+      {field.kind === 'string-list'
+        ? (
+            <StringListInput
+              field={field}
+              value={value}
+              issues={entryIssues}
+              disabled={disabled}
+              onChange={onChange}
+            />
+          )
         : null}
       {field.help === undefined ? null : <span className="dsh-channels-cfg__help">{field.help}</span>}
       {issue === undefined ? null : <span className="dsh-channels-cfg__fieldError">{issue.message}</span>}

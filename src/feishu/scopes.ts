@@ -44,6 +44,10 @@ export interface ScopeCheckContext {
   readonly slashCommandPanel: boolean
   /** The `feishu_send_file` tool is enabled (`feishuTools.sendFile`). */
   readonly sendFile: boolean
+  /** The wiki read tools are mounted (`feishuTools.wikiRead` with non-empty `wikiRoots`). */
+  readonly wikiRead: boolean
+  /** The wiki write tools are mounted (`feishuTools.wikiWrite` with non-empty `wikiRoots`). */
+  readonly wikiWrite: boolean
 }
 
 /** A requirement none of whose scopes is granted. */
@@ -86,6 +90,18 @@ const SLASH_COMMAND_REQUIREMENTS: readonly ScopeRequirement[] = [
 const SEND_FILE_REQUIREMENT: ScopeRequirement = {
   anyOf: ['im:resource', 'im:resource:upload'], level: 'optional', purpose: '上传图片/文件，让模型用 feishu_send_file 把生成的文件发给用户',
 }
+
+/** Wiki read needs (`feishu_wiki_list` / `feishu_wiki_read`). */
+const WIKI_READ_REQUIREMENTS: readonly ScopeRequirement[] = [
+  { anyOf: ['wiki:wiki', 'wiki:wiki:readonly'], level: 'optional', purpose: '浏览知识库节点（feishu_wiki_list / feishu_wiki_read）' },
+  { anyOf: ['docx:document', 'docx:document:readonly'], level: 'optional', purpose: '读取知识库中的文档内容（feishu_wiki_read）' },
+]
+
+/** Wiki write needs (`feishu_wiki_create` / `feishu_wiki_edit`). */
+const WIKI_WRITE_REQUIREMENTS: readonly ScopeRequirement[] = [
+  { anyOf: ['wiki:wiki'], level: 'optional', purpose: '在知识库中新建节点（feishu_wiki_create）' },
+  { anyOf: ['docx:document'], level: 'optional', purpose: '写入与修改知识库文档内容（feishu_wiki_create / feishu_wiki_edit）' },
+]
 
 /** Group receive needs while ordinary group messages require an @ mention. */
 const MENTION_GROUP_REQUIREMENTS: readonly ScopeRequirement[] = [
@@ -139,8 +155,15 @@ export function scopeRequirements(context: ScopeCheckContext): readonly ScopeReq
     ...(context.requireMention ? MENTION_GROUP_REQUIREMENTS : [ALL_GROUP_REQUIREMENT]),
     ...BASE_REQUIREMENTS,
     ...(context.sendFile ? [SEND_FILE_REQUIREMENT] : []),
+    ...wikiRequirements(context),
     ...(context.slashCommandPanel ? SLASH_COMMAND_REQUIREMENTS : []),
   ]
+}
+
+/** Wiki needs; the write set subsumes the read set's preferred scopes. */
+function wikiRequirements(context: ScopeCheckContext): readonly ScopeRequirement[] {
+  if (context.wikiWrite) return WIKI_WRITE_REQUIREMENTS
+  return context.wikiRead ? WIKI_READ_REQUIREMENTS : []
 }
 
 /**

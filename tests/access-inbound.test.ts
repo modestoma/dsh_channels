@@ -466,6 +466,46 @@ describe('guarded 模式：/auth 用户管理', () => {
     await h.service.shutdown()
   })
 
+  it('/auth wiki add|remove 管理独立的知识库白名单，重启后仍在', async () => {
+    const h = await setup()
+    const bot = { key: '@_user_1', openId: 'bot-open-id', name: 'DSH', isBot: true }
+    const carol = { key: '@_user_2', openId: 'ou_carol', userId: 'u_carol', name: 'Carol' }
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_group', senderId: ADMIN, mentionedBot: true,
+      mentions: [bot, carol], messageId: 'om_wiki_add', content: '/auth wiki add @Carol',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
+    expect(sentJson(h.channel.sent[0]!)).toContain('加入知识库白名单')
+    // The wiki grant does not admit the user to conversations.
+    expect(h.service.accessSnapshot().users).toEqual([])
+
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_p2p_admin', senderId: ADMIN,
+      mentionedBot: false, messageId: 'om_wiki_usage', content: '/auth wiki',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
+    expect(sentJson(h.channel.sent[1]!)).toContain('/auth wiki add')
+    await h.service.shutdown()
+
+    const restarted = await boot(h.config, h.ctxState, makeChannel())
+    await restarted.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_p2p_admin', senderId: ADMIN,
+      mentionedBot: false, messageId: 'om_wiki_list', content: '/auth list',
+    }))
+    await waitUntil(() => expect(restarted.channel.sent).toHaveLength(1))
+    expect(sentJson(restarted.channel.sent[0]!)).toContain('知识库白名单（1）')
+    expect(sentJson(restarted.channel.sent[0]!)).toContain('u_carol')
+
+    await restarted.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_p2p_admin', senderId: ADMIN,
+      mentionedBot: false, messageId: 'om_wiki_remove', content: '/auth wiki remove u_carol',
+    }))
+    await waitUntil(() => expect(restarted.channel.sent).toHaveLength(2))
+    expect(sentJson(restarted.channel.sent[1]!)).toContain('移出知识库白名单')
+    await restarted.service.shutdown()
+  })
+
   it('撤销用户与撤销群立即生效（非管理员被拒；管理员仍直通）', async () => {
     const h = await setup()
     await h.service.addAccessGroup('oc_group')
