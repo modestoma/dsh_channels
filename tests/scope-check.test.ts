@@ -83,12 +83,17 @@ describe('checkScopes', () => {
   it('lists the wiki scopes only while a wiki tool set is enabled, read accepting readonly scopes', () => {
     expect(checkScopes(ALL_GRANTED, 'cli_x', NO_OWNER_FALLBACK).missing).toEqual([])
     const read = { ...NO_OWNER_FALLBACK, wikiRead: true }
-    expect(checkScopes(ALL_GRANTED, 'cli_x', read).missing.map(item => item.anyOf.join('|')))
-      .toEqual(['wiki:wiki|wiki:wiki:readonly', 'docx:document|docx:document:readonly'])
-    const readonly = ALL_GRANTED.concat(['wiki:wiki:readonly', 'docx:document:readonly'].map(name => ({ name, granted: true })))
+    expect(checkScopes(ALL_GRANTED, 'cli_x', read).missing.map(item => item.anyOf.join('|'))).toEqual([
+      'wiki:wiki|wiki:wiki:readonly',
+      'docx:document|docx:document:readonly',
+      'sheets:spreadsheet|sheets:spreadsheet:readonly|sheets:spreadsheet:read',
+      'bitable:app|bitable:app:readonly|base:record:read',
+    ])
+    const readonly = ALL_GRANTED.concat(['wiki:wiki:readonly', 'docx:document:readonly', 'sheets:spreadsheet:read', 'base:record:read']
+      .map(name => ({ name, granted: true })))
     expect(checkScopes(readonly, 'cli_x', read).missing).toEqual([])
     expect(checkScopes(readonly, 'cli_x', { ...read, wikiWrite: true }).missing.map(item => item.anyOf.join('|')))
-      .toEqual(['wiki:wiki', 'docx:document'])
+      .toEqual(['wiki:wiki', 'docx:document', 'sheets:spreadsheet|sheets:spreadsheet:write_only', 'bitable:app|base:record:create'])
   })
 
   it('requires group_msg when unmentioned group messages are answered', () => {
