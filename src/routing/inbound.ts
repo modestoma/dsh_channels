@@ -34,6 +34,7 @@ import type { InboundAttachmentStoreResult } from '../feishu/native-attachments.
 import type { KnownAttachmentMessageInput, KnownAttachmentSource } from '../feishu/tools.ts'
 import type { FeishuChannel, NormalizedMessage } from '../feishu-channel.ts'
 import type { QuestionAnswerer } from '../interactions/questions.ts'
+import type { ApprovalAnswerer, ApprovalTextResult } from '../interactions/approvals.ts'
 import type { InflightRepair } from '../session/repair.ts'
 import type { SessionManager } from '../session/manager.ts'
 import type { RouteStore } from '../session/routes.ts'
@@ -143,7 +144,15 @@ export interface InboundDeps {
   queue: RouteOperationQueue
   streamer(): TurnStreamer | undefined
   questionAnswerer(): QuestionAnswerer | undefined
+  approvalAnswerer(): ApprovalAnswerer | undefined
   commands: CommandPlanePort
+}
+
+/** Confirmation line for each keyword approval reply. */
+const APPROVAL_TEXT_REPLIES: Record<Exclude<ApprovalTextResult, 'superseded'>, string> = {
+  allowed: '已允许本次操作。',
+  remembered: '已允许，本话题内同类操作不再询问。',
+  denied: '已拒绝本次操作。',
 }
 
 /**
@@ -256,6 +265,7 @@ export class InboundRouter {
   private get routeOperations(): RouteOperationQueue { return this.deps.queue }
   private get streamer(): TurnStreamer | undefined { return this.deps.streamer() }
   private get questionAnswerer(): QuestionAnswerer | undefined { return this.deps.questionAnswerer() }
+  private get approvalAnswerer(): ApprovalAnswerer | undefined { return this.deps.approvalAnswerer() }
   private get domain(): FeishuDomainHandle | undefined { return this.deps.domain() }
   private get access(): InboundAccessPort { return this.deps.access }
 
@@ -407,6 +417,11 @@ export class InboundRouter {
         if (content === '') return
       }
     }
+
+    // A session blocked on an approval card reads the owner's reply as the
+    // decision; any other text rejects the card and continues below as the
+    // next instruction.
+    if (await this.tryAnswerPendingApproval(msg, content)) return
 
     // A session blocked on `ask_user_question` has no other use for an inbound
     // text message: the next reply becomes the free-text answer.
@@ -848,6 +863,28 @@ export class InboundRouter {
     } catch {
       return undefined
     }
+  }
+
+  /**
+   * Consume one plain reply as an approval decision. Only the topic owner's
+   * replies in a session with an undecided approval card are intercepted.
+   * @returns true when the reply was a keyword decision and is fully handled;
+   * false when nothing was pending or the reply rejected the pending cards and
+   * must still be delivered as the next instruction.
+   */
+  private async tryAnswerPendingApproval(msg: NormalizedMessage, content: string): Promise<boolean> {
+    const answerer = this.approvalAnswerer
+    if (answerer === undefined || answerer.pendingCount() === 0) return false
+    const route = await this.commandRoute(msg)
+    if (route === undefined || !this.access.ownsRoute(msg, route)) return false
+    if (!answerer.hasPendingFor(route.sessionId)) return false
+    const result = answerer.submitText(route.sessionId, content)
+    if (result === undefined || result === 'superseded') return false
+    await this.delivery.commandCard(msg, {
+      kind: 'success', command: 'approval', sessionId: route.sessionId,
+      text: APPROVAL_TEXT_REPLIES[result],
+    }, { createThread: false })
+    return true
   }
 
   /**

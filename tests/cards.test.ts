@@ -536,12 +536,12 @@ describe('approval decision cards', () => {
       .map(element => element.content as string)
   }
 
-  it('renders the 2.0 structure with question summary and two enabled callback buttons', () => {
+  it('renders the 2.0 structure with question summary, reply hint, and three callback buttons', () => {
     const card = buildApprovalCard(question) as unknown as CardShape
     expect(card.schema).toBe('2.0')
     expect(card.config.width_mode).toBe('fill')
     expect(approvalElements(card).map(element => element.tag)).toEqual([
-      'markdown', 'markdown', 'markdown', 'hr', 'markdown', 'markdown', 'column_set',
+      'markdown', 'markdown', 'markdown', 'hr', 'markdown', 'markdown', 'markdown', 'column_set', 'button', 'markdown',
     ])
 
     const markdowns = markdownsOf(card)
@@ -551,10 +551,12 @@ describe('approval decision cards', () => {
     expect(markdowns[2]).toBe('> 需要写入工作区外的文件')
     expect(markdowns[3]).toContain('5 分钟')
     expect(markdowns[3]).toContain('超时自动拒绝')
-    expect(markdowns[4]).toContain('sess-1')
+    expect(markdowns[4]).toContain('回复其他内容视为拒绝')
+    expect(markdowns[5]).toContain('sess-1')
+    expect(markdowns[6]).toContain('本话题内 `bash` 都自动允许')
+    expect(markdowns[6]).toContain('/renew')
 
-    const actionRow = approvalElements(card).at(-1)!
-    expect(actionRow.tag).toBe('column_set')
+    const actionRow = approvalElements(card).find(element => element.tag === 'column_set')!
     expect(actionRow.flex_mode).toBe('bisect')
     expect(actionRow.horizontal_spacing).toBe('medium')
     expect(actionRow.columns).toHaveLength(2)
@@ -572,7 +574,36 @@ describe('approval decision cards', () => {
     expect(deny!.width).toBe('fill')
     expect(deny!.behaviors).toEqual([{ type: 'callback', value: { decision: 'deny', token: 'tok-1' } }])
 
+    const always = approvalElements(card).find(element => element.tag === 'button')!
+    expect(always.text.content).toBe('♾️ 本话题不再询问')
+    expect(always.type).toBe('default')
+    expect(always.behaviors).toEqual([{ type: 'callback', value: { decision: 'always', token: 'tok-1' } }])
+
     expect(notationMarkdownsOf(card)).toContain(markdowns[3]!)
+  })
+
+  it('shows the command, the escalation target, and a danger grant for full access', () => {
+    const card = buildApprovalCard({
+      ...question,
+      command: 'rm -rf build && make',
+      escalateTo: 'danger-full-access',
+    })
+    const markdowns = markdownsOf(card)
+    expect(markdowns[1]).toContain('提升到 `danger-full-access`')
+    expect(markdowns[2]).toContain('**将执行**')
+    expect(markdowns[2]).toContain('rm -rf build && make')
+    const always = approvalElements(card).find(element => element.tag === 'button')!
+    expect(always.type).toBe('danger')
+    expect(markdowns.join('\n')).toContain('完全不受沙箱限制')
+    expect(markdowns.join('\n')).toContain('`bash` 提升到 `danger-full-access`')
+  })
+
+  it('clips a long command and says how much was hidden', () => {
+    const card = buildApprovalCard({ ...question, command: 'a'.repeat(700) })
+    const markdowns = markdownsOf(card)
+    expect(markdowns[2]).toContain('a'.repeat(600))
+    expect(markdowns[2]).not.toContain('a'.repeat(601))
+    expect(markdowns[3]).toContain('已截断 100 个字符')
   })
 
   it('omits the reason blockquote and session line when absent', () => {
@@ -582,13 +613,15 @@ describe('approval decision cards', () => {
     expect(markdowns.some(text => text.startsWith('> '))).toBe(false)
     expect(notationMarkdownsOf(card)).toEqual([
       expect.stringContaining('1 分钟'),
+      expect.stringContaining('直接回复'),
+      expect.stringContaining('恢复询问'),
     ])
   })
 
   it('adds the owner-only notice when requested', () => {
     const card = buildApprovalCard(question, { unauthorizedNote: true })
     const notices = notationMarkdownsOf(card)
-    expect(notices).toHaveLength(3)
+    expect(notices).toHaveLength(5)
     expect(notices.some(content => content.includes('仅发起该会话的用户'))).toBe(true)
   })
 
@@ -605,7 +638,11 @@ describe('approval decision cards', () => {
 
   it.each([
     ['allowed', '已允许执行'],
+    ['allowed-text', '文字回复'],
+    ['remembered', '本话题不再询问'],
     ['denied', '已拒绝'],
+    ['denied-text', '已拒绝'],
+    ['superseded', '下一条指令'],
     ['expired', '已超时'],
     ['cancelled', '已取消'],
   ] as const)('renders the %s settled variant without decision controls', (state, expected) => {

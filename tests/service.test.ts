@@ -2989,6 +2989,47 @@ describe('free-text question answers', () => {
   })
 })
 
+describe('typed approval replies', () => {
+  async function pendingApproval(chatId: string) {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId, senderId: 'u_owner', content: '跑一下',
+    }))
+    await waitForEstablishedSession(h)
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    const { listener } = h.ctxState.approvalListeners[0]!
+    const pending = listener({ agent, toolName: 'bash', reason: '需要提权' }, vi.fn(async () => 'unavailable' as const))
+    await waitUntil(() => expect(h.channel.sent.length).toBe(2))
+    await resetFollowupAfterEstablishment(agent)
+    return { h, agent, pending }
+  }
+
+  it('a keyword reply decides the card without starting a model turn', async () => {
+    const { h, agent, pending } = await pendingApproval('oc_atext')
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_atext', senderId: 'u_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_atext_allow', content: '允许',
+    }))
+    await expect(pending).resolves.toBe('allowed-once')
+    expect(mock(agent.followup)).not.toHaveBeenCalled()
+    await waitUntil(() => expect(JSON.stringify(
+      (h.channel.sent.at(-1) as { input: object }).input,
+    )).toContain('已允许本次操作'))
+    await h.service.shutdown()
+  })
+
+  it('any other reply rejects the card and still reaches the agent', async () => {
+    const { h, agent, pending } = await pendingApproval('oc_aother')
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_aother', senderId: 'u_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_aother', content: '别提权，换个目录写',
+    }))
+    await expect(pending).resolves.toBe('rejected')
+    await waitUntil(() => expect(mock(agent.followup)).toHaveBeenCalled())
+    await h.service.shutdown()
+  })
+})
+
 describe('/permissions and /status extras', () => {
   it('shows the current permission preset and the catalog read-only by default', async () => {
     const h = await setup()

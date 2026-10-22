@@ -178,6 +178,8 @@ interface TurnState {
   reasoningMs: number
   /** The in-flight tool call, if any (cleared by its `tool/result`). */
   toolActivity: { name: string; label: string; since: number } | undefined
+  /** Tool names whose approval card is still undecided (shown over the tool line). */
+  awaitingApproval: readonly string[]
   /** Live workflow-run folds projected by the workflow tool into this session. */
   workflowRuns: Map<string, WorkflowRun>
   /** The last settled workflow run (kept visible until the next activity). */
@@ -362,6 +364,7 @@ export class TurnStreamer {
       reasoningSince: undefined,
       reasoningMs: 0,
       toolActivity: undefined,
+      awaitingApproval: [],
       workflowRuns: new Map(),
       workflowEndStatus: undefined,
       children: new Map(),
@@ -419,6 +422,20 @@ export class TurnStreamer {
       if (this.front(sessionId)?.cards.some(card => card.messageId === messageId) === true) return sessionId
     }
     return undefined
+  }
+
+  /**
+   * Show (or clear) the approval wait on the session's live turn: the tool
+   * line reads `⏳ 等待你审批：bash` while any approval card is undecided.
+   * @param sessionId - the session waiting on approval.
+   * @param toolNames - the tools still waiting; empty clears the line.
+   */
+  setAwaitingApproval(sessionId: string, toolNames: readonly string[]): void {
+    const state = this.front(sessionId)
+    if (state === undefined) return
+    if (state.awaitingApproval.join('\u0000') === toolNames.join('\u0000')) return
+    state.awaitingApproval = [...toolNames]
+    this.markDirty(sessionId, state)
   }
 
   /** Render the stop button disabled on the session's live turn. */
@@ -888,6 +905,9 @@ export class TurnStreamer {
    */
   private toolLine(state: TurnState, now: number): string {
     if (state.finalized) return ''
+    if (state.awaitingApproval.length > 0) {
+      return clipActivity(`⏳ 等待你审批：${[...new Set(state.awaitingApproval)].join('、')}`)
+    }
     const tool = state.toolActivity
     if (tool === undefined) return ''
     const prefix = tool.name === 'subagent'
