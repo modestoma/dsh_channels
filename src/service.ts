@@ -1916,7 +1916,8 @@ export class FeishuService {
   /**
    * Picker-card click: run the chosen `/<command> <arg>` exactly as if the
    * operator had typed it under the picker card, so access admission, route
-   * ownership and validation are the typed command's. Stale pickers (the
+   * ownership and validation are the typed command's. The result replaces
+   * the picker card in place instead of arriving as a new card. Stale pickers (the
    * topic was rebound, or the card was forwarded elsewhere) and non-owner
    * clicks are ignored.
    */
@@ -1928,7 +1929,7 @@ export class FeishuService {
     const userId = event.operator.userId
     if (route === undefined || route.chatId !== event.chatId || userId !== route.senderUserId) return
     const line = `/${action.command} ${action.arg}`
-    await this.handleSlashMessage({
+    await this.delivery.replacingCard(event.messageId, () => this.handleSlashMessage({
       messageId: event.messageId,
       chatId: route.chatId,
       chatType: route.chatType,
@@ -1941,7 +1942,7 @@ export class FeishuService {
       mentionedBot: true,
       ...(route.kind === 'thread' ? { threadId: route.key } : {}),
       createTime: Date.now(),
-    }, line)
+    }, line))
   }
 
   /**
