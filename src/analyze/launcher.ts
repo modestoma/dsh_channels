@@ -37,7 +37,7 @@ import type { InflightRepair } from '../session/repair.ts'
 import type { RouteStore } from '../session/routes.ts'
 import type { TurnStreamer } from '../streamer.ts'
 import { ensureAnalyzeWorkspace, topicTokenFor } from '../workspaces.ts'
-import { analyzeRequestHash, chatApplink } from './contract.ts'
+import { analyzeRequestHash } from './contract.ts'
 import type { AnalyzeAccepted, AnalyzeRequest, AnalyzeResponse } from './contract.ts'
 import type { AnalyzeHandler } from './server.ts'
 
@@ -123,7 +123,7 @@ export class AnalyzeLauncher implements AnalyzeHandler {
     const stored = domain.analyzeRequests.get(key)
     if (stored !== undefined) {
       if (stored.bodyHash !== bodyHash) return reusedKey()
-      return { status: 202, body: { ok: true, chatId: stored.chatId, messageId: stored.messageId, link: stored.link } }
+      return { status: 202, body: { ok: true, chatId: stored.chatId, messageId: stored.messageId } }
     }
     if (!this.deps.mayAnalyzeIn(request.chatId)) {
       return refused(403, '目标群未授权：请管理员在该群发送 /auth group add，或在设置面板「访问与授权」中添加')
@@ -135,13 +135,10 @@ export class AnalyzeLauncher implements AnalyzeHandler {
     } catch (error) {
       return refused(502, `占位卡片发送失败（机器人需在目标群内）：${messageOf(error)}`)
     }
-    const position = await channel.messagePositionOf(placeholderId).catch(() => undefined)
-    const body: AnalyzeAccepted = {
-      ok: true, chatId: request.chatId, messageId: placeholderId, link: chatApplink(request.chatId, position),
-    }
+    const body: AnalyzeAccepted = { ok: true, chatId: request.chatId, messageId: placeholderId }
     try {
       await domain.analyzeRequests.put(key, {
-        key, bodyHash, chatId: request.chatId, messageId: placeholderId, link: body.link, acceptedAt: Date.now(),
+        key, bodyHash, chatId: request.chatId, messageId: placeholderId, acceptedAt: Date.now(),
       })
     } catch (error) {
       // The card is visible already; a lost record only means a retry of this

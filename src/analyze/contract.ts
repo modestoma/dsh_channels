@@ -64,11 +64,6 @@ export interface AnalyzeAccepted {
   readonly chatId: string
   /** Placeholder card message id; the analysis topic hangs below it. */
   readonly messageId: string
-  /**
-   * Feishu applink opening the target group, positioned at the placeholder
-   * when Feishu reported its `message_position`.
-   */
-  readonly link: string
 }
 
 /** Body of a refused request. */
@@ -82,18 +77,6 @@ export interface AnalyzeRefused {
 export interface AnalyzeResponse {
   readonly status: number
   readonly body: AnalyzeAccepted | AnalyzeRefused
-}
-
-/**
- * Applink that opens one group chat in the Feishu client, optionally at one
- * message position.
- * @param chatId - group chat id.
- * @param position - the message's `message_position`, when known.
- * @returns the `applink.feishu.cn` chat link.
- */
-export function chatApplink(chatId: string, position?: string): string {
-  const base = `https://applink.feishu.cn/client/chat/open?openChatId=${encodeURIComponent(chatId)}`
-  return position === undefined ? base : `${base}&position=${encodeURIComponent(position)}`
 }
 
 /**

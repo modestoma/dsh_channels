@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
-  ANALYZE_ROUTE, analyzeRequestHash, chatApplink, parseAnalyzeRequest,
+  ANALYZE_ROUTE, analyzeRequestHash, parseAnalyzeRequest,
 } from '../src/analyze/contract.ts'
 import type { AnalyzeRequest, AnalyzeResponse } from '../src/analyze/contract.ts'
 import type { AnalyzeLauncher } from '../src/analyze/launcher.ts'
@@ -69,11 +69,6 @@ describe('analyze contract', () => {
     expect(analyzeRequestHash(request({ prompt: 'other' }))).not.toBe(analyzeRequestHash(request()))
   })
 
-  it('builds chat applinks with an optional position', () => {
-    expect(chatApplink('oc_g')).toBe('https://applink.feishu.cn/client/chat/open?openChatId=oc_g')
-    expect(chatApplink('oc_g', '12')).toBe('https://applink.feishu.cn/client/chat/open?openChatId=oc_g&position=12')
-  })
-
   it('validates the listen address and token reference in config', () => {
     expect(resolveConfig({ analyzeListen: '0.0.0.0:3090' }).analyzeListen).toBe('0.0.0.0:3090')
     expect(resolveConfig({}).analyzeToken).toBe('DSH_CHANNELS_ANALYZE_TOKEN')
@@ -91,7 +86,7 @@ describe('analyze listener', () => {
       token: handler.token ?? (async () => 'secret-token'),
       analyze: handler.analyze ?? (async (...args): Promise<AnalyzeResponse> => {
         calls.push(args)
-        return { status: 202, body: { ok: true, chatId: 'oc_group', messageId: 'om_1', link: 'l' } }
+        return { status: 202, body: { ok: true, chatId: 'oc_group', messageId: 'om_1' } }
       }),
     }, vi.fn())
     servers.push(server)
@@ -164,7 +159,7 @@ describe('analyze service flow', () => {
 
   async function setup(partial: Partial<FeishuConfig> = {}) {
     const config = makeConfig(partial)
-    const channel = makeChannel({ messagePositionOf: async () => '42' })
+    const channel = makeChannel()
     const ctxState = makeHostContext()
     const factory: ChannelFactory = () => channel
     const service = new FeishuService(ctxState.ctx, config, factory)
@@ -210,7 +205,6 @@ describe('analyze service flow', () => {
       status: 202,
       body: {
         ok: true, chatId: 'oc_group', messageId: 'om_1',
-        link: 'https://applink.feishu.cn/client/chat/open?openChatId=oc_group&position=42',
       },
     })
     const placeholder = h.channel.sent[0]!

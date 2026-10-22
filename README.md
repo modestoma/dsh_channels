@@ -383,10 +383,10 @@ Content-Type: application/json
 **响应**：校验通过、占位卡发出后立即返回 `202`：
 
 ```json
-{ "ok": true, "chatId": "oc_xxx", "messageId": "om_xxx", "link": "https://applink.feishu.cn/client/chat/open?openChatId=oc_xxx&position=42" }
+{ "ok": true, "chatId": "oc_xxx", "messageId": "om_xxx" }
 ```
 
-`link` 打开目标群，并在飞书返回了该消息的 `message_position` 时定位到占位卡。同步错误都带中文 `error`：`401` 令牌无效、`400` 参数或 `Idempotency-Key` 不合法、`403` 目标群未授权、`409` 同一个 `Idempotency-Key` 已被内容不同的请求使用、`413` 请求体超过 1 MiB、`415` 不是 JSON、`502` 占位卡发送失败（如机器人不在群里）、`503` 飞书未连接或未配置令牌。
+`messageId` 是占位卡的消息 id，分析话题挂在它下面。同步错误都带中文 `error`：`401` 令牌无效、`400` 参数或 `Idempotency-Key` 不合法、`403` 目标群未授权、`409` 同一个 `Idempotency-Key` 已被内容不同的请求使用、`413` 请求体超过 1 MiB、`415` 不是 JSON、`502` 占位卡发送失败（如机器人不在群里）、`503` 飞书未连接或未配置令牌。
 
 **去重**：同一个 `Idempotency-Key` 再次请求（包括并发重试）原样返回第一次的结果，不会再发卡、再分析。记录永久保存在 `channels_routes_v2` 域的 `analyze_requests` 表。占位卡发出后的失败（话题创建、Session 创建）不会回滚这条记录：占位卡会被替换成「日志分析未能开始」失败卡并写明原因，需要重试时请换一个新的 `Idempotency-Key`。
 

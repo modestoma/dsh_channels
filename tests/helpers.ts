@@ -737,7 +737,6 @@ export function makeHostContext(
 
 export interface FakeChannelOptions {
   threadIdOfMessage?: (messageId: string) => Promise<string | undefined>
-  messagePositionOf?: (messageId: string) => Promise<string | undefined>
   /** Raw `im.v1.message.get` stub (quoted message / merged-forward container). */
   messageGet?: (messageId: string) => Promise<unknown>
   /** Raw `im.v1.message.mget` stub (batch read). */
@@ -904,7 +903,6 @@ export function makeChannel(options: FakeChannelOptions = {}): FeishuChannel & {
       removedReactions.push({ messageId, reactionId })
     }),
     threadIdOfMessage: options.threadIdOfMessage ?? (async () => `omt_${serial}`),
-    messagePositionOf: options.messagePositionOf ?? (async () => undefined),
     ...(options.appOwnerUserId === undefined ? {} : { appOwnerUserId: options.appOwnerUserId }),
     ...(options.grantedScopes === undefined ? {} : { grantedScopes: options.grantedScopes }),
     ...(options.slashCommands === undefined ? {} : { slashCommands: options.slashCommands }),

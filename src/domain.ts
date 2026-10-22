@@ -301,8 +301,6 @@ export const analyzeRequestRecordSchema = z.object({
   chatId: z.string().min(1),
   /** Placeholder card message id (the analysis topic's root). */
   messageId: z.string().min(1),
-  /** Response link (chat applink, positioned when the position was known). */
-  link: z.string().min(1),
   /** Epoch ms when the request was accepted. */
   acceptedAt: z.number().int().nonnegative(),
 })
