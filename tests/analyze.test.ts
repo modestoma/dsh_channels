@@ -17,7 +17,7 @@ import type { AnalyzeHandler, AnalyzeServer } from '../src/analyze/server.ts'
 import { buildAnalyzeRootCard } from '../src/cards.ts'
 import { resolveConfig } from '../src/config.ts'
 import type { FeishuConfig } from '../src/config.ts'
-import type { RouteRecord } from '../src/domain.ts'
+import type { AnalyzeRequestRecord, RouteRecord } from '../src/domain.ts'
 import type { CardActionEvent, ChannelFactory, NormalizedMessage } from '../src/feishu-channel.ts'
 import { FeishuService } from '../src/service.ts'
 import type { SessionManager } from '../src/session/manager.ts'
@@ -195,6 +195,7 @@ describe('analyze service flow', () => {
       service, channel, ctxState, config, launcher,
       onMessage: (msg: NormalizedMessage) => Promise.resolve(handler(msg)),
       routes: () => [...ctxState.domain.raw.table('routes').entries()].map(([, value]) => value as RouteRecord),
+      record: (key: string) => ctxState.domain.raw.table('analyze_requests').get(key) as AnalyzeRequestRecord | undefined,
     }
   }
 
@@ -266,7 +267,8 @@ describe('analyze service flow', () => {
     expect(lastCard(h, 'om_1')).toBeUndefined()
 
     h.ctxState.sessionListeners[0]!(agent.session, { type: 'turn/end', seq: 1, data: { turn: 1, reason: 'stop' } })
-    await waitUntil(() => expect(lastCard(h, 'om_1')).toContain('已完成'))
+    await waitUntil(() => expect(h.record('key-1')?.status).toBe('done'))
+    expect(lastCard(h, 'om_1')).toContain('已完成')
     expect(lastCard(h, 'om_1')).toContain('"template":"green"')
     expect(h.channel.reactions).toContainEqual({ messageId: 'om_1', emojiType: 'DONE' })
   })
@@ -283,6 +285,28 @@ describe('analyze service flow', () => {
     await waitUntil(() => expect(lastCard(h, 'om_1')).toContain('失败'))
     expect(lastCard(h, 'om_1')).toContain('原因见话题')
     expect(lastCard(h, 'om_2')).toContain('model down')
+  })
+
+  it('marks analyses a previous instance never finished as interrupted at start', async () => {
+    const h = await setup()
+    await h.service.addAccessGroup('oc_group')
+    await h.launcher.analyze(request(), 'key-done')
+    await waitUntil(() => expect(h.routes()).toHaveLength(1))
+    const first = h.ctxState.agents.created[0]!.handle.agent
+    h.ctxState.sessionListeners[0]!(first.session, { type: 'turn/end', seq: 1, data: { turn: 1, reason: 'stop' } })
+    await waitUntil(() => expect(h.record('key-done')?.status).toBe('done'))
+    await h.launcher.analyze(request({ prompt: 'second' }), 'key-open')
+    await waitUntil(() => expect(h.routes()).toHaveLength(2))
+    expect(h.record('key-open')?.status).toBe('running')
+
+    await h.service.shutdown()
+    await h.service.start()
+    await waitUntil(() => expect(h.record('key-open')?.status).toBe('interrupted'))
+    const card = lastCard(h, h.record('key-open')!.messageId)
+    expect(card).toContain('已中断')
+    expect(card).toContain('"template":"orange"')
+    expect(card).toContain('设备 A 崩溃日志')
+    expect(h.record('key-done')?.status).toBe('done')
   })
 
   it('replays a retried key and refuses a reused one', async () => {
@@ -314,7 +338,8 @@ describe('analyze service flow', () => {
     await h.service.addAccessGroup('oc_group')
     sessionsOf(h.launcher).mountGuidance = async () => { throw new Error('mount failed') }
     await h.launcher.analyze(request(), 'key-1')
-    await waitUntil(() => expect(lastCard(h, 'om_1')).toContain('分析未能开始：mount failed'))
+    await waitUntil(() => expect(h.record('key-1')?.status).toBe('failed'))
+    expect(lastCard(h, 'om_1')).toContain('分析未能开始：mount failed')
     expect(lastCard(h, 'om_1')).toContain('"template":"red"')
     expect(lastCard(h, 'om_2')).toContain('分析未能开始：mount failed')
     expect(h.routes()).toHaveLength(0)

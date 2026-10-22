@@ -299,10 +299,24 @@ export const analyzeRequestRecordSchema = z.object({
   bodyHash: z.string().min(1),
   /** Target group chat. */
   chatId: z.string().min(1),
-  /** Placeholder card message id (the analysis topic's root). */
+  /** Root card message id (the analysis topic's root). */
   messageId: z.string().min(1),
   /** Epoch ms when the request was accepted. */
   acceptedAt: z.number().int().nonnegative(),
+  /** What the root card shows, kept so the card can be redrawn after a restart. */
+  subject: z.object({
+    requesterUserId: z.string(),
+    triggeredAt: z.string(),
+    app: z.string(),
+    errorCode: z.string(),
+    logDetails: z.array(z.object({ name: z.string(), url: z.string() })),
+  }),
+  /**
+   * Root card status. `running` until the first turn settles; a record still
+   * `running` when the channel starts belongs to an analysis the previous
+   * instance never finished, and becomes `interrupted`.
+   */
+  status: z.enum(['running', 'done', 'stopped', 'error', 'failed', 'interrupted']),
 })
 
 export type AnalyzeRequestRecord = z.infer<typeof analyzeRequestRecordSchema>
@@ -463,6 +477,7 @@ export interface AccessRequestsTable {
 export interface AnalyzeRequestsTable {
   get(key: string): AnalyzeRequestRecord | undefined
   put(key: string, value: AnalyzeRequestRecord): Promise<unknown> | void
+  entries(): IterableIterator<[string, AnalyzeRequestRecord]>
 }
 
 /** Normalized domain handle. */

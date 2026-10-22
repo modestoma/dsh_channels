@@ -8,7 +8,10 @@
  * directory, the Session, the group-shared route, and the first turn: the
  * platform prompt verbatim, streamed into that card like any topic turn. When
  * the first turn settles, the root card's status follows it (已完成 / 已停止 /
- * 失败). Log packages are fetched by the analysis skill the prompt invokes.
+ * 失败), and the request record keeps the same status. At channel start,
+ * records still `running` belong to analyses a previous instance never
+ * finished; {@link AnalyzeLauncher.markInterrupted} marks their cards 已中断.
+ * Log packages are fetched by the analysis skill the prompt invokes.
  *
  * The topic is reserved in the inbound router from its creation until the
  * route and the first prompt are published, so replies posted meanwhile queue
@@ -27,7 +30,7 @@ import type { FeishuConfig } from '../config.ts'
 import { buildAnalyzeRootCard, buildCard, initialStreamingCard } from '../cards.ts'
 import type { AnalyzeStatus, AnalyzeSubject } from '../cards.ts'
 import type { RouteOperationQueue } from '../commands.ts'
-import type { FeishuDomainHandle, RouteRecord } from '../domain.ts'
+import type { AnalyzeRequestRecord, FeishuDomainHandle, RouteRecord } from '../domain.ts'
 import type { FeishuChannel } from '../feishu-channel.ts'
 import { feishuUserMessage } from '../routing/inbound.ts'
 import { enterTopic, placementServices, planTopic } from '../session/isolation.ts'
@@ -114,6 +117,27 @@ export class AnalyzeLauncher implements AnalyzeHandler {
     await Promise.allSettled([...this.running])
   }
 
+  /**
+   * Mark every analysis still `running` as interrupted, on its card and in
+   * its record. Called at channel start before the listener opens, so each
+   * such record belongs to a previous instance whose first turn never
+   * settled. A card that cannot be updated (deleted, recalled) is logged and
+   * still recorded as interrupted, so it is not retried on every start.
+   */
+  async markInterrupted(): Promise<void> {
+    const channel = this.deps.channel()
+    const domain = this.deps.domain()
+    if (channel === undefined || domain === undefined) return
+    for (const [key, record] of [...domain.analyzeRequests.entries()]) {
+      if (record.status !== 'running') continue
+      await channel.updateCard(record.messageId, buildAnalyzeRootCard(record.subject, { kind: 'interrupted' }))
+        .catch((error: unknown) => {
+          this.deps.ctx.logger?.warn?.('dsh-channels: marking analysis card %s interrupted failed: %s', key, String(error))
+        })
+      await this.recordStatus(key, 'interrupted')
+    }
+  }
+
   private async accept(request: AnalyzeRequest, key: string, bodyHash: string): Promise<AnalyzeResponse> {
     const channel = this.deps.channel()
     const domain = this.deps.domain()
@@ -141,13 +165,14 @@ export class AnalyzeLauncher implements AnalyzeHandler {
     try {
       await domain.analyzeRequests.put(key, {
         key, bodyHash, chatId: request.chatId, messageId: rootId, acceptedAt: Date.now(),
+        subject: { ...subject, logDetails: [...subject.logDetails] }, status: 'running',
       })
     } catch (error) {
       // The card is visible already; a lost record only means a retry of this
       // key would post a second analysis.
       this.deps.ctx.logger?.warn?.('dsh-channels: recording analyze request %s failed: %s', key, String(error))
     }
-    const run = this.launch(channel, request, subject, rootId)
+    const run = this.launch(channel, request, subject, rootId, key)
     this.running.add(run)
     void run.finally(() => { this.running.delete(run) })
     return { status: 202, body }
@@ -159,14 +184,17 @@ export class AnalyzeLauncher implements AnalyzeHandler {
     request: AnalyzeRequest,
     subject: AnalyzeSubject,
     rootId: string,
+    key: string,
   ): Promise<void> {
     const warn = (message: string, ...args: unknown[]): void => {
       this.deps.ctx.logger?.warn?.(message, ...args)
     }
-    const showStatus = (status: AnalyzeStatus): Promise<void> =>
-      channel.updateCard(rootId, buildAnalyzeRootCard(subject, status)).catch((error: unknown) => {
+    const showStatus = async (status: AnalyzeStatus): Promise<void> => {
+      await channel.updateCard(rootId, buildAnalyzeRootCard(subject, status)).catch((error: unknown) => {
         warn('dsh-channels: updating analysis card %s failed: %s', rootId, String(error))
       })
+      await this.recordStatus(key, status.kind)
+    }
     const sessionId = randomUUID() as SessionId
     let handle: AgentHandle | undefined
     let cardId: string | undefined
@@ -224,13 +252,13 @@ export class AnalyzeLauncher implements AnalyzeHandler {
         attempts: 0,
       })
       const agent = handle.agent
-      const key = threadId
+      const routeKey = threadId
       const streamCardId = cardId
       // Route, stream binding, and prompt land in one queue slot, so a reply
       // posted in the topic meanwhile is delivered after the first turn.
-      await this.deps.queue.run(key, async () => {
+      await this.deps.queue.run(routeKey, async () => {
         this.assertStarted()
-        await this.deps.routes.put(key, record)
+        await this.deps.routes.put(routeKey, record)
         published = true
         this.deps.streamer()?.attach(agent.session, streamCardId, rootId, undefined, {
           onSettled: outcome => { void showStatus({ kind: outcome }) },
@@ -287,6 +315,18 @@ export class AnalyzeLauncher implements AnalyzeHandler {
       throw new Error('无法在目标群创建话题（读取话题 id 失败）')
     }
     return { cardId: sent.messageId, threadId }
+  }
+
+  /** Store a root card status in the request record (best-effort; the card already shows it). */
+  private async recordStatus(key: string, status: AnalyzeRequestRecord['status']): Promise<void> {
+    const domain = this.deps.domain()
+    const record = domain?.analyzeRequests.get(key)
+    if (domain === undefined || record === undefined) return
+    try {
+      await domain.analyzeRequests.put(key, { ...record, status })
+    } catch (error) {
+      this.deps.ctx.logger?.warn?.('dsh-channels: recording analysis %s status failed: %s', key, String(error))
+    }
   }
 
   private assertStarted(): void {

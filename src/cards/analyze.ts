@@ -1,8 +1,8 @@
 /**
  * Root card of a log-platform analysis: who started which analysis when, the
  * log-platform detail pages behind it, and a status tag (分析中 → 已完成 /
- * 已停止 / 失败). The analysis itself streams in the topic below the card
- * through the ordinary streaming card.
+ * 已停止 / 失败 / 已中断). The analysis itself streams in the topic below the
+ * card through the ordinary streaming card.
  *
  * @module dsh-channels/cards/analyze
  */
@@ -28,7 +28,8 @@ export interface AnalyzeSubject {
 
 /**
  * Root card status: `running` until the first turn settles (`done`,
- * `stopped`, `error`), or `failed` when the analysis could not start.
+ * `stopped`, `error`), `failed` when the analysis could not start, or
+ * `interrupted` when DSH restarted before the first turn settled.
  */
 export type AnalyzeStatus =
   | { readonly kind: 'running' }
@@ -36,6 +37,7 @@ export type AnalyzeStatus =
   | { readonly kind: 'stopped' }
   | { readonly kind: 'error' }
   | { readonly kind: 'failed'; readonly reason: string }
+  | { readonly kind: 'interrupted' }
 
 /** Rows per table page (Feishu caps `page_size` at 10). */
 const TABLE_PAGE_SIZE = 10
@@ -58,6 +60,7 @@ function statusLook(status: AnalyzeStatus): { tag: string; color: string; templa
     case 'stopped': return { tag: '已停止', color: 'neutral', template: 'grey' }
     case 'error':
     case 'failed': return { tag: '失败', color: 'red', template: 'red' }
+    case 'interrupted': return { tag: '已中断', color: 'orange', template: 'orange' }
   }
 }
 
@@ -69,6 +72,7 @@ function statusNote(status: AnalyzeStatus): string {
     case 'stopped': return '分析已停止；在话题内回复即可继续。'
     case 'error': return '分析回合失败，原因见话题；在话题内回复即可重试或追问。'
     case 'failed': return `分析未能开始：${plain(status.reason)}`
+    case 'interrupted': return 'DSH 重启导致分析中断；在话题内回复即可继续。'
   }
 }
 

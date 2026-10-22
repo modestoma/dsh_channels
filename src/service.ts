@@ -205,6 +205,7 @@ async function openFeishuDomain(ctx: HostContext): Promise<FeishuDomainHandle> {
     analyzeRequests: {
       get: key => analyzeRequestsRaw.get(key) as AnalyzeRequestRecord | undefined,
       put: (key, value) => analyzeRequestsRaw.put(key, value),
+      entries: () => analyzeRequestsRaw.entries() as IterableIterator<[string, AnalyzeRequestRecord]>,
     },
     getGlobal: () => (domain.global.get() ?? {}) as FeishuDomainGlobal,
     setGlobal: value => domain.global.set(value),
@@ -1486,6 +1487,8 @@ export class FeishuService {
     // Background: the results only feed the panel and the log.
     void this.runScopeCheck(channel, appId, ownerLookup)
     if (this.config.slashCommandPanel) void this.runSlashCommandSync(channel)
+    // Before the listener opens, so every `running` record left is a previous instance's.
+    await this.analyzeLauncher.markInterrupted()
     await this.openAnalyzeListener()
     // Repair cards a previous instance left mid-flight (best-effort, background).
     void this.repair.repairAll().catch((error: unknown) => {
