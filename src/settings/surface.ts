@@ -354,11 +354,11 @@ const FIELD_META: Record<EditableKey, { label: string; help: string; min?: numbe
   },
   'feishuTools.wikiRead': {
     label: '启用知识库读取工具',
-    help: '让模型浏览「知识库范围」内的知识库节点，并读取 docx 文档、电子表格和多维表格（feishu_wiki_list / feishu_wiki_read / feishu_wiki_sheet_read / feishu_wiki_base_read），以应用身份访问。需开通 wiki:wiki、docx:document、sheets:spreadsheet、bitable:app 权限（或对应的只读权限）。只有话题所有者是管理员或在知识库白名单（/auth wiki add @成员）中才能使用；打开文档前会在授权卡上征得话题所有者同意，每个话题一次。知识库范围为空时不挂载。对新会话生效。',
+    help: '让模型浏览「知识库范围」内的知识库节点，并读取 docx 文档、电子表格和多维表格（feishu_wiki_list / feishu_wiki_read / feishu_wiki_sheet_read / feishu_wiki_base_read），以应用身份访问。需开通 wiki:wiki、docx:document（或对应的只读权限），电子表格需 sheets:spreadsheet:read，多维表格需 base:table:read、base:field:read、base:record:read（旧版 sheets:spreadsheet、bitable:app 不生效）。只有话题所有者是管理员或在知识库白名单（/auth wiki add @成员）中才能使用；打开文档前会在授权卡上征得话题所有者同意，每个话题一次。知识库范围为空时不挂载。对新会话生效。',
   },
   'feishuTools.wikiWrite': {
     label: '启用知识库写入工具',
-    help: '让模型在「知识库范围」内新建 docx 文档、电子表格和多维表格，编辑本应用拥有的文档和电子表格，增改删本应用拥有的多维表格记录、向其他多维表格新增记录（feishu_wiki_create / feishu_wiki_edit / feishu_wiki_sheet_edit / feishu_wiki_base_edit），以应用身份访问；每次新建或编辑都需话题所有者在审批卡上同意。需开通 wiki:wiki、docx:document、sheets:spreadsheet、bitable:app 权限；使用条件同读取工具（管理员或知识库白名单）。知识库范围为空时不挂载。对新会话生效。',
+    help: '让模型在「知识库范围」内新建 docx 文档、电子表格和多维表格，编辑本应用拥有的文档和电子表格，增改删本应用拥有的多维表格记录、向其他多维表格新增记录（feishu_wiki_create / feishu_wiki_edit / feishu_wiki_sheet_edit / feishu_wiki_base_edit），以应用身份访问；每次新建或编辑都需话题所有者在审批卡上同意。需开通 wiki:wiki、docx:document、sheets:spreadsheet:write_only、base:record:create、base:record:update、base:record:delete 权限，以及读取工具的权限；使用条件同读取工具（管理员或知识库白名单）。知识库范围为空时不挂载。对新会话生效。',
   },
   wikiRoots: {
     label: '知识库范围（wikiRoots）',
