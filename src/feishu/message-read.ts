@@ -548,8 +548,10 @@ export function messageTextOf(item: RawMessageItem): string {
     }
     case 'merge_forward':
       return '[合并转发]'
-    case 'interactive':
-      return '[卡片消息]'
+    case 'interactive': {
+      const text = content === undefined ? '' : cardText(content)
+      return text === '' ? '[卡片消息]' : `[卡片] ${text}`
+    }
     case 'audio':
       return '[语音]'
     case 'video':
@@ -562,6 +564,80 @@ export function messageTextOf(item: RawMessageItem): string {
       return item.rawContent === undefined || item.rawContent === ''
         ? `[${item.msgType} 消息]`
         : sanitizeExcerpt(item.rawContent)
+  }
+}
+
+/** Deepest card node visited by {@link cardText}; real cards nest far less. */
+const MAX_CARD_DEPTH = 12
+
+/**
+ * Card keys whose values are never reader-visible text: callback payloads,
+ * link targets, and layout/style settings.
+ */
+const CARD_SKIPPED_KEYS = new Set([
+  'value', 'behaviors', 'url', 'href', 'multi_url', 'image_key', 'img_key',
+  'icon', 'style', 'config', 'confirm', 'i18n_elements', 'i18n_header', 'user_id', 'open_id',
+])
+
+/**
+ * Flatten one card body into text. Handles both the simplified structure the
+ * message read APIs return by default (`{ title, elements: [[...]] }`) and a
+ * sent card's JSON 1.0/2.0 (`header.title`, `elements` or `body.elements`):
+ * every `text`/`content` string and `plain_text`/`lark_md` object in reading
+ * order, images as `[图片]`. A Card 1.0 localized only through
+ * `i18n_header`/`i18n_elements` renders one locale. Returns `''` when no text
+ * is found.
+ */
+function cardText(content: Record<string, unknown>): string {
+  const parts: string[] = []
+  const title = stringField(content, 'title')
+  if (title !== undefined) parts.push(title)
+  collectCardText(asRecord(content.header) ?? localizedBranch(content.i18n_header), parts, 0)
+  collectCardText(
+    content.elements ?? asRecord(content.body)?.elements ?? localizedBranch(content.i18n_elements),
+    parts,
+    0,
+  )
+  return parts.map(part => part.trim()).filter(part => part !== '').join(' ')
+}
+
+/**
+ * One locale branch of a Card 1.0 `i18n_*` map: `zh_cn` when present,
+ * otherwise the first branch, so a card localized only through `i18n_*`
+ * still renders once instead of once per locale.
+ */
+function localizedBranch(value: unknown): unknown {
+  const branches = asRecord(value)
+  if (branches === undefined) return undefined
+  return branches.zh_cn ?? Object.values(branches)[0]
+}
+
+/** Append the reader-visible text of one card node to `parts`. */
+function collectCardText(node: unknown, parts: string[], depth: number): void {
+  if (depth > MAX_CARD_DEPTH) return
+  if (Array.isArray(node)) {
+    for (const child of node) collectCardText(child, parts, depth + 1)
+    return
+  }
+  const record = asRecord(node)
+  if (record === undefined) return
+  const tag = stringField(record, 'tag')
+  if (tag === 'img' || tag === 'image') {
+    parts.push('[图片]')
+    return
+  }
+  if (tag === 'at') {
+    const name = stringField(record, 'user_name')
+    parts.push(name === undefined ? '@' : `@${name}`)
+    return
+  }
+  for (const [key, value] of Object.entries(record)) {
+    if (CARD_SKIPPED_KEYS.has(key)) continue
+    if (typeof value === 'string') {
+      if (key === 'text' || key === 'content') parts.push(value)
+      continue
+    }
+    collectCardText(value, parts, depth + 1)
   }
 }
 
