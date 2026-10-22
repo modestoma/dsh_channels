@@ -25,6 +25,7 @@
    | `im:message.reactions:write_only`（发送、删除消息表情回复） | Typing / DONE / No 表态 |
    | `im:message:update`（更新消息卡片） | 流式卡片刷新（patch） |
    | `im:chat:readonly` 一类（获取群信息） | 入群通知卡展示群名/成员数（具体 scope 以控制台要求为准） |
+   | 「获取应用信息」一类（如 `admin:app.info:readonly` / `application:application:self_manage`，**可选**，以控制台要求为准） | 未配置 `adminUserId` 时连接后自动把应用所有者设为管理员；不便申请时跳过即可，按 3.3 手动设置管理员 |
    | `application:app_slash_command:read` 与 `application:app_slash_command:write`（读取/管理应用斜杠指令，可选，仅 `slashCommandPanel: true` 时需要） | 连接后把插件命令同步到飞书原生斜杠指令面板（输入 `/` 时列出，客户端约 5 分钟后刷新）；缺失时只是面板没有列表，直接输入命令不受影响 |
 
    > 卡片更新接口本身支持 `im:message` 一项即可，但建议把 `im:message:update` 也加上，避免组合差异。
@@ -132,7 +133,7 @@ chmod 600 $DSH_HOME/.credentials.yaml
       topicMessagesTimeoutMs: 20000     # 单次话题读取整段超时（20 s）
     approvalTimeoutMs: 300000           # HITL 审批决策卡等待时长（默认 5 分钟）
     accessMode: 'guarded'               # 准入模式：guarded（默认）| open（旧行为，不安全）
-    adminUserId: 'a1b2c3d4'            # 管理员 user_id（可留空，留空时 guarded 下拒绝一切对话）
+    adminUserId: 'a1b2c3d4'            # 管理员 user_id（可留空，留空时自动使用应用所有者；都没有时 guarded 下拒绝一切对话）
     authRequestTtlDays: 7               # 入群/用户授权申请卡有效期（天）
     loggerLevel: 'info'
 ```
@@ -153,7 +154,7 @@ chmod 600 $DSH_HOME/.credentials.yaml
 | `topicIsolation` | `auto` | 话题工作目录形式：`auto`（工作区含 `.git` 时用 Git worktree，否则普通子目录）/ `subdir` / `worktree`（失败回退子目录） |
 | `approvalTimeoutMs` | `300000` | HITL 审批决策卡等待时长（10s–1h）；超时自动拒绝 |
 | `accessMode` | `guarded` | 准入模式：`guarded` 仅管理员+白名单；`open` 保留旧行为（任何可用范围用户可对话，不安全） |
-| `adminUserId` | 未设置 | 唯一管理员 user_id（不是 `ou_` 开头的 open_id）；留空 + guarded = 拒绝一切对话（`/userid` 引导仍可用）。面板可改 |
+| `adminUserId` | 未设置 = 应用所有者 | 唯一管理员 user_id（不是 `ou_` 开头的 open_id）；留空时连接后自动使用应用所有者（需可选的「获取应用信息」权限），两者都没有 + guarded = 拒绝一切对话（`/userid` 引导仍可用）。面板可改 |
 | `authRequestTtlDays` | `7` | 入群/用户授权申请卡有效期（1–30 天） |
 | `acceptAttachments` | `true` | 接收飞书图片/文件/合并转发记录。native 下触发消息图片预取、文件懒取、纯附件静默不回复（引用该消息再提问时列入清单）；`false` 时附件消息完全惰性（不保存、不触发、不列入清单） |
 | `attachmentStore` | `native` | 入站附件后端：`native`（DSH 原生附件库，默认；不可变、内容寻址去重、随 Session 回放、不自动清理）/ `archive`（旧版下载到话题工作区 `attachments/`，会阻塞会话建立） |
@@ -175,7 +176,7 @@ chmod 600 $DSH_HOME/.credentials.yaml
 
 ### 3.3 初始化管理员与授权（默认准入）
 
-插件默认 `accessMode: 'guarded'`：**没有配置管理员时，所有对话都会被拒绝**（这是 fail-closed 的安全默认值）。初始化顺序：
+插件默认 `accessMode: 'guarded'`：**没有管理员时，所有对话都会被拒绝**（这是 fail-closed 的安全默认值）。如果应用开通了可选的「获取应用信息」权限，留空 `adminUserId` 时连接后会自动把应用所有者设为管理员（Web「访问授权」页显示“已自动使用应用所有者”），可以跳过下面第 1–2 步；没开通或查询失败时按以下顺序手动设置：
 
 1. 启动 dsh 后在飞书**私聊机器人**发送 `/userid`（未配置管理员时任何私聊用户都可以用，只回固定文本，不建会话）→ 复制返回的 user_id；
 2. 打开 Web **设置 → 飞书渠道 → 访问授权**，把它填进「管理员 user_id」并保存（立即生效）；也可以直接写 profile 的 `adminUserId`；

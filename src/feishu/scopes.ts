@@ -97,14 +97,15 @@ const DM_REQUIREMENT: ScopeRequirement = {
 }
 
 /**
- * App-info scope for the owner-as-administrator fallback. Its exact console
- * name is not documented, so the lookup outcome is authoritative; the names
- * only feed the deep link.
+ * App-info scope for the owner-as-administrator fallback. Optional: a
+ * configured `adminUserId` replaces it. Its exact console name is not
+ * documented, so the lookup outcome is authoritative; the names only feed
+ * the deep link.
  */
 const APP_INFO_REQUIREMENT: ScopeRequirement = {
   anyOf: ['admin:app.info:readonly', 'application:application:self_manage'],
-  level: 'required',
-  purpose: '查询应用所有者作为默认管理员；缺失且未配置管理员时所有对话都会被拒绝',
+  level: 'optional',
+  purpose: '自动把应用所有者设为管理员；不开通时在「访问授权」手动填写管理员 user_id 即可',
 }
 
 /**
