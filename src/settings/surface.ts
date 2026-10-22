@@ -128,6 +128,7 @@ const OPTIONAL_TEXT_KEYS = new Set<EditableKey>([
   'reasoningEffort',
   'agentPreset',
   'adminUserId',
+  'analyzeListen',
 ])
 
 const BOOLEAN_KEYS = new Set<EditableKey>([
@@ -250,6 +251,24 @@ const FIELD_META: Record<EditableKey, { label: string; help: string; min?: numbe
   welcomeOnboarding: { label: '首次私聊引导卡', help: '每个私聊会话第一次触达时发送一张命令与用法引导卡，只发一次。' },
   slashCommandPanel: { label: '同步飞书原生斜杠指令面板', help: '连接时把插件命令同步到飞书输入 / 时弹出的面板；需开通 application:app_slash_command:read 与 write 权限，部分企业不允许应用添加斜杠指令。关闭时不读写面板，直接输入命令不受影响。' },
   allowPermissionSwitch: { label: '允许飞书侧切换权限预设', help: '安全敏感：开启后话题所有者可用 /permissions 切换沙箱与审批预设。' },
+  analyzeListen: {
+    label: '日志分析接口监听地址',
+    help: '日志平台调用 POST /dsh-channels/analyze 的独立端口，格式 host:port（如 0.0.0.0:3090）；留空 = 关闭接口；需重连生效。请求需带 Authorization: Bearer <令牌>，令牌存放在 DSH 凭据 DSH_CHANNELS_ANALYZE_TOKEN（可用 analyzeToken 改引用名）。',
+    placeholder: '留空 = 关闭',
+  },
+  analyzeLogMaxBytes: {
+    label: '单次分析日志包总量上限（字节）',
+    help: '一次分析请求所有日志包的下载总字节预算（默认 1073741824 = 1 GiB）；超出则分析不启动，占位卡显示失败原因。',
+    min: 1,
+    step: 1,
+  },
+  analyzeLogTimeoutMs: {
+    label: '单次分析日志包下载超时（ms）',
+    help: '一次分析请求下载全部日志包的总超时（默认 600000 = 10 分钟，至少 1000）。',
+    min: 1_000,
+    max: MAX_TIMER_DELAY_MS,
+    step: 1_000,
+  },
   adminUserId: {
     label: '管理员 user_id',
     help: '唯一管理员。私聊机器人发送 /userid 获取（不是 ou_ 开头的 open_id，也不是邮箱）；留空 = 清除 Web 覆盖。未配置时自动使用飞书应用所有者（需可选的「获取应用信息」权限，开不了就在这里手动填写）；两者都没有时 guarded 模式会拒绝所有对话。',
@@ -383,6 +402,9 @@ const GROUP_OF: Record<EditableKey, EditableFieldWire['group']> = {
   welcomeOnboarding: 'behavior',
   slashCommandPanel: 'behavior',
   allowPermissionSwitch: 'behavior',
+  analyzeListen: 'behavior',
+  analyzeLogMaxBytes: 'behavior',
+  analyzeLogTimeoutMs: 'behavior',
   adminUserId: 'access',
   accessMode: 'access',
   authRequestTtlDays: 'access',

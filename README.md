@@ -147,6 +147,7 @@ src/
 │   ├── streaming.ts       #   流式回复卡构成（面板/活动行/正文/停止按钮/结算页脚）、分段、字节/表格预算
 │   ├── picker.ts          #   /model、/effort、/permissions 选择卡与按钮回传解析
 │   ├── onboarding.ts      #   私聊首次触达引导卡
+│   ├── analyze.ts         #   日志分析占位卡、结果卡首行、失败卡
 │   ├── approval.ts        #   审批决策卡
 │   └── question.ts        #   结构化问答卡
 ├── approvals.ts           # 审批 barrel → src/interactions/
@@ -276,6 +277,10 @@ npm 发行包已包含构建产物：Host 入口是 `lib/index.js`（profile 直
     accessMode: 'guarded'               # 准入模式：guarded（默认，仅管理员+白名单）| open（旧行为，不安全）
     adminUserId: 'a1b2c3d4'            # 管理员 user_id（可留空，留空时自动使用应用所有者；都没有时 guarded 下拒绝所有对话；面板可改）
     authRequestTtlDays: 7               # 入群/用户授权申请卡有效期（天，1–30）
+    analyzeListen: '0.0.0.0:3090'       # 日志平台分析接口的独立监听地址（不填 = 关闭；改后需重连）
+    analyzeToken: 'DSH_CHANNELS_ANALYZE_TOKEN' # 分析接口 Bearer 令牌的凭据引用名（值写在 .credentials.yaml）
+    analyzeLogMaxBytes: 1073741824      # 单次分析所有日志包的下载总量上限（1 GiB）
+    analyzeLogTimeoutMs: 600000         # 单次分析日志包下载总超时（10 分钟）
     loggerLevel: 'info'
 ```
 
@@ -336,6 +341,7 @@ FEISHU_APP_SECRET: xxxxxxxx
 |---|---|---|
 | 私聊 | `<baseDir>/p2p/<user_id>/` | `<工作区>/topics/<话题 id>/` |
 | 群聊 | `<baseDir>/groups/<chat_id>/<user_id>/` | 同上 |
+| 日志平台分析 | `<baseDir>/analyze/<应用>/<错误码>/` | 同上 |
 
 - 群聊必须是「群 × 用户」：同一个人在不同群之间不共享文件，避免 A 群会话把 B 群内容带出来。
 - 会话创建时以工作区为 header cwd（保证 GUI 里归属该项目、沙箱边界稳定），随后通过 `ctx.workingDirectory` 把实际工作目录切到话题目录；冷恢复会从 Session 日志还原该目录。因此话题之间的文件互不干扰，而工作区数量只随用户增长。
@@ -345,6 +351,50 @@ FEISHU_APP_SECRET: xxxxxxxx
 - **插件不删除任何工作区或话题目录**。需要回收磁盘时手动删除不再需要的话题目录即可：该话题下次对话时会重建一个空目录继续使用（worktree 模式下改建新的 worktree 分支）。手动删除 worktree checkout 后，可在仓库里 `git worktree prune` / `git branch -D` 回收 Git 记录。
 - 旧版本「一个话题一个工作区」（`<baseDir>/topics/...`）不会自动迁移：旧话题继续用原目录；旧版「用户 × 聊天」共享工作区正好作为新的用户工作区复用。
 - 设计取舍与约束详见 [docs/workspace-isolation-design.md](docs/workspace-isolation-design.md)。
+
+## 日志平台分析接口
+
+日志平台选中一个或多个同类不良日志包后，调用插件的分析接口：插件在指定群里发一张占位卡，下载日志包，把平台给的 prompt 原样交给一个新 Session（prompt 开头的斜杠命令由 DSH 展开成对应 skill），分析结束后**一次性**把结果写回这张占位卡（不流式）。群里通过准入的成员都可以在该话题内追问。
+
+**开启**：配置 `analyzeListen`（如 `0.0.0.0:3090`，面板「行为」页可改，需重连），并在 `$DSH_HOME/.credentials.yaml` 写入令牌 `DSH_CHANNELS_ANALYZE_TOKEN: <随机长串>`（引用名可用 `analyzeToken` 修改）。接口跑在独立端口上，与 DSH Web 端口无关；令牌每次请求都重新解析，轮换后下一次请求生效；令牌缺失时所有请求返回 503。
+
+**请求**：
+
+```http
+POST /dsh-channels/analyze
+Authorization: Bearer <令牌>
+Idempotency-Key: <平台生成的唯一值，1-200 个可见 ASCII 字符>
+Content-Type: application/json
+
+{
+  "requesterUserId": "a1b2c3d4",
+  "app": "camera",
+  "errorCode": "E1001",
+  "chatId": "oc_xxx",
+  "prompt": "/log-analyze 请分析这些日志……",
+  "logUrls": ["https://logs.example.com/1.zip", "https://logs.example.com/2.zip"]
+}
+```
+
+- `requesterUserId`：平台发起人的飞书 user_id，占位卡与结果卡 @ 此人；路由记录里也以此人作为发起人。
+- `app` / `errorCode`：只允许 `A-Z a-z 0-9 . _ -`（1–128 字符），决定工作区 `<baseDir>/analyze/<app>/<errorCode>/`；同一应用同一错误码的所有分析都在这个工作区里，每次分析各有一个话题目录。
+- `chatId`：目标群，必须是已授权群（`/auth group add` 或面板「访问与授权」），机器人需在群内；`accessMode: open` 时不校验。
+- `prompt`：原样作为首条用户消息，末尾追加一个 `<analyze_logs>` 块，列出下载到话题目录的日志包（如 `logs/01-1.zip`）。解压与分析由 skill 完成，插件不解压。
+- `logUrls`：1–50 个 http(s) 地址（不能带账号密码），按顺序下载，总量受 `analyzeLogMaxBytes`、总时长受 `analyzeLogTimeoutMs` 限制。
+
+**响应**：校验通过、占位卡发出后立即返回 `202`：
+
+```json
+{ "ok": true, "chatId": "oc_xxx", "messageId": "om_xxx", "link": "https://applink.feishu.cn/client/chat/open?openChatId=oc_xxx&position=42" }
+```
+
+`link` 打开目标群，并在飞书返回了该消息的 `message_position` 时定位到占位卡。同步错误都带中文 `error`：`401` 令牌无效、`400` 参数或 `Idempotency-Key` 不合法、`403` 目标群未授权、`409` 同一个 `Idempotency-Key` 已被内容不同的请求使用、`413` 请求体超过 1 MiB、`415` 不是 JSON、`502` 占位卡发送失败（如机器人不在群里）、`503` 飞书未连接或未配置令牌。
+
+**去重**：同一个 `Idempotency-Key` 再次请求（包括并发重试）原样返回第一次的结果，不会再发卡、再分析。记录永久保存在 `channels_routes_v2` 域的 `analyze_requests` 表。占位卡发出后的失败（话题创建、下载、Session 创建）不会回滚这条记录：占位卡会被替换成「日志分析未能开始」失败卡并写明原因，需要重试时请换一个新的 `Idempotency-Key`。
+
+**群里看到的**：先是占位卡「@发起人 正在分析 X 应用的 Y 问题（N 个日志包）」，紧接着话题内一条提示（同时用来创建话题）；分析结束后占位卡原地变成结果卡（首行保留发起人、应用、错误码），并加上 DONE / No 表情。分析过程中出现的审批卡、提问卡发在话题内。
+
+**追问与权限**：分析话题的路由是**群内共享**的（路由记录 `shared: true`）：群里任何通过准入的成员（管理员，或该群已授权且本人在用户白名单）都可以在话题内直接回复追问（无需 @），也可以点停止按钮、回答审批卡与提问卡、在话题里执行会话命令；未授权的人仍被静默忽略。追问的回复照常流式输出。话题之间互不读取，和普通话题一样。分析结果 markdown 怎么回传给平台由日志分析插件自己负责，本插件不参与。
 
 ## 行为与降级
 
