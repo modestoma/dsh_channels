@@ -584,16 +584,32 @@ const CARD_SKIPPED_KEYS = new Set([
  * message read APIs return by default (`{ title, elements: [[...]] }`) and a
  * sent card's JSON 1.0/2.0 (`header.title`, `elements` or `body.elements`):
  * every `text`/`content` string and `plain_text`/`lark_md` object in reading
- * order, images as `[图片]`. Returns `''` when no text is found.
+ * order, images as `[图片]`. A Card 1.0 localized only through
+ * `i18n_header`/`i18n_elements` renders one locale. Returns `''` when no text
+ * is found.
  */
 function cardText(content: Record<string, unknown>): string {
   const parts: string[] = []
   const title = stringField(content, 'title')
   if (title !== undefined) parts.push(title)
-  collectCardText(asRecord(content.header), parts, 0)
-  collectCardText(content.elements, parts, 0)
-  collectCardText(asRecord(content.body)?.elements, parts, 0)
+  collectCardText(asRecord(content.header) ?? localizedBranch(content.i18n_header), parts, 0)
+  collectCardText(
+    content.elements ?? asRecord(content.body)?.elements ?? localizedBranch(content.i18n_elements),
+    parts,
+    0,
+  )
   return parts.map(part => part.trim()).filter(part => part !== '').join(' ')
+}
+
+/**
+ * One locale branch of a Card 1.0 `i18n_*` map: `zh_cn` when present,
+ * otherwise the first branch, so a card localized only through `i18n_*`
+ * still renders once instead of once per locale.
+ */
+function localizedBranch(value: unknown): unknown {
+  const branches = asRecord(value)
+  if (branches === undefined) return undefined
+  return branches.zh_cn ?? Object.values(branches)[0]
 }
 
 /** Append the reader-visible text of one card node to `parts`. */

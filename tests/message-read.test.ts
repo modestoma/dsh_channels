@@ -217,6 +217,26 @@ describe('unified rendering', () => {
       },
     })
     expect(messageTextOf(raw)).toBe('[卡片] 审批 **金额** 100 同意')
+    // Card 1.0 localized only through i18n maps renders one locale (zh_cn first).
+    const localizedCard = item({
+      msg_type: 'interactive',
+      content: {
+        i18n_header: {
+          en_us: { title: { tag: 'plain_text', content: 'Deploy' } },
+          zh_cn: { title: { tag: 'plain_text', content: '发布' } },
+        },
+        i18n_elements: {
+          en_us: [{ tag: 'div', text: { tag: 'lark_md', content: 'done' } }],
+          zh_cn: [{ tag: 'div', text: { tag: 'lark_md', content: '完成' } }],
+        },
+      },
+    })
+    expect(messageTextOf(localizedCard)).toBe('[卡片] 发布 完成')
+    const englishOnly = item({
+      msg_type: 'interactive',
+      content: { i18n_elements: { en_us: [{ tag: 'markdown', content: 'only english' }] } },
+    })
+    expect(messageTextOf(englishOnly)).toBe('[卡片] only english')
   })
 
   it('renders empty text as empty, not as raw JSON', () => {
