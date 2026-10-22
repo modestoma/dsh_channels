@@ -58,6 +58,9 @@ export const PANEL_TITLES: Record<PanelPhase, string> = {
 /** `decision` carried by the streaming card's stop button. */
 export const STOP_ACTION = 'turn-stop'
 
+/** `decision` carried by a queued card's "add to the current reply" button. */
+export const STEER_ACTION = 'turn-steer'
+
 /**
  * Stop control state on the streaming card: `ready` offers the button,
  * `stopping` shows it disabled after the owner clicked it.
@@ -146,6 +149,14 @@ export interface CardState {
   stop?: StopControl
   /** Add the owner-only notice under the stop button (a non-owner clicked it). */
   stopDenied?: boolean
+  /**
+   * The message waits behind another turn of the same session: the main card
+   * renders only the queue notice and the steer button, never the panel,
+   * body or footer. Ignored on continuation cards.
+   */
+  queued?: boolean
+  /** Add the owner-only notice under the steer button (a non-owner clicked it). */
+  queuedDenied?: boolean
   stats: CardStats
 }
 
@@ -399,6 +410,31 @@ function stopElements(stop: StopControl, denied: boolean): object[] {
   return elements
 }
 
+/** Body of a card whose message waits behind the session's running turn. */
+export const QUEUED_NOTICE = '⏳ 排队中：上一轮回复结束后再处理这条消息'
+
+/** Label of the queued card's button that moves the message into the running turn. */
+export const STEER_LABEL = '⚡ 立即补充到当前回复'
+
+/** Body of a queued card after its message moved into the running turn. */
+export const MERGED_NOTICE = '↪️ 已补充到当前回复：当前这一步结束后模型就会读到这条消息，回复继续在上一张卡片中输出'
+
+/** The queued card: notice, steer button and the optional owner-only notice. */
+function queuedElements(denied: boolean): object[] {
+  const elements: object[] = [
+    markdown(QUEUED_NOTICE),
+    textButton({
+      label: STEER_LABEL,
+      type: 'default',
+      width: 'default',
+      margin: '8px 0 0 0',
+      value: { decision: STEER_ACTION },
+    }),
+  ]
+  if (denied) elements.push(note('ℹ️ 仅发起该会话的用户可补充'))
+  return elements
+}
+
 // ---- rendering ------------------------------------------------------------
 
 /** Render one card. `reasoning`/`body` are the already-budgeted texts. */
@@ -410,6 +446,7 @@ function renderCard(
 ): object {
   const segment = options.segment
   const main = segment === undefined
+  if (main && state.queued === true) return card(queuedElements(state.queuedDenied === true))
   const elements: object[] = []
 
   if (main) {
@@ -628,4 +665,25 @@ export function initialStreamingCard(sessionId: string): object {
     stats: { sessionId, inputTokens: 0, outputTokens: 0 },
   }
   return buildCard(state)
+}
+
+/**
+ * The first frame for a message that waits behind the session's running turn:
+ * the queue notice plus the button that moves the message into that turn.
+ * The streamer re-renders it as a normal streaming card once the message's
+ * own turn becomes the active one.
+ */
+export function queuedStreamingCard(sessionId: string): object {
+  return buildCard({
+    phase: 'thinking',
+    reasoning: '',
+    body: '',
+    queued: true,
+    stats: { sessionId, inputTokens: 0, outputTokens: 0 },
+  })
+}
+
+/** Terminal card of a queued message that moved into the running turn. */
+export function buildMergedCard(): object {
+  return card([markdown(MERGED_NOTICE)])
 }

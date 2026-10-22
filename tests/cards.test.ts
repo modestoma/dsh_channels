@@ -18,8 +18,14 @@ import {
   buildOnboardingCard,
   buildPickerCard,
   cardJsonBytes,
+  buildMergedCard,
   initialStreamingCard,
   MAX_PICKER_OPTIONS,
+  MERGED_NOTICE,
+  QUEUED_NOTICE,
+  queuedStreamingCard,
+  STEER_ACTION,
+  STEER_LABEL,
   parsePickAction,
   PICK_ACTION,
   STOP_ACTION,
@@ -680,6 +686,33 @@ function buttonLabel(button: Element): string | undefined {
 function buttonValue(button: Element): unknown {
   return (button.behaviors as Array<{ value: unknown }>)[0]!.value
 }
+
+describe('queued streaming card', () => {
+  it('renders only the queue notice and the steer button', () => {
+    const elements = elementsOf(queuedStreamingCard('sess-1'))
+    expect(elements.map(element => element.tag)).toEqual(['markdown', 'button'])
+    expect(elements[0]).toMatchObject({ content: QUEUED_NOTICE })
+    expect(buttonLabel(elements[1]!)).toBe(STEER_LABEL)
+    expect(buttonValue(elements[1]!)).toEqual({ decision: STEER_ACTION })
+    expect(JSON.stringify(queuedStreamingCard('sess-1'))).not.toContain(PANEL_TITLES.thinking)
+  })
+
+  it('adds the owner-only notice when a non-owner clicked', () => {
+    const json = JSON.stringify(buildCard(baseState({ queued: true, queuedDenied: true })))
+    expect(json).toContain('仅发起该会话的用户可补充')
+  })
+
+  it('keeps continuation cards unaffected by the queued flag', () => {
+    const json = JSON.stringify(buildCard(baseState({ queued: true, body: '续' }), { segment: 2 }))
+    expect(json).not.toContain(QUEUED_NOTICE)
+    expect(json).toContain('续')
+  })
+
+  it('settles a merged queued card as a plain notice', () => {
+    const elements = elementsOf(buildMergedCard())
+    expect(elements).toEqual([{ tag: 'markdown', content: MERGED_NOTICE }])
+  })
+})
 
 describe('streaming card stop button', () => {
   it('renders an enabled stop button after the body while ready', () => {

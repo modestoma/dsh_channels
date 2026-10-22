@@ -319,9 +319,10 @@ export function makeAgent(session: Session, options: AgentOptions = {}, ctx?: Ag
     options,
     session,
     status: 'idle',
-    inbox: { nextTurn: [], nextStep: [] },
+    inbox: { nextTurn: [], nextStep: [], remove: vi.fn(() => true) },
     ctx: ctx ?? makeAgentContext(),
     followup: vi.fn(),
+    steer: vi.fn(),
   }
 }
 

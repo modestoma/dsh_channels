@@ -7,7 +7,7 @@
 
 import type { AttachmentStore } from './attachments.ts'
 import type { CommandRuntime } from './commands.ts'
-import type { Session, SessionId, UserMessage } from './core.ts'
+import type { MessageId, Session, SessionId, UserMessage } from './core.ts'
 
 // ---- Agent surface ------------------------------------------------------
 
@@ -138,9 +138,13 @@ export interface Agent {
   readonly inbox: {
     readonly nextTurn: readonly unknown[]
     readonly nextStep: readonly unknown[]
+    /** Remove one still-pending message; false once the driver claimed it. */
+    remove(messageId: MessageId): boolean
   }
   readonly ctx: AgentContext
   followup(message: UserMessage): void
+  /** Deliver input at the running turn's next step boundary (an idle driver starts a turn). */
+  steer(message: UserMessage): void
   /** Abort the active turn (and pending input unless `keepInbox`). */
   cancel?(cause: AgentCancelCause, options?: { keepInbox?: boolean }): void
 }
