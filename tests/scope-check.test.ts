@@ -24,7 +24,7 @@ const ALL_GRANTED: readonly ScopeGrant[] = [
   'im:resource',
 ].map(name => ({ name, granted: true, type: 'tenant' as const }))
 
-const NO_OWNER_FALLBACK = { dmEnabled: true, requireMention: true, ownerLookupFailed: false, slashCommandPanel: true, sendFile: true }
+const NO_OWNER_FALLBACK = { dmEnabled: true, requireMention: true, ownerLookupFailed: false, slashCommandPanel: true, sendFile: true, wikiRead: false, wikiWrite: false }
 
 describe('checkScopes', () => {
   it('reports nothing when every applicable need is granted', () => {
@@ -78,6 +78,17 @@ describe('checkScopes', () => {
       .toEqual([['optional', 'im:resource|im:resource:upload']])
     expect(checkScopes(grants, 'cli_x', { ...NO_OWNER_FALLBACK, sendFile: false }).missing).toEqual([])
     expect(checkScopes(grants.concat([{ name: 'im:resource:upload', granted: true }]), 'cli_x', NO_OWNER_FALLBACK).missing).toEqual([])
+  })
+
+  it('lists the wiki scopes only while a wiki tool set is enabled, read accepting readonly scopes', () => {
+    expect(checkScopes(ALL_GRANTED, 'cli_x', NO_OWNER_FALLBACK).missing).toEqual([])
+    const read = { ...NO_OWNER_FALLBACK, wikiRead: true }
+    expect(checkScopes(ALL_GRANTED, 'cli_x', read).missing.map(item => item.anyOf.join('|')))
+      .toEqual(['wiki:wiki|wiki:wiki:readonly', 'docx:document|docx:document:readonly'])
+    const readonly = ALL_GRANTED.concat(['wiki:wiki:readonly', 'docx:document:readonly'].map(name => ({ name, granted: true })))
+    expect(checkScopes(readonly, 'cli_x', read).missing).toEqual([])
+    expect(checkScopes(readonly, 'cli_x', { ...read, wikiWrite: true }).missing.map(item => item.anyOf.join('|')))
+      .toEqual(['wiki:wiki', 'docx:document'])
   })
 
   it('requires group_msg when unmentioned group messages are answered', () => {

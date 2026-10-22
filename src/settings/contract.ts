@@ -81,6 +81,10 @@ export const EDITABLE_KEYS = [
   'feishuTools.topicMessages',
   'feishuTools.topicMessagesTimeoutMs',
   'feishuTools.sendFile',
+  'feishuTools.wikiRead',
+  'feishuTools.wikiWrite',
+  // 知识库范围（顶层 `wikiRoots` 字符串列表；为空时不挂载任何知识库工具）
+  'wikiRoots',
   'promptContextTimeoutMs',
   // 模型
   'provider',
@@ -110,8 +114,21 @@ export const RESTART_KEYS = [
 
 export type RestartKey = (typeof RESTART_KEYS)[number]
 
-/** Render kinds the generic panel form understands. */
-export type FieldKind = 'boolean' | 'number' | 'text' | 'select'
+/**
+ * Render kinds the generic panel form understands. `string-list` renders one
+ * single-line input per entry with a remove button each and an add button
+ * below; its value is a `readonly string[]`.
+ */
+export type FieldKind = 'boolean' | 'number' | 'text' | 'select' | 'string-list'
+
+/**
+ * Per-entry format of a `string-list` field. Host and Client both map the
+ * format onto the same entry parser, so an invalid entry is marked before
+ * saving and the Host re-validates it on save.
+ *
+ * - `wiki-root-link`: a Feishu wiki space link or wiki node link (`wikiRoots`).
+ */
+export type StringListItemFormat = 'wiki-root-link'
 
 /**
  * Field groups partition the editable form. Each group is rendered inside one
@@ -139,7 +156,12 @@ export interface EditableFieldWire {
   min?: number
   max?: number
   step?: number
+  /** Input placeholder; for `string-list` it applies to every entry input. */
   placeholder?: string
+  /** `string-list` only: most non-empty entries the Host accepts. */
+  maxItems?: number
+  /** `string-list` only: format every non-empty entry must satisfy. */
+  itemFormat?: StringListItemFormat
   /** Render across the whole form width (long paths). */
   wide?: boolean
   /**
@@ -182,8 +204,13 @@ export interface CatalogWire {
   defaultPresetId?: string
 }
 
-/** Values the panel may submit. Empty strings for optional text fields clear the override. */
-export type ConfigValue = string | number | boolean
+/**
+ * Values the panel may submit. Empty strings for optional text fields clear the
+ * override. A `string-list` field submits its entries as typed (untrimmed,
+ * empty inputs included) so Host issue indexes match the rendered inputs; the
+ * Host trims entries and drops empty ones before persisting.
+ */
+export type ConfigValue = string | number | boolean | readonly string[]
 export type EditableValues = Partial<Record<EditableKey, ConfigValue>>
 
 /** Read-only facts shown in the advanced card. */
@@ -418,6 +445,11 @@ export interface SaveConfigRequest {
 export interface FieldIssueWire {
   key: string
   message: string
+  /**
+   * `string-list` only: zero-based position of the rejected entry in the
+   * submitted array (empty inputs included). Absent for a whole-field issue.
+   */
+  index?: number
 }
 
 /** `PUT /dsh-channels/config` response. */
@@ -607,6 +639,12 @@ export const PANEL_COPY = {
   discardTab: '放弃本页更改',
   saveHintClean: '没有未保存的更改。',
   dirtyCount: '未保存项',
+  listAdd: '添加',
+  listRemove: '移除',
+  listEntry: '第 {n} 项',
+  listTooMany: '最多 {max} 项（空输入框不计）',
+  listNotArray: '必须是字符串列表',
+  listEntryNotString: '必须是字符串',
   browseDirectory: '选择目录…',
   browsingDirectory: '选择中…',
   directoryPicked: '已选择目录',

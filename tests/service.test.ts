@@ -49,6 +49,7 @@ function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
     routeTtlMs: 0,
     approvalTimeoutMs: 300_000,
     questionTimeoutMs: 300_000,
+    wikiRoots: [],
     allowPermissionSwitch: false,
     // Tests exercise routing/hitl behavior; access control has its own tests.
     accessMode: 'open',
@@ -73,6 +74,8 @@ function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
       topicMessages: true,
       topicMessagesTimeoutMs: 20_000,
       sendFile: true,
+      wikiRead: false,
+      wikiWrite: false,
     },
     topicIsolation: 'auto',
     ...partial,
@@ -4163,6 +4166,8 @@ describe('native attachment pipeline', () => {
           topicMessages: true,
           topicMessagesTimeoutMs: 20_000,
           sendFile: true,
+          wikiRead: false,
+          wikiWrite: false,
         },
       },
       { downloadResource: () => [PNG] },
@@ -4784,6 +4789,52 @@ describe('quote excerpts and first-turn topic history', () => {
       media: { kind: 'image', data: expect.any(Buffer) },
       options: { replyInThread: record.kind === 'thread' },
     }])
+    await h.service.shutdown()
+  })
+
+  it('mounts the wiki tools, gates them on the wiki whitelist, and routes consent clicks', async () => {
+    const node = {
+      spaceId: '1', nodeToken: 'wikcnServiceDoc01', objToken: 'doc_1', objType: 'docx' as const,
+      nodeType: 'origin' as const, title: '服务测试', hasChild: false,
+    }
+    const wiki = {
+      getNode: vi.fn(async () => node),
+      spaceName: vi.fn(async () => '空间'),
+      listChildren: vi.fn(async () => ({ items: [] })),
+      createDocxNode: vi.fn(async () => node),
+      documentRevision: vi.fn(async () => 1),
+      fetchDocument: vi.fn(async () => ({ revisionId: 1, content: '正文' })),
+      updateDocument: vi.fn(async () => ({ result: 'success', warnings: [] })),
+    }
+    const { h, tools } = await setupTurnReader({
+      adminUserId: 'u_admin',
+      wikiRoots: ['https://mi.feishu.cn/wiki/space/1'],
+      feishuTools: { ...makeConfig().feishuTools, wikiRead: true },
+    }, {})
+    Object.assign(h.channel, { wiki })
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_wiki', senderId: 'u_owner',
+      messageId: 'om_wiki_trigger', content: '读一下知识库',
+    }))
+    await waitForEstablishedSession(h)
+    const readTool = tools.definitions.get('feishu_wiki_read')
+    expect(tools.definitions.has('feishu_wiki_create')).toBe(false)
+    expect(await readTool!.execute({ doc: 'wikcnServiceDoc01' }, { signal: new AbortController().signal }))
+      .toMatchObject({ ok: false, code: 'NOT_AUTHORIZED' })
+
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_admin', senderId: 'u_admin', mentionedBot: false,
+      messageId: 'om_wiki_grant', content: '/auth wiki add u_owner',
+    }))
+    await waitUntil(() => expect(JSON.stringify(h.channel.sent)).toContain('加入知识库白名单'))
+    const before = h.channel.sent.length
+    const pending = readTool!.execute({ doc: 'wikcnServiceDoc01' }, { signal: new AbortController().signal })
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(before + 1))
+    await h.channel.fireCardAction({
+      messageId: `om_${h.channel.sent.length}`, chatId: 'oc_wiki',
+      operator: { openId: 'ou_owner', userId: 'u_owner' }, action: { value: { decision: 'allow' }, tag: 'button' },
+    })
+    expect(await pending).toMatchObject({ ok: true, content: '正文' })
     await h.service.shutdown()
   })
 

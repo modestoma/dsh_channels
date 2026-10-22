@@ -48,6 +48,7 @@ export function makeAccessDomain(): {
     accessGroups: tableOf<AccessGroupRecord>(raw, 'access_groups'),
     accessUsers: tableOf<AccessUserRecord>(raw, 'access_users'),
     accessRequests: tableOf<AccessRequestRecord>(raw, 'access_requests'),
+    accessWikiUsers: tableOf<AccessUserRecord>(raw, 'access_wiki_users'),
   } as unknown as FeishuDomainHandle
   return { handle, raw }
 }

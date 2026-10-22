@@ -13,6 +13,7 @@
 import { DSH_CHANNELS_VERSION } from '../session-export.ts'
 import type { FeishuConfig } from '../config.ts'
 import { FEISHU_USER_ID_PATTERN } from '../domain.ts'
+import { parseWikiRootLink, WIKI_ROOT_LINK_ERRORS } from '../feishu/wiki/links.ts'
 import type { HealthSnapshot } from '../health.ts'
 import { prepareWorkspaceBaseDir } from '../workspaces.ts'
 import {
@@ -45,6 +46,7 @@ import type {
   SaveCredentialsResponse,
   ScopeCheckWire,
   SlashCommandSyncWire,
+  StringListItemFormat,
 } from './contract.ts'
 import {
   configValueOf,
@@ -137,7 +139,76 @@ const BOOLEAN_KEYS = new Set<EditableKey>([
   'feishuTools.attachmentFetch',
   'feishuTools.topicMessages',
   'feishuTools.sendFile',
+  'feishuTools.wikiRead',
+  'feishuTools.wikiWrite',
 ])
+
+/** Bounds and entry format of one `string-list` field. */
+interface StringListSpec {
+  /** Most non-empty entries accepted (mirrors the config schema bound). */
+  maxItems: number
+  itemFormat?: StringListItemFormat
+}
+
+/** Editable keys rendered as `string-list` (one input per entry). */
+const STRING_LIST_FIELDS: Partial<Record<EditableKey, StringListSpec>> = {
+  wikiRoots: { maxItems: 20, itemFormat: 'wiki-root-link' },
+}
+
+/** Entry checks per item format: the readable reason, or `undefined` when valid. */
+const ITEM_FORMAT_CHECKS: Readonly<Record<StringListItemFormat, (entry: string) => string | undefined>> = {
+  'wiki-root-link': (entry) => {
+    const parsed = parseWikiRootLink(entry)
+    return parsed.ok ? undefined : WIKI_ROOT_LINK_ERRORS[parsed.error]
+  },
+}
+
+/** `第 N 项「entry」：reason`, shared wording with the Client check. */
+function listEntryMessage(index: number, entry: string | undefined, reason: string): string {
+  const position = PANEL_COPY.listEntry.replace('{n}', String(index + 1))
+  return entry === undefined ? `${position}${reason}` : `${position}「${entry}」：${reason}`
+}
+
+/**
+ * Normalize one submitted `string-list` value: entries are trimmed, empty
+ * entries dropped, the count bounded by `maxItems`, and every remaining entry
+ * checked against `itemFormat`. Issue indexes refer to the submitted array
+ * (empty inputs included), so the panel can mark the exact input.
+ *
+ * @param key - The editable key the issues are reported under.
+ * @param raw - The untrusted submitted value.
+ * @param spec - The field's bounds and entry format.
+ * @returns The cleaned entries, or every per-entry / whole-field issue.
+ */
+export function normalizeStringList(
+  key: EditableKey,
+  raw: unknown,
+  spec: StringListSpec,
+): { ok: true; value: string[] } | { ok: false; issues: FieldIssueWire[] } {
+  if (!Array.isArray(raw)) return { ok: false, issues: [{ key, message: PANEL_COPY.listNotArray }] }
+  const issues: FieldIssueWire[] = []
+  const value: string[] = []
+  const check = spec.itemFormat === undefined ? undefined : ITEM_FORMAT_CHECKS[spec.itemFormat]
+  raw.forEach((item: unknown, index) => {
+    if (typeof item !== 'string') {
+      issues.push({ key, index, message: listEntryMessage(index, undefined, PANEL_COPY.listEntryNotString) })
+      return
+    }
+    const entry = item.trim()
+    if (entry === '') return
+    const reason = check?.(entry)
+    if (reason !== undefined) {
+      issues.push({ key, index, message: listEntryMessage(index, entry, reason) })
+      return
+    }
+    value.push(entry)
+  })
+  const count = raw.filter(item => typeof item !== 'string' || item.trim() !== '').length
+  if (count > spec.maxItems) {
+    issues.push({ key, message: PANEL_COPY.listTooMany.replace('{max}', String(spec.maxItems)) })
+  }
+  return issues.length > 0 ? { ok: false, issues } : { ok: true, value }
+}
 
 const SELECT_OPTIONS: Partial<Record<EditableKey, ReadonlyArray<{ value: string; label: string }>>> = {
   attachmentStore: [
@@ -281,6 +352,20 @@ const FIELD_META: Record<EditableKey, { label: string; help: string; min?: numbe
     label: '启用 feishu_send_file 工具',
     help: '让模型把当前话题工作目录里生成的图片/文件发回当前会话（图片 ≤10 MB，文件 ≤30 MB）。需开通 im:resource 权限。对新会话生效。',
   },
+  'feishuTools.wikiRead': {
+    label: '启用知识库读取工具',
+    help: '让模型浏览「知识库范围」内的知识库节点并读取 docx 文档（feishu_wiki_list / feishu_wiki_read），以应用身份访问。需开通 wiki:wiki（或 wiki:wiki:readonly）与 docx:document（或 docx:document:readonly）权限。只有话题所有者是管理员或在知识库白名单（/auth wiki add @成员）中才能使用；打开文档前会在授权卡上征得话题所有者同意，每个话题一次。知识库范围为空时不挂载。对新会话生效。',
+  },
+  'feishuTools.wikiWrite': {
+    label: '启用知识库写入工具',
+    help: '让模型在「知识库范围」内新建 docx 文档，并编辑本应用拥有的文档（feishu_wiki_create / feishu_wiki_edit），以应用身份访问；每次新建或编辑都需话题所有者在审批卡上同意。需开通 wiki:wiki 与 docx:document 权限；使用条件同读取工具（管理员或知识库白名单）。知识库范围为空时不挂载。对新会话生效。',
+  },
+  wikiRoots: {
+    label: '知识库范围（wikiRoots）',
+    help: '知识库工具只能访问这些位置，每个输入框填一个链接：整个知识空间 https://<租户>.feishu.cn/wiki/space/<space_id>，或节点 https://<租户>.feishu.cn/wiki/<node_token>（该节点及其下所有节点）；最多 20 项，空输入框保存时忽略。留空 = 不挂载任何知识库工具（即使上面的开关已开启）。对新会话生效。',
+    placeholder: 'https://<租户>.feishu.cn/wiki/space/<space_id>',
+    wide: true,
+  },
   provider: { label: '模型服务商', help: '留空 = 使用部署默认；例如 deepseek-official。', placeholder: '留空 = 部署默认' },
   model: { label: '模型 id', help: '留空 = 使用部署默认；例如 deepseek-v4-flash。', placeholder: '留空 = 部署默认' },
   reasoningEffort: { label: '推理档位', help: '模型声明的精确档位 id（如 high / max）；留空 = 适配器默认。', placeholder: '留空 = 适配器默认' },
@@ -316,6 +401,9 @@ const GROUP_OF: Record<EditableKey, EditableFieldWire['group']> = {
   'feishuTools.topicMessages': 'tools',
   'feishuTools.topicMessagesTimeoutMs': 'tools',
   'feishuTools.sendFile': 'tools',
+  'feishuTools.wikiRead': 'tools',
+  'feishuTools.wikiWrite': 'tools',
+  wikiRoots: 'tools',
   provider: 'model',
   model: 'model',
   reasoningEffort: 'model',
@@ -329,10 +417,13 @@ const GROUP_OF: Record<EditableKey, EditableFieldWire['group']> = {
 export const FIELD_DESCRIPTORS: readonly EditableFieldWire[] = EDITABLE_KEYS.map(key => {
   const meta = FIELD_META[key]
   const options = SELECT_OPTIONS[key]
+  const list = STRING_LIST_FIELDS[key]
   return {
     key,
     label: meta.label,
-    kind: BOOLEAN_KEYS.has(key) ? 'boolean' : options !== undefined ? 'select' : meta.min !== undefined ? 'number' : 'text',
+    kind: list !== undefined
+      ? 'string-list'
+      : BOOLEAN_KEYS.has(key) ? 'boolean' : options !== undefined ? 'select' : meta.min !== undefined ? 'number' : 'text',
     group: GROUP_OF[key],
     help: meta.help,
     ...(options === undefined ? {} : { options }),
@@ -340,6 +431,8 @@ export const FIELD_DESCRIPTORS: readonly EditableFieldWire[] = EDITABLE_KEYS.map
     ...(meta.max === undefined ? {} : { max: meta.max }),
     ...(meta.step === undefined ? {} : { step: meta.step }),
     ...(meta.placeholder === undefined ? {} : { placeholder: meta.placeholder }),
+    ...(list === undefined ? {} : { maxItems: list.maxItems }),
+    ...(list?.itemFormat === undefined ? {} : { itemFormat: list.itemFormat }),
     ...(meta.wide === undefined ? {} : { wide: meta.wide }),
     restartRequired: RESTART_SET.has(key),
   }
@@ -726,6 +819,7 @@ export class SettingsSurface {
 
     const raw: Record<string, unknown> = {}
     const clearedKeys: EditableKey[] = []
+    const listIssues: FieldIssueWire[] = []
     for (const key of EDITABLE_KEYS) {
       const value = values[key]
       if (value === undefined) continue
@@ -733,15 +827,22 @@ export class SettingsSurface {
         clearedKeys.push(key)
         continue
       }
+      const list = STRING_LIST_FIELDS[key]
+      if (list !== undefined) {
+        const normalized = normalizeStringList(key, value, list)
+        if (normalized.ok) setOverlayValue(raw, key, normalized.value)
+        else listIssues.push(...normalized.issues)
+        continue
+      }
       setOverlayValue(raw, key, value)
     }
 
     const parsed = parseOverlay(raw)
-    if (!parsed.ok) {
-      const issues: FieldIssueWire[] = parsed.issues.map(issue => ({
-        key: issue.path,
-        message: issue.message,
-      }))
+    if (!parsed.ok || listIssues.length > 0) {
+      const issues: FieldIssueWire[] = [
+        ...listIssues,
+        ...(parsed.ok ? [] : parsed.issues.map(issue => ({ key: issue.path, message: issue.message }))),
+      ]
       return { ok: false, error: '配置校验失败', issues }
     }
 

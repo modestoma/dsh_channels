@@ -14,6 +14,7 @@
 
 import { z } from 'zod'
 import { FEISHU_USER_ID_PATTERN } from './domain.ts'
+import { parseWikiRootLink, WIKI_ROOT_LINK_ERRORS } from './feishu/wiki/links.ts'
 
 export const FEISHU_LOGGER_LEVELS = ['debug', 'info', 'warn', 'error'] as const
 export type FeishuLoggerLevel = (typeof FEISHU_LOGGER_LEVELS)[number]
@@ -287,6 +288,21 @@ export const configSchema = z.object({
    *   `im:resource` (or `im:resource:upload`) scope; without it a call returns
    *   a readable failure and the turn continues.
    *
+   * - `wikiRead` (default off): register `feishu_wiki_list` and
+   *   `feishu_wiki_read` so the model can browse the wiki nodes under
+   *   `wikiRoots` and read docx documents there. Needs `wiki:wiki` (or
+   *   `wiki:wiki:readonly`) and `docx:document` (or `docx:document:readonly`).
+   * - `wikiWrite` (default off): register `feishu_wiki_create` and
+   *   `feishu_wiki_edit` so the model can create docx documents under
+   *   `wikiRoots` and edit documents this app owns. Needs `wiki:wiki` and
+   *   `docx:document`.
+   *
+   * The wiki tools act with the app identity and are mounted only while
+   * `wikiRoots` is non-empty. Each call is limited to topics whose owner is
+   * the administrator or on the wiki whitelist (`/auth wiki add`); opening a
+   * document, creating one, and editing one each need the topic owner's
+   * consent on an authorization card (a read consent lasts for the topic).
+   *
    * The Web panel/metrics ship with `panel_docs_release`.
    */
   feishuTools: z.object({
@@ -301,6 +317,8 @@ export const configSchema = z.object({
     topicMessagesTimeoutMs: z.number().int().min(1_000).max(120_000)
       .default(DEFAULT_TOPIC_MESSAGES_TIMEOUT_MS),
     sendFile: z.boolean().default(true),
+    wikiRead: z.boolean().default(false),
+    wikiWrite: z.boolean().default(false),
   }).default({
     attachmentFetch: true,
     attachmentFetchMaxResources: DEFAULT_ATTACHMENT_FETCH_MAX_RESOURCES,
@@ -309,7 +327,21 @@ export const configSchema = z.object({
     topicMessages: true,
     topicMessagesTimeoutMs: DEFAULT_TOPIC_MESSAGES_TIMEOUT_MS,
     sendFile: true,
+    wikiRead: false,
+    wikiWrite: false,
   }),
+  /**
+   * Wiki (知识库) locations the wiki tools may touch: whole spaces
+   * (`https://<tenant>.feishu.cn/wiki/space/<space_id>`) or single nodes with
+   * everything below them (`https://<tenant>.feishu.cn/wiki/<node_token>`).
+   * Browsing, reading, creating, and editing outside these roots fail. Empty
+   * (default) mounts no wiki tool even when `feishuTools.wikiRead`/`wikiWrite`
+   * is on.
+   */
+  wikiRoots: z.array(z.string().trim().superRefine((link, issue) => {
+    const parsed = parseWikiRootLink(link)
+    if (!parsed.ok) issue.addIssue({ code: 'custom', message: WIKI_ROOT_LINK_ERRORS[parsed.error] })
+  })).max(20).default([]),
   /**
    * Send a one-time onboarding card on the first private message of a chat
    * (facts + command cheat sheet). Persisted per chat; never repeats.

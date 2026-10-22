@@ -61,8 +61,10 @@ import {
   FIELD_DESCRIPTORS,
   SettingsSurface,
   emptyCatalog,
+  normalizeStringList,
   readOnlyFields,
 } from '../src/settings/surface.ts'
+import { WIKI_ROOT_LINK_ERRORS } from '../src/feishu/wiki/links.ts'
 import type { SettingsTarget } from '../src/settings/surface.ts'
 import { createHostCatalog } from '../src/settings/catalog.ts'
 import type { SettingsCatalog } from '../src/settings/catalog.ts'
@@ -513,7 +515,31 @@ describe('field descriptors', () => {
       expect(field.label.length).toBeGreaterThan(0)
     }
     expect(new Set(FIELD_DESCRIPTORS.map(field => field.kind)))
-      .toEqual(new Set(['boolean', 'number', 'text', 'select']))
+      .toEqual(new Set(['boolean', 'number', 'text', 'select', 'string-list']))
+  })
+
+  it('describes the wiki tool switches and the wikiRoots link list in the tools group', () => {
+    const byKey = new Map(FIELD_DESCRIPTORS.map(field => [field.key, field]))
+    for (const key of ['feishuTools.wikiRead', 'feishuTools.wikiWrite'] as const) {
+      expect(byKey.get(key)).toMatchObject({ kind: 'boolean', group: 'tools', restartRequired: false })
+    }
+    expect(byKey.get('feishuTools.wikiRead')?.help).toContain('feishu_wiki_read')
+    expect(byKey.get('feishuTools.wikiRead')?.help).toContain('/auth wiki add')
+    expect(byKey.get('feishuTools.wikiWrite')?.help).toContain('feishu_wiki_edit')
+    const roots = byKey.get('wikiRoots')
+    expect(roots).toMatchObject({
+      kind: 'string-list',
+      group: 'tools',
+      maxItems: 20,
+      itemFormat: 'wiki-root-link',
+      wide: true,
+      restartRequired: false,
+    })
+    expect(roots?.label).toContain('wikiRoots')
+    expect(roots?.placeholder).toContain('/wiki/space/')
+    // Only list fields carry list metadata.
+    expect(FIELD_DESCRIPTORS.filter(field => field.maxItems !== undefined || field.itemFormat !== undefined)
+      .map(field => field.key)).toEqual(['wikiRoots'])
   })
 
   it('renders the read-only advanced facts from the effective config', () => {
@@ -1101,6 +1127,108 @@ describe('SettingsSurface', () => {
       topicMessages: true,
       attachmentFetchTimeoutMs: 30_000,
     })
+  })
+
+  it('saves the wiki switches and trims wikiRoots, dropping empty inputs', async () => {
+    const { surface, target, store } = makeSurface()
+    const result = await surface.save({
+      'feishuTools.wikiRead': true,
+      'feishuTools.wikiWrite': true,
+      wikiRoots: [
+        '  https://acme.feishu.cn/wiki/space/7012345678901234567 ',
+        '',
+        '   ',
+        'https://acme.feishu.cn/wiki/AbCdEf1234567890',
+      ],
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    const saved = {
+      feishuTools: { wikiRead: true, wikiWrite: true },
+      wikiRoots: [
+        'https://acme.feishu.cn/wiki/space/7012345678901234567',
+        'https://acme.feishu.cn/wiki/AbCdEf1234567890',
+      ],
+    }
+    await expect(store.load()).resolves.toEqual(saved)
+    expect(target.applied).toEqual(saved)
+    expect(result.panel.config.effective.wikiRoots).toEqual(saved.wikiRoots)
+    expect(result.panel.config.overlay.wikiRoots).toEqual(saved.wikiRoots)
+    expect(result.panel.config.overriddenKeys).toEqual(expect.arrayContaining([
+      'feishuTools.wikiRead', 'feishuTools.wikiWrite', 'wikiRoots',
+    ]))
+
+    // Removing every entry persists an explicit empty list (no wiki tool mounted).
+    const emptied = await surface.save({ wikiRoots: [''] })
+    expect(emptied.ok).toBe(true)
+    await expect(store.load()).resolves.toMatchObject({ wikiRoots: [] })
+  })
+
+  it('rejects an invalid wikiRoots entry naming its position, and writes nothing', async () => {
+    const { surface, target, store } = makeSurface()
+    const result = await surface.save({
+      'feishuTools.wikiRead': true,
+      wikiRoots: [
+        'https://acme.feishu.cn/wiki/space/7012345678901234567',
+        '',
+        'http://acme.feishu.cn/wiki/space/1',
+        'https://acme.feishu.cn/docx/AbCdEf1234567890',
+        'not a link',
+      ],
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error).toBe('配置校验失败')
+    expect(result.issues).toEqual([
+      { key: 'wikiRoots', index: 2, message: `第 3 项「http://acme.feishu.cn/wiki/space/1」：${WIKI_ROOT_LINK_ERRORS['not-https']}` },
+      { key: 'wikiRoots', index: 3, message: `第 4 项「https://acme.feishu.cn/docx/AbCdEf1234567890」：${WIKI_ROOT_LINK_ERRORS['not-a-wiki-link']}` },
+      { key: 'wikiRoots', index: 4, message: `第 5 项「not a link」：${WIKI_ROOT_LINK_ERRORS['not-a-url']}` },
+    ])
+    await expect(store.load()).resolves.toEqual({})
+    expect(target.applied).toBeUndefined()
+  })
+
+  it('rejects a non-list wikiRoots value and more than maxItems entries', async () => {
+    const { surface } = makeSurface()
+    const notList = await surface.save({ wikiRoots: 'https://acme.feishu.cn/wiki/space/1' })
+    expect(notList.ok).toBe(false)
+    if (notList.ok) return
+    expect(notList.issues).toEqual([{ key: 'wikiRoots', message: PANEL_COPY.listNotArray }])
+
+    const notStrings = await surface.save(JSON.parse('{"wikiRoots":[42]}') as EditableValues)
+    expect(notStrings.ok).toBe(false)
+    if (notStrings.ok) return
+    expect(notStrings.issues).toEqual([{ key: 'wikiRoots', index: 0, message: '第 1 项必须是字符串' }])
+
+    const many = Array.from({ length: 21 }, (_, index) => `https://acme.feishu.cn/wiki/space/${index + 1}`)
+    const tooMany = await surface.save({ wikiRoots: [...many, '', ''] })
+    expect(tooMany.ok).toBe(false)
+    if (tooMany.ok) return
+    expect(tooMany.issues).toEqual([{ key: 'wikiRoots', message: '最多 20 项（空输入框不计）' }])
+
+    // Exactly maxItems non-empty entries plus blank inputs is accepted.
+    const atLimit = await surface.save({ wikiRoots: [...many.slice(0, 20), ' '] })
+    expect(atLimit.ok).toBe(true)
+  })
+
+  it('normalizes string lists generically, without an entry format', () => {
+    expect(normalizeStringList('wikiRoots', [' a ', '', 'b'], { maxItems: 2 }))
+      .toEqual({ ok: true, value: ['a', 'b'] })
+    expect(normalizeStringList('wikiRoots', ['a', 'b', 'c'], { maxItems: 2 }).ok).toBe(false)
+  })
+
+  it('round-trips wikiRoots through the overlay file and keeps it top-level', async () => {
+    const store = new OverlayStore(tempOverlayFile())
+    await store.save({ wikiRoots: ['https://acme.feishu.cn/wiki/space/1'], feishuTools: { wikiRead: true } })
+    const loaded = await store.load()
+    expect(loaded).toEqual({ wikiRoots: ['https://acme.feishu.cn/wiki/space/1'], feishuTools: { wikiRead: true } })
+    const merged = mergeOverlay(makeConfig(), loaded)
+    expect(configValueOf(merged, 'wikiRoots')).toEqual(['https://acme.feishu.cn/wiki/space/1'])
+    expect(merged.feishuTools.wikiWrite).toBe(false)
+    expect(merged.feishuTools.sendFile).toBe(true)
+    // A hand-edited file with an invalid link degrades to no overlay.
+    writeFileSync(store.file, JSON.stringify({ wikiRoots: ['https://acme.feishu.cn/docx/x'] }))
+    await expect(store.load()).resolves.toEqual({})
   })
 
   it('rejects the removed image keys as unknown configuration', async () => {

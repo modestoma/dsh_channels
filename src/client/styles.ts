@@ -59,6 +59,9 @@ const CSS = `
 .dsh-channels-cfg__inputRow{display:flex;align-items:center;gap:8px;min-width:0}
 .dsh-channels-cfg__inputRow .dsh-channels-cfg__input{flex:1 1 auto;width:auto;min-width:0}
 .dsh-channels-cfg__btn--browse{flex:none}
+.dsh-channels-cfg__list{display:flex;flex-direction:column;gap:6px;min-width:0}
+.dsh-channels-cfg__listItem{display:flex;flex-direction:column;gap:2px;min-width:0}
+.dsh-channels-cfg__btn--listRemove{flex:none}
 .dsh-channels-cfg__input:focus{border-color:var(--dsw-alias-state-business-primary,#0a67d3)}
 .dsh-channels-cfg__input--invalid{border-color:var(--dsw-alias-state-danger-primary,#c62828)}
 select.dsh-channels-cfg__input{appearance:auto;cursor:pointer}

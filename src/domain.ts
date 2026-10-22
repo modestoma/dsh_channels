@@ -317,6 +317,10 @@ export interface FeishuDomainSpecShape {
       valueSchema: typeof accessRequestRecordSchema
       __key?: string
     }
+    access_wiki_users: {
+      valueSchema: typeof accessUserRecordSchema
+      __key?: string
+    }
   }
 }
 
@@ -353,6 +357,10 @@ export const feishuDomain: FeishuDomainSpecShape = {
     access_groups: { valueSchema: accessGroupRecordSchema },
     access_users: { valueSchema: accessUserRecordSchema },
     access_requests: { valueSchema: accessRequestRecordSchema },
+    // Wiki whitelist (`/auth wiki add`): same record as `access_users`, an
+    // independent grant. Added without a version bump like the other access
+    // tables: a missing table loads empty.
+    access_wiki_users: { valueSchema: accessUserRecordSchema },
   },
 }
 
@@ -428,6 +436,8 @@ export interface FeishuDomainHandle {
   accessGroups: AccessGroupsTable
   accessUsers: AccessUsersTable
   accessRequests: AccessRequestsTable
+  /** Wiki whitelist (key = `user_id`); same records as {@link AccessUsersTable}. */
+  accessWikiUsers: AccessUsersTable
   getGlobal(): FeishuDomainGlobal
   setGlobal(value: FeishuDomainGlobal): Promise<unknown> | void
   close(): Promise<void>

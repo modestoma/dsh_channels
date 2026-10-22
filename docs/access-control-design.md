@@ -335,6 +335,7 @@ bot 回显过滤 / chatType / 空内容 / dmMode
 | `/auth revoke` | 群聊（管理员） | 把当前群移出白名单，立即生效 |
 | `/auth user add <@用户\|user_id>` | 私聊/群聊（管理员） | 加入用户白名单；`@成员` 取 mention 里的 user_id，忽略对机器人的 @，没有 user_id 的外部用户被拒绝 |
 | `/auth user remove <open_id>` | 同上 | 移出用户白名单 |
+| `/auth wiki add <@用户\|user_id>` / `/auth wiki remove <@用户\|user_id>` | 同上 | 加入/移出知识库白名单（`access_wiki_users` 表）：只决定该用户发起的话题能否使用知识库工具，不授予对话权限；管理员始终可用 |
 | `/auth list` | 任意（管理员） | 列出群白名单、用户白名单与待处理申请 |
 
 - 非管理员发 `/auth` 一律拒绝（先校验管理员身份，再解析子命令）。
