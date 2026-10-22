@@ -28,7 +28,24 @@ export interface CardDeliveryDeps {
 }
 
 export class CardDelivery {
+  /** Inbound message ids whose command result replaces that message's card. */
+  private readonly inPlace = new Set<string>()
+
   constructor(private readonly deps: CardDeliveryDeps) {}
+
+  /**
+   * Run `operation` with every `standaloneReply` anchored to `messageId`
+   * patched into that (bot-sent card) message instead of replying to it.
+   * Used for picker clicks, whose synthetic message id is the picker card.
+   */
+  async replacingCard(messageId: string, operation: () => Promise<void>): Promise<void> {
+    this.inPlace.add(messageId)
+    try {
+      await operation()
+    } finally {
+      this.inPlace.delete(messageId)
+    }
+  }
 
   /** The live channel; throws instead of silently dropping a delivery. */
   requireChannel(): FeishuChannel {
@@ -74,7 +91,8 @@ export class CardDelivery {
    * Shared delivery policy for command-plane cards: reply in a new topic by
    * default, then degrade to a plain reply when Feishu refuses the topic.
    * `createThread: false` replies in the chat timeline, or inside the topic
-   * the message already belongs to.
+   * the message already belongs to. Inside `replacingCard` the card patches
+   * the anchored card instead, and falls back to a reply if the patch fails.
    */
   async standaloneReply(
     msg: NormalizedMessage,
@@ -83,6 +101,17 @@ export class CardDelivery {
   ): Promise<void> {
     const channel = this.deps.channel()
     if (!this.deps.started() || channel === undefined) return
+    if (this.inPlace.has(msg.messageId)) {
+      try {
+        await channel.updateCard(msg.messageId, card)
+        return
+      } catch (error) {
+        this.deps.warn(
+          'dsh-channels: in-place update of card %s failed, replying instead: %s',
+          msg.messageId, String(error),
+        )
+      }
+    }
     const createThread = options.createThread ?? true
     try {
       await channel.send(msg.chatId, { card }, createThread || msg.threadId !== undefined

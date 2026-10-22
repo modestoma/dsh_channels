@@ -736,11 +736,11 @@ describe('command picker cards', () => {
     current: 'a',
   }
 
-  it('renders the choices in two-column rows with the current one highlighted', () => {
+  it('renders the choices in one column with the current one highlighted', () => {
     const card = buildPickerCard(input)
-    const rows = elementsOf(card).filter(element => element.tag === 'column_set')
-    expect(rows).toHaveLength(2)
-    const buttons = buttonsOf(card)
+    expect(elementsOf(card).filter(element => element.tag === 'column_set')).toHaveLength(0)
+    const buttons = elementsOf(card).filter(element => element.tag === 'button')
+    expect(buttons.every(button => button.width === 'fill')).toBe(true)
     expect(buttons.map(buttonLabel)).toEqual(['✅ a', 'b', 'c'])
     expect(buttons[0]!.type).toBe('primary')
     expect(buttonValue(buttons[1]!)).toEqual({ decision: PICK_ACTION, command: 'model', arg: 'b', sessionId: 'sess-pick' })

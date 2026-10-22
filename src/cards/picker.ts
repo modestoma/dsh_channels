@@ -4,12 +4,13 @@
  *
  * A click carries the command and its argument back to the service, which
  * runs it exactly like the typed `/<command> <arg>` line, so admission,
- * ownership and validation stay in one place.
+ * ownership and validation stay in one place; the result replaces the picker
+ * card in place.
  *
  * @module dsh-channels/cards/picker
  */
 
-import { columnSet, divider, markdown, note, standaloneCard, textButton } from './primitives.ts'
+import { divider, markdown, note, standaloneCard, textButton } from './primitives.ts'
 
 /** `decision` carried by every picker button. */
 export const PICK_ACTION = 'command-pick'
@@ -58,20 +59,8 @@ function pickButton(input: PickerCardInput, label: string, arg: string): object 
   return textButton({
     label: active ? `✅ ${label}` : label,
     type: active ? 'primary' : 'default',
-    width: 'fill',
-    margin: '0px',
     value,
   })
-}
-
-/** Choices in two-column rows. */
-function optionRows(input: PickerCardInput, options: readonly PickerOption[]): object[] {
-  const rows: object[] = []
-  for (let index = 0; index < options.length; index += 2) {
-    const pair = options.slice(index, index + 2).map(option => pickButton(input, option.label, option.arg))
-    rows.push(columnSet(pair))
-  }
-  return rows
 }
 
 /** Whether a value can be appended to a command line as one argument. */
@@ -80,14 +69,18 @@ export function isPickerArg(value: string): boolean {
 }
 
 /**
- * The picker card. Options whose argument cannot form one command-line token
+ * The picker card: one full-width button per choice, in a single column.
+ * Options whose argument cannot form one command-line token
  * are skipped; when more than `MAX_PICKER_OPTIONS` remain the rest are
  * reported as typed-only.
  */
 export function buildPickerCard(input: PickerCardInput): object {
   const usable = input.options.filter(option => isPickerArg(option.arg))
   const shown = usable.slice(0, MAX_PICKER_OPTIONS)
-  const elements: object[] = [markdown(input.text), ...optionRows(input, shown)]
+  const elements: object[] = [
+    markdown(input.text),
+    ...shown.map(option => pickButton(input, option.label, option.arg)),
+  ]
   if (usable.length > shown.length) {
     elements.push(note(`另有 ${usable.length - shown.length} 项未展示，可直接输入 /${input.command} <id>。`))
   }

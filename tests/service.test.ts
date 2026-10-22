@@ -3238,6 +3238,9 @@ describe('command picker cards', () => {
   }
 
   const lastCard = (h: SetupResult): object => (h.channel.sent.at(-1) as { input: { card: object } }).input.card
+  const pickerUpdates = (h: SetupResult, messageId: string): object[] =>
+    (h.channel.updated as Array<{ messageId: string; card: object }>)
+      .filter(update => update.messageId === messageId).map(update => update.card)
 
   async function establishWithModel(h: SetupResult, chatId: string) {
     await h.onMessage(makeMessage({ chatType: 'group', chatId, senderId: 'u_owner', content: '开始' }))
@@ -3286,10 +3289,9 @@ describe('command picker cards', () => {
       messageId: 'om_2', chatId: 'oc_pick_model',
       operator: { openId: 'ou_o', userId: 'u_owner' }, action: { value: pro, tag: 'button' },
     })
-    await waitUntil(() => expect(h.channel.sent).toHaveLength(3))
-    const reply = h.channel.sent.at(-1) as { options: Record<string, unknown>; input: object }
-    expect(JSON.stringify(reply.input)).toContain('已切换为')
-    expect(reply.options).toMatchObject({ replyTo: 'om_2', replyInThread: true })
+    await waitUntil(() => expect(pickerUpdates(h, 'om_2')).toHaveLength(1))
+    expect(JSON.stringify(pickerUpdates(h, 'om_2')[0])).toContain('已切换为')
+    expect(h.channel.sent).toHaveLength(2)
     await expect(dispatchAgentRequest(created.setupCtx, { provider: 'deepseek-official', model: 'deepseek-v4-flash' }))
       .resolves.toMatchObject({ model: 'deepseek-v4-pro' })
     await h.service.shutdown()
@@ -3314,7 +3316,11 @@ describe('command picker cards', () => {
       messageId: 'om_2', chatId: 'oc_pick_effort',
       operator: { openId: 'ou_o', userId: 'u_owner' }, action: { value: buttons[0]!.value, tag: 'button' },
     })
-    await waitUntil(() => expect(h.channel.sent).toHaveLength(3))
+    await waitUntil(() => expect(pickerUpdates(h, 'om_2')).toHaveLength(1))
+    const settled = JSON.stringify(pickerUpdates(h, 'om_2')[0])
+    expect(settled).toContain('命令执行完成')
+    expect(settled).not.toContain('command-pick')
+    expect(h.channel.sent).toHaveLength(2)
     await expect(dispatchAgentRequest(created.setupCtx, { provider: 'deepseek-official', model: 'deepseek-v4-flash' }))
       .resolves.toMatchObject({ reasoningEffort: 'low' })
     await h.service.shutdown()
@@ -3355,8 +3361,20 @@ describe('command picker cards', () => {
       messageId: 'om_2', chatId: 'oc_pick_perm',
       operator: { openId: 'ou_o', userId: 'u_owner' }, action: { value: buttons[0]!.value, tag: 'button' },
     })
-    await waitUntil(() => expect(h.channel.sent).toHaveLength(3))
+    await waitUntil(() => expect(pickerUpdates(h, 'om_2')).toHaveLength(1))
+    expect(JSON.stringify(pickerUpdates(h, 'om_2')[0])).toContain('权限预设已切换')
+    expect(h.channel.sent).toHaveLength(2)
     expect(h.ctxState.permissions.set).toHaveBeenCalledWith(agent.session, 'read-only')
+
+    // A refused patch falls back to replying under the picker card.
+    mock(h.channel.updateCard).mockRejectedValueOnce(new Error('card expired'))
+    await h.channel.fireCardAction({
+      messageId: 'om_2', chatId: 'oc_pick_perm',
+      operator: { openId: 'ou_o', userId: 'u_owner' }, action: { value: buttons[1]!.value, tag: 'button' },
+    })
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(3))
+    expect((h.channel.sent.at(-1) as { options: Record<string, unknown> }).options)
+      .toMatchObject({ replyTo: 'om_2', replyInThread: true })
     await h.service.shutdown()
   })
 })
