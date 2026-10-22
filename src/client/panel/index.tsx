@@ -56,6 +56,7 @@ import {
   validateDraft,
 } from './shared.tsx'
 import type {
+  AnalyzeTokenView,
   BusyAction,
   CredentialsView,
   FormView,
@@ -80,6 +81,7 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
   const [pollError, setPollError] = useState<string | null>(null)
   const [appIdInput, setAppIdInput] = useState('')
   const [appSecretInput, setAppSecretInput] = useState('')
+  const [analyzeTokenInput, setAnalyzeTokenInput] = useState('')
   const [catalog, setCatalog] = useState<CatalogWire | null>(null)
   const [catalogBusy, setCatalogBusy] = useState(false)
   const [accessNotice, setAccessNotice] = useState<string | null>(null)
@@ -106,6 +108,7 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
       setDraft({})
       setAppIdInput('')
       setAppSecretInput('')
+      setAnalyzeTokenInput('')
     } catch (error) {
       setLoad({ phase: 'error', message: messageOf(error) })
     }
@@ -552,6 +555,28 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
     }
   }, [appIdInput, appSecretInput])
 
+  /** Save the analyze API token; it applies to the next request, no reconnect. */
+  const onSaveAnalyzeToken = useCallback(async (): Promise<void> => {
+    if (analyzeTokenInput.trim() === '') return
+    setBusy('credentials')
+    setNotice(null)
+    try {
+      const result = await saveCredentials({ analyzeToken: analyzeTokenInput })
+      if (!result.ok) {
+        setNotice({ kind: 'error', text: result.error, issues: result.issues })
+        return
+      }
+      setLoad({ phase: 'ready', panel: result.panel })
+      setStatus(result.panel.status)
+      setAnalyzeTokenInput('')
+      setNotice({ kind: 'ok', text: PANEL_COPY.analyzeTokenSaved })
+    } catch (error) {
+      setNotice({ kind: 'error', text: messageOf(error) })
+    } finally {
+      setBusy(null)
+    }
+  }, [analyzeTokenInput])
+
   const onClearCredential = useCallback(async (field: CredentialField): Promise<void> => {
     const confirmed = typeof window.confirm === 'function'
       ? window.confirm(PANEL_COPY.credentialRemoveConfirm)
@@ -569,7 +594,9 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
       setStatus(result.panel.status)
       setNotice({
         kind: 'ok',
-        text: result.reconnect === 'pending' ? PANEL_COPY.credentialRemovedPending : PANEL_COPY.credentialRemoved,
+        text: field === 'analyzeToken'
+          ? PANEL_COPY.analyzeTokenRemoved
+          : result.reconnect === 'pending' ? PANEL_COPY.credentialRemovedPending : PANEL_COPY.credentialRemoved,
       })
     } catch (error) {
       setNotice({ kind: 'error', text: messageOf(error) })
@@ -628,6 +655,16 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
     onClear: (field: CredentialField) => { void onClearCredential(field) },
   }), [appIdInput, appSecretInput, busy, hostBusy, issues, onClearCredential, onSaveCredentials])
 
+  const analyzeToken = useMemo<AnalyzeTokenView>(() => ({
+    value: analyzeTokenInput,
+    issues,
+    busy,
+    locked: hostBusy,
+    onChange: setAnalyzeTokenInput,
+    onSave: () => { void onSaveAnalyzeToken() },
+    onClear: () => { void onClearCredential('analyzeToken') },
+  }), [analyzeTokenInput, busy, hostBusy, issues, onClearCredential, onSaveAnalyzeToken])
+
   if (load.phase === 'loading') {
     return (
       <div className="dsh-channels-cfg">
@@ -680,7 +717,7 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
               />
             )
           : null}
-        {activeTab === 'sessions' ? <SessionsTab form={form} /> : null}
+        {activeTab === 'sessions' ? <SessionsTab form={form} analyzeToken={analyzeToken} /> : null}
         {activeTab === 'model' ? <ModelTab form={form} catalogBusy={catalogBusy} /> : null}
         {activeTab === 'workspace'
           ? (

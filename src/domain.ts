@@ -61,6 +61,12 @@ export const routeRecordSchema = z.object({
   lastActivityAt: z.number().int().nonnegative(),
   /** Sessions this topic has pointed at, oldest first. Optional for v1 compatibility. */
   sessionHistory: z.array(sessionHistoryEntrySchema).optional(),
+  /**
+   * Group-shared route (log-platform analysis topics): every member admitted
+   * in `chatId` may continue the Session and decide its cards, not only
+   * `senderUserId` (who then names the requester). Absent = owner-only.
+   */
+  shared: z.literal(true).optional(),
 })
 
 export type RouteRecord = z.infer<typeof routeRecordSchema>
@@ -281,6 +287,40 @@ export const processedRecordSchema = z.object({
 
 export type ProcessedRecord = z.infer<typeof processedRecordSchema>
 
+/**
+ * One accepted analyze API request, keyed by its `Idempotency-Key`. Kept
+ * forever: a retried key returns the stored response instead of posting a
+ * second analysis, and a reused key with a different body is refused.
+ */
+export const analyzeRequestRecordSchema = z.object({
+  /** The request's `Idempotency-Key` (also the table key). */
+  key: z.string().min(1),
+  /** SHA-256 (hex) of the canonical request body. */
+  bodyHash: z.string().min(1),
+  /** Target group chat. */
+  chatId: z.string().min(1),
+  /** Root card message id (the analysis topic's root). */
+  messageId: z.string().min(1),
+  /** Epoch ms when the request was accepted. */
+  acceptedAt: z.number().int().nonnegative(),
+  /** What the root card shows, kept so the card can be redrawn after a restart. */
+  subject: z.object({
+    requesterUserId: z.string(),
+    triggeredAt: z.string(),
+    app: z.string(),
+    errorCode: z.string(),
+    logDetails: z.array(z.object({ name: z.string(), url: z.string() })),
+  }),
+  /**
+   * Root card status. `running` until the first turn settles; a record still
+   * `running` when the channel starts belongs to an analysis the previous
+   * instance never finished, and becomes `interrupted`.
+   */
+  status: z.enum(['running', 'done', 'stopped', 'error', 'failed', 'interrupted']),
+})
+
+export type AnalyzeRequestRecord = z.infer<typeof analyzeRequestRecordSchema>
+
 export interface FeishuDomainSpecShape {
   name: 'channels_routes_v2'
   version: 1
@@ -319,6 +359,10 @@ export interface FeishuDomainSpecShape {
     }
     access_wiki_users: {
       valueSchema: typeof accessUserRecordSchema
+      __key?: string
+    }
+    analyze_requests: {
+      valueSchema: typeof analyzeRequestRecordSchema
       __key?: string
     }
   }
@@ -361,6 +405,8 @@ export const feishuDomain: FeishuDomainSpecShape = {
     // independent grant. Added without a version bump like the other access
     // tables: a missing table loads empty.
     access_wiki_users: { valueSchema: accessUserRecordSchema },
+    // Analyze API idempotency records; a missing table loads empty.
+    analyze_requests: { valueSchema: analyzeRequestRecordSchema },
   },
 }
 
@@ -427,6 +473,13 @@ export interface AccessRequestsTable {
   entries(): IterableIterator<[string, AccessRequestRecord]>
 }
 
+/** Normalized table handle for analyze API requests (key = `Idempotency-Key`). */
+export interface AnalyzeRequestsTable {
+  get(key: string): AnalyzeRequestRecord | undefined
+  put(key: string, value: AnalyzeRequestRecord): Promise<unknown> | void
+  entries(): IterableIterator<[string, AnalyzeRequestRecord]>
+}
+
 /** Normalized domain handle. */
 export interface FeishuDomainHandle {
   routes: RoutesTable
@@ -438,6 +491,8 @@ export interface FeishuDomainHandle {
   accessRequests: AccessRequestsTable
   /** Wiki whitelist (key = `user_id`); same records as {@link AccessUsersTable}. */
   accessWikiUsers: AccessUsersTable
+  /** Analyze API idempotency records. */
+  analyzeRequests: AnalyzeRequestsTable
   getGlobal(): FeishuDomainGlobal
   setGlobal(value: FeishuDomainGlobal): Promise<unknown> | void
   close(): Promise<void>

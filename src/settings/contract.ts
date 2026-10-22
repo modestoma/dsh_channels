@@ -61,6 +61,8 @@ export const EDITABLE_KEYS = [
   'welcomeOnboarding',
   'slashCommandPanel',
   'allowPermissionSwitch',
+  // 日志平台分析接口（访问令牌是凭据引用 analyzeToken，值写在 DSH 凭据里）
+  'analyzeListen',
   // 准入与授权（管理员/准入模式/申请有效期；白名单由「访问与授权」卡片管理）
   'adminUserId',
   'accessMode',
@@ -107,6 +109,7 @@ export const RESTART_KEYS = [
   'dmMode',
   'requireMention',
   'slashCommandPanel',
+  'analyzeListen',
   'refreshMs',
   'statusRefreshMs',
   'loggerLevel',
@@ -231,8 +234,11 @@ export interface CredentialRefWire {
   source?: string
 }
 
-/** The two credential slots the panel may write. */
-export type CredentialField = 'appId' | 'appSecret'
+/**
+ * The credential slots the panel may write: the Feishu application pair
+ * (resolved on connect) and the analyze API token (resolved per request).
+ */
+export type CredentialField = 'appId' | 'appSecret' | 'analyzeToken'
 
 /** Official-SDK WebSocket lifecycle snapshot (structural copy, no SDK import on the wire). */
 export interface ConnectionWire {
@@ -340,6 +346,7 @@ export interface PanelConfigWire {
   credentials: {
     appId: CredentialRefWire
     appSecret: CredentialRefWire
+    analyzeToken: CredentialRefWire
   }
 }
 
@@ -472,6 +479,7 @@ export type ClearConfigResponse =
 export interface SaveCredentialsRequest {
   appId?: string
   appSecret?: string
+  analyzeToken?: string
 }
 
 /** `DELETE /dsh-channels/credentials` body. */
@@ -484,7 +492,8 @@ export interface ClearCredentialRequest {
  *
  * - `auto`: the channel was stopped and connected immediately after the save.
  * - `pending`: the channel is running; reconnect for the value to take effect.
- * - `not-needed`: removed while stopped, nothing to reconnect.
+ * - `not-needed`: removed while stopped, or only the analyze API token
+ *   changed (it applies to the next request), nothing to reconnect.
  * - `unconfigured`: saved, but the other credential of the pair is still
  *   missing — the plugin keeps waiting (no connection attempt) until it is
  *   configured.
@@ -670,6 +679,13 @@ export const PANEL_COPY = {
   enabled: '已启用',
   disabled: '已关闭',
   credentialRemoveConfirm: '确定移除已存储的凭据值？移除后不会回显，需要时须重新填写。',
+  analyzeTokenCard: '日志分析接口令牌',
+  analyzeTokenCardHelp: '日志平台调用分析接口时 Authorization: Bearer 后面的值。经 DSH 凭据服务写入本机凭据库，面板永不回显；保存或移除后下一次请求即生效，无需重连。未配置时接口对所有请求返回 503。',
+  analyzeTokenLabel: '访问令牌',
+  analyzeTokenPlaceholder: '填写新令牌（建议 32 位以上随机串）',
+  saveAnalyzeToken: '保存令牌',
+  analyzeTokenSaved: '令牌已保存，下一次请求生效',
+  analyzeTokenRemoved: '令牌已移除，接口将拒绝所有请求',
   accessNotLoaded: '飞书连接建立后加载授权列表',
   loading: '加载中…',
   loadFailed: '设置面板加载失败',

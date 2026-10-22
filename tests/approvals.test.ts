@@ -157,6 +157,23 @@ describe('ApprovalAnswerer', () => {
     await expect(pending).resolves.toBe('cancelled')
   })
 
+  it('lets the shared-route gate decide who may click instead of the owner check', async () => {
+    const channel = makeChannel()
+    const mayDecide = vi.fn((userId: string) => userId === 'u_member')
+    const answerer = new ApprovalAnswerer(channel, {
+      routeFor: () => ({ ...ROUTE, mayDecide }),
+      onError: vi.fn(),
+    }, TIMEOUT)
+    const pending = answerer.onRequest(makeRequest(), nextOf('unavailable'))
+    await vi.waitFor(() => expect(channel.sent).toHaveLength(1))
+    answerer.onCardAction(clickEvent('om_1', 'allow', 'u_outsider'))
+    await flush()
+    expect(answerer.pendingCount()).toBe(1)
+    answerer.onCardAction(clickEvent('om_1', 'allow', 'u_member'))
+    await expect(pending).resolves.toBe('allowed-once')
+    expect(mayDecide).toHaveBeenCalledWith('u_member')
+  })
+
   it('ignores clicks with an unknown message id or an unknown decision value', async () => {
     const { channel, answerer } = makeEnv()
     const pending = answerer.onRequest(makeRequest(), nextOf('unavailable'))

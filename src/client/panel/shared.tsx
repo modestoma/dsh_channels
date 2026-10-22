@@ -182,6 +182,18 @@ export interface CredentialsView {
   onClear: (field: CredentialField) => void
 }
 
+/** Analyze API token editor data owned by the page shell, rendered by the sessions tab. */
+export interface AnalyzeTokenView {
+  value: string
+  issues: FieldIssueWire[]
+  busy: BusyAction | null
+  /** Host-side lifecycle busy (connecting/restarting): block writes. */
+  locked: boolean
+  onChange: (value: string) => void
+  onSave: () => void
+  onClear: () => void
+}
+
 /** Everything a field-bearing tab needs from the page shell's single draft. */
 export interface FormView {
   panel: PanelWire

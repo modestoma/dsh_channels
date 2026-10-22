@@ -160,7 +160,23 @@ interface TriggerReaction {
   reactionId: string | undefined
 }
 
+/** Settled outcome of one turn, as its card shows it. */
+export type TurnOutcome = 'done' | 'stopped' | 'error'
+
+/** Per-turn options of {@link TurnStreamer.attach}. */
+export interface AttachOptions {
+  /** Called once when the turn's card reaches its final state. */
+  readonly onSettled?: (outcome: TurnOutcome) => void
+  /**
+   * The prompt this turn will run; only a turn that carries it can be
+   * steered into the running turn while queued.
+   */
+  readonly message?: UserMessage
+}
+
 interface TurnState {
+  /** `AttachOptions.onSettled`. */
+  onSettled: ((outcome: TurnOutcome) => void) | undefined
   /** Turn number once known; undefined until the first `step/start`. */
   turn: number | undefined
   /** Message whose reaction carries Typing → DONE/No. */
@@ -348,15 +364,18 @@ export class TurnStreamer {
 
   /**
    * Bind a freshly sent reply card to a session; seeds the stats fold from the log.
-   * @param message - the prompt this turn will run; only a turn that carries
-   *   it can be steered into the running turn while queued.
+   * @param session - the Session whose next turn renders into the card.
+   * @param cardMessageId - the main card message (patched in place).
+   * @param triggerMessageId - the message carrying the Typing → DONE/No reaction.
+   * @param reactionId - the Typing reaction to remove, when one was added.
+   * @param options - per-turn options.
    */
   attach(
     session: Session,
     cardMessageId: string,
     triggerMessageId: string,
     reactionId: string | undefined,
-    message?: UserMessage,
+    options: AttachOptions = {},
   ): void {
     this.sessions.set(session.id, session)
     let fold = this.folds.get(session.id)
@@ -366,10 +385,11 @@ export class TurnStreamer {
     }
     const queue = this.bySession.get(session.id) ?? []
     queue.push({
+      onSettled: options.onSettled,
       turn: undefined,
       triggerMessageId,
       reactionId,
-      message,
+      message: options.message,
       mergedTriggers: [],
       phase: 'thinking',
       reasoning: '',
@@ -1327,6 +1347,13 @@ export class TurnStreamer {
     })
 
     this.hooks.onTurnFinalized(sessionId, state.turn ?? 0, state.cards[0]?.messageId ?? '')
+    if (state.onSettled !== undefined) {
+      try {
+        state.onSettled(state.phase === 'error' ? 'error' : state.phase === 'stopped' ? 'stopped' : 'done')
+      } catch (error) {
+        this.hooks.onError(sessionId, error)
+      }
+    }
   }
 
   private async swapReaction(state: TriggerReaction, failed: boolean): Promise<void> {

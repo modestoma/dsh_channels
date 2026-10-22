@@ -1192,8 +1192,8 @@ describe('TurnStreamer queued turns', () => {
   function queued(ch: ReturnType<typeof channel>, sessionId: string) {
     const streamer = new TurnStreamer(ch, 500, hooks())
     const session = makeSession(sessionId)
-    streamer.attach(session, 'om_first', 'om_t1', 'react-1', prompt('m1'))
-    streamer.attach(session, 'om_second', 'om_t2', 'react-2', prompt('m2'))
+    streamer.attach(session, 'om_first', 'om_t1', 'react-1', { message: prompt('m1') })
+    streamer.attach(session, 'om_second', 'om_t2', 'react-2', { message: prompt('m2') })
     return { streamer, session }
   }
 
@@ -1231,15 +1231,15 @@ describe('TurnStreamer queued turns', () => {
     const errors = hooks()
     const streamer = new TurnStreamer(ch, 500, errors)
     const session = makeSession('sess-merge-retry')
-    streamer.attach(session, 'om_first', 'om_t1', undefined, prompt('m1'))
-    streamer.attach(session, 'om_second', 'om_t2', undefined, prompt('m2'))
+    streamer.attach(session, 'om_first', 'om_t1', undefined, { message: prompt('m1') })
+    streamer.attach(session, 'om_second', 'om_t2', undefined, { message: prompt('m2') })
     mockFn(ch.updateCard).mockRejectedValueOnce(new Error('transient'))
     expect(streamer.mergeQueued('om_second', () => true)).toBe(true)
     await vi.advanceTimersByTimeAsync(1_000)
     expect(JSON.stringify(ch.updated.find(update => update.messageId === 'om_second')!.card)).toContain('已补充到当前回复')
     expect(errors.onError).not.toHaveBeenCalled()
 
-    streamer.attach(session, 'om_third', 'om_t3', undefined, prompt('m3'))
+    streamer.attach(session, 'om_third', 'om_t3', undefined, { message: prompt('m3') })
     mockFn(ch.updateCard).mockRejectedValue(new Error('down'))
     expect(streamer.mergeQueued('om_third', () => true)).toBe(true)
     await vi.advanceTimersByTimeAsync(3_000)
