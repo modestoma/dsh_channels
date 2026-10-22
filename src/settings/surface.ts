@@ -259,13 +259,6 @@ const FIELD_META: Record<EditableKey, { label: string; help: string; min?: numbe
     help: '日志平台调用 POST /dsh-channels/analyze 的独立端口，格式 host:port（如 0.0.0.0:3090）；留空 = 关闭接口；需重连生效。请求需带 Authorization: Bearer <令牌>，令牌在本页下方「日志分析接口令牌」卡片填写。',
     placeholder: '留空 = 关闭',
   },
-  analyzeLogTimeoutMs: {
-    label: '单次分析日志包下载超时（ms）',
-    help: '一次分析请求下载全部日志包的总超时（默认 600000 = 10 分钟，至少 1000）。',
-    min: 1_000,
-    max: MAX_TIMER_DELAY_MS,
-    step: 1_000,
-  },
   adminUserId: {
     label: '管理员 user_id',
     help: '唯一管理员。私聊机器人发送 /userid 获取（不是 ou_ 开头的 open_id，也不是邮箱）；留空 = 清除 Web 覆盖。未配置时自动使用飞书应用所有者（需可选的「获取应用信息」权限，开不了就在这里手动填写）；两者都没有时 guarded 模式会拒绝所有对话。',
@@ -400,7 +393,6 @@ const GROUP_OF: Record<EditableKey, EditableFieldWire['group']> = {
   slashCommandPanel: 'behavior',
   allowPermissionSwitch: 'behavior',
   analyzeListen: 'behavior',
-  analyzeLogTimeoutMs: 'behavior',
   adminUserId: 'access',
   accessMode: 'access',
   authRequestTtlDays: 'access',

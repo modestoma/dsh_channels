@@ -83,9 +83,6 @@ export const DEFAULT_PROMPT_CONTEXT_TIMEOUT_MS = 3_000
 /** Conventional credential reference holding the log-platform analyze API bearer token. */
 export const DEFAULT_ANALYZE_TOKEN_REF = 'DSH_CHANNELS_ANALYZE_TOKEN'
 
-/** Default whole-download timeout of one analyze request's log packages (10 min). */
-export const DEFAULT_ANALYZE_LOG_TIMEOUT_MS = 10 * 60 * 1000
-
 /** `host:port` listen address of the analyze API (`[v6]:port` for IPv6 literals). */
 export const ANALYZE_LISTEN_PATTERN = /^(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+):(?:[1-9][0-9]{0,4})$/u
 
@@ -436,9 +433,6 @@ export const configSchema = z.object({
    * applies to the next request; an unresolvable token refuses every request.
    */
   analyzeToken: credentialRefSchema.default(DEFAULT_ANALYZE_TOKEN_REF),
-  /** Whole-download timeout of one analyze request's log packages (default 10 min). */
-  analyzeLogTimeoutMs: z.number().int().min(1_000).max(MAX_TIMER_DELAY_MS)
-    .default(DEFAULT_ANALYZE_LOG_TIMEOUT_MS),
 })
 
 export type FeishuConfig = z.infer<typeof configSchema>

@@ -79,7 +79,6 @@ function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
     },
     topicIsolation: 'auto',
     analyzeToken: 'DSH_CHANNELS_ANALYZE_TOKEN',
-    analyzeLogTimeoutMs: 10_000,
     ...partial,
   }
 }

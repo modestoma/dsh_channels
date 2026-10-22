@@ -15,8 +15,6 @@ export interface AnalyzeSubject {
   readonly requesterUserId: string
   readonly app: string
   readonly errorCode: string
-  /** Number of log packages in the request. */
-  readonly logCount: number
 }
 
 /** Topic hint posted as the first reply below the placeholder (it also opens the topic). */
@@ -33,7 +31,7 @@ function plain(text: string): string {
  * @returns markdown notation text.
  */
 export function analyzePreface(subject: AnalyzeSubject): string {
-  return `📋 <at id=${subject.requesterUserId}></at> 发起的日志分析 · 应用 **${plain(subject.app)}** · 错误码 **${plain(subject.errorCode)}** · ${subject.logCount} 个日志包`
+  return `📋 <at id=${subject.requesterUserId}></at> 发起的日志分析 · 应用 **${plain(subject.app)}** · 错误码 **${plain(subject.errorCode)}**`
 }
 
 /**
@@ -43,7 +41,7 @@ export function analyzePreface(subject: AnalyzeSubject): string {
  */
 export function buildAnalyzePlaceholderCard(subject: AnalyzeSubject): object {
   return standaloneCard('**🔍 日志分析中**', [
-    markdown(`<at id=${subject.requesterUserId}></at> 正在分析 **${plain(subject.app)}** 应用的 **${plain(subject.errorCode)}** 问题（${subject.logCount} 个日志包）。`),
+    markdown(`<at id=${subject.requesterUserId}></at> 正在分析 **${plain(subject.app)}** 应用的 **${plain(subject.errorCode)}** 问题。`),
     note('分析完成后结果会更新在这张卡片上。'),
   ])
 }

@@ -1,12 +1,9 @@
 /**
- * Log-platform analyze API: wire contract, HTTP listener, log downloads, and
- * the service flow from an accepted request to a group-shared topic.
+ * Log-platform analyze API: wire contract, HTTP listener, and the service
+ * flow from an accepted request to a group-shared topic.
  */
 
-import { existsSync, mkdtempSync, readFileSync } from 'node:fs'
-import { createServer } from 'node:http'
-import type { IncomingMessage, Server, ServerResponse } from 'node:http'
-import type { AddressInfo } from 'node:net'
+import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -14,9 +11,7 @@ import {
   ANALYZE_ROUTE, analyzeRequestHash, chatApplink, parseAnalyzeRequest,
 } from '../src/analyze/contract.ts'
 import type { AnalyzeRequest, AnalyzeResponse } from '../src/analyze/contract.ts'
-import { downloadLogs, logFileName, LogDownloadError } from '../src/analyze/download.ts'
 import type { AnalyzeLauncher } from '../src/analyze/launcher.ts'
-import { analyzePromptText } from '../src/analyze/launcher.ts'
 import { parseListenAddress, startAnalyzeServer } from '../src/analyze/server.ts'
 import type { AnalyzeHandler, AnalyzeServer } from '../src/analyze/server.ts'
 import { resolveConfig } from '../src/config.ts'
@@ -24,6 +19,7 @@ import type { FeishuConfig } from '../src/config.ts'
 import type { RouteRecord } from '../src/domain.ts'
 import type { CardActionEvent, ChannelFactory, NormalizedMessage } from '../src/feishu-channel.ts'
 import { FeishuService } from '../src/service.ts'
+import type { SessionManager } from '../src/session/manager.ts'
 import { followupMessagesOf, makeChannel, makeHostContext, makeMessage } from './helpers.ts'
 
 const servers: Array<{ close(): Promise<void> }> = []
@@ -33,56 +29,6 @@ afterEach(async () => {
 })
 
 /** Serve fixed responses per path on 127.0.0.1 (log package fixtures). */
-async function serveFiles(
-  routes: Record<string, (req: IncomingMessage, res: ServerResponse) => void>,
-): Promise<string> {
-  const server: Server = createServer((req, res) => {
-    const route = routes[new URL(req.url ?? '/', 'http://x').pathname]
-    if (route === undefined) {
-      res.writeHead(404).end()
-      return
-    }
-    route(req, res)
-  })
-  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
-  servers.push({
-    close: () => new Promise<void>((resolve) => {
-      server.closeAllConnections()
-      server.close(() => resolve())
-    }),
-  })
-  return `http://127.0.0.1:${(server.address() as AddressInfo).port}`
-}
-
-function bytes(size: number): (req: IncomingMessage, res: ServerResponse) => void {
-  return (_req, res) => {
-    res.writeHead(200, { 'content-type': 'application/zip' })
-    res.end(Buffer.alloc(size, 7))
-  }
-}
-
-/** One log package whose response waits until `release()` (an in-flight download). */
-async function heldPackage(size: number): Promise<{ url: string; release(): void }> {
-  let pending: ServerResponse | undefined
-  let released = false
-  const send = (res: ServerResponse): void => {
-    res.writeHead(200, { 'content-type': 'application/zip' })
-    res.end(Buffer.alloc(size, 7))
-  }
-  const base = await serveFiles({
-    '/held.zip': (_req, res) => {
-      if (released) send(res)
-      else pending = res
-    },
-  })
-  return {
-    url: `${base}/held.zip`,
-    release: () => {
-      released = true
-      if (pending !== undefined) send(pending)
-    },
-  }
-}
 
 function request(partial: Partial<AnalyzeRequest> = {}): AnalyzeRequest {
   return {
@@ -90,8 +36,7 @@ function request(partial: Partial<AnalyzeRequest> = {}): AnalyzeRequest {
     app: 'camera',
     errorCode: 'E1001',
     chatId: 'oc_group',
-    prompt: '/log-analyze 分析这些日志',
-    logUrls: ['https://logs.example/a.zip'],
+    prompt: '/log-analyze https://logs.example/a.zip 分析这些日志',
     ...partial,
   }
 }
@@ -99,7 +44,7 @@ function request(partial: Partial<AnalyzeRequest> = {}): AnalyzeRequest {
 describe('analyze contract', () => {
   it('accepts a complete request and refuses unknown fields', () => {
     expect(parseAnalyzeRequest(request())).toEqual({ ok: true, value: request() })
-    const extra = parseAnalyzeRequest({ ...request(), extra: 1 })
+    const extra = parseAnalyzeRequest({ ...request(), logUrls: ['https://logs.example/a.zip'] })
     expect(extra.ok).toBe(false)
   })
 
@@ -109,12 +54,12 @@ describe('analyze contract', () => {
       requesterUserId: 'ou_open_id',
       app: '../etc',
       chatId: 'not-a-chat',
+      errorCode: '..',
       prompt: '   ',
-      logUrls: ['ftp://x/a.zip', 'https://user:pw@x/a.zip'],
     })
     expect(result.ok).toBe(false)
     if (result.ok) return
-    for (const field of ['requesterUserId', 'app', 'chatId', 'prompt', 'logUrls.0', 'logUrls.1']) {
+    for (const field of ['requesterUserId', 'app', 'errorCode', 'chatId', 'prompt']) {
       expect(result.error).toContain(field)
     }
   })
@@ -175,7 +120,7 @@ describe('analyze listener', () => {
     ['missing key', ANALYZE_ROUTE, { headers: { ...headers, 'idempotency-key': '' } }, JSON.stringify(request()), 400],
     ['wrong media type', ANALYZE_ROUTE, { headers: { ...headers, 'content-type': 'text/plain' } }, JSON.stringify(request()), 415],
     ['invalid JSON', ANALYZE_ROUTE, {}, '{', 400],
-    ['invalid body', ANALYZE_ROUTE, {}, JSON.stringify({ ...request(), logUrls: [] }), 400],
+    ['invalid body', ANALYZE_ROUTE, {}, JSON.stringify({ ...request(), prompt: '' }), 400],
     ['oversized body', ANALYZE_ROUTE, {}, JSON.stringify({ ...request(), prompt: 'x'.repeat(1_100_000) }), 413],
   ])('refuses %s', async (_name, route, init, body, status) => {
     const { url, calls } = await listen()
@@ -203,63 +148,6 @@ describe('analyze listener', () => {
   })
 })
 
-describe('log downloads', () => {
-  const tempDir = (): string => mkdtempSync(path.join(tmpdir(), 'dsh-analyze-'))
-
-  it('stores packages in order below logs/ with safe names', async () => {
-    const base = await serveFiles({ '/a%20b.zip': bytes(10), '/x/b.zip': bytes(20) })
-    const dir = tempDir()
-    const logs = await downloadLogs([`${base}/a%20b.zip?sig=1`, `${base}/x/b.zip`], dir, 5_000)
-    expect(logs).toEqual([
-      { relativePath: 'logs/01-a_b.zip', bytes: 10 },
-      { relativePath: 'logs/02-b.zip', bytes: 20 },
-    ])
-    expect(readFileSync(path.join(dir, 'logs', '02-b.zip'))).toHaveLength(20)
-    expect(logFileName('https://x/', 2)).toBe('03-log.zip')
-  })
-
-  it('fails on HTTP errors without leaking the query string', async () => {
-    const base = await serveFiles({})
-    const failure = downloadLogs([`${base}/missing.zip?sig=secret`], tempDir(), 5_000)
-    await expect(failure).rejects.toThrow(LogDownloadError)
-    await expect(failure).rejects.toThrow(/HTTP 404/)
-    await expect(failure).rejects.not.toThrow(/secret/)
-  })
-
-  it('removes the partial file of a failed package', async () => {
-    const base = await serveFiles({
-      '/a.zip': bytes(10),
-      '/b.zip': (_req, res) => {
-        res.writeHead(200, { 'content-type': 'application/zip' })
-        res.write(Buffer.alloc(10, 7))
-        setTimeout(() => res.destroy(), 20)
-      },
-    })
-    const dir = tempDir()
-    await expect(downloadLogs([`${base}/a.zip`, `${base}/b.zip`], dir, 5_000)).rejects.toThrow(LogDownloadError)
-    expect(existsSync(path.join(dir, 'logs', '01-a.zip'))).toBe(true)
-    expect(existsSync(path.join(dir, 'logs', '02-b.zip'))).toBe(false)
-  })
-
-  it('enforces the whole-download deadline', async () => {
-    const base = await serveFiles({ '/slow.zip': () => { /* never answers */ } })
-    await expect(downloadLogs([`${base}/slow.zip`], tempDir(), 1_000))
-      .rejects.toThrow(/超时（1000 ms）/)
-  })
-
-  it('aborts the whole download when the caller cancels', async () => {
-    const base = await serveFiles({ '/slow.zip': () => { /* never answers */ } })
-    const cancel = new AbortController()
-    const download = downloadLogs([`${base}/slow.zip`], tempDir(), 60_000, fetch, cancel.signal)
-    setTimeout(() => cancel.abort(), 20)
-    await expect(download).rejects.toThrow(/下载已取消/)
-  })
-
-  it('lists the packages after the verbatim prompt', () => {
-    expect(analyzePromptText('/skill go', [{ relativePath: 'logs/01-a.zip', bytes: 3 }]))
-      .toBe('/skill go\n\n<analyze_logs>\n本次分析的日志包已下载到当前工作目录：\n- logs/01-a.zip（3 字节）\n</analyze_logs>')
-  })
-})
 
 describe('analyze service flow', () => {
   function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
@@ -291,15 +179,32 @@ describe('analyze service flow', () => {
     }
   }
 
+  /** Session manager the launcher uses (its guidance mount is the last setup step before the route). */
+  function sessionsOf(launcher: AnalyzeLauncher): SessionManager {
+    return (launcher as unknown as { deps: { sessions: SessionManager } }).deps.sessions
+  }
+
+  /** Hold every launch between Session creation and the first prompt until `release()`. */
+  function holdSetup(launcher: AnalyzeLauncher): { release(): void } {
+    const sessions = sessionsOf(launcher)
+    const mount = sessions.mountGuidance.bind(sessions)
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    sessions.mountGuidance = async (...args: Parameters<SessionManager['mountGuidance']>) => {
+      await gate
+      return await mount(...args)
+    }
+    return { release }
+  }
+
   const waitUntil = async (assert: () => void) => {
     await vi.waitFor(assert, { timeout: 3000, interval: 5 })
   }
 
-  it('posts the placeholder, opens a shared topic, and forwards the prompt with the packages', async () => {
+  it('posts the placeholder, opens a shared topic, and forwards the prompt verbatim', async () => {
     const h = await setup()
     await h.service.addAccessGroup('oc_group')
-    const base = await serveFiles({ '/a.zip': bytes(5) })
-    const response = await h.launcher.analyze(request({ logUrls: [`${base}/a.zip`] }), 'key-1')
+    const response = await h.launcher.analyze(request(), 'key-1')
 
     expect(response).toEqual({
       status: 202,
@@ -310,29 +215,24 @@ describe('analyze service flow', () => {
     })
     const placeholder = h.channel.sent[0]!
     expect(placeholder.options).toBeUndefined()
-    expect(JSON.stringify(placeholder.input)).toContain('<at id=u_alice></at> 正在分析 **camera** 应用的 **E1001** 问题（1 个日志包）')
+    expect(JSON.stringify(placeholder.input)).toContain('<at id=u_alice></at> 正在分析 **camera** 应用的 **E1001** 问题。')
 
     await waitUntil(() => expect(h.routes()).toHaveLength(1))
     const hint = h.channel.sent[1]!
     expect(hint.options).toEqual({ replyTo: 'om_1', replyInThread: true })
-    const route = h.routes()[0]!
-    expect(route).toMatchObject({
+    expect(h.routes()[0]).toMatchObject({
       key: 'omt_2', kind: 'thread', chatId: 'oc_group', senderUserId: 'u_alice',
       cardMessageId: 'om_1', shared: true,
       workspacePath: path.join(h.config.baseDir, 'analyze', 'camera', 'E1001'),
     })
-    expect(readFileSync(path.join(route.sessionDir!, 'logs', '01-a.zip'))).toHaveLength(5)
     const agent = h.ctxState.agents.created[0]!.handle.agent
-    expect(followupMessagesOf(agent)[0]!.content[0]!.text).toBe(
-      analyzePromptText('/log-analyze 分析这些日志', [{ relativePath: 'logs/01-a.zip', bytes: 5 }]),
-    )
+    expect(followupMessagesOf(agent).map(message => message.content[0]!.text)).toEqual([request().prompt])
   })
 
   it('renders the first turn once, into the placeholder, with the preface', async () => {
     const h = await setup()
     await h.service.addAccessGroup('oc_group')
-    const base = await serveFiles({ '/a.zip': bytes(5) })
-    await h.launcher.analyze(request({ logUrls: [`${base}/a.zip`] }), 'key-1')
+    await h.launcher.analyze(request(), 'key-1')
     await waitUntil(() => expect(h.routes()).toHaveLength(1))
     const agent = h.ctxState.agents.created[0]!.handle.agent
     h.ctxState.assistantStreamListeners[0]!({ agent, frame: { type: 'chunk', attemptId: 'attempt-1', revision: 1, index: 0, time: 1, chunk: { type: 'text-delta', index: 0, text: '根因：内存溢出' } } })
@@ -351,8 +251,7 @@ describe('analyze service flow', () => {
   it('replays a retried key and refuses a reused one', async () => {
     const h = await setup()
     await h.service.addAccessGroup('oc_group')
-    const base = await serveFiles({ '/a.zip': bytes(5) })
-    const body = request({ logUrls: [`${base}/a.zip`] })
+    const body = request()
     const [first, concurrent] = await Promise.all([h.launcher.analyze(body, 'key-1'), h.launcher.analyze(body, 'key-1')])
     const replay = await h.launcher.analyze(body, 'key-1')
     expect(concurrent).toEqual(first)
@@ -373,15 +272,15 @@ describe('analyze service flow', () => {
     expect(await h.launcher.analyze(request(), 'key-1')).toMatchObject({ status: 503 })
   })
 
-  it('ends on a failure card without a route when a download fails', async () => {
+  it('ends on a failure card without a route when setup fails', async () => {
     const h = await setup()
     await h.service.addAccessGroup('oc_group')
-    const base = await serveFiles({})
-    await h.launcher.analyze(request({ logUrls: [`${base}/gone.zip`] }), 'key-1')
+    sessionsOf(h.launcher).mountGuidance = async () => { throw new Error('mount failed') }
+    await h.launcher.analyze(request(), 'key-1')
     await waitUntil(() => expect(h.channel.updated).toHaveLength(1))
     expect(h.channel.updated[0]!.messageId).toBe('om_1')
     expect(JSON.stringify(h.channel.updated[0]!.card)).toContain('日志分析未能开始')
-    expect(JSON.stringify(h.channel.updated[0]!.card)).toContain('HTTP 404')
+    expect(JSON.stringify(h.channel.updated[0]!.card)).toContain('mount failed')
     expect(h.routes()).toHaveLength(0)
     expect(h.ctxState.agents.created[0]!.handle.dispose).toHaveBeenCalled()
   })
@@ -390,8 +289,8 @@ describe('analyze service flow', () => {
     const h = await setup()
     await h.service.addAccessGroup('oc_group')
     await h.service.addAccessUser('u_bob')
-    const held = await heldPackage(5)
-    await h.launcher.analyze(request({ logUrls: [held.url] }), 'key-1')
+    const held = holdSetup(h.launcher)
+    await h.launcher.analyze(request(), 'key-1')
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
     const agent = h.ctxState.agents.created[0]!.handle.agent
 
@@ -404,17 +303,14 @@ describe('analyze service flow', () => {
 
     held.release()
     await waitUntil(() => expect(followupMessagesOf(agent)).toHaveLength(2))
-    expect(followupMessagesOf(agent).map(message => message.content[0]!.text)).toEqual([
-      analyzePromptText('/log-analyze 分析这些日志', [{ relativePath: 'logs/01-held.zip', bytes: 5 }]),
-      '顺便看下内存',
-    ])
+    expect(followupMessagesOf(agent).map(message => message.content[0]!.text)).toEqual([request().prompt, '顺便看下内存'])
   })
 
   it('removes the published route when the first prompt cannot be delivered', async () => {
     const h = await setup()
     await h.service.addAccessGroup('oc_group')
-    const held = await heldPackage(5)
-    await h.launcher.analyze(request({ logUrls: [held.url] }), 'key-1')
+    const held = holdSetup(h.launcher)
+    await h.launcher.analyze(request(), 'key-1')
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
     const { handle } = h.ctxState.agents.created[0]!
     vi.mocked(handle.agent.followup).mockImplementationOnce(() => { throw new Error('session closed') })
@@ -426,17 +322,17 @@ describe('analyze service flow', () => {
     expect(handle.dispose).toHaveBeenCalled()
   })
 
-  it('cancels a stalled download on shutdown and ends on the failure card', async () => {
-    const h = await setup({ analyzeLogTimeoutMs: 600_000 })
+  it('ends an analysis still starting at shutdown on the failure card', async () => {
+    const h = await setup()
     await h.service.addAccessGroup('oc_group')
-    const held = await heldPackage(5)
-    await h.launcher.analyze(request({ logUrls: [held.url] }), 'key-1')
+    const held = holdSetup(h.launcher)
+    await h.launcher.analyze(request(), 'key-1')
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
 
-    const startedAt = Date.now()
-    await h.service.shutdown()
-    expect(Date.now() - startedAt).toBeLessThan(2_000)
-    expect(JSON.stringify(h.channel.updated.at(-1)!.card)).toContain('下载已取消')
+    const shutdown = h.service.shutdown()
+    held.release()
+    await shutdown
+    expect(JSON.stringify(h.channel.updated.at(-1)!.card)).toContain('飞书渠道已断开')
     expect(h.routes()).toHaveLength(0)
   })
 
@@ -444,8 +340,7 @@ describe('analyze service flow', () => {
     const h = await setup()
     await h.service.addAccessGroup('oc_group')
     await h.service.addAccessUser('u_bob')
-    const base = await serveFiles({ '/a.zip': bytes(5) })
-    await h.launcher.analyze(request({ logUrls: [`${base}/a.zip`] }), 'key-1')
+    await h.launcher.analyze(request(), 'key-1')
     await waitUntil(() => expect(h.routes()).toHaveLength(1))
     const agent = h.ctxState.agents.created[0]!.handle.agent
     const thread = { chatId: 'oc_group', threadId: 'omt_2', mentionedBot: false }

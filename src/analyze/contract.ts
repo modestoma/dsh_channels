@@ -4,9 +4,10 @@
  * `POST /dsh-channels/analyze` on the dedicated `analyzeListen` port, with
  * `Authorization: Bearer <token>`, an `Idempotency-Key` header, and a JSON
  * body naming the requester, the subject (application + error code), the
- * target group, the prompt, and the log package URLs. A valid request posts a
- * placeholder card into the group and answers `202`; the analysis then runs in
- * the background and patches the card into its result.
+ * target group, and the prompt. A valid request posts a placeholder card into
+ * the group and answers `202`; the analysis then runs in the background and
+ * patches the card into its result. Log packages are the prompt's business:
+ * the analysis skill fetches whatever the prompt names.
  *
  * @module dsh-channels/analyze/contract
  */
@@ -24,9 +25,6 @@ export const ANALYZE_MAX_BODY_BYTES = 1024 * 1024
 /** Largest accepted prompt, in characters. */
 export const ANALYZE_MAX_PROMPT_CHARS = 100_000
 
-/** Most log packages one request may name. */
-export const ANALYZE_MAX_LOG_URLS = 50
-
 /**
  * `Idempotency-Key` format: 1–200 visible ASCII characters without spaces, so
  * a platform can use a UUID or its own `type:id` token.
@@ -42,15 +40,6 @@ const SUBJECT_SEGMENT = /^(?!\.{1,2}$)[A-Za-z0-9._-]{1,128}$/u
 /** Feishu group chat id (`oc_…`). */
 const CHAT_ID = /^oc_[A-Za-z0-9_-]{1,128}$/u
 
-const logUrlSchema = z.string().max(4096).refine((value) => {
-  try {
-    const url = new URL(value)
-    return (url.protocol === 'http:' || url.protocol === 'https:') && url.username === '' && url.password === ''
-  } catch {
-    return false
-  }
-}, 'must be an http(s) URL without credentials')
-
 /** JSON body of one analyze request. */
 export const analyzeRequestSchema = z.object({
   /** Feishu user_id of the person who started the analysis on the platform. */
@@ -64,8 +53,6 @@ export const analyzeRequestSchema = z.object({
   /** Prompt forwarded verbatim as the analysis Session's first user message. */
   prompt: z.string().min(1).max(ANALYZE_MAX_PROMPT_CHARS)
     .refine(value => value.trim() !== '', 'must not be blank'),
-  /** Log package download URLs, downloaded in order into the topic directory. */
-  logUrls: z.array(logUrlSchema).min(1).max(ANALYZE_MAX_LOG_URLS),
 }).strict()
 
 export type AnalyzeRequest = z.infer<typeof analyzeRequestSchema>
@@ -117,7 +104,7 @@ export function chatApplink(chatId: string, position?: string): string {
  */
 export function analyzeRequestHash(request: AnalyzeRequest): string {
   const canonical = JSON.stringify([
-    request.requesterUserId, request.app, request.errorCode, request.chatId, request.prompt, request.logUrls,
+    request.requesterUserId, request.app, request.errorCode, request.chatId, request.prompt,
   ])
   return createHash('sha256').update(canonical).digest('hex')
 }

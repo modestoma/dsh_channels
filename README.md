@@ -279,8 +279,7 @@ npm 发行包已包含构建产物：Host 入口是 `lib/index.js`（profile 直
     adminUserId: 'a1b2c3d4'            # 管理员 user_id（可留空，留空时自动使用应用所有者；都没有时 guarded 下拒绝所有对话；面板可改）
     authRequestTtlDays: 7               # 入群/用户授权申请卡有效期（天，1–30）
     analyzeListen: '0.0.0.0:3090'       # 日志平台分析接口的独立监听地址（不填 = 关闭；改后需重连）
-    analyzeToken: 'DSH_CHANNELS_ANALYZE_TOKEN' # 分析接口 Bearer 令牌的凭据引用名（值写在 .credentials.yaml）
-    analyzeLogTimeoutMs: 600000         # 单次分析日志包下载总超时（10 分钟）
+    analyzeToken: 'DSH_CHANNELS_ANALYZE_TOKEN' # 分析接口 Bearer 令牌的凭据引用名（值在面板填写或写进 .credentials.yaml）
     loggerLevel: 'info'
 ```
 
@@ -354,7 +353,7 @@ FEISHU_APP_SECRET: xxxxxxxx
 
 ## 日志平台分析接口
 
-日志平台选中一个或多个同类不良日志包后，调用插件的分析接口：插件在指定群里发一张占位卡，下载日志包，把平台给的 prompt 原样交给一个新 Session（prompt 开头的斜杠命令由 DSH 展开成对应 skill），分析结束后**一次性**把结果写回这张占位卡（不流式）。群里通过准入的成员都可以在该话题内追问。
+日志平台调用插件的分析接口：插件在指定群里发一张占位卡，把平台给的 prompt 原样交给一个新 Session（prompt 开头的斜杠命令由 DSH 展开成对应 skill），分析结束后**一次性**把结果写回这张占位卡（不流式）。群里通过准入的成员都可以在该话题内追问。插件只负责接收 prompt 和开会话：日志包地址写在 prompt 里，下载、解压、超时都由日志分析 skill 自己处理（Session 的沙箱需要能访问日志存储地址）。
 
 **开启**：配置 `analyzeListen`（如 `0.0.0.0:3090`，面板「行为」页可改，需重连），并在同一页的「日志分析接口令牌」卡片填写访问令牌（建议 32 位以上随机串；写入 DSH 凭据库的 `DSH_CHANNELS_ANALYZE_TOKEN`，也可直接写进 `$DSH_HOME/.credentials.yaml`，引用名可用 `analyzeToken` 修改）。接口跑在独立端口上，与 DSH Web 端口无关；令牌每次请求都重新解析，轮换后下一次请求生效；令牌缺失时所有请求返回 503。端口绑定失败不影响飞书连接，健康等级降为「降级」，面板「健康判定」与 `/health` 卡片会显示失败原因。
 
@@ -371,16 +370,15 @@ Content-Type: application/json
   "app": "camera",
   "errorCode": "E1001",
   "chatId": "oc_xxx",
-  "prompt": "/log-analyze 请分析这些日志……",
-  "logUrls": ["https://logs.example.com/1.zip", "https://logs.example.com/2.zip"]
+  "prompt": "/log-analyze https://logs.example.com/1.zip https://logs.example.com/2.zip 请分析这些日志"
 }
 ```
 
 - `requesterUserId`：平台发起人的飞书 user_id，占位卡与结果卡 @ 此人；路由记录里也以此人作为发起人。
 - `app` / `errorCode`：只允许 `A-Z a-z 0-9 . _ -`（1–128 字符），决定工作区 `<baseDir>/analyze/<app>/<errorCode>/`；同一应用同一错误码的所有分析都在这个工作区里，每次分析各有一个话题目录。
 - `chatId`：目标群，必须是已授权群（`/auth group add` 或面板「访问与授权」），机器人需在群内；`accessMode: open` 时不校验。
-- `prompt`：原样作为首条用户消息，末尾追加一个 `<analyze_logs>` 块，列出下载到话题目录的日志包（如 `logs/01-1.zip`）。解压与分析由 skill 完成，插件不解压。
-- `logUrls`：1–50 个 http(s) 地址（不能带账号密码），按顺序下载，总时长受 `analyzeLogTimeoutMs` 限制，不限大小。
+- `prompt`：1–100000 字符，原样作为首条用户消息，插件不追加任何内容。
+- 只接受以上 5 个字段，多余字段返回 400。
 
 **响应**：校验通过、占位卡发出后立即返回 `202`：
 
@@ -390,9 +388,9 @@ Content-Type: application/json
 
 `link` 打开目标群，并在飞书返回了该消息的 `message_position` 时定位到占位卡。同步错误都带中文 `error`：`401` 令牌无效、`400` 参数或 `Idempotency-Key` 不合法、`403` 目标群未授权、`409` 同一个 `Idempotency-Key` 已被内容不同的请求使用、`413` 请求体超过 1 MiB、`415` 不是 JSON、`502` 占位卡发送失败（如机器人不在群里）、`503` 飞书未连接或未配置令牌。
 
-**去重**：同一个 `Idempotency-Key` 再次请求（包括并发重试）原样返回第一次的结果，不会再发卡、再分析。记录永久保存在 `channels_routes_v2` 域的 `analyze_requests` 表。占位卡发出后的失败（话题创建、下载、Session 创建）不会回滚这条记录：占位卡会被替换成「日志分析未能开始」失败卡并写明原因，需要重试时请换一个新的 `Idempotency-Key`。
+**去重**：同一个 `Idempotency-Key` 再次请求（包括并发重试）原样返回第一次的结果，不会再发卡、再分析。记录永久保存在 `channels_routes_v2` 域的 `analyze_requests` 表。占位卡发出后的失败（话题创建、Session 创建）不会回滚这条记录：占位卡会被替换成「日志分析未能开始」失败卡并写明原因，需要重试时请换一个新的 `Idempotency-Key`。
 
-**群里看到的**：先是占位卡「@发起人 正在分析 X 应用的 Y 问题（N 个日志包）」，紧接着话题内一条提示（同时用来创建话题）；分析结束后占位卡原地变成结果卡（首行保留发起人、应用、错误码），并加上 DONE / No 表情。分析过程中出现的审批卡、提问卡发在话题内。
+**群里看到的**：先是占位卡「@发起人 正在分析 X 应用的 Y 问题」，紧接着话题内一条提示（同时用来创建话题）；分析结束后占位卡原地变成结果卡（首行保留发起人、应用、错误码），并加上 DONE / No 表情。分析过程中出现的审批卡、提问卡发在话题内。
 
 **追问与权限**：分析话题的路由是**群内共享**的（路由记录 `shared: true`）：群里任何通过准入的成员（管理员，或该群已授权且本人在用户白名单）都可以在话题内直接回复追问（无需 @），也可以点停止按钮、回答审批卡与提问卡、在话题里执行会话命令；未授权的人仍被静默忽略。追问的回复照常流式输出。话题之间互不读取，和普通话题一样。分析结果 markdown 怎么回传给平台由日志分析插件自己负责，本插件不参与。
 

@@ -5,14 +5,15 @@
  * `Idempotency-Key` replay, and the placeholder card. In the background: the
  * topic (opened by a hint reply below the placeholder), the
  * `<baseDir>/analyze/<app>/<errorCode>` workspace and its per-topic directory,
- * the Session, the log package downloads, the group-shared route, and the
- * first turn, which renders quietly (once, when it ends) into the placeholder.
+ * the Session, the group-shared route, and the first turn: the platform prompt
+ * verbatim, rendered quietly (once, when it ends) into the placeholder. Log
+ * packages are fetched by the analysis skill the prompt invokes.
  *
  * The topic is reserved in the inbound router from its creation until the
  * route and the first prompt are published, so replies posted meanwhile queue
  * behind the first turn. Follow-ups then use the ordinary topic routing: the
  * route is `shared`, so every member admitted in the group may continue it. A
- * failure before the first turn (including cancellation on shutdown) replaces
+ * failure before the first turn (including a disconnect meanwhile) replaces
  * the placeholder with a failure card and leaves no route.
  *
  * @module dsh-channels/analyze/launcher
@@ -38,8 +39,6 @@ import type { TurnStreamer } from '../streamer.ts'
 import { ensureAnalyzeWorkspace, topicTokenFor } from '../workspaces.ts'
 import { analyzeRequestHash, chatApplink } from './contract.ts'
 import type { AnalyzeAccepted, AnalyzeRequest, AnalyzeResponse } from './contract.ts'
-import { downloadLogs } from './download.ts'
-import type { DownloadedLog, FetchLike } from './download.ts'
 import type { AnalyzeHandler } from './server.ts'
 
 /** Collaborators of the launcher (late-bound where the service swaps them per connection). */
@@ -65,8 +64,6 @@ export interface AnalyzeLauncherDeps {
   mayAnalyzeIn(chatId: string): boolean
   /** Resolve the configured bearer token; undefined when unresolvable. */
   resolveToken(): Promise<string | undefined>
-  /** Fetch seam for log downloads (defaults to the global fetch). */
-  fetch?: FetchLike
 }
 
 /** One accepted request still answering its `202`. */
@@ -80,25 +77,11 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
-/**
- * Prompt of the first turn: the platform prompt verbatim, then the list of
- * downloaded packages (paths relative to the topic directory).
- * @param prompt - the platform prompt.
- * @param logs - the downloaded packages.
- * @returns the user message text.
- */
-export function analyzePromptText(prompt: string, logs: readonly DownloadedLog[]): string {
-  const lines = logs.map(log => `- ${log.relativePath}（${log.bytes} 字节）`)
-  return `${prompt}\n\n<analyze_logs>\n本次分析的日志包已下载到当前工作目录：\n${lines.join('\n')}\n</analyze_logs>`
-}
-
 export class AnalyzeLauncher implements AnalyzeHandler {
   /** `Idempotency-Key` → request still being accepted (concurrent retries share it). */
   private readonly accepting = new Map<string, PendingAccept>()
   /** Background analyses still starting (drained on shutdown). */
   private readonly running = new Set<Promise<void>>()
-  /** Cancellation of each background analysis still starting. */
-  private readonly cancels = new Set<AbortController>()
 
   constructor(private readonly deps: AnalyzeLauncherDeps) {}
 
@@ -123,11 +106,11 @@ export class AnalyzeLauncher implements AnalyzeHandler {
   }
 
   /**
-   * Cancel every background analysis that is still starting (log downloads
-   * abort at once; each analysis ends on its failure card) and wait for them.
+   * Wait for every background analysis that is still starting. Called after
+   * `started` turns false, so each one ends on its failure card or, when its
+   * first prompt was already sent, as an ordinary topic.
    */
   async drain(): Promise<void> {
-    for (const cancel of this.cancels) cancel.abort()
     await Promise.allSettled([...this.running])
   }
 
@@ -185,8 +168,6 @@ export class AnalyzeLauncher implements AnalyzeHandler {
     let threadId: string | undefined
     let releaseTopic: (() => void) | undefined
     let published = false
-    const cancel = new AbortController()
-    this.cancels.add(cancel)
     try {
       threadId = await this.openTopic(channel, request.chatId, placeholderId)
       releaseTopic = this.deps.reserveTopic(threadId)
@@ -208,9 +189,6 @@ export class AnalyzeLauncher implements AnalyzeHandler {
         })
       }
       await this.deps.sessions.mountGuidance(handle.agent, placement.sessionDir)
-      const logs = await downloadLogs(
-        request.logUrls, placement.sessionDir, this.deps.config.analyzeLogTimeoutMs, this.deps.fetch, cancel.signal,
-      )
       this.assertStarted()
 
       const createdAt = handle.agent.session.header.createdAt
@@ -251,7 +229,7 @@ export class AnalyzeLauncher implements AnalyzeHandler {
           quiet: true,
           preface: analyzePreface(subject),
         })
-        agent.followup(feishuUserMessage(analyzePromptText(request.prompt, logs)))
+        agent.followup(feishuUserMessage(request.prompt))
       })
     } catch (error) {
       warn('dsh-channels: analysis for %s/%s failed to start: %s', request.app, request.errorCode, String(error))
@@ -264,7 +242,6 @@ export class AnalyzeLauncher implements AnalyzeHandler {
       void this.deps.repair.clear(placeholderId)
       await channel.updateCard(placeholderId, buildAnalyzeFailureCard(subject, messageOf(error))).catch(() => {})
     } finally {
-      this.cancels.delete(cancel)
       releaseTopic?.()
     }
   }
@@ -293,7 +270,6 @@ function subjectOf(request: AnalyzeRequest): AnalyzeSubject {
     requesterUserId: request.requesterUserId,
     app: request.app,
     errorCode: request.errorCode,
-    logCount: request.logUrls.length,
   }
 }
 
