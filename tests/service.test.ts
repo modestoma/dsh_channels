@@ -78,6 +78,9 @@ function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
       wikiWrite: false,
     },
     topicIsolation: 'auto',
+    analyzeToken: 'DSH_CHANNELS_ANALYZE_TOKEN',
+    analyzeLogMaxBytes: 1024 * 1024,
+    analyzeLogTimeoutMs: 10_000,
     ...partial,
   }
 }

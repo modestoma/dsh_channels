@@ -118,6 +118,11 @@ export interface CardStats {
 }
 
 export interface CardState {
+  /**
+   * Fixed notation line at the top of the main card (an analysis topic names
+   * its requester and subject here). Undefined → omitted.
+   */
+  preface?: string
   phase: PanelPhase
   /** Raw reasoning text accumulated so far (may be empty). */
   reasoning: string
@@ -413,6 +418,7 @@ function renderCard(
   const elements: object[] = []
 
   if (main) {
+    if (state.preface !== undefined && state.preface !== '') elements.push(note(state.preface))
     if (panelShown(state.phase, reasoning)) {
       elements.push(foldPanel(
         PANEL_TITLES[state.phase],

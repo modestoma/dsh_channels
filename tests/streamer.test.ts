@@ -28,6 +28,7 @@ function channel(): FeishuChannel & { updated: Array<{ messageId: string; card: 
     addReaction: vi.fn(async () => 'react-1'),
     removeReaction: vi.fn(async () => {}),
     threadIdOfMessage: vi.fn(async () => undefined),
+    messagePositionOf: vi.fn(async () => undefined),
     downloadResource: vi.fn(async () => (async function* (): AsyncGenerator<Uint8Array> {})()),
     updated,
   }

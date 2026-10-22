@@ -131,6 +131,11 @@ export interface FeishuChannel {
   /** Fetch the thread id of a sent message (undefined when not a topic message). */
   threadIdOfMessage(messageId: string): Promise<string | undefined>
   /**
+   * Fetch the chat position of a sent message (`message_position`, used by
+   * the chat applink to jump to it); undefined when Feishu omits it.
+   */
+  messagePositionOf(messageId: string): Promise<string | undefined>
+  /**
    * Stream one inbound message resource. Files and images share the same
    * download endpoint; only the `type` query differs. The stream is bounded
    * chunk-by-chunk so arbitrarily large files never have to fit in memory.
@@ -542,6 +547,12 @@ class LarkChannelAdapter implements FeishuChannel {
   async threadIdOfMessage(messageId: string): Promise<string | undefined> {
     const res = await this.channel.rawClient.im.v1.message.get({ path: { message_id: messageId } })
     return res?.data?.items?.[0]?.thread_id
+  }
+
+  async messagePositionOf(messageId: string): Promise<string | undefined> {
+    const res = await this.channel.rawClient.im.v1.message.get({ path: { message_id: messageId } })
+    const position = res?.data?.items?.[0]?.message_position
+    return position === undefined || position === '' ? undefined : position
   }
 
   async messageGet(messageId: string): Promise<unknown> {

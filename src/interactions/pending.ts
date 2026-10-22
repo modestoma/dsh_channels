@@ -20,8 +20,13 @@ export interface InteractionRoute {
   cardMessageId: string
   /** Whether the anchor lives in a real topic (replyInThread). */
   inThread: boolean
-  /** The session owner (user_id) — the only operator allowed to decide. */
+  /** The session owner (user_id); the only operator allowed to decide unless `mayDecide` is set. */
   senderUserId: string
+  /**
+   * Decision gate of a group-shared route: replaces the owner-only check with
+   * the route's member admission. Absent = only `senderUserId` decides.
+   */
+  mayDecide?(userId: string): boolean
 }
 
 /** Fields every pending interaction card carries. */
@@ -96,7 +101,11 @@ export class PendingCardTable<E extends PendingCardEntry> {
       }
     }
     if (entry === undefined || entry.settled) return undefined
-    if (event.operator.userId !== entry.route.senderUserId) {
+    const operator = event.operator.userId
+    const allowed = operator !== undefined && (entry.route.mayDecide === undefined
+      ? operator === entry.route.senderUserId
+      : entry.route.mayDecide(operator))
+    if (!allowed) {
       onUnauthorized(entry)
       return undefined
     }

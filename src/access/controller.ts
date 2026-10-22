@@ -156,7 +156,38 @@ export class AccessController {
    * execution inside someone else's topic.
    */
   ownsRoute(msg: NormalizedMessage, record: RouteRecord): boolean {
-    return record.senderUserId === msg.senderId && record.chatId === msg.chatId
+    return this.mayActOnRoute(msg.senderId, msg.chatId, record)
+  }
+
+  /**
+   * Whether `userId`, acting in `chatId`, may continue or decide for the
+   * route's Session: the route owner, or, on a group-shared route
+   * (`record.shared`), any user the admission matrix allows in that chat.
+   * @param userId - Feishu user_id of the actor.
+   * @param chatId - chat the action comes from (must be the route's chat).
+   * @param record - the route acted on.
+   * @returns true when the action is allowed.
+   */
+  mayActOnRoute(userId: string | undefined, chatId: string, record: RouteRecord): boolean {
+    if (userId === undefined || record.chatId !== chatId) return false
+    if (record.senderUserId === userId) return true
+    if (record.shared !== true) return false
+    return decideAccess(
+      { chatType: record.chatType, chatId, senderId: userId },
+      this.config(),
+      this.deps.store.snapshot(),
+    ).kind === 'allow'
+  }
+
+  /**
+   * Whether the analyze API may post into `chatId`: an authorized group, or
+   * any group in `open` access mode.
+   * @param chatId - target group chat id.
+   * @returns true when the chat is a permitted target.
+   */
+  mayAnalyzeIn(chatId: string): boolean {
+    if (this.config().accessMode === 'open') return true
+    return this.deps.store.snapshot().groups.has(chatId)
   }
 
   /** Drop in-memory notices (shutdown; durable state lives in the store). */
