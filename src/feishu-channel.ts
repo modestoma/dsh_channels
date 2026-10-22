@@ -24,11 +24,17 @@ import type {
 export type { BotAddedEvent, ChatInfo, NormalizedMessage, SendResult } from '@larksuiteoapi/node-sdk'
 export type FeishuConnectionStatus = WSConnectionStatus
 
-/** Outbound payloads used by this plugin, including Buffer-backed file upload. */
+/** Outbound payloads used by this plugin, including Buffer-backed image and file uploads. */
 export type FeishuSendInput =
   | { card: object }
   | { text: string }
+  | { image: { source: Buffer } }
   | { file: { source: string | Buffer; fileName: string } }
+
+/** One outbound image or file uploaded from memory. */
+export type OutboundMedia =
+  | { readonly kind: 'image'; readonly data: Buffer }
+  | { readonly kind: 'file'; readonly data: Buffer; readonly fileName: string }
 
 /**
  * One normalized card action (button click) event, as delivered by the
@@ -87,12 +93,19 @@ export interface FeishuChannel {
   connect(): Promise<void>
   /** Stop the connection. */
   disconnect(): Promise<void>
-  /** Send one message (text or card) with optional reply targeting. */
+  /** Send one message (text, card, image or file) with optional reply targeting. */
   send(
     chatId: string,
     input: FeishuSendInput,
     options?: { replyTo?: string; replyInThread?: boolean },
   ): Promise<SendResult>
+  /**
+   * Upload one image or file and send it as a reply to `replyTo`. Unlike
+   * {@link FeishuChannel.send}, a recalled or deleted reply target is NOT
+   * retried as a fresh chat message: the call rejects with a
+   * {@link FeishuApiError}, so topic output never lands on the main timeline.
+   */
+  replyMedia(replyTo: string, media: OutboundMedia, options: { replyInThread: boolean }): Promise<SendResult>
   /** Full-card replacement of a previously sent card message. */
   updateCard(messageId: string, card: object): Promise<void>
   /** Add an emoji reaction; resolves with the reaction id needed for removal. */
@@ -260,6 +273,19 @@ async function feishuCall<T extends { code?: number; msg?: string }>(call: () =>
   }
   assertFeishuOk(response)
   return response
+}
+
+/**
+ * Run one upload. The typed upload methods return the `data` object directly
+ * (or `null`) and throw on a non-zero code, so only thrown errors need mapping.
+ */
+async function feishuUpload<T>(call: () => Promise<T>): Promise<T> {
+  try {
+    return await call()
+  } catch (error) {
+    const { detail, code } = thrownErrorFields(error)
+    throw new FeishuApiError(detail, code)
+  }
 }
 
 /** Base path of the app slash-command endpoints (absent from SDK 1.76's typed client). */
@@ -451,6 +477,31 @@ class LarkChannelAdapter implements FeishuChannel {
     options?: { replyTo?: string; replyInThread?: boolean },
   ): Promise<SendResult> {
     return this.channel.send(chatId, input, options)
+  }
+
+  async replyMedia(replyTo: string, media: OutboundMedia, options: { replyInThread: boolean }): Promise<SendResult> {
+    const im = this.channel.rawClient.im.v1
+    let content: string
+    if (media.kind === 'image') {
+      const uploaded = await feishuUpload(() => im.image.create({ data: { image_type: 'message', image: media.data } }))
+      const imageKey = uploaded?.image_key
+      if (imageKey === undefined) throw new FeishuApiError('image_key missing in upload response')
+      content = JSON.stringify({ image_key: imageKey })
+    } else {
+      const uploaded = await feishuUpload(() => im.file.create({
+        data: { file_type: 'stream', file_name: media.fileName, file: media.data },
+      }))
+      const fileKey = uploaded?.file_key
+      if (fileKey === undefined) throw new FeishuApiError('file_key missing in upload response')
+      content = JSON.stringify({ file_key: fileKey })
+    }
+    const sent = await feishuCall(() => im.message.reply({
+      path: { message_id: replyTo },
+      data: { msg_type: media.kind, content, reply_in_thread: options.replyInThread },
+    }))
+    const messageId = sent.data?.message_id
+    if (messageId === undefined) throw new FeishuApiError('message_id missing in reply response')
+    return { messageId }
   }
 
   async updateCard(messageId: string, card: object): Promise<void> {

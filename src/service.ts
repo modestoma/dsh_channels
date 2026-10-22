@@ -63,6 +63,7 @@ import { CardDelivery } from './feishu/delivery.ts'
 import { AttachmentIntake } from './feishu/inbound-attachments.ts'
 import { InboundAttachmentStore, effectiveAttachmentMode, resolveAttachmentService } from './feishu/native-attachments.ts'
 import { AttachmentFetchToolRuntime, TopicMessagesToolRuntime } from './feishu/tools.ts'
+import { SendFileToolRuntime } from './feishu/send-file.ts'
 import type { KnownAttachmentMessageInput, KnownAttachmentSource } from './feishu/tools.ts'
 import {
   MessageReader, TOPIC_MESSAGES_MAX_LIMIT, buildHistoryContextBlock,
@@ -266,6 +267,7 @@ export class FeishuService {
    */
   private readonly attachmentFetchTools: AttachmentFetchToolRuntime
   private readonly topicMessagesTools: TopicMessagesToolRuntime
+  private readonly sendFileTools: SendFileToolRuntime
   /** FIFO admission for ordinary turns and commands targeting one route. */
   private readonly routeOperations = new RouteOperationQueue()
   /** Active Host command executions, aborted before shutdown tears peers down. */
@@ -367,13 +369,15 @@ export class FeishuService {
         //
         // The topic-messages tool is backend-independent: quoted excerpts and
         // topic history are read-only, so it is mounted for both backends and
-        // self-gates on `feishuTools.topicMessages`. Both mounts start
-        // together and resolve as one promise (no serial blocking).
+        // self-gates on `feishuTools.topicMessages`; `feishu_send_file`
+        // self-gates on `feishuTools.sendFile`. The mounts start together and
+        // resolve as one promise (no serial blocking).
         const mounts: Array<Promise<void>> = []
         if (this.effectiveAttachmentBackend() === 'native') {
           mounts.push(this.attachmentFetchTools.mount(agentCtx, sessionId))
         }
         mounts.push(this.topicMessagesTools.mount(agentCtx, sessionId))
+        mounts.push(this.sendFileTools.mount(agentCtx, sessionId))
         return Promise.all(mounts).then(() => undefined)
       },
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
@@ -431,6 +435,20 @@ export class FeishuService {
       // The tool description must not promise a fetch tool that archive
       // deployments do not mount; the runtime appends a degradation note.
       fetchAvailable: () => this.effectiveAttachmentBackend() === 'native',
+      warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
+    })
+    this.sendFileTools = new SendFileToolRuntime({
+      config: () => this.config,
+      channel: () => (this.started ? this.channel : undefined),
+      targetOfSession: sessionId => {
+        const record = this.routes.findBySession(sessionId)
+        if (record === undefined) return undefined
+        return {
+          replyTo: record.cardMessageId,
+          inThread: record.kind === 'thread',
+          rootDir: sessionDirOf(record),
+        }
+      },
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
     })
     this.delivery = new CardDelivery({
@@ -1148,6 +1166,7 @@ export class FeishuService {
           && this.configuredAdminUserId() === undefined
           && this.appOwner !== undefined && 'error' in this.appOwner && this.appOwner.apiRejected,
         slashCommandPanel: this.config.slashCommandPanel,
+        sendFile: this.config.feishuTools.sendFile,
       })
       state = result.consoleUrl === undefined
         ? { state: 'ok', checkedAt: Date.now() }

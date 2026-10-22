@@ -23,6 +23,7 @@
    | `contact:user.employee_id:readonly`（获取用户 user ID，**必需**） | 插件用 `user_id` 识别用户（准入、话题归属、工作区目录）；未开通时所有用户消息都会被丢弃（控制台打印 warn）。外部联系人/跨租户用户没有本租户 `user_id`，无法使用 |
    | `im:message.group_msg`（读取群组中所有消息，**敏感权限**） | 读取群/话题中机器人入群前或未 @ 机器人的历史消息；控制台要求时申请并由企业管理员审批，未开通时按“机器人可见范围”降级 |
    | `im:message.reactions:write_only`（发送、删除消息表情回复） | Typing / DONE / No 表态 |
+   | `im:resource`（获取与上传图片或文件资源，**可选**；`im:resource:upload` 亦可） | 模型用 `feishu_send_file` 把生成的图片/文件发给用户；不开通时该工具返回可读错误 |
    | `im:message:update`（更新消息卡片） | 流式卡片刷新（patch） |
    | `im:chat:readonly` 一类（获取群信息） | 入群通知卡展示群名/成员数（具体 scope 以控制台要求为准） |
    | 「获取应用信息」一类（如 `admin:app.info:readonly` / `application:application:self_manage`，**可选**，以控制台要求为准） | 未配置 `adminUserId` 时连接后自动把应用所有者设为管理员；不便申请时跳过即可，按 3.3 手动设置管理员 |

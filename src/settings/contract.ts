@@ -80,6 +80,7 @@ export const EDITABLE_KEYS = [
   'feishuTools.attachmentFetchTimeoutMs',
   'feishuTools.topicMessages',
   'feishuTools.topicMessagesTimeoutMs',
+  'feishuTools.sendFile',
   'promptContextTimeoutMs',
   // 模型
   'provider',

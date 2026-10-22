@@ -21,7 +21,7 @@ import type {
 } from '../src/session/isolation.ts'
 import type {
   BotAddedEvent, CardActionEvent, ChatInfo, FeishuChannel, FeishuConnectionStatus, NormalizedMessage,
-  RawMessageListParams, SendResult,
+  OutboundMedia, RawMessageListParams, SendResult,
 } from '../src/feishu-channel.ts'
 import type { RawDomainHandle } from '../src/domain.ts'
 import type { ScopeGrant } from '../src/feishu/scopes.ts'
@@ -836,6 +836,8 @@ export function makeMessageListResponse(
 
 export function makeChannel(options: FakeChannelOptions = {}): FeishuChannel & {
   sent: Array<{ chatId: string; input: object; options?: { replyTo?: string; replyInThread?: boolean } }>
+  /** `replyMedia` calls, in order. */
+  repliedMedia: Array<{ replyTo: string; media: OutboundMedia; options: { replyInThread: boolean } }>
   updated: Array<{ messageId: string; card: object }>
   reactions: Array<{ messageId: string; emojiType: string }>
   removedReactions: Array<{ messageId: string; reactionId: string }>
@@ -847,6 +849,7 @@ export function makeChannel(options: FakeChannelOptions = {}): FeishuChannel & {
   fireBotAdded: (event: BotAddedEvent) => Promise<void>
 } {
   const sent: Array<{ chatId: string; input: object; options?: { replyTo?: string; replyInThread?: boolean } }> = []
+  const repliedMedia: Array<{ replyTo: string; media: OutboundMedia; options: { replyInThread: boolean } }> = []
   const updated: Array<{ messageId: string; card: object }> = []
   const reactions: Array<{ messageId: string; emojiType: string }> = []
   const removedReactions: Array<{ messageId: string; reactionId: string }> = []
@@ -882,6 +885,11 @@ export function makeChannel(options: FakeChannelOptions = {}): FeishuChannel & {
       const messageId = `om_${++serial}`
       sent.push({ chatId, input, options: sendOptions })
       const result: SendResult = { messageId }
+      return result
+    }),
+    replyMedia: vi.fn(async (replyTo: string, media: OutboundMedia, replyOptions: { replyInThread: boolean }) => {
+      repliedMedia.push({ replyTo, media, options: replyOptions })
+      const result: SendResult = { messageId: `om_${++serial}` }
       return result
     }),
     updateCard: vi.fn(async (messageId: string, card: object) => {
@@ -923,7 +931,7 @@ export function makeChannel(options: FakeChannelOptions = {}): FeishuChannel & {
     }),
   }
   return Object.assign(channel, {
-    sent, updated, reactions, removedReactions, cardActionHandlers, botAddedHandlers,
+    sent, repliedMedia, updated, reactions, removedReactions, cardActionHandlers, botAddedHandlers,
     fireCardAction: async (event: CardActionEvent) => {
       for (const handler of cardActionHandlers) await handler(event)
     },

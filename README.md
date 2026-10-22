@@ -7,6 +7,7 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 - 话题内后续消息**无需再 @**，自动延续该 session
 - 工作区归属：**每用户一个工作区**（私聊 = 用户；群聊 = 群 × 用户，同群不同用户互不影响）；每个话题在工作区内拥有独立工作目录（默认 `topics/<话题 id>/`，Git 仓库工作区可自动改用 worktree），因此话题之间的文件互不干扰，而工作区数量只随用户增长
 - **入站附件（v2，零等待）**：收到消息时**会话、话题、流式卡片立即建立，不等附件下载**。触发消息中的图片自动预取为首轮原生 `ImageBlock`，模型直接可见；文件默认不下载，prompt 用 `<feishu_context>` 清单声明“附件未加载”，模型需要时调用 `feishu_attachment_fetch` 按 `message_id` 懒取；引用消息与话题历史以 `<feishu_quote>` / `<feishu_history>` 摘录，更早的消息用 `feishu_topic_messages` 翻页（发现的资源同时获得 fetch 授权）。**只发附件、不带说明的消息完全静默**：不回复、不建会话、不下载、不加表情，本地也不留任何状态；要让模型看到它，请引用那条消息再提问（多个文件可合并转发后引用），话题内的附件也可由模型用 `feishu_topic_messages` 读到。所有入站图片/文件统一存入 **DSH 原生附件库**（不可变、内容寻址去重、读取校验、随 Session 回放；插件不承担入站附件清理）。显式 `attachmentStore: 'archive'`、宿主未挂载原生附件服务或关闭 fetch 工具时退回旧版工作区 `attachments/` 落盘。完整设计见 [docs/attachment-pipeline-v2.md](docs/attachment-pipeline-v2.md)。
+- **把生成的文件发给用户**：模型在话题工作目录里生成图片、报告、表格等文件后，可调用 `feishu_send_file` 直接发回当前话题/会话（可识别图片 ≤10 MB 以图片消息发送，其余以文件消息发送，文件上限 30 MB）。只能发送**当前话题工作目录内**的普通文件（`..` 与符号链接都按真实路径校验，不能读到其他话题或系统文件）；需开通 `im:resource` 权限，缺失时工具返回可读的 `PERMISSION_DENIED`，回合不受影响。开关：`feishuTools.sendFile`（默认开）
 - **HITL 审批**：当模型请求需要授权的动作（如 bash 沙箱升级 `sandbox_permissions`）时，插件监听主机 `approval/request` 事件，在同一话题里**新发一张独立审批决策卡**（✅ 允许 / ❌ 拒绝 按钮），用户点击后回填主机审批结果；超时（`approvalTimeoutMs`，默认 5 分钟）自动拒绝（fail-closed），非会话发起人点击无效
 - **结构化提问**：模型调用 `ask_user_question` 时，插件监听主机 `user-questions/request` 瀑布并发一张问答卡（每个问题一组选项按钮，多选先勾选再「提交本题选择」），答案回填给模型；主机自带的应答者只有 Web 客户端，没有本插件时纯飞书会话会以 `NO_PROVIDER` 失败。超时（`questionTimeoutMs`，默认 5 分钟）或回合取消时本轮提问失败（fail-closed）；没有可选项的问题直接提示用文字作答，**阻塞期间普通文本回复即作为该问题的自由文本答案**（同时支持多选后的自定义文本）
 - **准入与授权（默认开启）**：**管理员不受白名单限制**（私聊、任意群聊——包括尚未授权的群——都能直接发起会话）；其他人私聊只收到一条固定提示（`/userid` 例外），群聊需要「群已授权 + 用户在全局白名单」两层同时命中。机器人被拉进群后私聊管理员发**群信息卡**（未授权群附授权按钮，用于放行白名单用户）；已授权群里未授权用户 @ 会触发用户授权卡。授权入口：飞书 `/auth` 命令、授权卡、Web 设置面板；管理员 user_id 在面板配置（私聊 `/userid` 获取），**留空时自动使用飞书应用所有者**
@@ -71,7 +72,7 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 | 标签页 | 内容 |
 | --- | --- |
 | 连接 | 连接状态与连接信息（长连接状态、Bot open_id、运行时长、话题路由 / 活动会话 / 在途回复）、权限自检、斜杠指令面板同步结果、未配置时的三步引导、飞书应用凭据、最近一次连接失败原因、需重连的待生效提醒 |
-| 会话与行为 | 「行为」：私聊模式、普通群 @ 要求、话题兜底、首次私聊引导、原生斜杠指令面板同步、权限切换；「内容与附件」：附件接收、存储后端、图片预取与上限、首轮历史；「模型工具」：`feishu_attachment_fetch` / `feishu_topic_messages` 开关与上限、被动读取预算 |
+| 会话与行为 | 「行为」：私聊模式、普通群 @ 要求、话题兜底、首次私聊引导、原生斜杠指令面板同步、权限切换；「内容与附件」：附件接收、存储后端、图片预取与上限、首轮历史；「模型工具」：`feishu_attachment_fetch` / `feishu_topic_messages` / `feishu_send_file` 开关与上限、被动读取预算 |
 | 模型 | 模型服务商、模型 id、推理档位、Agent 预设（宿主目录驱动的级联下拉） |
 | 工作区 | 工作区根目录（可点「选择目录…」调用系统目录选择框）；话题目录隔离方式（`topicIsolation`）在 profile 配置中设置 |
 | 访问授权 | 管理员 user_id、准入模式、申请有效期；已授权群 / 用户白名单与待处理申请 |
@@ -80,7 +81,7 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 **入站附件与模型工具（v2）**：「会话与行为」标签页新增两组可编辑字段，与 profile 配置同名、写入同一 Web 覆盖文件（`$DSH_HOME/dsh-channels/settings.json`）：
 
 - **内容与附件**：附件接收（`acceptAttachments`）、入站附件存储后端（`attachmentStore`：DSH 原生附件库 / 工作区 `attachments/`）、触发消息图片预取（`prefetchImages`）及单图 / 总量 / 整段超时上限（`prefetchImageMaxBytes` / `prefetchTotalMaxBytes` / `prefetchTimeoutMs`）、首轮话题历史条数（`historyBootstrapLimit`）。
-- **模型工具**：`feishu_attachment_fetch` 开关与单次资源数 / 字节预算 / 超时（`feishuTools.attachmentFetch*`）、`feishu_topic_messages` 开关与超时（`feishuTools.topicMessages*`）、被动引用/历史读取预算（`promptContextTimeoutMs`）。
+- **模型工具**：`feishu_attachment_fetch` 开关与单次资源数 / 字节预算 / 超时（`feishuTools.attachmentFetch*`）、`feishu_topic_messages` 开关与超时（`feishuTools.topicMessages*`）、`feishu_send_file` 开关（`feishuTools.sendFile`）、被动引用/历史读取预算（`promptContextTimeoutMs`）。
 
 `feishuTools.*` 是嵌套配置：面板只把改动过的子键写进覆盖层，其余子键保持原值（Web 覆盖或 profile 配置），不会因部分保存变成未定义。字段默认值、边界与降级规则见下文配置示例和 [docs/attachment-pipeline-v2.md](docs/attachment-pipeline-v2.md)。
 
@@ -167,6 +168,7 @@ src/
 │   ├── message-read.ts    # 消息读取：get/mget/list、引用摘录、首轮历史、统一渲染
 │   ├── slash-commands.ts  # 连接后把命令注册表幂等同步到飞书原生斜杠指令面板
 │   ├── tools.ts           # feishu_attachment_fetch / feishu_topic_messages 与每 route 白名单
+│   ├── send-file.ts       # feishu_send_file：把话题工作目录内的图片/文件发回当前会话
 │   └── agent-context.ts   # agent 作用域 system prompt：native/archive 双模式附件指引
 ├── routing/
 │   └── inbound.ts         # 入站路由：去重、准入、路由决策树、建/续会话、首触引导
@@ -260,6 +262,7 @@ npm 发行包已包含构建产物：Host 入口是 `lib/index.js`（profile 直
       attachmentFetchTimeoutMs: 120000  # 单次工具调用整段超时（120 s）
       topicMessages: true               # feishu_topic_messages：读取引用消息 / 话题历史并授权其附件
       topicMessagesTimeoutMs: 20000     # 单次话题读取整段超时（20 s；被动摘录用独立 3 s 预算）
+      sendFile: true                    # feishu_send_file：把话题工作目录内生成的图片/文件发给用户（需 im:resource）
     welcomeOnboarding: true             # 私聊首次触达发一张引导卡（按 chat 持久化去重）
     slashCommandPanel: false            # 连接时把命令同步到飞书原生 / 面板（需 app_slash_command 读写权限；改后需重连）
     allowPermissionSwitch: false        # 是否允许 /permissions <name> 从飞书侧切换权限预设（安全敏感）
@@ -308,11 +311,12 @@ FEISHU_APP_SECRET: xxxxxxxx
    - 私聊需要能主动给管理员发消息（`im:message` 已覆盖；管理员需在应用可用范围内）
    - 「获取应用信息」权限（**可选**，如 `admin:app.info:readonly` / `application:application:self_manage`，以控制台要求为准）：未配置 `adminUserId` 时，插件在每次连接时调用 `application/v6/applications/:app_id` 查询应用所有者并让其成为管理员；调不通（企业内不便申请该权限等）时日志与面板会给出飞书返回的错误码，并提示在「访问授权」手动填写管理员 user_id，填写后不再依赖它
    - 回调：**卡片回传交互 card.action.trigger**（流式卡停止按钮、`/model` 等选择卡、HITL 审批 / `ask_user_question` 问答按钮的回传事件，同样走长连接）
+   - `im:resource`（获取与上传图片或文件资源，**可选**；`im:resource:upload` 亦可）：`feishu_send_file` 上传图片/文件后发给用户。未开通时该工具返回可读的 `PERMISSION_DENIED`；关闭 `feishuTools.sendFile` 后自检不再检查此项
    - `im:message.reactions:write_only`（发送、删除消息表情回复）
    - `im:message:update`（更新卡片）
 
    > 消息读取权限缺失时不会报死错：引用摘录与首轮话题历史静默省略（插件生命周期内首次降级输出一条 warn，之后 debug 级），显式调用 `feishu_topic_messages` 返回可读的 `PERMISSION_DENIED`。附件下载仍依赖 `im:message` 一类的消息资源权限；下载被拒时工具与 archive 路径都会返回可读原因。
-   > **连接后权限自检**：每次连上飞书后，插件调用 `application/v6/scopes` 读取应用的租户权限授予状态，与上面的清单对比（私聊关闭时不检查 `im:message.p2p_msg:readonly`，`requireMention: false` 时 `im:message.group_msg` 升为必需；未配置管理员且应用所有者查询被飞书拒绝时追加可选项「获取应用信息」）。缺失项在 Web 设置「连接」页以红字列出（标注必需/可选与用途，每项附开发者后台权限页深链，另有一键打开全部缺失项的链接），并在日志打印一条 warn；读取失败时显示飞书返回的原因。自检只做提示，不阻断连接；开通权限后需发布新版本并重新连接才会刷新。
+   > **连接后权限自检**：每次连上飞书后，插件调用 `application/v6/scopes` 读取应用的租户权限授予状态，与上面的清单对比（私聊关闭时不检查 `im:message.p2p_msg:readonly`，`requireMention: false` 时 `im:message.group_msg` 升为必需；`feishuTools.sendFile` 关闭时不检查 `im:resource`；未配置管理员且应用所有者查询被飞书拒绝时追加可选项「获取应用信息」）。缺失项在 Web 设置「连接」页以红字列出（标注必需/可选与用途，每项附开发者后台权限页深链，另有一键打开全部缺失项的链接），并在日志打印一条 warn；读取失败时显示飞书返回的原因。自检只做提示，不阻断连接；开通权限后需发布新版本并重新连接才会刷新。
 3. 事件订阅方式选**长连接**（WebSocket，免公网）。
 4. 发布版本并把用户加入可用范围；将机器人拉入测试群。
 
