@@ -27,12 +27,21 @@ import type { AgentContext, ToolContentBlock, ToolDefinition, ToolExecution } fr
 import type { FeishuChannel } from '../../feishu-channel.ts'
 import { FeishuApiError } from '../../feishu-channel.ts'
 import type { InteractionRoute } from '../../interactions/pending.ts'
+import {
+  consentFailure, describeError, display, failure, failureOf, FAILURE_REASONS, guarded, nodeUrl, ownedByApp,
+  parseArgs, preview, previewBlock,
+} from './shared.ts'
+import type { WikiCallContext, WikiFailure, WikiFailureCode, WikiGate, WikiToolKit, WikiToolSpec } from './shared.ts'
 import { MOUNT_INJECT_RETRY_WAIT_MS, MOUNT_INJECT_WAIT_MS, waitForAvailability } from '../tools.ts'
 import type { WikiApi, WikiDocFormat, WikiNode, WikiUpdateRequest } from './api.ts'
 import type { WikiConsent, WikiConsentOutcome } from './consent.ts'
 import { parseWikiRef, parseWikiRoots } from './links.ts'
 import type { WikiRef, WikiRoot } from './links.ts'
 import { containingRoot, spaceIsRoot } from './scope.ts'
+import { BASE_TOOL_SPECS } from './base-tools.ts'
+import { SHEET_TOOL_SPECS } from './sheet-tools.ts'
+import type { WikiSheetEditValue, WikiSheetReadValue } from './sheet-tools.ts'
+import type { WikiBaseEditValue, WikiBaseReadValue } from './base-tools.ts'
 
 // ---- Public identity ----------------------------------------------------
 
@@ -50,9 +59,6 @@ const MAX_TITLE_CHARS = 200
 
 /** Longest content one create/edit operation may carry (characters). */
 const MAX_CONTENT_CHARS = 200_000
-
-/** Characters of each content shown on a consent card. */
-const PREVIEW_CHARS = 300
 
 // ---- Arguments ----------------------------------------------------------
 
@@ -79,6 +85,7 @@ export const wikiReadArgsSchema = z.object({
 export const wikiCreateArgsSchema = z.object({
   parent: refSchema,
   title: z.string().trim().min(1).max(MAX_TITLE_CHARS),
+  type: z.enum(['docx', 'sheet', 'bitable']).optional(),
   content: contentSchema.optional(),
   format: formatSchema.optional(),
 }).strict()
@@ -107,69 +114,6 @@ export const wikiEditArgsSchema = z.object({
   operations: z.array(wikiEditOperationSchema).min(1).max(WIKI_EDIT_MAX_OPERATIONS),
 }).strict()
 
-// ---- Results ------------------------------------------------------------
-
-/** Stable failure codes; the readable `reason` carries the details. */
-export type WikiFailureCode =
-  | 'TOOL_DISABLED'
-  | 'ROUTE_NOT_FOUND'
-  | 'NOT_AUTHORIZED'
-  | 'CHANNEL_UNAVAILABLE'
-  | 'INVALID_REFERENCE'
-  | 'INVALID_OPERATION'
-  | 'OUTSIDE_ROOTS'
-  | 'NOT_FOUND'
-  | 'NO_ACCESS'
-  | 'UNSUPPORTED_TYPE'
-  | 'NOT_OWNED'
-  | 'REVISION_CONFLICT'
-  | 'CONSENT_DENIED'
-  | 'CONSENT_EXPIRED'
-  | 'CONSENT_UNAVAILABLE'
-  | 'PERMISSION_DENIED'
-  | 'CONTENT_FAILED'
-  | 'EDIT_FAILED'
-  | 'EDIT_PARTIAL'
-  | 'API_FAILED'
-  | 'ABORTED'
-
-const FAILURE_REASONS: Readonly<Record<WikiFailureCode, string>> = {
-  TOOL_DISABLED: '知识库工具已在插件配置中关闭',
-  ROUTE_NOT_FOUND: '当前会话没有绑定飞书话题，无法确定授权人',
-  NOT_AUTHORIZED: '当前话题的发起人不在知识库白名单中；请管理员发送 /auth wiki add @该用户 后重试',
-  CHANNEL_UNAVAILABLE: '飞书连接当前不可用，请稍后重试',
-  INVALID_REFERENCE: '无法识别的知识库引用：请传知识库节点链接 https://<租户>.feishu.cn/wiki/<node_token>、node_token，或知识空间链接 https://<租户>.feishu.cn/wiki/space/<space_id>',
-  INVALID_OPERATION: '编辑操作参数不完整',
-  OUTSIDE_ROOTS: '该位置不在插件配置的知识库范围（wikiRoots）内，不能访问',
-  NOT_FOUND: '知识库节点不存在或已被删除',
-  NO_ACCESS: '机器人对该知识库节点没有访问权限；请知识库管理员把应用（或包含机器人的群）加为该空间成员',
-  UNSUPPORTED_TYPE: '目前只支持读取和修改飞书文档（docx）；表格、多维表格等类型暂不支持',
-  NOT_OWNED: '只能修改由本应用创建（所有者是本应用）的文档',
-  REVISION_CONFLICT: '文档在你读取之后被修改过；请重新用 feishu_wiki_read 读取最新内容，基于新的 revision_id 再修改',
-  CONSENT_DENIED: '话题发起人拒绝了这次知识库操作',
-  CONSENT_EXPIRED: '话题发起人没有在授权卡有效期内确认，已自动拒绝',
-  CONSENT_UNAVAILABLE: '授权卡发送失败，无法征得话题发起人同意，已取消操作',
-  PERMISSION_DENIED: '飞书拒绝调用：应用缺少知识库或文档权限（wiki:wiki、docx:document），请管理员在开发者后台开通并发布版本',
-  CONTENT_FAILED: '文档已创建，但写入内容失败',
-  EDIT_FAILED: '修改失败',
-  EDIT_PARTIAL: '飞书报告操作只部分生效；已停止后续操作，请用 feishu_wiki_read 读取最新内容核验后再继续',
-  API_FAILED: '飞书接口调用失败',
-  ABORTED: '已取消',
-}
-
-/** One failed call. */
-export interface WikiFailure {
-  readonly ok: false
-  readonly code: WikiFailureCode
-  readonly reason: string
-  /** Set by `CONTENT_FAILED`: the document that was created anyway. */
-  readonly node_token?: string
-  readonly url?: string
-  /** Set by `EDIT_FAILED`/`EDIT_PARTIAL`: operations fully applied before the stop. */
-  readonly applied?: number
-  /** Set by `REVISION_CONFLICT`: the current revision. */
-  readonly revision_id?: number
-}
 
 /** One node as the tools report it. */
 export interface WikiNodeView {
@@ -237,7 +181,16 @@ export interface WikiEditValue {
   readonly warnings: readonly string[]
 }
 
-export type WikiToolValue = WikiFailure | WikiListValue | WikiReadValue | WikiCreateValue | WikiEditValue
+export type WikiToolValue =
+  | WikiFailure
+  | WikiListValue
+  | WikiReadValue
+  | WikiCreateValue
+  | WikiEditValue
+  | WikiSheetReadValue
+  | WikiSheetEditValue
+  | WikiBaseReadValue
+  | WikiBaseEditValue
 
 const OUTPUT_SCHEMA: Record<string, unknown> = {
   type: 'object',
@@ -255,16 +208,16 @@ const LIST_DESCRIPTION =
   + '结果分页，带 page_token 时用它取下一页。返回的 node_token 可直接传给其他知识库工具。'
 
 const READ_DESCRIPTION =
-  '读取知识库中的一篇飞书文档（docx）。doc 传知识库节点链接或 node_token。'
+  '读取知识库中的一篇飞书文档（docx；电子表格用 feishu_wiki_sheet_read，多维表格用 feishu_wiki_base_read）。doc 传知识库节点链接或 node_token。'
   + '第一次读取某篇文档会在话题里弹出授权卡，由话题发起人确认，确认后本话题内再次读取同一篇不再询问；等待期间不要重复调用。'
   + 'scope 默认 full（整篇）；大文档先用 outline 看目录，再用 section（start_block_id 为标题块 id）、range（start/end_block_id）或 keyword（关键词，支持 a|b）读取局部；max_depth 在 outline 中表示标题层级上限。'
   + FORMAT_NOTE
   + '返回的 revision_id 用于 feishu_wiki_edit；editable 表示这篇文档能否被修改（只有本应用创建的文档可以修改）。'
 
 const CREATE_DESCRIPTION =
-  '在知识库中新建一篇飞书文档（docx）。parent 传父节点（知识库节点链接或 node_token）或知识空间链接（建在空间顶层），必须位于插件配置的知识库范围内；'
-  + '新文档本身也可以作为目录，之后把它的 node_token 作为 parent 在下面继续新建子文档。'
-  + 'title 为标题；content 为正文（可选，不要在正文里重复标题）。' + FORMAT_NOTE
+  '在知识库中新建一篇飞书文档（docx，默认）、电子表格（type=sheet）或多维表格（type=bitable）。parent 传父节点（知识库节点链接或 node_token）或知识空间链接（建在空间顶层），必须位于插件配置的知识库范围内；'
+  + '新节点本身也可以作为目录，之后把它的 node_token 作为 parent 在下面继续新建子节点。'
+  + 'title 为标题；content 为文档正文（仅 docx，可选，不要在正文里重复标题），电子表格和多维表格建好后是空白的，再用 feishu_wiki_sheet_edit / feishu_wiki_base_edit 写入。' + FORMAT_NOTE
   + '每次新建都会在话题里弹出授权卡，由话题发起人确认后才执行；等待期间不要重复调用。'
 
 const EDIT_DESCRIPTION =
@@ -276,6 +229,15 @@ const EDIT_DESCRIPTION =
   + '每次修改都会在话题里弹出授权卡，由话题发起人确认后才执行；等待期间不要重复调用。'
 
 // ---- Runtime ------------------------------------------------------------
+
+const CREATE_TYPE_LABELS: Readonly<Record<'docx' | 'sheet' | 'bitable', string>> = {
+  docx: '飞书文档',
+  sheet: '电子表格',
+  bitable: '多维表格',
+}
+
+/** The spreadsheet and Base tool families, mounted with the docx tools under the same switches. */
+const FAMILY_SPECS: readonly WikiToolSpec[] = [...SHEET_TOOL_SPECS, ...BASE_TOOL_SPECS]
 
 export interface WikiToolRuntimeDeps {
   /** Live plugin configuration (switches, roots). */
@@ -292,21 +254,13 @@ export interface WikiToolRuntimeDeps {
   warn(message: string, ...args: unknown[]): void
 }
 
-/** What every gated call works with. */
-interface CallContext {
-  readonly route: InteractionRoute
-  readonly api: WikiApi
-  readonly roots: readonly WikiRoot[]
-  readonly botOpenId: string | undefined
-}
-
-type Gate = { ok: true; context: CallContext } | WikiFailure
+type CallContext = WikiCallContext
 
 /**
  * The wiki tool runtime: mounts the enabled tools into Agent scopes and runs
  * each call through the gates in the module contract.
  */
-export class WikiToolRuntime {
+export class WikiToolRuntime implements WikiToolKit {
   private readonly mountAttempts = new WeakMap<AgentContext, Promise<void>>()
   private readonly spaceNames = new Map<string, string>()
   private warnedUnavailable = false
@@ -318,9 +272,11 @@ export class WikiToolRuntime {
   enabledTools(): string[] {
     const config = this.deps.config()
     if (config.wikiRoots.length === 0) return []
+    const family = (access: 'read' | 'write'): string[] =>
+      FAMILY_SPECS.filter(spec => spec.access === access).map(spec => spec.name)
     return [
-      ...(config.feishuTools.wikiRead ? [WIKI_LIST_TOOL_NAME, WIKI_READ_TOOL_NAME] : []),
-      ...(config.feishuTools.wikiWrite ? [WIKI_CREATE_TOOL_NAME, WIKI_EDIT_TOOL_NAME] : []),
+      ...(config.feishuTools.wikiRead ? [WIKI_LIST_TOOL_NAME, WIKI_READ_TOOL_NAME, ...family('read')] : []),
+      ...(config.feishuTools.wikiWrite ? [WIKI_CREATE_TOOL_NAME, WIKI_EDIT_TOOL_NAME, ...family('write')] : []),
     ]
   }
 
@@ -386,6 +342,18 @@ export class WikiToolRuntime {
       output: { schema: OUTPUT_SCHEMA, render: (_args: Record<string, unknown>, value: unknown) => renderWikiResult(value) },
       presentResult: (_args: Record<string, unknown>, value: unknown) => presentWikiResult(value),
     }
+    const spec = FAMILY_SPECS.find(candidate => candidate.name === name)
+    if (spec !== undefined) {
+      return {
+        ...base,
+        name,
+        description: spec.description,
+        parameters: spec.parameters,
+        execute: async (rawArgs, exec) => await spec.execute(this, sessionId, rawArgs, exec.signal),
+        presentCall: args => spec.presentCall(args),
+        isConcurrencySafe: () => false,
+      }
+    }
     switch (name) {
       case WIKI_LIST_TOOL_NAME:
         return {
@@ -432,7 +400,7 @@ export class WikiToolRuntime {
 
   // ---- Gates -----------------------------------------------------------
 
-  private gate(sessionId: string, tool: string): Gate {
+  gate(sessionId: string, tool: string): WikiGate {
     if (!this.enabledTools().includes(tool)) return failure('TOOL_DISABLED')
     const route = this.deps.routeOfSession(sessionId)
     if (route === undefined) return failure('ROUTE_NOT_FOUND')
@@ -442,19 +410,26 @@ export class WikiToolRuntime {
     if (channel === undefined || api === undefined) return failure('CHANNEL_UNAVAILABLE')
     return {
       ok: true,
-      context: { route, api, roots: parseWikiRoots(this.deps.config().wikiRoots), botOpenId: channel.botOpenId() },
+      context: {
+        route,
+        api,
+        ...(channel.sheets === undefined ? {} : { sheets: channel.sheets }),
+        ...(channel.bases === undefined ? {} : { bases: channel.bases }),
+        roots: parseWikiRoots(this.deps.config().wikiRoots),
+        botOpenId: channel.botOpenId(),
+      },
     }
   }
 
   /** Resolve a node/docx reference and check containment. */
-  private async containedNode(context: CallContext, ref: WikiRef): Promise<WikiNode | WikiFailure> {
+  async containedNode(context: CallContext, ref: WikiRef): Promise<WikiNode | WikiFailure> {
     if (ref.kind === 'space') return failure('INVALID_REFERENCE', '这里需要一个文档或节点，而不是整个知识空间')
     const node = await context.api.getNode(ref.token, ref.kind === 'docx' ? 'docx' : 'wiki')
     const contained = await containingRoot(context.api, context.roots, node)
     return contained === undefined ? failure('OUTSIDE_ROOTS') : node
   }
 
-  private async consent(
+  async consent(
     sessionId: string,
     context: CallContext,
     action: WikiConsentAction,
@@ -475,7 +450,28 @@ export class WikiToolRuntime {
   }
 
   /** `空间 / 父节点` for a node (one parent lookup). */
-  private async locationOf(api: WikiApi, node: WikiNode): Promise<string> {
+  async readConsent(sessionId: string, context: CallContext, node: WikiNode, signal: AbortSignal): Promise<WikiFailure | undefined> {
+    if (this.deps.consent.hasReadGrant(sessionId, node.objToken)) return undefined
+    const denied = await this.consent(sessionId, context, 'read', {
+      title: node.title, url: nodeUrl(context.roots, node), location: await this.locationOf(context.api, node), details: [],
+    }, signal)
+    if (denied === undefined) this.deps.consent.grantRead(sessionId, node.objToken)
+    return denied
+  }
+
+  grantRead(sessionId: string, documentId: string): void {
+    this.deps.consent.grantRead(sessionId, documentId)
+  }
+
+  writeEnabled(): boolean {
+    return this.deps.config().feishuTools.wikiWrite
+  }
+
+  warn(message: string, ...args: unknown[]): void {
+    this.deps.warn(message, ...args)
+  }
+
+  async locationOf(api: WikiApi, node: WikiNode): Promise<string> {
     const space = await this.spaceName(api, node.spaceId)
     if (node.parentNodeToken === undefined) return space
     const parent = await api.getNode(node.parentNodeToken, 'wiki').catch(() => undefined)
@@ -559,13 +555,8 @@ export class WikiToolRuntime {
       if ('ok' in node) return node
       if (node.objType !== 'docx') return failure('UNSUPPORTED_TYPE', `${FAILURE_REASONS.UNSUPPORTED_TYPE}（该节点类型：${node.objType}）`)
       const url = nodeUrl(context.roots, node)
-      if (!this.deps.consent.hasReadGrant(sessionId, node.objToken)) {
-        const denied = await this.consent(sessionId, context, 'read', {
-          title: node.title, url, location: await this.locationOf(context.api, node), details: [],
-        }, exec.signal)
-        if (denied !== undefined) return denied
-        this.deps.consent.grantRead(sessionId, node.objToken)
-      }
+      const denied = await this.readConsent(sessionId, context, node, exec.signal)
+      if (denied !== undefined) return denied
       if (exec.signal.aborted) return failure('ABORTED')
       const format = args.format ?? 'markdown'
       const document = await context.api.fetchDocument(node.objToken, {
@@ -616,20 +607,26 @@ export class WikiToolRuntime {
         parentUrl = nodeUrl(context.roots, parent)
         location = `${await this.spaceName(context.api, spaceId)} / ${parent.title === '' ? parent.nodeToken : parent.title}`
       }
+      const type = args.type ?? 'docx'
       const format = args.format ?? 'markdown'
       const content = args.content === undefined || args.content.trim() === '' ? undefined : args.content
-      const details = content === undefined
-        ? ['**内容**：空文档']
-        : [`**内容预览**（${format === 'xml' ? 'XML' : 'Markdown'}，共 ${content.length} 字）\n${previewBlock(content)}`]
+      if (type !== 'docx' && content !== undefined) {
+        return failure('INVALID_OPERATION', 'content 只用于飞书文档；新建电子表格或多维表格后，用 feishu_wiki_sheet_edit / feishu_wiki_base_edit 写入数据')
+      }
+      const details = type !== 'docx'
+        ? [`**类型**：${CREATE_TYPE_LABELS[type]}（空白）`]
+        : content === undefined
+          ? ['**内容**：空文档']
+          : [`**内容预览**（${format === 'xml' ? 'XML' : 'Markdown'}，共 ${content.length} 字）\n${previewBlock(content)}`]
       const denied = await this.consent(sessionId, context, 'create', {
         title: args.title, ...(parentUrl === undefined ? {} : { url: parentUrl }), location, details,
       }, exec.signal)
       if (denied !== undefined) return denied
       if (exec.signal.aborted) return failure('ABORTED')
-      const node = await context.api.createDocxNode(spaceId, parentToken, args.title)
+      const node = await context.api.createNode(spaceId, parentToken, args.title, type)
       const url = nodeUrl(context.roots, node)
       // The topic owner approved this document; reading it back needs no new card.
-      this.deps.consent.grantRead(sessionId, node.objToken)
+      this.grantRead(sessionId, node.objToken)
       if (content === undefined) {
         return { ok: true, title: node.title || args.title, node_token: node.nodeToken, url, warnings: [] }
       }
@@ -733,71 +730,6 @@ export class WikiToolRuntime {
 
 // ---- Helpers ------------------------------------------------------------
 
-function failure(code: WikiFailureCode, reason?: string): WikiFailure {
-  return { ok: false, code, reason: reason ?? FAILURE_REASONS[code] }
-}
-
-function parseArgs<T>(tool: string, schema: z.ZodType<T>, rawArgs: Record<string, unknown>): T {
-  const parsed = schema.safeParse(rawArgs)
-  if (parsed.success) return parsed.data
-  const issue = parsed.error.issues[0]
-  const where = issue === undefined || issue.path.length === 0 ? 'arguments' : issue.path.join('.')
-  throw new Error(`${tool}: invalid ${where}: ${issue?.message ?? 'invalid arguments'}`)
-}
-
-/** Run one gated call body, mapping thrown Feishu errors to failures. */
-async function guarded(
-  deps: Pick<WikiToolRuntimeDeps, 'warn'>,
-  tool: string,
-  body: () => Promise<WikiToolValue>,
-): Promise<WikiToolValue> {
-  try {
-    return await body()
-  } catch (error) {
-    const mapped = failureOf(error)
-    if (mapped.code === 'API_FAILED') deps.warn('dsh-channels: %s failed: %s', tool, mapped.reason)
-    return mapped
-  }
-}
-
-/** Feishu codes: node missing/deleted, no resource access, missing app scope. */
-const NOT_FOUND_CODES: ReadonlySet<number> = new Set([131005, 131012, 131013, 131014, 131016])
-const NO_ACCESS_CODES: ReadonlySet<number> = new Set([131006, 1770032, 1770002])
-const PERMISSION_CODES: ReadonlySet<number> = new Set([99991672, 99991679])
-
-function failureOf(error: unknown): WikiFailure {
-  const detail = describeError(error)
-  if (error instanceof FeishuApiError && error.code !== undefined) {
-    if (NOT_FOUND_CODES.has(error.code)) return failure('NOT_FOUND', `${FAILURE_REASONS.NOT_FOUND}（${detail}）`)
-    if (NO_ACCESS_CODES.has(error.code)) return failure('NO_ACCESS', `${FAILURE_REASONS.NO_ACCESS}（${detail}）`)
-    if (PERMISSION_CODES.has(error.code)) return failure('PERMISSION_DENIED', `${FAILURE_REASONS.PERMISSION_DENIED}（${detail}）`)
-  }
-  return failure('API_FAILED', `${FAILURE_REASONS.API_FAILED}：${detail}`)
-}
-
-function consentFailure(outcome: WikiConsentOutcome): WikiFailure | undefined {
-  switch (outcome) {
-    case 'allowed': return undefined
-    case 'denied': return failure('CONSENT_DENIED')
-    case 'expired': return failure('CONSENT_EXPIRED')
-    case 'cancelled': return failure('ABORTED')
-    case 'unavailable': return failure('CONSENT_UNAVAILABLE')
-  }
-}
-
-/** Whether the app owns a node: Feishu reports the bot open_id as the owner. */
-function ownedByApp(node: WikiNode, botOpenId: string | undefined): boolean {
-  return botOpenId !== undefined && botOpenId !== '' && node.owner === botOpenId
-}
-
-/** A node's web link; falls back to the first root's origin. */
-function nodeUrl(roots: readonly WikiRoot[], node: WikiNode): string {
-  if (node.url !== undefined) return node.url
-  const first = roots[0]
-  const origin = first === undefined ? 'https://feishu.cn' : new URL(first.link).origin
-  return `${origin}/wiki/${node.nodeToken}`
-}
-
 /** Map one validated operation to a `docs_ai` update, or the reason it is incomplete. */
 function updateRequestOf(operation: WikiEditOperation, format: WikiDocFormat): WikiUpdateRequest | string {
   switch (operation.command) {
@@ -854,28 +786,6 @@ function blockRangeLabel(operation: { block_id?: string; start_block_id?: string
     : `块 \`${operation.start_block_id ?? '?'}\` 到 \`${operation.end_block_id ?? '?'}\``
 }
 
-/** One-line clipped preview with Markdown control characters neutralized. */
-function preview(value: string, max = 80): string {
-  const flat = value.replace(/\s+/gu, ' ').trim().replace(/([[\]()*_`~<>])/gu, '\\$1')
-  return flat.length <= max ? flat : `${flat.slice(0, max)}…`
-}
-
-/** A fenced preview of the first characters of a content. */
-function previewBlock(content: string): string {
-  const head = content.length <= PREVIEW_CHARS ? content : `${content.slice(0, PREVIEW_CHARS)}\n…`
-  return `\`\`\`\n${head.replace(/```/gu, '`​``')}\n\`\`\``
-}
-
-function display(value: unknown): string {
-  return typeof value === 'string' ? preview(value, 120) : '?'
-}
-
-/** Readable, bounded text for a thrown value. */
-function describeError(error: unknown): string {
-  const text = error instanceof FeishuApiError ? error.detail : error instanceof Error ? error.message : String(error)
-  const cleaned = text.replace(/[\u0000-\u001f\u007f]+/gu, ' ').trim()
-  return cleaned.length <= 300 ? cleaned : `${cleaned.slice(0, 300)}…`
-}
 
 function isValue(value: unknown): value is WikiToolValue {
   return typeof value === 'object' && value !== null && typeof (value as { ok?: unknown }).ok === 'boolean'
@@ -907,6 +817,8 @@ export function presentWikiResult(value: unknown): string {
   if (!isValue(value)) return '知识库工具结果不可用'
   if (!value.ok) return `失败（${value.code}）：${value.reason}`
   if ('items' in value) return `列出 ${value.items.length} 项`
+  if ('records' in value && value.records !== undefined) return `已读取《${value.title}》（${value.records.length} 条记录）`
+  if ('tables' in value) return `已读取《${value.title}》（${value.tables.length} 个数据表）`
   if ('content' in value) return `已读取《${value.title}》（${value.content.length} 字）`
   if ('applied' in value) return `已修改《${value.title}》（${value.applied} 个操作）`
   return `已新建《${value.title}》`
@@ -946,8 +858,9 @@ const CREATE_PARAMETERS: Record<string, unknown> = {
   type: 'object',
   properties: {
     parent: { type: 'string', description: `父位置：${REF_DESCRIPTION}，或知识空间链接（建在空间顶层）` },
-    title: { type: 'string', description: '文档标题' },
-    content: { type: 'string', description: '正文（可选）' },
+    title: { type: 'string', description: '标题' },
+    type: { type: 'string', enum: ['docx', 'sheet', 'bitable'], description: '节点类型：docx 飞书文档（默认）、sheet 电子表格、bitable 多维表格' },
+    content: { type: 'string', description: '文档正文（仅 docx，可选）' },
     format: FORMAT_PROPERTY,
   },
   required: ['parent', 'title'],

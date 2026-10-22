@@ -91,16 +91,28 @@ const SEND_FILE_REQUIREMENT: ScopeRequirement = {
   anyOf: ['im:resource', 'im:resource:upload'], level: 'optional', purpose: '上传图片/文件，让模型用 feishu_send_file 把生成的文件发给用户',
 }
 
-/** Wiki read needs (`feishu_wiki_list` / `feishu_wiki_read`). */
+/** Spreadsheet and Base read needs, shared by the wiki read and write sets. */
+const SHEET_BASE_READ_REQUIREMENTS: readonly ScopeRequirement[] = [
+  { anyOf: ['sheets:spreadsheet', 'sheets:spreadsheet:readonly', 'sheets:spreadsheet:read'], level: 'optional', purpose: '读取知识库电子表格（feishu_wiki_sheet_read）' },
+  { anyOf: ['bitable:app', 'bitable:app:readonly', 'base:record:read'], level: 'optional', purpose: '读取知识库多维表格（feishu_wiki_base_read）' },
+]
+
+/** Wiki read needs (`feishu_wiki_list` / `feishu_wiki_read` and the sheet/base read tools). */
 const WIKI_READ_REQUIREMENTS: readonly ScopeRequirement[] = [
   { anyOf: ['wiki:wiki', 'wiki:wiki:readonly'], level: 'optional', purpose: '浏览知识库节点（feishu_wiki_list / feishu_wiki_read）' },
   { anyOf: ['docx:document', 'docx:document:readonly'], level: 'optional', purpose: '读取知识库中的文档内容（feishu_wiki_read）' },
+  ...SHEET_BASE_READ_REQUIREMENTS,
 ]
 
 /** Wiki write needs (`feishu_wiki_create` / `feishu_wiki_edit`). */
 const WIKI_WRITE_REQUIREMENTS: readonly ScopeRequirement[] = [
   { anyOf: ['wiki:wiki'], level: 'optional', purpose: '在知识库中新建节点（feishu_wiki_create）' },
   { anyOf: ['docx:document'], level: 'optional', purpose: '写入与修改知识库文档内容（feishu_wiki_create / feishu_wiki_edit）' },
+  { anyOf: ['sheets:spreadsheet', 'sheets:spreadsheet:write_only'], level: 'optional', purpose: '写入知识库电子表格（feishu_wiki_sheet_edit）' },
+  { anyOf: ['bitable:app', 'base:record:create'], level: 'optional', purpose: '新增知识库多维表格记录（feishu_wiki_base_edit）' },
+  { anyOf: ['bitable:app', 'base:record:update'], level: 'optional', purpose: '修改本应用创建的多维表格中的记录（feishu_wiki_base_edit）' },
+  { anyOf: ['bitable:app', 'base:record:delete'], level: 'optional', purpose: '删除本应用创建的多维表格中的记录（feishu_wiki_base_edit）' },
+  ...SHEET_BASE_READ_REQUIREMENTS,
 ]
 
 /** Group receive needs while ordinary group messages require an @ mention. */

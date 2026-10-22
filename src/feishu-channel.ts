@@ -14,6 +14,10 @@ import type { ScopeGrant } from './feishu/scopes.ts'
 import type { RemoteSlashCommand, SlashCommandApi, SlashCommandEntry } from './feishu/slash-commands.ts'
 import { createWikiApi } from './feishu/wiki/api.ts'
 import type { WikiApi, WikiRawRequest } from './feishu/wiki/api.ts'
+import { createBaseApi } from './feishu/wiki/base-api.ts'
+import type { BaseApi } from './feishu/wiki/base-api.ts'
+import { createSheetApi } from './feishu/wiki/sheet-api.ts'
+import type { SheetApi } from './feishu/wiki/sheet-api.ts'
 import type {
   BotAddedEvent,
   ChatInfo,
@@ -95,6 +99,10 @@ export interface FeishuChannel {
    * a channel-unavailable result.
    */
   readonly wiki?: WikiApi
+  /** Spreadsheet (`sheet_ai/v2`) endpoints used by the wiki sheet tools; optional like {@link wiki}. */
+  readonly sheets?: SheetApi
+  /** Base (`base/v3`) endpoints used by the wiki base tools; optional like {@link wiki}. */
+  readonly bases?: BaseApi
   /** Current official-SDK WebSocket lifecycle snapshot, when initialized. */
   getConnectionStatus(): FeishuConnectionStatus | undefined
   /** Start the WebSocket long connection (resolves after the handshake). */
@@ -370,6 +378,8 @@ class LarkChannelAdapter implements FeishuChannel {
   private readonly dmMode: 'open' | 'disabled'
   readonly slashCommands: SlashCommandApi
   readonly wiki: WikiApi
+  readonly sheets: SheetApi
+  readonly bases: BaseApi
 
   constructor(options: ChannelConnectOptions) {
     this.channel = createLarkChannel({
@@ -400,7 +410,10 @@ class LarkChannelAdapter implements FeishuChannel {
     this.dmMode = options.dmMode
     const rawClient = this.channel.rawClient
     this.slashCommands = slashCommandApi(async <T,>(input: Parameters<RawRequest>[0]) => await rawClient.request<T>(input))
-    this.wiki = createWikiApi(async <T,>(input: Parameters<WikiRawRequest>[0]) => await rawClient.request<T>(input))
+    const wikiRequest = async <T,>(input: Parameters<WikiRawRequest>[0]): Promise<T> => await rawClient.request<T>(input)
+    this.wiki = createWikiApi(wikiRequest)
+    this.sheets = createSheetApi(wikiRequest)
+    this.bases = createBaseApi(wikiRequest)
   }
 
   onMessage(handler: (message: NormalizedMessage) => void | Promise<void>): () => void {

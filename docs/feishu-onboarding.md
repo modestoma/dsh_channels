@@ -25,7 +25,7 @@
    | `im:message.reactions:write_only`（发送、删除消息表情回复） | Typing / DONE / No 表态 |
    | `im:resource`（获取与上传图片或文件资源，**可选**；`im:resource:upload` 亦可） | 模型用 `feishu_send_file` 把生成的图片/文件发给用户；不开通时该工具返回可读错误 |
    | `im:message:update`（更新消息卡片） | 流式卡片刷新（patch） |
-   | `wiki:wiki` 与 `docx:document`（**可选**，只读可用 `wiki:wiki:readonly` / `docx:document:readonly`） | 知识库工具（`feishuTools.wikiRead` / `wikiWrite` + `wikiRoots`）：浏览知识库、读取/新建/修改飞书文档；应用还需是目标知识空间的成员 |
+   | `wiki:wiki`、`docx:document`、`sheets:spreadsheet`、`bitable:app`（**可选**，只读可用对应的 `:readonly` 权限） | 知识库工具（`feishuTools.wikiRead` / `wikiWrite` + `wikiRoots`）：浏览知识库，读取/新建/修改飞书文档、电子表格、多维表格；应用还需是目标知识空间的成员 |
    | `im:chat:readonly` 一类（获取群信息） | 入群通知卡展示群名/成员数（具体 scope 以控制台要求为准） |
    | 「获取应用信息」一类（如 `admin:app.info:readonly` / `application:application:self_manage`，**可选**，以控制台要求为准） | 未配置 `adminUserId` 时连接后自动把应用所有者设为管理员；不便申请时跳过即可，按 3.3 手动设置管理员 |
    | `application:app_slash_command:read` 与 `application:app_slash_command:write`（读取/管理应用斜杠指令，可选，仅 `slashCommandPanel: true` 时需要） | 连接后把插件命令同步到飞书原生斜杠指令面板（输入 `/` 时列出，客户端约 5 分钟后刷新）；缺失时只是面板没有列表，直接输入命令不受影响 |
@@ -271,6 +271,7 @@ DSH_HOME=$DSH_HOME pnpm dsh web        # 默认 http://127.0.0.1:3080
 | 14a | 群授权与群内准入 | 管理员点「授权本群」（或在群内发 `/auth allow`）；未授权用户 @；管理员 `/auth user add <user_id>` 后该用户再 @ | 授权前非管理员 @ 无响应（管理员除外）；授权后白名单用户可分别开会话；未授权用户 @ 不建会话且管理员收到用户授权卡；授权该用户后可正常开会话 |
 | 15 | 撤销与持久化 | `/auth revoke`（群内）/ `/auth user remove <user_id>`；重启 dsh 后再试 | 撤销后对应主体立即无法开启对话；重启后已授权群/用户仍有效（持久化） |
 | 15a | 知识库读写 | 开启 `wikiRead`/`wikiWrite`、配置 `wikiRoots`；白名单用户在话题里让模型列目录、读一篇文档、新建一篇、再修改它 | 列目录不弹卡；第一次读取弹「📚 知识库授权」卡，只有话题发起人能点，允许后同一篇再读不弹卡；新建、修改每次都弹卡；修改人工创建的文档返回 `NOT_OWNED`；不在白名单的用户发起的话题返回 `NOT_AUTHORIZED` |
+| 15b | 知识库表格 | 同上；让模型读一个电子表格、新建一个电子表格并写入几行再追加一行；读一个人建的多维表格并新增一条记录、尝试修改已有记录；新建一个多维表格后增改删记录 | 表格读取返回带 `[row=N]` 的 CSV；写入和追加落在正确的单元格；人建的电子表格修改返回 `NOT_OWNED`；人建的多维表格能新增记录、修改/删除返回 `NOT_OWNED`；本应用建的多维表格可增改删；每次写入都弹卡 |
 | 16 | 话题越权防护 | 授权群里用户 A 创建话题后，用户 B 在 A 的话题里发普通消息/附件/回答提问 | B 的消息被静默丢弃，不会进入 A 的 Session、不会写入 A 的话题目录；A 自己发言正常 |
 
 ### 5.0 HITL 审批验证点（重点）

@@ -123,13 +123,14 @@ export interface WikiApi {
    */
   listChildren(spaceId: string, parentNodeToken: string | undefined, pageToken?: string): Promise<WikiNodePage>
   /**
-   * Create one empty docx node.
+   * Create one empty docx, spreadsheet, or Base node.
    * @param spaceId Wiki space id.
    * @param parentNodeToken Parent node, or undefined for the space top level.
    * @param title Node title.
+   * @param objType Object kind of the new node.
    * @returns The new node.
    */
-  createDocxNode(spaceId: string, parentNodeToken: string | undefined, title: string): Promise<WikiNode>
+  createNode(spaceId: string, parentNodeToken: string | undefined, title: string, objType: 'docx' | 'sheet' | 'bitable'): Promise<WikiNode>
   /**
    * Current revision of one docx document.
    * @param documentId Docx document id (the node's `objToken`).
@@ -193,7 +194,15 @@ function thrownError(error: unknown): FeishuApiError {
   return new FeishuApiError([code === undefined ? undefined : `code=${code}`, msg].filter(Boolean).join(' '), code)
 }
 
-async function call<T>(request: WikiRawRequest, input: Parameters<WikiRawRequest>[0]): Promise<T> {
+/**
+ * One Feishu OpenAPI call: unwraps `data` and maps a transport error or a
+ * non-zero `code` to {@link FeishuApiError}.
+ *
+ * @param request The SDK's generic request.
+ * @param input Method, URL, query, and body.
+ * @returns The response `data`.
+ */
+export async function call<T>(request: WikiRawRequest, input: Parameters<WikiRawRequest>[0]): Promise<T> {
   let response: FeishuEnvelope<T>
   try {
     response = await request<FeishuEnvelope<T>>(input)
@@ -226,7 +235,13 @@ function wikiNode(raw: RawNode | undefined, where: string): WikiNode {
   }
 }
 
-function segment(value: string): string {
+/**
+ * Encode one URL path segment.
+ *
+ * @param value Raw segment.
+ * @returns The encoded segment.
+ */
+export function segment(value: string): string {
   return encodeURIComponent(value)
 }
 
@@ -265,13 +280,13 @@ export function createWikiApi(request: WikiRawRequest): WikiApi {
         ...(data.has_more === true && data.page_token !== undefined && data.page_token !== '' ? { pageToken: data.page_token } : {}),
       }
     },
-    async createDocxNode(spaceId, parentNodeToken, title) {
+    async createNode(spaceId, parentNodeToken, title, objType) {
       const url = `/open-apis/wiki/v2/spaces/${segment(spaceId)}/nodes`
       const data = await call<{ node?: RawNode }>(request, {
         method: 'POST',
         url,
         data: {
-          obj_type: 'docx',
+          obj_type: objType,
           node_type: 'origin',
           title,
           ...(parentNodeToken === undefined ? {} : { parent_node_token: parentNodeToken }),
