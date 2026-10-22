@@ -309,6 +309,13 @@ export const configSchema = z.object({
    */
   welcomeOnboarding: z.boolean().default(true),
   /**
+   * Sync the command registry to Feishu's native `/` panel on every connect
+   * (needs the `application:app_slash_command:read`/`write` scopes). Off by
+   * default: some tenants forbid apps from adding slash commands. When off,
+   * the plugin neither reads nor writes the panel.
+   */
+  slashCommandPanel: z.boolean().default(false),
+  /**
    * Allow `/permissions <name>` to switch this Session's sandbox + approval
    * preset from Feishu. Read-only `/permissions` always works; switching is
    * security-sensitive (it can widen the sandbox), so it is off by default.

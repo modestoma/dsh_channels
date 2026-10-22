@@ -1147,6 +1147,7 @@ export class FeishuService {
         ownerLookupFailed: this.config.accessMode === 'guarded'
           && this.configuredAdminUserId() === undefined
           && this.appOwner !== undefined && 'error' in this.appOwner && this.appOwner.apiRejected,
+        slashCommandPanel: this.config.slashCommandPanel,
       })
       state = result.consoleUrl === undefined
         ? { state: 'ok', checkedAt: Date.now() }
@@ -1390,7 +1391,7 @@ export class FeishuService {
     await channel.connect()
     // Background: the results only feed the panel and the log.
     void this.runScopeCheck(channel, appId, ownerLookup)
-    void this.runSlashCommandSync(channel)
+    if (this.config.slashCommandPanel) void this.runSlashCommandSync(channel)
     // Repair cards a previous instance left mid-flight (best-effort, background).
     void this.repair.repairAll().catch((error: unknown) => {
       this.ctx.logger?.warn?.('dsh-channels: inflight repair failed: %s', String(error))

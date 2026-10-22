@@ -40,6 +40,8 @@ export interface ScopeCheckContext {
    * mode without `adminUserId`).
    */
   readonly ownerLookupFailed: boolean
+  /** The native slash-command panel sync is enabled (`slashCommandPanel`). */
+  readonly slashCommandPanel: boolean
 }
 
 /** A requirement none of whose scopes is granted. */
@@ -70,6 +72,10 @@ const BASE_REQUIREMENTS: readonly ScopeRequirement[] = [
   { anyOf: ['im:message.reactions:write_only', 'im:message'], level: 'optional', purpose: '给消息添加/移除处理中表情' },
   { anyOf: ['im:message:readonly', 'im:message'], level: 'optional', purpose: '读取引用消息、话题历史与 feishu_topic_messages' },
   { anyOf: ['im:chat:readonly', 'im:chat'], level: 'optional', purpose: '机器人入群后读取群信息、发送群信息卡' },
+]
+
+/** Panel sync needs, applicable while `slashCommandPanel` is on. */
+const SLASH_COMMAND_REQUIREMENTS: readonly ScopeRequirement[] = [
   { anyOf: ['application:app_slash_command:read'], level: 'optional', purpose: '读取飞书原生斜杠指令面板，连接后同步插件命令' },
   { anyOf: ['application:app_slash_command:write'], level: 'optional', purpose: '写入飞书原生斜杠指令面板（输入 / 时列出插件命令）' },
 ]
@@ -116,7 +122,7 @@ export function scopeConsoleUrl(appId: string, scopes: readonly string[]): strin
 /**
  * The requirements that apply under `context`, in display order.
  *
- * @param context Runtime facts (DM mode, mention requirement, owner-fallback need).
+ * @param context Runtime facts (DM mode, mention requirement, panel sync, owner-fallback need).
  * @returns Requirement table for this connection.
  */
 export function scopeRequirements(context: ScopeCheckContext): readonly ScopeRequirement[] {
@@ -124,6 +130,7 @@ export function scopeRequirements(context: ScopeCheckContext): readonly ScopeReq
     ...(context.dmEnabled ? [DM_REQUIREMENT] : []),
     ...(context.requireMention ? MENTION_GROUP_REQUIREMENTS : [ALL_GROUP_REQUIREMENT]),
     ...BASE_REQUIREMENTS,
+    ...(context.slashCommandPanel ? SLASH_COMMAND_REQUIREMENTS : []),
   ]
 }
 

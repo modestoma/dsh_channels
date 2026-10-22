@@ -25,7 +25,7 @@
    | `im:message.reactions:write_only`（发送、删除消息表情回复） | Typing / DONE / No 表态 |
    | `im:message:update`（更新消息卡片） | 流式卡片刷新（patch） |
    | `im:chat:readonly` 一类（获取群信息） | 入群通知卡展示群名/成员数（具体 scope 以控制台要求为准） |
-   | `application:app_slash_command:read` 与 `application:app_slash_command:write`（读取/管理应用斜杠指令，可选） | 连接后把插件命令同步到飞书原生斜杠指令面板（输入 `/` 时列出，客户端约 5 分钟后刷新）；缺失时只是面板没有列表，直接输入命令不受影响 |
+   | `application:app_slash_command:read` 与 `application:app_slash_command:write`（读取/管理应用斜杠指令，可选，仅 `slashCommandPanel: true` 时需要） | 连接后把插件命令同步到飞书原生斜杠指令面板（输入 `/` 时列出，客户端约 5 分钟后刷新）；缺失时只是面板没有列表，直接输入命令不受影响 |
 
    > 卡片更新接口本身支持 `im:message` 一项即可，但建议把 `im:message:update` 也加上，避免组合差异。
    >

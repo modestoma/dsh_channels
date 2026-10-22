@@ -130,6 +130,7 @@ const OPTIONAL_TEXT_KEYS = new Set<EditableKey>([
 const BOOLEAN_KEYS = new Set<EditableKey>([
   'requireMention',
   'welcomeOnboarding',
+  'slashCommandPanel',
   'allowPermissionSwitch',
   'acceptAttachments',
   'prefetchImages',
@@ -174,6 +175,7 @@ const FIELD_META: Record<EditableKey, { label: string; help: string; min?: numbe
   requireMention: { label: '普通群需 @ 机器人', help: '已绑定的主题内始终不需要 @；关闭后普通群的每条消息都会触发。' },
   threadFallback: { label: '话题被拒时的兜底', help: 'degrade 降级为会话级路由；strict 直接让回复失败。' },
   welcomeOnboarding: { label: '首次私聊引导卡', help: '每个私聊会话第一次触达时发送一张命令与用法引导卡，只发一次。' },
+  slashCommandPanel: { label: '同步飞书原生斜杠指令面板', help: '连接时把插件命令同步到飞书输入 / 时弹出的面板；需开通 application:app_slash_command:read 与 write 权限，部分企业不允许应用添加斜杠指令。关闭时不读写面板，直接输入命令不受影响。' },
   allowPermissionSwitch: { label: '允许飞书侧切换权限预设', help: '安全敏感：开启后话题所有者可用 /permissions 切换沙箱与审批预设。' },
   adminUserId: {
     label: '管理员 user_id',
@@ -289,6 +291,7 @@ const GROUP_OF: Record<EditableKey, EditableFieldWire['group']> = {
   requireMention: 'behavior',
   threadFallback: 'behavior',
   welcomeOnboarding: 'behavior',
+  slashCommandPanel: 'behavior',
   allowPermissionSwitch: 'behavior',
   adminUserId: 'access',
   accessMode: 'access',
