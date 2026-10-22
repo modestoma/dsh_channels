@@ -28,8 +28,8 @@ export interface CardDeliveryDeps {
 }
 
 export class CardDelivery {
-  /** Inbound message ids whose command result replaces that message's card. */
-  private readonly inPlace = new Set<string>()
+  /** Open `replacingCard` scopes per message id; overlapping clicks nest. */
+  private readonly inPlace = new Map<string, number>()
 
   constructor(private readonly deps: CardDeliveryDeps) {}
 
@@ -39,11 +39,13 @@ export class CardDelivery {
    * Used for picker clicks, whose synthetic message id is the picker card.
    */
   async replacingCard(messageId: string, operation: () => Promise<void>): Promise<void> {
-    this.inPlace.add(messageId)
+    this.inPlace.set(messageId, (this.inPlace.get(messageId) ?? 0) + 1)
     try {
       await operation()
     } finally {
-      this.inPlace.delete(messageId)
+      const remaining = (this.inPlace.get(messageId) ?? 1) - 1
+      if (remaining === 0) this.inPlace.delete(messageId)
+      else this.inPlace.set(messageId, remaining)
     }
   }
 
