@@ -97,7 +97,7 @@ import { ACTIVITY_BUILD_MARKER, TurnStreamer } from './streamer.ts'
 import type { ProjectedStats, StreamerHooks } from './streamer.ts'
 import type { FeishuConfig } from './config.ts'
 import type {
-  AccessMutationResponse, AccessRequestWire, AccessWire, ScopeCheckWire, SlashCommandSyncWire,
+  AccessMutationResponse, AccessRequestWire, AccessWire, CredentialField, ScopeCheckWire, SlashCommandSyncWire,
 } from './settings/contract.ts'
 import { checkScopes } from './feishu/scopes.ts'
 import { desiredSlashCommands, syncSlashCommands } from './feishu/slash-commands.ts'
@@ -1281,10 +1281,10 @@ export class FeishuService {
   health(): HealthSnapshot { return this.healthSnapshot() }
 
   /**
-   * Credential facts for the two Feishu refs. Values are never returned:
+   * Credential facts for the panel's credential refs. Values are never returned:
    * `describe()` reports presence/source/writability only.
    */
-  async credentialStates(): Promise<{ appId: CredentialInfo; appSecret: CredentialInfo }> {
+  async credentialStates(): Promise<Record<CredentialField, CredentialInfo>> {
     const provider = this.credentialProvider()
     const read = async (ref: string): Promise<CredentialInfo> => {
       try {
@@ -1305,8 +1305,10 @@ export class FeishuService {
         return { configured: false, writable: false }
       }
     }
-    const [appId, appSecret] = await Promise.all([read(this.config.appId), read(this.config.appSecret)])
-    return { appId, appSecret }
+    const [appId, appSecret, analyzeToken] = await Promise.all([
+      read(this.config.appId), read(this.config.appSecret), read(this.config.analyzeToken),
+    ])
+    return { appId, appSecret, analyzeToken }
   }
 
   /** The host credentials seam, when mounted. */
@@ -1314,8 +1316,8 @@ export class FeishuService {
     return this.ctx.get?.('credentials') as CredentialProvider | undefined
   }
 
-  /** Store one Feishu credential value through the host seam; the value is never logged. */
-  async setCredential(field: 'appId' | 'appSecret', value: string): Promise<void> {
+  /** Store one credential value through the host seam; the value is never logged. */
+  async setCredential(field: CredentialField, value: string): Promise<void> {
     const provider = this.credentialProvider()
     if (provider?.set === undefined) {
       throw new Error('主机的凭据服务不可写（未挂载 credentials.set，或当前提供方只读）')
@@ -1329,8 +1331,8 @@ export class FeishuService {
     await this.refreshReadiness()
   }
 
-  /** Remove the stored value of one Feishu credential reference. */
-  async clearCredential(field: 'appId' | 'appSecret'): Promise<void> {
+  /** Remove the stored value of one credential reference. */
+  async clearCredential(field: CredentialField): Promise<void> {
     const provider = this.credentialProvider()
     if (provider?.unset === undefined) {
       throw new Error('主机的凭据服务不支持移除凭据')
@@ -1345,8 +1347,12 @@ export class FeishuService {
   }
 
   /** The overlay-independent ref name backing one editable credential slot. */
-  private credentialRef(field: 'appId' | 'appSecret'): string {
-    return field === 'appId' ? this.config.appId : this.config.appSecret
+  private credentialRef(field: CredentialField): string {
+    switch (field) {
+      case 'appId': return this.config.appId
+      case 'appSecret': return this.config.appSecret
+      case 'analyzeToken': return this.config.analyzeToken
+    }
   }
 
   /** Wire events and open the long connection. */

@@ -95,7 +95,7 @@ export interface SettingsTarget {
   runningConfigSnapshot(): FeishuConfig | undefined
   applyOverlay(overlay: OverlayPatch): void
   restart(): Promise<void>
-  credentialStates(): Promise<{ appId: CredentialInfo; appSecret: CredentialInfo }>
+  credentialStates(): Promise<Record<CredentialField, CredentialInfo>>
   setCredential(field: CredentialField, value: string): Promise<void>
   clearCredential(field: CredentialField): Promise<void>
   /** Current admission snapshot: mode, administrator, whitelists, pending requests. */
@@ -120,6 +120,9 @@ export interface CredentialInfo {
 }
 
 const RESTART_SET = new Set<string>(RESTART_KEYS)
+
+/** Every credential slot the panel writes, in form order. */
+const CREDENTIAL_FIELDS: readonly CredentialField[] = ['appId', 'appSecret', 'analyzeToken']
 
 /** Optional text fields: an empty string in the panel clears the override. */
 const OPTIONAL_TEXT_KEYS = new Set<EditableKey>([
@@ -253,7 +256,7 @@ const FIELD_META: Record<EditableKey, { label: string; help: string; min?: numbe
   allowPermissionSwitch: { label: '允许飞书侧切换权限预设', help: '安全敏感：开启后话题所有者可用 /permissions 切换沙箱与审批预设。' },
   analyzeListen: {
     label: '日志分析接口监听地址',
-    help: '日志平台调用 POST /dsh-channels/analyze 的独立端口，格式 host:port（如 0.0.0.0:3090）；留空 = 关闭接口；需重连生效。请求需带 Authorization: Bearer <令牌>，令牌存放在 DSH 凭据 DSH_CHANNELS_ANALYZE_TOKEN（可用 analyzeToken 改引用名）。',
+    help: '日志平台调用 POST /dsh-channels/analyze 的独立端口，格式 host:port（如 0.0.0.0:3090）；留空 = 关闭接口；需重连生效。请求需带 Authorization: Bearer <令牌>，令牌在本页下方「日志分析接口令牌」卡片填写。',
     placeholder: '留空 = 关闭',
   },
   analyzeLogTimeoutMs: {
@@ -769,9 +772,10 @@ export class SettingsSurface {
       this.directoryPicker?.available === true,
     )
 
-    let credentialStates: { appId: CredentialInfo; appSecret: CredentialInfo } = {
+    let credentialStates: Record<CredentialField, CredentialInfo> = {
       appId: { configured: false, writable: false },
       appSecret: { configured: false, writable: false },
+      analyzeToken: { configured: false, writable: false },
     }
     try {
       credentialStates = await this.target.credentialStates()
@@ -787,6 +791,7 @@ export class SettingsSurface {
     const credentials: PanelConfigWire['credentials'] = {
       appId: toWire(effective.appId, credentialStates.appId),
       appSecret: toWire(effective.appSecret, credentialStates.appSecret),
+      analyzeToken: toWire(effective.analyzeToken, credentialStates.analyzeToken),
     }
 
     // The access snapshot comes from in-memory maps, but a broken seam must
@@ -930,7 +935,7 @@ export class SettingsSurface {
     if (busy !== undefined) return busy
     const writes: Array<{ field: CredentialField; value: string }> = []
     const issues: FieldIssueWire[] = []
-    for (const field of ['appId', 'appSecret'] as const) {
+    for (const field of CREDENTIAL_FIELDS) {
       const raw = values[field]
       if (raw === undefined) continue
       const normalized = normalizeCredentialValue(raw)
@@ -941,12 +946,15 @@ export class SettingsSurface {
       writes.push({ field, value: normalized.value })
     }
     if (issues.length > 0) return { ok: false, error: '凭据校验失败', issues }
-    if (writes.length === 0) return { ok: false, error: '请至少填写一项凭据（App ID 或 App Secret）' }
+    if (writes.length === 0) return { ok: false, error: '请至少填写一项凭据' }
 
     try {
       for (const write of writes) await this.target.setCredential(write.field, write.value)
     } catch (error) {
       return { ok: false, error: messageOf(error) }
+    }
+    if (writes.every(write => write.field === 'analyzeToken')) {
+      return { ok: true, panel: await this.panel(), reconnect: 'not-needed' }
     }
     return this.finishCredentialChange('save')
   }
@@ -955,7 +963,7 @@ export class SettingsSurface {
   async clearCredential(field: CredentialField): Promise<ClearCredentialResponse> {
     const busy = this.writeBusy()
     if (busy !== undefined) return busy
-    if (field !== 'appId' && field !== 'appSecret') {
+    if (!CREDENTIAL_FIELDS.includes(field)) {
       return { ok: false, error: '未知的凭据字段' }
     }
     try {
@@ -963,6 +971,7 @@ export class SettingsSurface {
     } catch (error) {
       return { ok: false, error: messageOf(error) }
     }
+    if (field === 'analyzeToken') return { ok: true, panel: await this.panel(), reconnect: 'not-needed' }
     return this.finishCredentialChange('clear')
   }
 
