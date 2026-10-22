@@ -91,10 +91,16 @@ const SEND_FILE_REQUIREMENT: ScopeRequirement = {
   anyOf: ['im:resource', 'im:resource:upload'], level: 'optional', purpose: '上传图片/文件，让模型用 feishu_send_file 把生成的文件发给用户',
 }
 
-/** Spreadsheet and Base read needs, shared by the wiki read and write sets. */
+/**
+ * Spreadsheet and Base read needs, shared by the wiki read and write sets. The
+ * `sheet_ai/v2` and `base/v3` APIs accept only their fine-grained scopes; the
+ * classic `sheets:spreadsheet` / `bitable:app` grants do not satisfy them.
+ */
 const SHEET_BASE_READ_REQUIREMENTS: readonly ScopeRequirement[] = [
-  { anyOf: ['sheets:spreadsheet', 'sheets:spreadsheet:readonly', 'sheets:spreadsheet:read'], level: 'optional', purpose: '读取知识库电子表格（feishu_wiki_sheet_read）' },
-  { anyOf: ['bitable:app', 'bitable:app:readonly', 'base:record:read'], level: 'optional', purpose: '读取知识库多维表格（feishu_wiki_base_read）' },
+  { anyOf: ['sheets:spreadsheet:read'], level: 'optional', purpose: '读取知识库电子表格（feishu_wiki_sheet_read）' },
+  { anyOf: ['base:table:read'], level: 'optional', purpose: '列出知识库多维表格的数据表（feishu_wiki_base_read）' },
+  { anyOf: ['base:field:read'], level: 'optional', purpose: '读取知识库多维表格的字段（feishu_wiki_base_read）' },
+  { anyOf: ['base:record:read'], level: 'optional', purpose: '读取知识库多维表格的记录（feishu_wiki_base_read）' },
 ]
 
 /** Wiki read needs (`feishu_wiki_list` / `feishu_wiki_read` and the sheet/base read tools). */
@@ -108,10 +114,10 @@ const WIKI_READ_REQUIREMENTS: readonly ScopeRequirement[] = [
 const WIKI_WRITE_REQUIREMENTS: readonly ScopeRequirement[] = [
   { anyOf: ['wiki:wiki'], level: 'optional', purpose: '在知识库中新建节点（feishu_wiki_create）' },
   { anyOf: ['docx:document'], level: 'optional', purpose: '写入与修改知识库文档内容（feishu_wiki_create / feishu_wiki_edit）' },
-  { anyOf: ['sheets:spreadsheet', 'sheets:spreadsheet:write_only'], level: 'optional', purpose: '写入知识库电子表格（feishu_wiki_sheet_edit）' },
-  { anyOf: ['bitable:app', 'base:record:create'], level: 'optional', purpose: '新增知识库多维表格记录（feishu_wiki_base_edit）' },
-  { anyOf: ['bitable:app', 'base:record:update'], level: 'optional', purpose: '修改本应用创建的多维表格中的记录（feishu_wiki_base_edit）' },
-  { anyOf: ['bitable:app', 'base:record:delete'], level: 'optional', purpose: '删除本应用创建的多维表格中的记录（feishu_wiki_base_edit）' },
+  { anyOf: ['sheets:spreadsheet:write_only'], level: 'optional', purpose: '写入知识库电子表格（feishu_wiki_sheet_edit）' },
+  { anyOf: ['base:record:create'], level: 'optional', purpose: '新增知识库多维表格记录（feishu_wiki_base_edit）' },
+  { anyOf: ['base:record:update'], level: 'optional', purpose: '修改本应用创建的多维表格中的记录（feishu_wiki_base_edit）' },
+  { anyOf: ['base:record:delete'], level: 'optional', purpose: '删除本应用创建的多维表格中的记录（feishu_wiki_base_edit）' },
   ...SHEET_BASE_READ_REQUIREMENTS,
 ]
 

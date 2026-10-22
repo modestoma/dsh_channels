@@ -298,16 +298,18 @@ export const configSchema = z.object({
    *   `feishu_wiki_base_read` so the model can browse the wiki nodes under
    *   `wikiRoots` and read docx documents, spreadsheets, and Bases there.
    *   Needs `wiki:wiki` (or `wiki:wiki:readonly`), `docx:document` (or
-   *   `docx:document:readonly`), `sheets:spreadsheet` (or a read-only
-   *   spreadsheet scope), and `bitable:app` (or a read-only Base scope).
+   *   `docx:document:readonly`), `sheets:spreadsheet:read`, and
+   *   `base:table:read` + `base:field:read` + `base:record:read` (the
+   *   classic `sheets:spreadsheet` / `bitable:app` grants do not apply).
    * - `wikiWrite` (default off): register `feishu_wiki_create`,
    *   `feishu_wiki_edit`, `feishu_wiki_sheet_edit`, and
    *   `feishu_wiki_base_edit` so the model can create docx documents,
    *   spreadsheets, and Bases under `wikiRoots`, edit documents and
    *   spreadsheets this app owns, and change records of Bases this app owns
    *   (other Bases accept new records only). Needs `wiki:wiki`,
-   *   `docx:document`, `sheets:spreadsheet`, and `bitable:app` (or the
-   *   matching write-only scopes).
+   *   `docx:document`, `sheets:spreadsheet:write_only`, and
+   *   `base:record:create` / `base:record:update` / `base:record:delete`,
+   *   plus the read scopes above.
    *
    * The wiki tools act with the app identity and are mounted only while
    * `wikiRoots` is non-empty. Each call is limited to topics whose owner is
