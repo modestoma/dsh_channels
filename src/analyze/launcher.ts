@@ -8,9 +8,12 @@
  * the Session, the log package downloads, the group-shared route, and the
  * first turn, which renders quietly (once, when it ends) into the placeholder.
  *
- * Follow-ups then use the ordinary topic routing: the route is `shared`, so
- * every member admitted in the group may continue it. A failure before the
- * first turn replaces the placeholder with a failure card and leaves no route.
+ * The topic is reserved in the inbound router from its creation until the
+ * route and the first prompt are published, so replies posted meanwhile queue
+ * behind the first turn. Follow-ups then use the ordinary topic routing: the
+ * route is `shared`, so every member admitted in the group may continue it. A
+ * failure before the first turn (including cancellation on shutdown) replaces
+ * the placeholder with a failure card and leaves no route.
  *
  * @module dsh-channels/analyze/launcher
  */
@@ -52,6 +55,12 @@ export interface AnalyzeLauncherDeps {
   streamer(): TurnStreamer | undefined
   /** Shared per-route FIFO (the first turn must precede any follow-up). */
   queue: RouteOperationQueue
+  /**
+   * Reserve an opened topic until its route is published, so replies posted
+   * meanwhile wait instead of being dropped or starting a competing Session.
+   * The returned closer is called exactly once.
+   */
+  reserveTopic(threadId: string): () => void
   /** Whether the analyze API may post into the group. */
   mayAnalyzeIn(chatId: string): boolean
   /** Resolve the configured bearer token; undefined when unresolvable. */
@@ -88,6 +97,8 @@ export class AnalyzeLauncher implements AnalyzeHandler {
   private readonly accepting = new Map<string, PendingAccept>()
   /** Background analyses still starting (drained on shutdown). */
   private readonly running = new Set<Promise<void>>()
+  /** Cancellation of each background analysis still starting. */
+  private readonly cancels = new Set<AbortController>()
 
   constructor(private readonly deps: AnalyzeLauncherDeps) {}
 
@@ -111,8 +122,12 @@ export class AnalyzeLauncher implements AnalyzeHandler {
     }
   }
 
-  /** Wait for every background analysis that is still starting. */
+  /**
+   * Cancel every background analysis that is still starting (log downloads
+   * abort at once; each analysis ends on its failure card) and wait for them.
+   */
   async drain(): Promise<void> {
+    for (const cancel of this.cancels) cancel.abort()
     await Promise.allSettled([...this.running])
   }
 
@@ -167,8 +182,14 @@ export class AnalyzeLauncher implements AnalyzeHandler {
       this.deps.ctx.logger?.warn?.(message, ...args)
     }
     let handle: AgentHandle | undefined
+    let threadId: string | undefined
+    let releaseTopic: (() => void) | undefined
+    let published = false
+    const cancel = new AbortController()
+    this.cancels.add(cancel)
     try {
-      const threadId = await this.openTopic(channel, request.chatId, placeholderId)
+      threadId = await this.openTopic(channel, request.chatId, placeholderId)
+      releaseTopic = this.deps.reserveTopic(threadId)
       const sessionId = randomUUID() as SessionId
       const services = placementServices(this.deps.ctx)
       const workspace = await ensureAnalyzeWorkspace(
@@ -187,10 +208,9 @@ export class AnalyzeLauncher implements AnalyzeHandler {
         })
       }
       await this.deps.sessions.mountGuidance(handle.agent, placement.sessionDir)
-      const logs = await downloadLogs(request.logUrls, placement.sessionDir, {
-        maxBytes: this.deps.config.analyzeLogMaxBytes,
-        timeoutMs: this.deps.config.analyzeLogTimeoutMs,
-      }, this.deps.fetch)
+      const logs = await downloadLogs(
+        request.logUrls, placement.sessionDir, this.deps.config.analyzeLogTimeoutMs, this.deps.fetch, cancel.signal,
+      )
       this.assertStarted()
 
       const createdAt = handle.agent.session.header.createdAt
@@ -222,9 +242,11 @@ export class AnalyzeLauncher implements AnalyzeHandler {
       const agent = handle.agent
       // Route, stream binding, and prompt land in one queue slot, so a reply
       // posted in the topic meanwhile is delivered after the first turn.
-      await this.deps.queue.run(threadId, async () => {
+      const key = threadId
+      await this.deps.queue.run(key, async () => {
         this.assertStarted()
-        await this.deps.routes.put(threadId, record)
+        await this.deps.routes.put(key, record)
+        published = true
         this.deps.streamer()?.attach(agent.session, placeholderId, placeholderId, undefined, {
           quiet: true,
           preface: analyzePreface(subject),
@@ -233,9 +255,17 @@ export class AnalyzeLauncher implements AnalyzeHandler {
       })
     } catch (error) {
       warn('dsh-channels: analysis for %s/%s failed to start: %s', request.app, request.errorCode, String(error))
+      if (published && threadId !== undefined) {
+        await this.deps.routes.remove(threadId).catch((removeError: unknown) => {
+          warn('dsh-channels: removing analysis route %s failed: %s', threadId, String(removeError))
+        })
+      }
       await handle?.dispose().catch(() => {})
       void this.deps.repair.clear(placeholderId)
       await channel.updateCard(placeholderId, buildAnalyzeFailureCard(subject, messageOf(error))).catch(() => {})
+    } finally {
+      this.cancels.delete(cancel)
+      releaseTopic?.()
     }
   }
 

@@ -61,6 +61,29 @@ function bytes(size: number): (req: IncomingMessage, res: ServerResponse) => voi
   }
 }
 
+/** One log package whose response waits until `release()` (an in-flight download). */
+async function heldPackage(size: number): Promise<{ url: string; release(): void }> {
+  let pending: ServerResponse | undefined
+  let released = false
+  const send = (res: ServerResponse): void => {
+    res.writeHead(200, { 'content-type': 'application/zip' })
+    res.end(Buffer.alloc(size, 7))
+  }
+  const base = await serveFiles({
+    '/held.zip': (_req, res) => {
+      if (released) send(res)
+      else pending = res
+    },
+  })
+  return {
+    url: `${base}/held.zip`,
+    release: () => {
+      released = true
+      if (pending !== undefined) send(pending)
+    },
+  }
+}
+
 function request(partial: Partial<AnalyzeRequest> = {}): AnalyzeRequest {
   return {
     requesterUserId: 'u_alice',
@@ -186,9 +209,7 @@ describe('log downloads', () => {
   it('stores packages in order below logs/ with safe names', async () => {
     const base = await serveFiles({ '/a%20b.zip': bytes(10), '/x/b.zip': bytes(20) })
     const dir = tempDir()
-    const logs = await downloadLogs([`${base}/a%20b.zip?sig=1`, `${base}/x/b.zip`], dir, {
-      maxBytes: 100, timeoutMs: 5_000,
-    })
+    const logs = await downloadLogs([`${base}/a%20b.zip?sig=1`, `${base}/x/b.zip`], dir, 5_000)
     expect(logs).toEqual([
       { relativePath: 'logs/01-a_b.zip', bytes: 10 },
       { relativePath: 'logs/02-b.zip', bytes: 20 },
@@ -199,24 +220,39 @@ describe('log downloads', () => {
 
   it('fails on HTTP errors without leaking the query string', async () => {
     const base = await serveFiles({})
-    const failure = downloadLogs([`${base}/missing.zip?sig=secret`], tempDir(), { maxBytes: 100, timeoutMs: 5_000 })
+    const failure = downloadLogs([`${base}/missing.zip?sig=secret`], tempDir(), 5_000)
     await expect(failure).rejects.toThrow(LogDownloadError)
     await expect(failure).rejects.toThrow(/HTTP 404/)
     await expect(failure).rejects.not.toThrow(/secret/)
   })
 
-  it('enforces the shared byte budget and removes the partial file', async () => {
-    const base = await serveFiles({ '/a.zip': bytes(60), '/b.zip': bytes(60) })
+  it('removes the partial file of a failed package', async () => {
+    const base = await serveFiles({
+      '/a.zip': bytes(10),
+      '/b.zip': (_req, res) => {
+        res.writeHead(200, { 'content-type': 'application/zip' })
+        res.write(Buffer.alloc(10, 7))
+        setTimeout(() => res.destroy(), 20)
+      },
+    })
     const dir = tempDir()
-    await expect(downloadLogs([`${base}/a.zip`, `${base}/b.zip`], dir, { maxBytes: 100, timeoutMs: 5_000 }))
-      .rejects.toThrow(/超过上限 100/)
+    await expect(downloadLogs([`${base}/a.zip`, `${base}/b.zip`], dir, 5_000)).rejects.toThrow(LogDownloadError)
+    expect(existsSync(path.join(dir, 'logs', '01-a.zip'))).toBe(true)
     expect(existsSync(path.join(dir, 'logs', '02-b.zip'))).toBe(false)
   })
 
   it('enforces the whole-download deadline', async () => {
     const base = await serveFiles({ '/slow.zip': () => { /* never answers */ } })
-    await expect(downloadLogs([`${base}/slow.zip`], tempDir(), { maxBytes: 100, timeoutMs: 1_000 }))
+    await expect(downloadLogs([`${base}/slow.zip`], tempDir(), 1_000))
       .rejects.toThrow(/超时（1000 ms）/)
+  })
+
+  it('aborts the whole download when the caller cancels', async () => {
+    const base = await serveFiles({ '/slow.zip': () => { /* never answers */ } })
+    const cancel = new AbortController()
+    const download = downloadLogs([`${base}/slow.zip`], tempDir(), 60_000, fetch, cancel.signal)
+    setTimeout(() => cancel.abort(), 20)
+    await expect(download).rejects.toThrow(/下载已取消/)
   })
 
   it('lists the packages after the verbatim prompt', () => {
@@ -348,6 +384,60 @@ describe('analyze service flow', () => {
     expect(JSON.stringify(h.channel.updated[0]!.card)).toContain('HTTP 404')
     expect(h.routes()).toHaveLength(0)
     expect(h.ctxState.agents.created[0]!.handle.dispose).toHaveBeenCalled()
+  })
+
+  it('holds topic replies posted during setup until the analysis prompt is delivered', async () => {
+    const h = await setup()
+    await h.service.addAccessGroup('oc_group')
+    await h.service.addAccessUser('u_bob')
+    const held = await heldPackage(5)
+    await h.launcher.analyze(request({ logUrls: [held.url] }), 'key-1')
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+
+    await h.onMessage(makeMessage({
+      chatId: 'oc_group', threadId: 'omt_2', mentionedBot: false, senderId: 'u_bob', content: '顺便看下内存',
+    }))
+    await new Promise(resolve => setTimeout(resolve, 50))
+    expect(followupMessagesOf(agent)).toHaveLength(0)
+    expect(h.ctxState.agents.created).toHaveLength(1)
+
+    held.release()
+    await waitUntil(() => expect(followupMessagesOf(agent)).toHaveLength(2))
+    expect(followupMessagesOf(agent).map(message => message.content[0]!.text)).toEqual([
+      analyzePromptText('/log-analyze 分析这些日志', [{ relativePath: 'logs/01-held.zip', bytes: 5 }]),
+      '顺便看下内存',
+    ])
+  })
+
+  it('removes the published route when the first prompt cannot be delivered', async () => {
+    const h = await setup()
+    await h.service.addAccessGroup('oc_group')
+    const held = await heldPackage(5)
+    await h.launcher.analyze(request({ logUrls: [held.url] }), 'key-1')
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    const { handle } = h.ctxState.agents.created[0]!
+    vi.mocked(handle.agent.followup).mockImplementationOnce(() => { throw new Error('session closed') })
+
+    held.release()
+    await waitUntil(() => expect(h.channel.updated).toHaveLength(1))
+    expect(JSON.stringify(h.channel.updated[0]!.card)).toContain('session closed')
+    expect(h.routes()).toHaveLength(0)
+    expect(handle.dispose).toHaveBeenCalled()
+  })
+
+  it('cancels a stalled download on shutdown and ends on the failure card', async () => {
+    const h = await setup({ analyzeLogTimeoutMs: 600_000 })
+    await h.service.addAccessGroup('oc_group')
+    const held = await heldPackage(5)
+    await h.launcher.analyze(request({ logUrls: [held.url] }), 'key-1')
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+
+    const startedAt = Date.now()
+    await h.service.shutdown()
+    expect(Date.now() - startedAt).toBeLessThan(2_000)
+    expect(JSON.stringify(h.channel.updated.at(-1)!.card)).toContain('下载已取消')
+    expect(h.routes()).toHaveLength(0)
   })
 
   it('lets admitted group members, and nobody else, follow up and stop the shared topic', async () => {

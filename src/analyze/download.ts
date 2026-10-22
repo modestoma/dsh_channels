@@ -2,7 +2,8 @@
  * Log package download for analyze requests.
  *
  * Packages are fetched in request order into `<sessionDir>/logs/`, streamed to
- * disk under one shared byte budget and one whole-download deadline. The files
+ * disk under one whole-download deadline, and cancelled as a whole when the
+ * caller's signal aborts. Sizes are not limited. The files
  * are stored as received: unpacking belongs to the analysis skill, which runs
  * inside the Session sandbox.
  *
@@ -18,14 +19,6 @@ import type { ReadableStream as WebReadableStream } from 'node:stream/web'
 
 /** Directory below the topic directory that receives the packages. */
 export const ANALYZE_LOG_DIR = 'logs'
-
-/** Download limits of one request. */
-export interface LogDownloadLimits {
-  /** Total byte budget across every package. */
-  readonly maxBytes: number
-  /** Whole-download deadline in milliseconds. */
-  readonly timeoutMs: number
-}
 
 /** One downloaded package. */
 export interface DownloadedLog {
@@ -75,23 +68,29 @@ function displayUrl(url: string): string {
  * Download every package into `<sessionDir>/logs/`.
  * @param urls - package URLs in request order.
  * @param sessionDir - the topic directory.
- * @param limits - shared byte budget and deadline.
+ * @param timeoutMs - whole-download deadline in milliseconds.
  * @param fetchImpl - fetch seam (defaults to the global fetch).
+ * @param signal - cancels the whole download (service shutdown).
  * @returns the downloaded files; rejects with {@link LogDownloadError}.
  */
 export async function downloadLogs(
   urls: readonly string[],
   sessionDir: string,
-  limits: LogDownloadLimits,
+  timeoutMs: number,
   fetchImpl: FetchLike = fetch,
+  signal?: AbortSignal,
 ): Promise<DownloadedLog[]> {
   const directory = path.join(sessionDir, ANALYZE_LOG_DIR)
   await mkdir(directory, { recursive: true })
   const controller = new AbortController()
   const timer = setTimeout(() => {
-    controller.abort(new LogDownloadError(`日志包下载超时（${limits.timeoutMs} ms）`))
-  }, limits.timeoutMs)
-  let remaining = limits.maxBytes
+    controller.abort(new LogDownloadError(`日志包下载超时（${timeoutMs} ms）`))
+  }, timeoutMs)
+  const onCancel = (): void => {
+    controller.abort(new LogDownloadError('日志包下载已取消（飞书渠道已断开）'))
+  }
+  if (signal?.aborted === true) onCancel()
+  else signal?.addEventListener('abort', onCancel, { once: true })
   const downloaded: DownloadedLog[] = []
   try {
     for (const [index, url] of urls.entries()) {
@@ -108,38 +107,33 @@ export async function downloadLogs(
         throw new LogDownloadError(`下载 ${label} 失败：HTTP ${response.status}`)
       }
       let written = 0
-      const budget = new Transform({
+      const counter = new Transform({
         transform(chunk: Buffer, _encoding, callback) {
           written += chunk.length
-          if (written > remaining) {
-            callback(new LogDownloadError(`日志包总大小超过上限 ${limits.maxBytes} 字节（在 ${label} 处）`))
-            return
-          }
           callback(null, chunk)
         },
       })
       try {
         await pipeline(
           Readable.fromWeb(response.body as WebReadableStream<Uint8Array>),
-          budget,
+          counter,
           createWriteStream(target),
           { signal: controller.signal },
         )
       } catch (error) {
         await rm(target, { force: true }).catch(() => undefined)
-        if (error instanceof LogDownloadError) throw error
         throw failure(controller, `下载 ${label} 失败：${messageOf(error)}`)
       }
-      remaining -= written
       downloaded.push({ relativePath: path.posix.join(ANALYZE_LOG_DIR, name), bytes: written })
     }
     return downloaded
   } finally {
     clearTimeout(timer)
+    signal?.removeEventListener('abort', onCancel)
   }
 }
 
-/** The deadline's own error when the shared signal fired, otherwise `fallback`. */
+/** The deadline's or cancellation's own error when the shared signal fired, otherwise `fallback`. */
 function failure(controller: AbortController, fallback: string): LogDownloadError {
   const reason: unknown = controller.signal.reason
   return controller.signal.aborted && reason instanceof LogDownloadError ? reason : new LogDownloadError(fallback)

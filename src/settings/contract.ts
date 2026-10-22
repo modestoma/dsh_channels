@@ -63,7 +63,6 @@ export const EDITABLE_KEYS = [
   'allowPermissionSwitch',
   // 日志平台分析接口（访问令牌是凭据引用 analyzeToken，值写在 DSH 凭据里）
   'analyzeListen',
-  'analyzeLogMaxBytes',
   'analyzeLogTimeoutMs',
   // 准入与授权（管理员/准入模式/申请有效期；白名单由「访问与授权」卡片管理）
   'adminUserId',

@@ -566,6 +566,7 @@ export class FeishuService {
       sessions: this.sessions,
       streamer: () => this.streamer,
       queue: this.routeOperations,
+      reserveTopic: threadId => this.inbound.reserveTopic(threadId),
       mayAnalyzeIn: chatId => this.accessController.mayAnalyzeIn(chatId),
       resolveToken: () => resolveCredentialRef(this.ctx, this.config.analyzeToken).catch(() => undefined),
     })
@@ -1539,7 +1540,7 @@ export class FeishuService {
 
   /**
    * Bind the analyze listener when `analyzeListen` is set. A bind failure is
-   * logged and surfaced on the status line; the Feishu connection stays up.
+   * logged and folded into the health snapshot (panel reasons, `/health`); the Feishu connection stays up.
    */
   private async openAnalyzeListener(): Promise<void> {
     this.analyzeListenError = undefined
@@ -1556,17 +1557,6 @@ export class FeishuService {
       this.analyzeListenError = messageOf(error)
       this.ctx.logger?.error?.('dsh-channels: analyze listener on %s failed: %s', listen, this.analyzeListenError)
       console.error('[dsh-channels] 日志分析接口监听失败:', listen, error)
-    }
-  }
-
-  /** Analyze listener state for the status surface. */
-  analyzeListenerState(): { listen?: string; error?: string } {
-    const listen = this.analyzeServer === undefined
-      ? undefined
-      : `${this.analyzeServer.address.address}:${this.analyzeServer.address.port}`
-    return {
-      ...(listen === undefined ? {} : { listen }),
-      ...(this.analyzeListenError === undefined ? {} : { error: this.analyzeListenError }),
     }
   }
 
@@ -2506,6 +2496,7 @@ export class FeishuService {
       routeCount: this.routes.size(),
       liveAgentCount: this.sessions.liveCount(),
       inflightTurnCount,
+      ...(this.analyzeListenError === undefined ? {} : { analyzeListenError: this.analyzeListenError }),
     })
   }
 

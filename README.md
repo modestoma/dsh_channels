@@ -279,7 +279,6 @@ npm 发行包已包含构建产物：Host 入口是 `lib/index.js`（profile 直
     authRequestTtlDays: 7               # 入群/用户授权申请卡有效期（天，1–30）
     analyzeListen: '0.0.0.0:3090'       # 日志平台分析接口的独立监听地址（不填 = 关闭；改后需重连）
     analyzeToken: 'DSH_CHANNELS_ANALYZE_TOKEN' # 分析接口 Bearer 令牌的凭据引用名（值写在 .credentials.yaml）
-    analyzeLogMaxBytes: 1073741824      # 单次分析所有日志包的下载总量上限（1 GiB）
     analyzeLogTimeoutMs: 600000         # 单次分析日志包下载总超时（10 分钟）
     loggerLevel: 'info'
 ```
@@ -356,7 +355,7 @@ FEISHU_APP_SECRET: xxxxxxxx
 
 日志平台选中一个或多个同类不良日志包后，调用插件的分析接口：插件在指定群里发一张占位卡，下载日志包，把平台给的 prompt 原样交给一个新 Session（prompt 开头的斜杠命令由 DSH 展开成对应 skill），分析结束后**一次性**把结果写回这张占位卡（不流式）。群里通过准入的成员都可以在该话题内追问。
 
-**开启**：配置 `analyzeListen`（如 `0.0.0.0:3090`，面板「行为」页可改，需重连），并在 `$DSH_HOME/.credentials.yaml` 写入令牌 `DSH_CHANNELS_ANALYZE_TOKEN: <随机长串>`（引用名可用 `analyzeToken` 修改）。接口跑在独立端口上，与 DSH Web 端口无关；令牌每次请求都重新解析，轮换后下一次请求生效；令牌缺失时所有请求返回 503。
+**开启**：配置 `analyzeListen`（如 `0.0.0.0:3090`，面板「行为」页可改，需重连），并在 `$DSH_HOME/.credentials.yaml` 写入令牌 `DSH_CHANNELS_ANALYZE_TOKEN: <随机长串>`（引用名可用 `analyzeToken` 修改）。接口跑在独立端口上，与 DSH Web 端口无关；令牌每次请求都重新解析，轮换后下一次请求生效；令牌缺失时所有请求返回 503。端口绑定失败不影响飞书连接，健康等级降为「降级」，面板「健康判定」与 `/health` 卡片会显示失败原因。
 
 **请求**：
 
@@ -380,7 +379,7 @@ Content-Type: application/json
 - `app` / `errorCode`：只允许 `A-Z a-z 0-9 . _ -`（1–128 字符），决定工作区 `<baseDir>/analyze/<app>/<errorCode>/`；同一应用同一错误码的所有分析都在这个工作区里，每次分析各有一个话题目录。
 - `chatId`：目标群，必须是已授权群（`/auth group add` 或面板「访问与授权」），机器人需在群内；`accessMode: open` 时不校验。
 - `prompt`：原样作为首条用户消息，末尾追加一个 `<analyze_logs>` 块，列出下载到话题目录的日志包（如 `logs/01-1.zip`）。解压与分析由 skill 完成，插件不解压。
-- `logUrls`：1–50 个 http(s) 地址（不能带账号密码），按顺序下载，总量受 `analyzeLogMaxBytes`、总时长受 `analyzeLogTimeoutMs` 限制。
+- `logUrls`：1–50 个 http(s) 地址（不能带账号密码），按顺序下载，总时长受 `analyzeLogTimeoutMs` 限制，不限大小。
 
 **响应**：校验通过、占位卡发出后立即返回 `202`：
 

@@ -83,9 +83,6 @@ export const DEFAULT_PROMPT_CONTEXT_TIMEOUT_MS = 3_000
 /** Conventional credential reference holding the log-platform analyze API bearer token. */
 export const DEFAULT_ANALYZE_TOKEN_REF = 'DSH_CHANNELS_ANALYZE_TOKEN'
 
-/** Default total download budget of one analyze request's log packages (1 GiB). */
-export const DEFAULT_ANALYZE_LOG_MAX_BYTES = 1024 * 1024 * 1024
-
 /** Default whole-download timeout of one analyze request's log packages (10 min). */
 export const DEFAULT_ANALYZE_LOG_TIMEOUT_MS = 10 * 60 * 1000
 
@@ -439,8 +436,6 @@ export const configSchema = z.object({
    * applies to the next request; an unresolvable token refuses every request.
    */
   analyzeToken: credentialRefSchema.default(DEFAULT_ANALYZE_TOKEN_REF),
-  /** Total download budget of one analyze request's log packages (default 1 GiB). */
-  analyzeLogMaxBytes: z.number().int().min(1).default(DEFAULT_ANALYZE_LOG_MAX_BYTES),
   /** Whole-download timeout of one analyze request's log packages (default 10 min). */
   analyzeLogTimeoutMs: z.number().int().min(1_000).max(MAX_TIMER_DELAY_MS)
     .default(DEFAULT_ANALYZE_LOG_TIMEOUT_MS),

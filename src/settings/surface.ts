@@ -256,12 +256,6 @@ const FIELD_META: Record<EditableKey, { label: string; help: string; min?: numbe
     help: '日志平台调用 POST /dsh-channels/analyze 的独立端口，格式 host:port（如 0.0.0.0:3090）；留空 = 关闭接口；需重连生效。请求需带 Authorization: Bearer <令牌>，令牌存放在 DSH 凭据 DSH_CHANNELS_ANALYZE_TOKEN（可用 analyzeToken 改引用名）。',
     placeholder: '留空 = 关闭',
   },
-  analyzeLogMaxBytes: {
-    label: '单次分析日志包总量上限（字节）',
-    help: '一次分析请求所有日志包的下载总字节预算（默认 1073741824 = 1 GiB）；超出则分析不启动，占位卡显示失败原因。',
-    min: 1,
-    step: 1,
-  },
   analyzeLogTimeoutMs: {
     label: '单次分析日志包下载超时（ms）',
     help: '一次分析请求下载全部日志包的总超时（默认 600000 = 10 分钟，至少 1000）。',
@@ -403,7 +397,6 @@ const GROUP_OF: Record<EditableKey, EditableFieldWire['group']> = {
   slashCommandPanel: 'behavior',
   allowPermissionSwitch: 'behavior',
   analyzeListen: 'behavior',
-  analyzeLogMaxBytes: 'behavior',
   analyzeLogTimeoutMs: 'behavior',
   adminUserId: 'access',
   accessMode: 'access',
