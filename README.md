@@ -88,7 +88,7 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 
 **连接状态**：阶段徽标（待配置 / 未连接 / 连接中 / 已连接 / 连接失败）、飞书长连接状态、Bot open_id 尾号、运行时长、话题路由数 / 活动会话 / 在途回复、最近一次连接失败原因；每 5 秒自动刷新，也可手动刷新或**重启飞书连接**（会断开当前长连接并中断进行中的回复）。徽标不是健康时会额外显示「健康判定」原因——健康等级由宿主**所有 Cordis fiber** 折叠而来，因此「降级」也可能来自其它插件入口仍在等待依赖/加载（与飞书通道无关），原因行会列出对应插件名；「连接失败」只针对飞书连接本身，插件入口保持加载。
 
-**飞书应用凭据**：在「连接 → 飞书应用凭据」卡片里填写 **App ID / App Secret** 并保存，值经宿主 `ctx.credentials` 写入 DSH 凭据库（默认 `$DSH_HOME/.credentials.yaml` 的 `refs:` 段，仍遵循凭据层的解析优先级），面板只显示「已配置 / 未配置」与来源，**永不回显已存值**。两项齐全且通道未运行时保存后自动建立连接；已连接时保存只提示重连；只填了一项时保存成功但**不会连接**（状态保持「待配置」），补齐另一项后自动连接。已存值可以单独「移除已存值」；卡片下方显示的是凭据**引用名**（profile 配置里的 `appId` / `appSecret`），换引用名仍需改 profile 配置。
+**飞书应用凭据**：在「连接 → 飞书应用凭据」卡片里填写 **App ID / App Secret** 并保存，值经宿主 `ctx.credentials` 写入 DSH 凭据库（默认 `$DSH_HOME/.credentials.yaml` 的 `refs:` 段，仍遵循凭据层的解析优先级），面板只显示「已配置 / 未配置」与来源，**永不回显已存值**。两项齐全且通道未运行时保存后自动建立连接；已连接时保存只提示重连；只填了一项时保存成功但**不会连接**（状态保持「待配置」），补齐另一项后自动连接。已存值可以单独「移除已存值」；卡片下方显示的是凭据**引用名**（profile 配置里的 `appId` / `appSecret`），换引用名仍需改 profile 配置。「会话与行为」页底部的「日志分析接口令牌」卡片用同样方式写入令牌，保存或移除后下一次接口请求即生效，不会重连飞书。
 
 **统一保存**：除连接类操作外，可编辑字段共用一个草稿；每个表单标签页底部是「保存更改 / 放弃更改」，只提交改动过的字段，标注「需重连」的项在下次连接时生效；保存后「连接」标签页顶部横幅列出待生效项并提供一键重连。
 
@@ -147,6 +147,7 @@ src/
 │   ├── streaming.ts       #   流式回复卡构成（面板/活动行/正文/停止按钮/结算页脚）、分段、字节/表格预算
 │   ├── picker.ts          #   /model、/effort、/permissions 选择卡与按钮回传解析
 │   ├── onboarding.ts      #   私聊首次触达引导卡
+│   ├── analyze.ts         #   日志分析卡（详情页表格、状态标签）
 │   ├── approval.ts        #   审批决策卡
 │   └── question.ts        #   结构化问答卡
 ├── approvals.ts           # 审批 barrel → src/interactions/
@@ -189,6 +190,7 @@ src/
 │   │   ├── shared.tsx     #     字段渲染原语、保存栏、阶段徽标、草稿校验
 │   │   ├── connection-tab.tsx #   连接：三步引导 / 连接信息 / 待生效提醒 / 凭据卡
 │   │   ├── credentials-card.tsx  #  App ID / App Secret 编辑（不回显）
+│   │   ├── analyze-token-card.tsx #  日志分析接口令牌编辑（不回显，不触发重连）
 │   │   ├── sessions-tab.tsx / model-tab.tsx / workspace-tab.tsx / access-tab.tsx / advanced-tab.tsx
 │   │   └── access-card.tsx
 │   ├── catalog.ts         #   选择器目录折叠：Host 字段 + 实时目录 → 表单字段
@@ -276,6 +278,8 @@ npm 发行包已包含构建产物：Host 入口是 `lib/index.js`（profile 直
     accessMode: 'guarded'               # 准入模式：guarded（默认，仅管理员+白名单）| open（旧行为，不安全）
     adminUserId: 'a1b2c3d4'            # 管理员 user_id（可留空，留空时自动使用应用所有者；都没有时 guarded 下拒绝所有对话；面板可改）
     authRequestTtlDays: 7               # 入群/用户授权申请卡有效期（天，1–30）
+    analyzeListen: '0.0.0.0:3090'       # 日志平台分析接口的独立监听地址（不填 = 关闭；改后需重连）
+    analyzeToken: 'DSH_CHANNELS_ANALYZE_TOKEN' # 分析接口 Bearer 令牌的凭据引用名（值在面板填写或写进 .credentials.yaml）
     loggerLevel: 'info'
 ```
 
@@ -336,6 +340,7 @@ FEISHU_APP_SECRET: xxxxxxxx
 |---|---|---|
 | 私聊 | `<baseDir>/p2p/<user_id>/` | `<工作区>/topics/<话题 id>/` |
 | 群聊 | `<baseDir>/groups/<chat_id>/<user_id>/` | 同上 |
+| 日志平台分析 | `<baseDir>/analyze/<应用>/<错误码>/` | 同上 |
 
 - 群聊必须是「群 × 用户」：同一个人在不同群之间不共享文件，避免 A 群会话把 B 群内容带出来。
 - 会话创建时以工作区为 header cwd（保证 GUI 里归属该项目、沙箱边界稳定），随后通过 `ctx.workingDirectory` 把实际工作目录切到话题目录；冷恢复会从 Session 日志还原该目录。因此话题之间的文件互不干扰，而工作区数量只随用户增长。
@@ -345,6 +350,56 @@ FEISHU_APP_SECRET: xxxxxxxx
 - **插件不删除任何工作区或话题目录**。需要回收磁盘时手动删除不再需要的话题目录即可：该话题下次对话时会重建一个空目录继续使用（worktree 模式下改建新的 worktree 分支）。手动删除 worktree checkout 后，可在仓库里 `git worktree prune` / `git branch -D` 回收 Git 记录。
 - 旧版本「一个话题一个工作区」（`<baseDir>/topics/...`）不会自动迁移：旧话题继续用原目录；旧版「用户 × 聊天」共享工作区正好作为新的用户工作区复用。
 - 设计取舍与约束详见 [docs/workspace-isolation-design.md](docs/workspace-isolation-design.md)。
+
+## 日志平台分析接口
+
+日志平台调用插件的分析接口：插件在指定群里发一张分析卡（发起人、触发时间、应用、错误码和日志详情页表格），在卡片下开话题，把平台给的 prompt 原样交给一个新 Session（prompt 开头的斜杠命令由 DSH 展开成对应 skill），分析过程在话题内流式输出，和用户自己发起的会话一样。分析结束后分析卡的状态标签随之更新。群里通过准入的成员都可以在该话题内追问。插件只负责接收 prompt 和开会话：日志包地址写在 prompt 里，下载、解压、超时都由日志分析 skill 自己处理（Session 的沙箱需要能访问日志存储地址）。
+
+**开启**：配置 `analyzeListen`（如 `0.0.0.0:3090`，面板「行为」页可改，需重连），并在同一页的「日志分析接口令牌」卡片填写访问令牌（建议 32 位以上随机串；写入 DSH 凭据库的 `DSH_CHANNELS_ANALYZE_TOKEN`，也可直接写进 `$DSH_HOME/.credentials.yaml`，引用名可用 `analyzeToken` 修改）。接口跑在独立端口上，与 DSH Web 端口无关；令牌每次请求都重新解析，轮换后下一次请求生效；令牌缺失时所有请求返回 503。端口绑定失败不影响飞书连接，健康等级降为「降级」，面板「健康判定」与 `/health` 卡片会显示失败原因。
+
+**请求**：
+
+```http
+POST /dsh-channels/analyze
+Authorization: Bearer <令牌>
+Idempotency-Key: <平台生成的唯一值，1-200 个可见 ASCII 字符>
+Content-Type: application/json
+
+{
+  "requesterUserId": "a1b2c3d4",
+  "triggeredAt": "2026-10-22 19:30",
+  "app": "camera",
+  "errorCode": "E1001",
+  "logDetails": [
+    { "name": "设备 A 崩溃日志", "url": "https://logs.example.com/detail/1" },
+    { "name": "设备 B 崩溃日志", "url": "https://logs.example.com/detail/2" }
+  ],
+  "chatId": "oc_xxx",
+  "prompt": "/log-analyze https://logs.example.com/1.zip https://logs.example.com/2.zip 请分析这些日志"
+}
+```
+
+- `requesterUserId`：平台发起人的飞书 user_id，分析卡 @ 此人；路由记录里也以此人作为发起人。
+- `triggeredAt`：平台上发起分析的时间，1–64 字符，原样显示在分析卡上（时区和格式由平台决定）。
+- `app` / `errorCode`：只允许 `A-Z a-z 0-9 . _ -`（1–128 字符），决定工作区 `<baseDir>/analyze/<app>/<errorCode>/`；同一应用同一错误码的所有分析都在这个工作区里，每次分析各有一个话题目录。
+- `logDetails`：触发分析的日志在日志平台上的详情页，1–50 条，每条 `name`（1–200 字符）+ `url`（http/https）。只在分析卡的表格里列出（每页 10 行），插件不会访问这些地址。
+- `chatId`：目标群，必须是已授权群（`/auth group add` 或面板「访问与授权」），机器人需在群内；`accessMode: open` 时不校验。
+- `prompt`：1–100000 字符，原样作为首条用户消息，插件不追加任何内容。
+- 只接受以上 7 个字段，多余字段返回 400。
+
+**响应**：校验通过、分析卡发出后立即返回 `202`：
+
+```json
+{ "ok": true, "chatId": "oc_xxx", "messageId": "om_xxx" }
+```
+
+`messageId` 是分析卡的消息 id，分析话题挂在它下面。同步错误都带中文 `error`：`401` 令牌无效、`400` 参数或 `Idempotency-Key` 不合法、`403` 目标群未授权、`409` 同一个 `Idempotency-Key` 已被内容不同的请求使用、`413` 请求体超过 1 MiB、`415` 不是 JSON、`502` 分析卡发送失败（如机器人不在群里）、`503` 飞书未连接或未配置令牌。
+
+**去重**：同一个 `Idempotency-Key` 再次请求（包括并发重试）原样返回第一次的结果，不会再发卡、再分析。记录永久保存在 `channels_routes_v2` 域的 `analyze_requests` 表。分析卡发出后的失败（话题创建、Session 创建）不会回滚这条记录：分析卡的状态变成「失败」并写明原因，需要重试时请换一个新的 `Idempotency-Key`。
+
+**群里看到的**：先是分析卡「@发起人 于 <triggeredAt> 发起了对 X 应用 Y 错误码不良日志的分析」，下面是日志详情页表格，标题栏标签为「分析中」；紧接着话题内一张流式卡片（它同时创建话题），首轮分析在这里流式输出，带停止按钮。首轮结束后分析卡的标签变成「已完成」「已停止」或「失败」，并加上 DONE / No 表情；之后的追问不再改动分析卡。启动失败时话题里的流式卡片和分析卡都会写明原因。分析过程中出现的审批卡、提问卡发在话题内。DSH 在首轮进行中重启或重连飞书时，话题里的流式卡片照常由中断修复处理；重新连上后，插件把仍是「分析中」的分析卡改成「已中断」（橙色），提示在话题内回复即可继续，原来的 Session 会接着追问。分析卡状态同时记在 `analyze_requests` 记录里（连同重画卡片所需的发起人、时间、应用、错误码和详情页）。
+
+**追问与权限**：分析话题的路由是**群内共享**的（路由记录 `shared: true`）：群里任何通过准入的成员（管理员，或该群已授权且本人在用户白名单）都可以在话题内直接回复追问（无需 @），也可以点停止按钮、回答审批卡与提问卡、在话题里执行会话命令；未授权的人仍被静默忽略。追问的回复照常流式输出。话题之间互不读取，和普通话题一样。分析结果 markdown 怎么回传给平台由日志分析插件自己负责，本插件不参与。
 
 ## 行为与降级
 

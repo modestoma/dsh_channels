@@ -5,6 +5,7 @@
  * - p2p:   workspace `<baseDir>/p2p/<user_id>/`
  * - group: workspace `<baseDir>/groups/<chat_id>/<user_id>/`
  * - topic: `<workspace>/topics/<topic-token>/` (the Session's effective cwd)
+ * - log-platform analysis: workspace `<baseDir>/analyze/<app>/<errorCode>/`
  *
  * The workspace root is the Session header cwd: it keeps the Session grouped
  * under the user's project in the GUI and stays the sandbox write boundary.
@@ -231,4 +232,34 @@ export async function ensureWorkspace(
     dir,
     workspaceTitleFor(chatType, chatId, senderUserId),
   )
+}
+
+/**
+ * Workspace directory of one log-platform analysis subject:
+ * `<baseDir>/analyze/<app>/<errorCode>/`. Every analysis of the same
+ * application and error code is grouped there, each in its own topic
+ * directory.
+ */
+export function analyzeWorkspacePathFor(baseDir: string, app: string, errorCode: string): string {
+  return path.join(baseDir, 'analyze', safeSegment(app, 'app'), safeSegment(errorCode, 'errorCode'))
+}
+
+/** Workspace title of one analysis subject in the DSH workspace list. */
+export function analyzeWorkspaceTitleFor(app: string, errorCode: string): string {
+  return `日志分析 · ${app} · ${errorCode}`
+}
+
+/**
+ * Ensure one analysis subject's workspace exists and is registered (idempotent
+ * like {@link ensureWorkspace}).
+ */
+export async function ensureAnalyzeWorkspace(
+  ctx: HostContext,
+  baseDir: string,
+  app: string,
+  errorCode: string,
+): Promise<Workspace> {
+  const dir = analyzeWorkspacePathFor(baseDir, app, errorCode)
+  await mkdir(dir, { recursive: true })
+  return ctx.workspaceRegistry.create(dir, analyzeWorkspaceTitleFor(app, errorCode))
 }

@@ -52,10 +52,13 @@ import type { PermissionPresets, SessionQuery } from './dsh-types.ts'
 import { FEISHU_USER_ID_PATTERN, feishuDomain, sessionDirOf } from './domain.ts'
 import type {
   AccessGroupRecord, AccessRequestRecord, AccessUserRecord,
-  ExpiredRouteRecord, FeishuDomainGlobal, FeishuDomainHandle, InflightSnapshot,
+  AnalyzeRequestRecord, ExpiredRouteRecord, FeishuDomainGlobal, FeishuDomainHandle, InflightSnapshot,
   ProcessedRecord, RawDomainHandle, RouteRecord,
 } from './domain.ts'
 import { RouteStore } from './session/routes.ts'
+import { AnalyzeLauncher } from './analyze/launcher.ts'
+import { startAnalyzeServer } from './analyze/server.ts'
+import type { AnalyzeServer } from './analyze/server.ts'
 import { InflightRepair } from './session/repair.ts'
 import { SessionManager } from './session/manager.ts'
 import type { LiveAgent, RenewCommit } from './session/manager.ts'
@@ -94,7 +97,7 @@ import { ACTIVITY_BUILD_MARKER, TurnStreamer } from './streamer.ts'
 import type { ProjectedStats, StreamerHooks } from './streamer.ts'
 import type { FeishuConfig } from './config.ts'
 import type {
-  AccessMutationResponse, AccessRequestWire, AccessWire, ScopeCheckWire, SlashCommandSyncWire,
+  AccessMutationResponse, AccessRequestWire, AccessWire, CredentialField, ScopeCheckWire, SlashCommandSyncWire,
 } from './settings/contract.ts'
 import { checkScopes } from './feishu/scopes.ts'
 import { desiredSlashCommands, syncSlashCommands } from './feishu/slash-commands.ts'
@@ -149,6 +152,7 @@ async function openFeishuDomain(ctx: HostContext): Promise<FeishuDomainHandle> {
   const accessUsersRaw = domain.table('access_users')
   const accessRequestsRaw = domain.table('access_requests')
   const accessWikiUsersRaw = domain.table('access_wiki_users')
+  const analyzeRequestsRaw = domain.table('analyze_requests')
   return {
     routes: {
       get: key => table.get(key) as RouteRecord | undefined,
@@ -197,6 +201,11 @@ async function openFeishuDomain(ctx: HostContext): Promise<FeishuDomainHandle> {
       put: (key, value) => accessWikiUsersRaw.put(key, value),
       delete: key => accessWikiUsersRaw.delete(key),
       entries: () => accessWikiUsersRaw.entries() as IterableIterator<[string, AccessUserRecord]>,
+    },
+    analyzeRequests: {
+      get: key => analyzeRequestsRaw.get(key) as AnalyzeRequestRecord | undefined,
+      put: (key, value) => analyzeRequestsRaw.put(key, value),
+      entries: () => analyzeRequestsRaw.entries() as IterableIterator<[string, AnalyzeRequestRecord]>,
     },
     getGlobal: () => (domain.global.get() ?? {}) as FeishuDomainGlobal,
     setGlobal: value => domain.global.set(value),
@@ -270,6 +279,12 @@ export class FeishuService {
   private readonly messageReader = new MessageReader({ channel: () => this.channel })
   /** Inbound routing: dedup, admission, decision tree, session establishment. */
   private readonly inbound: InboundRouter
+  /** Log-platform analyze API business side (requests → shared analysis topics). */
+  private readonly analyzeLauncher: AnalyzeLauncher
+  /** Bound analyze listener while connected with `analyzeListen` set. */
+  private analyzeServer: AnalyzeServer | undefined
+  /** Why the analyze listener could not bind at the last connect. */
+  private analyzeListenError: string | undefined
   /** Agent/session lifecycle: live registry, resume, presets, renew. */
   private readonly sessions: SessionManager
   /**
@@ -425,6 +440,7 @@ export class FeishuService {
           chatId: record.chatId,
           chatType: record.chatType,
           senderUserId: record.senderUserId,
+          ...(record.shared === true ? { shared: true } : {}),
         }
       },
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
@@ -441,6 +457,7 @@ export class FeishuService {
           chatId: record.chatId,
           chatType: record.chatType,
           senderUserId: record.senderUserId,
+          ...(record.shared === true ? { shared: true } : {}),
         }
       },
       noteKnownMessage: (route, message, source) => {
@@ -538,6 +555,21 @@ export class FeishuService {
       questionAnswerer: () => this.questionAnswerer,
       approvalAnswerer: () => this.approvalAnswerer,
       commands: { handleSlash: (msg, line) => this.handleSlashMessage(msg, line) },
+    })
+    this.analyzeLauncher = new AnalyzeLauncher({
+      ctx: this.ctx,
+      config: this.config,
+      started: () => this.started,
+      channel: () => this.channel,
+      domain: () => this.domain,
+      routes: this.routes,
+      repair: this.repair,
+      sessions: this.sessions,
+      streamer: () => this.streamer,
+      queue: this.routeOperations,
+      reserveTopic: threadId => this.inbound.reserveTopic(threadId),
+      mayAnalyzeIn: chatId => this.accessController.mayAnalyzeIn(chatId),
+      resolveToken: () => resolveCredentialRef(this.ctx, this.config.analyzeToken).catch(() => undefined),
     })
   }
 
@@ -1250,10 +1282,10 @@ export class FeishuService {
   health(): HealthSnapshot { return this.healthSnapshot() }
 
   /**
-   * Credential facts for the two Feishu refs. Values are never returned:
+   * Credential facts for the panel's credential refs. Values are never returned:
    * `describe()` reports presence/source/writability only.
    */
-  async credentialStates(): Promise<{ appId: CredentialInfo; appSecret: CredentialInfo }> {
+  async credentialStates(): Promise<Record<CredentialField, CredentialInfo>> {
     const provider = this.credentialProvider()
     const read = async (ref: string): Promise<CredentialInfo> => {
       try {
@@ -1274,8 +1306,10 @@ export class FeishuService {
         return { configured: false, writable: false }
       }
     }
-    const [appId, appSecret] = await Promise.all([read(this.config.appId), read(this.config.appSecret)])
-    return { appId, appSecret }
+    const [appId, appSecret, analyzeToken] = await Promise.all([
+      read(this.config.appId), read(this.config.appSecret), read(this.config.analyzeToken),
+    ])
+    return { appId, appSecret, analyzeToken }
   }
 
   /** The host credentials seam, when mounted. */
@@ -1283,8 +1317,8 @@ export class FeishuService {
     return this.ctx.get?.('credentials') as CredentialProvider | undefined
   }
 
-  /** Store one Feishu credential value through the host seam; the value is never logged. */
-  async setCredential(field: 'appId' | 'appSecret', value: string): Promise<void> {
+  /** Store one credential value through the host seam; the value is never logged. */
+  async setCredential(field: CredentialField, value: string): Promise<void> {
     const provider = this.credentialProvider()
     if (provider?.set === undefined) {
       throw new Error('主机的凭据服务不可写（未挂载 credentials.set，或当前提供方只读）')
@@ -1298,8 +1332,8 @@ export class FeishuService {
     await this.refreshReadiness()
   }
 
-  /** Remove the stored value of one Feishu credential reference. */
-  async clearCredential(field: 'appId' | 'appSecret'): Promise<void> {
+  /** Remove the stored value of one credential reference. */
+  async clearCredential(field: CredentialField): Promise<void> {
     const provider = this.credentialProvider()
     if (provider?.unset === undefined) {
       throw new Error('主机的凭据服务不支持移除凭据')
@@ -1314,8 +1348,12 @@ export class FeishuService {
   }
 
   /** The overlay-independent ref name backing one editable credential slot. */
-  private credentialRef(field: 'appId' | 'appSecret'): string {
-    return field === 'appId' ? this.config.appId : this.config.appSecret
+  private credentialRef(field: CredentialField): string {
+    switch (field) {
+      case 'appId': return this.config.appId
+      case 'appSecret': return this.config.appSecret
+      case 'analyzeToken': return this.config.analyzeToken
+    }
   }
 
   /** Wire events and open the long connection. */
@@ -1449,6 +1487,9 @@ export class FeishuService {
     // Background: the results only feed the panel and the log.
     void this.runScopeCheck(channel, appId, ownerLookup)
     if (this.config.slashCommandPanel) void this.runSlashCommandSync(channel)
+    // Before the listener opens, so every `running` record left is a previous instance's.
+    await this.analyzeLauncher.markInterrupted()
+    await this.openAnalyzeListener()
     // Repair cards a previous instance left mid-flight (best-effort, background).
     void this.repair.repairAll().catch((error: unknown) => {
       this.ctx.logger?.warn?.('dsh-channels: inflight repair failed: %s', String(error))
@@ -1506,12 +1547,38 @@ export class FeishuService {
     )
   }
 
+  /**
+   * Bind the analyze listener when `analyzeListen` is set. A bind failure is
+   * logged and folded into the health snapshot (panel reasons, `/health`); the Feishu connection stays up.
+   */
+  private async openAnalyzeListener(): Promise<void> {
+    this.analyzeListenError = undefined
+    const listen = this.config.analyzeListen
+    if (listen === undefined) return
+    try {
+      this.analyzeServer = await startAnalyzeServer(
+        listen,
+        this.analyzeLauncher,
+        (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
+      )
+      console.info('[dsh-channels] 日志分析接口已监听', listen)
+    } catch (error) {
+      this.analyzeListenError = messageOf(error)
+      this.ctx.logger?.error?.('dsh-channels: analyze listener on %s failed: %s', listen, this.analyzeListenError)
+      console.error('[dsh-channels] 日志分析接口监听失败:', listen, error)
+    }
+  }
+
   /** Tear down: close the connection and dispose all live agents. */
   async shutdown(): Promise<void> {
     // Close admission first. In-flight Host commands receive cancellation
     // before their Agent/channel/storage dependencies are disposed, while
     // already queued route operations observe `started === false` and retire.
     this.started = false
+    const analyzeServer = this.analyzeServer
+    this.analyzeServer = undefined
+    await analyzeServer?.close()
+    await this.analyzeLauncher.drain()
     for (const controller of this.commandControllers) controller.abort()
     await Promise.allSettled([...this.commandOperations])
     this.commandControllers.clear()
@@ -1638,7 +1705,7 @@ export class FeishuService {
       return
     }
 
-    if (msg.senderId !== route.senderUserId) {
+    if (!this.accessController.ownsRoute(msg, route)) {
       await this.delivery.commandCard(msg, {
         kind: 'forbidden', command: parsed.name, text: '无权操作此会话。',
       })
@@ -1648,7 +1715,7 @@ export class FeishuService {
     const operation = this.routeOperations.run(route.key, async () => {
       if (!this.started) return
       const current = this.routes.get(route.key) ?? route
-      if (msg.senderId !== current.senderUserId) {
+      if (!this.accessController.ownsRoute(msg, current)) {
         await this.delivery.commandCard(msg, {
           kind: 'forbidden', command: parsed.name, text: '无权操作此会话。',
         })
@@ -1985,7 +2052,7 @@ export class FeishuService {
     if (sessionId === undefined) return
     const route = this.routes.findBySession(sessionId)
     if (route === undefined) return
-    if (event.operator.userId !== route.senderUserId || event.chatId !== route.chatId) {
+    if (!this.accessController.mayActOnRoute(event.operator.userId, event.chatId, route)) {
       this.streamer?.markStopDenied(sessionId)
       return
     }
@@ -2006,7 +2073,8 @@ export class FeishuService {
     if (action === undefined) return
     const route = this.routes.findBySession(action.sessionId)
     const userId = event.operator.userId
-    if (route === undefined || route.chatId !== event.chatId || userId !== route.senderUserId) return
+    if (route === undefined || userId === undefined
+      || !this.accessController.mayActOnRoute(userId, event.chatId, route)) return
     const line = `/${action.command} ${action.arg}`
     await this.delivery.replacingCard(event.messageId, () => this.handleSlashMessage({
       messageId: event.messageId,
@@ -2437,6 +2505,7 @@ export class FeishuService {
       routeCount: this.routes.size(),
       liveAgentCount: this.sessions.liveCount(),
       inflightTurnCount,
+      ...(this.analyzeListenError === undefined ? {} : { analyzeListenError: this.analyzeListenError }),
     })
   }
 
@@ -2566,6 +2635,9 @@ export class FeishuService {
       cardMessageId: record.cardMessageId,
       inThread: record.kind === 'thread',
       senderUserId: record.senderUserId,
+      ...(record.shared === true
+        ? { mayDecide: (userId: string) => this.accessController.mayActOnRoute(userId, record.chatId, record) }
+        : {}),
     }
   }
 

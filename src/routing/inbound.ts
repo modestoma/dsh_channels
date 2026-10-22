@@ -228,6 +228,21 @@ interface TurnDeliveryOptions {
   excludeMessageIds?: readonly string[]
 }
 
+/**
+ * Register one release gate under `key` in `gates`. The returned closer
+ * resolves the gate and removes it only while it is still the registered one.
+ */
+function openGate(gates: Map<string, { promise: Promise<void>; release(): void }>, key: string): () => void {
+  let settle!: () => void
+  const promise = new Promise<void>((resolve) => { settle = resolve })
+  const release = (): void => {
+    if (gates.get(key)?.promise === promise) gates.delete(key)
+    settle()
+  }
+  gates.set(key, { promise, release })
+  return release
+}
+
 export class InboundRouter {
   /**
    * In-process dedup guard: message id → accept timestamp. Set synchronously
@@ -251,6 +266,13 @@ export class InboundRouter {
    * racing it, otherwise the topic's turns reach the model out of order.
    */
   private readonly firstDeliveries = new Map<string, { promise: Promise<void>; release(): void }>()
+  /**
+   * topic id → reservation by an external starter (the analyze launcher) that
+   * opened the topic but has not published its route yet. A reply in the topic
+   * waits for the release and then routes against the published record, or
+   * falls through as an unbound topic when the start failed.
+   */
+  private readonly reservedTopics = new Map<string, { promise: Promise<void>; release(): void }>()
 
   constructor(private readonly deps: InboundDeps) {}
 
@@ -282,14 +304,7 @@ export class InboundRouter {
    * observes its gate. The returned closer must be called exactly once.
    */
   private openDeliveryGate(key: string): () => void {
-    let settle!: () => void
-    const promise = new Promise<void>((resolve) => { settle = resolve })
-    const release = (): void => {
-      if (this.firstDeliveries.get(key)?.promise === promise) this.firstDeliveries.delete(key)
-      settle()
-    }
-    this.firstDeliveries.set(key, { promise, release })
-    return release
+    return openGate(this.firstDeliveries, key)
   }
 
   /** Wait for the in-flight first followup of a route, when one is pending. */
@@ -298,7 +313,19 @@ export class InboundRouter {
     if (pending !== undefined) await pending.promise.catch(() => undefined)
   }
 
-/**
+  /**
+   * Reserve one topic whose route is about to be published by an external
+   * starter. Replies in the topic wait until the returned closer runs; the
+   * closer must be called exactly once, after the route (and its first turn)
+   * is published or the start was abandoned.
+   * @param threadId - the topic id.
+   * @returns the closer releasing waiting replies.
+   */
+  reserveTopic(threadId: string): () => void {
+    return openGate(this.reservedTopics, threadId)
+  }
+
+  /**
    * Send the one-time onboarding card for a private chat, then remember the
    * chat in the domain global. Best-effort: a storage failure only risks a
    * repeated card, never a blocked session.
@@ -327,6 +354,8 @@ export class InboundRouter {
     // first-turn delivery never stays suspended across a teardown.
     for (const entry of [...this.firstDeliveries.values()]) entry.release()
     this.firstDeliveries.clear()
+    for (const entry of [...this.reservedTopics.values()]) entry.release()
+    this.reservedTopics.clear()
   }
 
   /** Entry point: one normalized inbound message. */
@@ -369,6 +398,14 @@ export class InboundRouter {
     // whitelist). Nothing below this point may run for a denied sender: no
     // TTL tombstone, attachment archive, workspace, Session, or model call.
     if (!(await this.access.admit(msg))) return
+
+    // A reserved topic has no route yet: wait for its starter so the TTL,
+    // attachment, mention, and route decisions below see the published record.
+    const reservation = msg.threadId === undefined ? undefined : this.reservedTopics.get(msg.threadId)
+    if (reservation !== undefined) {
+      await reservation.promise
+      if (!this.started) return
+    }
 
     // Enforce TTL at admission as well as in the periodic sweep. A message that
     // arrives after the deadline must not get one chance to revive the route

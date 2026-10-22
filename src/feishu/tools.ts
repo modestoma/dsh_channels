@@ -105,6 +105,8 @@ export interface AttachmentFetchRoute {
   readonly chatId: string
   readonly chatType: 'p2p' | 'group'
   readonly senderUserId: string
+  /** Group-shared route: messages of any sender in the route's topic count as its own. */
+  readonly shared?: boolean
 }
 
 /** Why a message became known to one route. */
@@ -811,7 +813,7 @@ export class AttachmentFetchToolRuntime {
     if (!read.ok) return undefined
     const container = quoteItemsOf(read.value)
     if (container === undefined || container.deleted) return undefined
-    if (container.senderUserId !== call.route.senderUserId) return undefined
+    if (call.route.shared !== true && container.senderUserId !== call.route.senderUserId) return undefined
     if (!messageBelongsToRoute(call.route, container)) return undefined
     return knownMessageOfItems(read.value)
   }

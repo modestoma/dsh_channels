@@ -302,15 +302,15 @@ export function registerSettingsRoutes(
           }
           throw error
         }
-        const payload = body as { appId?: unknown; appSecret?: unknown; field?: unknown } | null
+        const payload = body as { appId?: unknown; appSecret?: unknown; analyzeToken?: unknown; field?: unknown } | null
         if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
           sendJson(res, 400, { ok: false, error: '请求体必须是 JSON 对象' })
           return
         }
         if (methodOf(req) === 'DELETE') {
           const field = payload.field
-          if (field !== 'appId' && field !== 'appSecret') {
-            sendJson(res, 400, { ok: false, error: 'field 必须是 appId 或 appSecret' })
+          if (field !== 'appId' && field !== 'appSecret' && field !== 'analyzeToken') {
+            sendJson(res, 400, { ok: false, error: 'field 必须是 appId、appSecret 或 analyzeToken' })
             return
           }
           const result = await surface.clearCredential(field as CredentialField)
@@ -320,6 +320,7 @@ export function registerSettingsRoutes(
         const values: SaveCredentialsRequest = {}
         if (payload.appId !== undefined) values.appId = payload.appId as string
         if (payload.appSecret !== undefined) values.appSecret = payload.appSecret as string
+        if (payload.analyzeToken !== undefined) values.analyzeToken = payload.analyzeToken as string
         const result = await surface.saveCredentials(values)
         sendJson(res, result.ok ? 200 : 400, result)
       }),

@@ -147,7 +147,18 @@ interface SegmentCard {
   nextRetryAt: number
 }
 
+/** Settled outcome of one turn, as its card shows it. */
+export type TurnOutcome = 'done' | 'stopped' | 'error'
+
+/** Per-turn options of {@link TurnStreamer.attach}. */
+export interface AttachOptions {
+  /** Called once when the turn's card reaches its final state. */
+  readonly onSettled?: (outcome: TurnOutcome) => void
+}
+
 interface TurnState {
+  /** `AttachOptions.onSettled`. */
+  onSettled: ((outcome: TurnOutcome) => void) | undefined
   /** Turn number once known; undefined until the first `step/start`. */
   turn: number | undefined
   /** Message whose reaction carries Typing → DONE/No. */
@@ -327,8 +338,21 @@ export class TurnStreamer {
     this.heartbeatMs = heartbeatMs
   }
 
-  /** Bind a freshly sent reply card to a session; seeds the stats fold from the log. */
-  attach(session: Session, cardMessageId: string, triggerMessageId: string, reactionId: string | undefined): void {
+  /**
+   * Bind a freshly sent reply card to a session; seeds the stats fold from the log.
+   * @param session - the Session whose next turn renders into the card.
+   * @param cardMessageId - the main card message (patched in place).
+   * @param triggerMessageId - the message carrying the Typing → DONE/No reaction.
+   * @param reactionId - the Typing reaction to remove, when one was added.
+   * @param options - per-turn options.
+   */
+  attach(
+    session: Session,
+    cardMessageId: string,
+    triggerMessageId: string,
+    reactionId: string | undefined,
+    options: AttachOptions = {},
+  ): void {
     this.sessions.set(session.id, session)
     let fold = this.folds.get(session.id)
     if (fold === undefined) {
@@ -337,6 +361,7 @@ export class TurnStreamer {
     }
     const queue = this.bySession.get(session.id) ?? []
     queue.push({
+      onSettled: options.onSettled,
       turn: undefined,
       triggerMessageId,
       reactionId,
@@ -1205,6 +1230,13 @@ export class TurnStreamer {
     })
 
     this.hooks.onTurnFinalized(sessionId, state.turn ?? 0, state.cards[0]?.messageId ?? '')
+    if (state.onSettled !== undefined) {
+      try {
+        state.onSettled(state.phase === 'error' ? 'error' : state.phase === 'stopped' ? 'stopped' : 'done')
+      } catch (error) {
+        this.hooks.onError(sessionId, error)
+      }
+    }
   }
 
   private async swapReaction(state: TurnState, failed: boolean): Promise<void> {
