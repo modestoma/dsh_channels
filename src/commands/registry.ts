@@ -62,7 +62,7 @@ export const CHANNEL_COMMANDS = [
   },
   {
     name: 'health', group: '基础', description: '显示 Harness 与飞书通道健康状态',
-    sessionOptional: true,
+    sessionOptional: true, directReply: true,
   },
   {
     name: 'status', group: '会话', description: '显示当前 Session 状态与性能指标',

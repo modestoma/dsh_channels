@@ -195,6 +195,7 @@ describe('FeishuService', () => {
     expect(h.ctxState.agents.created).toHaveLength(0)
     expect(h.ctxState.workspaces.workspaces.size).toBe(0)
     expect(h.channel.sent).toHaveLength(1)
+    expect((h.channel.sent[0] as { options?: object }).options).toEqual({ replyTo: 'om_health' })
     const json = JSON.stringify((h.channel.sent[0] as { input: object }).input)
     expect(json).toContain('健康检查')
     expect(json).toContain('degraded')

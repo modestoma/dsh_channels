@@ -2157,7 +2157,7 @@ export class FeishuService {
       return
     }
     if (spec.name === 'health' && result.kind === 'success') {
-      await this.delivery.standaloneReply(msg, buildHealthCard(this.healthSnapshot()))
+      await this.delivery.standaloneReply(msg, buildHealthCard(this.healthSnapshot()), { createThread: false })
       return
     }
     if (spec.name === 'status' && result.kind === 'success') {
