@@ -61,7 +61,7 @@ describe('checkScopes', () => {
     const grants = ALL_GRANTED.filter(grant => grant.name !== 'im:message.p2p_msg:readonly')
     expect(scopeRequirements({ ...NO_OWNER_FALLBACK, dmEnabled: false }).some(item => item.anyOf.includes('im:message.p2p_msg:readonly'))).toBe(false)
     const result = checkScopes(grants, 'cli_x', { ...NO_OWNER_FALLBACK, dmEnabled: false, ownerLookupFailed: true })
-    expect(result.missing.map(item => item.anyOf[0])).toEqual(['admin:app.info:readonly'])
+    expect(result.missing.map(item => [item.level, item.anyOf[0]])).toEqual([['optional', 'admin:app.info:readonly']])
   })
 
   it('lists the slash-command scopes only while the panel sync is enabled', () => {

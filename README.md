@@ -306,13 +306,13 @@ FEISHU_APP_SECRET: xxxxxxxx
    - 事件：**接收消息 im.message.receive_v1**（含“接收群聊中 @ 机器人消息”）
    - 事件：**机器人进群 im.chat.member.bot.added_v1**（入群后私聊管理员发群信息卡）；对应的群信息读取权限（如 `im:chat:readonly`，以控制台要求为准）
    - 私聊需要能主动给管理员发消息（`im:message` 已覆盖；管理员需在应用可用范围内）
-   - 「获取应用信息」权限（可选，以控制台要求为准）：未配置 `adminUserId` 时，插件在连接时调用 `application/v6/applications/:app_id` 查询应用所有者并让其成为管理员；缺权限时日志与面板会给出飞书返回的错误码和提示，配置 `adminUserId` 后不再依赖它
+   - 「获取应用信息」权限（**可选**，如 `admin:app.info:readonly` / `application:application:self_manage`，以控制台要求为准）：未配置 `adminUserId` 时，插件在每次连接时调用 `application/v6/applications/:app_id` 查询应用所有者并让其成为管理员；调不通（企业内不便申请该权限等）时日志与面板会给出飞书返回的错误码，并提示在「访问授权」手动填写管理员 user_id，填写后不再依赖它
    - 回调：**卡片回传交互 card.action.trigger**（流式卡停止按钮、`/model` 等选择卡、HITL 审批 / `ask_user_question` 问答按钮的回传事件，同样走长连接）
    - `im:message.reactions:write_only`（发送、删除消息表情回复）
    - `im:message:update`（更新卡片）
 
    > 消息读取权限缺失时不会报死错：引用摘录与首轮话题历史静默省略（插件生命周期内首次降级输出一条 warn，之后 debug 级），显式调用 `feishu_topic_messages` 返回可读的 `PERMISSION_DENIED`。附件下载仍依赖 `im:message` 一类的消息资源权限；下载被拒时工具与 archive 路径都会返回可读原因。
-   > **连接后权限自检**：每次连上飞书后，插件调用 `application/v6/scopes` 读取应用的租户权限授予状态，与上面的清单对比（私聊关闭时不检查 `im:message.p2p_msg:readonly`，`requireMention: false` 时 `im:message.group_msg` 升为必需；未配置管理员且应用所有者查询被飞书拒绝时追加「获取应用信息」）。缺失项在 Web 设置「连接」页以红字列出（标注必需/可选与用途，每项附开发者后台权限页深链，另有一键打开全部缺失项的链接），并在日志打印一条 warn；读取失败时显示飞书返回的原因。自检只做提示，不阻断连接；开通权限后需发布新版本并重新连接才会刷新。
+   > **连接后权限自检**：每次连上飞书后，插件调用 `application/v6/scopes` 读取应用的租户权限授予状态，与上面的清单对比（私聊关闭时不检查 `im:message.p2p_msg:readonly`，`requireMention: false` 时 `im:message.group_msg` 升为必需；未配置管理员且应用所有者查询被飞书拒绝时追加可选项「获取应用信息」）。缺失项在 Web 设置「连接」页以红字列出（标注必需/可选与用途，每项附开发者后台权限页深链，另有一键打开全部缺失项的链接），并在日志打印一条 warn；读取失败时显示飞书返回的原因。自检只做提示，不阻断连接；开通权限后需发布新版本并重新连接才会刷新。
 3. 事件订阅方式选**长连接**（WebSocket，免公网）。
 4. 发布版本并把用户加入可用范围；将机器人拉入测试群。
 
@@ -355,7 +355,7 @@ FEISHU_APP_SECRET: xxxxxxxx
 - **重启修复（流式中断）**：每条正在流式的 turn 会把自己的修复凭据（trigger 消息、Typing reaction id、全部段卡 id）写入 `channels_routes_v2` 域的 `inflight` 表（键 = 主卡 message id，turn 结束即删）。重启后长连接一建立，插件就把上一实例留下的中途卡片 patch 成「⚠️ 服务已重启，本次回复中断，请重新发送消息。」终态并补 DONE 表情；patch 失败重试一次（上限 2 次）后放弃。持久化盘点与缺口清单见 [docs/persistence.md](docs/persistence.md)。
 - **消息去重（WS 重投幂等）**：飞书长连接重连会重投未 ack 的事件；每条消息在任何副作用之前先落一条 `processed` 记录（键 = message id，飞书全局唯一），重投消息被直接丢弃——同进程靠内存守卫、跨重启靠持久化记录，每条消息至多处理一次。记录保留 24 小时后由 GC 清扫。
 - **路由表 GC 与过期话题拒绝**：超过 `routeTtlMs`（默认 30 天）无活动的真实话题路由会先写入最小持久化墓碑，再删除活动路由；此后该话题中的普通消息和 Session 命令会收到「话题已过期」提示，插件不会恢复旧 Session，也不会在可见历史仍属于旧 Session 的话题里新建 Session（`/help`、`/userid`、`/groupid`、`/health` 仍可用）。墓碑跨重启保留，仅含 thread/chat/owner/工作区路径/会话目录/最后活动时间；旧 DSH Session、日志与话题目录都不删除。降级的 chat-scoped 路由没有独立话题边界，仍直接清理。陈年 in-flight 快照同时在启动时及每 6 小时清扫。`routeTtlMs: 0` 关闭后续路由过期处理，已产生的墓碑仍保持拒绝语义。
-- **准入与授权**：`accessMode: 'guarded'`（默认）下，入站先过频道准入：**管理员不受任何白名单限制**，私聊/任意群聊（含未授权群）都可直接开会话；**非管理员**私聊回固定提示（`/userid` 例外），群聊要求 **群在白名单** 且 **user_id 在全局用户白名单**，两者缺一不可。未授权消息不建 Session、不建话题目录、不落附件、不调模型；群里静默、私聊回固定文案。机器人被拉进任意群时（订阅 `im.chat.member.bot.added_v1`），插件私聊管理员发群信息卡（群名/`chat_id`/成员数/邀请人），未授权群附「授权本群 / 忽略」按钮；已授权群里未授权用户 @ 机器人时，管理员会收到用户授权申请卡（含昵称/user_id）。授权状态持久化在 `channels_routes_v2` 域的 `access_groups` / `access_users` / `access_requests` 表，撤销立即生效。管理员 user_id 在 Web 面板配置，留空时为飞书应用所有者（连接时查询，需「获取应用信息」权限，失败则 fail closed）；`/auth` 命令、授权卡、面板三种入口等价。
+- **准入与授权**：`accessMode: 'guarded'`（默认）下，入站先过频道准入：**管理员不受任何白名单限制**，私聊/任意群聊（含未授权群）都可直接开会话；**非管理员**私聊回固定提示（`/userid` 例外），群聊要求 **群在白名单** 且 **user_id 在全局用户白名单**，两者缺一不可。未授权消息不建 Session、不建话题目录、不落附件、不调模型；群里静默、私聊回固定文案。机器人被拉进任意群时（订阅 `im.chat.member.bot.added_v1`），插件私聊管理员发群信息卡（群名/`chat_id`/成员数/邀请人），未授权群附「授权本群 / 忽略」按钮；已授权群里未授权用户 @ 机器人时，管理员会收到用户授权申请卡（含昵称/user_id）。授权状态持久化在 `channels_routes_v2` 域的 `access_groups` / `access_users` / `access_requests` 表，撤销立即生效。管理员 user_id 在 Web 面板配置，留空时为飞书应用所有者（连接时查询，需可选的「获取应用信息」权限；查询失败则 fail closed，手动填写管理员即可）；`/auth` 命令、授权卡、面板三种入口等价。
 - **HITL 审批**：插件以 `prepend: true` 注册为宿主 `approval/request` 瀑布的应答者——本频道路由的 session 的审批请求**优先于** Web 网关的通用应答（其面板对飞书用户不可见），非本频道的请求原样 `next()` 交给其他应答者。审批卡是**独立消息**（锚定到该 session 最新流式卡、同话题），绝不嵌入流式卡（其全量替换 patch 会冲掉按钮）。待审批时允许/拒绝按钮以两列等宽方式排列在同一行；决策仅在会话发起人点击时生效：允许 → `allowed-once`、拒绝 → `rejected`、超时 → `rejected`（fail-closed，卡面显示「已超时」）、请求被撤回（abort）→ `cancelled`、卡片发送失败 → `unavailable`（fail-closed）；每次决策后卡片更新为终态并移除两个按钮。审批记录（`approval/asked`/`decided`）由宿主会话日志负责，插件不做持久化——重启后遗留问题随 turn 消亡，与 Web 网关一致。需要飞书应用订阅 **card.action.trigger** 回调（见「飞书侧准备」）；启动日志 `HITL 审批应答已就绪` 表示生效，`主机未挂载 approval 服务` 表示该部署未启用 HITL。
 - **终态与表情**：成功轮的面板标题变为「回复结束」（无推理内容时不渲染面板），并把 `Typing` 换成 `DONE`；`turn/end.kind = error` 时面板标题为「回复失败」（同样仅当有推理内容），错误只在正文出现一次（`❌ **本轮运行失败**` + 结构化错误消息与错误码），并把 `Typing` 换成 `No`。模型/推理强度/本轮缓存样本不会继承上一轮。
 - **限频**：卡片更新单条消息 5 QPS、应用级 1000 次/分钟；500ms（2 QPS）默认安全，`refreshMs` 下限 200ms；活动状态行的保活心跳默认 5s（`statusRefreshMs` 下限 1s），远低于限频。

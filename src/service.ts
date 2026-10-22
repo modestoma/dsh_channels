@@ -1057,7 +1057,7 @@ export class FeishuService {
     } catch (error) {
       const detail = error instanceof AppOwnerLookupError ? error.detail : messageOf(error)
       state = {
-        error: `获取应用信息失败：${detail}；请在开发者后台为应用开通「获取应用信息」相关权限并发布版本`,
+        error: `获取应用信息失败：${detail}。请在「访问授权」手动填写管理员 user_id（私聊机器人发 /userid 获取，私聊模式关闭时可在飞书管理后台的成员详情里查看用户 ID）；或为应用开通「获取应用信息」权限并发布版本后重新连接`,
         apiRejected: error instanceof AppOwnerLookupError && error.code !== undefined,
       }
     } finally {
