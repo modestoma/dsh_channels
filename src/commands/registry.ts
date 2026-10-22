@@ -28,7 +28,10 @@ export interface ChannelCommandSpec {
   readonly mentionGate?: boolean
   /** Only usable in this chat type. */
   readonly chatType?: 'p2p' | 'group'
-  /** Answer with a direct reply instead of creating a topic. */
+  /**
+   * Answer with a direct reply instead of creating a topic; inside an existing
+   * topic the reply still lands in that topic.
+   */
   readonly directReply?: boolean
   /**
    * Answered by the channel itself (`/stop`), never through the agent command
@@ -47,7 +50,7 @@ export interface ChannelCommandSpec {
 export const CHANNEL_COMMANDS = [
   {
     name: 'help', group: '基础', description: '显示当前支持的斜杠命令',
-    routeFree: true, directReply: false,
+    routeFree: true, directReply: true,
   },
   {
     name: 'userid', group: '基础', description: '在私聊中显示当前用户 ID',
@@ -59,7 +62,7 @@ export const CHANNEL_COMMANDS = [
   },
   {
     name: 'health', group: '基础', description: '显示 Harness 与飞书通道健康状态',
-    sessionOptional: true,
+    sessionOptional: true, directReply: true,
   },
   {
     name: 'status', group: '会话', description: '显示当前 Session 状态与性能指标',
