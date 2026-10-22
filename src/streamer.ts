@@ -513,10 +513,27 @@ export class TurnStreamer {
       { triggerMessageId: state.triggerMessageId, reactionId: state.reactionId },
       ...state.mergedTriggers,
     )
-    this.channel.updateCard(messageId, buildMergedCard()).catch((error: unknown) => {
-      this.hooks.onError(sessionId, error)
-    })
+    void this.settleMergedCard(sessionId, messageId)
     return true
+  }
+
+  /**
+   * Patch a merged queued card into its terminal notice, with up to two
+   * retries (1s / 2s backoff) so a transient failure does not leave a stale
+   * queued card whose button no longer acts.
+   */
+  private async settleMergedCard(sessionId: string, messageId: string): Promise<void> {
+    let lastError: unknown
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        await this.channel.updateCard(messageId, buildMergedCard())
+        return
+      } catch (error) {
+        lastError = error
+        if (attempt < 2) await this.delay(1_000 * 2 ** attempt)
+      }
+    }
+    this.hooks.onError(sessionId, lastError)
   }
 
   /** Add the owner-only notice under a queued card's steer button (once). */

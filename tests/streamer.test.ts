@@ -1226,6 +1226,26 @@ describe('TurnStreamer queued turns', () => {
     expect(streamer.hasLiveTurn('sess-merge')).toBe(false)
   })
 
+  it('retries the merged card patch after a transient failure', async () => {
+    const ch = channel()
+    const errors = hooks()
+    const streamer = new TurnStreamer(ch, 500, errors)
+    const session = makeSession('sess-merge-retry')
+    streamer.attach(session, 'om_first', 'om_t1', undefined, prompt('m1'))
+    streamer.attach(session, 'om_second', 'om_t2', undefined, prompt('m2'))
+    mockFn(ch.updateCard).mockRejectedValueOnce(new Error('transient'))
+    expect(streamer.mergeQueued('om_second', () => true)).toBe(true)
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(JSON.stringify(ch.updated.find(update => update.messageId === 'om_second')!.card)).toContain('已补充到当前回复')
+    expect(errors.onError).not.toHaveBeenCalled()
+
+    streamer.attach(session, 'om_third', 'om_t3', undefined, prompt('m3'))
+    mockFn(ch.updateCard).mockRejectedValue(new Error('down'))
+    expect(streamer.mergeQueued('om_third', () => true)).toBe(true)
+    await vi.advanceTimersByTimeAsync(3_000)
+    expect(errors.onError).toHaveBeenCalledTimes(1)
+  })
+
   it('refuses to merge while stopping, when the prompt was already claimed, or for unknown cards', () => {
     const ch = channel()
     const { streamer } = queued(ch, 'sess-refuse')
@@ -1259,4 +1279,8 @@ describe('TurnStreamer queued turns', () => {
 
 function mockCalls(fn: unknown): unknown[][] {
   return (fn as { mock: { calls: unknown[][] } }).mock.calls
+}
+
+function mockFn(fn: unknown): ReturnType<typeof vi.fn> {
+  return fn as ReturnType<typeof vi.fn>
 }
