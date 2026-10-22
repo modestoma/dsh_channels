@@ -85,6 +85,8 @@ export interface WikiUpdateRequest {
   readonly blockId?: string
   readonly startBlockId?: string
   readonly endBlockId?: string
+  /** Base revision; Feishu rejects the update when the document moved past it. */
+  readonly revisionId?: number
 }
 
 /** Outcome of one update. */
@@ -327,6 +329,7 @@ export function createWikiApi(request: WikiRawRequest): WikiApi {
           ...(update.blockId === undefined ? {} : { block_id: update.blockId }),
           ...(update.startBlockId === undefined ? {} : { start_block_id: update.startBlockId }),
           ...(update.endBlockId === undefined ? {} : { end_block_id: update.endBlockId }),
+          ...(update.revisionId === undefined ? {} : { revision_id: update.revisionId }),
         },
       })
       const warnings = Array.isArray(data.warnings)

@@ -274,13 +274,29 @@ describe('feishu_wiki_edit', () => {
     await h.click('allow')
     expect(await pending).toMatchObject({ ok: true, applied: 4, revision_id: 11 })
     expect(h.api.updates.map(update => update.request)).toEqual([
-      { command: 'block_insert_after', format: 'xml', content: '<p>尾部</p>', blockId: '-1' },
-      { command: 'block_replace', format: 'xml', content: '<p>新</p>', startBlockId: 'blkA', endBlockId: 'blkB' },
-      { command: 'block_delete', format: 'xml', blockId: 'blkC' },
-      { command: 'str_replace', format: 'xml', pattern: '旧词', content: '' },
+      { command: 'block_insert_after', format: 'xml', content: '<p>尾部</p>', blockId: '-1', revisionId: 7 },
+      { command: 'block_replace', format: 'xml', content: '<p>新</p>', startBlockId: 'blkA', endBlockId: 'blkB', revisionId: 8 },
+      { command: 'block_delete', format: 'xml', blockId: 'blkC', revisionId: 9 },
+      { command: 'str_replace', format: 'xml', pattern: '旧词', content: '', revisionId: 10 },
     ])
     const card = JSON.stringify(h.channel.sent[0]?.input)
     expect(card).toContain('将执行 4 个操作')
+  })
+
+  it('keeps every operation on the consent card', async () => {
+    const h = await setup()
+    const long = 'x'.repeat(500)
+    const operations = [
+      ...Array.from({ length: 19 }, () => ({ command: 'append', content: long })),
+      { command: 'overwrite', content: '全新内容' },
+    ]
+    const pending = h.run(WIKI_EDIT_TOOL_NAME, { doc: 'wikcnChildNode001', revision_id: 7, operations })
+    await vi.waitFor(() => expect(h.channel.sent).toHaveLength(1))
+    const card = JSON.stringify(h.channel.sent[0]?.input)
+    expect(card).toContain('20. ⚠️ 清空整篇并重写')
+    expect(card).not.toContain('已截断')
+    await h.click('deny')
+    expect(await pending).toMatchObject({ ok: false, code: 'CONSENT_DENIED' })
   })
 
   it('refuses documents the app does not own and stale revisions without a card', async () => {
@@ -307,6 +323,18 @@ describe('feishu_wiki_edit', () => {
     expect(await pending).toMatchObject({ ok: false, code: 'EDIT_FAILED', applied: 1 })
     expect(h.api.updateDocument).toHaveBeenCalledTimes(2)
   })
+
+  it('stops at a partially applied operation and asks for verification', async () => {
+    const h = await setup()
+    h.api.updateDocument.mockImplementationOnce(async () => ({ result: 'partial_success', revisionId: 8, warnings: ['some blocks skipped'] }))
+    const pending = h.run(WIKI_EDIT_TOOL_NAME, {
+      doc: 'wikcnChildNode001', revision_id: 7,
+      operations: [{ command: 'overwrite', content: 'a' }, { command: 'append', content: 'b' }],
+    })
+    await h.click('allow')
+    expect(await pending).toMatchObject({ ok: false, code: 'EDIT_PARTIAL', applied: 0, revision_id: 8 })
+    expect(h.api.updateDocument).toHaveBeenCalledTimes(1)
+  })
 })
 
 describe('createWikiApi', () => {
@@ -328,7 +356,7 @@ describe('createWikiApi', () => {
     })
     expect(await api.fetchDocument('d', { format: 'xml', withBlockIds: true, scope: 'keyword', keyword: 'a|b' }))
       .toEqual({ revisionId: 3, content: '<p id="b1">x</p>' })
-    expect(await api.updateDocument('d', { command: 'block_delete', format: 'markdown', blockId: 'b1' }))
+    expect(await api.updateDocument('d', { command: 'block_delete', format: 'markdown', blockId: 'b1', revisionId: 3 }))
       .toEqual({ result: 'partial_success', revisionId: 4, warnings: ['w'] })
     await expect(api.spaceName('1')).rejects.toMatchObject({ code: 131006 })
     expect(calls).toEqual([
@@ -342,7 +370,7 @@ describe('createWikiApi', () => {
           read_option: { read_mode: 'keyword', keyword: 'a|b' },
         },
       },
-      { method: 'PUT', url: '/open-apis/docs_ai/v1/documents/d', data: { format: 'markdown', command: 'block_delete', block_id: 'b1' } },
+      { method: 'PUT', url: '/open-apis/docs_ai/v1/documents/d', data: { format: 'markdown', command: 'block_delete', block_id: 'b1', revision_id: 3 } },
       { method: 'GET', url: '/open-apis/wiki/v2/spaces/1' },
     ])
   })

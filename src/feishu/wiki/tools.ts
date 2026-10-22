@@ -129,6 +129,7 @@ export type WikiFailureCode =
   | 'PERMISSION_DENIED'
   | 'CONTENT_FAILED'
   | 'EDIT_FAILED'
+  | 'EDIT_PARTIAL'
   | 'API_FAILED'
   | 'ABORTED'
 
@@ -151,6 +152,7 @@ const FAILURE_REASONS: Readonly<Record<WikiFailureCode, string>> = {
   PERMISSION_DENIED: '飞书拒绝调用：应用缺少知识库或文档权限（wiki:wiki、docx:document），请管理员在开发者后台开通并发布版本',
   CONTENT_FAILED: '文档已创建，但写入内容失败',
   EDIT_FAILED: '修改失败',
+  EDIT_PARTIAL: '飞书报告操作只部分生效；已停止后续操作，请用 feishu_wiki_read 读取最新内容核验后再继续',
   API_FAILED: '飞书接口调用失败',
   ABORTED: '已取消',
 }
@@ -163,7 +165,7 @@ export interface WikiFailure {
   /** Set by `CONTENT_FAILED`: the document that was created anyway. */
   readonly node_token?: string
   readonly url?: string
-  /** Set by `EDIT_FAILED`: operations applied before the failure. */
+  /** Set by `EDIT_FAILED`/`EDIT_PARTIAL`: operations fully applied before the stop. */
   readonly applied?: number
   /** Set by `REVISION_CONFLICT`: the current revision. */
   readonly revision_id?: number
@@ -638,6 +640,9 @@ export class WikiToolRuntime {
         if (written.result === 'failed') {
           return { ...failure('CONTENT_FAILED', `${FAILURE_REASONS.CONTENT_FAILED}：${written.warnings.join('；') || '飞书返回 failed'}；可用 feishu_wiki_edit 重新写入`), node_token: node.nodeToken, url }
         }
+        if (written.result === 'partial_success') {
+          return { ...failure('CONTENT_FAILED', `文档已创建，但内容只部分写入：${written.warnings.join('；') || '飞书返回 partial_success'}；请先用 feishu_wiki_read 核验，再用 feishu_wiki_edit 补齐`), node_token: node.nodeToken, url }
+        }
         return {
           ok: true,
           title: node.title || args.title,
@@ -685,7 +690,7 @@ export class WikiToolRuntime {
         title: node.title,
         url,
         location: await this.locationOf(context.api, node),
-        details: [operationLines(args.operations)],
+        details: operationLines(args.operations),
       }, exec.signal)
       if (denied !== undefined) return denied
       // The document may have changed while the card was open.
@@ -693,12 +698,13 @@ export class WikiToolRuntime {
         return failure('REVISION_CONFLICT', `${FAILURE_REASONS.REVISION_CONFLICT}（等待授权期间文档被修改）`)
       }
       const warnings: string[] = []
-      let revision: number | undefined
+      // Each update names its base revision so a concurrent edit conflicts instead of landing on newer content.
+      let revision = args.revision_id
       for (const [index, request] of requests.entries()) {
         if (exec.signal.aborted) return { ...failure('ABORTED', `已取消；前 ${index} 个操作已执行`), applied: index }
         let result
         try {
-          result = await context.api.updateDocument(node.objToken, request)
+          result = await context.api.updateDocument(node.objToken, { ...request, revisionId: revision })
         } catch (error) {
           const reason = failureOf(error).reason
           return { ...failure('EDIT_FAILED', `第 ${index + 1} 个操作失败：${reason}；前 ${index} 个操作已执行`), applied: index }
@@ -708,6 +714,9 @@ export class WikiToolRuntime {
         if (result.result === 'failed') {
           return { ...failure('EDIT_FAILED', `第 ${index + 1} 个操作失败：${result.warnings.join('；') || '飞书返回 failed'}；前 ${index} 个操作已执行`), applied: index }
         }
+        if (result.result === 'partial_success') {
+          return { ...failure('EDIT_PARTIAL', `第 ${index + 1} 个操作只部分生效（${result.warnings.join('；') || '飞书返回 partial_success'}）；前 ${index} 个操作已执行，已停止后续操作；请用 feishu_wiki_read 读取核验后再继续`), applied: index, revision_id: revision }
+        }
       }
       return {
         ok: true,
@@ -715,7 +724,7 @@ export class WikiToolRuntime {
         node_token: node.nodeToken,
         url,
         applied: requests.length,
-        ...(revision === undefined ? {} : { revision_id: revision }),
+        revision_id: revision,
         warnings,
       }
     })
@@ -823,7 +832,8 @@ function rangeOf(operation: { block_id?: string; start_block_id?: string; end_bl
 }
 
 /** The consent card's operation list. */
-function operationLines(operations: readonly WikiEditOperation[]): string {
+/** Consent-card details: a header, then one entry per operation so every operation stays visible. */
+function operationLines(operations: readonly WikiEditOperation[]): string[] {
   const lines = operations.map((operation, index) => {
     const n = `${index + 1}.`
     switch (operation.command) {
@@ -835,7 +845,7 @@ function operationLines(operations: readonly WikiEditOperation[]): string {
       case 'overwrite': return `${n} ⚠️ 清空整篇并重写为 ${operation.content.length} 字：${preview(operation.content)}`
     }
   })
-  return `**将执行 ${operations.length} 个操作**\n${lines.join('\n')}`
+  return [`**将执行 ${operations.length} 个操作**`, ...lines]
 }
 
 function blockRangeLabel(operation: { block_id?: string; start_block_id?: string; end_block_id?: string }): string {
