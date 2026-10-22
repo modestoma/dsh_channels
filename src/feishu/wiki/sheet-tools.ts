@@ -40,6 +40,16 @@ const READ_MAX_CHARS = 100_000
 /** CSV characters requested when only the data extent of a sheet is needed. */
 const EXTENT_PROBE_CHARS = 2_000
 
+/** CSV characters per page while scanning below the first data region for later rows. */
+const EXTENT_SCAN_CHARS = 200_000
+
+/** Pages the append row scan reads before giving up. */
+const EXTENT_SCAN_PAGES = 20
+
+/** Scan bounds when the workbook does not report the grid size. */
+const MAX_SCAN_COLUMN = 18_278
+const MAX_SCAN_ROW = 10_000_000
+
 /** Rows of each written block shown on a consent card. */
 const CARD_PREVIEW_ROWS = 3
 
@@ -128,7 +138,7 @@ const READ_DESCRIPTION =
 const EDIT_DESCRIPTION =
   '修改知识库中由本应用创建的飞书电子表格（sheet）的单元格值。先用 feishu_wiki_sheet_read 读取，把读到的 revision_id 原样传入；表格在此之后被改过会被拒绝，需要重新读取。'
   + `operations 按顺序执行（最多 ${WIKI_SHEET_EDIT_MAX_OPERATIONS} 个，合计不超过 ${WIKI_SHEET_EDIT_MAX_CELLS} 个单元格）：`
-  + 'write（从 start_cell 如 B3 开始写入二维数组 values）、append（在子表现有数据的最后一行之后追加 values，start_column 默认 A）。'
+  + 'write（从 start_cell 如 B3 开始写入二维数组 values）、append（在子表现有数据的最后一行之后追加 values，start_column 默认 A；目标单元格非空时失败，不会覆盖）。'
   + 'values 每个元素是一行；单元格可以是字符串、数字、布尔或 null（null 表示保持原值不变）；以 = 开头的字符串作为公式写入。'
   + '数字、金额、百分比（0.4 表示 40%）写成数字；编号、前导零、身份证号写成字符串。不会修改样式、图表、行列结构。'
   + 'sheet 传子表 sheet_id 或标题，只有一个可见子表时可省略。每次修改都会在话题里弹出授权卡，由话题发起人确认后才执行；等待期间不要重复调用。'
@@ -340,13 +350,35 @@ function cardLines(planned: readonly PlannedWrite[]): string[] {
   return [`**将执行 ${planned.length} 个操作**`, ...lines]
 }
 
-/** First empty row after the sheet's data (1 for an empty sheet). */
+/** First empty row after the sheet's data (1 for an empty sheet), or undefined when it cannot be determined. */
 async function appendRow(sheets: SheetApi, token: string, sheet: SheetInfo): Promise<number | undefined> {
   const probe = await sheets.readCsv(token, { sheetId: sheet.sheetId, range: wholeSheetRange(sheet), maxChars: EXTENT_PROBE_CHARS })
   const region = probe.currentRegion ?? (probe.hasMore ? undefined : probe.actualRange)
-  if (region === undefined) return probe.csv.trim() === '' && !probe.hasMore ? 1 : undefined
-  const last = rangeEndRow(region)
-  return last === undefined ? undefined : last + 1
+  let last = region === undefined ? (probe.csv.trim() === '' && !probe.hasMore ? 0 : undefined) : rangeEndRow(region)
+  if (last === undefined) return undefined
+  // `current_region` stops at a fully blank row, so later data regions are found by scanning the rows below it.
+  const lastColumn = columnLetters(sheet.columnCount !== undefined && sheet.columnCount > 0 ? sheet.columnCount : MAX_SCAN_COLUMN)
+  const lastRow = sheet.rowCount !== undefined && sheet.rowCount > 0 ? sheet.rowCount : MAX_SCAN_ROW
+  let from = last + 1
+  for (let page = 0; from <= lastRow; page++) {
+    if (page === EXTENT_SCAN_PAGES) return undefined
+    const scan = await sheets.readCsv(token, { sheetId: sheet.sheetId, range: `A${from}:${lastColumn}${lastRow}`, maxChars: EXTENT_SCAN_CHARS })
+    last = Math.max(last, lastFilledRow(scan.csv))
+    if (!scan.hasMore) break
+    const end = scan.actualRange === undefined ? undefined : rangeEndRow(scan.actualRange)
+    if (end === undefined || end < from) return undefined
+    from = end + 1
+  }
+  return last + 1
+}
+
+/** Largest `[row=N]` whose record has a non-empty cell, or 0. */
+function lastFilledRow(csv: string): number {
+  let last = 0
+  for (const match of csv.matchAll(/^\[row=(\d+)\] ?(.*)$/gmu)) {
+    if (/[^,\s"]/u.test(match[2] ?? '')) last = Math.max(last, Number(match[1]))
+  }
+  return last
 }
 
 async function edit(kit: WikiToolKit, sessionId: string, rawArgs: Record<string, unknown>, signal: AbortSignal): Promise<object> {
@@ -391,7 +423,12 @@ async function edit(kit: WikiToolKit, sessionId: string, rawArgs: Record<string,
           start = { column: write.start.column, row }
         }
         const range = rectangle(start, write.rows.length, write.columns)
-        await sheets.writeCells(node.objToken, { sheetId: write.sheet.sheetId, range, rows: write.rows })
+        await sheets.writeCells(node.objToken, {
+          sheetId: write.sheet.sheetId,
+          range,
+          rows: write.rows,
+          ...(write.operation.command === 'append' ? { allowOverwrite: false } : {}),
+        })
         written.push({ sheet_id: write.sheet.sheetId, range })
       } catch (error) {
         const reason = failureOf(error).reason

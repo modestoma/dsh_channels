@@ -109,7 +109,9 @@ const WIKI_WRITE_REQUIREMENTS: readonly ScopeRequirement[] = [
   { anyOf: ['wiki:wiki'], level: 'optional', purpose: '在知识库中新建节点（feishu_wiki_create）' },
   { anyOf: ['docx:document'], level: 'optional', purpose: '写入与修改知识库文档内容（feishu_wiki_create / feishu_wiki_edit）' },
   { anyOf: ['sheets:spreadsheet', 'sheets:spreadsheet:write_only'], level: 'optional', purpose: '写入知识库电子表格（feishu_wiki_sheet_edit）' },
-  { anyOf: ['bitable:app', 'base:record:create'], level: 'optional', purpose: '写入知识库多维表格记录（feishu_wiki_base_edit）' },
+  { anyOf: ['bitable:app', 'base:record:create'], level: 'optional', purpose: '新增知识库多维表格记录（feishu_wiki_base_edit）' },
+  { anyOf: ['bitable:app', 'base:record:update'], level: 'optional', purpose: '修改本应用创建的多维表格中的记录（feishu_wiki_base_edit）' },
+  { anyOf: ['bitable:app', 'base:record:delete'], level: 'optional', purpose: '删除本应用创建的多维表格中的记录（feishu_wiki_base_edit）' },
   ...SHEET_BASE_READ_REQUIREMENTS,
 ]
 

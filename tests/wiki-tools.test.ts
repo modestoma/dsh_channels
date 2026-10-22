@@ -14,7 +14,7 @@ import { createBaseApi } from '../src/feishu/wiki/base-api.ts'
 import type { BaseApi, BaseField, BaseRecordFields, BaseRecordPage, BaseTable } from '../src/feishu/wiki/base-api.ts'
 import { WikiConsent } from '../src/feishu/wiki/consent.ts'
 import { createSheetApi } from '../src/feishu/wiki/sheet-api.ts'
-import type { SheetApi, SheetCsv, SheetWorkbook, SheetWriteRequest } from '../src/feishu/wiki/sheet-api.ts'
+import type { SheetApi, SheetCsv, SheetCsvRequest, SheetWorkbook, SheetWriteRequest } from '../src/feishu/wiki/sheet-api.ts'
 import { parseWikiRef, parseWikiRootLink } from '../src/feishu/wiki/links.ts'
 import {
   WIKI_CREATE_TOOL_NAME, WIKI_EDIT_TOOL_NAME, WIKI_LIST_TOOL_NAME, WIKI_READ_TOOL_NAME, WikiToolRuntime,
@@ -89,7 +89,7 @@ function fakeSheets() {
         { sheetId: 'bt1', title: '嵌入表', index: 2, resourceType: 'bitable', hidden: false },
       ],
     })),
-    readCsv: vi.fn(async (): Promise<SheetCsv> => ({
+    readCsv: vi.fn(async (_token: string, _request: SheetCsvRequest): Promise<SheetCsv> => ({
       csv: '[row=1] 项目,金额\n[row=2] 差旅,1200',
       actualRange: 'A1:B2',
       currentRegion: 'A1:B2',
@@ -462,11 +462,38 @@ describe('feishu_wiki_sheet_edit', () => {
     })
     expect(h.sheets.writes.map(write => write.request)).toEqual([
       { sheetId: 'sh1', range: 'B3:C4', rows: [['a', 1], ['=SUM(C3:C4)', null]] },
-      { sheetId: 'sh1', range: 'A3:C3', rows: [['差旅', 300, true]] },
+      { sheetId: 'sh1', range: 'A3:C3', rows: [['差旅', 300, true]], allowOverwrite: false },
     ])
     const card = JSON.stringify(h.channel.sent[0]?.input)
     expect(card).toContain('B3:C4（2 行 × 2 列）')
     expect(card).toContain('末尾追加 1 行 × 3 列')
+  })
+
+  it('appends below data regions that follow a blank row, paging through truncated scans', async () => {
+    const h = await setup()
+    h.sheets.readCsv
+      .mockResolvedValueOnce({ csv: '[row=1] 项目,金额', actualRange: 'A1:F3', currentRegion: 'A1:B2', hasMore: true })
+      .mockResolvedValueOnce({ csv: '[row=3] ,\n[row=5] 小计,"1,200"', actualRange: 'A3:F5', hasMore: true })
+      .mockResolvedValueOnce({ csv: '[row=6] ,""\n[row=7] ,', actualRange: 'A6:F200', hasMore: false })
+    const pending = h.run('feishu_wiki_sheet_edit', {
+      doc: 'wikcnSheetOwned01', revision_id: 30, operations: [{ command: 'append', start_column: 'B', values: [['x']] }],
+    })
+    await h.click('allow')
+    expect(await pending).toMatchObject({ ok: true, written: [{ sheet_id: 'sh1', range: 'B6:B6' }] })
+    expect(h.sheets.readCsv.mock.calls.map(([, request]) => request.range)).toEqual(['A1:F200', 'A3:F200', 'A6:F200'])
+  })
+
+  it('refuses an append when a scan page does not advance', async () => {
+    const h = await setup()
+    h.sheets.readCsv
+      .mockResolvedValueOnce({ csv: '', currentRegion: 'A1:B2', hasMore: false })
+      .mockResolvedValueOnce({ csv: '[row=3] a', hasMore: true })
+    const pending = h.run('feishu_wiki_sheet_edit', {
+      doc: 'wikcnSheetOwned01', revision_id: 30, operations: [{ command: 'append', values: [['x']] }],
+    })
+    await h.click('allow')
+    expect(await pending).toMatchObject({ ok: false, code: 'EDIT_FAILED', applied: 0 })
+    expect(h.sheets.writes).toEqual([])
   })
 
   it('refuses spreadsheets the app does not own, stale revisions, and too many cells without a card', async () => {
@@ -580,6 +607,7 @@ describe('createSheetApi', () => {
       { code: 0, data: { output: JSON.stringify({ revision: 60, sheets: [{ sheet_id: 'sh1', title: 'S', row_count: 10, column_count: 3, is_hidden: true }, { sheet_id: '' }] }) } },
       { code: 0, data: { output: JSON.stringify({ annotated_csv: '[row=1] a', actual_range: 'A1', has_more: true, warning_message: 'w' }) } },
       { code: 0, data: { output: '' } },
+      { code: 0, data: { output: '' } },
       { code: 0, data: { output: 'not json' } },
     ]
     const request = (async (input: Parameters<WikiRawRequest>[0]) => {
@@ -594,6 +622,7 @@ describe('createSheetApi', () => {
     expect(await api.readCsv('sht1', { sheetId: 'sh1', range: 'A1:C10', maxChars: 1000 }))
       .toEqual({ csv: '[row=1] a', actualRange: 'A1', hasMore: true, warning: 'w' })
     await api.writeCells('sht1', { sheetId: 'sh1', range: 'A1:C1', rows: [['=A2', null, 3]] })
+    await api.writeCells('sht1', { sheetId: 'sh1', range: 'A2:A2', rows: [['x']], allowOverwrite: false })
     await expect(api.workbook('sht1')).rejects.toThrow(/not JSON/u)
     expect(calls[0]).toEqual({
       method: 'POST',
@@ -607,6 +636,7 @@ describe('createSheetApi', () => {
     expect(JSON.parse((calls[2]?.data as { input: string }).input)).toEqual({
       excel_id: 'sht1', sheet_id: 'sh1', range: 'A1:C1', cells: [[{ formula: '=A2' }, {}, { value: 3 }]],
     })
+    expect(JSON.parse((calls[3]?.data as { input: string }).input)).toMatchObject({ range: 'A2:A2', allow_overwrite: false })
   })
 })
 

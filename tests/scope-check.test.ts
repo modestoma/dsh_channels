@@ -93,7 +93,7 @@ describe('checkScopes', () => {
       .map(name => ({ name, granted: true })))
     expect(checkScopes(readonly, 'cli_x', read).missing).toEqual([])
     expect(checkScopes(readonly, 'cli_x', { ...read, wikiWrite: true }).missing.map(item => item.anyOf.join('|')))
-      .toEqual(['wiki:wiki', 'docx:document', 'sheets:spreadsheet|sheets:spreadsheet:write_only', 'bitable:app|base:record:create'])
+      .toEqual(['wiki:wiki', 'docx:document', 'sheets:spreadsheet|sheets:spreadsheet:write_only', 'bitable:app|base:record:create', 'bitable:app|base:record:update', 'bitable:app|base:record:delete'])
   })
 
   it('requires group_msg when unmentioned group messages are answered', () => {

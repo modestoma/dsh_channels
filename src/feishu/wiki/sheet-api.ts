@@ -70,6 +70,8 @@ export interface SheetWriteRequest {
   /** Rectangle whose size equals `rows` exactly. */
   readonly range: string
   readonly rows: readonly (readonly SheetCellValue[])[]
+  /** False makes the write fail when any target cell is non-empty; the server default is true. */
+  readonly allowOverwrite?: boolean
 }
 
 /** The `sheet_ai` spreadsheet tools the wiki sheet tools consume. */
@@ -208,6 +210,7 @@ export function createSheetApi(request: WikiRawRequest): SheetApi {
         sheet_id: write.sheetId,
         range: write.range,
         cells: write.rows.map(row => row.map(cellOf)),
+        ...(write.allowOverwrite === false ? { allow_overwrite: false } : {}),
       })
     },
   }
