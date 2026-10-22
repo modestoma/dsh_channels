@@ -25,7 +25,7 @@
    | `im:message.reactions:write_only`（发送、删除消息表情回复） | Typing / DONE / No 表态 |
    | `im:resource`（获取与上传图片或文件资源，**可选**；`im:resource:upload` 亦可） | 模型用 `feishu_send_file` 把生成的图片/文件发给用户；不开通时该工具返回可读错误 |
    | `im:message:update`（更新消息卡片） | 流式卡片刷新（patch） |
-   | `wiki:wiki`、`docx:document`、`sheets:spreadsheet`、`bitable:app`（**可选**，只读可用对应的 `:readonly` 权限） | 知识库工具（`feishuTools.wikiRead` / `wikiWrite` + `wikiRoots`）：浏览知识库，读取/新建/修改飞书文档、电子表格、多维表格；应用还需是目标知识空间的成员 |
+   | `wiki:wiki`、`docx:document`（只读可用对应的 `:readonly` 权限），电子表格 `sheets:spreadsheet:read` / `sheets:spreadsheet:write_only`，多维表格 `base:table:read`、`base:field:read`、`base:record:read` / `base:record:create`、`base:record:update`、`base:record:delete`（**可选**；旧版 `sheets:spreadsheet` / `bitable:app` 对新版接口不生效） | 知识库工具（`feishuTools.wikiRead` / `wikiWrite` + `wikiRoots`）：浏览知识库，读取/新建/修改飞书文档、电子表格、多维表格；应用还需是目标知识空间的成员 |
    | `im:chat:readonly` 一类（获取群信息） | 入群通知卡展示群名/成员数（具体 scope 以控制台要求为准） |
    | 「获取应用信息」一类（如 `admin:app.info:readonly` / `application:application:self_manage`，**可选**，以控制台要求为准） | 未配置 `adminUserId` 时连接后自动把应用所有者设为管理员；不便申请时跳过即可，按 3.3 手动设置管理员 |
    | `application:app_slash_command:read` 与 `application:app_slash_command:write`（读取/管理应用斜杠指令，可选，仅 `slashCommandPanel: true` 时需要） | 连接后把插件命令同步到飞书原生斜杠指令面板（输入 `/` 时列出，客户端约 5 分钟后刷新）；缺失时只是面板没有列表，直接输入命令不受影响 |

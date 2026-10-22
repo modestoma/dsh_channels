@@ -86,14 +86,16 @@ describe('checkScopes', () => {
     expect(checkScopes(ALL_GRANTED, 'cli_x', read).missing.map(item => item.anyOf.join('|'))).toEqual([
       'wiki:wiki|wiki:wiki:readonly',
       'docx:document|docx:document:readonly',
-      'sheets:spreadsheet|sheets:spreadsheet:readonly|sheets:spreadsheet:read',
-      'bitable:app|bitable:app:readonly|base:record:read',
+      'sheets:spreadsheet:read',
+      'base:table:read',
+      'base:field:read',
+      'base:record:read',
     ])
-    const readonly = ALL_GRANTED.concat(['wiki:wiki:readonly', 'docx:document:readonly', 'sheets:spreadsheet:read', 'base:record:read']
+    const readonly = ALL_GRANTED.concat(['wiki:wiki:readonly', 'docx:document:readonly', 'sheets:spreadsheet:read', 'base:table:read', 'base:field:read', 'base:record:read']
       .map(name => ({ name, granted: true })))
     expect(checkScopes(readonly, 'cli_x', read).missing).toEqual([])
     expect(checkScopes(readonly, 'cli_x', { ...read, wikiWrite: true }).missing.map(item => item.anyOf.join('|')))
-      .toEqual(['wiki:wiki', 'docx:document', 'sheets:spreadsheet|sheets:spreadsheet:write_only', 'bitable:app|base:record:create', 'bitable:app|base:record:update', 'bitable:app|base:record:delete'])
+      .toEqual(['wiki:wiki', 'docx:document', 'sheets:spreadsheet:write_only', 'base:record:create', 'base:record:update', 'base:record:delete'])
   })
 
   it('requires group_msg when unmentioned group messages are answered', () => {
