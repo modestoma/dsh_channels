@@ -69,8 +69,8 @@ import type { SettingsTarget } from '../src/settings/surface.ts'
 import { createHostCatalog } from '../src/settings/catalog.ts'
 import type { SettingsCatalog } from '../src/settings/catalog.ts'
 import type { SettingsDirectoryPicker } from '../src/settings/directory-picker.ts'
-import { isSameOriginRequest, registerSettingsRoutes } from '../src/settings/routes.ts'
-import type { HostWebServer } from '../src/settings/routes.ts'
+import { isSameOriginRequest, mountSettingsRoutes, registerSettingsRoutes } from '../src/settings/routes.ts'
+import type { HostRequestGate, HostWebServer } from '../src/settings/routes.ts'
 import { normalizeWorkspaceBaseDir, prepareWorkspaceBaseDir } from '../src/workspaces.ts'
 import { makeChannel, makeHostContext } from './helpers.ts'
 
@@ -1670,7 +1670,59 @@ function makeWebServer(): { server: HostWebServer; routes: Map<string, RouteHand
   return { server, routes }
 }
 
+/** A host gate that admits every request (authentication tested separately). */
+const allowAll: HostRequestGate = { requestRejection: () => undefined }
+
+const ALL_SETTINGS_ROUTES: Array<{ route: string; method: string }> = [
+  { route: STATUS_ROUTE, method: 'GET' },
+  { route: PANEL_ROUTE, method: 'GET' },
+  { route: CATALOG_ROUTE, method: 'GET' },
+  { route: CONFIG_ROUTE, method: 'PUT' },
+  { route: CONFIG_ROUTE, method: 'DELETE' },
+  { route: CREDENTIALS_ROUTE, method: 'PUT' },
+  { route: CREDENTIALS_ROUTE, method: 'DELETE' },
+  { route: RECONNECT_ROUTE, method: 'POST' },
+  { route: PICK_DIRECTORY_ROUTE, method: 'POST' },
+  { route: ACCESS_ROUTE, method: 'GET' },
+  { route: ACCESS_GROUPS_ROUTE, method: 'POST' },
+  { route: ACCESS_USERS_ROUTE, method: 'POST' },
+  { route: ACCESS_REQUESTS_ROUTE, method: 'POST' },
+]
+
 describe('settings routes', () => {
+  it('refuses every route the host connection gate rejects, before touching the surface', async () => {
+    for (const rejection of [401, 403] as const) {
+      const { surface, store, target } = makeSurface()
+      await store.save({ dmMode: 'disabled' })
+      const { server, routes } = makeWebServer()
+      const seen: IncomingMessage[] = []
+      registerSettingsRoutes(server, {
+        requestRejection: (req) => {
+          seen.push(req as IncomingMessage)
+          return rejection
+        },
+      }, surface)
+
+      for (const { route, method } of ALL_SETTINGS_ROUTES) {
+        const req = makeRequest({
+          method,
+          url: route,
+          headers: { 'content-type': 'application/json', host: '10.0.0.5:3000' },
+          body: JSON.stringify({ values: { dmMode: 'open' }, appId: 'cli_evil', field: 'appSecret', chatId: 'oc_x', userId: 'u_x', token: 't', decision: 'allow' }),
+        })
+        const response = await call(routes, route, req)
+        expect(response.status, `${method} ${route}`).toBe(rejection)
+        expect(JSON.parse(response.body).ok).toBe(false)
+        expect(response.body).not.toContain('dmMode')
+        expect(seen.at(-1)).toBe(req)
+      }
+      expect(seen).toHaveLength(ALL_SETTINGS_ROUTES.length)
+      await expect(store.load()).resolves.toEqual({ dmMode: 'disabled' })
+      expect(target.restartCalls).toBe(0)
+      expect(target.accessCalls).toEqual([])
+    }
+  })
+
   it('recognises same-origin and cross-origin mutations', () => {
     expect(isSameOriginRequest(makeRequest())).toBe(true)
     expect(isSameOriginRequest(makeRequest({
@@ -1687,7 +1739,7 @@ describe('settings routes', () => {
   it('serves status and panel, and rejects other methods with 405', async () => {
     const { surface } = makeSurface()
     const { server, routes } = makeWebServer()
-    registerSettingsRoutes(server, surface)
+    registerSettingsRoutes(server, allowAll, surface)
 
     const status = await call(routes, STATUS_ROUTE, makeRequest())
     expect(status.status).toBe(200)
@@ -1706,7 +1758,7 @@ describe('settings routes', () => {
     const fake = makeCatalog()
     const { surface } = makeSurface({ provider: 'deepseek-account', model: 'deepseek-flash' }, fake.catalog)
     const { server, routes } = makeWebServer()
-    registerSettingsRoutes(server, surface)
+    registerSettingsRoutes(server, allowAll, surface)
 
     const catalog = await call(routes, CATALOG_ROUTE, makeRequest({
       url: `${CATALOG_ROUTE}?provider=deepseek-account&model=deepseek-flash`,
@@ -1728,7 +1780,7 @@ describe('settings routes', () => {
   it('writes config via PUT and enforces same-origin + JSON', async () => {
     const { surface, store } = makeSurface()
     const { server, routes } = makeWebServer()
-    registerSettingsRoutes(server, surface)
+    registerSettingsRoutes(server, allowAll, surface)
 
     const crossSite = await call(routes, CONFIG_ROUTE, makeRequest({
       method: 'PUT',
@@ -1765,7 +1817,7 @@ describe('settings routes', () => {
   it('clears overrides via DELETE and reconnects via POST', async () => {
     const { surface, store, target } = makeSurface()
     const { server, routes } = makeWebServer()
-    registerSettingsRoutes(server, surface)
+    registerSettingsRoutes(server, allowAll, surface)
     await store.save({ dmMode: 'disabled' })
 
     const cleared = await call(routes, CONFIG_ROUTE, makeRequest({ method: 'DELETE', headers: { host: 'h' } }))
@@ -1786,7 +1838,7 @@ describe('settings routes', () => {
     target.runningFlag = false
     target.credentialInfo.appSecret = { configured: false, writable: true }
     const { server, routes } = makeWebServer()
-    registerSettingsRoutes(server, surface)
+    registerSettingsRoutes(server, allowAll, surface)
 
     const response = await call(routes, RECONNECT_ROUTE, makeRequest({ method: 'POST', headers: { host: 'h' } }))
     expect(response.status).toBe(400)
@@ -1799,7 +1851,7 @@ describe('settings routes', () => {
   it('opens the native directory chooser and returns the picked path', async () => {
     const { surface } = makeSurface({}, undefined, stubPicker(async () => '/Users/me/workspaces'))
     const { server, routes } = makeWebServer()
-    registerSettingsRoutes(server, surface)
+    registerSettingsRoutes(server, allowAll, surface)
 
     const crossSite = await call(routes, PICK_DIRECTORY_ROUTE, makeRequest({
       method: 'POST',
@@ -1823,7 +1875,7 @@ describe('settings routes', () => {
     let outcome: () => Promise<string | null> = async () => null
     const { surface } = makeSurface({}, undefined, { available: true, pick: () => outcome() })
     const { server, routes } = makeWebServer()
-    registerSettingsRoutes(server, surface)
+    registerSettingsRoutes(server, allowAll, surface)
 
     const canceled = await call(routes, PICK_DIRECTORY_ROUTE, makeRequest({
       method: 'POST',
@@ -1845,7 +1897,7 @@ describe('settings routes', () => {
     // No picker seam (remote/headless host): the route still exists but refuses.
     const headless = makeSurface()
     const headlessServer = makeWebServer()
-    registerSettingsRoutes(headlessServer.server, headless.surface)
+    registerSettingsRoutes(headlessServer.server, allowAll, headless.surface)
     const unavailable = await call(headlessServer.routes, PICK_DIRECTORY_ROUTE, makeRequest({
       method: 'POST',
       headers: { host: 'h' },
@@ -1872,7 +1924,7 @@ describe('settings routes', () => {
       }],
     }
     const { server, routes } = makeWebServer()
-    registerSettingsRoutes(server, surface)
+    registerSettingsRoutes(server, allowAll, surface)
 
     const read = await call(routes, ACCESS_ROUTE, makeRequest())
     expect(read.status).toBe(200)
@@ -1950,7 +2002,7 @@ describe('settings routes', () => {
   it('writes and removes credentials via PUT / DELETE with the same guards', async () => {
     const { surface } = makeSurface()
     const { server, routes } = makeWebServer()
-    registerSettingsRoutes(server, surface)
+    registerSettingsRoutes(server, allowAll, surface)
 
     const crossSite = await call(routes, CREDENTIALS_ROUTE, makeRequest({
       method: 'PUT',
@@ -2006,12 +2058,20 @@ describe('apply() web wiring', () => {
     const childCtx = {
       ...base,
       effect,
-      get: (name: string) => (name === 'webServer' ? server : base.get?.(name)),
+      get: (name: string) => {
+        if (name === 'webServer') return server
+        if (name === 'connection') return allowAll
+        return base.get?.(name)
+      },
     }
+    const injected: string[][] = []
     const ctx = {
       ...base,
       effect,
-      inject: (_dependencies: string[], callback: (child: HostContext) => void) => callback(childCtx as unknown as HostContext),
+      inject: (dependencies: string[], callback: (child: HostContext) => void) => {
+        injected.push(dependencies)
+        callback(childCtx as unknown as HostContext)
+      },
     } as unknown as HostContext
 
     const channel = makeChannel()
@@ -2024,6 +2084,7 @@ describe('apply() web wiring', () => {
       channelFactory: () => channel,
     })
 
+    expect(injected).toContainEqual(['webServer', 'connection'])
     expect(routes.has(PANEL_ROUTE)).toBe(true)
     expect(routes.has(STATUS_ROUTE)).toBe(true)
     expect(routes.has(CATALOG_ROUTE)).toBe(true)
@@ -2061,6 +2122,25 @@ describe('apply() web wiring', () => {
 
     for (const cleanup of cleanups.reverse()) await cleanup()
     vi.unstubAllEnvs()
+  })
+})
+
+describe('mountSettingsRoutes', () => {
+  it('mounts nothing when the host has a webServer but no connection gate', () => {
+    const { surface } = makeSurface()
+    const { server, routes } = makeWebServer()
+    const { ctx: base } = makeHostContext()
+    const ctx = {
+      ...base,
+      effect: (callback: () => unknown) => { callback() },
+      get: (name: string) => (name === 'webServer' ? server : undefined),
+    } as unknown as HostContext
+    mountSettingsRoutes(ctx, surface)
+    expect(routes.size).toBe(0)
+
+    const gated = { ...ctx, get: (name: string) => (name === 'webServer' ? server : name === 'connection' ? allowAll : undefined) }
+    mountSettingsRoutes(gated as unknown as HostContext, surface)
+    expect(routes.has(CONFIG_ROUTE)).toBe(true)
   })
 })
 
