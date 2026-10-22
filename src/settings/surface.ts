@@ -12,6 +12,7 @@
 
 import { DSH_CHANNELS_VERSION } from '../session-export.ts'
 import type { FeishuConfig } from '../config.ts'
+import { MAX_TIMER_DELAY_MS } from '../config.ts'
 import { FEISHU_USER_ID_PATTERN } from '../domain.ts'
 import { parseWikiRootLink, WIKI_ROOT_LINK_ERRORS } from '../feishu/wiki/links.ts'
 import type { HealthSnapshot } from '../health.ts'
@@ -325,16 +326,15 @@ const FIELD_META: Record<EditableKey, { label: string; help: string; min?: numbe
   },
   'feishuTools.attachmentFetchMaxBytes': {
     label: '单次取回字节预算（字节）',
-    help: '一次工具调用的总下载字节预算（默认 104857600 = 100 MiB）；文件流式写入原生库，不整文件缓冲。',
+    help: '一次工具调用的总下载字节预算（默认 104857600 = 100 MiB，不设上限）；文件流式写入原生库，不整文件缓冲，几 GiB 的文件只占磁盘。',
     min: 1,
-    max: 1024 * 1024 * 1024,
     step: 1,
   },
   'feishuTools.attachmentFetchTimeoutMs': {
     label: '单次取回超时（ms）',
-    help: '一次 feishu_attachment_fetch 的整段超时（默认 120000 ms，1000–600000）；到期取消下载并逐项报告可读原因。',
+    help: '一次 feishu_attachment_fetch 的整段超时（默认 120000 ms，最小 1000，最大 2147483647 ≈ 24.8 天）；到期取消下载并逐项报告可读原因。大文件请按带宽同步调大。',
     min: 1_000,
-    max: 600_000,
+    max: MAX_TIMER_DELAY_MS,
     step: 1_000,
   },
   'feishuTools.topicMessages': {

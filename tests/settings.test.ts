@@ -643,7 +643,7 @@ describe('field descriptors', () => {
     })
     expect(byKey.get('feishuTools.attachmentFetchMaxBytes')).toMatchObject({ kind: 'number', min: 1 })
     expect(byKey.get('feishuTools.attachmentFetchTimeoutMs')).toMatchObject({
-      kind: 'number', min: 1_000, max: 600_000,
+      kind: 'number', min: 1_000, max: 2_147_483_647,
     })
     expect(byKey.get('feishuTools.topicMessages')).toMatchObject({ kind: 'boolean', group: 'tools' })
     expect(byKey.get('feishuTools.topicMessagesTimeoutMs')).toMatchObject({

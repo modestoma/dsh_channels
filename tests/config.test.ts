@@ -7,7 +7,7 @@ import {
   DEFAULT_HISTORY_BOOTSTRAP_LIMIT, DEFAULT_PREFETCH_IMAGE_MAX_BYTES, DEFAULT_PREFETCH_TIMEOUT_MS,
   DEFAULT_PROMPT_CONTEXT_TIMEOUT_MS,
   DEFAULT_PREFETCH_TOTAL_MAX_BYTES, DEFAULT_ROUTE_TTL_MS, DEFAULT_TOPIC_MESSAGES_TIMEOUT_MS,
-  MAX_HISTORY_BOOTSTRAP_LIMIT, resolveConfig,
+  MAX_HISTORY_BOOTSTRAP_LIMIT, MAX_TIMER_DELAY_MS, resolveConfig,
 } from '../src/config.ts'
 
 describe('resolveConfig', () => {
@@ -156,6 +156,24 @@ describe('resolveConfig', () => {
     expect(() => resolveConfig({
       appId: 'FEISHU_APP_ID', appSecret: 'FEISHU_APP_SECRET',
       feishuTools: { topicMessagesTimeoutMs: 10 },
+    })).toThrow(/invalid configuration/)
+  })
+
+  it('accepts multi-GiB attachment fetch budgets and timeouts up to the timer ceiling', () => {
+    const fiveGiB = 5 * 1024 * 1024 * 1024
+    const config = resolveConfig({
+      appId: 'FEISHU_APP_ID', appSecret: 'FEISHU_APP_SECRET',
+      feishuTools: { attachmentFetchMaxBytes: fiveGiB, attachmentFetchTimeoutMs: MAX_TIMER_DELAY_MS },
+    })
+    expect(config.feishuTools.attachmentFetchMaxBytes).toBe(fiveGiB)
+    expect(config.feishuTools.attachmentFetchTimeoutMs).toBe(MAX_TIMER_DELAY_MS)
+    expect(() => resolveConfig({
+      appId: 'FEISHU_APP_ID', appSecret: 'FEISHU_APP_SECRET',
+      feishuTools: { attachmentFetchTimeoutMs: MAX_TIMER_DELAY_MS + 1 },
+    })).toThrow(/invalid configuration/)
+    expect(() => resolveConfig({
+      appId: 'FEISHU_APP_ID', appSecret: 'FEISHU_APP_SECRET',
+      feishuTools: { attachmentFetchMaxBytes: 0 },
     })).toThrow(/invalid configuration/)
   })
 
