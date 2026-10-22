@@ -506,6 +506,7 @@ export class FeishuService {
       queue: this.routeOperations,
       streamer: () => this.streamer,
       questionAnswerer: () => this.questionAnswerer,
+      approvalAnswerer: () => this.approvalAnswerer,
       commands: { handleSlash: (msg, line) => this.handleSlashMessage(msg, line) },
     })
   }
@@ -1342,6 +1343,9 @@ export class FeishuService {
       onError: (sessionId, error) => {
         this.ctx.logger?.warn?.('dsh-channels approval error (session %s): %s', sessionId, String(error))
       },
+      onWaitingChange: (sessionId, toolNames) => {
+        this.streamer?.setAwaitingApproval(sessionId, toolNames)
+      },
     }, this.config.approvalTimeoutMs)
     this.approvalAnswerer = answerer
     this.unlistenApproval = this.ctx.on('approval/request', (req, next) => answerer.onRequest(req, next), { prepend: true })
@@ -1387,6 +1391,7 @@ export class FeishuService {
 
     this.unlistenHost.push(this.ctx.on('session/event', (session, event) => {
       this.streamer?.onSessionEvent(session, event)
+      this.approvalAnswerer?.onSessionEvent(session.id, event)
     }))
     // DSH removed the durable `assistant/chunk` event (format v2 embeds the
     // stream in the settlement); the live deltas arrive here instead.

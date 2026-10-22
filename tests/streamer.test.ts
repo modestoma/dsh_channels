@@ -536,6 +536,26 @@ describe('TurnStreamer activity status + keep-alive', () => {
     expect(markdownLines(headCard(ch)).join('\n')).not.toContain('调用工具')
   })
 
+  it('replaces the tool line with the approval wait while a card is undecided', async () => {
+    const ch = channel()
+    const streamer = new TurnStreamer(ch, 500, hooks())
+    const session = makeSession('sess-approval-wait')
+    streamer.attach(session, 'om_card', 'om_trigger', undefined)
+    streamer.onSessionEvent(session, {
+      type: 'tool/call', seq: 1,
+      data: { turn: 1, step: 1, callId: 'call-1', name: 'bash', arguments: '{"command":"ls"}' },
+    })
+    streamer.setAwaitingApproval('sess-approval-wait', ['bash'])
+    await vi.advanceTimersByTimeAsync(500)
+    expect(markdownLines(headCard(ch)).join('\n')).toContain('⏳ 等待你审批：bash')
+    expect(markdownLines(headCard(ch)).join('\n')).not.toContain('调用工具')
+
+    streamer.setAwaitingApproval('sess-approval-wait', [])
+    await vi.advanceTimersByTimeAsync(500)
+    expect(markdownLines(headCard(ch)).join('\n')).not.toContain('等待你审批')
+    expect(markdownLines(headCard(ch)).join('\n')).toContain('🔧 调用工具：bash')
+  })
+
   it('shows the activity lines only on the card that is still streaming', async () => {
     const ch = channel()
     const streamer = new TurnStreamer(ch, 500, hooks())
