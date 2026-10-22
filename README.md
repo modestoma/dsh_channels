@@ -18,7 +18,7 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 
 ## 斜杠命令
 
-- `/help`：列出当前支持的斜杠命令，无需绑定 Session
+- `/help`：列出当前支持的斜杠命令，无需绑定 Session；私聊和普通群聊中直接回复、不创建话题，话题群或已有话题内则回复在该话题中
 - `/userid`：仅在私聊中直接回复**发送者自己的** user_id，无需绑定 Session，也不创建话题；**任何私聊用户都可以用**（准入配置/授权引导用，不消耗 token）
 - `/groupid`：仅在群聊中直接回复当前群组 ID，无需绑定 Session，也不创建话题；普通群聊遵循 `requireMention`，话题内无需重复 @
 - `/health`：显示 Harness 与飞书通道健康状态，无需绑定 Session

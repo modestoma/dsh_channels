@@ -218,6 +218,7 @@ describe('FeishuService', () => {
 
     expect(h.ctxState.agents.created).toHaveLength(0)
     expect(h.ctxState.workspaces.workspaces.size).toBe(0)
+    expect((h.channel.sent[0] as { options?: object }).options).toEqual({ replyTo: 'om_help' })
     const json = JSON.stringify((h.channel.sent[0] as { input: object }).input)
     expect(json).toContain('斜杠命令帮助')
     expect(json).toContain('/help')
@@ -235,6 +236,24 @@ describe('FeishuService', () => {
         { messageId: 'om_help', emojiType: 'DONE' },
       ])
   })
+  })
+
+  it('answers /help directly in a plain group and inside an existing topic', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', senderId: 'u_alice', mentionedBot: true,
+      messageId: 'om_help_group', content: '/help',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
+    expect((h.channel.sent[0] as { options?: object }).options).toEqual({ replyTo: 'om_help_group' })
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', senderId: 'u_alice', mentionedBot: true, threadId: 'omt_help',
+      messageId: 'om_help_topic', content: '/help',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
+    expect((h.channel.sent[1] as { options?: object }).options).toEqual({ replyTo: 'om_help_topic', replyInThread: true })
+    expect(h.ctxState.agents.created).toHaveLength(0)
   })
 
   it('rejects /help arguments without creating a workspace or Session', async () => {
@@ -324,7 +343,7 @@ describe('FeishuService', () => {
 
     expect(JSON.stringify((h.channel.sent[0] as { input: object }).input)).toContain('oc_topic_group')
     expect((h.channel.sent[0] as { options?: object }).options)
-      .toEqual({ replyTo: 'om_groupid_topic' })
+      .toEqual({ replyTo: 'om_groupid_topic', replyInThread: true })
     expect(h.ctxState.agents.created).toHaveLength(0)
   })
 

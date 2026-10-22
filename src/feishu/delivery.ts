@@ -73,6 +73,8 @@ export class CardDelivery {
   /**
    * Shared delivery policy for command-plane cards: reply in a new topic by
    * default, then degrade to a plain reply when Feishu refuses the topic.
+   * `createThread: false` replies in the chat timeline, or inside the topic
+   * the message already belongs to.
    */
   async standaloneReply(
     msg: NormalizedMessage,
@@ -83,7 +85,7 @@ export class CardDelivery {
     if (!this.deps.started() || channel === undefined) return
     const createThread = options.createThread ?? true
     try {
-      await channel.send(msg.chatId, { card }, createThread
+      await channel.send(msg.chatId, { card }, createThread || msg.threadId !== undefined
         ? { replyTo: msg.messageId, replyInThread: true }
         : { replyTo: msg.messageId })
     } catch (error) {
