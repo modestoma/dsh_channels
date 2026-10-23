@@ -2,7 +2,7 @@
  * Web 设置面板的线上契约：Host 半侧的路由/面板数据与 Browser 半侧的渲染共用。
  *
  * 本模块**没有运行时依赖**：Host 与 Client bundle 都直接内联它。因此这里只放
- * 常量、字段清单与可序列化的 wire 类型，不 import zod / node / DSH 内部包。
+ * 常量、字段清单、可序列化的 wire 类型与无依赖的纯文案函数，不 import zod / node / DSH 内部包。
  *
  * @module dsh-channels/settings/contract
  */
@@ -52,52 +52,62 @@ export const PICK_DIRECTORY_ROUTE = '/dsh-channels/pick-directory'
  * `baseDir`（工作区根目录 = 模型/工具产生文件的落点）可覆盖，但面板只接受
  * **绝对路径**（`~` 会展开）；已有 Session / 目录不迁移，只影响之后新建的
  * 会话。校验与保存时建目录见 `src/workspaces.ts`。
+ *
+ * 数组顺序就是面板里同一分组内字段的显示顺序。
  */
 export const EDITABLE_KEYS = [
-  // 工作区
-  'baseDir',
-  // 行为
+  // 会话：触发
   'dmMode',
   'requireMention',
   'threadFallback',
+  // 会话：工作区
+  'baseDir',
+  'topicIsolation',
+  // 会话：话题与卡片
+  'routeTtlMs',
+  'approvalTimeoutMs',
+  'questionTimeoutMs',
+  'refreshMs',
+  'statusRefreshMs',
+  // 会话：飞书侧功能
   'welcomeOnboarding',
   'slashCommandPanel',
   'allowPermissionSwitch',
-  // 日志平台分析接口（访问令牌是凭据引用 analyzeToken，值写在 DSH 凭据里）
-  'analyzeListen',
-  // 准入与授权（管理员/准入模式/申请有效期；白名单由「访问与授权」卡片管理）
-  'adminUserId',
-  'accessMode',
-  'authRequestTtlDays',
-  // 内容与附件（v2 管线；`feishuTools.*` 是嵌套配置，覆盖层仍写成嵌套对象）
-  'acceptAttachments',
-  'attachmentStore',
-  'prefetchImages',
-  'prefetchTimeoutMs',
-  'prefetchImageMaxBytes',
-  'prefetchTotalMaxBytes',
-  'historyBootstrapLimit',
-  // 模型工具（feishuTools 子项）
-  'feishuTools.attachmentFetch',
-  'feishuTools.attachmentFetchMaxResources',
-  'feishuTools.attachmentFetchMaxBytes',
-  'feishuTools.attachmentFetchTimeoutMs',
-  'feishuTools.topicMessages',
-  'feishuTools.topicMessagesTimeoutMs',
-  'feishuTools.sendFile',
-  'feishuTools.wikiRead',
-  'feishuTools.wikiWrite',
-  // 知识库范围（顶层 `wikiRoots` 字符串列表；为空时不挂载任何知识库工具）
-  'wikiRoots',
-  'promptContextTimeoutMs',
   // 模型
   'provider',
   'model',
   'reasoningEffort',
+  'maxTokens',
   'agentPreset',
-  // 流式卡片
-  'refreshMs',
-  'statusRefreshMs',
+  // 附件（v2 管线）
+  'acceptAttachments',
+  'attachmentStore',
+  'prefetchImages',
+  'historyBootstrapLimit',
+  // 模型工具（`feishuTools.*` 是嵌套配置，覆盖层仍写成嵌套对象）
+  'feishuTools.attachmentFetch',
+  'feishuTools.topicMessages',
+  'feishuTools.sendFile',
+  // 限额与超时
+  'prefetchTimeoutMs',
+  'prefetchImageMaxBytes',
+  'prefetchTotalMaxBytes',
+  'feishuTools.attachmentFetchMaxResources',
+  'feishuTools.attachmentFetchMaxBytes',
+  'feishuTools.attachmentFetchTimeoutMs',
+  'feishuTools.topicMessagesTimeoutMs',
+  'promptContextTimeoutMs',
+  // 准入与授权（白名单由「访问授权」tab 的列表管理）
+  'accessMode',
+  'adminUserId',
+  'authRequestTtlDays',
+  // 知识库（顶层 `wikiRoots` 字符串列表；为空时不挂载任何知识库工具）
+  'feishuTools.wikiRead',
+  'feishuTools.wikiWrite',
+  'wikiRoots',
+  // 日志平台分析接口（访问令牌是凭据引用 analyzeToken，值写在 DSH 凭据里）
+  'analyzeListen',
+  // 日志
   'loggerLevel',
 ] as const
 
@@ -140,12 +150,33 @@ export type StringListItemFormat = 'wiki-root-link'
  * panel tab (see {@link TAB_FIELD_GROUPS}); the Host is the source of truth for
  * which key belongs to which group.
  */
-export type FieldGroup = 'workspace' | 'behavior' | 'content' | 'tools' | 'model' | 'streaming' | 'access' | 'wiki'
+export type FieldGroup =
+  | 'trigger'
+  | 'workspace'
+  | 'cards'
+  | 'features'
+  | 'model'
+  | 'attachments'
+  | 'tools'
+  | 'limits'
+  | 'access'
+  | 'wiki'
+  | 'analyze'
+  | 'logging'
 
 /** One selectable value rendered by the generic form. */
 export interface FieldOptionWire {
   value: string
   label: string
+}
+
+/**
+ * A two-value `select` rendered as a switch: `on` is the value stored while
+ * the switch is on, `off` while it is off. Both are members of `options`.
+ */
+export interface FieldToggleWire {
+  on: string
+  off: string
 }
 
 /** One editable row, fully described by the Host so the client stays schema-free. */
@@ -154,8 +185,23 @@ export interface EditableFieldWire {
   label: string
   kind: FieldKind
   group: FieldGroup
+  /** One-line description always shown under the label. */
+  summary?: string
+  /** Longer explanation, collapsed behind the row's「详情」link. */
   help?: string
   options?: readonly FieldOptionWire[]
+  /** `select` only: render the two options as a switch. */
+  toggle?: FieldToggleWire
+  /**
+   * `number` only: display unit next to the input. With `scale`, the input
+   * shows `stored / scale` and the panel submits `round(input * scale)`;
+   * `min` / `max` / `step` stay in stored units.
+   */
+  unit?: string
+  /** `number` only: stored units per displayed unit (e.g. 1000 for 秒 over ms). */
+  scale?: number
+  /** `number` only: an empty input clears the override instead of failing. */
+  optional?: boolean
   /** Selector is not editable yet (e.g. pick the provider before the model). */
   disabled?: boolean
   min?: number
@@ -167,7 +213,7 @@ export interface EditableFieldWire {
   maxItems?: number
   /** `string-list` only: format every non-empty entry must satisfy. */
   itemFormat?: StringListItemFormat
-  /** Render across the whole form width (long paths). */
+  /** Render the control below the label across the row width (paths, lists). */
   wide?: boolean
   /**
    * `directory`：给这个 text 字段加一个「选择目录…」按钮，点击后由 Host
@@ -217,14 +263,6 @@ export interface CatalogWire {
  */
 export type ConfigValue = string | number | boolean | readonly string[]
 export type EditableValues = Partial<Record<EditableKey, ConfigValue>>
-
-/** Read-only facts shown in the advanced card. */
-export interface ReadOnlyFieldWire {
-  key: string
-  label: string
-  value: string
-  help?: string
-}
 
 /** One credential reference plus its Host-side state (values never cross the wire). */
 export interface CredentialRefWire {
@@ -344,7 +382,6 @@ export interface PanelConfigWire {
   /** 与当前运行中连接不一致、需重连才生效的字段。 */
   restartPendingKeys: EditableKey[]
   fields: EditableFieldWire[]
-  readOnly: ReadOnlyFieldWire[]
   credentials: {
     appId: CredentialRefWire
     appSecret: CredentialRefWire
@@ -530,9 +567,9 @@ export type ClearCredentialResponse =
  */
 export const PANEL_TABS = [
   { id: 'connection', label: '连接' },
-  { id: 'sessions', label: '会话与行为' },
+  { id: 'sessions', label: '会话' },
   { id: 'model', label: '模型' },
-  { id: 'workspace', label: '工作区' },
+  { id: 'attachments', label: '附件与工具' },
   { id: 'access', label: '访问授权' },
   { id: 'wiki', label: '知识库' },
   { id: 'advanced', label: '高级' },
@@ -540,92 +577,91 @@ export const PANEL_TABS = [
 
 export type PanelTabId = (typeof PANEL_TABS)[number]['id']
 
-/** Which editable field groups each tab renders (the tabs own one or two). */
+/** Which editable field groups each tab renders, in section order. */
 export const TAB_FIELD_GROUPS: Readonly<Record<PanelTabId, readonly FieldGroup[]>> = {
   connection: [],
-  sessions: ['behavior', 'content', 'tools'],
+  sessions: ['trigger', 'workspace', 'cards', 'features'],
   model: ['model'],
-  workspace: ['workspace'],
+  attachments: ['attachments', 'tools', 'limits'],
   access: ['access'],
   wiki: ['wiki'],
-  advanced: ['streaming'],
+  advanced: ['analyze', 'logging'],
 }
 
 /** Section heading for one field group inside its tab. */
 export const FIELD_GROUP_LABELS: Readonly<Record<FieldGroup, string>> = {
-  workspace: '工作区与文件',
-  behavior: '行为',
-  content: '内容与附件',
-  tools: '模型工具',
-  model: '模型与推理',
-  streaming: '流式卡片与日志',
-  access: '准入与授权',
+  trigger: '触发',
+  workspace: '工作区',
+  cards: '话题与卡片',
+  features: '飞书侧功能',
+  model: '模型',
+  attachments: '入站附件',
+  tools: '模型可用的飞书工具',
+  limits: '限额与超时',
+  access: '准入',
   wiki: '知识库工具',
+  analyze: '日志分析接口',
+  logging: '日志',
 }
+
+/** Groups rendered collapsed behind one summary row (rarely changed values). */
+export const COLLAPSED_FIELD_GROUPS: readonly FieldGroup[] = ['limits']
+
+/** `unit` of byte-count fields; the panel adds a MiB reading next to them. */
+export const BYTES_UNIT = '字节'
 
 /** Display labels for the panel header/cards (kept on the wire so the client owns no copy). */
 export const PANEL_COPY = {
   title: '飞书渠道',
-  description: '飞书长连接、应用凭据与渠道配置。凭据只写入 DSH 凭据库且不回显；标注「需重连」的项在连接建立时读取。',
   // ---- lifecycle / status -------------------------------------------------
-  statusCard: '连接状态',
   phaseUnconfigured: '待配置',
   phaseIdle: '未连接',
   phaseConnecting: '连接中',
   phaseConnected: '已连接',
   phaseError: '连接失败',
-  configuredBadge: '凭据已配置',
-  unconfiguredBadge: '凭据未配置',
-  statusSummaryConnected: '飞书长连接已建立，机器人可以收发消息。',
-  statusSummaryUnconfigured: '尚未配置飞书应用凭据：插件已加载，但不会连接飞书。填写凭据并保存后会自动连接。',
-  statusSummaryIdle: '飞书应用凭据已就绪，但当前没有建立长连接。',
-  statusSummaryConnecting: '正在连接飞书长连接…',
-  statusSummaryError: '最近一次连接飞书失败，请检查凭据与网络后重试。',
+  statusSummaryConnected: '机器人在线，可以收发消息',
+  statusSummaryUnconfigured: '还没有填写飞书应用凭据，插件不会连接飞书',
+  statusSummaryIdle: '凭据已就绪，还没有建立连接',
+  statusSummaryConnecting: '正在连接飞书…',
+  statusSummaryError: '连接飞书失败，请检查凭据与网络后重试',
+  uptimePrefix: '运行',
   lastError: '最近一次连接失败',
-  scopeCheckTitle: '权限自检',
-  scopeCheckOk: '已开通插件需要的全部飞书权限。',
-  scopeCheckMissing: '以下飞书权限未开通，开通后需在开发者后台发布新版本：',
-  scopeCheckOpenAll: '在开发者后台开通全部缺失权限',
+  checksTitle: '自检',
+  scopeCheckOk: '插件需要的飞书权限都已开通',
+  scopeCheckMissing: '{n} 项权限未开通',
+  scopeCheckMissingRequired: '{n} 项必需权限未开通，相关功能无法使用',
+  scopeCheckMissingOptional: '不影响收发消息，只有相关功能不可用。开通后需在开发者后台发布新版本。',
+  scopeCheckPublish: '开通后需在开发者后台发布新版本。',
+  scopeCheckOpenAll: '全部开通',
   scopeCheckOpenOne: '去开通',
-  scopeCheckOptional: '可选',
   scopeCheckRequired: '必需',
-  scopeCheckError: '无法读取应用的权限授予状态：',
+  scopeCheckError: '无法读取权限开通情况',
   slashCommandSyncTitle: '斜杠指令面板',
-  slashCommandSyncOk: '插件命令已同步到飞书原生斜杠指令面板，在聊天框输入 / 即可选择（飞书客户端约 5 分钟后刷新）。',
-  slashCommandSyncTotal: '命令数',
-  slashCommandSyncCreated: '本次新增',
-  slashCommandSyncUpdated: '本次更新',
-  slashCommandSyncRemoved: '本次删除',
-  slashCommandSyncError: '同步飞书原生斜杠指令面板失败（不影响直接输入命令）：',
+  slashCommandSyncOk: '已同步 {total} 条命令，飞书客户端约 5 分钟后刷新',
+  slashCommandSyncError: '同步失败，直接输入命令不受影响',
   missingConfig: '缺少配置',
-  statusHintUnconfigured: '配置完成后插件会自动连接；也可以稍后在本页手动连接。',
-  connectionInfo: '连接信息',
-  connectionStateLabel: '飞书长连接',
-  botOpenId: 'Bot open_id',
-  uptime: '运行时长',
   routeCount: '话题路由',
   liveAgentCount: '活动会话',
   inflightTurnCount: '在途回复',
+  botOpenId: 'Bot open_id',
   healthReasons: '健康判定',
   unknownValue: '—',
   connect: '连接飞书',
   connecting: '连接中…',
   // ---- onboarding ---------------------------------------------------------
   onboardingTitle: '开始使用飞书渠道',
-  onboardingIntro: '只需三步：在飞书开放平台创建自建应用，把 App ID / App Secret 填入本页，保存后自动连接。',
   onboardingStep1Title: '创建飞书自建应用',
-  onboardingStep1Text: '在飞书开放平台创建企业自建应用，开启机器人能力；事件订阅选择「长连接」，订阅 im.message.receive_v1（接收消息）。',
+  onboardingStep1Text: '在 open.feishu.cn/app 创建企业自建应用，开启机器人能力；事件订阅选「长连接」，订阅 im.message.receive_v1。',
   onboardingStep2Title: '填写应用凭据',
-  onboardingStep2Text: '把应用的 App ID（cli_ 开头）与 App Secret 填入下方「飞书应用凭据」，值会写入 DSH 凭据库。',
-  onboardingStep3Title: '保存并等待连接',
-  onboardingStep3Text: '两项凭据都保存后插件会自动连接；状态变为「已连接」即可在飞书里私聊机器人。',
-  onboardingDocsHint: '开放平台地址：open.feishu.cn/app；应用需要开通 im:message、im:message:send_as_bot 等消息权限。',
+  onboardingStep2Text: '把 App ID（cli_ 开头）和 App Secret 填到下方「应用凭据」。',
+  onboardingStep3Title: '保存后自动连接',
+  onboardingStep3Text: '两项都保存后插件会自动连接，状态变成「已连接」就能在飞书里私聊机器人。',
   // ---- credentials --------------------------------------------------------
-  credentialsCard: '飞书应用凭据',
-  credentialsCardHelp: '凭据值经 DSH 凭据服务写入本机凭据库；面板只显示「已配置 / 未配置」，永不回显已存值。两项都配置后才会连接飞书。',
-  appIdLabel: '飞书 App ID',
-  appSecretLabel: '飞书 App Secret',
-  credentialsRef: '凭据引用',
+  credentialsTitle: '应用凭据',
+  credentialsHint: '值只存在本机凭据库，面板不回显。',
+  appIdLabel: 'App ID',
+  appSecretLabel: 'App Secret',
+  credentialStore: '凭据库',
   saveCredentials: '保存凭据',
   savingCredentials: '保存中…',
   credentialSaved: '凭据已保存',
@@ -635,28 +671,30 @@ export const PANEL_COPY = {
   credentialAutoConnectFailed: '凭据已保存，但自动连接失败',
   credentialRemoved: '已移除存储的凭据',
   credentialRemovedPending: '已移除存储的凭据，重启飞书连接后生效',
-  removeCredential: '移除已存值',
+  replaceCredential: '更换',
+  setCredential: '设置',
+  cancel: '取消',
+  removeCredential: '移除',
   removingCredential: '移除中…',
   credentialConfigured: '已配置',
   credentialMissing: '未配置',
   credentialReadOnly: '当前凭据存储不可写',
   appIdPlaceholder: '输入 App ID（cli_…）',
   appSecretPlaceholder: '输入 App Secret',
-  credentialsPendingHint: '填写后点「保存凭据」；两项齐全时插件会自动连接飞书。',
-  // ---- tabs / forms -------------------------------------------------------
-  connectionTabHelp: '连接状态与飞书应用凭据。凭据不完整时不会连接飞书。',
-  sessionsTabHelp: '私聊、群聊触发方式与入站内容：附件存储/预取、模型工具开关与读取预算；「需重连」项在下次连接时读取。',
-  modelTabHelp: '飞书会话使用的模型服务商、模型、推理档位与 Agent 预设；下拉选项来自宿主机实时目录，保存后对新会话生效。',
-  workspaceTabHelp: '每个用户一个工作区（模型/工具产生文件的落点），每个话题在其中拥有独立工作目录；只影响之后新建的话题。入站附件默认存于 DSH 原生附件库，不占用话题目录。插件不会自动删除工作区或话题目录；过期目录可手动删除，话题下次对话时会重建空目录。',
-  accessTabHelp: '准入采用 fail-closed：管理员不受白名单限制，非管理员私聊会被拒绝，群聊需要「群已授权 + 用户在白名单」两层同时命中。',
-  wikiTabHelp: '知识库工具以应用身份访问「知识库范围」内的文档、电子表格和多维表格。只有管理员或知识库白名单里的用户发起的话题能用；每次打开、新建、修改仍需话题发起人在授权卡上确认。',
-  advancedTabHelp: '流式刷新等低层参数、Web 覆盖文件与只读信息。',
-  save: '保存更改',
+  credentialRemoveConfirm: '确定移除已存储的凭据值？移除后不会回显，需要时须重新填写。',
+  // ---- forms --------------------------------------------------------------
+  save: '保存',
   saving: '保存中…',
-  saveHintDirty: '只保存改动过的字段；标注「需重连」的项在下次连接时生效。',
-  discardTab: '放弃本页更改',
-  saveHintClean: '没有未保存的更改。',
-  dirtyCount: '未保存项',
+  discard: '放弃',
+  dirtyCount: '{n} 项未保存',
+  dirtyRestart: '，其中 {n} 项需要重连后生效',
+  details: '详情',
+  expand: '展开',
+  collapse: '收起',
+  collapsedCount: '{n} 项',
+  collapsedClean: '一般不用改',
+  collapsedChanged: '{n} 项已在面板修改',
+  restartTag: '需重连',
   listAdd: '添加',
   listRemove: '移除',
   listEntry: '第 {n} 项',
@@ -668,64 +706,58 @@ export const PANEL_COPY = {
   directoryPicked: '已选择目录',
   directoryPickFailed: '无法打开系统目录选择器',
   saved: '已保存',
-  cleared: '已清除 Web 覆盖，恢复为 profile 配置',
-  clear: '清除 Web 覆盖',
-  clearing: '清除中…',
-  noOverrides: '当前没有 Web 覆盖',
-  overridden: 'Web 覆盖',
-  inherited: '继承 profile',
-  restartTag: '需重连',
-  restartBanner: '以下配置需重启飞书连接后生效：',
-  restartWarning: '重启会断开当前飞书长连接并中断进行中的回复，请确认空闲时操作。',
-  reconnect: '重启飞书连接',
+  saveInvalid: '请先修正标红的配置项',
+  numberInvalid: '请输入数字',
+  numberMin: '不得小于 {n}',
+  numberMax: '不得大于 {n}',
+  modelFootnote: '对之后新建的会话生效。',
+  catalogFailed: '模型目录加载失败，已退回手填。',
+  catalogLoading: '正在读取宿主机选项…',
+  catalogUnavailable: '宿主机未提供可选项，请手填。',
+  // ---- restart ------------------------------------------------------------
+  restartBanner: '以下配置要重启飞书连接后生效：',
+  restartWarning: '重启会断开当前飞书连接并中断进行中的回复，确定现在重启？',
+  reconnect: '重启连接',
   reconnecting: '重连中…',
-  refresh: '刷新状态',
+  refresh: '刷新',
   retry: '重试',
   pollFailed: '状态刷新失败',
   connectDone: '已连接飞书',
   reconnectDone: '已重启飞书连接',
-  saveInvalid: '请先修正标红的配置项',
-  enabled: '已启用',
-  disabled: '已关闭',
-  credentialRemoveConfirm: '确定移除已存储的凭据值？移除后不会回显，需要时须重新填写。',
-  analyzeTokenCard: '日志分析接口令牌',
-  analyzeTokenCardHelp: '日志平台调用分析接口时 Authorization: Bearer 后面的值。经 DSH 凭据服务写入本机凭据库，面板永不回显；保存或移除后下一次请求即生效，无需重连。未配置时接口对所有请求返回 503。',
-  analyzeTokenLabel: '访问令牌',
-  analyzeTokenPlaceholder: '填写新令牌（建议 32 位以上随机串）',
-  saveAnalyzeToken: '保存令牌',
-  analyzeTokenSaved: '令牌已保存，下一次请求生效',
-  analyzeTokenRemoved: '令牌已移除，接口将拒绝所有请求',
-  accessNotLoaded: '飞书连接建立后加载授权列表',
   loading: '加载中…',
   loadFailed: '设置面板加载失败',
-  catalogFailed: '模型目录加载失败，已退回手填。',
-  catalogLoading: '正在读取宿主机选项…',
-  catalogUnavailable: '宿主机未提供可选项，请手填。',
-  version: '插件版本',
+  // ---- advanced -----------------------------------------------------------
+  analyzeTokenLabel: '访问令牌',
+  analyzeTokenSummary: '请求头 Authorization: Bearer 的值，保存后立即生效；未配置时接口拒绝所有请求',
+  analyzeTokenPlaceholder: '填写新令牌（建议 32 位以上随机串）',
+  analyzeTokenSaved: '令牌已保存，下一次请求生效',
+  analyzeTokenRemoved: '令牌已移除，接口将拒绝所有请求',
+  overlayTitle: 'Web 覆盖',
   overlayPath: '覆盖文件',
-  overlayPathHelp: '可以直接编辑该 JSON 文件；面板保存会整体重写它，「清除 Web 覆盖」会删除它并回落到 profile 配置。',
-  advancedCard: '只读与高级信息',
-  advancedHelp: '这些值来自 profile 配置，不能在面板里编辑。',
-  readOnlyCard: '部署级参数',
-  // ---- model --------------------------------------------------------------
+  overlayCount: '{n} 项配置由面板覆盖',
+  noOverrides: '当前没有面板覆盖的配置',
+  overlayPathHelp: '面板保存的配置写在这个 JSON 文件里，优先级高于 profile。可以直接编辑；面板保存会整体重写它。',
+  clear: '恢复 profile 配置',
+  clearing: '恢复中…',
+  clearConfirm: '确定删除所有面板覆盖，恢复为 profile 配置？',
+  cleared: '已恢复为 profile 配置',
   // ---- access -------------------------------------------------------------
-  accessCard: '访问与授权',
-  accessCardHelp: '准入采用 fail-closed：管理员不受白名单限制（私聊、任意群聊都可直接对话）；非管理员私聊会被拒绝，群聊需要「群已授权 + 用户在白名单」两层同时命中。管理员与准入模式在上方「准入与授权」中编辑；私聊机器人发送 /userid 获取自己的 user_id。',
-  accessModeOpenWarning: '当前准入模式为开放（open）：应用可用范围内的任何人都能开启对话。该模式不安全，仅建议调试时使用。',
-  accessAdminMissingWarning: '当前准入=guarded 但未配置管理员，也无法自动使用应用所有者，所有对话都会被拒绝。请在上方「准入与授权」填写管理员 user_id（私聊机器人发送 /userid 获取；私聊模式关闭时 /userid 不可用，可在飞书管理后台的成员详情里查看用户 ID）。',
-  accessAdminOwnerNotice: '未配置管理员，已自动使用应用所有者作为管理员：',
-  accessGroupsTitle: '已授权群',
-  accessGroupsEmpty: '尚未授权任何群。机器人被拉进群后，管理员会收到带 chat_id 的群信息卡；也可在群内发送 /groupid 获取。',
-  accessUsersTitle: '已授权用户',
-  accessUsersEmpty: '尚未授权任何用户。已授权用户可在所有已授权群里与机器人对话（私聊仍只开给管理员）。',
+  debugModeWarning: '调试模式已打开：应用可用范围内的任何人都能和机器人对话。用完请在「访问授权」关闭。',
+  accessAdminMissingWarning: '没有可用的管理员，所有对话都会被拒绝。请在下方填写管理员 user_id（私聊机器人发送 /userid 获取）。',
+  accessAdminOwnerSummary: '未单独设置，正在使用应用所有者 {id}',
+  accessNotLoaded: '飞书连接建立后加载授权列表',
   accessRequestsTitle: '待处理申请',
-  accessRequestsEmpty: '没有待处理的授权申请。',
-  accessGroupChatIdPlaceholder: '群 chat_id（oc_…）',
+  accessGroupsTitle: '已授权群',
+  accessUsersTitle: '已授权用户',
+  accessGroupsEmpty: '还没有授权任何群',
+  accessUsersEmpty: '还没有授权任何用户',
+  accessGroupChatIdPlaceholder: 'chat_id（oc_…，群里发 /groupid 获取）',
   accessGroupNamePlaceholder: '群名（可选）',
-  accessUserIdPlaceholder: '用户 user_id',
+  accessUserIdPlaceholder: 'user_id（私聊机器人发 /userid 获取）',
   accessUserNamePlaceholder: '昵称（可选）',
   accessAddGroup: '添加群',
   accessAddUser: '添加用户',
+  accessAdd: '添加',
   accessRemove: '移除',
   accessAllow: '授权',
   accessDeny: '忽略',
@@ -733,22 +765,35 @@ export const PANEL_COPY = {
   accessSourceCommand: '对话命令',
   accessSourceCard: '授权卡',
   accessSourcePanel: '设置面板',
-  accessRequestGroup: '群申请',
-  accessRequestUser: '用户申请',
-  accessRequestRequester: '申请人',
-  accessRequestExpires: '有效期至',
+  accessRequestGroup: '申请授权群',
+  accessRequestUser: '申请使用',
+  accessRequestIn: '在「{group}」',
+  accessRequestExpires: '{date} 前有效',
   accessGroupAdded: '已添加群授权',
   accessGroupRemoved: '已移除群授权',
   accessUserAdded: '已添加用户授权',
   accessUserRemoved: '已移除用户授权',
   accessRequestAllowed: '已授权',
   accessRequestDenied: '已忽略',
-  accessHints: '三种授权入口：群内 /auth 命令、入群与用户授权卡、本面板。撤销立即生效；白名单只约束非管理员（管理员在任何私聊/群聊都直接放行），非管理员需要群和用户两层同时命中。',
   // ---- wiki ---------------------------------------------------------------
-  wikiUsersCard: '知识库白名单',
-  wikiUsersHelp: '与「访问授权」里的用户白名单相互独立：这里的用户（以及管理员）发起的话题可以使用知识库工具。也可以在飞书里发送 /auth wiki add @用户 或 /auth wiki remove @用户；移除立即生效。',
-  wikiUsersEmpty: '知识库白名单为空：目前只有管理员发起的话题能使用知识库工具。',
+  wikiUsersTitle: '可使用的人',
+  wikiUsersAdminPlus: '管理员 + {n}',
+  wikiUsersEmpty: '目前只有管理员发起的话题能用知识库工具',
+  wikiUsersHint: '也可以在飞书发 /auth wiki add @用户',
   wikiUserAdded: '已加入知识库白名单',
   wikiUserRemoved: '已移出知识库白名单',
-  accessChatIdHint: 'chat_id 可从入群群信息卡或群内 /groupid 获取；user_id 可私聊机器人发送 /userid 获取。',
 } as const
+
+/**
+ * Fill `{name}` placeholders of one `PANEL_COPY` template.
+ *
+ * @param template - Copy containing `{name}` placeholders.
+ * @param values - Replacement per placeholder name.
+ * @returns The filled string; unknown placeholders stay as written.
+ */
+export function fillCopy(template: string, values: Readonly<Record<string, string | number>>): string {
+  return template.replace(/\{(\w+)\}/g, (match, name: string) => {
+    const value = values[name]
+    return value === undefined ? match : String(value)
+  })
+}

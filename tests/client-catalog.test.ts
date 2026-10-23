@@ -151,7 +151,7 @@ describe('applyCatalogFields', () => {
   })
 
   it('passes the attachment controls through unchanged', () => {
-    const attachments = makeField('acceptAttachments', { kind: 'boolean', group: 'content' })
+    const attachments = makeField('acceptAttachments', { kind: 'boolean', group: 'attachments' })
     const fields = applyCatalogFields([...initialFields(), attachments], PROVIDER_CHOSEN, {})
     expect(fields.find(field => field.key === 'acceptAttachments')).toEqual(attachments)
   })

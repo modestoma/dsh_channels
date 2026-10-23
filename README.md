@@ -13,7 +13,7 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 - **结构化提问**：模型调用 `ask_user_question` 时，插件监听主机 `user-questions/request` 瀑布并发一张问答卡（每个问题一组选项按钮，多选先勾选再「提交本题选择」），答案回填给模型；主机自带的应答者只有 Web 客户端，没有本插件时纯飞书会话会以 `NO_PROVIDER` 失败。超时（`questionTimeoutMs`，默认 5 分钟）或回合取消时本轮提问失败（fail-closed）；没有可选项的问题直接提示用文字作答，**阻塞期间普通文本回复即作为该问题的自由文本答案**（同时支持多选后的自定义文本）
 - **准入与授权（默认开启）**：**管理员不受白名单限制**（私聊、任意群聊——包括尚未授权的群——都能直接发起会话）；其他人私聊只收到一条固定提示（`/userid` 例外），群聊需要「群已授权 + 用户在全局白名单」两层同时命中。机器人被拉进群后私聊管理员发**群信息卡**（未授权群附授权按钮，用于放行白名单用户）；已授权群里未授权用户 @ 会触发用户授权卡。授权入口：飞书 `/auth` 命令、授权卡、Web 设置面板；管理员 user_id 在面板配置（私聊 `/userid` 获取），**留空时自动使用飞书应用所有者**
 - 全部基于飞书官方 SDK [`@larksuiteoapi/node-sdk`](https://www.npmjs.com/package/@larksuiteoapi/node-sdk)（WebSocket 长连接，免公网）
-- **Web 设置面板**：Web/桌面端 **设置 → 飞书渠道**，顶部状态头 + 7 个标签页（连接 / 会话与行为 / 模型 / 工作区 / 访问授权 / 知识库 / 高级）；凭据不完整时插件不连接、面板显示三步引导，填写保存后自动连接（保存写入本机覆盖文件，部分字段需重连生效）；详见下文「Web 设置面板」章节
+- **Web 设置面板**：Web/桌面端 **设置 → 飞书渠道**，顶部状态头 + 7 个标签页（连接 / 会话 / 模型 / 附件与工具 / 访问授权 / 知识库 / 高级）；凭据不完整时插件不连接、面板显示三步引导，填写保存后自动连接（保存写入本机覆盖文件，部分字段需重连生效）；详见下文「Web 设置面板」章节
 
 设计与可行性论证见 [docs/feasibility-and-design.md](docs/feasibility-and-design.md)；工作区粒度与会话隔离的取舍见 [docs/workspace-isolation-design.md](docs/workspace-isolation-design.md)；入站附件管线（存储 / 清单 / 工具 / 引用与历史 / 降级 / 隐私边界）见 [docs/attachment-pipeline-v2.md](docs/attachment-pipeline-v2.md)。
 
@@ -69,30 +69,33 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 - **凭据不完整** → 插件正常加载、**不建连接**、不报错，面板显示「待配置」与三步引导；在「连接」标签页填好两项凭据并保存后自动连接。
 - **连接失败**（凭据错误、网络等）→ 记录在面板状态卡，插件保持加载；修好凭据或网络后点「重试」。
 
-**面板结构**：顶部固定连接状态头（阶段徽标：待配置 / 未连接 / 连接中 / 已连接 / 连接失败、一句话摘要、刷新按钮），下方按标签页分区：
+**面板结构**：顶部固定状态头（标题、阶段徽标：待配置 / 未连接 / 连接中 / 已连接 / 连接失败、插件版本、运行时长、刷新按钮），下方按标签页分区。每一项是单列一行：名称 + 一句话说明 + 控件，两值选项用开关，较长的说明收在「详情」里；数值项按显示单位输入（天 / 秒 / ms / 条 / 字节，字节项旁显示 MiB 读数）。
 
 | 标签页 | 内容 |
 | --- | --- |
-| 连接 | 连接状态与连接信息（长连接状态、Bot open_id、运行时长、话题路由 / 活动会话 / 在途回复）、权限自检、斜杠指令面板同步结果、未配置时的三步引导、飞书应用凭据、最近一次连接失败原因、需重连的待生效提醒 |
-| 会话与行为 | 「行为」：私聊模式、普通群 @ 要求、话题兜底、首次私聊引导、原生斜杠指令面板同步、权限切换；「内容与附件」：附件接收、存储后端、图片预取与上限、首轮历史；「模型工具」：`feishu_attachment_fetch` / `feishu_topic_messages` / `feishu_send_file` 开关与上限、被动读取预算 |
-| 模型 | 模型服务商、模型 id、推理档位、Agent 预设（宿主目录驱动的级联下拉） |
-| 工作区 | 工作区根目录（可点「选择目录…」调用系统目录选择框）；话题目录隔离方式（`topicIsolation`）在 profile 配置中设置 |
-| 访问授权 | 管理员 user_id、准入模式、申请有效期；已授权群 / 用户白名单与待处理申请 |
-| 知识库 | 知识库读/写开关（`feishuTools.wikiRead` / `feishuTools.wikiWrite`）、知识库范围 `wikiRoots`（每条链接一个输入框，逐条校验）；知识库白名单增删（与用户白名单独立，等同 `/auth wiki add|remove`） |
-| 高级 | 流式刷新 / 状态行 / SDK 日志级别、部署级只读参数、Web 覆盖文件路径与「清除 Web 覆盖」 |
+| 连接 | 状态块（当前阶段唯一的操作按钮：连接 / 重试 / 重启连接，连接后显示话题路由 / 活动会话 / 在途回复 / Bot open_id 尾号）、自检（权限缺口可展开逐项开通、斜杠指令面板同步结果）、飞书应用凭据（更换 / 移除）；未配置时显示三步引导，有需重连才生效的已保存项时顶部显示「重启连接」横幅 |
+| 会话 | 「触发」：私聊、普通群需要 @、话题被拒时降级为会话级（均为开关）；「工作区」：工作区根目录、话题工作目录隔离方式（`topicIsolation`）；「话题与卡片」：话题过期（`routeTtlMs`，按天）、审批 / 提问卡片等待（`approvalTimeoutMs` / `questionTimeoutMs`，按秒）、流式刷新与状态行保活间隔；「飞书侧功能」：首次私聊引导、斜杠指令面板同步、权限切换 |
+| 模型 | 服务商、模型、推理档位、单次输出上限（`maxTokens`，留空使用模型默认）、Agent 预设 |
+| 附件与工具 | 「入站附件」：接收图片和文件、使用 DSH 原生附件库（开关，关闭则存到话题目录 `attachments/`）、图片预取、首轮话题历史；「工具」：`feishu_attachment_fetch` / `feishu_topic_messages` / `feishu_send_file` 开关；「限额与超时」：预取上限、读取附件上限与超时、读取话题消息超时、引用摘录与历史超时（共 8 项，默认收起，有改动或错误时自动展开） |
+| 访问授权 | 待处理申请（置顶，一键授权 / 忽略）、调试模式（`accessMode`，开关）、管理员 user_id、申请有效期；已授权群 / 用户白名单（添加表单默认收起） |
+| 知识库 | 知识库读 / 写开关（`feishuTools.wikiRead` / `feishuTools.wikiWrite`）、可访问范围 `wikiRoots`（每条链接一个输入框，逐条校验）；「可使用的人」：知识库白名单增删（与用户白名单独立，等同 `/auth wiki add|remove`） |
+| 高级 | 日志分析接口（监听地址 `analyzeListen` 与访问令牌）、SDK 日志级别、Web 覆盖文件路径与「恢复 profile 配置」 |
 
-**入站附件与模型工具（v2）**：「会话与行为」标签页新增两组可编辑字段，与 profile 配置同名、写入同一 Web 覆盖文件（`$DSH_HOME/dsh-channels/settings.json`）：
+**调试模式**：「访问授权 → 调试模式」打开即 `accessMode: open`，所有人都能和机器人聊天；打开期间面板顶部常驻黄色警告。默认关闭（`guarded`）。
 
-- **内容与附件**：附件接收（`acceptAttachments`）、入站附件存储后端（`attachmentStore`：DSH 原生附件库 / 工作区 `attachments/`）、触发消息图片预取（`prefetchImages`）及单图 / 总量 / 整段超时上限（`prefetchImageMaxBytes` / `prefetchTotalMaxBytes` / `prefetchTimeoutMs`）、首轮话题历史条数（`historyBootstrapLimit`）。
-- **模型工具**：`feishu_attachment_fetch` 开关与单次资源数 / 字节预算 / 超时（`feishuTools.attachmentFetch*`）、`feishu_topic_messages` 开关与超时（`feishuTools.topicMessages*`）、`feishu_send_file` 开关（`feishuTools.sendFile`）、被动引用/历史读取预算（`promptContextTimeoutMs`）。
+**入站附件与模型工具（v2）**：「附件与工具」标签页的字段与 profile 配置同名、写入同一 Web 覆盖文件（`$DSH_HOME/dsh-channels/settings.json`）：
+
+- **入站附件**：附件接收（`acceptAttachments`）、入站附件存储后端（`attachmentStore`：开关打开为 DSH 原生附件库，关闭为话题目录 `attachments/`）、触发消息图片预取（`prefetchImages`）、首轮话题历史条数（`historyBootstrapLimit`）。
+- **工具**：`feishu_attachment_fetch`（`feishuTools.attachmentFetch`）、`feishu_topic_messages`（`feishuTools.topicMessages`）、`feishu_send_file`（`feishuTools.sendFile`）开关。
+- **限额与超时**：预取单图 / 总量 / 整段超时（`prefetchImageMaxBytes` / `prefetchTotalMaxBytes` / `prefetchTimeoutMs`）、读取附件资源数 / 字节预算 / 超时（`feishuTools.attachmentFetchMaxResources` / `attachmentFetchMaxBytes` / `attachmentFetchTimeoutMs`）、读取话题消息超时（`feishuTools.topicMessagesTimeoutMs`）、被动引用 / 历史读取预算（`promptContextTimeoutMs`）。
 
 `feishuTools.*` 是嵌套配置：面板只把改动过的子键写进覆盖层，其余子键保持原值（Web 覆盖或 profile 配置），不会因部分保存变成未定义。字段默认值、边界与降级规则见下文配置示例和 [docs/attachment-pipeline-v2.md](docs/attachment-pipeline-v2.md)。
 
 **连接状态**：阶段徽标（待配置 / 未连接 / 连接中 / 已连接 / 连接失败）、飞书长连接状态、Bot open_id 尾号、运行时长、话题路由数 / 活动会话 / 在途回复、最近一次连接失败原因；每 5 秒自动刷新，也可手动刷新或**重启飞书连接**（会断开当前长连接并中断进行中的回复）。徽标不是健康时会额外显示「健康判定」原因——健康等级由宿主**所有 Cordis fiber** 折叠而来，因此「降级」也可能来自其它插件入口仍在等待依赖/加载（与飞书通道无关），原因行会列出对应插件名；「连接失败」只针对飞书连接本身，插件入口保持加载。
 
-**飞书应用凭据**：在「连接 → 飞书应用凭据」卡片里填写 **App ID / App Secret** 并保存，值经宿主 `ctx.credentials` 写入 DSH 凭据库（默认 `$DSH_HOME/.credentials.yaml` 的 `refs:` 段，仍遵循凭据层的解析优先级），面板只显示「已配置 / 未配置」与来源，**永不回显已存值**。两项齐全且通道未运行时保存后自动建立连接；已连接时保存只提示重连；只填了一项时保存成功但**不会连接**（状态保持「待配置」），补齐另一项后自动连接。已存值可以单独「移除已存值」；卡片下方显示的是凭据**引用名**（profile 配置里的 `appId` / `appSecret`），换引用名仍需改 profile 配置。「会话与行为」页底部的「日志分析接口令牌」卡片用同样方式写入令牌，保存或移除后下一次接口请求即生效，不会重连飞书。
+**飞书应用凭据**：在「连接 → 飞书应用凭据」卡片里填写 **App ID / App Secret** 并保存，值经宿主 `ctx.credentials` 写入 DSH 凭据库（默认 `$DSH_HOME/.credentials.yaml` 的 `refs:` 段，仍遵循凭据层的解析优先级），面板只显示「已配置 / 未配置」与来源，**永不回显已存值**。两项齐全且通道未运行时保存后自动建立连接；已连接时保存只提示重连；只填了一项时保存成功但**不会连接**（状态保持「待配置」），补齐另一项后自动连接。每项凭据一行，点「更换」展开输入框，已存值可以单独「移除」；行内显示的是凭据**引用名**（profile 配置里的 `appId` / `appSecret`），换引用名仍需改 profile 配置。「高级 → 日志分析接口 → 访问令牌」用同样方式写入令牌，保存或移除后下一次接口请求即生效，不会重连飞书。
 
-**统一保存**：除连接类操作外，可编辑字段共用一个草稿；每个表单标签页底部是「保存更改 / 放弃更改」，只提交改动过的字段，标注「需重连」的项在下次连接时生效；保存后「连接」标签页顶部横幅列出待生效项并提供一键重连。
+**统一保存**：除连接类操作外，可编辑字段共用一个跨标签页的草稿；有未保存改动时页面底部浮出保存栏（「N 项未保存」、其中需重连的项数、「放弃 / 保存」），没有改动时不显示。只提交改动过的字段，标注「需重连」的项在下次连接时生效；保存后「连接」标签页顶部横幅列出待生效项并提供一键重连。
 
 **模型选择器**：模型与推理在面板里是**独立的「模型」标签页**：宿主 LLM 服务可用时，`provider` / `model` / `reasoningEffort` 与 `agentPreset` 渲染为**下拉选择**而不是手填：provider 来自 `ctx.llm.listProviders()`，model 来自所选 provider 的 `listModels()`，推理档位来自 `resolveModelInfo(provider, model).reasoning.efforts`，Agent 预设来自 `agentPresets.list()`。每个选择器的首项是「留空 = 部署默认 / 适配器默认 / roster 默认」，有部署默认模型（`agentDefaultModel`）或 roster 默认预设时会在标签里带上具体值。选择按依赖级联：先选 provider 才会加载 model，选了 model 才会加载推理档位；宿主暂时无法枚举的项（服务未挂载、适配器查询失败/超时）自动退回原来的自由文本框，已保存但当前列表里没有的值会作为「当前配置，不在宿主机列表中」选项保留，不会在打开面板时被静默改掉。级联查询走只读的 `GET /dsh-channels/catalog?provider=…&model=…`（Host 侧短 TTL 缓存，单次查询 4 秒上限）。`provider` 与 `model` 在宿主侧是一条完整的请求路由，因此面板保存时要求**两者同时设置或同时留空**，不允许只选一半。
 
@@ -100,9 +103,9 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 
 **可视化选择工作区根目录**：输入框旁的「选择目录…」按钮会调用**宿主机的系统目录选择框**（macOS 的 NSOpenPanel / Windows 的文件夹对话框），选中后把绝对路径填进草稿，仍需点「保存更改」才落盘。该能力转发自宿主可选的 `ctx.directoryPicker` 服务：桌面端/本机 GUI 会话（native 后端）提供按钮；headless、远程或 SSH 会话没有可服务的显示会话（browse 后端），面板不显示按钮、保留手写输入，插件在缺少该服务的旧宿主上照常加载。选择框打开期间请求保持挂起；取消是正常结果，不会报错。
 
-**访问授权**：「访问授权」标签页集中管理准入：管理员 user_id（私聊 `/userid` 获取）、准入模式、授权申请有效期；「已授权群」「已授权用户」列表支持增删（群 ID 可从入群群信息卡或 `/groupid` 获得，用户 user_id 可用 `/userid` 查看）；「待处理申请」可一键授权/忽略。白名单只约束非管理员：管理员在任何私聊/群聊都直接放行。管理员留空时自动使用飞书应用所有者（连接时通过「获取应用信息」接口查询），标签页会显示“已自动使用应用所有者”；`guarded` 且既未配置管理员、也查不到应用所有者时，标签页顶部会红字提示“当前会拒绝所有对话”并附上查询失败原因。授权白名单与申请记录保存在插件 `storageDomain`（`channels_routes_v2` 域），重启后保留；未建立飞书连接时白名单尚未加载，标签页会提示「连接建立后加载授权列表」并禁用写操作。
+**访问授权**：「访问授权」标签页集中管理准入：管理员 user_id（私聊 `/userid` 获取）、调试模式、授权申请有效期；「已授权群」「已授权用户」列表支持增删（群 ID 可从入群群信息卡或 `/groupid` 获得，用户 user_id 可用 `/userid` 查看）；「待处理申请」可一键授权/忽略。白名单只约束非管理员：管理员在任何私聊/群聊都直接放行。管理员留空时自动使用飞书应用所有者（连接时通过「获取应用信息」接口查询），管理员一行的说明会显示“已自动使用应用所有者”；`guarded` 且既未配置管理员、也查不到应用所有者时，标签页顶部会红字提示“当前会拒绝所有对话”并附上查询失败原因。授权白名单与申请记录保存在插件 `storageDomain`（`channels_routes_v2` 域），重启后保留；未建立飞书连接时白名单尚未加载，标签页会提示「连接建立后加载授权列表」并禁用写操作。
 
-**配置层级**：`configSchema` 默认值 < profile `cordis.patch.yml` 的 `config` < Web 面板覆盖。面板只把可编辑字段写入 `$DSH_HOME/dsh-channels/settings.json`；「高级 → 清除 Web 覆盖」删除该文件并回落到 profile 配置。`baseDir` 可在「工作区」标签页编辑（绝对路径；只影响之后新建的会话）；超时、路由 TTL 等仍只读展示。凭据**值**在「连接 → 飞书应用凭据」编辑，凭据**引用名**（`appId` / `appSecret` 配置项）仍由 profile 配置决定。已移除的目录清理配置 `workspaceRetention` / `workspaceRetentionAuto` 与覆盖文件路径配置 `settingsFile` 若仍留在 profile 或覆盖文件中会被静默忽略，面板下次保存时从覆盖文件中去掉。
+**配置层级**：`configSchema` 默认值 < profile `cordis.patch.yml` 的 `config` < Web 面板覆盖。面板只把可编辑字段写入 `$DSH_HOME/dsh-channels/settings.json`；「高级 → 恢复 profile 配置」确认后删除该文件并回落到 profile 配置。`baseDir` 与 `topicIsolation` 在「会话 → 工作区」编辑（只影响之后新建的话题）；话题过期、审批 / 提问卡片等待与 `maxTokens` 保存后立即生效，不需要重连。凭据**值**在「连接 → 飞书应用凭据」编辑，凭据**引用名**（`appId` / `appSecret` 配置项）仍由 profile 配置决定。已移除的目录清理配置 `workspaceRetention` / `workspaceRetentionAuto` 与覆盖文件路径配置 `settingsFile` 若仍留在 profile 或覆盖文件中会被静默忽略，面板下次保存时从覆盖文件中去掉。
 
 **为什么落在插件自己的文件而不是 profile 的 `cordis.patch.yml`？** DSH 提供官方 `ctx.configEditor.edit()`，可以安全写 profile patch（完整 Config 校验、保留注释与 `!!js`、原子替换、失败回滚、与 HMR 串行）；但它是「完整配置编辑」通道——本插件的 Config 是 zod，没有 schemastery `.volatile()` 标记，普通字段写入会触发 Loader 重载插件，等于每次保存都断开并重连飞书；而且该服务只在有 `profileContext` 的启动器（桌面端 / `dsh web`）存在。`$DSH_HOME/<plugin>/` 是 DSH 插件保存运行时数据的惯例（如 dsh-pet 的 `$DSH_HOME/dsh-pet/`），因此面板偏好写入 `$DSH_HOME/dsh-channels/settings.json`：保存即生效（需重连字段除外）、可一键清除回退、不依赖 `profileContext`；profile 的 `cordis.patch.yml` 继续作为部署级基础配置层。若将来要求「所有配置统一进 profile」，迁移路径是改用 `ctx.configEditor.edit()` 并接受保存触发插件重载。
 
@@ -189,12 +192,13 @@ src/
 │   ├── index.ts           #   client 插件入口：settings.section 注册 + 样式
 │   ├── panel/             #   页面外壳 + 七个标签页
 │   │   ├── index.tsx      #     加载 / 5s 状态轮询 / 全局草稿 / catalog 级联 / 顶部状态头 / Tab
-│   │   ├── shared.tsx     #     字段渲染原语、保存栏、阶段徽标、草稿校验
-│   │   ├── connection-tab.tsx #   连接：三步引导 / 连接信息 / 待生效提醒 / 凭据卡
-│   │   ├── credentials-card.tsx  #  App ID / App Secret 编辑（不回显）
-│   │   ├── analyze-token-card.tsx #  日志分析接口令牌编辑（不回显，不触发重连）
-│   │   ├── sessions-tab.tsx / model-tab.tsx / workspace-tab.tsx / access-tab.tsx / wiki-tab.tsx / advanced-tab.tsx
-│   │   └── access-card.tsx
+│   │   ├── shared.tsx     #     行 / 开关 / 分组 / 保存栏等渲染原语、阶段徽标、草稿校验
+│   │   ├── connection-tab.tsx #   连接：三步引导 / 状态块 / 自检 / 待生效提醒 / 凭据
+│   │   ├── credentials-card.tsx  #  凭据行：更换 / 移除（不回显），App 凭据与分析接口令牌共用
+│   │   ├── fields-tab.tsx #     会话 / 模型 / 附件与工具：纯字段分组页
+│   │   ├── access-tab.tsx / wiki-tab.tsx / advanced-tab.tsx
+│   │   └── whitelist.tsx  #     白名单与待处理申请列表
+│   ├── number-field.ts    #   数值字段显示单位换算、上下界校验、字节读数
 │   ├── catalog.ts         #   选择器目录折叠：Host 字段 + 实时目录 → 表单字段
 │   ├── api.ts             #   同源 /dsh-channels/* 请求封装
 │   └── styles.ts          #   语义 token 样式（注入一次）

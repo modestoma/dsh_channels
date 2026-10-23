@@ -214,7 +214,7 @@ native 后端下，准入通过后由 `inboundAttachmentState` 做**不下载的
 
 ## 11. 配置项全景
 
-下表为 v2 相关配置（默认值 / 边界以 [src/config.ts](../src/config.ts) 为准）。Web 面板「设置 → 飞书渠道 → 会话与行为」把它们分为「内容与附件」（`FieldGroup = content`）与「模型工具」（`FieldGroup = tools`）两组；`feishuTools.*` 在覆盖层中仍写成嵌套对象，保存时只合并被修改的子键。
+下表为 v2 相关配置（默认值 / 边界以 [src/config.ts](../src/config.ts) 为准）。Web 面板「设置 → 飞书渠道 → 附件与工具」把它们分为「入站附件」（`FieldGroup = attachments`）、「工具」（`tools`）与默认收起的「限额与超时」（`limits`）三组；`feishuTools.*` 在覆盖层中仍写成嵌套对象，保存时只合并被修改的子键。
 
 | 配置项 | 默认 | 边界 / 说明 | 面板分组 |
 | --- | --- | --- | --- |
