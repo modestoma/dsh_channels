@@ -1,6 +1,6 @@
 /**
- * 设置面板共享层：页面状态类型、Host 字段渲染原语（FieldRow / FieldsCard /
- * SaveBar）、生命周期徽标与纯格式化工具。
+ * 设置面板共享层：页面状态类型、Host 字段渲染原语（SettingRow /
+ * FieldSections / SaveBar）、分区与列表原语、生命周期徽标与纯格式化工具。
  *
  * 这一层不发请求、不持有页面状态，只把 Host 下发的 wire 数据渲染成控件；
  * 页面外壳在 `index.tsx`，各 tab 只组合这些原语。
@@ -9,9 +9,15 @@
  */
 
 import { useState } from 'react'
-import { FIELD_GROUP_LABELS, PANEL_COPY, TAB_FIELD_GROUPS } from '../../settings/contract.ts'
+import type { ReactNode } from 'react'
+import {
+  BYTES_UNIT,
+  COLLAPSED_FIELD_GROUPS,
+  FIELD_GROUP_LABELS,
+  fillCopy,
+  PANEL_COPY,
+} from '../../settings/contract.ts'
 import type {
-  AccessWire,
   ChannelPhaseWire,
   ConfigValue,
   CredentialField,
@@ -20,9 +26,9 @@ import type {
   EditableValues,
   FieldGroup,
   FieldIssueWire,
-  PanelTabId,
   PanelWire,
 } from '../../settings/contract.ts'
+import { bytesReading, numberDraftValue, numberInputStep, numberInputValue } from '../number-field.ts'
 import {
   listIsFull,
   listItems,
@@ -43,7 +49,7 @@ export type LoadState =
 export interface Notice {
   kind: 'ok' | 'error'
   text: string
-  /** Per-field validation failures rendered inline by FieldRow. */
+  /** Per-field validation failures rendered inline by SettingRow. */
   issues?: FieldIssueWire[]
 }
 
@@ -56,14 +62,14 @@ export type BusyAction =
   | 'credentials-clear'
   | 'access'
 
-/** Tone of a small badge; maps onto `dsh-channels-cfg__badge--*` classes. */
+/** Tone of a small pill; maps onto `dsh-channels-cfg__pill--*` classes. */
 export type BadgeTone = 'ok' | 'warn' | 'bad' | 'muted'
 
 export function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
-/** Compact duration for the connection card. */
+/** Compact duration for the page header. */
 export function formatUptime(ms: number | undefined): string {
   if (ms === undefined || !Number.isFinite(ms)) return PANEL_COPY.unknownValue
   const totalSeconds = Math.max(0, Math.floor(ms / 1_000))
@@ -86,24 +92,9 @@ export function fieldLabel(fields: readonly EditableFieldWire[], key: EditableKe
   return fields.find(field => field.key === key)?.label ?? key
 }
 
-/** Effective access-mode label, reusing the Host field options for consistency. */
-export function accessModeLabel(panel: PanelWire, mode: AccessWire['mode']): string {
-  const field = panel.config.fields.find(item => item.key === 'accessMode')
-  return field?.options?.find(option => option.value === mode)?.label ?? mode
-}
-
-/** Numeric draft kept as the raw input string; parsed on save. */
-function numericDraft(field: EditableFieldWire, raw: ConfigValue | undefined): number | undefined {
-  if (typeof raw === 'number') return raw
-  if (typeof raw !== 'string' || raw.trim() === '') return undefined
-  const parsed = Number(raw)
-  return Number.isFinite(parsed) ? parsed : undefined
-}
-
 /**
  * Turn the dirty draft into the wire payload, keeping the Host-descriptor
- * bounds check client-side. Field messages stay technical (the Host re-validates
- * every value on save).
+ * bounds check client-side (the Host re-validates every value on save).
  */
 export function validateDraft(
   panel: PanelWire,
@@ -115,20 +106,9 @@ export function validateDraft(
     if (!(field.key in draft)) continue
     const raw = draft[field.key]
     if (field.kind === 'number') {
-      const parsed = numericDraft(field, raw)
-      if (parsed === undefined) {
-        issues.push({ key: field.key, message: '请输入数字' })
-        continue
-      }
-      if (field.min !== undefined && parsed < field.min) {
-        issues.push({ key: field.key, message: `不得小于 ${field.min}` })
-        continue
-      }
-      if (field.max !== undefined && parsed > field.max) {
-        issues.push({ key: field.key, message: `不得大于 ${field.max}` })
-        continue
-      }
-      values[field.key] = parsed
+      const parsed = numberDraftValue(field, raw)
+      if (parsed.ok) values[field.key] = parsed.value
+      else issues.push({ key: field.key, message: parsed.message })
       continue
     }
     if (field.kind === 'boolean') {
@@ -146,7 +126,7 @@ export function validateDraft(
   return { values, issues }
 }
 
-/** Header badge for the Host-derived lifecycle phase. */
+/** Header pill for the Host-derived lifecycle phase. */
 export function phaseBadge(phase: ChannelPhaseWire): { text: string; tone: BadgeTone } {
   switch (phase) {
     case 'connected': return { text: PANEL_COPY.phaseConnected, tone: 'ok' }
@@ -157,7 +137,7 @@ export function phaseBadge(phase: ChannelPhaseWire): { text: string; tone: Badge
   }
 }
 
-/** One-line explanation shown under the page title for the current phase. */
+/** One-line explanation of the current phase (connection tab status block). */
 export function phaseSummary(phase: ChannelPhaseWire): string {
   switch (phase) {
     case 'connected': return PANEL_COPY.statusSummaryConnected
@@ -182,7 +162,7 @@ export interface CredentialsView {
   onClear: (field: CredentialField) => void
 }
 
-/** Analyze API token editor data owned by the page shell, rendered by the sessions tab. */
+/** Analyze API token editor data owned by the page shell, rendered by the advanced tab. */
 export interface AnalyzeTokenView {
   value: string
   issues: FieldIssueWire[]
@@ -204,17 +184,111 @@ export interface FormView {
   busy: BusyAction | null
   /** Host-side lifecycle busy (connecting/restarting): block writes. */
   locked: boolean
-  dirtyCount: number
   onChange: (key: EditableKey, value: ConfigValue) => void
-  onSave: () => void
-  /** Drop only the draft keys owned by one tab. */
-  onDiscardTab: (tab: PanelTabId) => void
   /**
    * Open the Host's native directory chooser and write the picked absolute
-   * path into the draft (not saved until「保存更改」). Absent when the Host
+   * path into the draft (not saved until「保存」). Absent when the Host
    * cannot offer a native chooser.
    */
   onPickDirectory?: (key: EditableKey) => Promise<void>
+}
+
+/** Small rounded status pill. */
+export function Pill(props: { tone: BadgeTone; dot?: boolean; children: ReactNode }): JSX.Element {
+  return (
+    <span className={`dsh-channels-cfg__pill dsh-channels-cfg__pill--${props.tone}`}>
+      {props.dot === true ? <span className="dsh-channels-cfg__dot" /> : null}
+      {props.children}
+    </span>
+  )
+}
+
+/** One titled section: a muted heading above a bordered row list. */
+export function Section(props: {
+  title: ReactNode
+  footnote?: ReactNode
+  tone?: 'warn'
+  children: ReactNode
+}): JSX.Element {
+  const { title, footnote, tone, children } = props
+  return (
+    <section className="dsh-channels-cfg__sec">
+      <h3 className="dsh-channels-cfg__secTitle">{title}</h3>
+      <div className={`dsh-channels-cfg__list${tone === 'warn' ? ' dsh-channels-cfg__list--warn' : ''}`}>
+        {children}
+      </div>
+      {footnote === undefined ? null : <p className="dsh-channels-cfg__secFoot">{footnote}</p>}
+    </section>
+  )
+}
+
+/**
+ * One setting row: label (with tags and the「详情」toggle) and a one-line
+ * summary on the left, the control on the right. `details` renders below the
+ * row once expanded; `wide` puts the control under the text.
+ */
+export function Row(props: {
+  label: ReactNode
+  tags?: ReactNode
+  summary?: ReactNode
+  details?: ReactNode
+  control?: ReactNode
+  error?: ReactNode
+  wide?: boolean
+  leading?: ReactNode
+}): JSX.Element {
+  const { label, tags, summary, details, control, error, wide = false, leading } = props
+  const [open, setOpen] = useState(false)
+  return (
+    <div className="dsh-channels-cfg__rowWrap">
+      <div className={`dsh-channels-cfg__row${wide ? ' dsh-channels-cfg__row--wide' : ''}`}>
+        {leading}
+        <div className="dsh-channels-cfg__rowText">
+          <div className="dsh-channels-cfg__rowLabel">
+            <span>{label}</span>
+            {tags}
+            {details === undefined
+              ? null
+              : (
+                  <button
+                    type="button"
+                    className="dsh-channels-cfg__more"
+                    aria-expanded={open}
+                    onClick={() => setOpen(!open)}
+                  >
+                    {PANEL_COPY.details}
+                  </button>
+                )}
+          </div>
+          {summary === undefined ? null : <div className="dsh-channels-cfg__rowSummary">{summary}</div>}
+        </div>
+        {control === undefined ? null : <div className="dsh-channels-cfg__rowCtl">{control}</div>}
+      </div>
+      {open && details !== undefined ? <div className="dsh-channels-cfg__details">{details}</div> : null}
+      {error === undefined || error === null ? null : <div className="dsh-channels-cfg__rowError">{error}</div>}
+    </div>
+  )
+}
+
+/** Accessible on/off switch. */
+export function Switch(props: {
+  checked: boolean
+  label: string
+  disabled?: boolean
+  onChange: (next: boolean) => void
+}): JSX.Element {
+  const { checked, label, disabled = false, onChange } = props
+  return (
+    <button
+      type="button"
+      role="switch"
+      className="dsh-channels-cfg__switch"
+      aria-checked={checked}
+      aria-label={label}
+      disabled={disabled}
+      onClick={() => onChange(!checked)}
+    />
+  )
 }
 
 /**
@@ -253,7 +327,7 @@ function DirectoryTextInput(props: {
       />
       <button
         type="button"
-        className="dsh-channels-cfg__btn dsh-channels-cfg__btn--browse"
+        className="dsh-channels-cfg__btn"
         disabled={disabled || picking}
         onClick={() => { void pick() }}
       >
@@ -265,7 +339,7 @@ function DirectoryTextInput(props: {
 
 /**
  * `string-list` control: one single-line input per entry, each with a remove
- * button, and an add button below (disabled at `maxItems` inputs). An empty
+ * button, and an add link below (disabled at `maxItems` inputs). An empty
  * list renders one blank input so the first entry can be typed directly.
  * Issues carrying an `index` mark that input and show the reason under it.
  */
@@ -280,13 +354,13 @@ function StringListInput(props: {
   const empty = listItems(value).length === 0
   const rows = listRows(value)
   return (
-    <div className="dsh-channels-cfg__list">
+    <div className="dsh-channels-cfg__stringList">
       {rows.map((item, index) => {
         const issue = issues.find(entry => entry.index === index)
         const position = PANEL_COPY.listEntry.replace('{n}', String(index + 1))
         // Entries have no identity beyond their position, so the index is the key.
         return (
-          <div className="dsh-channels-cfg__listItem" key={index}>
+          <div className="dsh-channels-cfg__stringListItem" key={index}>
             <div className="dsh-channels-cfg__inputRow">
               <input
                 type="text"
@@ -303,7 +377,7 @@ function StringListInput(props: {
                 : (
                     <button
                       type="button"
-                      className="dsh-channels-cfg__btn dsh-channels-cfg__btn--listRemove"
+                      className="dsh-channels-cfg__btn dsh-channels-cfg__btn--remove"
                       aria-label={`${PANEL_COPY.listRemove} ${position}`}
                       disabled={disabled}
                       onClick={() => onChange(field.key, withoutListEntry(rows, index))}
@@ -319,22 +393,125 @@ function StringListInput(props: {
       <div>
         <button
           type="button"
-          className="dsh-channels-cfg__btn"
+          className="dsh-channels-cfg__link"
           disabled={disabled || listIsFull(field, rows)}
           onClick={() => onChange(field.key, withBlankListEntry(rows))}
         >
-          {PANEL_COPY.listAdd}
+          ＋ {PANEL_COPY.listAdd}
         </button>
       </div>
     </div>
   )
 }
 
-/** One generic form control driven by the Host field descriptor. */
-export function FieldRow(props: {
+/** Number input with its unit (and a MiB reading for byte counts). */
+function NumberInput(props: {
   field: EditableFieldWire
   value: ConfigValue | undefined
-  issues: FieldIssueWire[]
+  inputClass: string
+  disabled: boolean
+  onChange: (key: EditableKey, value: ConfigValue) => void
+}): JSX.Element {
+  const { field, value, inputClass, disabled, onChange } = props
+  const text = numberInputValue(field, value)
+  const reading = field.unit === BYTES_UNIT ? bytesReading(text) : undefined
+  return (
+    <div className="dsh-channels-cfg__inputRow">
+      {reading === undefined ? null : <span className="dsh-channels-cfg__bytes">{reading}</span>}
+      <input
+        type="number"
+        className={`${inputClass} dsh-channels-cfg__input--num`}
+        value={text}
+        placeholder={field.placeholder}
+        step={numberInputStep(field)}
+        aria-label={field.label}
+        disabled={disabled}
+        onChange={event => onChange(field.key, event.target.value)}
+      />
+      {field.unit === undefined ? null : <span className="dsh-channels-cfg__unit">{field.unit}</span>}
+    </div>
+  )
+}
+
+/** The control for one Host field descriptor. */
+function FieldControl(props: {
+  field: EditableFieldWire
+  value: ConfigValue | undefined
+  issues: readonly FieldIssueWire[]
+  invalid: boolean
+  disabled: boolean
+  onChange: (key: EditableKey, value: ConfigValue) => void
+  onPickDirectory?: () => Promise<void>
+}): JSX.Element | null {
+  const { field, value, issues, invalid, disabled, onChange, onPickDirectory } = props
+  const inputClass = `dsh-channels-cfg__input${invalid ? ' dsh-channels-cfg__input--invalid' : ''}`
+  switch (field.kind) {
+    case 'boolean':
+      return <Switch checked={value === true} label={field.label} disabled={disabled} onChange={next => onChange(field.key, next)} />
+    case 'select': {
+      const toggle = field.toggle
+      if (toggle !== undefined) {
+        return (
+          <Switch
+            checked={value === toggle.on}
+            label={field.label}
+            disabled={disabled}
+            onChange={next => onChange(field.key, next ? toggle.on : toggle.off)}
+          />
+        )
+      }
+      return (
+        <select
+          className={`${inputClass} dsh-channels-cfg__select`}
+          value={String(value ?? '')}
+          disabled={disabled || field.disabled === true}
+          aria-label={field.label}
+          onChange={event => onChange(field.key, event.target.value)}
+        >
+          {(field.options ?? []).map(option => (
+            <option key={option.value} value={option.value}>{option.label}</option>
+          ))}
+        </select>
+      )
+    }
+    case 'number':
+      return <NumberInput field={field} value={value} inputClass={inputClass} disabled={disabled} onChange={onChange} />
+    case 'text':
+      return field.browse === 'directory' && onPickDirectory !== undefined
+        ? (
+            <DirectoryTextInput
+              field={field}
+              value={value}
+              inputClass={inputClass}
+              disabled={disabled}
+              onChange={onChange}
+              onPick={onPickDirectory}
+            />
+          )
+        : (
+            <input
+              type="text"
+              className={`${inputClass}${field.wide === true ? '' : ' dsh-channels-cfg__input--text'}`}
+              value={String(value ?? '')}
+              placeholder={field.placeholder}
+              aria-label={field.label}
+              disabled={disabled}
+              onChange={event => onChange(field.key, event.target.value)}
+            />
+          )
+    case 'string-list':
+      return <StringListInput field={field} value={value} issues={issues} disabled={disabled} onChange={onChange} />
+    default:
+      // Unknown kinds come from a newer Host; render nothing instead of a broken control.
+      return null
+  }
+}
+
+/** One Host field rendered as a setting row. */
+export function SettingRow(props: {
+  field: EditableFieldWire
+  value: ConfigValue | undefined
+  issues: readonly FieldIssueWire[]
   disabled?: boolean
   onChange: (key: EditableKey, value: ConfigValue) => void
   /** Present only for `field.browse === 'directory'` rows the page can serve. */
@@ -344,229 +521,157 @@ export function FieldRow(props: {
   // Entry issues (`index` set) are rendered next to their input by StringListInput.
   const issue = issues.find(item => item.key === field.key && item.index === undefined)
   const entryIssues = issues.filter(item => item.key === field.key && item.index !== undefined)
-  const inputClass = `dsh-channels-cfg__input${issue === undefined ? '' : ' dsh-channels-cfg__input--invalid'}`
-  const fieldClass = `dsh-channels-cfg__field${field.wide === true ? ' dsh-channels-cfg__field--wide' : ''}`
   return (
-    <div className={fieldClass}>
-      <div className="dsh-channels-cfg__labelRow">
-        <span className="dsh-channels-cfg__label">{field.label}</span>
-        {field.restartRequired
-          ? <span className="dsh-channels-cfg__tag dsh-channels-cfg__tag--restart">{PANEL_COPY.restartTag}</span>
-          : null}
-      </div>
-      {field.kind === 'boolean'
-        ? (
-            <label className="dsh-channels-cfg__check">
-              <input
-                type="checkbox"
-                className="dsh-channels-cfg__checkbox"
-                checked={value === true}
-                aria-label={field.label}
-                disabled={disabled}
-                onChange={event => onChange(field.key, event.target.checked)}
-              />
-              <span>{value === true ? PANEL_COPY.enabled : PANEL_COPY.disabled}</span>
-            </label>
-          )
-        : null}
-      {field.kind === 'select'
-        ? (
-            <select
-              className={inputClass}
-              value={String(value ?? '')}
-              disabled={disabled || field.disabled === true}
-              aria-label={field.label}
-              onChange={event => onChange(field.key, event.target.value)}
-            >
-              {(field.options ?? []).map(option => (
-                <option key={option.value} value={option.value}>{option.label}</option>
-              ))}
-            </select>
-          )
-        : null}
-      {field.kind === 'number'
-        ? (
-            <input
-              type="number"
-              className={inputClass}
-              value={value === undefined || value === '' ? '' : String(value)}
-              min={field.min}
-              max={field.max}
-              step={field.step}
-              aria-label={field.label}
-              disabled={disabled}
-              onChange={event => onChange(field.key, event.target.value)}
-            />
-          )
-        : null}
-      {field.kind === 'text'
-        ? (field.browse === 'directory' && onPickDirectory !== undefined
-            ? (
-                <DirectoryTextInput
-                  field={field}
-                  value={value}
-                  inputClass={inputClass}
-                  disabled={disabled}
-                  onChange={onChange}
-                  onPick={onPickDirectory}
-                />
-              )
-            : (
-                <input
-                  type="text"
-                  className={inputClass}
-                  value={String(value ?? '')}
-                  placeholder={field.placeholder}
-                  aria-label={field.label}
-                  disabled={disabled}
-                  onChange={event => onChange(field.key, event.target.value)}
-                />
-              ))
-        : null}
-      {field.kind === 'string-list'
-        ? (
-            <StringListInput
-              field={field}
-              value={value}
-              issues={entryIssues}
-              disabled={disabled}
-              onChange={onChange}
-            />
-          )
-        : null}
-      {field.help === undefined ? null : <span className="dsh-channels-cfg__help">{field.help}</span>}
-      {issue === undefined ? null : <span className="dsh-channels-cfg__fieldError">{issue.message}</span>}
-    </div>
+    <Row
+      label={field.label}
+      tags={field.restartRequired ? <span className="dsh-channels-cfg__tag">{PANEL_COPY.restartTag}</span> : undefined}
+      summary={field.summary}
+      details={field.help}
+      wide={field.wide === true}
+      error={issue?.message}
+      control={(
+        <FieldControl
+          field={field}
+          value={value}
+          issues={entryIssues}
+          invalid={issue !== undefined}
+          disabled={disabled}
+          onChange={onChange}
+          onPickDirectory={onPickDirectory}
+        />
+      )}
+    />
+  )
+}
+
+/** Rows for every field of one group. */
+function GroupRows(props: { form: FormView; fields: readonly EditableFieldWire[] }): JSX.Element {
+  const { form, fields } = props
+  return (
+    <>
+      {fields.map((field) => {
+        const onPick = form.onPickDirectory
+        return (
+          <SettingRow
+            key={field.key}
+            field={field}
+            value={form.draft[field.key] ?? effectiveValue(form.panel, field.key)}
+            issues={form.issues}
+            disabled={form.locked}
+            onChange={form.onChange}
+            onPickDirectory={onPick === undefined ? undefined : () => onPick(field.key)}
+          />
+        )
+      })}
+    </>
   )
 }
 
 /**
- * One tab's editable fields, partitioned by the Host field groups that the tab
- * owns (`TAB_FIELD_GROUPS`). Empty groups render nothing, so a Host that moves
- * every key out of a group does not leave a stray heading behind.
+ * A group of rarely changed fields behind one summary row. It opens on its
+ * own when one of its fields has a validation issue.
  */
-export function FieldsCard(props: {
+function CollapsedGroup(props: { form: FormView; fields: readonly EditableFieldWire[] }): JSX.Element {
+  const { form, fields } = props
+  const [open, setOpen] = useState(false)
+  const keys = new Set<string>(fields.map(field => field.key))
+  const changed = fields.filter(field =>
+    form.panel.config.overriddenKeys.includes(field.key) || field.key in form.draft).length
+  const expanded = open || form.issues.some(issue => keys.has(issue.key))
+  return (
+    <>
+      <Row
+        label={fillCopy(PANEL_COPY.collapsedCount, { n: fields.length })}
+        summary={changed === 0 ? PANEL_COPY.collapsedClean : fillCopy(PANEL_COPY.collapsedChanged, { n: changed })}
+        control={(
+          <button type="button" className="dsh-channels-cfg__more" aria-expanded={expanded} onClick={() => setOpen(!expanded)}>
+            {expanded ? PANEL_COPY.collapse : PANEL_COPY.expand}
+          </button>
+        )}
+      />
+      {expanded ? <GroupRows form={form} fields={fields} /> : null}
+    </>
+  )
+}
+
+/**
+ * One tab's editable fields as titled sections, one per Host field group, in
+ * the given order. Empty groups render nothing, so a Host that moves every key
+ * out of a group does not leave a stray heading behind. `extra` appends rows
+ * that are not Host fields (e.g. a credential) to one group's list.
+ */
+export function FieldSections(props: {
   form: FormView
   groups: readonly FieldGroup[]
-}): JSX.Element | null {
-  const { form, groups } = props
-  const sections = groups
-    .map(group => ({
-      group,
-      label: FIELD_GROUP_LABELS[group],
-      fields: form.fields.filter(field => field.group === group),
-    }))
-    .filter(section => section.fields.length > 0)
-  if (sections.length === 0) return null
+  extra?: Partial<Record<FieldGroup, ReactNode>>
+  footnotes?: Partial<Record<FieldGroup, ReactNode>>
+}): JSX.Element {
+  const { form, groups, extra = {}, footnotes = {} } = props
   return (
-    <section className="dsh-channels-cfg__card">
-      {sections.map(section => (
-        <div className="dsh-channels-cfg__group" key={section.group}>
-          <div className="dsh-channels-cfg__labelRow">
-            <span className="dsh-channels-cfg__cardTitle">{section.label}</span>
-          </div>
-          <div className="dsh-channels-cfg__grid">
-            {section.fields.map((field) => {
-              const onPick = form.onPickDirectory
-              return (
-                <FieldRow
-                  key={field.key}
-                  field={field}
-                  value={form.draft[field.key] ?? effectiveValue(form.panel, field.key)}
-                  issues={form.issues}
-                  disabled={form.locked}
-                  onChange={form.onChange}
-                  onPickDirectory={onPick === undefined ? undefined : () => onPick(field.key)}
-                />
-              )
-            })}
-          </div>
-        </div>
-      ))}
-    </section>
+    <>
+      {groups.map((group) => {
+        const fields = form.fields.filter(field => field.group === group)
+        const more = extra[group]
+        if (fields.length === 0 && more === undefined) return null
+        return (
+          <Section key={group} title={FIELD_GROUP_LABELS[group]} footnote={footnotes[group]}>
+            {COLLAPSED_FIELD_GROUPS.includes(group)
+              ? <CollapsedGroup form={form} fields={fields} />
+              : <GroupRows form={form} fields={fields} />}
+            {more}
+          </Section>
+        )
+      })}
+    </>
   )
 }
 
-/** The unified per-tab action bar: save every dirty field or drop the draft. */
-export function SaveBar(props: { form: FormView; tab: PanelTabId }): JSX.Element {
-  const { form, tab } = props
-  const groups = new Set<string>(TAB_FIELD_GROUPS[tab])
-  const pageDirty = form.fields.filter(field => groups.has(field.group) && field.key in form.draft).length
-  // Saving submits the whole draft, so any dirty key (any tab) enables it;
-  // discarding only clears this tab, so it follows this tab's own count.
-  const dirty = form.dirtyCount > 0
-  const disabled = !dirty || form.busy !== null || form.locked
+/**
+ * Sticky bar shown only while the draft has unsaved keys. Saving submits the
+ * whole draft (every tab); discarding drops it.
+ */
+export function SaveBar(props: {
+  dirtyCount: number
+  restartCount: number
+  busy: BusyAction | null
+  locked: boolean
+  onSave: () => void
+  onDiscard: () => void
+}): JSX.Element | null {
+  const { dirtyCount, restartCount, busy, locked, onSave, onDiscard } = props
+  if (dirtyCount === 0) return null
+  const disabled = busy !== null || locked
   return (
-    <div className="dsh-channels-cfg__footer">
-      <button
-        type="button"
-        className="dsh-channels-cfg__btn dsh-channels-cfg__btn--primary"
-        onClick={form.onSave}
-        disabled={disabled}
-      >
-        {form.busy === 'save' ? PANEL_COPY.saving : PANEL_COPY.save}
-      </button>
-      <button
-        type="button"
-        className="dsh-channels-cfg__btn"
-        onClick={() => form.onDiscardTab(tab)}
-        disabled={pageDirty === 0 || form.busy !== null || form.locked}
-      >
-        {PANEL_COPY.discardTab}
-      </button>
-      <span className="dsh-channels-cfg__spacer" />
-      {pageDirty > 0
-        ? (
-            <span className="dsh-channels-cfg__tag dsh-channels-cfg__tag--dirty">
-              {PANEL_COPY.dirtyCount} {pageDirty}
-            </span>
-          )
-        : dirty
-          ? (
-              <span className="dsh-channels-cfg__tag dsh-channels-cfg__tag--dirty">
-                {PANEL_COPY.dirtyCount} {form.dirtyCount}（其他标签页）
-              </span>
-            )
-          : null}
-      <span className="dsh-channels-cfg__help">
-        {dirty ? PANEL_COPY.saveHintDirty : PANEL_COPY.saveHintClean}
+    <div className="dsh-channels-cfg__saveBar" role="region" aria-label={PANEL_COPY.save}>
+      <span className="dsh-channels-cfg__saveMsg">
+        {fillCopy(PANEL_COPY.dirtyCount, { n: dirtyCount })}
+        {restartCount === 0 ? '' : fillCopy(PANEL_COPY.dirtyRestart, { n: restartCount })}
       </span>
+      <button type="button" className="dsh-channels-cfg__btn dsh-channels-cfg__btn--ghost" onClick={onDiscard} disabled={disabled}>
+        {PANEL_COPY.discard}
+      </button>
+      <button type="button" className="dsh-channels-cfg__btn dsh-channels-cfg__btn--primary" onClick={onSave} disabled={disabled}>
+        {busy === 'save' ? PANEL_COPY.saving : PANEL_COPY.save}
+      </button>
     </div>
   )
 }
 
-/** Muted help paragraph introducing one tab. */
-export function TabHelp(props: { text: string }): JSX.Element {
-  return <p className="dsh-channels-cfg__tabHelp">{props.text}</p>
-}
-
-/** Transient page-level banner (save / credentials / reconnect / catalog). */
-export function NoticeBar(props: { notice: Notice }): JSX.Element {
-  const { notice } = props
+/** Transient banner (save / credentials / reconnect / catalog / access). */
+export function NoticeBar(props: { kind: 'ok' | 'error'; text: string }): JSX.Element {
+  const { kind, text } = props
   return (
     <div
-      className={`dsh-channels-cfg__notice dsh-channels-cfg__notice--${notice.kind === 'ok' ? 'ok' : 'error'}`}
-      role="status"
+      className={`dsh-channels-cfg__notice dsh-channels-cfg__notice--${kind}`}
+      role={kind === 'error' ? 'alert' : 'status'}
       aria-live="polite"
     >
-      <span>{notice.text}</span>
+      {text}
     </div>
   )
 }
 
-/** Muted empty/blocked state (e.g. access lists before the channel connects). */
-export function EmptyState(props: { text: string }): JSX.Element {
-  return <div className="dsh-channels-cfg__emptyState">{props.text}</div>
-}
-
-/** Human label for the official SDK's WebSocket lifecycle state. */
-export function connectionStateLabel(state: string | undefined): { text: string; tone: BadgeTone } {
-  switch (state) {
-    case 'connected': return { text: PANEL_COPY.phaseConnected, tone: 'ok' }
-    case 'connecting': return { text: PANEL_COPY.phaseConnecting, tone: 'warn' }
-    case 'reconnecting': return { text: PANEL_COPY.phaseConnecting, tone: 'warn' }
-    case 'failed': return { text: PANEL_COPY.phaseError, tone: 'bad' }
-    case 'idle': return { text: PANEL_COPY.phaseIdle, tone: 'muted' }
-    default: return { text: state ?? PANEL_COPY.unknownValue, tone: 'muted' }
-  }
+/** Muted row inside a list (empty or not-yet-loaded state). */
+export function EmptyRow(props: { text: string }): JSX.Element {
+  return <div className="dsh-channels-cfg__emptyRow">{props.text}</div>
 }

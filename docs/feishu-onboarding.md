@@ -174,7 +174,7 @@ chmod 600 $DSH_HOME/.credentials.yaml
 | `feishuTools.topicMessagesTimeoutMs` | `20000` | 单次 `feishu_topic_messages` 整段超时（1000–120000 ms） |
 | `loggerLevel` | `info` | 官方 SDK 日志级别 |
 
-> **面板与配置位置**：v2 附件配置已加入 Web 面板「设置 → 飞书渠道 → 会话与行为」：`acceptAttachments` / `attachmentStore` / `prefetch*` / `historyBootstrapLimit` 在「内容与附件」组，`feishuTools.*` 与 `promptContextTimeoutMs` 在「模型工具」组；保存写入同一 Web 覆盖文件，`feishuTools.*` 按子键合并（不会把未修改子键写空）。直接写 profile 补丁层同样生效，面板覆盖优先。其中 `feishuTools.topicMessages=false` 只关闭模型工具，被动的引用/历史 prompt 摘录仍生效；要完全关闭首轮历史请设 `historyBootstrapLimit: 0`。archive 后端下 `feishu_attachment_fetch` 不挂载，`feishu_topic_messages` 仍可读取历史文本，但工具描述会提示附件不可取。
+> **面板与配置位置**：v2 附件配置在 Web 面板「设置 → 飞书渠道 → 附件与工具」：`acceptAttachments` / `attachmentStore` / `prefetchImages` / `historyBootstrapLimit` 在「入站附件」组，`feishuTools.*` 开关在「工具」组，各项字节上限与超时在「限额与超时」组；保存写入同一 Web 覆盖文件，`feishuTools.*` 按子键合并（不会把未修改子键写空）。直接写 profile 补丁层同样生效，面板覆盖优先。其中 `feishuTools.topicMessages=false` 只关闭模型工具，被动的引用/历史 prompt 摘录仍生效；要完全关闭首轮历史请设 `historyBootstrapLimit: 0`。archive 后端下 `feishu_attachment_fetch` 不挂载，`feishu_topic_messages` 仍可读取历史文本，但工具描述会提示附件不可取。
 
 ### 3.3 初始化管理员与授权（默认准入）
 
@@ -340,7 +340,7 @@ DSH_HOME=$DSH_HOME pnpm dsh web        # 默认 http://127.0.0.1:3080
 | D4 | 关闭附件接收 | 面板关闭 `acceptAttachments` 后发纯附件 / 文件+文字 | 纯附件：无回复/无登记/无下载；文件+文字：只以文字触发，附件不保存不登记 | ⏳ 待手测（自动测试覆盖） |
 | E1 | 权限缺失·读取 | 临时移除 `im:message:readonly`（或让 `im:message.group_msg` 未审批）后发布版本，发引用消息/在群内 @ | 普通对话正常；引用/历史块静默省略；首次降级一条 warn；显式 `feishu_topic_messages` 返回可读 `PERMISSION_DENIED`；恢复权限并重发版本后恢复 | ⏳ 待手测（用户已决定跳过；自动测试覆盖 throw/resolved 两种降级） |
 | E2 | 权限缺失·下载 | 临时移除消息资源读取相关 scope，让模型 fetch 一个文件 | 工具逐资源返回可读失败（403/权限说明），回合不崩；archive 下则加 `No` 并回纯文字失败提示 | ⏳ 待手测（自动测试覆盖） |
-| F1 | 面板配置 | 在 Web 「会话与行为」依次修改存储后端、预取开关/上限、登记 TTL/容量、两个工具开关与上限并保存，新建会话验证生效 | 面板读写与帮助文案正确；嵌套 `feishuTools.*` 只改被改子键；旧值不丢；保存后入站行为即时按新配置判定、工具挂载对新会话生效；非法值被拒 | ⏳ 待手测 + 自动测试（settings 覆盖） |
+| F1 | 面板配置 | 在 Web 「附件与工具」依次修改存储后端、预取开关/上限、登记 TTL/容量、两个工具开关与上限并保存，新建会话验证生效 | 面板读写与帮助文案正确；嵌套 `feishuTools.*` 只改被改子键；旧值不丢；保存后入站行为即时按新配置判定、工具挂载对新会话生效；非法值被拒 | ⏳ 待手测 + 自动测试（settings 覆盖） |
 
 **记录要求**：每个「待手测」项执行后，在 `acceptance.md` 对应 AC 下写「操作 / 实际结果 / 结论 / 环境（构建 SHA、profile、日期）」；失败的项保留原文与日志摘录，修复后复测再更新。`historyBootstrapLimit: 0`、非本 route 负向、`acceptAttachments=false` 等用户已决定跳过真机的项，标注「自动测试覆盖，用户决定跳过真机」，不要写成已验证。
 

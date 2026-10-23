@@ -44,7 +44,7 @@ export type { AccessGroupRecord, AccessRequestRecord, AccessUserRecord } from '.
 export { CATALOG_ROUTE, CONFIG_ROUTE, CREDENTIALS_ROUTE, EDITABLE_KEYS, PANEL_COPY, PANEL_ROUTE, PICK_DIRECTORY_ROUTE, RECONNECT_ROUTE, RESTART_KEYS, STATUS_ROUTE } from './settings/contract.ts'
 export type { PickDirectoryResponse } from './settings/contract.ts'
 export { defaultOverlayPath, mergeOverlay, normalizeOverlay, OverlayStore, parseOverlay, pickEditable, resolveDshHome } from './settings/overlay.ts'
-export { applyCatalog, emptyCatalog, FIELD_DESCRIPTORS, normalizeCredentialValue, readOnlyFields, SettingsSurface, withDirectoryBrowse } from './settings/surface.ts'
+export { applyCatalog, emptyCatalog, FIELD_DESCRIPTORS, normalizeCredentialValue, SettingsSurface, withDirectoryBrowse } from './settings/surface.ts'
 export type { SettingsTarget } from './settings/surface.ts'
 export { createHostCatalog } from './settings/catalog.ts'
 export type { CatalogWarn, SettingsCatalog } from './settings/catalog.ts'

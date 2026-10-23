@@ -22,7 +22,9 @@ import {
   ACCESS_ROUTE,
   ACCESS_USERS_ROUTE,
   ACCESS_WIKI_USERS_ROUTE,
+  BYTES_UNIT,
   CATALOG_ROUTE,
+  COLLAPSED_FIELD_GROUPS,
   CONFIG_ROUTE,
   CREDENTIALS_ROUTE,
   EDITABLE_KEYS,
@@ -64,7 +66,6 @@ import {
   SettingsSurface,
   emptyCatalog,
   normalizeStringList,
-  readOnlyFields,
 } from '../src/settings/surface.ts'
 import { WIKI_ROOT_LINK_ERRORS } from '../src/feishu/wiki/links.ts'
 import type { SettingsTarget } from '../src/settings/surface.ts'
@@ -556,19 +557,48 @@ describe('field descriptors', () => {
       wide: true,
       restartRequired: false,
     })
-    expect(roots?.label).toContain('wikiRoots')
+    expect(roots?.label).toContain('范围')
+    expect(roots?.summary).toContain('为空时不挂载')
     expect(roots?.placeholder).toContain('/wiki/space/')
     // Only list fields carry list metadata.
     expect(FIELD_DESCRIPTORS.filter(field => field.maxItems !== undefined || field.itemFormat !== undefined)
       .map(field => field.key)).toEqual(['wikiRoots'])
   })
 
-  it('renders the read-only advanced facts from the effective config', () => {
-    const fields = readOnlyFields(makeConfig({ maxTokens: 4096, routeTtlMs: 0 }))
-    const byKey = new Map(fields.map(field => [field.key, field.value]))
-    expect(byKey.get('maxTokens')).toBe('4096 tokens')
-    expect(byKey.get('routeTtlMs')).toBe('关闭（不过期）')
-    expect(byKey.has('baseDir')).toBe(false)
+  it('describes the session timing fields with display units and live application', () => {
+    const byKey = new Map(FIELD_DESCRIPTORS.map(field => [field.key, field]))
+    expect(byKey.get('routeTtlMs')).toMatchObject({
+      kind: 'number', group: 'cards', min: 0, unit: '天', scale: 86_400_000, restartRequired: false,
+    })
+    for (const key of ['approvalTimeoutMs', 'questionTimeoutMs'] as const) {
+      expect(byKey.get(key)).toMatchObject({
+        kind: 'number', group: 'cards', min: 10_000, max: 3_600_000, unit: '秒', scale: 1_000, restartRequired: false,
+      })
+    }
+    expect(byKey.get('topicIsolation')).toMatchObject({ kind: 'select', group: 'workspace', restartRequired: false })
+    expect(byKey.get('topicIsolation')?.options?.map(option => option.value)).toEqual(['auto', 'subdir', 'worktree'])
+    expect(byKey.get('maxTokens')).toMatchObject({
+      kind: 'number', group: 'model', min: 1, optional: true, restartRequired: false,
+    })
+    // Only maxTokens may be saved empty.
+    expect(FIELD_DESCRIPTORS.filter(field => field.optional === true).map(field => field.key)).toEqual(['maxTokens'])
+  })
+
+  it('renders two-value selects as switches with the stored on/off values', () => {
+    const toggles = Object.fromEntries(FIELD_DESCRIPTORS
+      .filter(field => field.toggle !== undefined)
+      .map(field => [field.key, field.toggle]))
+    expect(toggles).toEqual({
+      dmMode: { on: 'open', off: 'disabled' },
+      threadFallback: { on: 'degrade', off: 'strict' },
+      attachmentStore: { on: 'native', off: 'archive' },
+      accessMode: { on: 'open', off: 'guarded' },
+    })
+    for (const field of FIELD_DESCRIPTORS) {
+      if (field.toggle === undefined) continue
+      expect(field.kind).toBe('select')
+      expect(field.options?.map(option => option.value).sort()).toEqual([field.toggle.on, field.toggle.off].sort())
+    }
   })
 
   it('exposes the workspace root as an editable full-width path field', () => {
@@ -610,19 +640,19 @@ describe('field descriptors', () => {
     const admin = byKey.get('adminUserId')
     expect(admin).toMatchObject({ kind: 'text' })
     expect(admin?.label).toContain('管理员')
-    expect(admin?.help).toContain('/userid')
-    expect(admin?.help).toContain('u_')
+    expect(admin?.summary).toContain('/userid')
+    expect(admin?.help).toContain('ou_')
 
     const mode = byKey.get('accessMode')
-    expect(mode).toMatchObject({ kind: 'select' })
+    expect(mode).toMatchObject({ kind: 'select', toggle: { on: 'open', off: 'guarded' } })
+    expect(mode?.label).toBe('调试模式')
     expect(mode?.options?.map(option => option.value)).toEqual(['guarded', 'open'])
-    expect(mode?.options?.find(option => option.value === 'guarded')?.label).toContain('守卫')
-    expect(mode?.options?.find(option => option.value === 'open')?.label).toContain('不安全')
+    expect(mode?.summary).toContain('不安全')
 
     const ttl = byKey.get('authRequestTtlDays')
     expect(ttl).toMatchObject({ kind: 'number', min: 1, max: 30, step: 1 })
     expect(ttl?.label).toContain('有效期')
-    expect(ttl?.help).toContain('过期')
+    expect(ttl?.unit).toBe('天')
   })
 
   it('describes the attachment toggle instead of the old image and retention keys', () => {
@@ -635,7 +665,7 @@ describe('field descriptors', () => {
     const byKey = new Map(FIELD_DESCRIPTORS.map(field => [field.key, field]))
     expect(byKey.get('acceptAttachments')).toMatchObject({
       kind: 'boolean',
-      group: 'content',
+      group: 'attachments',
       restartRequired: false,
     })
   })
@@ -643,19 +673,19 @@ describe('field descriptors', () => {
   it('describes the v2 attachment pipeline and model-tool fields with bounds', () => {
     const byKey = new Map(FIELD_DESCRIPTORS.map(field => [field.key, field]))
     const store = byKey.get('attachmentStore')
-    expect(store).toMatchObject({ kind: 'select', group: 'content', restartRequired: false })
+    expect(store).toMatchObject({ kind: 'select', group: 'attachments', restartRequired: false })
     expect(store?.options?.map(option => option.value)).toEqual(['native', 'archive'])
-    expect(store?.options?.find(option => option.value === 'native')?.label).toContain('原生')
+    expect(store?.label).toContain('原生附件库')
     expect(store?.help).toContain('不可变')
 
-    expect(byKey.get('prefetchImages')).toMatchObject({ kind: 'boolean', group: 'content' })
+    expect(byKey.get('prefetchImages')).toMatchObject({ kind: 'boolean', group: 'attachments' })
     expect(byKey.get('prefetchTimeoutMs')).toMatchObject({
-      kind: 'number', group: 'content', min: 100, max: 120_000,
+      kind: 'number', group: 'limits', min: 100, max: 120_000,
     })
     expect(byKey.get('prefetchImageMaxBytes')).toMatchObject({ kind: 'number', min: 1 })
     expect(byKey.get('prefetchTotalMaxBytes')).toMatchObject({ kind: 'number', min: 1 })
     expect(byKey.get('historyBootstrapLimit')).toMatchObject({ kind: 'number', min: 0, max: 20 })
-    expect(byKey.get('promptContextTimeoutMs')).toMatchObject({ kind: 'number', group: 'tools' })
+    expect(byKey.get('promptContextTimeoutMs')).toMatchObject({ kind: 'number', group: 'limits' })
     expect(byKey.get('feishuTools.attachmentFetch')).toMatchObject({
       kind: 'boolean', group: 'tools', restartRequired: false,
     })
@@ -670,23 +700,24 @@ describe('field descriptors', () => {
     expect(byKey.get('feishuTools.topicMessagesTimeoutMs')).toMatchObject({
       kind: 'number', min: 1_000, max: 120_000,
     })
-    // Every new descriptor renders under the「会话与行为」tab.
-    const toolOrContent = new Set([
+    // The attachment pipeline and model tools render under「附件与工具」.
+    const attachmentsTab = new Set([
       'attachmentStore', 'prefetchImages', 'prefetchTimeoutMs',
       'historyBootstrapLimit', 'feishuTools.attachmentFetch', 'feishuTools.topicMessages',
     ])
     for (const field of FIELD_DESCRIPTORS) {
-      if (!toolOrContent.has(field.key)) continue
-      expect(TAB_FIELD_GROUPS.sessions).toContain(field.group)
+      if (!attachmentsTab.has(field.key)) continue
+      expect(TAB_FIELD_GROUPS.attachments).toContain(field.group)
     }
   })
 
-  it('describes where attachments live and that directories are never deleted automatically', () => {
-    expect(PANEL_COPY.workspaceTabHelp).toContain('原生附件库')
-    expect(PANEL_COPY.workspaceTabHelp).toContain('不会自动删除')
-
-    const byKey = new Map(FIELD_DESCRIPTORS.map(field => [field.key, field]))
-    expect(byKey.get('acceptAttachments')?.help).toContain('原生附件库')
+  it('collapses only the limits group and labels byte limits in bytes', () => {
+    expect(COLLAPSED_FIELD_GROUPS).toEqual(['limits'])
+    const byteKeys = FIELD_DESCRIPTORS.filter(field => field.unit === BYTES_UNIT).map(field => field.key)
+    expect(byteKeys).toEqual(['prefetchImageMaxBytes', 'prefetchTotalMaxBytes', 'feishuTools.attachmentFetchMaxBytes'])
+    for (const key of byteKeys) {
+      expect(FIELD_DESCRIPTORS.find(field => field.key === key)?.group).toBe('limits')
+    }
   })
 })
 
@@ -1312,6 +1343,36 @@ describe('SettingsSurface', () => {
     const overlay = await store.load()
     expect(overlay.adminUserId).toBeUndefined()
     expect(overlay.accessMode).toBe('open')
+  })
+
+  it('saves the newly editable session and model fields live and clears maxTokens on empty', async () => {
+    const { surface, store } = makeSurface()
+    const saved = await surface.save({
+      topicIsolation: 'subdir',
+      routeTtlMs: 86_400_000,
+      approvalTimeoutMs: 60_000,
+      questionTimeoutMs: 120_000,
+      maxTokens: 4096,
+    })
+    expect(saved.ok).toBe(true)
+    if (!saved.ok) return
+    expect(saved.panel.config.restartPendingKeys).toEqual([])
+    expect(saved.panel.config.effective).toMatchObject({
+      topicIsolation: 'subdir',
+      routeTtlMs: 86_400_000,
+      approvalTimeoutMs: 60_000,
+      questionTimeoutMs: 120_000,
+      maxTokens: 4096,
+    })
+
+    const invalid = await surface.save({ approvalTimeoutMs: 1_000 })
+    expect(invalid.ok).toBe(false)
+
+    const cleared = await surface.save({ maxTokens: '' })
+    expect(cleared.ok).toBe(true)
+    const overlay = await store.load()
+    expect(overlay.maxTokens).toBeUndefined()
+    expect(overlay.topicIsolation).toBe('subdir')
   })
 
   it('rejects unknown keys and invalid values with per-field issues', async () => {

@@ -1,6 +1,6 @@
 /**
- * 设置 →「飞书渠道」页面：数据加载、5 秒状态轮询、全局 draft 与顶部状态头 /
- * tab 导航的外壳。
+ * 设置 →「飞书渠道」页面：数据加载、5 秒状态轮询、全局 draft、顶部状态头 /
+ * tab 导航与底部保存条的外壳。
  *
  * 所有 Host 交互（panel / status / catalog / config / credentials / access /
  * pick-directory）都集中在这里；tab 组件只接收渲染所需的数据与
@@ -48,14 +48,15 @@ import { applyCatalogFields, catalogFromFields } from '../catalog.ts'
 import { AccessTab } from './access-tab.tsx'
 import { AdvancedTab } from './advanced-tab.tsx'
 import { ConnectionTab } from './connection-tab.tsx'
-import { ModelTab } from './model-tab.tsx'
-import { SessionsTab } from './sessions-tab.tsx'
+import { FieldsTab } from './fields-tab.tsx'
 import {
   fieldLabel,
+  formatUptime,
   messageOf,
   NoticeBar,
   phaseBadge,
-  phaseSummary,
+  Pill,
+  SaveBar,
   validateDraft,
 } from './shared.tsx'
 import type {
@@ -67,7 +68,6 @@ import type {
   Notice,
 } from './shared.tsx'
 import { WikiTab } from './wiki-tab.tsx'
-import { WorkspaceTab } from './workspace-tab.tsx'
 
 /** Owner props handed to a `settings.section` contribution (unused beyond parity). */
 export interface FeishuChannelsSectionProps {
@@ -316,24 +316,14 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
     }
   }, [draft, panel])
 
-  /** Drop the draft keys owned by one tab (nothing is written). */
-  const discardTab = useCallback((tab: PanelTabId): void => {
+  /** Drop the whole draft (nothing is written). */
+  const discardDraft = useCallback((): void => {
     if (panel === null) return
-    const groups = new Set<string>(TAB_FIELD_GROUPS[tab])
-    const keys = new Set(
-      panel.config.fields.filter(field => groups.has(field.group)).map(field => field.key),
-    )
-    setDraft((previous) => {
-      const next = { ...previous }
-      for (const key of keys) delete next[key]
-      return next
-    })
+    setDraft({})
     setNotice(null)
-    if (tab === 'model') {
-      catalogTicket.current += 1
-      setCatalog(catalogFromFields(panel.config.fields))
-      setCatalogBusy(false)
-    }
+    catalogTicket.current += 1
+    setCatalog(catalogFromFields(panel.config.fields))
+    setCatalogBusy(false)
   }, [panel])
 
   /**
@@ -359,6 +349,10 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
 
   /** Drop every Web override and return the refreshed panel. */
   const onClear = useCallback(async (): Promise<void> => {
+    const confirmed = typeof window.confirm === 'function'
+      ? window.confirm(PANEL_COPY.clearConfirm)
+      : true
+    if (!confirmed) return
     setBusy('clear')
     setNotice(null)
     try {
@@ -624,6 +618,10 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
     [notice],
   )
   const dirtyCount = Object.keys(draft).length
+  const restartCount = useMemo(
+    () => (panel?.config.fields ?? []).filter(field => field.restartRequired && field.key in draft).length,
+    [draft, panel],
+  )
 
   /** Which tabs currently own a dirty key (the dot is per tab, not global). */
   const dirtyTabs = useMemo<ReadonlySet<PanelTabId>>(() => {
@@ -649,13 +647,10 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
       issues,
       busy,
       locked: hostBusy,
-      dirtyCount,
       onChange: updateDraft,
-      onSave: () => { void onSave() },
-      onDiscardTab: discardTab,
       onPickDirectory,
     }
-  }, [busy, discardTab, dirtyCount, draft, hostBusy, issues, onPickDirectory, onSave, panel, renderedFields, updateDraft])
+  }, [busy, draft, hostBusy, issues, onPickDirectory, panel, renderedFields, updateDraft])
 
   const credentials = useMemo<CredentialsView>(() => ({
     appId: appIdInput,
@@ -713,8 +708,14 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
         locked={hostBusy}
         onRefresh={() => { void onRefresh() }}
       />
-      <TabNav activeTab={activeTab} dirtyTabs={dirtyTabs} onChange={setActiveTab} />
-      {notice === null ? null : <NoticeBar notice={notice} />}
+      <TabNav
+        activeTab={activeTab}
+        dirtyTabs={dirtyTabs}
+        counts={{ access: load.panel.access.loaded ? load.panel.access.requests.length : 0 }}
+        onChange={setActiveTab}
+      />
+      {load.panel.access.mode === 'open' ? <div className="dsh-channels-cfg__banner">{PANEL_COPY.debugModeWarning}</div> : null}
+      {notice === null ? null : <NoticeBar kind={notice.kind} text={notice.text} />}
       <div
         role="tabpanel"
         id={`dsh-channels-tabpanel-${activeTab}`}
@@ -731,13 +732,11 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
               />
             )
           : null}
-        {activeTab === 'sessions' ? <SessionsTab form={form} analyzeToken={analyzeToken} /> : null}
-        {activeTab === 'model' ? <ModelTab form={form} catalogBusy={catalogBusy} /> : null}
-        {activeTab === 'workspace'
-          ? (
-              <WorkspaceTab form={form} />
-            )
+        {activeTab === 'sessions' ? <FieldsTab form={form} tab="sessions" /> : null}
+        {activeTab === 'model'
+          ? <FieldsTab form={form} tab="model" note={catalogBusy ? PANEL_COPY.catalogLoading : undefined} />
           : null}
+        {activeTab === 'attachments' ? <FieldsTab form={form} tab="attachments" /> : null}
         {activeTab === 'access'
           ? (
               <AccessTab
@@ -764,14 +763,22 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
             )
           : null}
         {activeTab === 'advanced'
-          ? <AdvancedTab form={form} onClear={() => { void onClear() }} />
+          ? <AdvancedTab form={form} analyzeToken={analyzeToken} onClear={() => { void onClear() }} />
           : null}
       </div>
+      <SaveBar
+        dirtyCount={dirtyCount}
+        restartCount={restartCount}
+        busy={busy}
+        locked={hostBusy}
+        onSave={() => { void onSave() }}
+        onDiscard={discardDraft}
+      />
     </div>
   )
 }
 
-/** Page header: title + phase badge + refresh, visible on every tab. */
+/** Page header: title, phase pill, version and uptime, refresh; visible on every tab. */
 function PanelHeader(props: {
   status: ChannelStatusWire
   pollError: string | null
@@ -782,24 +789,24 @@ function PanelHeader(props: {
   const { status, pollError, busy, locked, onRefresh } = props
   const badge = phaseBadge(status.phase)
   return (
-    <header className="dsh-channels-cfg__panelHead" title={PANEL_COPY.description}>
+    <header className="dsh-channels-cfg__panelHead">
       <div className="dsh-channels-cfg__headRow">
         <h2 className="dsh-channels-cfg__title">{PANEL_COPY.title}</h2>
-        <span className={`dsh-channels-cfg__badge dsh-channels-cfg__badge--${badge.tone}`}>
-          <span className="dsh-channels-cfg__dot" />
-          {badge.text}
-        </span>
+        <Pill tone={badge.tone} dot>{badge.text}</Pill>
+        <span className="dsh-channels-cfg__meta dsh-channels-cfg__mono">v{status.version}</span>
+        {status.uptimeMs === undefined
+          ? null
+          : <span className="dsh-channels-cfg__meta">· {PANEL_COPY.uptimePrefix} {formatUptime(status.uptimeMs)}</span>}
         <span className="dsh-channels-cfg__spacer" />
         <button
           type="button"
-          className="dsh-channels-cfg__btn"
+          className="dsh-channels-cfg__btn dsh-channels-cfg__btn--ghost"
           onClick={onRefresh}
           disabled={busy !== null || locked}
         >
           {PANEL_COPY.refresh}
         </button>
       </div>
-      <p className="dsh-channels-cfg__summary">{phaseSummary(status.phase)}</p>
       {pollError === null
         ? null
         : (
@@ -815,9 +822,11 @@ function PanelHeader(props: {
 function TabNav(props: {
   activeTab: PanelTabId
   dirtyTabs: ReadonlySet<PanelTabId>
+  /** Items waiting for the operator per tab (pending access requests). */
+  counts: Partial<Record<PanelTabId, number>>
   onChange: (tab: PanelTabId) => void
 }): JSX.Element {
-  const { activeTab, dirtyTabs, onChange } = props
+  const { activeTab, dirtyTabs, counts, onChange } = props
   const refs = useRef<Array<HTMLButtonElement | null>>([])
 
   /** Roving-focus keyboard navigation between tabs (WAI-ARIA tabs pattern). */
@@ -856,12 +865,12 @@ function TabNav(props: {
             onKeyDown={event => onKeyDown(index, event)}
           >
             {tab.label}
+            {(counts[tab.id] ?? 0) > 0 ? <span className="dsh-channels-cfg__tabCount">{counts[tab.id]}</span> : null}
             {dirty
               ? (
                   <span
                     className="dsh-channels-cfg__tabDot"
-                    title={PANEL_COPY.dirtyCount}
-                    aria-label={PANEL_COPY.dirtyCount}
+                    aria-hidden="true"
                   />
                 )
               : null}

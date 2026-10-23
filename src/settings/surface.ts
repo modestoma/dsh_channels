@@ -18,6 +18,7 @@ import { parseWikiRootLink, WIKI_ROOT_LINK_ERRORS } from '../feishu/wiki/links.t
 import type { HealthSnapshot } from '../health.ts'
 import { prepareWorkspaceBaseDir } from '../workspaces.ts'
 import {
+  BYTES_UNIT,
   EDITABLE_KEYS,
   PANEL_COPY,
   RESTART_KEYS,
@@ -37,10 +38,11 @@ import type {
   EditableKey,
   EditableValues,
   FieldIssueWire,
+  FieldGroup,
   FieldOptionWire,
+  FieldToggleWire,
   PanelConfigWire,
   PanelWire,
-  ReadOnlyFieldWire,
   ReconnectResponse,
   SaveConfigResponse,
   SaveCredentialsRequest,
@@ -128,12 +130,13 @@ const RESTART_SET = new Set<string>(RESTART_KEYS)
 /** Every credential slot the panel writes, in form order. */
 const CREDENTIAL_FIELDS: readonly CredentialField[] = ['appId', 'appSecret', 'analyzeToken']
 
-/** Optional text fields: an empty string in the panel clears the override. */
+/** Optional fields: an empty string in the panel clears the override. */
 const OPTIONAL_TEXT_KEYS = new Set<EditableKey>([
   'provider',
   'model',
   'reasoningEffort',
   'agentPreset',
+  'maxTokens',
   'adminUserId',
   'analyzeListen',
 ])
@@ -220,17 +223,26 @@ export function normalizeStringList(
 }
 
 const SELECT_OPTIONS: Partial<Record<EditableKey, ReadonlyArray<{ value: string; label: string }>>> = {
-  attachmentStore: [
-    { value: 'native', label: 'DSH 原生附件库（默认）' },
-    { value: 'archive', label: '工作区 attachments/（旧版）' },
-  ],
   dmMode: [
-    { value: 'open', label: '开放私聊' },
-    { value: 'disabled', label: '禁用私聊' },
+    { value: 'open', label: '开启' },
+    { value: 'disabled', label: '关闭' },
   ],
   threadFallback: [
-    { value: 'degrade', label: '话题被拒时降级为会话级' },
-    { value: 'strict', label: '话题被拒时直接失败' },
+    { value: 'degrade', label: '降级为会话级' },
+    { value: 'strict', label: '直接失败' },
+  ],
+  topicIsolation: [
+    { value: 'auto', label: '自动（推荐）' },
+    { value: 'subdir', label: '普通子目录' },
+    { value: 'worktree', label: 'Git worktree' },
+  ],
+  attachmentStore: [
+    { value: 'native', label: 'DSH 原生附件库' },
+    { value: 'archive', label: '话题目录 attachments/' },
+  ],
+  accessMode: [
+    { value: 'guarded', label: '关闭（管理员与白名单）' },
+    { value: 'open', label: '打开（所有人可聊）' },
   ],
   loggerLevel: [
     { value: 'debug', label: 'debug' },
@@ -238,199 +250,195 @@ const SELECT_OPTIONS: Partial<Record<EditableKey, ReadonlyArray<{ value: string;
     { value: 'warn', label: 'warn' },
     { value: 'error', label: 'error' },
   ],
-  accessMode: [
-    { value: 'guarded', label: '守卫模式（仅管理员与白名单）' },
-    { value: 'open', label: '开放（不安全，仅调试）' },
-  ],
 }
 
-/** Panel copy per editable key: label, help, and (for numbers) bounds. */
-const FIELD_META: Record<EditableKey, { label: string; help: string; min?: number; max?: number; step?: number; placeholder?: string; wide?: boolean }> = {
+/** Two-value selects rendered as switches: the stored value while on / off. */
+const TOGGLES: Partial<Record<EditableKey, FieldToggleWire>> = {
+  dmMode: { on: 'open', off: 'disabled' },
+  threadFallback: { on: 'degrade', off: 'strict' },
+  attachmentStore: { on: 'native', off: 'archive' },
+  accessMode: { on: 'open', off: 'guarded' },
+}
+
+const DAY_MS = 86_400_000
+
+/** Panel copy and bounds per editable key; numeric bounds stay in stored units. */
+interface FieldMeta {
+  label: string
+  group: FieldGroup
+  summary?: string
+  help?: string
+  min?: number
+  max?: number
+  step?: number
+  unit?: string
+  scale?: number
+  optional?: boolean
+  placeholder?: string
+  wide?: boolean
+}
+
+const FIELD_META: Record<EditableKey, FieldMeta> = {
+  dmMode: { label: '私聊', group: 'trigger', summary: '关闭后私聊不再触发会话', help: '群聊和已绑定的话题不受影响。' },
+  requireMention: { label: '普通群需要 @ 机器人', group: 'trigger', summary: '话题内始终不需要 @', help: '关闭后普通群里的每条消息都会触发会话。' },
+  threadFallback: { label: '话题被拒时降级为会话级', group: 'trigger', summary: '飞书不允许建话题时改在会话里回复，关闭则直接报错' },
   baseDir: {
-    label: '工作区根目录（文件落点）',
-    help: '每个用户/群成员一个工作区：私聊 <baseDir>/p2p/<user_id>/，群聊 <baseDir>/groups/<chat_id>/<user_id>/；每个话题在其中拥有独立工作目录 <工作区>/topics/<话题>/（Git 仓库工作区可自动改用 worktree）。必须是绝对路径（~ 开头按家目录展开），保存时会创建该目录；只影响之后新建立的会话 —— 已有话题即使 /renew 也沿用原目录，旧文件不会迁移。',
+    label: '工作区根目录',
+    group: 'workspace',
+    summary: '模型和工具生成文件的位置',
+    help: '每个用户一个工作区：私聊 <根目录>/p2p/<user_id>/，群聊 <根目录>/groups/<chat_id>/<user_id>/，每个话题在里面有独立目录。必须是绝对路径（~ 按家目录展开），保存时会创建该目录。只影响之后新建的话题，旧文件不迁移。',
     placeholder: '/Users/you/.dsh/dsh-channels/workspaces',
     wide: true,
   },
-  dmMode: { label: '私聊模式', help: '禁用后私聊消息不再触发会话；群聊与已绑定话题不受影响。' },
-  requireMention: { label: '普通群需 @ 机器人', help: '已绑定的主题内始终不需要 @；关闭后普通群的每条消息都会触发。' },
-  threadFallback: { label: '话题被拒时的兜底', help: 'degrade 降级为会话级路由；strict 直接让回复失败。' },
-  welcomeOnboarding: { label: '首次私聊引导卡', help: '每个私聊会话第一次触达时发送一张命令与用法引导卡，只发一次。' },
-  slashCommandPanel: { label: '同步飞书原生斜杠指令面板', help: '连接时把插件命令同步到飞书输入 / 时弹出的面板；需开通 application:app_slash_command:read 与 write 权限，部分企业不允许应用添加斜杠指令。关闭时不读写面板，直接输入命令不受影响。' },
-  allowPermissionSwitch: { label: '允许飞书侧切换权限预设', help: '安全敏感：开启后话题所有者可用 /permissions 切换沙箱与审批预设。' },
-  analyzeListen: {
-    label: '日志分析接口监听地址',
-    help: '日志平台调用 POST /dsh-channels/analyze 的独立端口，格式 host:port（如 0.0.0.0:3090）；留空 = 关闭接口；需重连生效。请求需带 Authorization: Bearer <令牌>，令牌在本页下方「日志分析接口令牌」卡片填写。',
-    placeholder: '留空 = 关闭',
+  topicIsolation: {
+    label: '话题工作目录',
+    group: 'workspace',
+    summary: '每个话题在工作区里怎么隔离',
+    help: '自动：工作区是 Git 仓库时给每个话题建一个 worktree，否则用普通子目录。选 Git worktree 但宿主不支持时退回普通子目录。只影响之后新建的话题，已有话题保持原来的目录。',
   },
-  adminUserId: {
-    label: '管理员 user_id',
-    help: '唯一管理员。私聊机器人发送 /userid 获取（不是 ou_ 开头的 open_id，也不是邮箱）；留空 = 清除 Web 覆盖。未配置时自动使用飞书应用所有者（需可选的「获取应用信息」权限，开不了就在这里手动填写）；两者都没有时 guarded 模式会拒绝所有对话。',
-    placeholder: 'user_id',
+  routeTtlMs: {
+    label: '话题过期',
+    group: 'cards',
+    summary: '闲置超过这么久的话题不再续聊，0 为永不过期',
+    help: '过期话题里的新消息会被明确拒绝并提示新开话题，而不是悄悄开一个没有上下文的会话；Session 和工作区文件都保留。调小后，下一次清理（启动时和定期）就会让更多旧话题过期。',
+    min: 0,
+    step: DAY_MS,
+    unit: '天',
+    scale: DAY_MS,
   },
-  accessMode: {
-    label: '准入模式',
-    help: 'guarded（默认）：私聊仅管理员，群聊需群授权且发送者是管理员或已授权用户；open：应用可用范围内的任何人都能对话，不安全，仅调试。',
+  approvalTimeoutMs: {
+    label: '审批卡片等待',
+    group: 'cards',
+    summary: '超时自动拒绝，等待期间回复暂停',
+    min: 10_000,
+    max: 3_600_000,
+    step: 1_000,
+    unit: '秒',
+    scale: 1_000,
   },
-  authRequestTtlDays: {
-    label: '授权申请有效期（天）',
-    help: '入群/用户授权申请卡的有效期，1–30 天；过期后卡片需重新触发申请（也可在本页下方「待处理申请」中处理）。',
-    min: 1,
-    max: 30,
-    step: 1,
+  questionTimeoutMs: {
+    label: '提问卡片等待',
+    group: 'cards',
+    summary: '模型向用户提问时最多等多久',
+    min: 10_000,
+    max: 3_600_000,
+    step: 1_000,
+    unit: '秒',
+    scale: 1_000,
   },
+  refreshMs: { label: '流式刷新间隔', group: 'cards', summary: '回复卡片多久更新一次', min: 200, max: 10_000, step: 100, unit: 'ms' },
+  statusRefreshMs: { label: '状态行保活间隔', group: 'cards', summary: '没有文字输出时，计时多久刷新一次', min: 1_000, max: 60_000, step: 500, unit: 'ms' },
+  welcomeOnboarding: { label: '首次私聊发引导卡', group: 'features', summary: '每个私聊只发一次' },
+  slashCommandPanel: {
+    label: '同步斜杠指令面板',
+    group: 'features',
+    summary: '在飞书输入 / 时列出插件命令',
+    help: '需要 application:app_slash_command:read 和 application:app_slash_command:write 权限。部分企业不允许应用添加斜杠指令；关闭时不读写面板，直接输入命令不受影响。',
+  },
+  allowPermissionSwitch: { label: '允许在飞书里切换权限预设', group: 'features', summary: '话题所有者可以用 /permissions 改沙箱和审批' },
+  provider: { label: '服务商', group: 'model', summary: '留空使用部署默认', placeholder: '留空 = 部署默认' },
+  model: { label: '模型', group: 'model', summary: '留空使用部署默认', placeholder: '留空 = 部署默认' },
+  reasoningEffort: { label: '推理档位', group: 'model', summary: '模型声明的档位 id，留空使用适配器默认', placeholder: '留空 = 适配器默认' },
+  maxTokens: { label: '单次输出上限', group: 'model', summary: '留空使用模型默认', min: 1, step: 1, unit: 'tokens', optional: true, placeholder: '模型默认' },
+  agentPreset: { label: 'Agent 预设', group: 'model', summary: '留空使用 roster 默认', placeholder: '留空 = roster 默认' },
   acceptAttachments: {
-    label: '接收入站附件',
-    help: '接收飞书图片、文件与合并转发记录。native（默认）下入站附件存入 DSH 原生附件库：触发消息的图片预取进首轮、文件保持懒取，纯附件消息不回复、不落地，需要时请引用该消息（多个文件可合并转发后引用）再提问；archive 下按旧版行为下载到工作区 attachments/。关闭后附件消息不保存、不触发模型、也不列入清单。',
+    label: '接收图片和文件',
+    group: 'attachments',
+    summary: '关闭后附件消息不保存、不触发模型',
+    help: '纯附件消息不回复；需要时引用该消息再提问，多个文件可以合并转发后引用。也接收合并转发的聊天记录。',
   },
   attachmentStore: {
-    label: '入站附件存储后端',
-    help: 'native（默认）：图片与文件存入 DSH 原生附件库（不可变、内容寻址去重、读取校验、随 Session 回放；不自动清理）。archive：旧版下载到话题工作区 attachments/（可清理但会阻塞会话）。宿主未挂载附件服务时 native 自动降级 archive。',
+    label: '使用 DSH 原生附件库',
+    group: 'attachments',
+    summary: '推荐开启；关闭则下载到话题目录 attachments/',
+    help: '原生附件库：不可变、内容寻址去重、随 Session 回放，不自动清理。话题目录：旧版行为，可以手动清理，但下载会阻塞会话。宿主没有附件服务时自动退回话题目录。',
   },
-  prefetchImages: {
-    label: '预取触发消息的图片',
-    help: 'native 下把触发消息的图片预取为首轮 ImageBlock，会话/话题/卡片不等下载；失败、超限或超时的图片降级为清单中的懒取项。关闭后图片也需用 feishu_attachment_fetch 获取。',
-  },
-  prefetchTimeoutMs: {
-    label: '图片预取整段超时（ms）',
-    help: '一次触发消息图片预取的总超时（默认 10000 ms，100–120000）；到期后已取回的图片保留，其余降级为清单，不阻塞回合。',
-    min: 100,
-    max: 120_000,
-    step: 100,
-  },
-  prefetchImageMaxBytes: {
-    label: '单张预取图片上限（字节）',
-    help: '单张图片超过该字节数即不入首轮图片、留在清单懒取（默认 20971520 = 20 MiB）。',
-    min: 1,
-    max: 200 * 1024 * 1024,
-    step: 1,
-  },
-  prefetchTotalMaxBytes: {
-    label: '单次预取总量上限（字节）',
-    help: '一次触发消息图片预取的总字节预算（默认 52428800 = 50 MiB）；用尽后剩余图片降级为清单懒取。',
-    min: 1,
-    max: 1024 * 1024 * 1024,
-    step: 1,
-  },
+  prefetchImages: { label: '预取触发消息里的图片', group: 'attachments', summary: '首轮直接带图，失败的留给模型按需取' },
   historyBootstrapLimit: {
-    label: '首轮话题历史条数',
-    help: '新 Session 首轮自动附带本话题最近 N 条消息摘要（0 = 关闭，上限 20）；被动读取使用短预算，缺权限/失败时静默省略。更早的消息用 feishu_topic_messages 工具翻页。',
+    label: '首轮带上话题历史',
+    group: 'attachments',
+    summary: '新会话自动附带最近几条消息，0 为关闭',
+    help: '更早的消息由模型用 feishu_topic_messages 工具翻页读取。缺权限或读取失败时静默省略。',
     min: 0,
     max: 20,
     step: 1,
-  },
-  promptContextTimeoutMs: {
-    label: '被动读取预算（ms）',
-    help: '引用摘录与首轮话题历史这类被动 prompt 增强的整段预算（默认 3000 ms，100–10000）；超时即省略对应块、回合照跑。模型主动调用工具的读取超时另由 feishu_tools 超时控制。',
-    min: 100,
-    max: 10_000,
-    step: 100,
+    unit: '条',
   },
   'feishuTools.attachmentFetch': {
-    label: '启用 feishu_attachment_fetch 工具',
-    help: '让模型按 message_id/file_key 懒取已授权消息的图片/文件。关闭后文件无法懒取，插件整体回退 archive 后端（入站文件直接下载到工作区）。对新会话生效。',
-  },
-  'feishuTools.attachmentFetchMaxResources': {
-    label: '单次取回资源数上限',
-    help: '一次工具调用最多取回的附件数量（默认 10，1–50）；超出会返回可读原因，模型可按 file_key 拆分重试。',
-    min: 1,
-    max: 50,
-    step: 1,
-  },
-  'feishuTools.attachmentFetchMaxBytes': {
-    label: '单次取回字节预算（字节）',
-    help: '一次工具调用的总下载字节预算（默认 104857600 = 100 MiB，不设上限）；文件流式写入原生库，不整文件缓冲，几 GiB 的文件只占磁盘。',
-    min: 1,
-    step: 1,
-  },
-  'feishuTools.attachmentFetchTimeoutMs': {
-    label: '单次取回超时（ms）',
-    help: '一次 feishu_attachment_fetch 的整段超时（默认 120000 ms，最小 1000，最大 2147483647 ≈ 24.8 天）；到期取消下载并逐项报告可读原因。大文件请按带宽同步调大。',
-    min: 1_000,
-    max: MAX_TIMER_DELAY_MS,
-    step: 1_000,
+    label: '读取附件',
+    group: 'tools',
+    summary: '按需下载已授权消息里的图片和文件',
+    help: '工具名 feishu_attachment_fetch。关闭后文件无法按需读取，入站文件直接下载到话题目录。对新会话生效。',
   },
   'feishuTools.topicMessages': {
-    label: '启用 feishu_topic_messages 工具',
-    help: '让模型按需读取引用消息与话题内更早的消息/附件。关闭只影响模型工具；被动的引用摘录与首轮历史仍由 historyBootstrapLimit 控制。',
-  },
-  'feishuTools.topicMessagesTimeoutMs': {
-    label: '单次话题读取超时（ms）',
-    help: '一次 feishu_topic_messages 的整段超时（默认 20000 ms，1000–120000）；被动摘录使用独立的短预算。',
-    min: 1_000,
-    max: 120_000,
-    step: 1_000,
+    label: '读取话题消息',
+    group: 'tools',
+    summary: '翻看引用消息和话题里更早的内容',
+    help: '工具名 feishu_topic_messages。只影响模型主动读取；引用摘录和首轮历史不受影响。',
   },
   'feishuTools.sendFile': {
-    label: '启用 feishu_send_file 工具',
-    help: '让模型把当前话题工作目录里生成的图片/文件发回当前会话（图片 ≤10 MB，文件 ≤30 MB）。需开通 im:resource 权限。对新会话生效。',
+    label: '发送文件',
+    group: 'tools',
+    summary: '把生成的图片或文件发回会话，需 im:resource 权限',
+    help: '工具名 feishu_send_file。图片不超过 10 MB，文件不超过 30 MB。对新会话生效。',
   },
+  prefetchTimeoutMs: { label: '图片预取超时', group: 'limits', min: 100, max: 120_000, step: 100, unit: 'ms' },
+  prefetchImageMaxBytes: { label: '单张预取图片上限', group: 'limits', min: 1, max: 200 * 1024 * 1024, step: 1, unit: BYTES_UNIT },
+  prefetchTotalMaxBytes: { label: '单次预取总量', group: 'limits', min: 1, max: 1024 * 1024 * 1024, step: 1, unit: BYTES_UNIT },
+  'feishuTools.attachmentFetchMaxResources': { label: '读取附件：数量上限', group: 'limits', min: 1, max: 50, step: 1, unit: '个' },
+  'feishuTools.attachmentFetchMaxBytes': { label: '读取附件：总字节', group: 'limits', min: 1, step: 1, unit: BYTES_UNIT },
+  'feishuTools.attachmentFetchTimeoutMs': { label: '读取附件：超时', group: 'limits', min: 1_000, max: MAX_TIMER_DELAY_MS, step: 1_000, unit: 'ms' },
+  'feishuTools.topicMessagesTimeoutMs': { label: '读取话题消息：超时', group: 'limits', min: 1_000, max: 120_000, step: 1_000, unit: 'ms' },
+  promptContextTimeoutMs: { label: '引用摘录与历史：超时', group: 'limits', min: 100, max: 10_000, step: 100, unit: 'ms' },
+  accessMode: {
+    label: '调试模式',
+    group: 'access',
+    summary: '打开后所有人都能聊，不安全，只在调试时用',
+    help: '关闭时（默认）：管理员随时可用；非管理员私聊会被拒绝；群聊要同时满足群已授权、发言人在用户白名单里。授权入口有三个：群里 /auth 命令、授权卡、本页。撤销立即生效。',
+  },
+  adminUserId: {
+    label: '管理员 user_id',
+    group: 'access',
+    summary: '私聊机器人发送 /userid 获取；留空使用应用所有者',
+    help: '不是 ou_ 开头的 open_id，也不是邮箱。私聊关闭时 /userid 不可用，可以在飞书管理后台的成员详情里查看。自动使用应用所有者需要可选的「获取应用信息」权限。',
+    placeholder: 'user_id',
+  },
+  authRequestTtlDays: { label: '申请有效期', group: 'access', summary: '授权申请卡多久内可以处理', min: 1, max: 30, step: 1, unit: '天' },
   'feishuTools.wikiRead': {
-    label: '启用知识库读取工具',
-    help: '让模型浏览「知识库范围」内的知识库节点，并读取 docx 文档、电子表格和多维表格（feishu_wiki_list / feishu_wiki_read / feishu_wiki_sheet_read / feishu_wiki_base_read），以应用身份访问。需开通 wiki:wiki、docx:document（或对应的只读权限），电子表格需 sheets:spreadsheet:read，多维表格需 base:table:read、base:field:read、base:record:read（旧版 sheets:spreadsheet、bitable:app 不生效）。只有话题所有者是管理员或在知识库白名单（/auth wiki add @成员）中才能使用；打开文档前会在授权卡上征得话题所有者同意，每个话题一次。知识库范围为空时不挂载。对新会话生效。',
+    label: '读取知识库',
+    group: 'wiki',
+    summary: '浏览节点，读取文档、电子表格、多维表格',
+    help: '以应用身份访问，工具 feishu_wiki_list / feishu_wiki_read / feishu_wiki_sheet_read / feishu_wiki_base_read。打开文档前在授权卡上征得话题发起人同意，每个话题一次。只有管理员或下方「可使用的人」发起的话题能用（/auth wiki add @成员）。需要权限 wiki:wiki、docx:document（或只读）、sheets:spreadsheet:read、base:table:read、base:field:read、base:record:read；旧版 sheets:spreadsheet、bitable:app 不生效。对新会话生效。',
   },
   'feishuTools.wikiWrite': {
-    label: '启用知识库写入工具',
-    help: '让模型在「知识库范围」内新建 docx 文档、电子表格和多维表格，编辑本应用拥有的文档和电子表格，增改删本应用拥有的多维表格记录、向其他多维表格新增记录（feishu_wiki_create / feishu_wiki_edit / feishu_wiki_sheet_edit / feishu_wiki_base_edit），以应用身份访问；每次新建或编辑都需话题所有者在审批卡上同意。需开通 wiki:wiki、docx:document、sheets:spreadsheet:write_only、base:record:create、base:record:update、base:record:delete 权限，以及读取工具的权限；使用条件同读取工具（管理员或知识库白名单）。知识库范围为空时不挂载。对新会话生效。',
+    label: '编辑知识库',
+    group: 'wiki',
+    summary: '新建和修改文档、表格，每次都需审批',
+    help: '工具 feishu_wiki_create / feishu_wiki_edit / feishu_wiki_sheet_edit / feishu_wiki_base_edit。只能编辑本应用拥有的文档和表格；其他多维表格只能新增记录。需要读取工具的权限，以及 sheets:spreadsheet:write_only、base:record:create、base:record:update、base:record:delete。对新会话生效。',
   },
   wikiRoots: {
-    label: '知识库范围（wikiRoots）',
-    help: '知识库工具只能访问这些位置，每个输入框填一个链接：整个知识空间 https://<租户>.feishu.cn/wiki/space/<space_id>，或节点 https://<租户>.feishu.cn/wiki/<node_token>（该节点及其下所有节点）；最多 20 项，空输入框保存时忽略。留空 = 不挂载任何知识库工具（即使上面的开关已开启）。对新会话生效。',
+    label: '可访问范围',
+    group: 'wiki',
+    summary: '每行一个知识空间或节点链接，为空时不挂载知识库工具',
+    help: '整个知识空间 https://<租户>.feishu.cn/wiki/space/<space_id>，或节点 https://<租户>.feishu.cn/wiki/<node_token>（含其下所有节点）。最多 20 项，空行保存时忽略。对新会话生效。',
     placeholder: 'https://<租户>.feishu.cn/wiki/space/<space_id>',
     wide: true,
   },
-  provider: { label: '模型服务商', help: '留空 = 使用部署默认；例如 deepseek-official。', placeholder: '留空 = 部署默认' },
-  model: { label: '模型 id', help: '留空 = 使用部署默认；例如 deepseek-v4-flash。', placeholder: '留空 = 部署默认' },
-  reasoningEffort: { label: '推理档位', help: '模型声明的精确档位 id（如 high / max）；留空 = 适配器默认。', placeholder: '留空 = 适配器默认' },
-  agentPreset: { label: 'Agent 预设', help: '新会话使用的预设 id（如 standard）；留空 = roster 默认。', placeholder: '留空 = roster 默认' },
-  refreshMs: { label: '流式刷新间隔（ms）', help: '流式卡片的 patch 节流间隔，200–10000；需重连生效。', min: 200, max: 10_000, step: 100 },
-  statusRefreshMs: { label: '状态行保活间隔（ms）', help: '无文本输出时活动状态行的计时刷新间隔，1000–60000；需重连生效。', min: 1_000, max: 60_000, step: 500 },
-  loggerLevel: { label: 'SDK 日志级别', help: '官方 SDK 的日志级别；需重连生效。' },
-}
-
-const GROUP_OF: Record<EditableKey, EditableFieldWire['group']> = {
-  baseDir: 'workspace',
-  dmMode: 'behavior',
-  requireMention: 'behavior',
-  threadFallback: 'behavior',
-  welcomeOnboarding: 'behavior',
-  slashCommandPanel: 'behavior',
-  allowPermissionSwitch: 'behavior',
-  analyzeListen: 'behavior',
-  adminUserId: 'access',
-  accessMode: 'access',
-  authRequestTtlDays: 'access',
-  acceptAttachments: 'content',
-  attachmentStore: 'content',
-  prefetchImages: 'content',
-  prefetchTimeoutMs: 'content',
-  prefetchImageMaxBytes: 'content',
-  prefetchTotalMaxBytes: 'content',
-  historyBootstrapLimit: 'content',
-  promptContextTimeoutMs: 'tools',
-  'feishuTools.attachmentFetch': 'tools',
-  'feishuTools.attachmentFetchMaxResources': 'tools',
-  'feishuTools.attachmentFetchMaxBytes': 'tools',
-  'feishuTools.attachmentFetchTimeoutMs': 'tools',
-  'feishuTools.topicMessages': 'tools',
-  'feishuTools.topicMessagesTimeoutMs': 'tools',
-  'feishuTools.sendFile': 'tools',
-  'feishuTools.wikiRead': 'wiki',
-  'feishuTools.wikiWrite': 'wiki',
-  wikiRoots: 'wiki',
-  provider: 'model',
-  model: 'model',
-  reasoningEffort: 'model',
-  agentPreset: 'model',
-  refreshMs: 'streaming',
-  statusRefreshMs: 'streaming',
-  loggerLevel: 'streaming',
+  analyzeListen: {
+    label: '监听地址',
+    group: 'analyze',
+    summary: '日志平台调用分析接口的 host:port，留空关闭',
+    help: '接口路径 POST /dsh-channels/analyze，请求需带 Authorization: Bearer <访问令牌>。',
+    placeholder: '例如 0.0.0.0:3090',
+  },
+  loggerLevel: { label: 'SDK 日志级别', group: 'logging' },
 }
 
 /** One descriptor per editable key, in `EDITABLE_KEYS` order (Host-driven form). */
 export const FIELD_DESCRIPTORS: readonly EditableFieldWire[] = EDITABLE_KEYS.map(key => {
   const meta = FIELD_META[key]
   const options = SELECT_OPTIONS[key]
+  const toggle = TOGGLES[key]
   const list = STRING_LIST_FIELDS[key]
   return {
     key,
@@ -438,12 +446,17 @@ export const FIELD_DESCRIPTORS: readonly EditableFieldWire[] = EDITABLE_KEYS.map
     kind: list !== undefined
       ? 'string-list'
       : BOOLEAN_KEYS.has(key) ? 'boolean' : options !== undefined ? 'select' : meta.min !== undefined ? 'number' : 'text',
-    group: GROUP_OF[key],
-    help: meta.help,
+    group: meta.group,
+    ...(meta.summary === undefined ? {} : { summary: meta.summary }),
+    ...(meta.help === undefined ? {} : { help: meta.help }),
     ...(options === undefined ? {} : { options }),
+    ...(toggle === undefined ? {} : { toggle }),
     ...(meta.min === undefined ? {} : { min: meta.min }),
     ...(meta.max === undefined ? {} : { max: meta.max }),
     ...(meta.step === undefined ? {} : { step: meta.step }),
+    ...(meta.unit === undefined ? {} : { unit: meta.unit }),
+    ...(meta.scale === undefined ? {} : { scale: meta.scale }),
+    ...(meta.optional === undefined ? {} : { optional: meta.optional }),
     ...(meta.placeholder === undefined ? {} : { placeholder: meta.placeholder }),
     ...(list === undefined ? {} : { maxItems: list.maxItems }),
     ...(list?.itemFormat === undefined ? {} : { itemFormat: list.itemFormat }),
@@ -546,18 +559,6 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
-function formatDays(ms: number): string {
-  return ms === 0 ? '关闭（不过期）' : `${Math.round(ms / 86_400_000)} 天`
-}
-
-function formatSeconds(ms: number): string {
-  return `${Math.round(ms / 1_000)} 秒`
-}
-
-function formatOptional(value: string | number | undefined, suffix = ''): string {
-  return value === undefined ? '未设置' : `${value}${suffix}`
-}
-
 /** Credential values are opaque strings; trim, cap length, reject control chars. */
 const MAX_CREDENTIAL_LENGTH = 512
 
@@ -612,24 +613,6 @@ export function normalizeAccessName(
   // eslint-disable-next-line no-control-regex
   if (/[\u0000-\u001f\u007f]/.test(value)) return { ok: false, message: '名称包含非法控制字符' }
   return { ok: true, value }
-}
-
-/** Build the read-only advanced card from the effective config. */
-export function readOnlyFields(config: FeishuConfig): ReadOnlyFieldWire[] {
-  return [
-    {
-      key: 'topicIsolation',
-      label: '话题目录隔离',
-      value: config.topicIsolation === 'auto'
-        ? '自动（Git 仓库用 worktree，否则普通子目录）'
-        : config.topicIsolation === 'worktree' ? 'Git worktree（失败回退子目录）' : '普通子目录',
-      help: '每个话题的独立工作目录形式；在 profile 配置里用 topicIsolation 设置（auto / subdir / worktree）。',
-    },
-    { key: 'routeTtlMs', label: '话题路由过期', value: formatDays(config.routeTtlMs), help: '超期话题的后续消息会被明确拒绝，而不是新建 Context-free Session。' },
-    { key: 'approvalTimeoutMs', label: '审批卡片等待', value: formatSeconds(config.approvalTimeoutMs) },
-    { key: 'questionTimeoutMs', label: '提问卡片等待', value: formatSeconds(config.questionTimeoutMs) },
-    { key: 'maxTokens', label: '单次输出上限', value: formatOptional(config.maxTokens, ' tokens'), help: '留空/未设置时使用模型适配器默认值。' },
-  ]
 }
 
 /**
@@ -821,7 +804,6 @@ export class SettingsSurface {
         overriddenKeys,
         restartPendingKeys,
         fields,
-        readOnly: readOnlyFields(effective),
         credentials,
       },
       access,
