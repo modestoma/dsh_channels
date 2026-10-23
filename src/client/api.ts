@@ -51,9 +51,15 @@ function errorFromBody(status: number, text: string): string {
   return `HTTP ${status}`
 }
 
-async function request(path: string, init?: RequestInit): Promise<Response> {
+/**
+ * Fetch one Host route. Routes are registered as absolute pathnames, but the
+ * browser addresses them relative to the DSH document (`<base href="./">`), so
+ * a reverse proxy that mounts DSH under a prefix such as `/dsh/` still routes
+ * them to DSH with the login cookie it scoped to that prefix.
+ */
+async function request(route: string, init?: RequestInit): Promise<Response> {
   try {
-    return await fetch(path, {
+    return await fetch(route.slice(1), {
       cache: 'no-store',
       credentials: 'same-origin',
       ...init,
