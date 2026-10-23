@@ -13,7 +13,7 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 - **结构化提问**：模型调用 `ask_user_question` 时，插件监听主机 `user-questions/request` 瀑布并发一张问答卡（每个问题一组选项按钮，多选先勾选再「提交本题选择」），答案回填给模型；主机自带的应答者只有 Web 客户端，没有本插件时纯飞书会话会以 `NO_PROVIDER` 失败。超时（`questionTimeoutMs`，默认 5 分钟）或回合取消时本轮提问失败（fail-closed）；没有可选项的问题直接提示用文字作答，**阻塞期间普通文本回复即作为该问题的自由文本答案**（同时支持多选后的自定义文本）
 - **准入与授权（默认开启）**：**管理员不受白名单限制**（私聊、任意群聊——包括尚未授权的群——都能直接发起会话）；其他人私聊只收到一条固定提示（`/userid` 例外），群聊需要「群已授权 + 用户在全局白名单」两层同时命中。机器人被拉进群后私聊管理员发**群信息卡**（未授权群附授权按钮，用于放行白名单用户）；已授权群里未授权用户 @ 会触发用户授权卡。授权入口：飞书 `/auth` 命令、授权卡、Web 设置面板；管理员 user_id 在面板配置（私聊 `/userid` 获取），**留空时自动使用飞书应用所有者**
 - 全部基于飞书官方 SDK [`@larksuiteoapi/node-sdk`](https://www.npmjs.com/package/@larksuiteoapi/node-sdk)（WebSocket 长连接，免公网）
-- **Web 设置面板**：Web/桌面端 **设置 → 飞书渠道**，顶部状态头 + 6 个标签页（连接 / 会话与行为 / 模型 / 工作区 / 访问授权 / 高级）；凭据不完整时插件不连接、面板显示三步引导，填写保存后自动连接（保存写入本机覆盖文件，部分字段需重连生效）；详见下文「Web 设置面板」章节
+- **Web 设置面板**：Web/桌面端 **设置 → 飞书渠道**，顶部状态头 + 7 个标签页（连接 / 会话与行为 / 模型 / 工作区 / 访问授权 / 知识库 / 高级）；凭据不完整时插件不连接、面板显示三步引导，填写保存后自动连接（保存写入本机覆盖文件，部分字段需重连生效）；详见下文「Web 设置面板」章节
 
 设计与可行性论证见 [docs/feasibility-and-design.md](docs/feasibility-and-design.md)；工作区粒度与会话隔离的取舍见 [docs/workspace-isolation-design.md](docs/workspace-isolation-design.md)；入站附件管线（存储 / 清单 / 工具 / 引用与历史 / 降级 / 隐私边界）见 [docs/attachment-pipeline-v2.md](docs/attachment-pipeline-v2.md)。
 
@@ -74,16 +74,17 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 | 标签页 | 内容 |
 | --- | --- |
 | 连接 | 连接状态与连接信息（长连接状态、Bot open_id、运行时长、话题路由 / 活动会话 / 在途回复）、权限自检、斜杠指令面板同步结果、未配置时的三步引导、飞书应用凭据、最近一次连接失败原因、需重连的待生效提醒 |
-| 会话与行为 | 「行为」：私聊模式、普通群 @ 要求、话题兜底、首次私聊引导、原生斜杠指令面板同步、权限切换；「内容与附件」：附件接收、存储后端、图片预取与上限、首轮历史；「模型工具」：`feishu_attachment_fetch` / `feishu_topic_messages` / `feishu_send_file` / 知识库工具开关与上限、`wikiRoots`、被动读取预算 |
+| 会话与行为 | 「行为」：私聊模式、普通群 @ 要求、话题兜底、首次私聊引导、原生斜杠指令面板同步、权限切换；「内容与附件」：附件接收、存储后端、图片预取与上限、首轮历史；「模型工具」：`feishu_attachment_fetch` / `feishu_topic_messages` / `feishu_send_file` 开关与上限、被动读取预算 |
 | 模型 | 模型服务商、模型 id、推理档位、Agent 预设（宿主目录驱动的级联下拉） |
 | 工作区 | 工作区根目录（可点「选择目录…」调用系统目录选择框）；话题目录隔离方式（`topicIsolation`）在 profile 配置中设置 |
 | 访问授权 | 管理员 user_id、准入模式、申请有效期；已授权群 / 用户白名单与待处理申请 |
+| 知识库 | 知识库读/写开关（`feishuTools.wikiRead` / `feishuTools.wikiWrite`）、知识库范围 `wikiRoots`（每条链接一个输入框，逐条校验）；知识库白名单增删（与用户白名单独立，等同 `/auth wiki add|remove`） |
 | 高级 | 流式刷新 / 状态行 / SDK 日志级别、部署级只读参数、Web 覆盖文件路径与「清除 Web 覆盖」 |
 
 **入站附件与模型工具（v2）**：「会话与行为」标签页新增两组可编辑字段，与 profile 配置同名、写入同一 Web 覆盖文件（`$DSH_HOME/dsh-channels/settings.json`）：
 
 - **内容与附件**：附件接收（`acceptAttachments`）、入站附件存储后端（`attachmentStore`：DSH 原生附件库 / 工作区 `attachments/`）、触发消息图片预取（`prefetchImages`）及单图 / 总量 / 整段超时上限（`prefetchImageMaxBytes` / `prefetchTotalMaxBytes` / `prefetchTimeoutMs`）、首轮话题历史条数（`historyBootstrapLimit`）。
-- **模型工具**：`feishu_attachment_fetch` 开关与单次资源数 / 字节预算 / 超时（`feishuTools.attachmentFetch*`）、`feishu_topic_messages` 开关与超时（`feishuTools.topicMessages*`）、`feishu_send_file` 开关（`feishuTools.sendFile`）、知识库读/写开关（`feishuTools.wikiRead` / `feishuTools.wikiWrite`）与知识库范围 `wikiRoots`（每条链接一个输入框，逐条校验）、被动引用/历史读取预算（`promptContextTimeoutMs`）。
+- **模型工具**：`feishu_attachment_fetch` 开关与单次资源数 / 字节预算 / 超时（`feishuTools.attachmentFetch*`）、`feishu_topic_messages` 开关与超时（`feishuTools.topicMessages*`）、`feishu_send_file` 开关（`feishuTools.sendFile`）、被动引用/历史读取预算（`promptContextTimeoutMs`）。
 
 `feishuTools.*` 是嵌套配置：面板只把改动过的子键写进覆盖层，其余子键保持原值（Web 覆盖或 profile 配置），不会因部分保存变成未定义。字段默认值、边界与降级规则见下文配置示例和 [docs/attachment-pipeline-v2.md](docs/attachment-pipeline-v2.md)。
 
@@ -186,13 +187,13 @@ src/
 ├── feishu-channel.ts      # 官方 SDK Channel 适配（可注入 stub）
 ├── client/                # 浏览器半区：设置 →「飞书渠道」页面（构建到 lib/client.js）
 │   ├── index.ts           #   client 插件入口：settings.section 注册 + 样式
-│   ├── panel/             #   页面外壳 + 六个标签页
+│   ├── panel/             #   页面外壳 + 七个标签页
 │   │   ├── index.tsx      #     加载 / 5s 状态轮询 / 全局草稿 / catalog 级联 / 顶部状态头 / Tab
 │   │   ├── shared.tsx     #     字段渲染原语、保存栏、阶段徽标、草稿校验
 │   │   ├── connection-tab.tsx #   连接：三步引导 / 连接信息 / 待生效提醒 / 凭据卡
 │   │   ├── credentials-card.tsx  #  App ID / App Secret 编辑（不回显）
 │   │   ├── analyze-token-card.tsx #  日志分析接口令牌编辑（不回显，不触发重连）
-│   │   ├── sessions-tab.tsx / model-tab.tsx / workspace-tab.tsx / access-tab.tsx / advanced-tab.tsx
+│   │   ├── sessions-tab.tsx / model-tab.tsx / workspace-tab.tsx / access-tab.tsx / wiki-tab.tsx / advanced-tab.tsx
 │   │   └── access-card.tsx
 │   ├── catalog.ts         #   选择器目录折叠：Host 字段 + 实时目录 → 表单字段
 │   ├── api.ts             #   同源 /dsh-channels/* 请求封装

@@ -506,6 +506,20 @@ describe('guarded 模式：/auth 用户管理', () => {
     await restarted.service.shutdown()
   })
 
+  it('设置面板增删知识库白名单，与用户白名单互不影响', async () => {
+    const h = await setup()
+    const added = await h.service.addWikiUser(' u_dave ', ' Dave ')
+    expect(added).toMatchObject({ ok: true })
+    if (!added.ok) return
+    expect(added.access.wikiUsers).toEqual([{ userId: 'u_dave', name: 'Dave', source: 'panel', addedAt: expect.any(Number) }])
+    expect(added.access.users).toEqual([])
+    expect(await h.service.addWikiUser('u_dave')).toMatchObject({ ok: true, access: { wikiUsers: [{ name: 'Dave' }] } })
+    expect(await h.service.addWikiUser('ou_dave')).toMatchObject({ ok: false })
+    expect(await h.service.removeWikiUser('u_dave')).toMatchObject({ ok: true, access: { wikiUsers: [] } })
+    expect(await h.service.removeWikiUser('bad id')).toMatchObject({ ok: false })
+    await h.service.shutdown()
+  })
+
   it('撤销用户与撤销群立即生效（非管理员被拒；管理员仍直通）', async () => {
     const h = await setup()
     await h.service.addAccessGroup('oc_group')

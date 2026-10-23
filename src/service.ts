@@ -97,7 +97,7 @@ import { ACTIVITY_BUILD_MARKER, TurnStreamer } from './streamer.ts'
 import type { ProjectedStats, StreamerHooks } from './streamer.ts'
 import type { FeishuConfig } from './config.ts'
 import type {
-  AccessMutationResponse, AccessRequestWire, AccessWire, CredentialField, ScopeCheckWire, SlashCommandSyncWire,
+  AccessMutationResponse, AccessRequestWire, AccessUserWire, AccessWire, CredentialField, ScopeCheckWire, SlashCommandSyncWire,
 } from './settings/contract.ts'
 import { checkScopes } from './feishu/scopes.ts'
 import { desiredSlashCommands, syncSlashCommands } from './feishu/slash-commands.ts'
@@ -239,6 +239,16 @@ async function resolveCredentialRef(ctx: HostContext, ref: string): Promise<stri
 }
 
 /** Best-effort human-readable error text for the settings panel. */
+/** One whitelisted user as the panel shows it. */
+function userWire(record: AccessUserRecord): AccessUserWire {
+  return {
+    userId: record.userId,
+    ...(record.name === undefined ? {} : { name: record.name }),
+    source: record.source,
+    addedAt: record.addedAt,
+  }
+}
+
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
@@ -981,12 +991,8 @@ export class FeishuService {
         source: record.source,
         addedAt: record.addedAt,
       })),
-      users: this.accessStore.userRecords().map(record => ({
-        userId: record.userId,
-        ...(record.name === undefined ? {} : { name: record.name }),
-        source: record.source,
-        addedAt: record.addedAt,
-      })),
+      users: this.accessStore.userRecords().map(userWire),
+      wikiUsers: this.accessStore.wikiUserRecords().map(userWire),
       requests: this.accessStore.pendingRequests().map(record => {
         const wire: AccessRequestWire = {
           token: record.token,
@@ -1042,13 +1048,37 @@ export class FeishuService {
 
   /** Panel: authorize one user (global across authorized groups). */
   async addAccessUser(userId: string, name?: string): Promise<AccessMutationResponse> {
+    return this.addPanelUser(userId, name, id => this.accessStore.hasUser(id), record => this.accessStore.addUser(record))
+  }
+
+  /** Panel: revoke one user. */
+  async removeAccessUser(userId: string): Promise<AccessMutationResponse> {
+    return this.removePanelUser(userId, id => this.accessStore.removeUser(id))
+  }
+
+  /** Panel: add one user to the wiki whitelist. */
+  async addWikiUser(userId: string, name?: string): Promise<AccessMutationResponse> {
+    return this.addPanelUser(userId, name, id => this.accessStore.hasWikiUser(id), record => this.accessStore.addWikiUser(record))
+  }
+
+  /** Panel: remove one user from the wiki whitelist. */
+  async removeWikiUser(userId: string): Promise<AccessMutationResponse> {
+    return this.removePanelUser(userId, id => this.accessStore.removeWikiUser(id))
+  }
+
+  private async addPanelUser(
+    userId: string,
+    name: string | undefined,
+    has: (id: string) => boolean,
+    add: (record: AccessUserRecord) => Promise<AccessUserRecord>,
+  ): Promise<AccessMutationResponse> {
     const id = this.cleanAccessUserId(userId)
     if (id === undefined) return { ok: false, error: 'user_id 不合法（只能包含字母、数字、_ 和 -，不是 ou_ 开头的 open_id）' }
     const admin = this.effectiveAdminUserId()
     if (admin === undefined) return { ok: false, error: '请先在「访问授权」标签页设置管理员 user_id' }
     try {
-      if (!this.accessStore.hasUser(id)) {
-        await this.accessStore.addUser({
+      if (!has(id)) {
+        await add({
           userId: id,
           ...(name === undefined || name.trim() === '' ? {} : { name: name.trim() }),
           source: 'panel',
@@ -1062,12 +1092,11 @@ export class FeishuService {
     }
   }
 
-  /** Panel: revoke one user. */
-  async removeAccessUser(userId: string): Promise<AccessMutationResponse> {
+  private async removePanelUser(userId: string, remove: (id: string) => Promise<boolean>): Promise<AccessMutationResponse> {
     const id = this.cleanAccessUserId(userId)
     if (id === undefined) return { ok: false, error: 'user_id 不合法' }
     try {
-      await this.accessStore.removeUser(id)
+      await remove(id)
       return { ok: true, access: this.accessSnapshot() }
     } catch (error) {
       return { ok: false, error: `撤销授权失败：${messageOf(error)}` }
