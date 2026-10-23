@@ -14,6 +14,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { KeyboardEvent } from 'react'
 import { PANEL_COPY, PANEL_TABS, TAB_FIELD_GROUPS } from '../../settings/contract.ts'
 import type {
+  AccessMutationResponse,
   AccessWire,
   CatalogWire,
   ChannelStatusWire,
@@ -28,6 +29,7 @@ import type {
 import {
   addAccessGroup,
   addAccessUser,
+  addWikiUser,
   clearConfig,
   clearCredential,
   fetchCatalog,
@@ -37,6 +39,7 @@ import {
   reconnect,
   removeAccessGroup,
   removeAccessUser,
+  removeWikiUser,
   resolveAccessRequest,
   saveConfig,
   saveCredentials,
@@ -63,6 +66,7 @@ import type {
   LoadState,
   Notice,
 } from './shared.tsx'
+import { WikiTab } from './wiki-tab.tsx'
 import { WorkspaceTab } from './workspace-tab.tsx'
 
 /** Owner props handed to a `settings.section` contribution (unused beyond parity). */
@@ -456,18 +460,24 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
     }
   }, [applyAccess])
 
-  const onAddAccessUser = useCallback(async (userId: string, name: string): Promise<boolean> => {
+  /** Add one user to a whitelist; resolves true when the input should clear. */
+  const addUser = useCallback(async (
+    add: (userId: string, name: string) => Promise<AccessMutationResponse>,
+    userId: string,
+    name: string,
+    notice: string,
+  ): Promise<boolean> => {
     setBusy('access')
     setAccessError(null)
     setAccessNotice(null)
     try {
-      const result = await addAccessUser(userId, name)
+      const result = await add(userId, name)
       if (!result.ok) {
         setAccessError(result.error)
         return false
       }
       applyAccess(result.access)
-      setAccessNotice(PANEL_COPY.accessUserAdded)
+      setAccessNotice(notice)
       return true
     } catch (error) {
       setAccessError(messageOf(error))
@@ -477,18 +487,22 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
     }
   }, [applyAccess])
 
-  const onRemoveAccessUser = useCallback(async (userId: string): Promise<void> => {
+  const removeUser = useCallback(async (
+    remove: (userId: string) => Promise<AccessMutationResponse>,
+    userId: string,
+    notice: string,
+  ): Promise<void> => {
     setBusy('access')
     setAccessError(null)
     setAccessNotice(null)
     try {
-      const result = await removeAccessUser(userId)
+      const result = await remove(userId)
       if (!result.ok) {
         setAccessError(result.error)
         return
       }
       applyAccess(result.access)
-      setAccessNotice(PANEL_COPY.accessUserRemoved)
+      setAccessNotice(notice)
     } catch (error) {
       setAccessError(messageOf(error))
     } finally {
@@ -732,9 +746,20 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
                 accessError={accessError}
                 onAddGroup={onAddAccessGroup}
                 onRemoveGroup={chatId => { void onRemoveAccessGroup(chatId) }}
-                onAddUser={onAddAccessUser}
-                onRemoveUser={userId => { void onRemoveAccessUser(userId) }}
+                onAddUser={(userId, name) => addUser(addAccessUser, userId, name, PANEL_COPY.accessUserAdded)}
+                onRemoveUser={userId => { void removeUser(removeAccessUser, userId, PANEL_COPY.accessUserRemoved) }}
                 onResolveRequest={(token, decision) => { void onResolveAccessRequest(token, decision) }}
+              />
+            )
+          : null}
+        {activeTab === 'wiki'
+          ? (
+              <WikiTab
+                form={form}
+                accessNotice={accessNotice}
+                accessError={accessError}
+                onAddUser={(userId, name) => addUser(addWikiUser, userId, name, PANEL_COPY.wikiUserAdded)}
+                onRemoveUser={userId => { void removeUser(removeWikiUser, userId, PANEL_COPY.wikiUserRemoved) }}
               />
             )
           : null}

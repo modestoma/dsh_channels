@@ -21,6 +21,7 @@ import {
   ACCESS_REQUESTS_ROUTE,
   ACCESS_ROUTE,
   ACCESS_USERS_ROUTE,
+  ACCESS_WIKI_USERS_ROUTE,
   CATALOG_ROUTE,
   CONFIG_ROUTE,
   CREDENTIALS_ROUTE,
@@ -134,6 +135,7 @@ class FakeTarget implements SettingsTarget {
     loaded: true,
     groups: [],
     users: [],
+    wikiUsers: [],
     requests: [],
   }
   /** Every whitelist mutation the surface forwarded (asserted by the tests). */
@@ -257,6 +259,29 @@ class FakeTarget implements SettingsTarget {
     const failed = this.accessFailure()
     if (failed !== undefined) return failed
     this.accessState.users = this.accessState.users.filter(user => user.userId !== userId)
+    return { ok: true, access: this.accessSnapshot() }
+  }
+
+  async addWikiUser(userId: string, name?: string): Promise<AccessMutationResponse> {
+    this.accessCalls.push({ op: 'add-wiki-user', userId, name })
+    const failed = this.accessFailure()
+    if (failed !== undefined) return failed
+    if (!this.accessState.wikiUsers.some(user => user.userId === userId)) {
+      this.accessState.wikiUsers.push({
+        userId,
+        ...(name === undefined ? {} : { name }),
+        source: 'panel',
+        addedAt: 1_700_000_000_000,
+      })
+    }
+    return { ok: true, access: this.accessSnapshot() }
+  }
+
+  async removeWikiUser(userId: string): Promise<AccessMutationResponse> {
+    this.accessCalls.push({ op: 'remove-wiki-user', userId })
+    const failed = this.accessFailure()
+    if (failed !== undefined) return failed
+    this.accessState.wikiUsers = this.accessState.wikiUsers.filter(user => user.userId !== userId)
     return { ok: true, access: this.accessSnapshot() }
   }
 
@@ -514,10 +539,10 @@ describe('field descriptors', () => {
       .toEqual(new Set(['boolean', 'number', 'text', 'select', 'string-list']))
   })
 
-  it('describes the wiki tool switches and the wikiRoots link list in the tools group', () => {
+  it('describes the wiki tool switches and the wikiRoots link list in the wiki group', () => {
     const byKey = new Map(FIELD_DESCRIPTORS.map(field => [field.key, field]))
     for (const key of ['feishuTools.wikiRead', 'feishuTools.wikiWrite'] as const) {
-      expect(byKey.get(key)).toMatchObject({ kind: 'boolean', group: 'tools', restartRequired: false })
+      expect(byKey.get(key)).toMatchObject({ kind: 'boolean', group: 'wiki', restartRequired: false })
     }
     expect(byKey.get('feishuTools.wikiRead')?.help).toContain('feishu_wiki_read')
     expect(byKey.get('feishuTools.wikiRead')?.help).toContain('/auth wiki add')
@@ -525,7 +550,7 @@ describe('field descriptors', () => {
     const roots = byKey.get('wikiRoots')
     expect(roots).toMatchObject({
       kind: 'string-list',
-      group: 'tools',
+      group: 'wiki',
       maxItems: 20,
       itemFormat: 'wiki-root-link',
       wide: true,
@@ -1384,6 +1409,7 @@ describe('SettingsSurface access control', () => {
     loaded: true,
     groups: [{ chatId: 'oc_team', name: '研发群', source: 'card', addedAt: 1_700_000_000_000 }],
     users: [{ userId: 'u_alice', name: 'Alice', source: 'command', addedAt: 1_700_000_100_000 }],
+    wikiUsers: [{ userId: 'u_wiki', source: 'command', addedAt: 1_700_000_000_000 }],
     requests: [{
       token: 'tok_1',
       kind: 'group',
@@ -1413,6 +1439,7 @@ describe('SettingsSurface access control', () => {
       loaded: false,
       groups: [],
       users: [],
+      wikiUsers: [],
       requests: [],
     })
     await expect(surface.access()).rejects.toThrow('access store down')
@@ -1459,6 +1486,9 @@ describe('SettingsSurface access control', () => {
     }
     const badName = await surface.saveAccessUser('u_bob', 'x'.repeat(129))
     expect(badName.ok).toBe(false)
+    expect((await surface.saveWikiUser('ou_bob')).ok).toBe(false)
+    expect((await surface.saveWikiUser('u_bob', 'x'.repeat(129))).ok).toBe(false)
+    expect((await surface.removeWikiUser('bad id')).ok).toBe(false)
     expect(target.accessCalls).toEqual([])
   })
 
@@ -1470,6 +1500,10 @@ describe('SettingsSurface access control', () => {
     expect(removedGroup.ok).toBe(true)
     const removedUser = await surface.removeAccessUser('u_alice')
     expect(removedUser.ok).toBe(true)
+    const removedWiki = await surface.removeWikiUser('u_wiki')
+    expect(removedWiki.ok).toBe(true)
+    if (!removedWiki.ok) return
+    expect(removedWiki.access.wikiUsers).toEqual([])
     const allowed = await surface.resolveAccessRequest('tok_1', 'allow')
     expect(allowed.ok).toBe(true)
     if (!allowed.ok) return
@@ -1478,6 +1512,7 @@ describe('SettingsSurface access control', () => {
     expect(target.accessCalls).toEqual([
       { op: 'remove-group', chatId: 'oc_team' },
       { op: 'remove-user', userId: 'u_alice' },
+      { op: 'remove-wiki-user', userId: 'u_wiki' },
       { op: 'resolve', token: 'tok_1', decision: 'allow' },
     ])
   })
@@ -1701,6 +1736,7 @@ const ALL_SETTINGS_ROUTES: Array<{ route: string; method: string }> = [
   { route: ACCESS_ROUTE, method: 'GET' },
   { route: ACCESS_GROUPS_ROUTE, method: 'POST' },
   { route: ACCESS_USERS_ROUTE, method: 'POST' },
+  { route: ACCESS_WIKI_USERS_ROUTE, method: 'POST' },
   { route: ACCESS_REQUESTS_ROUTE, method: 'POST' },
 ]
 
@@ -1929,6 +1965,7 @@ describe('settings routes', () => {
       loaded: true,
       groups: [{ chatId: 'oc_team', name: '研发群', source: 'card', addedAt: 1_700_000_000_000 }],
       users: [],
+      wikiUsers: [],
       requests: [{
         token: 'tok_1',
         kind: 'group',
@@ -1956,6 +1993,8 @@ describe('settings routes', () => {
       { route: ACCESS_GROUPS_ROUTE, method: 'DELETE', body: { chatId: 'oc_team' } },
       { route: ACCESS_USERS_ROUTE, method: 'POST', body: { userId: 'u_alice' } },
       { route: ACCESS_USERS_ROUTE, method: 'DELETE', body: { userId: 'u_alice' } },
+      { route: ACCESS_WIKI_USERS_ROUTE, method: 'POST', body: { userId: 'u_alice' } },
+      { route: ACCESS_WIKI_USERS_ROUTE, method: 'DELETE', body: { userId: 'u_alice' } },
       { route: ACCESS_REQUESTS_ROUTE, method: 'POST', body: { token: 'tok_1', decision: 'allow' } },
     ]
     for (const write of writes) {
@@ -1992,6 +2031,26 @@ describe('settings routes', () => {
       body: JSON.stringify({ chatId: 'oc_team' }),
     }))
     expect(removed.status).toBe(200)
+
+    const addedWiki = await call(routes, ACCESS_WIKI_USERS_ROUTE, makeRequest({
+      method: 'POST',
+      headers: { 'content-type': 'application/json', host: 'h' },
+      body: JSON.stringify({ userId: 'u_wiki', name: 'Wiki' }),
+    }))
+    expect(addedWiki.status).toBe(200)
+    expect(JSON.parse(addedWiki.body).access.wikiUsers.map((user: { userId: string }) => user.userId)).toEqual(['u_wiki'])
+    const removedWiki = await call(routes, ACCESS_WIKI_USERS_ROUTE, makeRequest({
+      method: 'DELETE',
+      headers: { 'content-type': 'application/json', host: 'h' },
+      body: JSON.stringify({ userId: 'u_wiki' }),
+    }))
+    expect(JSON.parse(removedWiki.body).access.wikiUsers).toEqual([])
+    const invalidWiki = await call(routes, ACCESS_WIKI_USERS_ROUTE, makeRequest({
+      method: 'POST',
+      headers: { 'content-type': 'application/json', host: 'h' },
+      body: JSON.stringify({ userId: 'ou_wiki' }),
+    }))
+    expect(invalidWiki.status).toBe(400)
 
     const resolved = await call(routes, ACCESS_REQUESTS_ROUTE, makeRequest({
       method: 'POST',

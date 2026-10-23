@@ -21,6 +21,7 @@ import {
   ACCESS_REQUESTS_ROUTE,
   ACCESS_ROUTE,
   ACCESS_USERS_ROUTE,
+  ACCESS_WIKI_USERS_ROUTE,
   CATALOG_ROUTE,
   CONFIG_ROUTE,
   CREDENTIALS_ROUTE,
@@ -423,6 +424,23 @@ export function registerSettingsRoutes(
         const result = methodOf(req) === 'DELETE'
           ? await surface.removeAccessUser(payload.userId)
           : await surface.saveAccessUser(payload.userId, payload.name)
+        sendJson(res, result.ok ? 200 : 400, result)
+      }),
+    }),
+    server.register({
+      kind: 'exact',
+      path: ACCESS_WIKI_USERS_ROUTE,
+      handler: guarded(async (req, res) => {
+        if (!allowOnly(req, res, ['POST', 'DELETE'])) return
+        if (!isSameOriginRequest(req)) {
+          forbiddenWrite(res)
+          return
+        }
+        const payload = await readAccessBody(req, res)
+        if (payload === undefined) return
+        const result = methodOf(req) === 'DELETE'
+          ? await surface.removeWikiUser(payload.userId)
+          : await surface.saveWikiUser(payload.userId, payload.name)
         sendJson(res, result.ok ? 200 : 400, result)
       }),
     }),

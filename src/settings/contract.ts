@@ -20,12 +20,14 @@ export const CREDENTIALS_ROUTE = '/dsh-channels/credentials'
 export const RECONNECT_ROUTE = '/dsh-channels/reconnect'
 /** 模型/推理档位/预设选择器的宿主目录（provider → model → effort 级联刷新）。 */
 export const CATALOG_ROUTE = '/dsh-channels/catalog'
-/** 访问与授权只读快照（GET/HEAD）：准入模式、管理员、群/用户白名单、待处理申请。 */
+/** 访问与授权只读快照（GET/HEAD）：准入模式、管理员、群/用户/知识库白名单、待处理申请。 */
 export const ACCESS_ROUTE = '/dsh-channels/access'
 /** 群白名单增删（POST/DELETE，body `{ chatId, name? }` / `{ chatId }`）。 */
 export const ACCESS_GROUPS_ROUTE = '/dsh-channels/access/groups'
 /** 用户白名单增删（POST/DELETE，body `{ userId, name? }` / `{ userId }`）。 */
 export const ACCESS_USERS_ROUTE = '/dsh-channels/access/users'
+/** 知识库白名单增删（POST/DELETE，body `{ userId, name? }` / `{ userId }`）。 */
+export const ACCESS_WIKI_USERS_ROUTE = '/dsh-channels/access/wiki-users'
 /** 结算一条待处理授权申请（POST，body `{ token, decision }`）。 */
 export const ACCESS_REQUESTS_ROUTE = '/dsh-channels/access/requests'
 /**
@@ -138,7 +140,7 @@ export type StringListItemFormat = 'wiki-root-link'
  * panel tab (see {@link TAB_FIELD_GROUPS}); the Host is the source of truth for
  * which key belongs to which group.
  */
-export type FieldGroup = 'workspace' | 'behavior' | 'content' | 'tools' | 'model' | 'streaming' | 'access'
+export type FieldGroup = 'workspace' | 'behavior' | 'content' | 'tools' | 'model' | 'streaming' | 'access' | 'wiki'
 
 /** One selectable value rendered by the generic form. */
 export interface FieldOptionWire {
@@ -395,7 +397,8 @@ export interface AccessRequestWire {
 
 /**
  * `GET /dsh-channels/access` payload: admission mode, the administrator
- * reference, both whitelists, and the still-pending authorization requests.
+ * reference, the group, user, and wiki whitelists, and the still-pending
+ * authorization requests.
  */
 export interface AccessWire {
   mode: 'open' | 'guarded'
@@ -417,6 +420,8 @@ export interface AccessWire {
   loaded: boolean
   groups: AccessGroupWire[]
   users: AccessUserWire[]
+  /** Wiki whitelist (`/auth wiki add`): topic owners allowed to use the wiki tools. */
+  wikiUsers: AccessUserWire[]
   requests: AccessRequestWire[]
 }
 
@@ -529,6 +534,7 @@ export const PANEL_TABS = [
   { id: 'model', label: '模型' },
   { id: 'workspace', label: '工作区' },
   { id: 'access', label: '访问授权' },
+  { id: 'wiki', label: '知识库' },
   { id: 'advanced', label: '高级' },
 ] as const
 
@@ -541,6 +547,7 @@ export const TAB_FIELD_GROUPS: Readonly<Record<PanelTabId, readonly FieldGroup[]
   model: ['model'],
   workspace: ['workspace'],
   access: ['access'],
+  wiki: ['wiki'],
   advanced: ['streaming'],
 }
 
@@ -553,6 +560,7 @@ export const FIELD_GROUP_LABELS: Readonly<Record<FieldGroup, string>> = {
   model: '模型与推理',
   streaming: '流式卡片与日志',
   access: '准入与授权',
+  wiki: '知识库工具',
 }
 
 /** Display labels for the panel header/cards (kept on the wire so the client owns no copy). */
@@ -641,6 +649,7 @@ export const PANEL_COPY = {
   modelTabHelp: '飞书会话使用的模型服务商、模型、推理档位与 Agent 预设；下拉选项来自宿主机实时目录，保存后对新会话生效。',
   workspaceTabHelp: '每个用户一个工作区（模型/工具产生文件的落点），每个话题在其中拥有独立工作目录；只影响之后新建的话题。入站附件默认存于 DSH 原生附件库，不占用话题目录。插件不会自动删除工作区或话题目录；过期目录可手动删除，话题下次对话时会重建空目录。',
   accessTabHelp: '准入采用 fail-closed：管理员不受白名单限制，非管理员私聊会被拒绝，群聊需要「群已授权 + 用户在白名单」两层同时命中。',
+  wikiTabHelp: '知识库工具以应用身份访问「知识库范围」内的文档、电子表格和多维表格。只有管理员或知识库白名单里的用户发起的话题能用；每次打开、新建、修改仍需话题发起人在授权卡上确认。',
   advancedTabHelp: '流式刷新等低层参数、Web 覆盖文件与只读信息。',
   save: '保存更改',
   saving: '保存中…',
@@ -735,5 +744,11 @@ export const PANEL_COPY = {
   accessRequestAllowed: '已授权',
   accessRequestDenied: '已忽略',
   accessHints: '三种授权入口：群内 /auth 命令、入群与用户授权卡、本面板。撤销立即生效；白名单只约束非管理员（管理员在任何私聊/群聊都直接放行），非管理员需要群和用户两层同时命中。',
+  // ---- wiki ---------------------------------------------------------------
+  wikiUsersCard: '知识库白名单',
+  wikiUsersHelp: '与「访问授权」里的用户白名单相互独立：这里的用户（以及管理员）发起的话题可以使用知识库工具。也可以在飞书里发送 /auth wiki add @用户 或 /auth wiki remove @用户；移除立即生效。',
+  wikiUsersEmpty: '知识库白名单为空：目前只有管理员发起的话题能使用知识库工具。',
+  wikiUserAdded: '已加入知识库白名单',
+  wikiUserRemoved: '已移出知识库白名单',
   accessChatIdHint: 'chat_id 可从入群群信息卡或群内 /groupid 获取；user_id 可私聊机器人发送 /userid 获取。',
 } as const

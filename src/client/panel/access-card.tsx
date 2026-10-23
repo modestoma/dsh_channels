@@ -54,10 +54,7 @@ export function AccessCard(props: AccessCardProps): JSX.Element {
   const { access } = panel
   const [groupChatId, setGroupChatId] = useState('')
   const [groupName, setGroupName] = useState('')
-  const [userUserId, setUserUserId] = useState('')
-  const [userName, setUserName] = useState('')
   const groups: readonly AccessGroupWire[] = access.groups
-  const users: readonly AccessUserWire[] = access.users
   const requests: readonly AccessRequestWire[] = access.requests
   const working = busy === 'access'
   const disabled = busy !== null || locked || !access.loaded
@@ -67,14 +64,6 @@ export function AccessCard(props: AccessCardProps): JSX.Element {
     if (await onAddGroup(groupChatId, groupName)) {
       setGroupChatId('')
       setGroupName('')
-    }
-  }
-
-  const submitUser = async (): Promise<void> => {
-    if (userUserId.trim() === '') return
-    if (await onAddUser(userUserId, userName)) {
-      setUserUserId('')
-      setUserName('')
     }
   }
 
@@ -170,65 +159,16 @@ export function AccessCard(props: AccessCardProps): JSX.Element {
                 </div>
               </div>
 
-              <div className="dsh-channels-cfg__accessSection">
-                <div className="dsh-channels-cfg__labelRow">
-                  <span className="dsh-channels-cfg__label">{PANEL_COPY.accessUsersTitle}</span>
-                  <span className="dsh-channels-cfg__cardMeta">{users.length} 个</span>
-                </div>
-                {users.length === 0
-                  ? <span className="dsh-channels-cfg__help">{PANEL_COPY.accessUsersEmpty}</span>
-                  : (
-                      <ul className="dsh-channels-cfg__accessList">
-                        {users.map(user => (
-                          <li className="dsh-channels-cfg__accessRow" key={user.userId}>
-                            <span className="dsh-channels-cfg__accessMain">
-                              <span>{user.name ?? user.userId}</span>
-                              <span className="dsh-channels-cfg__accessMeta">
-                                <span className="dsh-channels-cfg__mono">{user.userId}</span>
-                                {` · ${accessSourceLabel(user.source)} · ${formatAccessDate(user.addedAt)}`}
-                              </span>
-                            </span>
-                            <button
-                              type="button"
-                              className="dsh-channels-cfg__btn"
-                              disabled={disabled}
-                              onClick={() => onRemoveUser(user.userId)}
-                            >
-                              {working ? PANEL_COPY.accessWorking : PANEL_COPY.accessRemove}
-                            </button>
-                          </li>
-                        ))}
-                      </ul>
-                    )}
-                <div className="dsh-channels-cfg__accessAdd">
-                  <input
-                    type="text"
-                    className="dsh-channels-cfg__input dsh-channels-cfg__accessInput"
-                    value={userUserId}
-                    placeholder={PANEL_COPY.accessUserIdPlaceholder}
-                    aria-label={PANEL_COPY.accessUserIdPlaceholder}
-                    disabled={disabled}
-                    onChange={event => setUserUserId(event.target.value)}
-                  />
-                  <input
-                    type="text"
-                    className="dsh-channels-cfg__input dsh-channels-cfg__accessInput"
-                    value={userName}
-                    placeholder={PANEL_COPY.accessUserNamePlaceholder}
-                    aria-label={PANEL_COPY.accessUserNamePlaceholder}
-                    disabled={disabled}
-                    onChange={event => setUserName(event.target.value)}
-                  />
-                  <button
-                    type="button"
-                    className="dsh-channels-cfg__btn dsh-channels-cfg__btn--primary"
-                    disabled={disabled || userUserId.trim() === ''}
-                    onClick={() => { void submitUser() }}
-                  >
-                    {working ? PANEL_COPY.accessWorking : PANEL_COPY.accessAddUser}
-                  </button>
-                </div>
-              </div>
+              <UserWhitelist
+                title={PANEL_COPY.accessUsersTitle}
+                empty={PANEL_COPY.accessUsersEmpty}
+                addLabel={PANEL_COPY.accessAddUser}
+                users={access.users}
+                disabled={disabled}
+                working={working}
+                onAdd={onAddUser}
+                onRemove={onRemoveUser}
+              />
 
               <div className="dsh-channels-cfg__accessSection">
                 <div className="dsh-channels-cfg__labelRow">
@@ -299,5 +239,91 @@ export function AccessCard(props: AccessCardProps): JSX.Element {
       <span className="dsh-channels-cfg__help">{PANEL_COPY.accessHints}</span>
       <span className="dsh-channels-cfg__help">{PANEL_COPY.accessChatIdHint}</span>
     </section>
+  )
+}
+
+/** One user whitelist (user `user_id` list with add/remove), shared by the access and wiki tabs. */
+export function UserWhitelist(props: {
+  title: string
+  empty: string
+  addLabel: string
+  users: readonly AccessUserWire[]
+  disabled: boolean
+  working: boolean
+  onAdd: (userId: string, name: string) => Promise<boolean>
+  onRemove: (userId: string) => void
+}): JSX.Element {
+  const { title, empty, addLabel, users, disabled, working, onAdd, onRemove } = props
+  const [userUserId, setUserUserId] = useState('')
+  const [userName, setUserName] = useState('')
+
+  const submitUser = async (): Promise<void> => {
+    if (userUserId.trim() === '') return
+    if (await onAdd(userUserId, userName)) {
+      setUserUserId('')
+      setUserName('')
+    }
+  }
+
+  return (
+    <div className="dsh-channels-cfg__accessSection">
+      <div className="dsh-channels-cfg__labelRow">
+        <span className="dsh-channels-cfg__label">{title}</span>
+        <span className="dsh-channels-cfg__cardMeta">{users.length} 个</span>
+      </div>
+      {users.length === 0
+        ? <span className="dsh-channels-cfg__help">{empty}</span>
+        : (
+            <ul className="dsh-channels-cfg__accessList">
+              {users.map(user => (
+                <li className="dsh-channels-cfg__accessRow" key={user.userId}>
+                  <span className="dsh-channels-cfg__accessMain">
+                    <span>{user.name ?? user.userId}</span>
+                    <span className="dsh-channels-cfg__accessMeta">
+                      <span className="dsh-channels-cfg__mono">{user.userId}</span>
+                      {` · ${accessSourceLabel(user.source)} · ${formatAccessDate(user.addedAt)}`}
+                    </span>
+                  </span>
+                  <button
+                    type="button"
+                    className="dsh-channels-cfg__btn"
+                    disabled={disabled}
+                    onClick={() => onRemove(user.userId)}
+                  >
+                    {working ? PANEL_COPY.accessWorking : PANEL_COPY.accessRemove}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+      <div className="dsh-channels-cfg__accessAdd">
+        <input
+          type="text"
+          className="dsh-channels-cfg__input dsh-channels-cfg__accessInput"
+          value={userUserId}
+          placeholder={PANEL_COPY.accessUserIdPlaceholder}
+          aria-label={PANEL_COPY.accessUserIdPlaceholder}
+          disabled={disabled}
+          onChange={event => setUserUserId(event.target.value)}
+        />
+        <input
+          type="text"
+          className="dsh-channels-cfg__input dsh-channels-cfg__accessInput"
+          value={userName}
+          placeholder={PANEL_COPY.accessUserNamePlaceholder}
+          aria-label={PANEL_COPY.accessUserNamePlaceholder}
+          disabled={disabled}
+          onChange={event => setUserName(event.target.value)}
+        />
+        <button
+          type="button"
+          className="dsh-channels-cfg__btn dsh-channels-cfg__btn--primary"
+          disabled={disabled || userUserId.trim() === ''}
+          onClick={() => { void submitUser() }}
+        >
+          {working ? PANEL_COPY.accessWorking : addLabel}
+        </button>
+      </div>
+    </div>
   )
 }

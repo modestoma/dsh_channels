@@ -108,6 +108,10 @@ export interface SettingsTarget {
   addAccessUser(userId: string, name?: string): Promise<AccessMutationResponse>
   /** Revoke one user authorization (takes effect on the next message). */
   removeAccessUser(userId: string): Promise<AccessMutationResponse>
+  /** Add one user `user_id` to the wiki whitelist. */
+  addWikiUser(userId: string, name?: string): Promise<AccessMutationResponse>
+  /** Remove one user from the wiki whitelist (takes effect on the next wiki tool call). */
+  removeWikiUser(userId: string): Promise<AccessMutationResponse>
   /** Settle one pending request (panel shares this path with the Feishu DM card). */
   resolveAccessRequest(token: string, decision: 'allow' | 'deny'): Promise<AccessMutationResponse>
 }
@@ -411,9 +415,9 @@ const GROUP_OF: Record<EditableKey, EditableFieldWire['group']> = {
   'feishuTools.topicMessages': 'tools',
   'feishuTools.topicMessagesTimeoutMs': 'tools',
   'feishuTools.sendFile': 'tools',
-  'feishuTools.wikiRead': 'tools',
-  'feishuTools.wikiWrite': 'tools',
-  wikiRoots: 'tools',
+  'feishuTools.wikiRead': 'wiki',
+  'feishuTools.wikiWrite': 'wiki',
+  wikiRoots: 'wiki',
   provider: 'model',
   model: 'model',
   reasoningEffort: 'model',
@@ -570,6 +574,9 @@ export function normalizeCredentialValue(raw: unknown): { ok: true; value: strin
 /** Longest accepted whitelist identifier / display name. */
 const MAX_ACCESS_VALUE_LENGTH = 128
 
+
+/** Format reason for a rejected user `user_id` (shared by the user and wiki whitelists). */
+const USER_ID_FORMAT = '用户 user_id 只能包含字母、数字、_ 和 -（不是 ou_ 开头的 open_id，也不是邮箱）'
 
 /** Trim one whitelist identifier, rejecting empty, oversized, or hostile input. */
 export function normalizeAccessId(
@@ -800,6 +807,7 @@ export class SettingsSurface {
         loaded: false,
         groups: [],
         users: [],
+        wikiUsers: [],
         requests: [],
       }
     }
@@ -1056,18 +1064,43 @@ export class SettingsSurface {
 
   /** Authorize one user `user_id` (not an open_id or email). */
   async saveAccessUser(userId: unknown, name?: unknown): Promise<AccessMutationResponse> {
-    const id = normalizeAccessId(userId, '用户 user_id', '用户 user_id 只能包含字母、数字、_ 和 -（不是 ou_ 开头的 open_id，也不是邮箱）')
-    if (!id.ok) return { ok: false, error: id.message }
-    const label = normalizeAccessName(name)
-    if (!label.ok) return { ok: false, error: label.message }
-    return this.mutateAccess(() => this.target.addAccessUser(id.value, label.value))
+    return this.saveUser(userId, name, (id, label) => this.target.addAccessUser(id, label))
   }
 
   /** Revoke one user authorization (immediate: the next message re-evaluates). */
   async removeAccessUser(userId: unknown): Promise<AccessMutationResponse> {
-    const id = normalizeAccessId(userId, '用户 user_id', '用户 user_id 只能包含字母、数字、_ 和 -（不是 ou_ 开头的 open_id，也不是邮箱）')
+    return this.removeUser(userId, id => this.target.removeAccessUser(id))
+  }
+
+  /** Add one user `user_id` to the wiki whitelist. */
+  async saveWikiUser(userId: unknown, name?: unknown): Promise<AccessMutationResponse> {
+    return this.saveUser(userId, name, (id, label) => this.target.addWikiUser(id, label))
+  }
+
+  /** Remove one user from the wiki whitelist (immediate: the next wiki tool call re-evaluates). */
+  async removeWikiUser(userId: unknown): Promise<AccessMutationResponse> {
+    return this.removeUser(userId, id => this.target.removeWikiUser(id))
+  }
+
+  private async saveUser(
+    userId: unknown,
+    name: unknown,
+    add: (id: string, label: string | undefined) => Promise<AccessMutationResponse>,
+  ): Promise<AccessMutationResponse> {
+    const id = normalizeAccessId(userId, '用户 user_id', USER_ID_FORMAT)
     if (!id.ok) return { ok: false, error: id.message }
-    return this.mutateAccess(() => this.target.removeAccessUser(id.value))
+    const label = normalizeAccessName(name)
+    if (!label.ok) return { ok: false, error: label.message }
+    return this.mutateAccess(() => add(id.value, label.value))
+  }
+
+  private async removeUser(
+    userId: unknown,
+    remove: (id: string) => Promise<AccessMutationResponse>,
+  ): Promise<AccessMutationResponse> {
+    const id = normalizeAccessId(userId, '用户 user_id', USER_ID_FORMAT)
+    if (!id.ok) return { ok: false, error: id.message }
+    return this.mutateAccess(() => remove(id.value))
   }
 
   /**

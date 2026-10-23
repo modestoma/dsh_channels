@@ -10,6 +10,7 @@ import {
   ACCESS_REQUESTS_ROUTE,
   ACCESS_ROUTE,
   ACCESS_USERS_ROUTE,
+  ACCESS_WIKI_USERS_ROUTE,
   CATALOG_ROUTE,
   CONFIG_ROUTE,
   CREDENTIALS_ROUTE,
@@ -251,6 +252,20 @@ export async function addAccessUser(userId: string, name?: string): Promise<Acce
 /** Revoke one user authorization (takes effect on the next message). */
 export async function removeAccessUser(userId: string): Promise<AccessMutationResponse> {
   return mutateAccess(ACCESS_USERS_ROUTE, 'DELETE', { userId })
+}
+
+/** Add one user `user_id` to the wiki whitelist. */
+export async function addWikiUser(userId: string, name?: string): Promise<AccessMutationResponse> {
+  return mutateAccess(
+    ACCESS_WIKI_USERS_ROUTE,
+    'POST',
+    name === undefined || name === '' ? { userId } : { userId, name },
+  )
+}
+
+/** Remove one user from the wiki whitelist (takes effect on the next wiki tool call). */
+export async function removeWikiUser(userId: string): Promise<AccessMutationResponse> {
+  return mutateAccess(ACCESS_WIKI_USERS_ROUTE, 'DELETE', { userId })
 }
 
 /** Settle one pending authorization request (same resolver as the Feishu card). */
