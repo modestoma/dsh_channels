@@ -8,6 +8,8 @@
 import { useState } from 'react'
 import { fillCopy, PANEL_COPY } from '../../settings/contract.ts'
 import type { AccessGroupWire, AccessRequestWire } from '../../settings/contract.ts'
+import { Avatar } from '../avatar.tsx'
+import type { ProfileView } from './profiles.ts'
 import { EmptyRow, Row, Section } from './shared.tsx'
 
 /** Local `MM-DD HH:mm` rendering for authorization timestamps. */
@@ -27,15 +29,13 @@ function sourceLabel(source: AccessGroupWire['source']): string {
   }
 }
 
-/** Round initial badge in front of a whitelist entry. */
-function Avatar(props: { text: string }): JSX.Element {
-  return <span className="dsh-channels-cfg__avatar" aria-hidden="true">{Array.from(props.text)[0] ?? '?'}</span>
-}
-
 /** One whitelist entry: a group `chat_id` or a user `user_id`. */
 export interface WhitelistEntry {
   id: string
+  /** Live Feishu name, else the name captured at authorization time. */
   name?: string
+  /** Live Feishu avatar. */
+  avatarUrl?: string
   source: AccessGroupWire['source']
 }
 
@@ -48,6 +48,7 @@ export function Whitelist(props: {
   /** Shown after the title once loaded; defaults to the entry count. */
   countLabel?: string
   entries: readonly WhitelistEntry[]
+  /** Fallback avatar text for entries without an image; defaults to the entry name. */
   avatar?: string
   empty: string
   loaded: boolean
@@ -81,7 +82,7 @@ export function Whitelist(props: {
       {entries.map(entry => (
         <Row
           key={entry.id}
-          leading={<Avatar text={avatar ?? entry.name ?? entry.id} />}
+          leading={<Avatar text={avatar ?? entry.name ?? entry.id} url={entry.avatarUrl} />}
           label={entry.name ?? entry.id}
           summary={<><span className="dsh-channels-cfg__mono">{entry.id}</span> · {sourceLabel(entry.source)}</>}
           control={(
@@ -146,22 +147,27 @@ export function Whitelist(props: {
 /** Pending authorization requests, settled with the same resolver as the DM card. */
 export function RequestList(props: {
   requests: readonly AccessRequestWire[]
+  profiles: ProfileView
   disabled: boolean
   working: boolean
   onResolve: (token: string, decision: 'allow' | 'deny') => void
 }): JSX.Element {
-  const { requests, disabled, working, onResolve } = props
+  const { requests, profiles, disabled, working, onResolve } = props
   return (
     <Section title={`${PANEL_COPY.accessRequestsTitle} · ${requests.length}`} tone="warn">
       {requests.map((request) => {
-        const target = request.name ?? request.targetId
-        const where = request.kind === 'user' && (request.groupName ?? request.chatId) !== undefined
-          ? fillCopy(PANEL_COPY.accessRequestIn, { group: request.groupName ?? request.chatId ?? '' })
+        const profile = request.kind === 'user' ? profiles.user(request.targetId) : profiles.chat(request.targetId)
+        const target = profile?.name ?? request.name ?? request.targetId
+        const group = request.chatId === undefined
+          ? request.groupName
+          : profiles.chat(request.chatId)?.name ?? request.groupName ?? request.chatId
+        const where = request.kind === 'user' && group !== undefined
+          ? fillCopy(PANEL_COPY.accessRequestIn, { group })
           : ''
         return (
           <Row
             key={request.token}
-            leading={<Avatar text={target} />}
+            leading={<Avatar text={target} url={profile?.avatarUrl} />}
             label={`${target} ${where}${request.kind === 'group' ? PANEL_COPY.accessRequestGroup : PANEL_COPY.accessRequestUser}`}
             summary={(
               <>

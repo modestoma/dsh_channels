@@ -10,12 +10,16 @@
  */
 
 import { fillCopy, PANEL_COPY, TAB_FIELD_GROUPS } from '../../settings/contract.ts'
-import { FieldSections, NoticeBar } from './shared.tsx'
+import type { AccessWire } from '../../settings/contract.ts'
+import { Avatar } from '../avatar.tsx'
+import type { ProfileView } from './profiles.ts'
+import { FieldSections, NoticeBar, Row } from './shared.tsx'
 import type { FormView } from './shared.tsx'
 import { RequestList, Whitelist } from './whitelist.tsx'
 
 export interface AccessTabProps {
   form: FormView
+  profiles: ProfileView
   accessNotice: string | null
   accessError: string | null
   onAddGroup: (chatId: string, name: string) => Promise<boolean>
@@ -26,17 +30,10 @@ export interface AccessTabProps {
 }
 
 export function AccessTab(props: AccessTabProps): JSX.Element {
-  const { form, accessNotice, accessError, onAddGroup, onRemoveGroup, onAddUser, onRemoveUser, onResolveRequest } = props
+  const { form, profiles, accessNotice, accessError, onAddGroup, onRemoveGroup, onAddUser, onRemoveUser, onResolveRequest } = props
   const { access } = form.panel
   const working = form.busy === 'access'
   const disabled = form.busy !== null || form.locked || !access.loaded
-  // The administrator row says who is in charge right now when the owner fallback applies.
-  const ownerAdmin = access.mode === 'guarded' && access.admin.source === 'owner' ? access.admin.userId : undefined
-  const fields = ownerAdmin === undefined
-    ? form.fields
-    : form.fields.map(field => field.key === 'adminUserId'
-      ? { ...field, summary: fillCopy(PANEL_COPY.accessAdminOwnerSummary, { id: ownerAdmin }) }
-      : field)
   return (
     <div className="dsh-channels-cfg__tabBody">
       {accessNotice === null ? null : <NoticeBar kind="ok" text={accessNotice} />}
@@ -51,13 +48,23 @@ export function AccessTab(props: AccessTabProps): JSX.Element {
             />
           )
         : null}
+      {profiles.warning === undefined ? null : <p className="dsh-channels-cfg__secFoot">{fillCopy(PANEL_COPY.profilesWarning, { reason: profiles.warning })}</p>}
       {access.loaded && access.requests.length > 0
-        ? <RequestList requests={access.requests} disabled={disabled} working={working} onResolve={onResolveRequest} />
+        ? <RequestList requests={access.requests} profiles={profiles} disabled={disabled} working={working} onResolve={onResolveRequest} />
         : null}
-      <FieldSections form={{ ...form, fields }} groups={TAB_FIELD_GROUPS.access} />
+      <FieldSections
+        form={form}
+        groups={TAB_FIELD_GROUPS.access}
+        extra={{ access: <AdminRow admin={access.admin} profiles={profiles} /> }}
+      />
       <Whitelist
         title={PANEL_COPY.accessGroupsTitle}
-        entries={access.groups.map(group => ({ id: group.chatId, name: group.name, source: group.source }))}
+        entries={access.groups.map(group => ({
+          id: group.chatId,
+          name: profiles.chat(group.chatId)?.name ?? group.name,
+          avatarUrl: profiles.chat(group.chatId)?.avatarUrl,
+          source: group.source,
+        }))}
         avatar="群"
         empty={PANEL_COPY.accessGroupsEmpty}
         loaded={access.loaded}
@@ -71,7 +78,12 @@ export function AccessTab(props: AccessTabProps): JSX.Element {
       />
       <Whitelist
         title={PANEL_COPY.accessUsersTitle}
-        entries={access.users.map(user => ({ id: user.userId, name: user.name, source: user.source }))}
+        entries={access.users.map(user => ({
+          id: user.userId,
+          name: profiles.user(user.userId)?.name ?? user.name,
+          avatarUrl: profiles.user(user.userId)?.avatarUrl,
+          source: user.source,
+        }))}
         empty={PANEL_COPY.accessUsersEmpty}
         loaded={access.loaded}
         addLabel={PANEL_COPY.accessAddUser}
@@ -83,5 +95,21 @@ export function AccessTab(props: AccessTabProps): JSX.Element {
         onRemove={onRemoveUser}
       />
     </div>
+  )
+}
+
+/** The effective administrator with their Feishu name and avatar; nothing while there is none. */
+function AdminRow(props: { admin: AccessWire['admin']; profiles: ProfileView }): JSX.Element | null {
+  const { admin, profiles } = props
+  if (admin.userId === undefined) return null
+  const profile = profiles.user(admin.userId)
+  const name = profile?.name ?? admin.userId
+  const source = admin.source === 'owner' ? PANEL_COPY.accessAdminSourceOwner : PANEL_COPY.accessAdminSourceConfig
+  return (
+    <Row
+      leading={<Avatar text={name} url={profile?.avatarUrl} />}
+      label={name}
+      summary={<>{PANEL_COPY.accessAdminCurrent} · <span className="dsh-channels-cfg__mono">{admin.userId}</span> · {source}</>}
+    />
   )
 }

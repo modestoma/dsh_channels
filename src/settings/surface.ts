@@ -37,6 +37,7 @@ import type {
   EditableFieldWire,
   EditableKey,
   EditableValues,
+  FeishuProfilesWire,
   FieldIssueWire,
   FieldGroup,
   FieldOptionWire,
@@ -120,6 +121,8 @@ export interface SettingsTarget {
   resolveAccessRequest(token: string, decision: 'allow' | 'deny'): Promise<AccessMutationResponse>
   /** Feishu origin of one Session, or null when Feishu never routed it. */
   sessionOrigin(sessionId: string): Promise<SessionOriginWire | null>
+  /** Live Feishu names and avatars of the given users and chats. */
+  feishuProfiles(userIds: readonly string[], chatIds: readonly string[]): Promise<FeishuProfilesWire>
 }
 
 /** Presence/source/writability facts returned by the credentials seam. */
@@ -727,6 +730,16 @@ export class SettingsSurface {
   /** Feishu origin of one Session for the conversation sidebar. */
   async sessionOrigin(sessionId: string): Promise<SessionOriginResponse> {
     return { origin: await this.target.sessionOrigin(sessionId) }
+  }
+
+  /**
+   * Live Feishu names and avatars for the panel's users and chats.
+   * @param userIds - user `user_id`s.
+   * @param chatIds - chat `chat_id`s.
+   * @returns the profiles Feishu resolved.
+   */
+  async feishuProfiles(userIds: readonly string[], chatIds: readonly string[]): Promise<FeishuProfilesWire> {
+    return this.target.feishuProfiles(userIds, chatIds)
   }
 
   async catalogFor(provider?: string, model?: string): Promise<CatalogWire> {

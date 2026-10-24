@@ -48,6 +48,7 @@ import { AccessTab } from './access-tab.tsx'
 import { AdvancedTab } from './advanced-tab.tsx'
 import { ConnectionTab } from './connection-tab.tsx'
 import { FieldsTab } from './fields-tab.tsx'
+import { useFeishuProfiles } from './profiles.ts'
 import {
   fieldLabel,
   formatUptime,
@@ -661,6 +662,8 @@ function FeishuChannelsPanel(): JSX.Element | null {
     }
   }, [busy, draft, hostBusy, issues, onPickDirectory, panel, renderedFields, updateDraft])
 
+  const profiles = useFeishuProfiles(panel?.access ?? null)
+
   const credentials = useMemo<CredentialsView>(() => ({
     appId: appIdInput,
     appSecret: appSecretInput,
@@ -750,6 +753,7 @@ function FeishuChannelsPanel(): JSX.Element | null {
           ? (
               <AccessTab
                 form={form}
+                profiles={profiles}
                 accessNotice={accessNotice}
                 accessError={accessError}
                 onAddGroup={onAddAccessGroup}
@@ -764,6 +768,7 @@ function FeishuChannelsPanel(): JSX.Element | null {
           ? (
               <WikiTab
                 form={form}
+                profiles={profiles}
                 accessNotice={accessNotice}
                 accessError={accessError}
                 onAddUser={(userId, name) => addUser(addWikiUser, userId, name, PANEL_COPY.wikiUserAdded)}

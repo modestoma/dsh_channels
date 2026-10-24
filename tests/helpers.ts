@@ -20,7 +20,7 @@ import type {
   CreatedWorktree, WorkingDirectoryService, WorktreeService,
 } from '../src/session/isolation.ts'
 import type {
-  BotAddedEvent, CardActionEvent, ChatInfo, FeishuChannel, FeishuConnectionStatus, NormalizedMessage,
+  BotAddedEvent, CardActionEvent, ChatInfo, FeishuChannel, FeishuConnectionStatus, FeishuProfile, NormalizedMessage,
   OutboundMedia, RawMessageListParams, SendResult,
 } from '../src/feishu-channel.ts'
 import type { RawDomainHandle } from '../src/domain.ts'
@@ -760,8 +760,12 @@ export interface FakeChannelOptions {
   connectionStatus?: FeishuConnectionStatus
   /** Chat info returned by the `getChatInfo` stub (defaults to a group shell). */
   chatInfo?: (chatId: string) => ChatInfo | Promise<ChatInfo>
-  /** User-name lookup stub; omitted = the channel has no name lookup. */
-  userName?: (userId: string, chatId?: string) => Promise<string | undefined>
+  /** Contact-profile batch stub; omitted = the channel has no profile lookup. */
+  userProfiles?: (userIds: readonly string[]) => Promise<ReadonlyMap<string, FeishuProfile>>
+  /** Chat-profile stub; omitted = the channel has no chat-profile lookup. */
+  chatProfile?: (chatId: string) => Promise<FeishuProfile>
+  /** Chat-member name stub; omitted = the channel has no member-list lookup. */
+  memberName?: (userId: string, chatId: string) => Promise<string | undefined>
   /** App-owner lookup stub; omitted = the channel has no owner lookup. */
   appOwnerUserId?: () => Promise<string | undefined>
   /** Scope-grant stub; omitted = the channel has no scope self-check. */
@@ -874,7 +878,9 @@ export function makeChannel(options: FakeChannelOptions = {}): FeishuChannel & {
       if (options.chatInfo !== undefined) return options.chatInfo(chatId)
       return { chatId, chatType: 'group' }
     }),
-    ...(options.userName === undefined ? {} : { userName: vi.fn(options.userName) }),
+    ...(options.userProfiles === undefined ? {} : { userProfiles: vi.fn(options.userProfiles) }),
+    ...(options.chatProfile === undefined ? {} : { chatProfile: vi.fn(options.chatProfile) }),
+    ...(options.memberName === undefined ? {} : { memberName: vi.fn(options.memberName) }),
     botOpenId: () => 'bot-open-id',
     getConnectionStatus: vi.fn(() => options.connectionStatus),
     connect: vi.fn(async () => {}),

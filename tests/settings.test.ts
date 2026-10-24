@@ -32,6 +32,8 @@ import {
   PANEL_COPY,
   PANEL_ROUTE,
   PICK_DIRECTORY_ROUTE,
+  PROFILES_MAX_IDS,
+  PROFILES_ROUTE,
   SESSION_ORIGIN_ROUTE,
   PANEL_TABS,
   TAB_FIELD_GROUPS,
@@ -46,6 +48,7 @@ import type {
   CredentialField,
   EditableValues,
   ScopeCheckWire,
+  FeishuProfilesWire,
   SessionOriginWire,
   SlashCommandSyncWire,
 } from '../src/settings/contract.ts'
@@ -134,6 +137,7 @@ class FakeTarget implements SettingsTarget {
   /** Origins by session id; absent ids are Sessions Feishu never routed. */
   origins = new Map<string, SessionOriginWire>()
   originCalls: string[] = []
+  profileCalls: Array<{ users: readonly string[]; chats: readonly string[] }> = []
   /** Admission snapshot handed to the panel (the real service keeps it in memory). */
   accessState: AccessWire = {
     mode: 'guarded',
@@ -294,6 +298,14 @@ class FakeTarget implements SettingsTarget {
   async sessionOrigin(sessionId: string): Promise<SessionOriginWire | null> {
     this.originCalls.push(sessionId)
     return this.origins.get(sessionId) ?? null
+  }
+
+  async feishuProfiles(userIds: readonly string[], chatIds: readonly string[]): Promise<FeishuProfilesWire> {
+    this.profileCalls.push({ users: userIds, chats: chatIds })
+    return {
+      users: Object.fromEntries(userIds.map(id => [id, { name: `名-${id}` }])),
+      chats: Object.fromEntries(chatIds.map(id => [id, { name: `群-${id}`, avatarUrl: `https://cdn.example/${id}.png` }])),
+    }
   }
 
   async resolveAccessRequest(token: string, decision: 'allow' | 'deny'): Promise<AccessMutationResponse> {
@@ -1810,6 +1822,7 @@ const ALL_SETTINGS_ROUTES: Array<{ route: string; method: string }> = [
   { route: ACCESS_WIKI_USERS_ROUTE, method: 'POST' },
   { route: ACCESS_REQUESTS_ROUTE, method: 'POST' },
   { route: SESSION_ORIGIN_ROUTE, method: 'GET' },
+  { route: PROFILES_ROUTE, method: 'GET' },
 ]
 
 describe('settings routes', () => {
@@ -1844,6 +1857,7 @@ describe('settings routes', () => {
       expect(target.restartCalls).toBe(0)
       expect(target.accessCalls).toEqual([])
       expect(target.originCalls).toEqual([])
+      expect(target.profileCalls).toEqual([])
     }
   })
 
@@ -1901,6 +1915,30 @@ describe('settings routes', () => {
     expect(target.originCalls).toEqual(['s_feishu', 's_web'])
 
     const post = await call(routes, SESSION_ORIGIN_ROUTE, makeRequest({ method: 'POST', url: SESSION_ORIGIN_ROUTE }))
+    expect(post.status).toBe(405)
+  })
+
+  it('serves Feishu profiles for comma-separated ids over GET and bounds the id count', async () => {
+    const { surface, target } = makeSurface()
+    const { server, routes } = makeWebServer()
+    registerSettingsRoutes(server, allowAll, surface)
+
+    const hit = await call(routes, PROFILES_ROUTE, makeRequest({ url: `${PROFILES_ROUTE}?users=u_1,%20u_2,u_1,&chats=oc_1` }))
+    expect(hit.status).toBe(200)
+    expect(JSON.parse(hit.body)).toEqual({
+      users: { u_1: { name: '名-u_1' }, u_2: { name: '名-u_2' } },
+      chats: { oc_1: { name: '群-oc_1', avatarUrl: 'https://cdn.example/oc_1.png' } },
+    })
+    const none = await call(routes, PROFILES_ROUTE, makeRequest({ url: PROFILES_ROUTE }))
+    expect(JSON.parse(none.body)).toEqual({ users: {}, chats: {} })
+    expect(target.profileCalls).toEqual([{ users: ['u_1', 'u_2'], chats: ['oc_1'] }, { users: [], chats: [] }])
+
+    const many = Array.from({ length: PROFILES_MAX_IDS + 1 }, (_, index) => `u_${index}`).join(',')
+    const tooMany = await call(routes, PROFILES_ROUTE, makeRequest({ url: `${PROFILES_ROUTE}?users=${many}` }))
+    expect(tooMany.status).toBe(400)
+    expect(target.profileCalls).toHaveLength(2)
+
+    const post = await call(routes, PROFILES_ROUTE, makeRequest({ method: 'POST', url: PROFILES_ROUTE }))
     expect(post.status).toBe(405)
   })
 

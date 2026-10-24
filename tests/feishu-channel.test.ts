@@ -21,8 +21,13 @@ const sdk = vi.hoisted(() => {
         },
       },
       request: vi.fn(async (): Promise<unknown> => ({ data: { items: [] } })),
+      contact: {
+        v3: { user: { batch: vi.fn(async (): Promise<unknown> => ({ code: 0, data: { items: [] } })) } },
+      },
       im: {
         v1: {
+          chat: { get: vi.fn(async (): Promise<unknown> => ({ code: 0, data: {} })) },
+          chatMembers: { get: vi.fn(async (): Promise<unknown> => ({ code: 0, data: { items: [] } })) },
           message: {
             get: vi.fn(async () => ({ data: { items: [] } })),
             list: vi.fn(async () => ({ data: { items: [], has_more: false } })),
@@ -137,6 +142,61 @@ describe('LarkChannelAdapter', () => {
       await expect(api?.list()).rejects.toMatchObject({ code: 99991672, detail: 'code=99991672 denied' })
       request().mockRejectedValueOnce(Object.assign(new Error('400'), { response: { data: { code: 40000000, msg: 'exists' } } }))
       await expect(api?.create({ command: 'help', description: 'h' })).rejects.toBeInstanceOf(FeishuApiError)
+    })
+  })
+
+  describe('profiles', () => {
+    const batch = () => sdk.channel.rawClient.contact.v3.user.batch
+    const chat = () => sdk.channel.rawClient.im.v1.chat.get
+    const members = () => sdk.channel.rawClient.im.v1.chatMembers.get
+
+    it('batches user_ids 50 per call and keeps names and https avatars', async () => {
+      const ids = Array.from({ length: 51 }, (_, index) => `u_${index}`)
+      batch()
+        .mockResolvedValueOnce({ code: 0, data: { items: [
+          { user_id: 'u_0', name: ' 张三 ', avatar: { avatar_72: 'https://cdn.example/u0.png' } },
+          { user_id: 'u_1', name: '', avatar: { avatar_72: 'javascript:alert(1)' } },
+          { name: '无 id' },
+        ] } })
+        .mockResolvedValueOnce({ code: 0, data: { items: [{ user_id: 'u_50', name: '李四' }] } })
+      const profiles = await defaultChannelFactory(options).userProfiles?.(ids)
+      expect(profiles).toEqual(new Map([
+        ['u_0', { name: '张三', avatarUrl: 'https://cdn.example/u0.png' }],
+        ['u_1', {}],
+        ['u_50', { name: '李四' }],
+      ]))
+      expect(batch()).toHaveBeenNthCalledWith(1, { params: { user_ids: ids.slice(0, 50), user_id_type: 'user_id' } })
+      expect(batch()).toHaveBeenNthCalledWith(2, { params: { user_ids: ['u_50'], user_id_type: 'user_id' } })
+    })
+
+    it('rejects a failed user batch with the Feishu code', async () => {
+      batch().mockResolvedValueOnce({ code: 99991672, msg: 'Access denied' })
+      await expect(defaultChannelFactory(options).userProfiles?.(['u_1']))
+        .rejects.toMatchObject({ code: 99991672, detail: 'code=99991672 Access denied' })
+    })
+
+    it('reads a chat name and avatar, and rejects a failed chat read', async () => {
+      chat().mockResolvedValueOnce({ code: 0, data: { name: '研发群', avatar: 'https://cdn.example/oc.png' } })
+      await expect(defaultChannelFactory(options).chatProfile?.('oc_1'))
+        .resolves.toEqual({ name: '研发群', avatarUrl: 'https://cdn.example/oc.png' })
+      expect(chat()).toHaveBeenCalledWith({ path: { chat_id: 'oc_1' } })
+      chat().mockResolvedValueOnce({ code: 232011, msg: 'not found' })
+      await expect(defaultChannelFactory(options).chatProfile?.('oc_2')).rejects.toBeInstanceOf(FeishuApiError)
+    })
+
+    it('scans chat member pages for a name and gives up quietly', async () => {
+      members()
+        .mockResolvedValueOnce({ code: 0, data: { items: [{ member_id: 'u_x', name: 'X' }], has_more: true, page_token: 'p2' } })
+        .mockResolvedValueOnce({ code: 0, data: { items: [{ member_id: 'u_1', name: ' 张三 ' }] } })
+      await expect(defaultChannelFactory(options).memberName?.('u_1', 'oc_1')).resolves.toBe('张三')
+      expect(members()).toHaveBeenLastCalledWith({
+        path: { chat_id: 'oc_1' },
+        params: { member_id_type: 'user_id', page_size: 100, page_token: 'p2' },
+      })
+      members().mockResolvedValueOnce({ code: 0, data: { items: [], has_more: false } })
+      await expect(defaultChannelFactory(options).memberName?.('u_1', 'oc_1')).resolves.toBeUndefined()
+      members().mockRejectedValueOnce(new Error('no scope'))
+      await expect(defaultChannelFactory(options).memberName?.('u_1', 'oc_1')).resolves.toBeUndefined()
     })
   })
 

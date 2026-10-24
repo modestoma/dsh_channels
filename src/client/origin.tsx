@@ -7,6 +7,7 @@
 
 import { useCallback, useEffect, useState } from 'react'
 import type { SessionOriginWire } from '../settings/contract.ts'
+import { Avatar } from './avatar.tsx'
 import { loadSessionOrigin } from './origin-cache.ts'
 import { FeishuChannelsIcon } from './icon.tsx'
 
@@ -22,8 +23,11 @@ type OriginState =
   | { phase: 'ready'; origin: SessionOriginWire | null }
   | { phase: 'error'; message: string }
 
-/** Load one Session's origin; `reload` asks the Host again. */
-function useSessionOrigin(sessionId: string): [OriginState, () => void] {
+/**
+ * Load one Session's origin; `reload` asks the Host again. `fresh` skips the
+ * shared cache on the first load too, so names and avatars are current.
+ */
+function useSessionOrigin(sessionId: string, fresh = false): [OriginState, () => void] {
   const [state, setState] = useState<OriginState>({ phase: 'loading' })
   // A reload is tied to the Session it was asked for, so switching Sessions
   // never shows the previous Session's origin while the new one loads.
@@ -32,24 +36,32 @@ function useSessionOrigin(sessionId: string): [OriginState, () => void] {
   useEffect(() => {
     let live = true
     setState(current => (current.phase === 'ready' && ticket > 0 ? current : { phase: 'loading' }))
-    loadSessionOrigin(sessionId, ticket > 0).then(
+    loadSessionOrigin(sessionId, fresh || ticket > 0).then(
       origin => { if (live) setState({ phase: 'ready', origin }) },
       (error: unknown) => {
         if (live) setState({ phase: 'error', message: error instanceof Error ? error.message : String(error) })
       },
     )
     return () => { live = false }
-  }, [sessionId, ticket])
+  }, [fresh, sessionId, ticket])
   const reload = useCallback(() => {
     setReloadOf(current => ({ sessionId, ticket: current.sessionId === sessionId ? current.ticket + 1 : 1 }))
   }, [sessionId])
   return [state, reload]
 }
 
-/** Short source label: group name, or 私聊. */
+/** Header chip text: group name, or 私聊 with the peer's name. */
 function sourceLabel(origin: SessionOriginWire): string {
-  if (origin.chatType === 'p2p') return '飞书私聊'
+  if (origin.chatType === 'p2p') return origin.senderName === undefined ? '飞书私聊' : `私聊 · ${origin.senderName}`
   return origin.chatName === undefined ? '飞书群聊' : origin.chatName
+}
+
+/** Tab heading: the group, or the private-chat peer, with its avatar. */
+function originHeading(origin: SessionOriginWire): { title: string; avatarUrl?: string } {
+  if (origin.chatType === 'p2p') {
+    return { title: origin.senderName ?? '飞书私聊', ...(origin.senderAvatarUrl === undefined ? {} : { avatarUrl: origin.senderAvatarUrl }) }
+  }
+  return { title: origin.chatName ?? '飞书群聊', ...(origin.chatAvatarUrl === undefined ? {} : { avatarUrl: origin.chatAvatarUrl }) }
 }
 
 /** Times a mounted header re-asks after a null answer, and the delay between asks. */
@@ -117,7 +129,7 @@ function formatTime(ms: number): string {
  * @returns the origin page.
  */
 export function OriginTab({ sessionId }: OriginTabProps): JSX.Element {
-  const [state, reload] = useSessionOrigin(sessionId)
+  const [state, reload] = useSessionOrigin(sessionId, true)
   return (
     <div className="dsh-channels-origin">
       {state.phase === 'loading' ? <div className="dsh-channels-origin__muted">正在读取飞书来源…</div> : null}
@@ -152,12 +164,13 @@ function OriginDetails({ origin, onRefresh }: { origin: SessionOriginWire; onRef
     rows.push(['群 ID', <span className="dsh-channels-origin__mono">{origin.chatId}</span>])
   }
   rows.push([origin.shared ? '请求人' : '发起人', (
-    <span>
-      {origin.senderName ?? null}
-      {origin.senderName === undefined ? null : ' '}
+    <span className="dsh-channels-origin__who">
+      <Avatar text={origin.senderName ?? origin.senderUserId} url={origin.senderAvatarUrl} size={20} />
+      {origin.senderName === undefined ? null : <span>{origin.senderName}</span>}
       <span className="dsh-channels-origin__mono dsh-channels-origin__muted">{origin.senderUserId}</span>
     </span>
   )])
+  const heading = originHeading(origin)
   if (origin.shared) rows.push(['说明', '日志平台分析话题，群内成员都可以继续'])
   rows.push(['开始于', formatTime(origin.createdAt)])
   rows.push(origin.bound && origin.lastActivityAt !== undefined
@@ -166,8 +179,10 @@ function OriginDetails({ origin, onRefresh }: { origin: SessionOriginWire; onRef
   return (
     <>
       <div className="dsh-channels-origin__head">
-        <FeishuChannelsIcon size={16} active={false} />
-        <span className="dsh-channels-origin__title">{sourceLabel(origin)}</span>
+        {heading.avatarUrl === undefined
+          ? <FeishuChannelsIcon size={16} active={false} />
+          : <Avatar text={heading.title} url={heading.avatarUrl} size={28} />}
+        <span className="dsh-channels-origin__title">{heading.title}</span>
       </div>
       <dl className="dsh-channels-origin__list">
         {rows.map(([label, value]) => (
