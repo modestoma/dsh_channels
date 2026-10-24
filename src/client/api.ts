@@ -16,6 +16,7 @@ import {
   CREDENTIALS_ROUTE,
   PANEL_ROUTE,
   PICK_DIRECTORY_ROUTE,
+  PROFILES_MAX_IDS,
   PROFILES_ROUTE,
   RECONNECT_ROUTE,
   SESSION_ORIGIN_ROUTE,
@@ -97,14 +98,29 @@ export async function fetchSessionOrigin(sessionId: string): Promise<SessionOrig
 }
 
 /**
- * Live Feishu names and avatars of the given users and chats.
+ * Live Feishu names and avatars of the given users and chats, split into
+ * requests of at most {@link PROFILES_MAX_IDS} ids per list and merged.
  * @param userIds - user `user_id`s.
  * @param chatIds - chat `chat_id`s.
- * @returns the profiles Feishu resolved, by id.
+ * @returns the profiles Feishu resolved, by id, with every request's warning.
  */
 export async function fetchFeishuProfiles(userIds: readonly string[], chatIds: readonly string[]): Promise<FeishuProfilesWire> {
-  const query = new URLSearchParams({ users: userIds.join(','), chats: chatIds.join(',') }).toString()
-  return readJson<FeishuProfilesWire>(await request(`${PROFILES_ROUTE}?${query}`))
+  const requests: Array<Promise<FeishuProfilesWire>> = []
+  const rounds = Math.max(1, Math.ceil(userIds.length / PROFILES_MAX_IDS), Math.ceil(chatIds.length / PROFILES_MAX_IDS))
+  for (let round = 0; round < rounds; round += 1) {
+    const window = (ids: readonly string[]): string => ids.slice(round * PROFILES_MAX_IDS, (round + 1) * PROFILES_MAX_IDS).join(',')
+    const query = new URLSearchParams({ users: window(userIds), chats: window(chatIds) }).toString()
+    requests.push(request(`${PROFILES_ROUTE}?${query}`).then(response => readJson<FeishuProfilesWire>(response)))
+  }
+  const merged: FeishuProfilesWire = { users: {}, chats: {} }
+  const warnings = new Set<string>()
+  for (const part of await Promise.all(requests)) {
+    Object.assign(merged.users, part.users)
+    Object.assign(merged.chats, part.chats)
+    if (part.warning !== undefined) warnings.add(part.warning)
+  }
+  if (warnings.size > 0) merged.warning = [...warnings].join('；')
+  return merged
 }
 
 /**
