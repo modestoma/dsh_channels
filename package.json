@@ -1,7 +1,7 @@
 {
   "name": "@modesto_ma/dsh-channels",
   "version": "0.0.0",
-  "description": "DeepSeek Harness (DSH) 飞书渠道插件：一个 dsh 实例对应一个飞书机器人，私聊/群聊/话题群 @ 触发会话，话题绑定 session，卡片 2.0 流式回复；Web 设置里提供「飞书渠道」状态与常用配置面板",
+  "description": "DeepSeek Harness (DSH) 飞书渠道插件：一个 dsh 实例对应一个飞书机器人，私聊/群聊/话题群 @ 触发会话，话题绑定 session，卡片 2.0 流式回复；Web 左侧栏提供「飞书渠道」状态与常用配置面板",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/modestoma/dsh_channels.git"
