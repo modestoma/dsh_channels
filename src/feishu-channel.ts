@@ -71,6 +71,13 @@ export interface FeishuChannel {
   onBotAdded(handler: (event: BotAddedEvent) => void | Promise<void>): () => void
   /** Chat name/owner/member count (needs chat-info read permission). */
   getChatInfo(chatId: string): Promise<ChatInfo>
+  /**
+   * Display name of one tenant user by `user_id`: the contact profile first
+   * (`contact:user.base:readonly`), then the member list of `chatId` when given
+   * (`im:chat:readonly`). Resolves `undefined` when neither source names the
+   * user; never rejects. Optional so stubs can omit it.
+   */
+  userName?(userId: string, chatId?: string): Promise<string | undefined>
   /** Bot open_id, available after `connect()` resolves. */
   botOpenId(): string | undefined
   /**
@@ -278,6 +285,9 @@ function assertFeishuOk(response: { code?: number; msg?: string }): void {
   }
 }
 
+/** Member-list pages `userName()` scans before giving up (100 members each). */
+const USER_NAME_MEMBER_PAGES = 5
+
 /** Run one raw request, mapping thrown and non-zero-code failures to {@link FeishuApiError}. */
 async function feishuCall<T extends { code?: number; msg?: string }>(call: () => Promise<T>): Promise<T> {
   let response: T
@@ -448,6 +458,40 @@ class LarkChannelAdapter implements FeishuChannel {
 
   async getChatInfo(chatId: string): Promise<ChatInfo> {
     return this.channel.getChatInfo(chatId)
+  }
+
+  async userName(userId: string, chatId?: string): Promise<string | undefined> {
+    const client = this.channel.rawClient
+    try {
+      const response = await feishuCall(() => client.contact.v3.user.get({
+        path: { user_id: userId },
+        params: { user_id_type: 'user_id' },
+      }))
+      const name = response.data?.user?.name?.trim()
+      if (name !== undefined && name !== '') return name
+    } catch (_profileUnavailable) {
+      // Missing contact scope or user outside the app's contact range: the
+      // chat member list below may still name the user.
+    }
+    if (chatId === undefined) return undefined
+    let pageToken: string | undefined
+    for (let page = 0; page < USER_NAME_MEMBER_PAGES; page += 1) {
+      let response
+      try {
+        response = await feishuCall(() => client.im.v1.chatMembers.get({
+          path: { chat_id: chatId },
+          params: { member_id_type: 'user_id', page_size: 100, ...(pageToken === undefined ? {} : { page_token: pageToken }) },
+        }))
+      } catch (_membersUnavailable) {
+        // No chat-read scope, or a chat the bot left: the caller shows the id.
+        return undefined
+      }
+      const hit = response.data?.items?.find(item => item.member_id === userId)?.name?.trim()
+      if (hit !== undefined && hit !== '') return hit
+      pageToken = response.data?.page_token
+      if (response.data?.has_more !== true || pageToken === undefined) return undefined
+    }
+    return undefined
   }
 
   botOpenId(): string | undefined {

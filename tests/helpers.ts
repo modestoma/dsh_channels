@@ -760,6 +760,8 @@ export interface FakeChannelOptions {
   connectionStatus?: FeishuConnectionStatus
   /** Chat info returned by the `getChatInfo` stub (defaults to a group shell). */
   chatInfo?: (chatId: string) => ChatInfo | Promise<ChatInfo>
+  /** User-name lookup stub; omitted = the channel has no name lookup. */
+  userName?: (userId: string, chatId?: string) => Promise<string | undefined>
   /** App-owner lookup stub; omitted = the channel has no owner lookup. */
   appOwnerUserId?: () => Promise<string | undefined>
   /** Scope-grant stub; omitted = the channel has no scope self-check. */
@@ -872,6 +874,7 @@ export function makeChannel(options: FakeChannelOptions = {}): FeishuChannel & {
       if (options.chatInfo !== undefined) return options.chatInfo(chatId)
       return { chatId, chatType: 'group' }
     }),
+    ...(options.userName === undefined ? {} : { userName: vi.fn(options.userName) }),
     botOpenId: () => 'bot-open-id',
     getConnectionStatus: vi.fn(() => options.connectionStatus),
     connect: vi.fn(async () => {}),

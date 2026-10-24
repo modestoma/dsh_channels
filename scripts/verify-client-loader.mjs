@@ -53,28 +53,47 @@ assert.equal(typeof plugin.name, 'string')
 
 const registrations = []
 const effects = []
+const tabTypes = []
+const opened = []
+const scopeDeps = []
+const fakeSlots = {
+  inject: (slot, contribution) => { contribution() },
+  register: (declaration, component) => {
+    registrations.push({ declaration, component })
+    return () => {}
+  },
+}
 plugin.apply({
   effect: callback => { effects.push(callback()) },
-  slots: {
-    inject: (slot, contribution) => { contribution() },
-    register: (declaration, component) => {
-      registrations.push({ declaration, component })
-      return () => {}
-    },
+  slots: fakeSlots,
+  inject: (deps, callback) => {
+    scopeDeps.push(deps)
+    callback({
+      effect: callback => { effects.push(callback()) },
+      slots: fakeSlots,
+      sidebarRightTabs: { register: definition => { tabTypes.push(definition); return () => {} } },
+      sidebarRight: { openTab: kind => { opened.push(kind) } },
+    })
   },
 })
 
 assert.equal(styles.length, 1, 'stylesheet was not installed')
 assert.deepEqual(
   registrations.map(({ declaration }) => declaration.name),
-  ['main', 'sidebar.panellist'],
-  'expected the main page and the left-sidebar entry',
+  ['main', 'sidebar.panellist', 'sidebar.right.pane.tab', 'conversation.session.header.actions'],
+  'expected the main page, the left-sidebar entry, the origin tab body, and the header entry',
 )
-const [page, entry] = registrations
+const [page, entry, originTab, originAction] = registrations
 assert.equal(page.declaration.key, 'feishu-channels')
 assert.equal(entry.declaration.id, 'feishu-channels', 'sidebar row id must address the main page key')
 assert.equal(entry.declaration.label(), '飞书渠道')
-assert.equal(typeof page.component, 'function')
-assert.equal(typeof entry.component, 'function')
+for (const { component } of registrations) assert.equal(typeof component, 'function')
 
-console.log('OK: lib/client.js loads through the module-loader shim and registers the 飞书渠道 sidebar entry + page')
+assert.deepEqual(scopeDeps, [['sidebarRightTabs', 'sidebarRight']])
+assert.equal(tabTypes.length, 1, 'origin tab type was not registered')
+assert.equal(originTab.declaration.key, tabTypes[0].id, 'tab body must be keyed by the tab type id')
+assert.equal(tabTypes[0].title(''), '飞书来源')
+originAction.declaration.inject('s_1').openOrigin()
+assert.deepEqual(opened, [tabTypes[0].kind], 'header entry must open the origin tab kind')
+
+console.log('OK: lib/client.js loads through the module-loader shim and registers the 飞书渠道 sidebar entry, page, and origin tab')

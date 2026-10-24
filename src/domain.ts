@@ -321,6 +321,34 @@ export const analyzeRequestRecordSchema = z.object({
 
 export type AnalyzeRequestRecord = z.infer<typeof analyzeRequestRecordSchema>
 
+/**
+ * Where one Feishu-routed Session came from, keyed by its DSH session id.
+ * Written the first time a route record names the Session (new topic,
+ * `/renew`, analyze API) and kept after the route retires, so the Web
+ * client can still show the origin of an old Session. Names are resolved
+ * live when read, never stored.
+ */
+export const sessionOriginRecordSchema = z.object({
+  /** DSH session id (also the table key). */
+  key: z.string().min(1),
+  /** Route key the Session was bound under (thread_id or chat:<chatId>). */
+  routeKey: z.string().min(1),
+  /** Topic-scoped (`thread`) or chat-scoped (`chat`) route. */
+  kind: z.enum(['thread', 'chat']),
+  /** Feishu chat the Session was started from. */
+  chatId: z.string().min(1),
+  /** `p2p` or `group`. */
+  chatType: z.enum(['p2p', 'group']),
+  /** `user_id` of the user who started the Session (the requester for analyze topics). */
+  senderUserId: z.string().min(1),
+  /** Epoch ms when the Session was bound to the route. */
+  createdAt: z.number().int().nonnegative(),
+  /** Group-shared route (log-platform analysis topic). */
+  shared: z.literal(true).optional(),
+})
+
+export type SessionOriginRecord = z.infer<typeof sessionOriginRecordSchema>
+
 export interface FeishuDomainSpecShape {
   name: 'channels_routes_v2'
   version: 1
@@ -365,6 +393,10 @@ export interface FeishuDomainSpecShape {
       valueSchema: typeof analyzeRequestRecordSchema
       __key?: string
     }
+    session_origins: {
+      valueSchema: typeof sessionOriginRecordSchema
+      __key?: string
+    }
   }
 }
 
@@ -407,6 +439,8 @@ export const feishuDomain: FeishuDomainSpecShape = {
     access_wiki_users: { valueSchema: accessUserRecordSchema },
     // Analyze API idempotency records; a missing table loads empty.
     analyze_requests: { valueSchema: analyzeRequestRecordSchema },
+    // Session id → Feishu origin; a missing table loads empty.
+    session_origins: { valueSchema: sessionOriginRecordSchema },
   },
 }
 
@@ -480,6 +514,12 @@ export interface AnalyzeRequestsTable {
   entries(): IterableIterator<[string, AnalyzeRequestRecord]>
 }
 
+/** Normalized table handle for the session-origin table (key = DSH session id). */
+export interface SessionOriginsTable {
+  get(key: string): SessionOriginRecord | undefined
+  put(key: string, value: SessionOriginRecord): Promise<unknown> | void
+}
+
 /** Normalized domain handle. */
 export interface FeishuDomainHandle {
   routes: RoutesTable
@@ -493,6 +533,8 @@ export interface FeishuDomainHandle {
   accessWikiUsers: AccessUsersTable
   /** Analyze API idempotency records. */
   analyzeRequests: AnalyzeRequestsTable
+  /** Feishu origin of every Session a route ever named. */
+  sessionOrigins: SessionOriginsTable
   getGlobal(): FeishuDomainGlobal
   setGlobal(value: FeishuDomainGlobal): Promise<unknown> | void
   close(): Promise<void>

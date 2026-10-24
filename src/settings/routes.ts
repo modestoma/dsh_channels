@@ -28,6 +28,7 @@ import {
   PANEL_ROUTE,
   PICK_DIRECTORY_ROUTE,
   RECONNECT_ROUTE,
+  SESSION_ORIGIN_ROUTE,
   STATUS_ROUTE,
 } from './contract.ts'
 import type {
@@ -249,6 +250,24 @@ export function registerSettingsRoutes(
           url.searchParams.get('provider') ?? undefined,
           url.searchParams.get('model') ?? undefined,
         ))
+      }),
+    }),
+    server.register({
+      kind: 'exact',
+      path: SESSION_ORIGIN_ROUTE,
+      handler: guarded(async (req, res) => {
+        if (!allowOnly(req, res, ['GET', 'HEAD'])) return
+        if (methodOf(req) === 'HEAD') {
+          res.writeHead(200, { 'cache-control': 'no-store' })
+          res.end()
+          return
+        }
+        const sessionId = new URL(req.url ?? '/', 'http://dsh.local').searchParams.get('sessionId')?.trim()
+        if (sessionId === undefined || sessionId === '') {
+          sendJson(res, 400, { ok: false, error: '缺少 sessionId 参数' })
+          return
+        }
+        sendJson(res, 200, await surface.sessionOrigin(sessionId))
       }),
     }),
     server.register({

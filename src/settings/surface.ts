@@ -48,6 +48,8 @@ import type {
   SaveCredentialsRequest,
   SaveCredentialsResponse,
   ScopeCheckWire,
+  SessionOriginResponse,
+  SessionOriginWire,
   SlashCommandSyncWire,
   StringListItemFormat,
 } from './contract.ts'
@@ -116,6 +118,8 @@ export interface SettingsTarget {
   removeWikiUser(userId: string): Promise<AccessMutationResponse>
   /** Settle one pending request (panel shares this path with the Feishu DM card). */
   resolveAccessRequest(token: string, decision: 'allow' | 'deny'): Promise<AccessMutationResponse>
+  /** Feishu origin of one Session, or null when Feishu never routed it. */
+  sessionOrigin(sessionId: string): Promise<SessionOriginWire | null>
 }
 
 /** Presence/source/writability facts returned by the credentials seam. */
@@ -720,6 +724,11 @@ export class SettingsSurface {
    * the draft provider/model changes). A broken lookup degrades to the
    * free-text form instead of failing the panel.
    */
+  /** Feishu origin of one Session for the conversation sidebar. */
+  async sessionOrigin(sessionId: string): Promise<SessionOriginResponse> {
+    return { origin: await this.target.sessionOrigin(sessionId) }
+  }
+
   async catalogFor(provider?: string, model?: string): Promise<CatalogWire> {
     if (this.catalog === undefined) return emptyCatalog()
     try {

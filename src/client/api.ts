@@ -17,6 +17,7 @@ import {
   PANEL_ROUTE,
   PICK_DIRECTORY_ROUTE,
   RECONNECT_ROUTE,
+  SESSION_ORIGIN_ROUTE,
   STATUS_ROUTE,
 } from '../settings/contract.ts'
 import type {
@@ -34,6 +35,7 @@ import type {
   SaveConfigResponse,
   SaveCredentialsRequest,
   SaveCredentialsResponse,
+  SessionOriginResponse,
 } from '../settings/contract.ts'
 
 function messageOf(error: unknown): string {
@@ -84,6 +86,12 @@ export async function fetchPanel(): Promise<PanelWire> {
 /** Status-only payload polled while the page is open. */
 export async function fetchStatus(): Promise<ChannelStatusWire> {
   return readJson<ChannelStatusWire>(await request(STATUS_ROUTE))
+}
+
+/** Feishu origin of one Session (`origin: null` when Feishu never routed it). */
+export async function fetchSessionOrigin(sessionId: string): Promise<SessionOriginResponse> {
+  const query = new URLSearchParams({ sessionId }).toString()
+  return readJson<SessionOriginResponse>(await request(`${SESSION_ORIGIN_ROUTE}?${query}`))
 }
 
 /**
