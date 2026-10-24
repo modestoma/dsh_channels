@@ -13,7 +13,7 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 - **结构化提问**：模型调用 `ask_user_question` 时，插件监听主机 `user-questions/request` 瀑布并发一张问答卡（每个问题一组选项按钮，多选先勾选再「提交本题选择」），答案回填给模型；主机自带的应答者只有 Web 客户端，没有本插件时纯飞书会话会以 `NO_PROVIDER` 失败。超时（`questionTimeoutMs`，默认 5 分钟）或回合取消时本轮提问失败（fail-closed）；没有可选项的问题直接提示用文字作答，**阻塞期间普通文本回复即作为该问题的自由文本答案**（同时支持多选后的自定义文本）
 - **准入与授权（默认开启）**：**管理员不受白名单限制**（私聊、任意群聊——包括尚未授权的群——都能直接发起会话）；其他人私聊只收到一条固定提示（`/userid` 例外），群聊需要「群已授权 + 用户在全局白名单」两层同时命中。机器人被拉进群后私聊管理员发**群信息卡**（未授权群附授权按钮，用于放行白名单用户）；已授权群里未授权用户 @ 会触发用户授权卡。授权入口：飞书 `/auth` 命令、授权卡、Web 设置面板；管理员 user_id 在面板配置（私聊 `/userid` 获取），**留空时自动使用飞书应用所有者**
 - 全部基于飞书官方 SDK [`@larksuiteoapi/node-sdk`](https://www.npmjs.com/package/@larksuiteoapi/node-sdk)（WebSocket 长连接，免公网）
-- **Web 设置面板**：Web/桌面端 **设置 → 飞书渠道**，顶部状态头 + 7 个标签页（连接 / 会话 / 模型 / 附件与工具 / 访问授权 / 知识库 / 高级）；凭据不完整时插件不连接、面板显示三步引导，填写保存后自动连接（保存写入本机覆盖文件，部分字段需重连生效）；详见下文「Web 设置面板」章节
+- **Web 设置面板**：Web/桌面端左侧栏 **飞书渠道** 入口（主区整页），顶部状态头 + 7 个标签页（连接 / 会话 / 模型 / 附件与工具 / 访问授权 / 知识库 / 高级）；凭据不完整时插件不连接、面板显示三步引导，填写保存后自动连接（保存写入本机覆盖文件，部分字段需重连生效）；详见下文「Web 设置面板」章节
 
 设计与可行性论证见 [docs/feasibility-and-design.md](docs/feasibility-and-design.md)；工作区粒度与会话隔离的取舍见 [docs/workspace-isolation-design.md](docs/workspace-isolation-design.md)；入站附件管线（存储 / 清单 / 工具 / 引用与历史 / 降级 / 隐私边界）见 [docs/attachment-pipeline-v2.md](docs/attachment-pipeline-v2.md)。
 
@@ -59,9 +59,9 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
    - 第二行：`📊 上下文 {tokens}/{window} ({占比}) · 📩 输入 {n} · 📨 输出 {n} · ⚡ 缓存命中 {pct}`。占比 = 上下文 tokens / 窗口（<10% 保留一位小数，≥10% 取整）；没有窗口时只显示 tokens
    - 输入/输出为 session 累计口径；模型、推理强度、缓存命中按**当前轮次**，本轮在请求头产生前失败时模型/缓存命中显示 `—`、推理强度省略，不会沿用上一轮
 
-## Web 设置面板（设置 → 飞书渠道）
+## Web 设置面板（左侧栏 → 飞书渠道）
 
-包内含可选的浏览器半区（`lib/client.js`，DSH client module）：在 Web/桌面端 **设置** 导航注册「飞书渠道」分区。宿主没有 `webServer` 服务（headless profile）时不加载面板，飞书通道本身不受影响。
+包内含可选的浏览器半区（`lib/client.js`，DSH client module）：在 Web/桌面端左侧栏注册「飞书渠道」全局入口（`sidebar.panellist`），点击后在主区打开整页面板（`main` 槽）。宿主没有 `webServer` 服务（headless profile）时不加载面板，飞书通道本身不受影响。
 
 **连接时机**：启用插件时**不会无条件连接飞书**。插件启动先读取 profile 配置与 Web 覆盖，再检查 `appId` / `appSecret` 两个凭据引用能否解析出值：
 
@@ -188,8 +188,8 @@ src/
 ├── health.ts              # 健康快照与卡片
 ├── session-export.ts      # 逻辑日志导出
 ├── feishu-channel.ts      # 官方 SDK Channel 适配（可注入 stub）
-├── client/                # 浏览器半区：设置 →「飞书渠道」页面（构建到 lib/client.js）
-│   ├── index.ts           #   client 插件入口：settings.section 注册 + 样式
+├── client/                # 浏览器半区：左侧栏「飞书渠道」主区页面（构建到 lib/client.js）
+│   ├── index.ts           #   client 插件入口：sidebar.panellist + main 注册 + 样式
 │   ├── panel/             #   页面外壳 + 七个标签页
 │   │   ├── index.tsx      #     加载 / 5s 状态轮询 / 全局草稿 / catalog 级联 / 顶部状态头 / Tab
 │   │   ├── shared.tsx     #     行 / 开关 / 分组 / 保存栏等渲染原语、阶段徽标、草稿校验
@@ -302,13 +302,13 @@ FEISHU_APP_ID: cli_xxxxxxxx
 FEISHU_APP_SECRET: xxxxxxxx
 ```
 
-也可以不手改文件：安装并在 Web 面板里打开 **设置 → 飞书渠道**，在「飞书应用凭据」卡片填入 App ID / App Secret 保存即可（值同样写进该凭据库）。
+也可以不手改文件：安装并在 Web 左侧栏打开 **飞书渠道**，在「飞书应用凭据」卡片填入 App ID / App Secret 保存即可（值同样写进该凭据库）。
 
 文件必须仅属主可读（dsh 强制校验，否则拒绝启动）：`chmod 600 $DSH_HOME/.credentials.yaml`。解析优先级：进程环境变量 > `.credentials.yaml` > `<cwd>/.env` > `$DSH_HOME/.env`（由 `dsh-credentials-local` 提供，热加载）。配置里只写引用名，明文密钥会被 schema 拒绝。改动凭据后：Web 面板保存会即时写入，未连接时自动建立连接、已连接时提示重连；手改 `.credentials.yaml` 由凭据层热加载，但正在运行的连接不会自动使用新值，需在面板点「重启飞书连接」。
 
 验证组合（不启动服务）：`DSH_HOME=$DSH_HOME pnpm dsh web --dump-config | grep dsh-channels`
 
-启动成功标志（控制台）：`[dsh-channels] feishu long connection established, bot open_id: ou_xxx`；凭据不完整时不会连接，日志会提示缺少的凭据引用（如 `飞书应用凭据未配置完整（缺少 FEISHU_APP_SECRET…）`），打开 Web **设置 → 飞书渠道 → 连接** 补齐即可。
+启动成功标志（控制台）：`[dsh-channels] feishu long connection established, bot open_id: ou_xxx`；凭据不完整时不会连接，日志会提示缺少的凭据引用（如 `飞书应用凭据未配置完整（缺少 FEISHU_APP_SECRET…）`），打开 Web 左侧栏 **飞书渠道 → 连接** 补齐即可。
 
 宿主 profile 已内置所需服务（agent-loop、llm-deepseek、session 持久化、storage-domain、workspace、working-directory）；web profile 默认组合还包含 DSH 原生附件库 `dsh-attachment-local` 与 `dsh-tools`（`ctx.attachments` / `ctx.tools`）。缺少原生附件库时入站附件自动回退 archive 后端（见「行为与降级」）。推荐确认 `dsh-token-meter` 已启用（卡片上下文占用显示）。Git worktree 隔离模式额外依赖可选的 `@deepseek-ai/dsh-experimental-worktree` 实验插件，缺失时自动回退为普通话题子目录。
 

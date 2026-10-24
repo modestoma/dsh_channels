@@ -174,14 +174,14 @@ chmod 600 $DSH_HOME/.credentials.yaml
 | `feishuTools.topicMessagesTimeoutMs` | `20000` | 单次 `feishu_topic_messages` 整段超时（1000–120000 ms） |
 | `loggerLevel` | `info` | 官方 SDK 日志级别 |
 
-> **面板与配置位置**：v2 附件配置在 Web 面板「设置 → 飞书渠道 → 附件与工具」：`acceptAttachments` / `attachmentStore` / `prefetchImages` / `historyBootstrapLimit` 在「入站附件」组，`feishuTools.*` 开关在「工具」组，各项字节上限与超时在「限额与超时」组；保存写入同一 Web 覆盖文件，`feishuTools.*` 按子键合并（不会把未修改子键写空）。直接写 profile 补丁层同样生效，面板覆盖优先。其中 `feishuTools.topicMessages=false` 只关闭模型工具，被动的引用/历史 prompt 摘录仍生效；要完全关闭首轮历史请设 `historyBootstrapLimit: 0`。archive 后端下 `feishu_attachment_fetch` 不挂载，`feishu_topic_messages` 仍可读取历史文本，但工具描述会提示附件不可取。
+> **面板与配置位置**：v2 附件配置在 Web 面板「左侧栏 → 飞书渠道 → 附件与工具」：`acceptAttachments` / `attachmentStore` / `prefetchImages` / `historyBootstrapLimit` 在「入站附件」组，`feishuTools.*` 开关在「工具」组，各项字节上限与超时在「限额与超时」组；保存写入同一 Web 覆盖文件，`feishuTools.*` 按子键合并（不会把未修改子键写空）。直接写 profile 补丁层同样生效，面板覆盖优先。其中 `feishuTools.topicMessages=false` 只关闭模型工具，被动的引用/历史 prompt 摘录仍生效；要完全关闭首轮历史请设 `historyBootstrapLimit: 0`。archive 后端下 `feishu_attachment_fetch` 不挂载，`feishu_topic_messages` 仍可读取历史文本，但工具描述会提示附件不可取。
 
 ### 3.3 初始化管理员与授权（默认准入）
 
 插件默认 `accessMode: 'guarded'`：**没有管理员时，所有对话都会被拒绝**（这是 fail-closed 的安全默认值）。如果应用开通了可选的「获取应用信息」权限，留空 `adminUserId` 时连接后会自动把应用所有者设为管理员（Web「访问授权」页显示“已自动使用应用所有者”），可以跳过下面第 1–2 步；没开通或查询失败时按以下顺序手动设置：
 
 1. 启动 dsh 后在飞书**私聊机器人**发送 `/userid`（未配置管理员时任何私聊用户都可以用，只回固定文本，不建会话）→ 复制返回的 user_id；
-2. 打开 Web **设置 → 飞书渠道 → 访问授权**，把它填进「管理员 user_id」并保存（立即生效）；也可以直接写 profile 的 `adminUserId`；
+2. 打开 Web 左侧栏 **飞书渠道 → 访问授权**，把它填进「管理员 user_id」并保存（立即生效）；也可以直接写 profile 的 `adminUserId`；
 3. 现在管理员私聊机器人即可正常对话。**其他用户私聊会收到一条固定提示**（“非管理员禁用私聊功能哦…”），不会建会话；
 4. **给群授权**（三种入口任选；目的是放行**非管理员**，管理员本人在任何群都能直接对话）：
    - 机器人被拉进群 → 管理员私聊收到**群信息卡**（群名/`chat_id`/成员数/邀请人）→ 点「授权本群」；
@@ -233,7 +233,7 @@ DSH_HOME=$DSH_HOME pnpm dsh web        # 默认 http://127.0.0.1:3080
 | `feishu_topic_messages 未挂载：宿主 tools 服务不可用（会话继续）` | 缺 `tools` 服务：话题读取工具不注册 |
 | `adopted N legacy staged attachment(s) into …; the one-time _staging migration is deprecated and will be removed after one release cycle` | 旧版 `_staging` 遗留文件被一次性迁入话题目录；按 D12，该兼容路径在 v2 发布后的下一个 minor 版本移除，可据此清理旧数据 |
 
-**未配置凭据（不是启动失败）**：日志会提示 `飞书应用凭据未配置完整（缺少 FEISHU_APP_…）`，插件照常加载但**不连接**；打开 Web **设置 → 飞书渠道 → 连接**，按三步引导填写 App ID / App Secret 并保存后自动连接。
+**未配置凭据（不是启动失败）**：日志会提示 `飞书应用凭据未配置完整（缺少 FEISHU_APP_…）`，插件照常加载但**不连接**；打开 Web 左侧栏 **飞书渠道 → 连接**，按三步引导填写 App ID / App Secret 并保存后自动连接。
 
 **常见连接失败**（插件保持加载，面板「连接」标签页显示原因，可重试）：
 

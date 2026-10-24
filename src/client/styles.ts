@@ -1,5 +1,5 @@
 /**
- * Settings panel styling. DSH semantic tokens (`--dsw-alias-*`) with neutral
+ * Feishu channel page styling. DSH semantic tokens (`--dsw-alias-*`) with neutral
  * fallbacks, aliased once to local `--dc-*` variables, so the page follows
  * the active theme.
  *
@@ -9,10 +9,13 @@
 const STYLE_ATTRIBUTE = 'data-dsh-channels-css'
 
 const CSS = `
+.dsh-channels-page{width:100%;height:100%;min-width:0;min-height:0;overflow:auto;scrollbar-gutter:stable;background:var(--dsw-alias-bg-base,#fff)}
+.dsh-channels-page__content{box-sizing:border-box;max-width:816px;margin:0 auto;padding:18px clamp(24px,4vw,48px) 48px}
+[data-platform='darwin'] .dsh-channels-page__content{padding-top:calc(18px + var(--dsh-frame-top-clearance,0px))}
 .dsh-channels-cfg{--dc-fg:var(--dsw-alias-label-primary,#1f2328);--dc-fg2:var(--dsw-alias-label-secondary,#5c6169);--dc-fg3:var(--dsw-alias-label-tertiary,#8a8f98);--dc-dim:var(--dsw-alias-label-dimmed,#b0b4ba);--dc-bg:var(--dsw-alias-bg-base,#fff);--dc-line:var(--dsw-alias-border-l2,rgba(0,0,0,.12));--dc-hover:var(--dsw-alias-interactive-bg-hover,rgba(0,0,0,.05));--dc-accent:var(--dsw-alias-state-business-primary,#0a67d3);--dc-ok:var(--dsw-alias-state-success-primary,#0a7d33);--dc-warn:var(--dsw-alias-state-warn-primary,#a15c00);--dc-bad:var(--dsw-alias-state-error-primary,#c62828);--dc-mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;container-type:inline-size;display:flex;flex-direction:column;gap:14px;width:100%;max-width:720px;color:var(--dc-fg);font-size:13px;line-height:20px}
 .dsh-channels-cfg__panelHead{position:sticky;top:0;z-index:2;display:flex;flex-direction:column;gap:4px;padding:10px 0 6px;background:var(--dc-bg)}
 .dsh-channels-cfg__headRow{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.dsh-channels-cfg__title{margin:0 2px 0 0;font-size:17px;font-weight:600;line-height:26px}
+.dsh-channels-cfg__title{margin:0 2px 0 0;font-size:20px;font-weight:500;line-height:28px}
 .dsh-channels-cfg__meta{color:var(--dc-fg3);font-size:12px}
 .dsh-channels-cfg__spacer{flex:1}
 .dsh-channels-cfg__mono{font-family:var(--dc-mono);font-size:12px}

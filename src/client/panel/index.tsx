@@ -1,11 +1,10 @@
 /**
- * 设置 →「飞书渠道」页面：数据加载、5 秒状态轮询、全局 draft、顶部状态头 /
+ * 左侧栏「飞书渠道」主区页面：数据加载、5 秒状态轮询、全局 draft、顶部状态头 /
  * tab 导航与底部保存条的外壳。
  *
  * 所有 Host 交互（panel / status / catalog / config / credentials / access /
  * pick-directory）都集中在这里；tab 组件只接收渲染所需的数据与
- * 回调。页面不 import 任何 DSH 客户端包，只依赖 react 与 `settings.section`
- * 槽位。
+ * 回调。页面不 import 任何 DSH 客户端包，只依赖 react 与 `main` 槽位。
  *
  * @module dsh-channels/client/panel
  */
@@ -69,13 +68,23 @@ import type {
 } from './shared.tsx'
 import { WikiTab } from './wiki-tab.tsx'
 
-/** Owner props handed to a `settings.section` contribution (unused beyond parity). */
-export interface FeishuChannelsSectionProps {
-  close?: () => void
+/**
+ * Main-column page for the `main` slot: a full-height scroll region with the
+ * centered panel column. The slot passes no owner props.
+ * @returns the page.
+ */
+export function FeishuChannelsPage(): JSX.Element {
+  return (
+    <section className="dsh-channels-page" aria-label={PANEL_COPY.title}>
+      <div className="dsh-channels-page__content">
+        <FeishuChannelsPanel />
+      </div>
+    </section>
+  )
 }
 
-/** Page shell: one panel payload, one status poll, one global config draft. */
-export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.Element | null {
+/** Panel shell: one panel payload, one status poll, one global config draft. */
+function FeishuChannelsPanel(): JSX.Element | null {
   const [load, setLoad] = useState<LoadState>({ phase: 'loading' })
   const [activeTab, setActiveTab] = useState<PanelTabId>('connection')
   const [draft, setDraft] = useState<EditableValues>({})
@@ -791,7 +800,7 @@ function PanelHeader(props: {
   return (
     <header className="dsh-channels-cfg__panelHead">
       <div className="dsh-channels-cfg__headRow">
-        <h2 className="dsh-channels-cfg__title">{PANEL_COPY.title}</h2>
+        <h1 className="dsh-channels-cfg__title">{PANEL_COPY.title}</h1>
         <Pill tone={badge.tone} dot>{badge.text}</Pill>
         <span className="dsh-channels-cfg__meta dsh-channels-cfg__mono">v{status.version}</span>
         {status.uptimeMs === undefined
