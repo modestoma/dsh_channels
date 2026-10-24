@@ -18,6 +18,7 @@ const ALL_GRANTED: readonly ScopeGrant[] = [
   'im:message.group_at_msg:readonly',
   'im:message.group_msg',
   'contact:user.employee_id:readonly',
+  'contact:user.base:readonly',
   'im:chat:readonly',
   'application:app_slash_command:read',
   'application:app_slash_command:write',
@@ -48,6 +49,13 @@ describe('checkScopes', () => {
       : grant.name === 'contact:user.employee_id:readonly' ? { ...grant, type: 'user' as const } : grant)
     const names = checkScopes(grants, 'cli_x', NO_OWNER_FALLBACK).missing.map(item => item.anyOf[0])
     expect(names).toEqual(['im:message.p2p_msg:readonly', 'contact:user.employee_id:readonly'])
+  })
+
+  it('lists the contact profile scope as optional for real names and avatars', () => {
+    const grants = ALL_GRANTED.filter(grant => grant.name !== 'contact:user.base:readonly')
+    expect(checkScopes(grants, 'cli_x', NO_OWNER_FALLBACK).missing).toEqual([
+      expect.objectContaining({ anyOf: ['contact:user.base:readonly'], level: 'optional' }),
+    ])
   })
 
   it('accepts any alternative scope of a need', () => {

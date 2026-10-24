@@ -51,10 +51,14 @@ export interface SessionOriginWire {
   chatId: string
   /** 群名（群聊且能读取群信息时）。 */
   chatName?: string
+  /** 群头像 URL（群聊且能读取群信息时）。 */
+  chatAvatarUrl?: string
   /** 发起人 user_id（日志平台分析话题为请求人）。 */
   senderUserId: string
   /** 发起人姓名（通讯录或群成员列表能查到时）。 */
   senderName?: string
+  /** 发起人头像 URL（通讯录能查到时）。 */
+  senderAvatarUrl?: string
   /** 日志平台分析话题：群内成员都可以继续。 */
   shared: boolean
   /** Epoch ms when the Session was bound to its Feishu route. */
@@ -65,6 +69,34 @@ export interface SessionOriginWire {
   lastActivityAt?: number
   /** 在飞书客户端打开该聊天的链接。 */
   chatLink: string
+}
+
+/**
+ * `GET PROFILES_ROUTE?users=<user_id,...>&chats=<chat_id,...>`: live Feishu
+ * names and avatars for the users and chats the panel shows. At most
+ * {@link PROFILES_MAX_IDS} ids per list.
+ */
+export const PROFILES_ROUTE = '/dsh-channels/profiles'
+
+/** Most `user_id`s, and separately most `chat_id`s, one profiles request may name. */
+export const PROFILES_MAX_IDS = 200
+
+/** Display name and avatar of one Feishu user or chat. */
+export interface FeishuProfileWire {
+  name?: string
+  /** `https:` image URL on the Feishu CDN. */
+  avatarUrl?: string
+}
+
+/**
+ * `GET PROFILES_ROUTE` response. Ids Feishu could not resolve, and ids that
+ * are not valid Feishu ids, are absent; `warning` carries the Feishu reason
+ * when a lookup failed (typically a missing scope).
+ */
+export interface FeishuProfilesWire {
+  users: Record<string, FeishuProfileWire>
+  chats: Record<string, FeishuProfileWire>
+  warning?: string
 }
 
 /** `GET SESSION_ORIGIN_ROUTE` response: `origin` is null for a Session not started from Feishu. */
@@ -777,7 +809,10 @@ export const PANEL_COPY = {
   // ---- access -------------------------------------------------------------
   debugModeWarning: '调试模式已打开：应用可用范围内的任何人都能和机器人对话。用完请在「访问授权」关闭。',
   accessAdminMissingWarning: '没有可用的管理员，所有对话都会被拒绝。请在下方填写管理员 user_id（私聊机器人发送 /userid 获取）。',
-  accessAdminOwnerSummary: '未单独设置，正在使用应用所有者 {id}',
+  accessAdminCurrent: '当前管理员',
+  accessAdminSourceConfig: '已配置',
+  accessAdminSourceOwner: '应用所有者',
+  profilesWarning: '部分飞书名字和头像未能读取：{reason}',
   accessNotLoaded: '飞书连接建立后加载授权列表',
   accessRequestsTitle: '待处理申请',
   accessGroupsTitle: '已授权群',

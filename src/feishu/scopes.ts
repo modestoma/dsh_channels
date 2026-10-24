@@ -77,7 +77,8 @@ const BASE_REQUIREMENTS: readonly ScopeRequirement[] = [
   { anyOf: ['im:message:update', 'im:message'], level: 'required', purpose: '流式更新回复卡片' },
   { anyOf: ['im:message.reactions:write_only', 'im:message'], level: 'optional', purpose: '给消息添加/移除处理中表情' },
   { anyOf: ['im:message:readonly', 'im:message'], level: 'optional', purpose: '读取引用消息、话题历史与 feishu_topic_messages' },
-  { anyOf: ['im:chat:readonly', 'im:chat'], level: 'optional', purpose: '机器人入群后读取群信息、发送群信息卡' },
+  { anyOf: ['im:chat:readonly', 'im:chat'], level: 'optional', purpose: '机器人入群后读取群信息、发送群信息卡；Web 页面显示群名和群头像' },
+  { anyOf: ['contact:user.base:readonly'], level: 'optional', purpose: 'Web 页面显示用户真实姓名和头像' },
 ]
 
 /** Panel sync needs, applicable while `slashCommandPanel` is on. */

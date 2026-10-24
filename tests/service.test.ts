@@ -10,6 +10,7 @@ import { promisify } from 'node:util'
 import { gunzip } from 'node:zlib'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { FeishuService } from '../src/service.ts'
+import { FeishuApiError } from '../src/feishu-channel.ts'
 import type { FeishuConfig } from '../src/config.ts'
 import type {
   CardActionEvent, ChannelFactory, FeishuChannel, NormalizedMessage, RawMessageListParams,
@@ -921,10 +922,10 @@ describe('FeishuService', () => {
     expect(mock(old.handle.agent.followup)).toHaveBeenCalledTimes(1)
   })
 
-  it('records each Session\'s Feishu origin once and serves it with live names', async () => {
+  it('records each Session\'s Feishu origin once and serves it with live names and avatars', async () => {
     const h = await setup({}, {
-      chatInfo: chatId => ({ chatId, chatType: 'group', name: '研发群' }),
-      userName: async userId => (userId === 'u_owner' ? '张三' : undefined),
+      chatProfile: async () => ({ name: '研发群', avatarUrl: 'https://cdn.example/chat.png' }),
+      userProfiles: async ids => new Map(ids.filter(id => id === 'u_owner').map(id => [id, { name: '张三', avatarUrl: 'https://cdn.example/u.png' }])),
     })
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_origin', senderId: 'u_owner', messageId: 'om_origin_start', content: '开始',
@@ -948,8 +949,10 @@ describe('FeishuService', () => {
       chatType: 'group',
       kind: 'thread',
       chatName: '研发群',
+      chatAvatarUrl: 'https://cdn.example/chat.png',
       senderUserId: 'u_owner',
       senderName: '张三',
+      senderAvatarUrl: 'https://cdn.example/u.png',
       shared: false,
       bound: true,
       chatLink: 'https://applink.feishu.cn/client/chat/open?openChatId=oc_origin',
@@ -957,14 +960,18 @@ describe('FeishuService', () => {
     const previous = await h.service.sessionOrigin(old.options.sessionId)
     expect(previous).toMatchObject({ bound: false, chatName: '研发群', senderName: '张三' })
     expect(previous).not.toHaveProperty('lastActivityAt')
-    // Names are cached: two lookups for two Sessions of the same chat and user.
-    expect(mock(h.channel.getChatInfo).mock.calls.filter(([id]) => id === 'oc_origin')).toHaveLength(1)
-    expect(mock(h.channel.userName)).toHaveBeenCalledTimes(1)
+    // Profiles are cached briefly: one lookup serves both Sessions of the same chat and user.
+    expect(mock(h.channel.chatProfile)).toHaveBeenCalledTimes(1)
+    expect(mock(h.channel.userProfiles)).toHaveBeenCalledTimes(1)
     expect(await h.service.sessionOrigin('not-a-feishu-session')).toBeNull()
   })
 
   it('serves a private-chat origin without a chat name and with the user id when no name resolves', async () => {
-    const h = await setup({}, { userName: async () => undefined })
+    const h = await setup({}, {
+      userProfiles: async () => new Map(),
+      chatProfile: async () => ({ name: '不该查询' }),
+      memberName: async () => '不该查询',
+    })
     await h.onMessage(makeMessage({
       chatType: 'p2p', chatId: 'oc_dm', senderId: 'u_dm', messageId: 'om_dm_start', content: '开始',
     }))
@@ -974,7 +981,55 @@ describe('FeishuService', () => {
     expect(origin).toMatchObject({ chatType: 'p2p', senderUserId: 'u_dm', bound: true })
     expect(origin).not.toHaveProperty('chatName')
     expect(origin).not.toHaveProperty('senderName')
-    expect(mock(h.channel.userName)).toHaveBeenCalledWith('u_dm', undefined)
+    expect(mock(h.channel.userProfiles)).toHaveBeenCalledWith(['u_dm'])
+    expect(mock(h.channel.chatProfile)).not.toHaveBeenCalled()
+    expect(mock(h.channel.memberName)).not.toHaveBeenCalled()
+  })
+
+  it('names a group sender from the chat member list when the contact profile is unavailable', async () => {
+    const h = await setup({}, {
+      userProfiles: async () => { throw new FeishuApiError('code=99991672 Access denied', 99991672) },
+      chatProfile: async () => ({ name: '研发群' }),
+      memberName: async (userId, chatId) => (userId === 'u_owner' && chatId === 'oc_member' ? '张三' : undefined),
+    })
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_member', senderId: 'u_owner', messageId: 'om_member_start', content: '开始',
+    }))
+    await waitForEstablishedSession(h)
+    const origin = await h.service.sessionOrigin(h.ctxState.agents.created[0]!.options.sessionId)
+    expect(origin).toMatchObject({ chatName: '研发群', senderName: '张三' })
+    expect(origin).not.toHaveProperty('senderAvatarUrl')
+  })
+
+  it('serves panel profiles through a short cache, skipping invalid ids and reporting lookup failures', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    try {
+      const h = await setup({}, {
+        userProfiles: async ids => new Map(ids.filter(id => id !== 'u_unknown').map(id => [id, { name: `名-${id}` }])),
+        chatProfile: async (chatId) => {
+          if (chatId === 'oc_gone') throw new FeishuApiError('code=232011 not found', 232011)
+          return { name: '研发群', avatarUrl: 'https://cdn.example/chat.png' }
+        },
+      })
+      const first = await h.service.feishuProfiles(['u_a', 'u_unknown', 'ou_open', 'u_a'], ['oc_dev', 'oc_gone', 'bad id'])
+      expect(first).toEqual({
+        users: { u_a: { name: '名-u_a' } },
+        chats: { oc_dev: { name: '研发群', avatarUrl: 'https://cdn.example/chat.png' } },
+        warning: '读取群信息失败：code=232011 not found',
+      })
+      expect(mock(h.channel.userProfiles)).toHaveBeenCalledWith(['u_a', 'u_unknown'])
+      await h.service.feishuProfiles(['u_a', 'u_unknown'], ['oc_dev'])
+      expect(mock(h.channel.userProfiles)).toHaveBeenCalledTimes(1)
+      expect(mock(h.channel.chatProfile)).toHaveBeenCalledTimes(2)
+      // A failed chat is not cached; it is asked again on the next entry.
+      await h.service.feishuProfiles([], ['oc_gone'])
+      expect(mock(h.channel.chatProfile)).toHaveBeenCalledTimes(3)
+      vi.setSystemTime(Date.now() + 30_000)
+      await h.service.feishuProfiles(['u_a'], [])
+      expect(mock(h.channel.userProfiles)).toHaveBeenCalledTimes(2)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('backfills origins for routes written before origins existed', async () => {

@@ -16,6 +16,7 @@ import {
   CREDENTIALS_ROUTE,
   PANEL_ROUTE,
   PICK_DIRECTORY_ROUTE,
+  PROFILES_ROUTE,
   RECONNECT_ROUTE,
   SESSION_ORIGIN_ROUTE,
   STATUS_ROUTE,
@@ -29,6 +30,7 @@ import type {
   ClearCredentialResponse,
   CredentialField,
   EditableValues,
+  FeishuProfilesWire,
   PanelWire,
   PickDirectoryResponse,
   ReconnectResponse,
@@ -92,6 +94,17 @@ export async function fetchStatus(): Promise<ChannelStatusWire> {
 export async function fetchSessionOrigin(sessionId: string): Promise<SessionOriginResponse> {
   const query = new URLSearchParams({ sessionId }).toString()
   return readJson<SessionOriginResponse>(await request(`${SESSION_ORIGIN_ROUTE}?${query}`))
+}
+
+/**
+ * Live Feishu names and avatars of the given users and chats.
+ * @param userIds - user `user_id`s.
+ * @param chatIds - chat `chat_id`s.
+ * @returns the profiles Feishu resolved, by id.
+ */
+export async function fetchFeishuProfiles(userIds: readonly string[], chatIds: readonly string[]): Promise<FeishuProfilesWire> {
+  const query = new URLSearchParams({ users: userIds.join(','), chats: chatIds.join(',') }).toString()
+  return readJson<FeishuProfilesWire>(await request(`${PROFILES_ROUTE}?${query}`))
 }
 
 /**

@@ -97,7 +97,8 @@ import { ACTIVITY_BUILD_MARKER, TurnStreamer } from './streamer.ts'
 import type { ProjectedStats, StreamerHooks } from './streamer.ts'
 import type { FeishuConfig } from './config.ts'
 import type {
-  AccessMutationResponse, AccessRequestWire, AccessUserWire, AccessWire, CredentialField, ScopeCheckWire, SessionOriginWire,
+  AccessMutationResponse, AccessRequestWire, AccessUserWire, AccessWire, CredentialField, FeishuProfilesWire, FeishuProfileWire,
+  ScopeCheckWire, SessionOriginWire,
   SlashCommandSyncWire,
 } from './settings/contract.ts'
 import { checkScopes } from './feishu/scopes.ts'
@@ -142,8 +143,20 @@ interface ModelAdmission {
   controller: RequestPolicyController
 }
 
-/** How long a resolved chat or user name serves the session-origin view. */
-const ORIGIN_NAME_TTL_MS = 10 * 60 * 1000
+/**
+ * How long one resolved user or chat profile is reused. Short enough that
+ * every page entry shows current Feishu data; long enough that the session
+ * header and its sidebar tab opening together cost one lookup.
+ */
+const PROFILE_TTL_MS = 30 * 1000
+
+/** The Feishu `code=<n> <msg>` of a failed API call, else the error text. */
+function feishuReason(error: unknown): string {
+  return error instanceof FeishuApiError ? error.detail : messageOf(error)
+}
+
+/** Feishu `chat_id`s the profile lookup accepts. */
+const FEISHU_CHAT_ID_PATTERN = /^oc_[A-Za-z0-9_-]+$/u
 
 /** Wrap the host's storage facility open behind a stable local type. */
 async function openFeishuDomain(ctx: HostContext): Promise<FeishuDomainHandle> {
@@ -370,8 +383,8 @@ export class FeishuService {
    * is unset. Cleared on shutdown so a reconnect looks it up again.
    */
   private appOwner: AppOwnerState | undefined
-  /** Live-resolved chat and user display names for the session-origin view, by `chat:`/`user:` key. */
-  private readonly originNames = new Map<string, { name: string | undefined; at: number }>()
+  /** Live-resolved user and chat profiles, by `user:`/`chat:` key; misses are kept as `{}`. */
+  private readonly profileCache = new Map<string, { profile: FeishuProfileWire; at: number }>()
   /** Post-connect scope self-check; cleared on shutdown. */
   private scopeCheckState: ScopeCheckWire | undefined
   /** Post-connect slash-command panel sync; cleared on shutdown. */
@@ -1114,29 +1127,27 @@ export class FeishuService {
     }
   }
 
-  /** Panel: decide one pending authorization request (same path as the card). */
+  /** Panel: Feishu origin of one Session, or null when Feishu never routed it. */
   async sessionOrigin(sessionId: string): Promise<SessionOriginWire | null> {
     const origin = this.routes.origin(sessionId)
     if (origin === undefined) return null
     const route = this.routes.findBySession(sessionId)
     const bound = route !== undefined
-    const [chatName, senderName] = await Promise.all([
-      origin.chatType === 'group'
-        ? this.originName(`chat:${origin.chatId}`, async channel => (await channel.getChatInfo(origin.chatId)).name)
-        : Promise.resolve(undefined),
-      this.originName(`user:${origin.senderUserId}`, async channel => await channel.userName?.(
-        origin.senderUserId,
-        origin.chatType === 'group' ? origin.chatId : undefined,
-      )),
-    ])
+    const group = origin.chatType === 'group'
+    const profiles = await this.feishuProfiles([origin.senderUserId], group ? [origin.chatId] : [])
+    const chat = profiles.chats[origin.chatId] ?? {}
+    const sender = profiles.users[origin.senderUserId] ?? {}
+    const senderName = sender.name ?? (group ? await this.memberName(origin.senderUserId, origin.chatId) : undefined)
     return {
       sessionId,
       chatType: origin.chatType,
       kind: origin.kind,
       chatId: origin.chatId,
-      ...(chatName === undefined ? {} : { chatName }),
+      ...(chat.name === undefined ? {} : { chatName: chat.name }),
+      ...(chat.avatarUrl === undefined ? {} : { chatAvatarUrl: chat.avatarUrl }),
       senderUserId: origin.senderUserId,
       ...(senderName === undefined ? {} : { senderName }),
+      ...(sender.avatarUrl === undefined ? {} : { senderAvatarUrl: sender.avatarUrl }),
       shared: origin.shared === true,
       createdAt: origin.createdAt,
       bound,
@@ -1146,29 +1157,90 @@ export class FeishuService {
   }
 
   /**
-   * One display name through a short-lived cache. Lookup failures and a
-   * disconnected channel yield `undefined`; misses are cached too, so an
-   * unnamed user does not cost a Feishu call on every sidebar refresh.
+   * Live Feishu names and avatars for the panel and the session-origin view,
+   * through a {@link PROFILE_TTL_MS} cache. Ids that are not Feishu
+   * `user_id`s / `chat_id`s are skipped; a disconnected channel and failed
+   * lookups leave ids absent, and failures are reported in `warning` and not
+   * cached.
+   * @param userIds - user `user_id`s to resolve.
+   * @param chatIds - chat `chat_id`s to resolve.
+   * @returns the resolved profiles by id.
    */
-  private async originName(
-    key: string,
-    lookup: (channel: FeishuChannel) => Promise<string | undefined>,
-  ): Promise<string | undefined> {
+  async feishuProfiles(userIds: readonly string[], chatIds: readonly string[]): Promise<FeishuProfilesWire> {
+    const result: FeishuProfilesWire = { users: {}, chats: {} }
+    const warnings: string[] = []
     const now = Date.now()
-    const cached = this.originNames.get(key)
-    if (cached !== undefined && now - cached.at < ORIGIN_NAME_TTL_MS) return cached.name
-    const channel = this.channel
-    if (channel === undefined) return cached?.name
-    let name: string | undefined
-    try {
-      name = (await lookup(channel))?.trim() || undefined
-    } catch (error) {
-      this.ctx.logger?.debug?.('dsh-channels: resolving %s for the session origin failed: %s', key, messageOf(error))
+    for (const [key, cached] of this.profileCache) {
+      if (now - cached.at >= PROFILE_TTL_MS) this.profileCache.delete(key)
     }
-    this.originNames.set(key, { name, at: now })
+    const fresh = (key: string): FeishuProfileWire | undefined => this.profileCache.get(key)?.profile
+    const keep = (target: Record<string, FeishuProfileWire>, id: string, profile: FeishuProfileWire): void => {
+      if (profile.name !== undefined || profile.avatarUrl !== undefined) target[id] = profile
+    }
+    const users = [...new Set(userIds)].filter(id => FEISHU_USER_ID_PATTERN.test(id))
+    const chats = [...new Set(chatIds)].filter(id => FEISHU_CHAT_ID_PATTERN.test(id))
+    const missingUsers: string[] = []
+    for (const id of users) {
+      const cached = fresh(`user:${id}`)
+      if (cached === undefined) missingUsers.push(id)
+      else keep(result.users, id, cached)
+    }
+    const missingChats: string[] = []
+    for (const id of chats) {
+      const cached = fresh(`chat:${id}`)
+      if (cached === undefined) missingChats.push(id)
+      else keep(result.chats, id, cached)
+    }
+    const channel = this.channel
+    if (channel === undefined) return result
+    const lookups: Array<Promise<void>> = []
+    if (missingUsers.length > 0 && channel.userProfiles !== undefined) {
+      lookups.push(channel.userProfiles(missingUsers).then(
+        (found) => {
+          for (const id of missingUsers) {
+            const profile = found.get(id) ?? {}
+            this.profileCache.set(`user:${id}`, { profile, at: now })
+            keep(result.users, id, profile)
+          }
+        },
+        (error: unknown) => { warnings.push(`读取用户资料失败：${feishuReason(error)}`) },
+      ))
+    }
+    const chatProfile = channel.chatProfile?.bind(channel)
+    if (chatProfile !== undefined) {
+      let chatError: string | undefined
+      for (const id of missingChats) {
+        lookups.push(chatProfile(id).then(
+          (profile) => {
+            this.profileCache.set(`chat:${id}`, { profile, at: now })
+            keep(result.chats, id, profile)
+          },
+          (error: unknown) => {
+            if (chatError !== undefined) return
+            chatError = `读取群信息失败：${feishuReason(error)}`
+            warnings.push(chatError)
+          },
+        ))
+      }
+    }
+    await Promise.all(lookups)
+    if (warnings.length > 0) {
+      result.warning = warnings.join('；')
+      this.ctx.logger?.debug?.('dsh-channels: Feishu profile lookup: %s', result.warning)
+    }
+    return result
+  }
+
+  /** Chat-member-list name for a user the contact profile cannot name. */
+  private async memberName(userId: string, chatId: string): Promise<string | undefined> {
+    const cached = this.profileCache.get(`member:${chatId}:${userId}`)
+    if (cached !== undefined && Date.now() - cached.at < PROFILE_TTL_MS) return cached.profile.name
+    const name = await this.channel?.memberName?.(userId, chatId)
+    this.profileCache.set(`member:${chatId}:${userId}`, { profile: name === undefined ? {} : { name }, at: Date.now() })
     return name
   }
 
+  /** Panel: decide one pending authorization request (same path as the card). */
   async resolveAccessRequest(token: string, decision: 'allow' | 'deny'): Promise<AccessMutationResponse> {
     const requests = this.accessRequests
     if (requests === undefined) return { ok: false, error: '授权服务尚未启动' }

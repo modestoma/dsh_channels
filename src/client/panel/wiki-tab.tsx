@@ -7,12 +7,14 @@
  */
 
 import { fillCopy, PANEL_COPY, TAB_FIELD_GROUPS } from '../../settings/contract.ts'
+import type { ProfileView } from './profiles.ts'
 import { FieldSections, NoticeBar } from './shared.tsx'
 import type { FormView } from './shared.tsx'
 import { Whitelist } from './whitelist.tsx'
 
 export interface WikiTabProps {
   form: FormView
+  profiles: ProfileView
   accessNotice: string | null
   accessError: string | null
   onAddUser: (userId: string, name: string) => Promise<boolean>
@@ -20,18 +22,24 @@ export interface WikiTabProps {
 }
 
 export function WikiTab(props: WikiTabProps): JSX.Element {
-  const { form, accessNotice, accessError, onAddUser, onRemoveUser } = props
+  const { form, profiles, accessNotice, accessError, onAddUser, onRemoveUser } = props
   const { access } = form.panel
   const disabled = form.busy !== null || form.locked || !access.loaded
   return (
     <div className="dsh-channels-cfg__tabBody">
       {accessNotice === null ? null : <NoticeBar kind="ok" text={accessNotice} />}
       {accessError === null ? null : <NoticeBar kind="error" text={accessError} />}
+      {profiles.warning === undefined ? null : <p className="dsh-channels-cfg__secFoot">{fillCopy(PANEL_COPY.profilesWarning, { reason: profiles.warning })}</p>}
       <FieldSections form={form} groups={TAB_FIELD_GROUPS.wiki} />
       <Whitelist
         title={PANEL_COPY.wikiUsersTitle}
         countLabel={fillCopy(PANEL_COPY.wikiUsersAdminPlus, { n: access.wikiUsers.length })}
-        entries={access.wikiUsers.map(user => ({ id: user.userId, name: user.name, source: user.source }))}
+        entries={access.wikiUsers.map(user => ({
+          id: user.userId,
+          name: profiles.user(user.userId)?.name ?? user.name,
+          avatarUrl: profiles.user(user.userId)?.avatarUrl,
+          source: user.source,
+        }))}
         empty={PANEL_COPY.wikiUsersEmpty}
         loaded={access.loaded}
         addLabel={PANEL_COPY.accessAddUser}

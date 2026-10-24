@@ -72,12 +72,26 @@ export interface FeishuChannel {
   /** Chat name/owner/member count (needs chat-info read permission). */
   getChatInfo(chatId: string): Promise<ChatInfo>
   /**
-   * Display name of one tenant user by `user_id`: the contact profile first
-   * (`contact:user.base:readonly`), then the member list of `chatId` when given
-   * (`im:chat:readonly`). Resolves `undefined` when neither source names the
-   * user; never rejects. Optional so stubs can omit it.
+   * Contact profiles (name and avatar) of tenant users by `user_id`
+   * (`contact.v3.user.batch`, `contact:user.base:readonly`). Users outside the
+   * app's contact range are absent from the map. Rejects with a
+   * {@link FeishuApiError} when the lookup fails as a whole. Optional so stubs
+   * can omit it.
    */
-  userName?(userId: string, chatId?: string): Promise<string | undefined>
+  userProfiles?(userIds: readonly string[]): Promise<ReadonlyMap<string, FeishuProfile>>
+  /**
+   * Name and avatar of one chat (`im.v1.chat.get`, `im:chat:readonly`); a bot
+   * outside the chat still gets both. Rejects with a {@link FeishuApiError}
+   * when the call fails. Optional so stubs can omit it.
+   */
+  chatProfile?(chatId: string): Promise<FeishuProfile>
+  /**
+   * Display name of one user from the member list of `chatId`
+   * (`im:chat:readonly`), for users the contact profile cannot name. Resolves
+   * `undefined` when the list does not name the user; never rejects. Optional
+   * so stubs can omit it.
+   */
+  memberName?(userId: string, chatId: string): Promise<string | undefined>
   /** Bot open_id, available after `connect()` resolves. */
   botOpenId(): string | undefined
   /**
@@ -285,8 +299,28 @@ function assertFeishuOk(response: { code?: number; msg?: string }): void {
   }
 }
 
-/** Member-list pages `userName()` scans before giving up (100 members each). */
-const USER_NAME_MEMBER_PAGES = 5
+/** Member-list pages `memberName()` scans before giving up (100 members each). */
+const MEMBER_NAME_PAGES = 5
+
+/** `user_ids` per `contact.v3.user.batch` call (the API maximum). */
+const USER_BATCH_SIZE = 50
+
+/** Display name and avatar of one Feishu user or chat, as far as Feishu reports them. */
+export interface FeishuProfile {
+  name?: string
+  /** `https:` image URL on the Feishu CDN. */
+  avatarUrl?: string
+}
+
+/** Keep a non-blank name and an `https:` avatar URL from one Feishu response. */
+function feishuProfile(name: string | undefined, avatar: string | undefined): FeishuProfile {
+  const trimmed = name?.trim()
+  const avatarUrl = avatar !== undefined && /^https:\/\/[^\s"'<>]+$/u.test(avatar) ? avatar : undefined
+  return {
+    ...(trimmed === undefined || trimmed === '' ? {} : { name: trimmed }),
+    ...(avatarUrl === undefined ? {} : { avatarUrl }),
+  }
+}
 
 /** Run one raw request, mapping thrown and non-zero-code failures to {@link FeishuApiError}. */
 async function feishuCall<T extends { code?: number; msg?: string }>(call: () => Promise<T>): Promise<T> {
@@ -460,22 +494,31 @@ class LarkChannelAdapter implements FeishuChannel {
     return this.channel.getChatInfo(chatId)
   }
 
-  async userName(userId: string, chatId?: string): Promise<string | undefined> {
+  async userProfiles(userIds: readonly string[]): Promise<ReadonlyMap<string, FeishuProfile>> {
     const client = this.channel.rawClient
-    try {
-      const response = await feishuCall(() => client.contact.v3.user.get({
-        path: { user_id: userId },
-        params: { user_id_type: 'user_id' },
+    const profiles = new Map<string, FeishuProfile>()
+    for (let offset = 0; offset < userIds.length; offset += USER_BATCH_SIZE) {
+      const response = await feishuCall(() => client.contact.v3.user.batch({
+        params: { user_ids: userIds.slice(offset, offset + USER_BATCH_SIZE), user_id_type: 'user_id' },
       }))
-      const name = response.data?.user?.name?.trim()
-      if (name !== undefined && name !== '') return name
-    } catch (_profileUnavailable) {
-      // Missing contact scope or user outside the app's contact range: the
-      // chat member list below may still name the user.
+      for (const item of response.data?.items ?? []) {
+        if (item.user_id === undefined) continue
+        profiles.set(item.user_id, feishuProfile(item.name, item.avatar?.avatar_72))
+      }
     }
-    if (chatId === undefined) return undefined
+    return profiles
+  }
+
+  async chatProfile(chatId: string): Promise<FeishuProfile> {
+    const client = this.channel.rawClient
+    const response = await feishuCall(() => client.im.v1.chat.get({ path: { chat_id: chatId } }))
+    return feishuProfile(response.data?.name, response.data?.avatar)
+  }
+
+  async memberName(userId: string, chatId: string): Promise<string | undefined> {
+    const client = this.channel.rawClient
     let pageToken: string | undefined
-    for (let page = 0; page < USER_NAME_MEMBER_PAGES; page += 1) {
+    for (let page = 0; page < MEMBER_NAME_PAGES; page += 1) {
       let response
       try {
         response = await feishuCall(() => client.im.v1.chatMembers.get({

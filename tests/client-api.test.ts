@@ -5,7 +5,7 @@
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { fetchCatalog, fetchPanel, removeAccessUser } from '../src/client/api.ts'
+import { fetchCatalog, fetchFeishuProfiles, fetchPanel, removeAccessUser } from '../src/client/api.ts'
 
 function stubFetch(): ReturnType<typeof vi.fn> {
   const fetcher = vi.fn(async () => new Response('{}', { status: 200 }))
@@ -23,10 +23,12 @@ describe('settings client routes', () => {
     await fetchPanel()
     await fetchCatalog('deepseek', 'chat')
     await removeAccessUser('u1')
+    await fetchFeishuProfiles(['u1', 'u2'], ['oc_1'])
     expect(fetcher.mock.calls.map(call => call[0])).toEqual([
       'dsh-channels/panel',
       'dsh-channels/catalog?provider=deepseek&model=chat',
       'dsh-channels/access/users',
+      'dsh-channels/profiles?users=u1%2Cu2&chats=oc_1',
     ])
     for (const target of fetcher.mock.calls.map(call => String(call[0]))) {
       expect(new URL(target, 'https://example.com/dsh/').pathname.startsWith('/dsh/dsh-channels/')).toBe(true)

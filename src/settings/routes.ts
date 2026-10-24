@@ -27,6 +27,8 @@ import {
   CREDENTIALS_ROUTE,
   PANEL_ROUTE,
   PICK_DIRECTORY_ROUTE,
+  PROFILES_MAX_IDS,
+  PROFILES_ROUTE,
   RECONNECT_ROUTE,
   SESSION_ORIGIN_ROUTE,
   STATUS_ROUTE,
@@ -140,6 +142,12 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
   } catch {
     throw new HttpError(400, '请求体不是合法 JSON')
   }
+}
+
+/** Distinct non-empty entries of one comma-separated id query parameter. */
+function idList(raw: string | null): string[] {
+  if (raw === null) return []
+  return [...new Set(raw.split(',').map(id => id.trim()).filter(id => id !== ''))]
 }
 
 /**
@@ -268,6 +276,26 @@ export function registerSettingsRoutes(
           return
         }
         sendJson(res, 200, await surface.sessionOrigin(sessionId))
+      }),
+    }),
+    server.register({
+      kind: 'exact',
+      path: PROFILES_ROUTE,
+      handler: guarded(async (req, res) => {
+        if (!allowOnly(req, res, ['GET', 'HEAD'])) return
+        if (methodOf(req) === 'HEAD') {
+          res.writeHead(200, { 'cache-control': 'no-store' })
+          res.end()
+          return
+        }
+        const params = new URL(req.url ?? '/', 'http://dsh.local').searchParams
+        const userIds = idList(params.get('users'))
+        const chatIds = idList(params.get('chats'))
+        if (userIds.length > PROFILES_MAX_IDS || chatIds.length > PROFILES_MAX_IDS) {
+          sendJson(res, 400, { ok: false, error: `每次最多查询 ${PROFILES_MAX_IDS} 个用户和 ${PROFILES_MAX_IDS} 个群` })
+          return
+        }
+        sendJson(res, 200, await surface.feishuProfiles(userIds, chatIds))
       }),
     }),
     server.register({
