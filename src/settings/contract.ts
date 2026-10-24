@@ -38,6 +38,39 @@ export const ACCESS_REQUESTS_ROUTE = '/dsh-channels/access/requests'
  * [`EditableFieldWire.browse`]，保留手写输入。
  */
 export const PICK_DIRECTORY_ROUTE = '/dsh-channels/pick-directory'
+/** 会话的飞书来源（GET/HEAD，`?sessionId=`）：对话右侧栏「飞书来源」标签与会话头部入口使用。 */
+export const SESSION_ORIGIN_ROUTE = '/dsh-channels/session-origin'
+
+/** Where one Feishu-routed Session came from; names are resolved live and may be absent. */
+export interface SessionOriginWire {
+  sessionId: string
+  /** `p2p` = 私聊，`group` = 群聊。 */
+  chatType: 'p2p' | 'group'
+  /** `thread` = 话题内会话，`chat` = 整个聊天一个会话（话题不可用时的降级）。 */
+  kind: 'thread' | 'chat'
+  chatId: string
+  /** 群名（群聊且能读取群信息时）。 */
+  chatName?: string
+  /** 发起人 user_id（日志平台分析话题为请求人）。 */
+  senderUserId: string
+  /** 发起人姓名（通讯录或群成员列表能查到时）。 */
+  senderName?: string
+  /** 日志平台分析话题：群内成员都可以继续。 */
+  shared: boolean
+  /** Epoch ms when the Session was bound to its Feishu route. */
+  createdAt: number
+  /** Whether the Feishu route still points at this Session (false after `/renew`, `/new` or route expiry). */
+  bound: boolean
+  /** Epoch ms of the route's last activity, while bound. */
+  lastActivityAt?: number
+  /** 在飞书客户端打开该聊天的链接。 */
+  chatLink: string
+}
+
+/** `GET SESSION_ORIGIN_ROUTE` response: `origin` is null for a Session not started from Feishu. */
+export interface SessionOriginResponse {
+  origin: SessionOriginWire | null
+}
 
 /**
  * 可由 Web 面板覆盖的配置项。顶层键对应 `src/config.ts` 的字段；`feishuTools.*`

@@ -921,6 +921,81 @@ describe('FeishuService', () => {
     expect(mock(old.handle.agent.followup)).toHaveBeenCalledTimes(1)
   })
 
+  it('records each Session\'s Feishu origin once and serves it with live names', async () => {
+    const h = await setup({}, {
+      chatInfo: chatId => ({ chatId, chatType: 'group', name: '研发群' }),
+      userName: async userId => (userId === 'u_owner' ? '张三' : undefined),
+    })
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_origin', senderId: 'u_owner', messageId: 'om_origin_start', content: '开始',
+    }))
+    await waitForEstablishedSession(h)
+    const old = h.ctxState.agents.created[0]!
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_origin', senderId: 'u_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_origin_renew', content: '/renew',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
+    const renewed = h.ctxState.agents.created[1]!
+    await waitForRenewedRoute(h, 'omt_1', renewed.options.sessionId)
+
+    const origins = h.ctxState.domain.raw.table('session_origins')
+    expect(origins.get(old.options.sessionId)).toMatchObject({
+      routeKey: 'omt_1', kind: 'thread', chatId: 'oc_origin', chatType: 'group', senderUserId: 'u_owner',
+    })
+    expect(await h.service.sessionOrigin(renewed.options.sessionId)).toMatchObject({
+      sessionId: renewed.options.sessionId,
+      chatType: 'group',
+      kind: 'thread',
+      chatName: '研发群',
+      senderUserId: 'u_owner',
+      senderName: '张三',
+      shared: false,
+      bound: true,
+      chatLink: 'https://applink.feishu.cn/client/chat/open?openChatId=oc_origin',
+    })
+    const previous = await h.service.sessionOrigin(old.options.sessionId)
+    expect(previous).toMatchObject({ bound: false, chatName: '研发群', senderName: '张三' })
+    expect(previous).not.toHaveProperty('lastActivityAt')
+    // Names are cached: two lookups for two Sessions of the same chat and user.
+    expect(mock(h.channel.getChatInfo).mock.calls.filter(([id]) => id === 'oc_origin')).toHaveLength(1)
+    expect(mock(h.channel.userName)).toHaveBeenCalledTimes(1)
+    expect(await h.service.sessionOrigin('not-a-feishu-session')).toBeNull()
+  })
+
+  it('serves a private-chat origin without a chat name and with the user id when no name resolves', async () => {
+    const h = await setup({}, { userName: async () => undefined })
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_dm', senderId: 'u_dm', messageId: 'om_dm_start', content: '开始',
+    }))
+    await waitForEstablishedSession(h)
+    const sessionId = h.ctxState.agents.created[0]!.options.sessionId
+    const origin = await h.service.sessionOrigin(sessionId)
+    expect(origin).toMatchObject({ chatType: 'p2p', senderUserId: 'u_dm', bound: true })
+    expect(origin).not.toHaveProperty('chatName')
+    expect(origin).not.toHaveProperty('senderName')
+    expect(mock(h.channel.userName)).toHaveBeenCalledWith('u_dm', undefined)
+  })
+
+  it('backfills origins for routes written before origins existed', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_backfill', senderId: 'u_owner', messageId: 'om_backfill', content: '开始',
+    }))
+    await waitForEstablishedSession(h)
+    const sessionId = h.ctxState.agents.created[0]!.options.sessionId
+    await h.service.shutdown()
+    await h.ctxState.domain.raw.table('session_origins').delete(sessionId)
+
+    const service2 = new FeishuService(h.ctxState.ctx, h.config, () => makeChannel())
+    await service2.start()
+    await waitUntil(() => expect(h.ctxState.domain.raw.table('session_origins').get(sessionId)).toMatchObject({
+      chatId: 'oc_backfill', senderUserId: 'u_owner',
+    }))
+    expect(await service2.sessionOrigin(sessionId)).toMatchObject({ chatType: 'group', bound: true })
+    await service2.shutdown()
+  })
+
   it.each(['running', 'next-turn', 'next-step'] as const)(
     'rejects /renew while the old Agent has %s work without creating a Session',
     async busyKind => {

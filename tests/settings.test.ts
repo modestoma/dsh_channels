@@ -32,6 +32,7 @@ import {
   PANEL_COPY,
   PANEL_ROUTE,
   PICK_DIRECTORY_ROUTE,
+  SESSION_ORIGIN_ROUTE,
   PANEL_TABS,
   TAB_FIELD_GROUPS,
   RECONNECT_ROUTE,
@@ -45,6 +46,7 @@ import type {
   CredentialField,
   EditableValues,
   ScopeCheckWire,
+  SessionOriginWire,
   SlashCommandSyncWire,
 } from '../src/settings/contract.ts'
 import {
@@ -129,6 +131,9 @@ class FakeTarget implements SettingsTarget {
   healthState = healthySnapshot()
   scopeCheckState: ScopeCheckWire | undefined
   slashCommandSyncState: SlashCommandSyncWire | undefined
+  /** Origins by session id; absent ids are Sessions Feishu never routed. */
+  origins = new Map<string, SessionOriginWire>()
+  originCalls: string[] = []
   /** Admission snapshot handed to the panel (the real service keeps it in memory). */
   accessState: AccessWire = {
     mode: 'guarded',
@@ -284,6 +289,11 @@ class FakeTarget implements SettingsTarget {
     if (failed !== undefined) return failed
     this.accessState.wikiUsers = this.accessState.wikiUsers.filter(user => user.userId !== userId)
     return { ok: true, access: this.accessSnapshot() }
+  }
+
+  async sessionOrigin(sessionId: string): Promise<SessionOriginWire | null> {
+    this.originCalls.push(sessionId)
+    return this.origins.get(sessionId) ?? null
   }
 
   async resolveAccessRequest(token: string, decision: 'allow' | 'deny'): Promise<AccessMutationResponse> {
@@ -1799,6 +1809,7 @@ const ALL_SETTINGS_ROUTES: Array<{ route: string; method: string }> = [
   { route: ACCESS_USERS_ROUTE, method: 'POST' },
   { route: ACCESS_WIKI_USERS_ROUTE, method: 'POST' },
   { route: ACCESS_REQUESTS_ROUTE, method: 'POST' },
+  { route: SESSION_ORIGIN_ROUTE, method: 'GET' },
 ]
 
 describe('settings routes', () => {
@@ -1832,6 +1843,7 @@ describe('settings routes', () => {
       await expect(store.load()).resolves.toEqual({ dmMode: 'disabled' })
       expect(target.restartCalls).toBe(0)
       expect(target.accessCalls).toEqual([])
+      expect(target.originCalls).toEqual([])
     }
   })
 
@@ -1864,6 +1876,32 @@ describe('settings routes', () => {
     const notAllowed = await call(routes, STATUS_ROUTE, makeRequest({ method: 'POST' }))
     expect(notAllowed.status).toBe(405)
     expect(notAllowed.headers.allow).toBe('GET, HEAD')
+  })
+
+  it('serves a Session origin over GET, null for other Sessions, and requires sessionId', async () => {
+    const { surface, target } = makeSurface()
+    const origin: SessionOriginWire = {
+      sessionId: 's_feishu', chatType: 'group', kind: 'thread', chatId: 'oc_1', chatName: '研发群',
+      senderUserId: 'u_1', senderName: '张三', shared: false, createdAt: 1, bound: true, lastActivityAt: 2,
+      chatLink: 'https://applink.feishu.cn/client/chat/open?openChatId=oc_1',
+    }
+    target.origins.set('s_feishu', origin)
+    const { server, routes } = makeWebServer()
+    registerSettingsRoutes(server, allowAll, surface)
+
+    const hit = await call(routes, SESSION_ORIGIN_ROUTE, makeRequest({ url: `${SESSION_ORIGIN_ROUTE}?sessionId=s_feishu` }))
+    expect(hit.status).toBe(200)
+    expect(JSON.parse(hit.body)).toEqual({ origin })
+
+    const miss = await call(routes, SESSION_ORIGIN_ROUTE, makeRequest({ url: `${SESSION_ORIGIN_ROUTE}?sessionId=s_web` }))
+    expect(JSON.parse(miss.body)).toEqual({ origin: null })
+
+    const missing = await call(routes, SESSION_ORIGIN_ROUTE, makeRequest({ url: `${SESSION_ORIGIN_ROUTE}?sessionId=%20` }))
+    expect(missing.status).toBe(400)
+    expect(target.originCalls).toEqual(['s_feishu', 's_web'])
+
+    const post = await call(routes, SESSION_ORIGIN_ROUTE, makeRequest({ method: 'POST', url: SESSION_ORIGIN_ROUTE }))
+    expect(post.status).toBe(405)
   })
 
   it('serves the selector catalog over GET and rejects writes', async () => {

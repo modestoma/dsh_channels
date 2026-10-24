@@ -53,7 +53,7 @@ import { FEISHU_USER_ID_PATTERN, feishuDomain, sessionDirOf } from './domain.ts'
 import type {
   AccessGroupRecord, AccessRequestRecord, AccessUserRecord,
   AnalyzeRequestRecord, ExpiredRouteRecord, FeishuDomainGlobal, FeishuDomainHandle, InflightSnapshot,
-  ProcessedRecord, RawDomainHandle, RouteRecord,
+  ProcessedRecord, RawDomainHandle, RouteRecord, SessionOriginRecord,
 } from './domain.ts'
 import { RouteStore } from './session/routes.ts'
 import { AnalyzeLauncher } from './analyze/launcher.ts'
@@ -97,7 +97,8 @@ import { ACTIVITY_BUILD_MARKER, TurnStreamer } from './streamer.ts'
 import type { ProjectedStats, StreamerHooks } from './streamer.ts'
 import type { FeishuConfig } from './config.ts'
 import type {
-  AccessMutationResponse, AccessRequestWire, AccessUserWire, AccessWire, CredentialField, ScopeCheckWire, SlashCommandSyncWire,
+  AccessMutationResponse, AccessRequestWire, AccessUserWire, AccessWire, CredentialField, ScopeCheckWire, SessionOriginWire,
+  SlashCommandSyncWire,
 } from './settings/contract.ts'
 import { checkScopes } from './feishu/scopes.ts'
 import { desiredSlashCommands, syncSlashCommands } from './feishu/slash-commands.ts'
@@ -141,6 +142,9 @@ interface ModelAdmission {
   controller: RequestPolicyController
 }
 
+/** How long a resolved chat or user name serves the session-origin view. */
+const ORIGIN_NAME_TTL_MS = 10 * 60 * 1000
+
 /** Wrap the host's storage facility open behind a stable local type. */
 async function openFeishuDomain(ctx: HostContext): Promise<FeishuDomainHandle> {
   const domain = await ctx.storageDomain.open(feishuDomain) as unknown as RawDomainHandle
@@ -153,6 +157,7 @@ async function openFeishuDomain(ctx: HostContext): Promise<FeishuDomainHandle> {
   const accessRequestsRaw = domain.table('access_requests')
   const accessWikiUsersRaw = domain.table('access_wiki_users')
   const analyzeRequestsRaw = domain.table('analyze_requests')
+  const sessionOriginsRaw = domain.table('session_origins')
   return {
     routes: {
       get: key => table.get(key) as RouteRecord | undefined,
@@ -206,6 +211,10 @@ async function openFeishuDomain(ctx: HostContext): Promise<FeishuDomainHandle> {
       get: key => analyzeRequestsRaw.get(key) as AnalyzeRequestRecord | undefined,
       put: (key, value) => analyzeRequestsRaw.put(key, value),
       entries: () => analyzeRequestsRaw.entries() as IterableIterator<[string, AnalyzeRequestRecord]>,
+    },
+    sessionOrigins: {
+      get: key => sessionOriginsRaw.get(key) as SessionOriginRecord | undefined,
+      put: (key, value) => sessionOriginsRaw.put(key, value),
     },
     getGlobal: () => (domain.global.get() ?? {}) as FeishuDomainGlobal,
     setGlobal: value => domain.global.set(value),
@@ -361,6 +370,8 @@ export class FeishuService {
    * is unset. Cleared on shutdown so a reconnect looks it up again.
    */
   private appOwner: AppOwnerState | undefined
+  /** Live-resolved chat and user display names for the session-origin view, by `chat:`/`user:` key. */
+  private readonly originNames = new Map<string, { name: string | undefined; at: number }>()
   /** Post-connect scope self-check; cleared on shutdown. */
   private scopeCheckState: ScopeCheckWire | undefined
   /** Post-connect slash-command panel sync; cleared on shutdown. */
@@ -1104,6 +1115,60 @@ export class FeishuService {
   }
 
   /** Panel: decide one pending authorization request (same path as the card). */
+  async sessionOrigin(sessionId: string): Promise<SessionOriginWire | null> {
+    const origin = this.routes.origin(sessionId)
+    if (origin === undefined) return null
+    const route = this.routes.findBySession(sessionId)
+    const bound = route !== undefined
+    const [chatName, senderName] = await Promise.all([
+      origin.chatType === 'group'
+        ? this.originName(`chat:${origin.chatId}`, async channel => (await channel.getChatInfo(origin.chatId)).name)
+        : Promise.resolve(undefined),
+      this.originName(`user:${origin.senderUserId}`, async channel => await channel.userName?.(
+        origin.senderUserId,
+        origin.chatType === 'group' ? origin.chatId : undefined,
+      )),
+    ])
+    return {
+      sessionId,
+      chatType: origin.chatType,
+      kind: origin.kind,
+      chatId: origin.chatId,
+      ...(chatName === undefined ? {} : { chatName }),
+      senderUserId: origin.senderUserId,
+      ...(senderName === undefined ? {} : { senderName }),
+      shared: origin.shared === true,
+      createdAt: origin.createdAt,
+      bound,
+      ...(bound ? { lastActivityAt: route.lastActivityAt } : {}),
+      chatLink: `https://applink.feishu.cn/client/chat/open?openChatId=${encodeURIComponent(origin.chatId)}`,
+    }
+  }
+
+  /**
+   * One display name through a short-lived cache. Lookup failures and a
+   * disconnected channel yield `undefined`; misses are cached too, so an
+   * unnamed user does not cost a Feishu call on every sidebar refresh.
+   */
+  private async originName(
+    key: string,
+    lookup: (channel: FeishuChannel) => Promise<string | undefined>,
+  ): Promise<string | undefined> {
+    const now = Date.now()
+    const cached = this.originNames.get(key)
+    if (cached !== undefined && now - cached.at < ORIGIN_NAME_TTL_MS) return cached.name
+    const channel = this.channel
+    if (channel === undefined) return cached?.name
+    let name: string | undefined
+    try {
+      name = (await lookup(channel))?.trim() || undefined
+    } catch (error) {
+      this.ctx.logger?.debug?.('dsh-channels: resolving %s for the session origin failed: %s', key, messageOf(error))
+    }
+    this.originNames.set(key, { name, at: now })
+    return name
+  }
+
   async resolveAccessRequest(token: string, decision: 'allow' | 'deny'): Promise<AccessMutationResponse> {
     const requests = this.accessRequests
     if (requests === undefined) return { ok: false, error: '授权服务尚未启动' }

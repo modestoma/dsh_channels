@@ -14,6 +14,7 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 - **准入与授权（默认开启）**：**管理员不受白名单限制**（私聊、任意群聊——包括尚未授权的群——都能直接发起会话）；其他人私聊只收到一条固定提示（`/userid` 例外），群聊需要「群已授权 + 用户在全局白名单」两层同时命中。机器人被拉进群后私聊管理员发**群信息卡**（未授权群附授权按钮，用于放行白名单用户）；已授权群里未授权用户 @ 会触发用户授权卡。授权入口：飞书 `/auth` 命令、授权卡、Web 设置面板；管理员 user_id 在面板配置（私聊 `/userid` 获取），**留空时自动使用飞书应用所有者**
 - 全部基于飞书官方 SDK [`@larksuiteoapi/node-sdk`](https://www.npmjs.com/package/@larksuiteoapi/node-sdk)（WebSocket 长连接，免公网）
 - **Web 设置面板**：Web/桌面端左侧栏 **飞书渠道** 入口（主区整页），顶部状态头 + 7 个标签页（连接 / 会话 / 模型 / 附件与工具 / 访问授权 / 知识库 / 高级）；凭据不完整时插件不连接、面板显示三步引导，填写保存后自动连接（保存写入本机覆盖文件，部分字段需重连生效）；详见下文「Web 设置面板」章节
+- **对话里的飞书来源**：从飞书发起的会话在 Web/桌面端对话标题旁多一个来源按钮（群名或「飞书私聊」），点开在右侧栏「飞书来源」标签页查看群聊/私聊、话题、发起人、开始与最近活跃时间，并可跳回飞书；其他会话不显示；详见下文「对话里的飞书来源」章节
 
 设计与可行性论证见 [docs/feasibility-and-design.md](docs/feasibility-and-design.md)；工作区粒度与会话隔离的取舍见 [docs/workspace-isolation-design.md](docs/workspace-isolation-design.md)；入站附件管线（存储 / 清单 / 工具 / 引用与历史 / 降级 / 隐私边界）见 [docs/attachment-pipeline-v2.md](docs/attachment-pipeline-v2.md)。
 
@@ -119,6 +120,17 @@ pnpm verify:host      # 以纯 ESM 导入 Host bundle，检查 Cordis 插件面
 pnpm verify:client    # 用 __ModuleLoader__ shim 做 loader 冒烟
 ```
 
+## 对话里的飞书来源
+
+从飞书发起的会话（话题、会话级降级、`/renew` 新开的会话、日志平台分析话题）在 Web/桌面端对话标题旁会出现一个来源按钮：群聊显示群名，私聊显示「飞书私聊」。点击后在右侧栏打开「飞书来源」标签页，内容包括：
+
+- **来源**：私聊 / 群聊 / 群聊 · 话题；群名读不到时显示群 ID；
+- **发起人**：姓名 + `user_id`（日志平台分析话题显示请求人，并注明群内成员都可以继续）；
+- **开始于 / 最近活跃**：飞书侧已经换到新会话（`/renew`、`/new`）或路由过期后，「最近活跃」换成「状态：飞书侧已切换到新会话或已过期」；
+- **在飞书中打开**（飞书 applink 打开对应聊天）与「刷新」。
+
+Web 里直接新建的会话不显示按钮。来源在 Host 侧按会话 id 持久保存（存储表 `session_origins`，路由过期后仍可查；升级前已有的路由在启动时补写）。群名与姓名每次读取时实时解析并缓存 10 分钟：群名用 `im:chat:readonly`，姓名优先用通讯录 `contact:user.base:readonly`，缺失时群聊从群成员列表查，私聊只显示 `user_id`。接口为 `GET /dsh-channels/session-origin?sessionId=…`，与设置面板一样需要 DSH 登录。右侧栏不可用的宿主（如 headless）不注册这部分。
+
 ## 发布
 
 版本号由 semantic-release 按 Conventional Commits 计算，**只在手动触发时发布**；推送到 `main` / `dev` 只跑检查，可以先累积多笔提交。
@@ -189,7 +201,9 @@ src/
 ├── session-export.ts      # 逻辑日志导出
 ├── feishu-channel.ts      # 官方 SDK Channel 适配（可注入 stub）
 ├── client/                # 浏览器半区：左侧栏「飞书渠道」主区页面（构建到 lib/client.js）
-│   ├── index.ts           #   client 插件入口：sidebar.panellist + main 注册 + 样式
+│   ├── index.ts           #   client 插件入口：sidebar.panellist + main 注册、飞书来源（右侧栏标签 + 会话头部入口）+ 样式
+│   ├── origin.tsx         #   对话里的飞书来源：会话头部按钮与右侧栏标签页
+│   ├── origin-cache.ts    #   按会话缓存的来源查询
 │   ├── panel/             #   页面外壳 + 七个标签页
 │   │   ├── index.tsx      #     加载 / 5s 状态轮询 / 全局草稿 / catalog 级联 / 顶部状态头 / Tab
 │   │   ├── shared.tsx     #     行 / 开关 / 分组 / 保存栏等渲染原语、阶段徽标、草稿校验

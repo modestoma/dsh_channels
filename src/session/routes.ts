@@ -2,15 +2,16 @@
  * Durable route store: thread/chat keys → bound DSH session records.
  *
  * Owns the hot cache over the `channels_routes` domain tables, the TTL
- * retirement that leaves a persistent tombstone, and session → route lookup.
+ * retirement that leaves a persistent tombstone, session → route lookup, and
+ * the durable session → Feishu origin records every route write feeds.
  * The domain handle is late-bound (`domain()`), because the service opens it
  * during `start()` while the store is constructed earlier.
  *
  * @module dsh-channels/session/routes
  */
 
-import type { ExpiredRouteRecord, FeishuDomainHandle, RouteRecord } from '../domain.ts'
-import { normalizeRouteRecord } from '../domain.ts'
+import type { ExpiredRouteRecord, FeishuDomainHandle, RouteRecord, SessionOriginRecord } from '../domain.ts'
+import { normalizeRouteRecord, normalizeSessionHistory } from '../domain.ts'
 
 export interface RouteStoreDeps {
   /** The opened domain handle, or undefined before `start()` / after shutdown. */
@@ -44,6 +45,11 @@ export class RouteStore {
       this.expired.set(key, record)
       this.active.delete(key)
     }
+    // Routes written before origins existed get theirs now; a failure only
+    // leaves those Sessions without a Web origin view.
+    for (const record of this.active.values()) {
+      void this.recordOrigins(record)
+    }
   }
 
   /** One active route by key (cache-first, normalized). */
@@ -70,7 +76,14 @@ export class RouteStore {
   /** Persist one active route and refresh the cache. */
   async put(key: string, record: RouteRecord): Promise<void> {
     await this.deps.domain()?.routes.put(key, record)
-    this.active.set(key, normalizeRouteRecord(record))
+    const normalized = normalizeRouteRecord(record)
+    this.active.set(key, normalized)
+    await this.recordOrigins(normalized)
+  }
+
+  /** Feishu origin of one Session any route ever named, retired routes included. */
+  origin(sessionId: string): SessionOriginRecord | undefined {
+    return this.deps.domain()?.sessionOrigins.get(sessionId)
   }
 
   /** Delete one active route from the medium and the cache. */
@@ -102,6 +115,34 @@ export class RouteStore {
   clear(): void {
     this.active.clear()
     this.expired.clear()
+  }
+
+  /**
+   * Write an origin for every Session in the route's history that has none.
+   * Existing origins are never rewritten: the first route naming a Session
+   * is where it started. Failures are logged and never fail the route write.
+   */
+  private async recordOrigins(record: RouteRecord): Promise<void> {
+    const table = this.deps.domain()?.sessionOrigins
+    if (table === undefined) return
+    for (const entry of normalizeSessionHistory(record)) {
+      if (table.get(entry.sessionId) !== undefined) continue
+      const origin: SessionOriginRecord = {
+        key: entry.sessionId,
+        routeKey: record.key,
+        kind: record.kind,
+        chatId: record.chatId,
+        chatType: record.chatType,
+        senderUserId: record.senderUserId,
+        createdAt: entry.createdAt,
+        ...(record.shared === true ? { shared: true as const } : {}),
+      }
+      try {
+        await table.put(entry.sessionId, origin)
+      } catch (error) {
+        this.deps.warn('dsh-channels: recording the origin of session %s failed: %s', entry.sessionId, String(error))
+      }
+    }
   }
 
   /** Whether one active route has crossed the configured inactivity deadline. */
