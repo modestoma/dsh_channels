@@ -25,7 +25,10 @@ type OriginState =
 /** Load one Session's origin; `reload` asks the Host again. */
 function useSessionOrigin(sessionId: string): [OriginState, () => void] {
   const [state, setState] = useState<OriginState>({ phase: 'loading' })
-  const [ticket, setTicket] = useState(0)
+  // A reload is tied to the Session it was asked for, so switching Sessions
+  // never shows the previous Session's origin while the new one loads.
+  const [reloadOf, setReloadOf] = useState<{ sessionId: string; ticket: number }>({ sessionId, ticket: 0 })
+  const ticket = reloadOf.sessionId === sessionId ? reloadOf.ticket : 0
   useEffect(() => {
     let live = true
     setState(current => (current.phase === 'ready' && ticket > 0 ? current : { phase: 'loading' }))
@@ -37,7 +40,9 @@ function useSessionOrigin(sessionId: string): [OriginState, () => void] {
     )
     return () => { live = false }
   }, [sessionId, ticket])
-  const reload = useCallback(() => { setTicket(value => value + 1) }, [])
+  const reload = useCallback(() => {
+    setReloadOf(current => ({ sessionId, ticket: current.sessionId === sessionId ? current.ticket + 1 : 1 }))
+  }, [sessionId])
   return [state, reload]
 }
 
@@ -46,6 +51,10 @@ function sourceLabel(origin: SessionOriginWire): string {
   if (origin.chatType === 'p2p') return '飞书私聊'
   return origin.chatName === undefined ? '飞书群聊' : origin.chatName
 }
+
+/** Times a mounted header re-asks after a null answer, and the delay between asks. */
+const HEADER_NULL_RETRIES = 3
+const HEADER_NULL_RETRY_MS = 5_000
 
 /** Props of the header entry: the session standard kit's `sessionId`. */
 export interface OriginHeaderActionProps {
@@ -61,7 +70,20 @@ export interface OriginHeaderActionProps {
  * @returns the button or null.
  */
 export function OriginHeaderAction({ sessionId, openOrigin }: OriginHeaderActionProps): JSX.Element | null {
-  const [state] = useSessionOrigin(sessionId)
+  const [state, reload] = useSessionOrigin(sessionId)
+  const [retries, setRetries] = useState(0)
+  useEffect(() => { setRetries(0) }, [sessionId])
+  // A Session opened while Feishu is still creating it answers null until its
+  // route is written; look again a few times while the header stays mounted.
+  const waiting = state.phase === 'ready' && state.origin === null && retries < HEADER_NULL_RETRIES
+  useEffect(() => {
+    if (!waiting) return
+    const timer = setTimeout(() => {
+      setRetries(value => value + 1)
+      reload()
+    }, HEADER_NULL_RETRY_MS)
+    return () => { clearTimeout(timer) }
+  }, [waiting, reload])
   if (state.phase !== 'ready' || state.origin === null) return null
   const label = sourceLabel(state.origin)
   return (
@@ -108,7 +130,12 @@ export function OriginTab({ sessionId }: OriginTabProps): JSX.Element {
           )
         : null}
       {state.phase === 'ready' && state.origin === null
-        ? <div className="dsh-channels-origin__muted">这个会话不是从飞书发起的。</div>
+        ? (
+            <div className="dsh-channels-origin__muted">
+              这个会话不是从飞书发起的。
+              <button type="button" className="dsh-channels-origin__link" onClick={reload}>刷新</button>
+            </div>
+          )
         : null}
       {state.phase === 'ready' && state.origin !== null ? <OriginDetails origin={state.origin} onRefresh={reload} /> : null}
     </div>

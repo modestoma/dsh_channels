@@ -28,13 +28,32 @@ describe('loadSessionOrigin', () => {
     expect(fetch).toHaveBeenCalledTimes(2)
   })
 
-  it('caches a non-Feishu answer but retries after a failure', async () => {
+  it('re-asks after a non-Feishu answer expires, since a new Session is listed before its route exists', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    try {
+      const fetch = vi.fn()
+        .mockResolvedValueOnce(new Response(JSON.stringify({ origin: null }), { status: 200 }))
+        .mockResolvedValue(new Response(JSON.stringify({ origin }), { status: 200 }))
+      vi.stubGlobal('fetch', fetch)
+      await expect(loadSessionOrigin('s_early')).resolves.toBeNull()
+      await expect(loadSessionOrigin('s_early')).resolves.toBeNull()
+      expect(fetch).toHaveBeenCalledTimes(1)
+      vi.setSystemTime(Date.now() + 15_000)
+      await expect(loadSessionOrigin('s_early')).resolves.toEqual(origin)
+      vi.setSystemTime(Date.now() + 60_000)
+      await expect(loadSessionOrigin('s_early')).resolves.toEqual(origin)
+      expect(fetch).toHaveBeenCalledTimes(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('retries after a failure', async () => {
     const fetch = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify({ ok: false, error: '未登录' }), { status: 401 }))
       .mockResolvedValue(new Response(JSON.stringify({ origin: null }), { status: 200 }))
     vi.stubGlobal('fetch', fetch)
     await expect(loadSessionOrigin('s_retry')).rejects.toThrow('未登录')
-    await expect(loadSessionOrigin('s_retry')).resolves.toBeNull()
     await expect(loadSessionOrigin('s_retry')).resolves.toBeNull()
     expect(fetch).toHaveBeenCalledTimes(2)
   })
