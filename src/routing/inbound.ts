@@ -47,7 +47,13 @@ import { ensureWorkspace, stagingPathFor, topicTokenFor } from '../workspaces.ts
 
 /** The command plane the inbound router delegates admission-time work to. */
 export interface CommandPlanePort {
-  /** Slash-command admission + dispatch. */
+  /**
+   * Whether a `/`-prefixed line names a channel command (including aliases).
+   * Other slash lines are ordinary prompts, so DSH can expand user-invocable
+   * skills such as `/guanxiang`.
+   */
+  owns(line: string): boolean
+  /** Slash-command admission + dispatch for a line {@link owns} accepted. */
   handleSlash(msg: NormalizedMessage, line: string): Promise<void>
 }
 
@@ -386,10 +392,12 @@ export class InboundRouter {
       this.ctx.logger?.warn?.('dsh-channels: recording processed message %s failed: %s', msg.messageId, String(error))
     }
 
-    // Slash admission stays behind message-id dedup but ahead of every route,
-    // mention, workspace, Session, card-stream, and model side effect. The
-    // command plane applies its own administrator/bootstrap rules.
-    if (content.startsWith('/')) {
+    // Channel-command admission stays behind message-id dedup but ahead of
+    // every route, mention, workspace, Session, card-stream, and model side
+    // effect. The command plane applies its own administrator/bootstrap rules.
+    // A slash line that names no channel command continues as an ordinary
+    // prompt through the channel-plane admission below.
+    if (content.startsWith('/') && this.deps.commands.owns(content)) {
       await this.deps.commands.handleSlash(msg, content)
       return
     }

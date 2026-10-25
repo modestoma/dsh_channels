@@ -588,7 +588,13 @@ export class FeishuService {
       streamer: () => this.streamer,
       questionAnswerer: () => this.questionAnswerer,
       approvalAnswerer: () => this.approvalAnswerer,
-      commands: { handleSlash: (msg, line) => this.handleSlashMessage(msg, line) },
+      commands: {
+        owns: (line) => {
+          const parsed = parseSlashCommand(line)
+          return parsed !== undefined && commandSpec(parsed.name) !== undefined
+        },
+        handleSlash: (msg, line) => this.handleSlashMessage(msg, line),
+      },
     })
     this.analyzeLauncher = new AnalyzeLauncher({
       ctx: this.ctx,

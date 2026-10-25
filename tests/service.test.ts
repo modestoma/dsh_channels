@@ -480,17 +480,36 @@ describe('FeishuService', () => {
     expect(json).not.toContain('cause')
   })
 
-  it('rejects an unknown slash command without creating a Session or model turn', async () => {
+  it('forwards a slash line that names no channel command to the Agent as a prompt', async () => {
     const h = await setup()
-    const msg = makeMessage({ chatType: 'p2p', senderId: 'u_alice', content: '/foo' })
-    await h.onMessage(msg)
+    await h.onMessage(makeMessage({ chatType: 'p2p', senderId: 'u_alice', content: '/guanxiang 订单服务下单报 500' }))
+    await waitForEstablishedSession(h)
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    await waitUntil(() => expect(mock(agent.followup)).toHaveBeenCalledTimes(1))
+
+    expect((mock(agent.followup).mock.calls[0]?.[0] as { content: Array<{ text: string }> }).content[0]?.text)
+      .toBe('/guanxiang 订单服务下单报 500')
+    expect(mock(h.ctxState.ctx.commands.execute)).not.toHaveBeenCalled()
+    expect(JSON.stringify(h.channel.sent)).not.toContain('未知命令')
+  })
+
+  it('forwards an @-mentioned slash prompt in a group chat', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({ chatType: 'group', chatId: 'oc_guanxiang', senderId: 'u_owner', mentionedBot: true, content: '/guanxiang 看下支付回调日志' }))
+    await waitForEstablishedSession(h)
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    await waitUntil(() => expect(mock(agent.followup)).toHaveBeenCalledTimes(1))
+    expect((mock(agent.followup).mock.calls[0]?.[0] as { content: Array<{ text: string }> }).content[0]?.text)
+      .toBe('/guanxiang 看下支付回调日志')
+  })
+
+  it('keeps answering a channel command alias on the command plane', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({ chatType: 'p2p', senderId: 'u_alice', content: '/help' }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
 
     expect(h.ctxState.agents.created).toHaveLength(0)
-    expect(h.channel.sent).toHaveLength(1)
-    const json = JSON.stringify((h.channel.sent[0] as { input: object }).input)
-    expect(json).toContain('未知命令')
-    expect(json).toContain('/health')
+    expect(JSON.stringify((h.channel.sent[0] as { input: object }).input)).toContain('/health')
   })
 
   it('executes a routed command once with one lifecycle pair and no followup', async () => {
@@ -3170,21 +3189,23 @@ describe('command registry dispatch', () => {
     await h.service.shutdown()
   })
 
-  it('rejects an unknown command with the registry-derived supported list', async () => {
+  it('sends an unknown slash line in a topic to the bound Session as a prompt', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_unknown', senderId: 'u_owner', content: '开始',
     }))
     await waitForEstablishedSession(h)
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    await waitUntil(() => expect(mock(agent.followup)).toHaveBeenCalledTimes(1))
 
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_unknown', senderId: 'u_owner', threadId: 'omt_1',
-      mentionedBot: false, messageId: 'om_unknown_cmd', content: '/nope',
+      mentionedBot: false, messageId: 'om_unknown_cmd', content: '/nope 继续',
     }))
-    await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
-    const json = JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)
-    expect(json).toContain('未找到命令 /nope')
-    expect(json).toContain('/userid')
+    await waitUntil(() => expect(mock(agent.followup)).toHaveBeenCalledTimes(2))
+    expect((mock(agent.followup).mock.calls[1]?.[0] as { content: Array<{ text: string }> }).content[0]?.text).toBe('/nope 继续')
+    expect(h.ctxState.agents.created).toHaveLength(1)
+    expect(JSON.stringify(h.channel.sent)).not.toContain('未找到命令')
     await h.service.shutdown()
   })
 })
