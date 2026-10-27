@@ -6,7 +6,8 @@
  * every mutation writes through to the domain first and then updates memory,
  * matching the store patterns used for routes and inflight snapshots.
  *
- * The tables (`access_groups`, `access_users`, `access_requests`) were added
+ * The tables (`access_groups`, `access_users`, `access_requests`,
+ * `access_wiki_users`) were added
  * without bumping the domain version on purpose: the JSON backend's `single`
  * layout refuses a stored-version mismatch, while unknown/missing tables are
  * simply empty on load (see `docs/access-control-design.md` §4.2).
@@ -40,6 +41,8 @@ export class AccessStore {
   private readonly groups = new Map<string, AccessGroupRecord>()
   private readonly users = new Map<string, AccessUserRecord>()
   private readonly requests = new Map<string, AccessRequestRecord>()
+  /** Wiki whitelist (`/auth wiki add`), independent of the user whitelist. */
+  private readonly wikiUsers = new Map<string, AccessUserRecord>()
   /** Cached key sets so `snapshot()` can stay allocation-free per message. */
   private readonly groupKeys = new Set<string>()
   private readonly userKeys = new Set<string>()
@@ -65,6 +68,9 @@ export class AccessStore {
     for (const [key, record] of domain.accessRequests.entries()) {
       this.requests.set(key, record)
     }
+    for (const [key, record] of domain.accessWikiUsers.entries()) {
+      this.wikiUsers.set(key, record)
+    }
   }
 
   /** Drop every in-memory record (shutdown). The domain owns durability. */
@@ -72,6 +78,7 @@ export class AccessStore {
     this.groups.clear()
     this.users.clear()
     this.requests.clear()
+    this.wikiUsers.clear()
     this.groupKeys.clear()
     this.userKeys.clear()
   }
@@ -84,16 +91,16 @@ export class AccessStore {
     return this.groupKeys.has(chatId)
   }
 
-  hasUser(openId: string): boolean {
-    return this.userKeys.has(openId)
+  hasUser(userId: string): boolean {
+    return this.userKeys.has(userId)
   }
 
   getGroup(chatId: string): AccessGroupRecord | undefined {
     return this.groups.get(chatId)
   }
 
-  getUser(openId: string): AccessUserRecord | undefined {
-    return this.users.get(openId)
+  getUser(userId: string): AccessUserRecord | undefined {
+    return this.users.get(userId)
   }
 
   /** Every authorized group, oldest first. */
@@ -122,17 +129,40 @@ export class AccessStore {
   }
 
   async addUser(record: AccessUserRecord): Promise<AccessUserRecord> {
-    await this.requireDomain('add access user').accessUsers.put(record.openId, record)
-    this.users.set(record.openId, record)
-    this.userKeys.add(record.openId)
+    await this.requireDomain('add access user').accessUsers.put(record.userId, record)
+    this.users.set(record.userId, record)
+    this.userKeys.add(record.userId)
     return record
   }
 
-  async removeUser(openId: string): Promise<boolean> {
-    if (!this.users.has(openId)) return false
-    await this.requireDomain('remove access user').accessUsers.delete(openId)
-    this.users.delete(openId)
-    this.userKeys.delete(openId)
+  async removeUser(userId: string): Promise<boolean> {
+    if (!this.users.has(userId)) return false
+    await this.requireDomain('remove access user').accessUsers.delete(userId)
+    this.users.delete(userId)
+    this.userKeys.delete(userId)
+    return true
+  }
+
+  /** Whether `userId` is on the wiki whitelist (the administrator is not implied). */
+  hasWikiUser(userId: string): boolean {
+    return this.wikiUsers.has(userId)
+  }
+
+  /** Every wiki-whitelisted user, oldest first. */
+  wikiUserRecords(): AccessUserRecord[] {
+    return [...this.wikiUsers.values()].sort((left, right) => left.addedAt - right.addedAt)
+  }
+
+  async addWikiUser(record: AccessUserRecord): Promise<AccessUserRecord> {
+    await this.requireDomain('add wiki user').accessWikiUsers.put(record.userId, record)
+    this.wikiUsers.set(record.userId, record)
+    return record
+  }
+
+  async removeWikiUser(userId: string): Promise<boolean> {
+    if (!this.wikiUsers.has(userId)) return false
+    await this.requireDomain('remove wiki user').accessWikiUsers.delete(userId)
+    this.wikiUsers.delete(userId)
     return true
   }
 

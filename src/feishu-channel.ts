@@ -9,6 +9,15 @@
  */
 
 import { createLarkChannel, LoggerLevel } from '@larksuiteoapi/node-sdk'
+import { SCOPE_GRANTED_STATUS } from './feishu/scopes.ts'
+import type { ScopeGrant } from './feishu/scopes.ts'
+import type { RemoteSlashCommand, SlashCommandApi, SlashCommandEntry } from './feishu/slash-commands.ts'
+import { createWikiApi } from './feishu/wiki/api.ts'
+import type { WikiApi, WikiRawRequest } from './feishu/wiki/api.ts'
+import { createBaseApi } from './feishu/wiki/base-api.ts'
+import type { BaseApi } from './feishu/wiki/base-api.ts'
+import { createSheetApi } from './feishu/wiki/sheet-api.ts'
+import type { SheetApi } from './feishu/wiki/sheet-api.ts'
 import type {
   BotAddedEvent,
   ChatInfo,
@@ -21,11 +30,17 @@ import type {
 export type { BotAddedEvent, ChatInfo, NormalizedMessage, SendResult } from '@larksuiteoapi/node-sdk'
 export type FeishuConnectionStatus = WSConnectionStatus
 
-/** Outbound payloads used by this plugin, including Buffer-backed file upload. */
+/** Outbound payloads used by this plugin, including Buffer-backed image and file uploads. */
 export type FeishuSendInput =
   | { card: object }
   | { text: string }
+  | { image: { source: Buffer } }
   | { file: { source: string | Buffer; fileName: string } }
+
+/** One outbound image or file uploaded from memory. */
+export type OutboundMedia =
+  | { readonly kind: 'image'; readonly data: Buffer }
+  | { readonly kind: 'file'; readonly data: Buffer; readonly fileName: string }
 
 /**
  * One normalized card action (button click) event, as delivered by the
@@ -56,20 +71,78 @@ export interface FeishuChannel {
   onBotAdded(handler: (event: BotAddedEvent) => void | Promise<void>): () => void
   /** Chat name/owner/member count (needs chat-info read permission). */
   getChatInfo(chatId: string): Promise<ChatInfo>
+  /**
+   * Contact profiles (name and avatar) of tenant users by `user_id`
+   * (`contact.v3.user.batch`, `contact:user.base:readonly`). Users outside the
+   * app's contact range are absent from the map. Rejects with a
+   * {@link FeishuApiError} when the lookup fails as a whole. Optional so stubs
+   * can omit it.
+   */
+  userProfiles?(userIds: readonly string[]): Promise<ReadonlyMap<string, FeishuProfile>>
+  /**
+   * Name and avatar of one chat (`im.v1.chat.get`, `im:chat:readonly`); a bot
+   * outside the chat still gets both. Rejects with a {@link FeishuApiError}
+   * when the call fails. Optional so stubs can omit it.
+   */
+  chatProfile?(chatId: string): Promise<FeishuProfile>
+  /**
+   * Display name of one user from the member list of `chatId`
+   * (`im:chat:readonly`), for users the contact profile cannot name. Resolves
+   * `undefined` when the list does not name the user; never rejects. Optional
+   * so stubs can omit it.
+   */
+  memberName?(userId: string, chatId: string): Promise<string | undefined>
   /** Bot open_id, available after `connect()` resolves. */
   botOpenId(): string | undefined
+  /**
+   * The app owner's `user_id` (`application.v6.application.get`), used as the
+   * administrator when none is configured. Resolves `undefined` when the owner
+   * is not a tenant member; rejects with an {@link AppOwnerLookupError} when
+   * the API call fails (typically a missing app-info scope). Optional so stubs
+   * and older channels can omit it; absence means no owner fallback.
+   */
+  appOwnerUserId?(): Promise<string | undefined>
+  /**
+   * Scopes the app requested from the tenant and their grant state
+   * (`application.v6.scope.list`). Rejects with a {@link FeishuApiError} when
+   * the call fails. Optional so stubs can omit it; absence skips the check.
+   */
+  grantedScopes?(): Promise<readonly ScopeGrant[]>
+  /**
+   * The app's native slash-command panel endpoints
+   * (`application/v7/app_slash_commands`). Optional so stubs can omit it;
+   * absence skips the panel sync.
+   */
+  readonly slashCommands?: SlashCommandApi
+  /**
+   * Wiki and docx endpoints used by the wiki tools, called with the app
+   * identity. Optional so stubs can omit it; absence fails wiki calls with
+   * a channel-unavailable result.
+   */
+  readonly wiki?: WikiApi
+  /** Spreadsheet (`sheet_ai/v2`) endpoints used by the wiki sheet tools; optional like {@link wiki}. */
+  readonly sheets?: SheetApi
+  /** Base (`base/v3`) endpoints used by the wiki base tools; optional like {@link wiki}. */
+  readonly bases?: BaseApi
   /** Current official-SDK WebSocket lifecycle snapshot, when initialized. */
   getConnectionStatus(): FeishuConnectionStatus | undefined
   /** Start the WebSocket long connection (resolves after the handshake). */
   connect(): Promise<void>
   /** Stop the connection. */
   disconnect(): Promise<void>
-  /** Send one message (text or card) with optional reply targeting. */
+  /** Send one message (text, card, image or file) with optional reply targeting. */
   send(
     chatId: string,
     input: FeishuSendInput,
     options?: { replyTo?: string; replyInThread?: boolean },
   ): Promise<SendResult>
+  /**
+   * Upload one image or file and send it as a reply to `replyTo`. Unlike
+   * {@link FeishuChannel.send}, a recalled or deleted reply target is NOT
+   * retried as a fresh chat message: the call rejects with a
+   * {@link FeishuApiError}, so topic output never lands on the main timeline.
+   */
+  replyMedia(replyTo: string, media: OutboundMedia, options: { replyInThread: boolean }): Promise<SendResult>
   /** Full-card replacement of a previously sent card message. */
   updateCard(messageId: string, card: object): Promise<void>
   /** Add an emoji reaction; resolves with the reaction id needed for removal. */
@@ -181,6 +254,159 @@ export async function* downloadResourceInRanges(
   }
 }
 
+/** Owner type `2` = tenant member; `0`/`1` are Feishu itself or an ISV partner. */
+const APP_OWNER_TYPE_TENANT_MEMBER = 2
+
+/** Failed Feishu OpenAPI call, carrying the Feishu `code`/`msg` when present. */
+export class FeishuApiError extends Error {
+  /**
+   * @param detail Feishu `code=<n> <msg>` or the transport error text.
+   * @param code Feishu API error code, when the response carried one.
+   */
+  constructor(readonly detail: string, readonly code?: number) {
+    super(`feishu api call failed: ${detail}`)
+    this.name = 'FeishuApiError'
+  }
+}
+
+/** Failed app-owner lookup, carrying the Feishu `code`/`msg` when present. */
+export class AppOwnerLookupError extends FeishuApiError {
+  /**
+   * @param detail Feishu `code=<n> <msg>` or the transport error text.
+   * @param code Feishu API error code, when the response carried one.
+   */
+  constructor(detail: string, code?: number) {
+    super(detail, code)
+    this.message = `app owner lookup failed: ${detail}`
+    this.name = 'AppOwnerLookupError'
+  }
+}
+
+/** `detail`/`code` of a thrown SDK/Axios error, preferring the Feishu error body. */
+function thrownErrorFields(error: unknown): { detail: string; code?: number } {
+  const data = (error as { response?: { data?: { code?: unknown; msg?: unknown } } } | undefined)?.response?.data
+  const code = typeof data?.code === 'number' ? data.code : undefined
+  const msg = typeof data?.msg === 'string' ? data.msg : undefined
+  if (code === undefined && msg === undefined) return { detail: error instanceof Error ? error.message : String(error) }
+  return { detail: [code === undefined ? undefined : `code=${code}`, msg].filter(Boolean).join(' '), code }
+}
+
+/** Normalize a thrown SDK/Axios error into an {@link AppOwnerLookupError}. */
+/** Throw a {@link FeishuApiError} for a non-zero Feishu `code`. */
+function assertFeishuOk(response: { code?: number; msg?: string }): void {
+  if (response.code !== undefined && response.code !== 0) {
+    throw new FeishuApiError(`code=${response.code}${response.msg === undefined ? '' : ` ${response.msg}`}`, response.code)
+  }
+}
+
+/** Member-list pages `memberName()` scans before giving up (100 members each). */
+const MEMBER_NAME_PAGES = 5
+
+/** `user_ids` per `contact.v3.user.batch` call (the API maximum). */
+const USER_BATCH_SIZE = 50
+
+/** Display name and avatar of one Feishu user or chat, as far as Feishu reports them. */
+export interface FeishuProfile {
+  name?: string
+  /** `https:` image URL on the Feishu CDN. */
+  avatarUrl?: string
+}
+
+/** Keep a non-blank name and an `https:` avatar URL from one Feishu response. */
+function feishuProfile(name: string | undefined, avatar: string | undefined): FeishuProfile {
+  const trimmed = name?.trim()
+  const avatarUrl = avatar !== undefined && /^https:\/\/[^\s"'<>]+$/u.test(avatar) ? avatar : undefined
+  return {
+    ...(trimmed === undefined || trimmed === '' ? {} : { name: trimmed }),
+    ...(avatarUrl === undefined ? {} : { avatarUrl }),
+  }
+}
+
+/** Run one raw request, mapping thrown and non-zero-code failures to {@link FeishuApiError}. */
+async function feishuCall<T extends { code?: number; msg?: string }>(call: () => Promise<T>): Promise<T> {
+  let response: T
+  try {
+    response = await call()
+  } catch (error) {
+    const { detail, code } = thrownErrorFields(error)
+    throw new FeishuApiError(detail, code)
+  }
+  assertFeishuOk(response)
+  return response
+}
+
+/**
+ * Run one upload. The typed upload methods return the `data` object directly
+ * (or `null`) and throw on a non-zero code, so only thrown errors need mapping.
+ */
+async function feishuUpload<T>(call: () => Promise<T>): Promise<T> {
+  try {
+    return await call()
+  } catch (error) {
+    const { detail, code } = thrownErrorFields(error)
+    throw new FeishuApiError(detail, code)
+  }
+}
+
+/** Base path of the app slash-command endpoints (absent from SDK 1.76's typed client). */
+const SLASH_COMMANDS_PATH = '/open-apis/application/v7/app_slash_commands'
+
+/** One `app_slash_commands` list response (unpaginated). */
+interface SlashCommandListResponse {
+  code?: number
+  msg?: string
+  data?: {
+    items?: Array<{ command_id?: string; command?: string; description?: { default_value?: string } }>
+  }
+}
+
+/** `rawClient.request` as the slash-command endpoints use it. */
+type RawRequest = <T>(input: { method: string; url: string; data?: object }) => Promise<T>
+
+/**
+ * Create/update body. The panel icon stays at Feishu's default; PATCH
+ * replaces the whole `description` object.
+ */
+function slashCommandDescription(entry: SlashCommandEntry): object {
+  return { default_value: entry.description, i18n: { zh_cn: entry.description } }
+}
+
+/** {@link SlashCommandApi} over the SDK's generic authenticated request. */
+function slashCommandApi(request: RawRequest): SlashCommandApi {
+  const commandUrl = (id: string) => `${SLASH_COMMANDS_PATH}/${encodeURIComponent(id)}`
+  return {
+    async list(): Promise<readonly RemoteSlashCommand[]> {
+      const response = await feishuCall(() => request<SlashCommandListResponse>({ method: 'GET', url: SLASH_COMMANDS_PATH }))
+      return (response.data?.items ?? []).flatMap(item => item.command_id === undefined || item.command === undefined
+        ? []
+        : [{ id: item.command_id, command: item.command, description: item.description?.default_value ?? '' }])
+    },
+    async create(entry: SlashCommandEntry): Promise<void> {
+      await feishuCall(() => request<{ code?: number; msg?: string }>({
+        method: 'POST',
+        url: SLASH_COMMANDS_PATH,
+        data: { command: entry.command, description: slashCommandDescription(entry) },
+      }))
+    },
+    async update(id: string, entry: SlashCommandEntry): Promise<void> {
+      await feishuCall(() => request<{ code?: number; msg?: string }>({
+        method: 'PATCH',
+        url: commandUrl(id),
+        data: { description: slashCommandDescription(entry) },
+      }))
+    },
+    async delete(id: string): Promise<void> {
+      await feishuCall(() => request<{ code?: number; msg?: string }>({ method: 'DELETE', url: commandUrl(id) }))
+    },
+  }
+}
+
+function appOwnerLookupError(error: unknown): AppOwnerLookupError {
+  if (error instanceof AppOwnerLookupError) return error
+  const { detail, code } = thrownErrorFields(error)
+  return new AppOwnerLookupError(detail, code)
+}
+
 export interface ChannelConnectOptions {
   appId: string
   appSecret: string
@@ -191,17 +417,21 @@ export interface ChannelConnectOptions {
 
 class LarkChannelAdapter implements FeishuChannel {
   private readonly channel: LarkChannel
+  private readonly appId: string
   private readonly requireMention: boolean
   private readonly dmMode: 'open' | 'disabled'
+  readonly slashCommands: SlashCommandApi
+  readonly wiki: WikiApi
+  readonly sheets: SheetApi
+  readonly bases: BaseApi
 
   constructor(options: ChannelConnectOptions) {
     this.channel = createLarkChannel({
       appId: options.appId,
       appSecret: options.appSecret,
       loggerLevel: LOGGER_LEVELS[options.loggerLevel],
-      // Keep the raw event body: rich-text messages attach files in a
-      // top-level `files` array the SDK normalizer drops, so the attachment
-      // intake recovers them from `msg.raw` instead.
+      // Keep the raw event body: the sender `user_id` and the top-level
+      // rich-text `files` array are only recoverable from `msg.raw`.
       includeRawEvent: true,
       policy: {
         // The plugin routes mentions itself (thread routing must work without
@@ -210,13 +440,42 @@ class LarkChannelAdapter implements FeishuChannel {
         dmMode: options.dmMode === 'open' ? 'open' : 'disabled',
         respondToMentionAll: false,
       },
+      safety: {
+        // The SDK debounces messages per chatId and merges a burst into one
+        // message carrying the LAST sender/thread/message id. In a group that
+        // attributes one user's text and files to another, bypassing admission
+        // and topic ownership. Flush every message on its own; per-chat
+        // serialization and dedup stay in place.
+        batch: { text: { delayMs: 0 } },
+      },
     })
+    this.appId = options.appId
     this.requireMention = options.requireMention
     this.dmMode = options.dmMode
+    const rawClient = this.channel.rawClient
+    this.slashCommands = slashCommandApi(async <T,>(input: Parameters<RawRequest>[0]) => await rawClient.request<T>(input))
+    const wikiRequest = async <T,>(input: Parameters<WikiRawRequest>[0]): Promise<T> => await rawClient.request<T>(input)
+    this.wiki = createWikiApi(wikiRequest)
+    this.sheets = createSheetApi(wikiRequest)
+    this.bases = createBaseApi(wikiRequest)
   }
 
   onMessage(handler: (message: NormalizedMessage) => void | Promise<void>): () => void {
-    return this.channel.on('message', handler)
+    return this.channel.on('message', message => {
+      const userId = senderUserIdOf(message.raw)
+      if (userId === undefined) {
+        // Bots and other apps never carry a user_id; neither do external
+        // users or a tenant app without the user ID scope. None of them can
+        // be identified, so none of them may reach admission or routing.
+        console.warn(
+          '[dsh-channels] dropped message %s: sender has no user_id '
+          + '(bot/app sender, external user, or the app lacks contact:user.employee_id:readonly)',
+          message.messageId,
+        )
+        return
+      }
+      return handler({ ...message, senderId: userId })
+    })
   }
 
   onCardAction(handler: (event: CardActionEvent) => void | Promise<void>): () => void {
@@ -235,12 +494,83 @@ class LarkChannelAdapter implements FeishuChannel {
     return this.channel.getChatInfo(chatId)
   }
 
+  async userProfiles(userIds: readonly string[]): Promise<ReadonlyMap<string, FeishuProfile>> {
+    const client = this.channel.rawClient
+    const profiles = new Map<string, FeishuProfile>()
+    for (let offset = 0; offset < userIds.length; offset += USER_BATCH_SIZE) {
+      const response = await feishuCall(() => client.contact.v3.user.batch({
+        params: { user_ids: userIds.slice(offset, offset + USER_BATCH_SIZE), user_id_type: 'user_id' },
+      }))
+      for (const item of response.data?.items ?? []) {
+        if (item.user_id === undefined) continue
+        profiles.set(item.user_id, feishuProfile(item.name, item.avatar?.avatar_72))
+      }
+    }
+    return profiles
+  }
+
+  async chatProfile(chatId: string): Promise<FeishuProfile> {
+    const client = this.channel.rawClient
+    const response = await feishuCall(() => client.im.v1.chat.get({ path: { chat_id: chatId } }))
+    return feishuProfile(response.data?.name, response.data?.avatar)
+  }
+
+  async memberName(userId: string, chatId: string): Promise<string | undefined> {
+    const client = this.channel.rawClient
+    let pageToken: string | undefined
+    for (let page = 0; page < MEMBER_NAME_PAGES; page += 1) {
+      let response
+      try {
+        response = await feishuCall(() => client.im.v1.chatMembers.get({
+          path: { chat_id: chatId },
+          params: { member_id_type: 'user_id', page_size: 100, ...(pageToken === undefined ? {} : { page_token: pageToken }) },
+        }))
+      } catch (_membersUnavailable) {
+        // No chat-read scope, or a chat the bot left: the caller shows the id.
+        return undefined
+      }
+      const hit = response.data?.items?.find(item => item.member_id === userId)?.name?.trim()
+      if (hit !== undefined && hit !== '') return hit
+      pageToken = response.data?.page_token
+      if (response.data?.has_more !== true || pageToken === undefined) return undefined
+    }
+    return undefined
+  }
+
   botOpenId(): string | undefined {
     return this.channel.botIdentity?.openId
   }
 
   getConnectionStatus(): FeishuConnectionStatus | undefined {
     return this.channel.getConnectionStatus()
+  }
+
+  async appOwnerUserId(): Promise<string | undefined> {
+    let response
+    try {
+      response = await this.channel.rawClient.application.v6.application.get({
+        path: { app_id: this.appId },
+        params: { lang: 'zh_cn', user_id_type: 'user_id' },
+      })
+    } catch (error) {
+      throw appOwnerLookupError(error)
+    }
+    if (response.code !== undefined && response.code !== 0) {
+      throw new AppOwnerLookupError(`code=${response.code}${response.msg === undefined ? '' : ` ${response.msg}`}`, response.code)
+    }
+    const owner = response.data?.app?.owner
+    if (owner?.type !== APP_OWNER_TYPE_TENANT_MEMBER) return undefined
+    const userId = owner.owner_id?.trim()
+    return userId === undefined || userId === '' ? undefined : userId
+  }
+
+  async grantedScopes(): Promise<readonly ScopeGrant[]> {
+    const response = await feishuCall(() => this.channel.rawClient.application.v6.scope.list())
+    return (response.data?.scopes ?? []).map(scope => ({
+      name: scope.scope_name,
+      granted: scope.grant_status === SCOPE_GRANTED_STATUS,
+      ...(scope.scope_type === undefined ? {} : { type: scope.scope_type }),
+    }))
   }
 
   async connect(): Promise<void> {
@@ -257,6 +587,31 @@ class LarkChannelAdapter implements FeishuChannel {
     options?: { replyTo?: string; replyInThread?: boolean },
   ): Promise<SendResult> {
     return this.channel.send(chatId, input, options)
+  }
+
+  async replyMedia(replyTo: string, media: OutboundMedia, options: { replyInThread: boolean }): Promise<SendResult> {
+    const im = this.channel.rawClient.im.v1
+    let content: string
+    if (media.kind === 'image') {
+      const uploaded = await feishuUpload(() => im.image.create({ data: { image_type: 'message', image: media.data } }))
+      const imageKey = uploaded?.image_key
+      if (imageKey === undefined) throw new FeishuApiError('image_key missing in upload response')
+      content = JSON.stringify({ image_key: imageKey })
+    } else {
+      const uploaded = await feishuUpload(() => im.file.create({
+        data: { file_type: 'stream', file_name: media.fileName, file: media.data },
+      }))
+      const fileKey = uploaded?.file_key
+      if (fileKey === undefined) throw new FeishuApiError('file_key missing in upload response')
+      content = JSON.stringify({ file_key: fileKey })
+    }
+    const sent = await feishuCall(() => im.message.reply({
+      path: { message_id: replyTo },
+      data: { msg_type: media.kind, content, reply_in_thread: options.replyInThread },
+    }))
+    const messageId = sent.data?.message_id
+    if (messageId === undefined) throw new FeishuApiError('message_id missing in reply response')
+    return { messageId }
   }
 
   async updateCard(messageId: string, card: object): Promise<void> {
@@ -278,9 +633,9 @@ class LarkChannelAdapter implements FeishuChannel {
 
   async messageGet(messageId: string): Promise<unknown> {
     const message = this.channel.rawClient.im.v1.message as unknown as {
-      get(input: { path: { message_id: string } }): Promise<unknown>
+      get(input: { path: { message_id: string }; params: { user_id_type: 'user_id' } }): Promise<unknown>
     }
-    return await message.get({ path: { message_id: messageId } })
+    return await message.get({ path: { message_id: messageId }, params: { user_id_type: 'user_id' } })
   }
 
   async messageMget(messageIds: readonly string[]): Promise<unknown> {
@@ -300,7 +655,7 @@ class LarkChannelAdapter implements FeishuChannel {
     }
     return await client.request({
       method: 'GET',
-      url: `/open-apis/im/v1/messages/mget?${query}&card_msg_content_type=raw_card_content`,
+      url: `/open-apis/im/v1/messages/mget?${query}&card_msg_content_type=raw_card_content&user_id_type=user_id`,
     })
   }
 
@@ -379,6 +734,22 @@ export function sniffImageMediaType(data: Uint8Array): 'image/png' | 'image/jpeg
   if (data.length >= 12 && data[8] === 0x57 && data[9] === 0x45 && data[10] === 0x42 && data[11] === 0x50) return 'image/webp'
   if (data.length >= 6 && data[0] === 0x47 && data[1] === 0x49 && data[2] === 0x46) return 'image/gif'
   return undefined
+}
+
+/**
+ * The sender `user_id` of one raw `im.message.receive_v1` event body. The SDK
+ * normalizer fills `senderId` with the open_id; the plugin identifies users by
+ * the tenant-wide `user_id`, which Feishu only sends to tenant-internal apps
+ * granted `contact:user.employee_id:readonly`.
+ *
+ * @param raw - `NormalizedMessage.raw` (requires `includeRawEvent`).
+ * @returns the non-empty `user_id`, or `undefined` when the event has none.
+ */
+export function senderUserIdOf(raw: unknown): string | undefined {
+  if (raw === null || typeof raw !== 'object') return undefined
+  const sender = (raw as { sender?: { sender_id?: { user_id?: unknown } } }).sender
+  const userId = sender?.sender_id?.user_id
+  return typeof userId === 'string' && userId !== '' ? userId : undefined
 }
 
 const LOGGER_LEVELS: Record<ChannelConnectOptions['loggerLevel'], LoggerLevel> = {

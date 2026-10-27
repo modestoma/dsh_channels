@@ -1,11 +1,10 @@
 /**
- * 设置 →「飞书渠道」页面：数据加载、5 秒状态轮询、全局 draft 与顶部状态头 /
- * tab 导航的外壳。
+ * 左侧栏「飞书渠道」主区页面：数据加载、5 秒状态轮询、全局 draft、顶部状态头 /
+ * tab 导航与底部保存条的外壳。
  *
- * 所有 Host 交互（panel / status / catalog / config / credentials / cleanup /
- * access / pick-directory）都集中在这里；tab 组件只接收渲染所需的数据与
- * 回调。页面不 import 任何 DSH 客户端包，只依赖 react 与 `settings.section`
- * 槽位。
+ * 所有 Host 交互（panel / status / catalog / config / credentials / access /
+ * pick-directory）都集中在这里；tab 组件只接收渲染所需的数据与
+ * 回调。页面不 import 任何 DSH 客户端包，只依赖 react 与 `main` 槽位。
  *
  * @module dsh-channels/client/panel
  */
@@ -14,10 +13,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { KeyboardEvent } from 'react'
 import { PANEL_COPY, PANEL_TABS, TAB_FIELD_GROUPS } from '../../settings/contract.ts'
 import type {
+  AccessMutationResponse,
   AccessWire,
   CatalogWire,
   ChannelStatusWire,
-  CleanupRunWire,
   ConfigValue,
   CredentialField,
   EditableKey,
@@ -29,6 +28,7 @@ import type {
 import {
   addAccessGroup,
   addAccessUser,
+  addWikiUser,
   clearConfig,
   clearCredential,
   fetchCatalog,
@@ -38,8 +38,8 @@ import {
   reconnect,
   removeAccessGroup,
   removeAccessUser,
+  removeWikiUser,
   resolveAccessRequest,
-  runCleanup,
   saveConfig,
   saveCredentials,
 } from '../api.ts'
@@ -47,33 +47,45 @@ import { applyCatalogFields, catalogFromFields } from '../catalog.ts'
 import { AccessTab } from './access-tab.tsx'
 import { AdvancedTab } from './advanced-tab.tsx'
 import { ConnectionTab } from './connection-tab.tsx'
-import { ModelTab } from './model-tab.tsx'
-import { SessionsTab } from './sessions-tab.tsx'
+import { FieldsTab } from './fields-tab.tsx'
+import { useFeishuProfiles } from './profiles.ts'
 import {
   fieldLabel,
-  formatBytes,
+  formatUptime,
   messageOf,
   NoticeBar,
   phaseBadge,
-  phaseSummary,
+  Pill,
+  SaveBar,
   validateDraft,
 } from './shared.tsx'
 import type {
+  AnalyzeTokenView,
   BusyAction,
   CredentialsView,
   FormView,
   LoadState,
   Notice,
 } from './shared.tsx'
-import { WorkspaceTab } from './workspace-tab.tsx'
+import { WikiTab } from './wiki-tab.tsx'
 
-/** Owner props handed to a `settings.section` contribution (unused beyond parity). */
-export interface FeishuChannelsSectionProps {
-  close?: () => void
+/**
+ * Main-column page for the `main` slot: a full-height scroll region with the
+ * centered panel column. The slot passes no owner props.
+ * @returns the page.
+ */
+export function FeishuChannelsPage(): JSX.Element {
+  return (
+    <section className="dsh-channels-page" aria-label={PANEL_COPY.title}>
+      <div className="dsh-channels-page__content">
+        <FeishuChannelsPanel />
+      </div>
+    </section>
+  )
 }
 
-/** Page shell: one panel payload, one status poll, one global config draft. */
-export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.Element | null {
+/** Panel shell: one panel payload, one status poll, one global config draft. */
+function FeishuChannelsPanel(): JSX.Element | null {
   const [load, setLoad] = useState<LoadState>({ phase: 'loading' })
   const [activeTab, setActiveTab] = useState<PanelTabId>('connection')
   const [draft, setDraft] = useState<EditableValues>({})
@@ -83,10 +95,9 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
   const [pollError, setPollError] = useState<string | null>(null)
   const [appIdInput, setAppIdInput] = useState('')
   const [appSecretInput, setAppSecretInput] = useState('')
+  const [analyzeTokenInput, setAnalyzeTokenInput] = useState('')
   const [catalog, setCatalog] = useState<CatalogWire | null>(null)
   const [catalogBusy, setCatalogBusy] = useState(false)
-  const [cleanupResult, setCleanupResult] = useState<CleanupRunWire | null>(null)
-  const [cleanupError, setCleanupError] = useState<string | null>(null)
   const [accessNotice, setAccessNotice] = useState<string | null>(null)
   const [accessError, setAccessError] = useState<string | null>(null)
   const catalogTicket = useRef(0)
@@ -102,8 +113,6 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
   const loadPanel = useCallback(async (): Promise<void> => {
     setLoad({ phase: 'loading' })
     setNotice(null)
-    setCleanupResult(null)
-    setCleanupError(null)
     setAccessNotice(null)
     setAccessError(null)
     try {
@@ -113,6 +122,7 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
       setDraft({})
       setAppIdInput('')
       setAppSecretInput('')
+      setAnalyzeTokenInput('')
     } catch (error) {
       setLoad({ phase: 'error', message: messageOf(error) })
     }
@@ -145,7 +155,7 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
         setPollError(null)
         // A phase transition changes what the panel payload can offer: the
         // storage domain opens/closes with the connection, so the access
-        // whitelists and the cleanup preview go stale. Re-read the panel but
+        // whitelists go stale. Re-read the panel but
         // never touch the dirty draft.
         if (previousPhase !== undefined && previousPhase !== next.phase) {
           try {
@@ -260,8 +270,8 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
   }, [])
 
   /**
-   * Manual refresh: reload the whole panel payload so access lists, the cleanup
-   * preview and `restartPendingKeys` catch up with the Host. The dirty draft is
+   * Manual refresh: reload the whole panel payload so access lists and
+   * `restartPendingKeys` catch up with the Host. The dirty draft is
    * deliberately preserved — refreshing never discards user input.
    */
   const onRefresh = useCallback(async (): Promise<void> => {
@@ -301,8 +311,6 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
       }
       setLoad({ phase: 'ready', panel: result.panel })
       setStatus(result.panel.status)
-      setCleanupResult(null)
-      setCleanupError(null)
       // Clear only the submitted keys: edits typed while the request was in
       // flight stay in the draft instead of being silently discarded.
       setDraft(previous => {
@@ -318,24 +326,14 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
     }
   }, [draft, panel])
 
-  /** Drop the draft keys owned by one tab (nothing is written). */
-  const discardTab = useCallback((tab: PanelTabId): void => {
+  /** Drop the whole draft (nothing is written). */
+  const discardDraft = useCallback((): void => {
     if (panel === null) return
-    const groups = new Set<string>(TAB_FIELD_GROUPS[tab])
-    const keys = new Set(
-      panel.config.fields.filter(field => groups.has(field.group)).map(field => field.key),
-    )
-    setDraft((previous) => {
-      const next = { ...previous }
-      for (const key of keys) delete next[key]
-      return next
-    })
+    setDraft({})
     setNotice(null)
-    if (tab === 'model') {
-      catalogTicket.current += 1
-      setCatalog(catalogFromFields(panel.config.fields))
-      setCatalogBusy(false)
-    }
+    catalogTicket.current += 1
+    setCatalog(catalogFromFields(panel.config.fields))
+    setCatalogBusy(false)
   }, [panel])
 
   /**
@@ -361,6 +359,10 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
 
   /** Drop every Web override and return the refreshed panel. */
   const onClear = useCallback(async (): Promise<void> => {
+    const confirmed = typeof window.confirm === 'function'
+      ? window.confirm(PANEL_COPY.clearConfirm)
+      : true
+    if (!confirmed) return
     setBusy('clear')
     setNotice(null)
     try {
@@ -372,8 +374,6 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
       setLoad({ phase: 'ready', panel: result.panel })
       setStatus(result.panel.status)
       setDraft({})
-      setCleanupResult(null)
-      setCleanupError(null)
       setNotice({ kind: 'ok', text: PANEL_COPY.cleared })
     } catch (error) {
       setNotice({ kind: 'error', text: messageOf(error) })
@@ -416,40 +416,6 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
       setBusy(null)
     }
   }, [refreshStatus, running])
-
-  /**
-   * Delete stale workspaces after an explicit confirmation. The Host refreshes
-   * the panel in the same response, so the preview counts update immediately;
-   * partial failures stay visible in the card instead of being swallowed.
-   */
-  const onRunCleanup = useCallback(async (): Promise<void> => {
-    if (panel === null) return
-    const { cleanup } = panel
-    const confirmed = typeof window.confirm === 'function'
-      ? window.confirm(
-        `${PANEL_COPY.cleanupConfirm}\n${PANEL_COPY.cleanupCandidates}：${cleanup.candidates} · ${PANEL_COPY.cleanupCandidateBytes}：${formatBytes(cleanup.candidateBytes)}`,
-      )
-      : true
-    if (!confirmed) return
-    setBusy('cleanup')
-    setNotice(null)
-    setCleanupResult(null)
-    setCleanupError(null)
-    try {
-      const response = await runCleanup()
-      if (!response.ok) {
-        setCleanupError(response.error)
-        return
-      }
-      setLoad({ phase: 'ready', panel: response.panel })
-      setStatus(response.panel.status)
-      setCleanupResult(response.result)
-    } catch (error) {
-      setCleanupError(messageOf(error))
-    } finally {
-      setBusy(null)
-    }
-  }, [panel])
 
   /** Replace the embedded access snapshot after a whitelist mutation. */
   const applyAccess = useCallback((access: AccessWire): void => {
@@ -498,18 +464,24 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
     }
   }, [applyAccess])
 
-  const onAddAccessUser = useCallback(async (openId: string, name: string): Promise<boolean> => {
+  /** Add one user to a whitelist; resolves true when the input should clear. */
+  const addUser = useCallback(async (
+    add: (userId: string, name: string) => Promise<AccessMutationResponse>,
+    userId: string,
+    name: string,
+    notice: string,
+  ): Promise<boolean> => {
     setBusy('access')
     setAccessError(null)
     setAccessNotice(null)
     try {
-      const result = await addAccessUser(openId, name)
+      const result = await add(userId, name)
       if (!result.ok) {
         setAccessError(result.error)
         return false
       }
       applyAccess(result.access)
-      setAccessNotice(PANEL_COPY.accessUserAdded)
+      setAccessNotice(notice)
       return true
     } catch (error) {
       setAccessError(messageOf(error))
@@ -519,18 +491,22 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
     }
   }, [applyAccess])
 
-  const onRemoveAccessUser = useCallback(async (openId: string): Promise<void> => {
+  const removeUser = useCallback(async (
+    remove: (userId: string) => Promise<AccessMutationResponse>,
+    userId: string,
+    notice: string,
+  ): Promise<void> => {
     setBusy('access')
     setAccessError(null)
     setAccessNotice(null)
     try {
-      const result = await removeAccessUser(openId)
+      const result = await remove(userId)
       if (!result.ok) {
         setAccessError(result.error)
         return
       }
       applyAccess(result.access)
-      setAccessNotice(PANEL_COPY.accessUserRemoved)
+      setAccessNotice(notice)
     } catch (error) {
       setAccessError(messageOf(error))
     } finally {
@@ -597,6 +573,28 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
     }
   }, [appIdInput, appSecretInput])
 
+  /** Save the analyze API token; it applies to the next request, no reconnect. */
+  const onSaveAnalyzeToken = useCallback(async (): Promise<void> => {
+    if (analyzeTokenInput.trim() === '') return
+    setBusy('credentials')
+    setNotice(null)
+    try {
+      const result = await saveCredentials({ analyzeToken: analyzeTokenInput })
+      if (!result.ok) {
+        setNotice({ kind: 'error', text: result.error, issues: result.issues })
+        return
+      }
+      setLoad({ phase: 'ready', panel: result.panel })
+      setStatus(result.panel.status)
+      setAnalyzeTokenInput('')
+      setNotice({ kind: 'ok', text: PANEL_COPY.analyzeTokenSaved })
+    } catch (error) {
+      setNotice({ kind: 'error', text: messageOf(error) })
+    } finally {
+      setBusy(null)
+    }
+  }, [analyzeTokenInput])
+
   const onClearCredential = useCallback(async (field: CredentialField): Promise<void> => {
     const confirmed = typeof window.confirm === 'function'
       ? window.confirm(PANEL_COPY.credentialRemoveConfirm)
@@ -614,7 +612,9 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
       setStatus(result.panel.status)
       setNotice({
         kind: 'ok',
-        text: result.reconnect === 'pending' ? PANEL_COPY.credentialRemovedPending : PANEL_COPY.credentialRemoved,
+        text: field === 'analyzeToken'
+          ? PANEL_COPY.analyzeTokenRemoved
+          : result.reconnect === 'pending' ? PANEL_COPY.credentialRemovedPending : PANEL_COPY.credentialRemoved,
       })
     } catch (error) {
       setNotice({ kind: 'error', text: messageOf(error) })
@@ -628,6 +628,10 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
     [notice],
   )
   const dirtyCount = Object.keys(draft).length
+  const restartCount = useMemo(
+    () => (panel?.config.fields ?? []).filter(field => field.restartRequired && field.key in draft).length,
+    [draft, panel],
+  )
 
   /** Which tabs currently own a dirty key (the dot is per tab, not global). */
   const dirtyTabs = useMemo<ReadonlySet<PanelTabId>>(() => {
@@ -653,13 +657,12 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
       issues,
       busy,
       locked: hostBusy,
-      dirtyCount,
       onChange: updateDraft,
-      onSave: () => { void onSave() },
-      onDiscardTab: discardTab,
       onPickDirectory,
     }
-  }, [busy, discardTab, dirtyCount, draft, hostBusy, issues, onPickDirectory, onSave, panel, renderedFields, updateDraft])
+  }, [busy, draft, hostBusy, issues, onPickDirectory, panel, renderedFields, updateDraft])
+
+  const profiles = useFeishuProfiles(panel?.access ?? null)
 
   const credentials = useMemo<CredentialsView>(() => ({
     appId: appIdInput,
@@ -672,6 +675,16 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
     onSave: () => { void onSaveCredentials() },
     onClear: (field: CredentialField) => { void onClearCredential(field) },
   }), [appIdInput, appSecretInput, busy, hostBusy, issues, onClearCredential, onSaveCredentials])
+
+  const analyzeToken = useMemo<AnalyzeTokenView>(() => ({
+    value: analyzeTokenInput,
+    issues,
+    busy,
+    locked: hostBusy,
+    onChange: setAnalyzeTokenInput,
+    onSave: () => { void onSaveAnalyzeToken() },
+    onClear: () => { void onClearCredential('analyzeToken') },
+  }), [analyzeTokenInput, busy, hostBusy, issues, onClearCredential, onSaveAnalyzeToken])
 
   if (load.phase === 'loading') {
     return (
@@ -707,8 +720,14 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
         locked={hostBusy}
         onRefresh={() => { void onRefresh() }}
       />
-      <TabNav activeTab={activeTab} dirtyTabs={dirtyTabs} onChange={setActiveTab} />
-      {notice === null ? null : <NoticeBar notice={notice} />}
+      <TabNav
+        activeTab={activeTab}
+        dirtyTabs={dirtyTabs}
+        counts={{ access: load.panel.access.loaded ? load.panel.access.requests.length : 0 }}
+        onChange={setActiveTab}
+      />
+      {load.panel.access.mode === 'open' ? <div className="dsh-channels-cfg__banner">{PANEL_COPY.debugModeWarning}</div> : null}
+      {notice === null ? null : <NoticeBar kind={notice.kind} text={notice.text} />}
       <div
         role="tabpanel"
         id={`dsh-channels-tabpanel-${activeTab}`}
@@ -725,42 +744,55 @@ export function FeishuChannelsSection(_props: FeishuChannelsSectionProps): JSX.E
               />
             )
           : null}
-        {activeTab === 'sessions' ? <SessionsTab form={form} /> : null}
-        {activeTab === 'model' ? <ModelTab form={form} catalogBusy={catalogBusy} /> : null}
-        {activeTab === 'workspace'
-          ? (
-              <WorkspaceTab
-                form={form}
-                cleanup={form.panel.cleanup}
-                cleanupResult={cleanupResult}
-                cleanupError={cleanupError}
-                onRunCleanup={() => { void onRunCleanup() }}
-              />
-            )
+        {activeTab === 'sessions' ? <FieldsTab form={form} tab="sessions" /> : null}
+        {activeTab === 'model'
+          ? <FieldsTab form={form} tab="model" note={catalogBusy ? PANEL_COPY.catalogLoading : undefined} />
           : null}
+        {activeTab === 'attachments' ? <FieldsTab form={form} tab="attachments" /> : null}
         {activeTab === 'access'
           ? (
               <AccessTab
                 form={form}
+                profiles={profiles}
                 accessNotice={accessNotice}
                 accessError={accessError}
                 onAddGroup={onAddAccessGroup}
                 onRemoveGroup={chatId => { void onRemoveAccessGroup(chatId) }}
-                onAddUser={onAddAccessUser}
-                onRemoveUser={openId => { void onRemoveAccessUser(openId) }}
+                onAddUser={(userId, name) => addUser(addAccessUser, userId, name, PANEL_COPY.accessUserAdded)}
+                onRemoveUser={userId => { void removeUser(removeAccessUser, userId, PANEL_COPY.accessUserRemoved) }}
                 onResolveRequest={(token, decision) => { void onResolveAccessRequest(token, decision) }}
               />
             )
           : null}
+        {activeTab === 'wiki'
+          ? (
+              <WikiTab
+                form={form}
+                profiles={profiles}
+                accessNotice={accessNotice}
+                accessError={accessError}
+                onAddUser={(userId, name) => addUser(addWikiUser, userId, name, PANEL_COPY.wikiUserAdded)}
+                onRemoveUser={userId => { void removeUser(removeWikiUser, userId, PANEL_COPY.wikiUserRemoved) }}
+              />
+            )
+          : null}
         {activeTab === 'advanced'
-          ? <AdvancedTab form={form} onClear={() => { void onClear() }} />
+          ? <AdvancedTab form={form} analyzeToken={analyzeToken} onClear={() => { void onClear() }} />
           : null}
       </div>
+      <SaveBar
+        dirtyCount={dirtyCount}
+        restartCount={restartCount}
+        busy={busy}
+        locked={hostBusy}
+        onSave={() => { void onSave() }}
+        onDiscard={discardDraft}
+      />
     </div>
   )
 }
 
-/** Page header: title + phase badge + refresh, visible on every tab. */
+/** Page header: title, phase pill, version and uptime, refresh; visible on every tab. */
 function PanelHeader(props: {
   status: ChannelStatusWire
   pollError: string | null
@@ -771,24 +803,24 @@ function PanelHeader(props: {
   const { status, pollError, busy, locked, onRefresh } = props
   const badge = phaseBadge(status.phase)
   return (
-    <header className="dsh-channels-cfg__panelHead" title={PANEL_COPY.description}>
+    <header className="dsh-channels-cfg__panelHead">
       <div className="dsh-channels-cfg__headRow">
-        <h2 className="dsh-channels-cfg__title">{PANEL_COPY.title}</h2>
-        <span className={`dsh-channels-cfg__badge dsh-channels-cfg__badge--${badge.tone}`}>
-          <span className="dsh-channels-cfg__dot" />
-          {badge.text}
-        </span>
+        <h1 className="dsh-channels-cfg__title">{PANEL_COPY.title}</h1>
+        <Pill tone={badge.tone} dot>{badge.text}</Pill>
+        <span className="dsh-channels-cfg__meta dsh-channels-cfg__mono">v{status.version}</span>
+        {status.uptimeMs === undefined
+          ? null
+          : <span className="dsh-channels-cfg__meta">· {PANEL_COPY.uptimePrefix} {formatUptime(status.uptimeMs)}</span>}
         <span className="dsh-channels-cfg__spacer" />
         <button
           type="button"
-          className="dsh-channels-cfg__btn"
+          className="dsh-channels-cfg__btn dsh-channels-cfg__btn--ghost"
           onClick={onRefresh}
           disabled={busy !== null || locked}
         >
           {PANEL_COPY.refresh}
         </button>
       </div>
-      <p className="dsh-channels-cfg__summary">{phaseSummary(status.phase)}</p>
       {pollError === null
         ? null
         : (
@@ -804,9 +836,11 @@ function PanelHeader(props: {
 function TabNav(props: {
   activeTab: PanelTabId
   dirtyTabs: ReadonlySet<PanelTabId>
+  /** Items waiting for the operator per tab (pending access requests). */
+  counts: Partial<Record<PanelTabId, number>>
   onChange: (tab: PanelTabId) => void
 }): JSX.Element {
-  const { activeTab, dirtyTabs, onChange } = props
+  const { activeTab, dirtyTabs, counts, onChange } = props
   const refs = useRef<Array<HTMLButtonElement | null>>([])
 
   /** Roving-focus keyboard navigation between tabs (WAI-ARIA tabs pattern). */
@@ -845,12 +879,12 @@ function TabNav(props: {
             onKeyDown={event => onKeyDown(index, event)}
           >
             {tab.label}
+            {(counts[tab.id] ?? 0) > 0 ? <span className="dsh-channels-cfg__tabCount">{counts[tab.id]}</span> : null}
             {dirty
               ? (
                   <span
                     className="dsh-channels-cfg__tabDot"
-                    title={PANEL_COPY.dirtyCount}
-                    aria-label={PANEL_COPY.dirtyCount}
+                    aria-hidden="true"
                   />
                 )
               : null}

@@ -40,15 +40,15 @@ const ROUTE = {
   kind: 'thread',
   chatId: 'oc_chat',
   chatType: 'group',
-  senderOpenId: 'ou_user',
+  senderUserId: 'u_user',
 } as const
 
 const CHAT_ROUTE = {
-  key: 'chat:oc_chat:ou_user',
+  key: 'chat:oc_chat:u_user',
   kind: 'chat',
   chatId: 'oc_chat',
   chatType: 'p2p',
-  senderOpenId: 'ou_user',
+  senderUserId: 'u_user',
 } as const
 
 function item(partial: Parameters<typeof makeRawMessage>[0] = {}): RawMessageItem {
@@ -75,7 +75,7 @@ describe('raw response parsing', () => {
       thread_id: 'omt_topic',
       parent_id: 'om_parent',
       sender_type: 'user',
-      sender_id: 'ou_user',
+      sender_id: 'u_user',
       content: { text: '你好' },
     })
     const parsed = parseMessageItems({ data: { items: [raw] } })
@@ -87,11 +87,14 @@ describe('raw response parsing', () => {
       chatId: 'oc_chat',
       threadId: 'omt_topic',
       parentId: 'om_parent',
-      senderOpenId: 'ou_user',
+      senderUserId: 'u_user',
       senderType: 'user',
       deleted: false,
     })
     expect(parsed?.[0]?.content).toEqual({ text: '你好' })
+    // Only a `user_id`-typed sender id is a user identity.
+    const openIdSender = { ...raw, sender: { id: 'ou_x', id_type: 'open_id', sender_type: 'user' } }
+    expect(parseMessageItems({ data: { items: [openIdSender] } })?.[0]?.senderUserId).toBeUndefined()
     // mget answers with the same `data.items` shape.
     expect(parseMessageItems({ data: { items: [raw] } })).toEqual(parsed)
     // Tolerate a direct `{ items }` body used by stubs.
@@ -178,6 +181,62 @@ describe('unified rendering', () => {
     expect(messageTextOf(item({ msg_type: 'audio', content: {} }))).toBe('[语音]')
     expect(messageTextOf(item({ msg_type: 'system', content: {} }))).toBe('[系统消息]')
     expect(messageTextOf(item({ msg_type: 'text', deleted: true, content: '{}' }))).toBe('[已撤回]')
+  })
+
+  it('flattens card messages into text', () => {
+    // Default read-API structure: title plus rows of elements.
+    const simplified = item({
+      msg_type: 'interactive',
+      content: {
+        title: '构建失败',
+        elements: [
+          [{ tag: 'text', text: '分支 dev ' }, { tag: 'a', text: '查看日志', href: 'https://x' }],
+          [{ tag: 'at', user_name: '张三' }],
+          [{ tag: 'img', image_key: 'img_1' }],
+          [{ tag: 'button', text: '重试' }],
+        ],
+      },
+    })
+    expect(messageTextOf(simplified)).toBe('[卡片] 构建失败 分支 dev 查看日志 @张三 [图片] 重试')
+    // Sent JSON 2.0: header title, nested markdown, button labels; callback
+    // values and links are not text.
+    const raw = item({
+      msg_type: 'interactive',
+      content: {
+        schema: '2.0',
+        header: { title: { tag: 'plain_text', content: '审批' } },
+        body: {
+          elements: [
+            { tag: 'markdown', content: '**金额** 100' },
+            {
+              tag: 'column_set',
+              columns: [{ elements: [{ tag: 'button', text: { tag: 'plain_text', content: '同意' }, value: { action: 'ok' } }] }],
+            },
+          ],
+        },
+      },
+    })
+    expect(messageTextOf(raw)).toBe('[卡片] 审批 **金额** 100 同意')
+    // Card 1.0 localized only through i18n maps renders one locale (zh_cn first).
+    const localizedCard = item({
+      msg_type: 'interactive',
+      content: {
+        i18n_header: {
+          en_us: { title: { tag: 'plain_text', content: 'Deploy' } },
+          zh_cn: { title: { tag: 'plain_text', content: '发布' } },
+        },
+        i18n_elements: {
+          en_us: [{ tag: 'div', text: { tag: 'lark_md', content: 'done' } }],
+          zh_cn: [{ tag: 'div', text: { tag: 'lark_md', content: '完成' } }],
+        },
+      },
+    })
+    expect(messageTextOf(localizedCard)).toBe('[卡片] 发布 完成')
+    const englishOnly = item({
+      msg_type: 'interactive',
+      content: { i18n_elements: { en_us: [{ tag: 'markdown', content: 'only english' }] } },
+    })
+    expect(messageTextOf(englishOnly)).toBe('[卡片] only english')
   })
 
   it('renders empty text as empty, not as raw JSON', () => {
@@ -363,6 +422,18 @@ describe('route membership', () => {
     expect(messageBelongsToRoute(ROUTE, otherChat)).toBe(false)
     // A response without a chat id fails closed instead of being trusted.
     expect(messageBelongsToRoute(ROUTE, missingChat)).toBe(false)
+  })
+
+  it('never accepts unregistered main-line messages of the route owner in a thread route', () => {
+    const ownerMain = item({ message_id: 'om_owner', chat_id: 'oc_chat', sender_id: 'u_user' })
+    const ownerOtherThread = item({
+      message_id: 'om_owner_other', chat_id: 'oc_chat', thread_id: 'omt_other', sender_id: 'u_user',
+    })
+    const ownerOtherChat = item({ message_id: 'om_owner_chat2', chat_id: 'oc_other', sender_id: 'u_user' })
+    expect(messageBelongsToRoute(ROUTE, ownerMain)).toBe(false)
+    expect(messageBelongsToRoute(ROUTE, ownerMain, ['om_owner'])).toBe(true)
+    expect(messageBelongsToRoute(ROUTE, ownerOtherThread)).toBe(false)
+    expect(messageBelongsToRoute(ROUTE, ownerOtherChat)).toBe(false)
   })
 
   it('filters topic messages out of a degraded chat route', () => {
@@ -562,7 +633,7 @@ describe('MessageReader wrappers', () => {
     const channel = makeChannel({ messageList: async () => threadPage })
     const threadReader = new MessageReader({ channel: () => channel })
     const threadResult = await threadReader.listRoute({
-      key: 'omt_1', kind: 'thread', chatId: 'oc_chat', chatType: 'group', senderOpenId: 'ou_user',
+      key: 'omt_1', kind: 'thread', chatId: 'oc_chat', chatType: 'group', senderUserId: 'u_user',
     })
     // A list read is container-scoped: foreign chat rows are dropped, while a
     // missing chat id (stub/older payload) is tolerated; the topic row stays.
@@ -570,7 +641,7 @@ describe('MessageReader wrappers', () => {
       .toEqual(['om_a', 'om_b', 'om_d'])
 
     const chatResult = await threadReader.listRoute({
-      key: 'chat:oc_chat:ou_user', kind: 'chat', chatId: 'oc_chat', chatType: 'p2p', senderOpenId: 'ou_user',
+      key: 'chat:oc_chat:u_user', kind: 'chat', chatId: 'oc_chat', chatType: 'p2p', senderUserId: 'u_user',
     })
     expect(chatResult.ok && chatResult.value.items.map(value => value.messageId)).toEqual(['om_b'])
   })

@@ -16,7 +16,19 @@ import {
   buildCard,
   buildInterruptionCard,
   buildOnboardingCard,
+  buildPickerCard,
   cardJsonBytes,
+  buildMergedCard,
+  initialStreamingCard,
+  MAX_PICKER_OPTIONS,
+  MERGED_NOTICE,
+  QUEUED_NOTICE,
+  queuedStreamingCard,
+  STEER_ACTION,
+  STEER_LABEL,
+  parsePickAction,
+  PICK_ACTION,
+  STOP_ACTION,
   segmentCardContent,
   splitBodyForCard,
   stripTables,
@@ -530,12 +542,12 @@ describe('approval decision cards', () => {
       .map(element => element.content as string)
   }
 
-  it('renders the 2.0 structure with question summary and two enabled callback buttons', () => {
+  it('renders the 2.0 structure with question summary, reply hint, and three callback buttons', () => {
     const card = buildApprovalCard(question) as unknown as CardShape
     expect(card.schema).toBe('2.0')
     expect(card.config.width_mode).toBe('fill')
     expect(approvalElements(card).map(element => element.tag)).toEqual([
-      'markdown', 'markdown', 'markdown', 'hr', 'markdown', 'markdown', 'column_set',
+      'markdown', 'markdown', 'markdown', 'hr', 'markdown', 'markdown', 'markdown', 'column_set', 'button', 'markdown',
     ])
 
     const markdowns = markdownsOf(card)
@@ -545,10 +557,12 @@ describe('approval decision cards', () => {
     expect(markdowns[2]).toBe('> 需要写入工作区外的文件')
     expect(markdowns[3]).toContain('5 分钟')
     expect(markdowns[3]).toContain('超时自动拒绝')
-    expect(markdowns[4]).toContain('sess-1')
+    expect(markdowns[4]).toContain('回复其他内容视为拒绝')
+    expect(markdowns[5]).toContain('sess-1')
+    expect(markdowns[6]).toContain('本话题内 `bash` 都自动允许')
+    expect(markdowns[6]).toContain('/renew')
 
-    const actionRow = approvalElements(card).at(-1)!
-    expect(actionRow.tag).toBe('column_set')
+    const actionRow = approvalElements(card).find(element => element.tag === 'column_set')!
     expect(actionRow.flex_mode).toBe('bisect')
     expect(actionRow.horizontal_spacing).toBe('medium')
     expect(actionRow.columns).toHaveLength(2)
@@ -566,7 +580,36 @@ describe('approval decision cards', () => {
     expect(deny!.width).toBe('fill')
     expect(deny!.behaviors).toEqual([{ type: 'callback', value: { decision: 'deny', token: 'tok-1' } }])
 
+    const always = approvalElements(card).find(element => element.tag === 'button')!
+    expect(always.text.content).toBe('♾️ 本话题不再询问')
+    expect(always.type).toBe('default')
+    expect(always.behaviors).toEqual([{ type: 'callback', value: { decision: 'always', token: 'tok-1' } }])
+
     expect(notationMarkdownsOf(card)).toContain(markdowns[3]!)
+  })
+
+  it('shows the command, the escalation target, and a danger grant for full access', () => {
+    const card = buildApprovalCard({
+      ...question,
+      command: 'rm -rf build && make',
+      escalateTo: 'danger-full-access',
+    })
+    const markdowns = markdownsOf(card)
+    expect(markdowns[1]).toContain('提升到 `danger-full-access`')
+    expect(markdowns[2]).toContain('**将执行**')
+    expect(markdowns[2]).toContain('rm -rf build && make')
+    const always = approvalElements(card).find(element => element.tag === 'button')!
+    expect(always.type).toBe('danger')
+    expect(markdowns.join('\n')).toContain('完全不受沙箱限制')
+    expect(markdowns.join('\n')).toContain('`bash` 提升到 `danger-full-access`')
+  })
+
+  it('clips a long command and says how much was hidden', () => {
+    const card = buildApprovalCard({ ...question, command: 'a'.repeat(700) })
+    const markdowns = markdownsOf(card)
+    expect(markdowns[2]).toContain('a'.repeat(600))
+    expect(markdowns[2]).not.toContain('a'.repeat(601))
+    expect(markdowns[3]).toContain('已截断 100 个字符')
   })
 
   it('omits the reason blockquote and session line when absent', () => {
@@ -576,13 +619,15 @@ describe('approval decision cards', () => {
     expect(markdowns.some(text => text.startsWith('> '))).toBe(false)
     expect(notationMarkdownsOf(card)).toEqual([
       expect.stringContaining('1 分钟'),
+      expect.stringContaining('直接回复'),
+      expect.stringContaining('恢复询问'),
     ])
   })
 
   it('adds the owner-only notice when requested', () => {
     const card = buildApprovalCard(question, { unauthorizedNote: true })
     const notices = notationMarkdownsOf(card)
-    expect(notices).toHaveLength(3)
+    expect(notices).toHaveLength(5)
     expect(notices.some(content => content.includes('仅发起该会话的用户'))).toBe(true)
   })
 
@@ -599,7 +644,11 @@ describe('approval decision cards', () => {
 
   it.each([
     ['allowed', '已允许执行'],
+    ['allowed-text', '文字回复'],
+    ['remembered', '本话题不再询问'],
     ['denied', '已拒绝'],
+    ['denied-text', '已拒绝'],
+    ['superseded', '下一条指令'],
     ['expired', '已超时'],
     ['cancelled', '已取消'],
   ] as const)('renders the %s settled variant without decision controls', (state, expected) => {
@@ -609,5 +658,153 @@ describe('approval decision cards', () => {
     expect(approvalElements(card).some(element => element.tag === 'column_set')).toBe(false)
     // The settled card keeps the question summary for context.
     expect(markdownsOf(card).some(text => text.includes('bash'))).toBe(true)
+  })
+})
+
+type Element = Record<string, unknown>
+
+function elementsOf(card: object): Element[] {
+  return (card as { body: { elements: Element[] } }).body.elements
+}
+
+function buttonsOf(card: object): Element[] {
+  const out: Element[] = []
+  const walk = (elements: Element[]): void => {
+    for (const element of elements) {
+      if (element.tag === 'button') out.push(element)
+      for (const column of (element.columns as Array<{ elements: Element[] }> | undefined) ?? []) walk(column.elements)
+    }
+  }
+  walk(elementsOf(card))
+  return out
+}
+
+function buttonLabel(button: Element): string | undefined {
+  return (button.text as { content?: string } | undefined)?.content
+}
+
+function buttonValue(button: Element): unknown {
+  return (button.behaviors as Array<{ value: unknown }>)[0]!.value
+}
+
+describe('queued streaming card', () => {
+  it('renders only the queue notice and the steer button', () => {
+    const elements = elementsOf(queuedStreamingCard('sess-1'))
+    expect(elements.map(element => element.tag)).toEqual(['markdown', 'button'])
+    expect(elements[0]).toMatchObject({ content: QUEUED_NOTICE })
+    expect(buttonLabel(elements[1]!)).toBe(STEER_LABEL)
+    expect(buttonValue(elements[1]!)).toEqual({ decision: STEER_ACTION })
+    expect(JSON.stringify(queuedStreamingCard('sess-1'))).not.toContain(PANEL_TITLES.thinking)
+  })
+
+  it('adds the owner-only notice when a non-owner clicked', () => {
+    const json = JSON.stringify(buildCard(baseState({ queued: true, queuedDenied: true })))
+    expect(json).toContain('仅发起该会话的用户可补充')
+  })
+
+  it('keeps continuation cards unaffected by the queued flag', () => {
+    const json = JSON.stringify(buildCard(baseState({ queued: true, body: '续' }), { segment: 2 }))
+    expect(json).not.toContain(QUEUED_NOTICE)
+    expect(json).toContain('续')
+  })
+
+  it('settles a merged queued card as a plain notice', () => {
+    const elements = elementsOf(buildMergedCard())
+    expect(elements).toEqual([{ tag: 'markdown', content: MERGED_NOTICE }])
+  })
+})
+
+describe('streaming card stop button', () => {
+  it('renders an enabled stop button after the body while ready', () => {
+    const elements = elementsOf(buildCard(baseState({ phase: 'replying', body: '正文', stop: 'ready' })))
+    const index = elements.findIndex(element => element.tag === 'button')
+    expect(index).toBe(elements.length - 1)
+    expect(elements[index - 1]).toMatchObject({ tag: 'markdown', content: '正文' })
+    expect(buttonLabel(elements[index]!)).toBe('⏹ 停止')
+    expect(elements[index]!.disabled).toBeUndefined()
+    expect(buttonValue(elements[index]!)).toEqual({ decision: STOP_ACTION })
+  })
+
+  it('disables the button while stopping and adds the owner-only notice when denied', () => {
+    const card = buildCard(baseState({ phase: 'replying', stop: 'stopping', stopDenied: true }))
+    const [button] = buttonsOf(card)
+    expect(buttonLabel(button!)).toBe('正在停止…')
+    expect(button!.disabled).toBe(true)
+    expect(JSON.stringify(card)).toContain('仅发起该会话的用户可停止')
+  })
+
+  it('omits the button without a stop control', () => {
+    expect(buttonsOf(buildCard(baseState({ phase: 'done', body: 'x' })))).toHaveLength(0)
+  })
+
+  it('leaves the button off the first frame', () => {
+    expect(buttonsOf(initialStreamingCard('sess-1'))).toHaveLength(0)
+  })
+
+  it('settles a stopped turn with its own panel title and the footer', () => {
+    const card = buildCard(baseState({ phase: 'stopped', reasoning: '想了想', body: '' }))
+    const json = JSON.stringify(card)
+    expect(json).toContain(PANEL_TITLES.stopped)
+    expect(json).toContain('已按请求停止本轮回复')
+    expect(json).toContain('本次无正文输出')
+    expect(json).toContain('缓存命中')
+  })
+
+  it('keeps a split continuation head within the target budget with the button', () => {
+    const body = 'x'.repeat(40_000)
+    const options = { segment: 2 }
+    const split = segmentCardContent(baseState({ phase: 'replying', body }), options)
+    const card = buildCard(baseState({ phase: 'replying', body: split.head, stop: 'stopping', stopDenied: true }), options)
+    expect(cardJsonBytes(card)).toBeLessThanOrEqual(CARD_TARGET_BYTES)
+  })
+})
+
+describe('command picker cards', () => {
+  const input = {
+    title: '🧠 模型',
+    command: 'model' as const,
+    text: '**当前模型**：`a`',
+    sessionId: 'sess-pick',
+    options: [{ label: 'a', arg: 'a' }, { label: 'b', arg: 'b' }, { label: 'c', arg: 'c' }],
+    current: 'a',
+  }
+
+  it('renders the choices in one column with the current one highlighted', () => {
+    const card = buildPickerCard(input)
+    expect(elementsOf(card).filter(element => element.tag === 'column_set')).toHaveLength(0)
+    const buttons = elementsOf(card).filter(element => element.tag === 'button')
+    expect(buttons.every(button => button.width === 'fill')).toBe(true)
+    expect(buttons.map(buttonLabel)).toEqual(['✅ a', 'b', 'c'])
+    expect(buttons[0]!.type).toBe('primary')
+    expect(buttonValue(buttons[1]!)).toEqual({ decision: PICK_ACTION, command: 'model', arg: 'b', sessionId: 'sess-pick' })
+    expect(JSON.stringify(card)).toContain('仅发起该会话的用户可操作')
+  })
+
+  it('adds a reset button on request', () => {
+    const buttons = buttonsOf(buildPickerCard({ ...input, reset: true }))
+    expect(buttonLabel(buttons.at(-1)!)).toBe('恢复默认')
+    expect(buttonValue(buttons.at(-1)!)).toMatchObject({ arg: 'reset' })
+  })
+
+  it('skips arguments that are not one token and reports the overflow', () => {
+    const options = [
+      { label: 'bad', arg: 'two words' },
+      ...Array.from({ length: MAX_PICKER_OPTIONS + 2 }, (_, index) => ({ label: `m${index}`, arg: `m${index}` })),
+    ]
+    const card = buildPickerCard({ ...input, options })
+    expect(buttonsOf(card)).toHaveLength(MAX_PICKER_OPTIONS)
+    expect(buttonsOf(card).map(buttonLabel)).not.toContain('bad')
+    expect(JSON.stringify(card)).toContain('另有 2 项未展示')
+  })
+
+  it('parses only well-formed picker values', () => {
+    const value = { decision: PICK_ACTION, command: 'effort', arg: 'high', sessionId: 's' }
+    expect(parsePickAction(value)).toEqual(value)
+    expect(parsePickAction(undefined)).toBeUndefined()
+    expect(parsePickAction({ ...value, decision: STOP_ACTION })).toBeUndefined()
+    expect(parsePickAction({ ...value, command: 'renew' })).toBeUndefined()
+    expect(parsePickAction({ ...value, arg: 'a b' })).toBeUndefined()
+    expect(parsePickAction({ ...value, arg: 1 })).toBeUndefined()
+    expect(parsePickAction({ ...value, sessionId: '' })).toBeUndefined()
   })
 })

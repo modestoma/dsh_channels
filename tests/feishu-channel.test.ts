@@ -14,9 +14,20 @@ const sdk = vi.hoisted(() => {
     addReaction: vi.fn(async () => 'reaction-1'),
     removeReaction: vi.fn(async () => {}),
     rawClient: {
-      request: vi.fn(async () => ({ data: { items: [] } })),
+      application: {
+        v6: {
+          application: { get: vi.fn(async (): Promise<unknown> => ({ code: 0, data: {} })) },
+          scope: { list: vi.fn(async (): Promise<unknown> => ({ code: 0, data: {} })) },
+        },
+      },
+      request: vi.fn(async (): Promise<unknown> => ({ data: { items: [] } })),
+      contact: {
+        v3: { user: { batch: vi.fn(async (): Promise<unknown> => ({ code: 0, data: { items: [] } })) } },
+      },
       im: {
         v1: {
+          chat: { get: vi.fn(async (): Promise<unknown> => ({ code: 0, data: {} })) },
+          chatMembers: { get: vi.fn(async (): Promise<unknown> => ({ code: 0, data: { items: [] } })) },
           message: {
             get: vi.fn(async () => ({ data: { items: [] } })),
             list: vi.fn(async () => ({ data: { items: [], has_more: false } })),
@@ -36,7 +47,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 
 import { Readable } from 'node:stream'
 import {
-  contentRangeTotal, defaultChannelFactory, downloadResourceInRanges, RANGE_DOWNLOAD_CHUNK_BYTES,
+  AppOwnerLookupError, contentRangeTotal, FeishuApiError, defaultChannelFactory, downloadResourceInRanges, RANGE_DOWNLOAD_CHUNK_BYTES,
 } from '../src/feishu-channel.ts'
 import type { FeishuConnectionStatus, ResourceChunkStream } from '../src/feishu-channel.ts'
 
@@ -67,6 +78,168 @@ describe('LarkChannelAdapter', () => {
     vi.clearAllMocks()
   })
 
+  describe('grantedScopes', () => {
+    const list = () => sdk.channel.rawClient.application.v6.scope.list
+
+    it('maps grant_status 1 to granted and keeps the scope type', async () => {
+      list().mockResolvedValueOnce({ code: 0, data: { scopes: [
+        { scope_name: 'im:message', grant_status: 1, scope_type: 'tenant' },
+        { scope_name: 'im:chat:readonly', grant_status: 2 },
+      ] } })
+      await expect(defaultChannelFactory(options).grantedScopes?.()).resolves.toEqual([
+        { name: 'im:message', granted: true, type: 'tenant' },
+        { name: 'im:chat:readonly', granted: false },
+      ])
+      list().mockResolvedValueOnce({ code: 0 })
+      await expect(defaultChannelFactory(options).grantedScopes?.()).resolves.toEqual([])
+    })
+
+    it('rejects a non-zero code and maps thrown errors', async () => {
+      list().mockResolvedValueOnce({ code: 99991672, msg: 'denied' })
+      const error = await defaultChannelFactory(options).grantedScopes?.().catch((e: unknown) => e)
+      expect(error).toBeInstanceOf(FeishuApiError)
+      expect(error).toMatchObject({ code: 99991672, detail: 'code=99991672 denied' })
+      list().mockResolvedValueOnce({ code: 5 })
+      await expect(defaultChannelFactory(options).grantedScopes?.()).rejects.toMatchObject({ detail: 'code=5' })
+      list().mockRejectedValueOnce(Object.assign(new Error('400'), { response: { data: { msg: 'bad' } } }))
+      await expect(defaultChannelFactory(options).grantedScopes?.()).rejects.toMatchObject({ detail: 'bad' })
+      list().mockRejectedValueOnce('down')
+      await expect(defaultChannelFactory(options).grantedScopes?.()).rejects.toMatchObject({ detail: 'down' })
+    })
+  })
+
+  describe('slashCommands', () => {
+    const request = () => sdk.channel.rawClient.request
+    const base = '/open-apis/application/v7/app_slash_commands'
+
+    it('lists commands and skips rows without an id or name', async () => {
+      request().mockResolvedValueOnce({ code: 0, data: { items: [
+        { command_id: 'c1', command: 'help', description: { default_value: 'h' } },
+        { command: 'orphan' },
+        { command_id: 'c2', command: 'stop' },
+      ] } })
+      await expect(defaultChannelFactory(options).slashCommands?.list()).resolves.toEqual([
+        { id: 'c1', command: 'help', description: 'h' },
+        { id: 'c2', command: 'stop', description: '' },
+      ])
+      expect(request()).toHaveBeenLastCalledWith({ method: 'GET', url: base })
+    })
+
+    it('creates, patches, and deletes by encoded id', async () => {
+      const api = defaultChannelFactory(options).slashCommands
+      const description = { default_value: '帮助', i18n: { zh_cn: '帮助' } }
+      await api?.create({ command: 'help', description: '帮助' })
+      expect(request()).toHaveBeenLastCalledWith({ method: 'POST', url: base, data: { command: 'help', description } })
+      await api?.update('a/b', { command: 'help', description: '帮助' })
+      expect(request()).toHaveBeenLastCalledWith({ method: 'PATCH', url: `${base}/a%2Fb`, data: { description } })
+      await api?.delete('a/b')
+      expect(request()).toHaveBeenLastCalledWith({ method: 'DELETE', url: `${base}/a%2Fb` })
+    })
+
+    it('maps non-zero codes and thrown errors to FeishuApiError', async () => {
+      const api = defaultChannelFactory(options).slashCommands
+      request().mockResolvedValueOnce({ code: 99991672, msg: 'denied' })
+      await expect(api?.list()).rejects.toMatchObject({ code: 99991672, detail: 'code=99991672 denied' })
+      request().mockRejectedValueOnce(Object.assign(new Error('400'), { response: { data: { code: 40000000, msg: 'exists' } } }))
+      await expect(api?.create({ command: 'help', description: 'h' })).rejects.toBeInstanceOf(FeishuApiError)
+    })
+  })
+
+  describe('profiles', () => {
+    const batch = () => sdk.channel.rawClient.contact.v3.user.batch
+    const chat = () => sdk.channel.rawClient.im.v1.chat.get
+    const members = () => sdk.channel.rawClient.im.v1.chatMembers.get
+
+    it('batches user_ids 50 per call and keeps names and https avatars', async () => {
+      const ids = Array.from({ length: 51 }, (_, index) => `u_${index}`)
+      batch()
+        .mockResolvedValueOnce({ code: 0, data: { items: [
+          { user_id: 'u_0', name: ' 张三 ', avatar: { avatar_72: 'https://cdn.example/u0.png' } },
+          { user_id: 'u_1', name: '', avatar: { avatar_72: 'javascript:alert(1)' } },
+          { name: '无 id' },
+        ] } })
+        .mockResolvedValueOnce({ code: 0, data: { items: [{ user_id: 'u_50', name: '李四' }] } })
+      const profiles = await defaultChannelFactory(options).userProfiles?.(ids)
+      expect(profiles).toEqual(new Map([
+        ['u_0', { name: '张三', avatarUrl: 'https://cdn.example/u0.png' }],
+        ['u_1', {}],
+        ['u_50', { name: '李四' }],
+      ]))
+      expect(batch()).toHaveBeenNthCalledWith(1, { params: { user_ids: ids.slice(0, 50), user_id_type: 'user_id' } })
+      expect(batch()).toHaveBeenNthCalledWith(2, { params: { user_ids: ['u_50'], user_id_type: 'user_id' } })
+    })
+
+    it('rejects a failed user batch with the Feishu code', async () => {
+      batch().mockResolvedValueOnce({ code: 99991672, msg: 'Access denied' })
+      await expect(defaultChannelFactory(options).userProfiles?.(['u_1']))
+        .rejects.toMatchObject({ code: 99991672, detail: 'code=99991672 Access denied' })
+    })
+
+    it('reads a chat name and avatar, and rejects a failed chat read', async () => {
+      chat().mockResolvedValueOnce({ code: 0, data: { name: '研发群', avatar: 'https://cdn.example/oc.png' } })
+      await expect(defaultChannelFactory(options).chatProfile?.('oc_1'))
+        .resolves.toEqual({ name: '研发群', avatarUrl: 'https://cdn.example/oc.png' })
+      expect(chat()).toHaveBeenCalledWith({ path: { chat_id: 'oc_1' } })
+      chat().mockResolvedValueOnce({ code: 232011, msg: 'not found' })
+      await expect(defaultChannelFactory(options).chatProfile?.('oc_2')).rejects.toBeInstanceOf(FeishuApiError)
+    })
+
+    it('scans chat member pages for a name and gives up quietly', async () => {
+      members()
+        .mockResolvedValueOnce({ code: 0, data: { items: [{ member_id: 'u_x', name: 'X' }], has_more: true, page_token: 'p2' } })
+        .mockResolvedValueOnce({ code: 0, data: { items: [{ member_id: 'u_1', name: ' 张三 ' }] } })
+      await expect(defaultChannelFactory(options).memberName?.('u_1', 'oc_1')).resolves.toBe('张三')
+      expect(members()).toHaveBeenLastCalledWith({
+        path: { chat_id: 'oc_1' },
+        params: { member_id_type: 'user_id', page_size: 100, page_token: 'p2' },
+      })
+      members().mockResolvedValueOnce({ code: 0, data: { items: [], has_more: false } })
+      await expect(defaultChannelFactory(options).memberName?.('u_1', 'oc_1')).resolves.toBeUndefined()
+      members().mockRejectedValueOnce(new Error('no scope'))
+      await expect(defaultChannelFactory(options).memberName?.('u_1', 'oc_1')).resolves.toBeUndefined()
+    })
+  })
+
+  describe('appOwnerUserId', () => {
+    const get = () => sdk.channel.rawClient.application.v6.application.get
+
+    it('queries the own app with user_id and returns a tenant-member owner', async () => {
+      get().mockResolvedValueOnce({ code: 0, data: { app: { owner: { type: 2, owner_id: ' u_owner ' } } } })
+      await expect(defaultChannelFactory(options).appOwnerUserId?.()).resolves.toBe('u_owner')
+      expect(get()).toHaveBeenCalledWith({
+        path: { app_id: 'cli_test' },
+        params: { lang: 'zh_cn', user_id_type: 'user_id' },
+      })
+    })
+
+    it.each([
+      { app: { owner: { type: 0, owner_id: 'u_feishu' } } },
+      { app: { owner: { type: 2, owner_id: '  ' } } },
+      { app: {} },
+    ])('returns undefined without a tenant-member owner id (%j)', async (data) => {
+      get().mockResolvedValueOnce({ code: 0, data })
+      await expect(defaultChannelFactory(options).appOwnerUserId?.()).resolves.toBeUndefined()
+    })
+
+    it('rejects a non-zero API code with its code and msg', async () => {
+      get().mockResolvedValueOnce({ code: 99991672, msg: 'Access denied' })
+      const error = await defaultChannelFactory(options).appOwnerUserId?.().catch((e: unknown) => e)
+      expect(error).toBeInstanceOf(AppOwnerLookupError)
+      expect(error).toMatchObject({ code: 99991672, detail: 'code=99991672 Access denied' })
+    })
+
+    it('maps a thrown HTTP error body and a bare error', async () => {
+      get().mockRejectedValueOnce(Object.assign(new Error('Request failed with status code 400'), {
+        response: { data: { code: 99991672, msg: 'scope required' } },
+      }))
+      await expect(defaultChannelFactory(options).appOwnerUserId?.())
+        .rejects.toMatchObject({ code: 99991672, detail: 'code=99991672 scope required' })
+      get().mockRejectedValueOnce(new Error('socket hang up'))
+      await expect(defaultChannelFactory(options).appOwnerUserId?.())
+        .rejects.toMatchObject({ detail: 'socket hang up' })
+    })
+  })
+
   it.each<FeishuConnectionStatus>([
     { state: 'connected', lastConnectTime: 100, reconnectAttempts: 0 },
     { state: 'reconnecting', lastConnectTime: 100, nextConnectTime: 200, reconnectAttempts: 2 },
@@ -77,6 +250,35 @@ describe('LarkChannelAdapter', () => {
 
     expect(channel.getConnectionStatus()).toEqual(status)
     expect(sdk.channel.getConnectionStatus).toHaveBeenCalledOnce()
+  })
+
+  it('disables SDK debounce merging so a burst never collapses into the last sender', () => {
+    defaultChannelFactory(options)
+
+    expect(sdk.createLarkChannel).toHaveBeenCalledWith(expect.objectContaining({
+      safety: { batch: { text: { delayMs: 0 } } },
+    }))
+  })
+
+  it('identifies message senders by user_id and drops senders without one', async () => {
+    const channel = defaultChannelFactory(options)
+    const received: unknown[] = []
+    channel.onMessage(message => { received.push(message) })
+    const calls = sdk.channel.on.mock.calls as unknown as Array<[string, (message: object) => unknown]>
+    const listener = calls.find(([event]) => event === 'message')?.[1]
+    expect(listener).toBeDefined()
+    const base = { messageId: 'om_1', chatId: 'oc_chat', chatType: 'p2p', senderId: 'ou_sender' }
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      await listener?.({ ...base, raw: { sender: { sender_id: { open_id: 'ou_sender', user_id: 'u_sender' } } } })
+      await listener?.({ ...base, raw: { sender: { sender_id: { open_id: 'ou_bot' } } } })
+      await listener?.({ ...base, raw: undefined })
+      expect(warn).toHaveBeenCalledTimes(2)
+    } finally {
+      warn.mockRestore()
+    }
+
+    expect(received).toEqual([expect.objectContaining({ messageId: 'om_1', senderId: 'u_sender' })])
   })
 
   it('passes a Buffer-backed file payload to the official SDK', async () => {
@@ -97,7 +299,10 @@ describe('LarkChannelAdapter', () => {
   it('exposes the raw message get/list read wrappers', async () => {
     const channel = defaultChannelFactory(options)
     await channel.messageGet?.('om_1')
-    expect(sdk.channel.rawClient.im.v1.message.get).toHaveBeenCalledWith({ path: { message_id: 'om_1' } })
+    expect(sdk.channel.rawClient.im.v1.message.get).toHaveBeenCalledWith({
+      path: { message_id: 'om_1' },
+      params: { user_id_type: 'user_id' },
+    })
 
     const params = {
       container_id_type: 'thread' as const,
@@ -114,7 +319,7 @@ describe('LarkChannelAdapter', () => {
     await channel.messageMget?.(['om_a', 'om_b'])
     expect(sdk.channel.rawClient.request).toHaveBeenCalledWith({
       method: 'GET',
-      url: '/open-apis/im/v1/messages/mget?message_ids=om_a&message_ids=om_b&card_msg_content_type=raw_card_content',
+      url: '/open-apis/im/v1/messages/mget?message_ids=om_a&message_ids=om_b&card_msg_content_type=raw_card_content&user_id_type=user_id',
     })
 
     await expect(channel.messageMget?.([])).rejects.toThrow(/1-50/)

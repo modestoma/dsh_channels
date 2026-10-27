@@ -10,13 +10,16 @@ import {
   ACCESS_REQUESTS_ROUTE,
   ACCESS_ROUTE,
   ACCESS_USERS_ROUTE,
+  ACCESS_WIKI_USERS_ROUTE,
   CATALOG_ROUTE,
-  CLEANUP_ROUTE,
   CONFIG_ROUTE,
   CREDENTIALS_ROUTE,
   PANEL_ROUTE,
   PICK_DIRECTORY_ROUTE,
+  PROFILES_MAX_IDS,
+  PROFILES_ROUTE,
   RECONNECT_ROUTE,
+  SESSION_ORIGIN_ROUTE,
   STATUS_ROUTE,
 } from '../settings/contract.ts'
 import type {
@@ -24,17 +27,18 @@ import type {
   AccessWire,
   CatalogWire,
   ChannelStatusWire,
-  CleanupResponse,
   ClearConfigResponse,
   ClearCredentialResponse,
   CredentialField,
   EditableValues,
+  FeishuProfilesWire,
   PanelWire,
   PickDirectoryResponse,
   ReconnectResponse,
   SaveConfigResponse,
   SaveCredentialsRequest,
   SaveCredentialsResponse,
+  SessionOriginResponse,
 } from '../settings/contract.ts'
 
 function messageOf(error: unknown): string {
@@ -52,9 +56,15 @@ function errorFromBody(status: number, text: string): string {
   return `HTTP ${status}`
 }
 
-async function request(path: string, init?: RequestInit): Promise<Response> {
+/**
+ * Fetch one Host route. Routes are registered as absolute pathnames, but the
+ * browser addresses them relative to the DSH document (`<base href="./">`), so
+ * a reverse proxy that mounts DSH under a prefix such as `/dsh/` still routes
+ * them to DSH with the login cookie it scoped to that prefix.
+ */
+async function request(route: string, init?: RequestInit): Promise<Response> {
   try {
-    return await fetch(path, {
+    return await fetch(route.slice(1), {
       cache: 'no-store',
       credentials: 'same-origin',
       ...init,
@@ -79,6 +89,38 @@ export async function fetchPanel(): Promise<PanelWire> {
 /** Status-only payload polled while the page is open. */
 export async function fetchStatus(): Promise<ChannelStatusWire> {
   return readJson<ChannelStatusWire>(await request(STATUS_ROUTE))
+}
+
+/** Feishu origin of one Session (`origin: null` when Feishu never routed it). */
+export async function fetchSessionOrigin(sessionId: string): Promise<SessionOriginResponse> {
+  const query = new URLSearchParams({ sessionId }).toString()
+  return readJson<SessionOriginResponse>(await request(`${SESSION_ORIGIN_ROUTE}?${query}`))
+}
+
+/**
+ * Live Feishu names and avatars of the given users and chats, split into
+ * requests of at most {@link PROFILES_MAX_IDS} ids per list and merged.
+ * @param userIds - user `user_id`s.
+ * @param chatIds - chat `chat_id`s.
+ * @returns the profiles Feishu resolved, by id, with every request's warning.
+ */
+export async function fetchFeishuProfiles(userIds: readonly string[], chatIds: readonly string[]): Promise<FeishuProfilesWire> {
+  const requests: Array<Promise<FeishuProfilesWire>> = []
+  const rounds = Math.max(1, Math.ceil(userIds.length / PROFILES_MAX_IDS), Math.ceil(chatIds.length / PROFILES_MAX_IDS))
+  for (let round = 0; round < rounds; round += 1) {
+    const window = (ids: readonly string[]): string => ids.slice(round * PROFILES_MAX_IDS, (round + 1) * PROFILES_MAX_IDS).join(',')
+    const query = new URLSearchParams({ users: window(userIds), chats: window(chatIds) }).toString()
+    requests.push(request(`${PROFILES_ROUTE}?${query}`).then(response => readJson<FeishuProfilesWire>(response)))
+  }
+  const merged: FeishuProfilesWire = { users: {}, chats: {} }
+  const warnings = new Set<string>()
+  for (const part of await Promise.all(requests)) {
+    Object.assign(merged.users, part.users)
+    Object.assign(merged.chats, part.chats)
+    if (part.warning !== undefined) warnings.add(part.warning)
+  }
+  if (warnings.size > 0) merged.warning = [...warnings].join('；')
+  return merged
 }
 
 /**
@@ -141,24 +183,6 @@ export async function reconnect(): Promise<ReconnectResponse> {
     }
   }
   return JSON.parse(text) as ReconnectResponse
-}
-
-/**
- * Run one workspace cleanup. No request body: the Host derives the candidate
- * set from the effective retention config. Irreversible, so the caller asks
- * for confirmation first; partial failures come back inside `result.failures`.
- */
-export async function runCleanup(): Promise<CleanupResponse> {
-  const response = await request(CLEANUP_ROUTE, { method: 'POST' })
-  const text = await response.text()
-  if (!response.ok) {
-    try {
-      return JSON.parse(text) as CleanupResponse
-    } catch {
-      return { ok: false, error: errorFromBody(response.status, text) }
-    }
-  }
-  return JSON.parse(text) as CleanupResponse
 }
 
 /**
@@ -259,18 +283,32 @@ export async function removeAccessGroup(chatId: string): Promise<AccessMutationR
   return mutateAccess(ACCESS_GROUPS_ROUTE, 'DELETE', { chatId })
 }
 
-/** Authorize one user open_id (global across authorized groups). */
-export async function addAccessUser(openId: string, name?: string): Promise<AccessMutationResponse> {
+/** Authorize one user `user_id` (global across authorized groups). */
+export async function addAccessUser(userId: string, name?: string): Promise<AccessMutationResponse> {
   return mutateAccess(
     ACCESS_USERS_ROUTE,
     'POST',
-    name === undefined || name === '' ? { openId } : { openId, name },
+    name === undefined || name === '' ? { userId } : { userId, name },
   )
 }
 
 /** Revoke one user authorization (takes effect on the next message). */
-export async function removeAccessUser(openId: string): Promise<AccessMutationResponse> {
-  return mutateAccess(ACCESS_USERS_ROUTE, 'DELETE', { openId })
+export async function removeAccessUser(userId: string): Promise<AccessMutationResponse> {
+  return mutateAccess(ACCESS_USERS_ROUTE, 'DELETE', { userId })
+}
+
+/** Add one user `user_id` to the wiki whitelist. */
+export async function addWikiUser(userId: string, name?: string): Promise<AccessMutationResponse> {
+  return mutateAccess(
+    ACCESS_WIKI_USERS_ROUTE,
+    'POST',
+    name === undefined || name === '' ? { userId } : { userId, name },
+  )
+}
+
+/** Remove one user from the wiki whitelist (takes effect on the next wiki tool call). */
+export async function removeWikiUser(userId: string): Promise<AccessMutationResponse> {
+  return mutateAccess(ACCESS_WIKI_USERS_ROUTE, 'DELETE', { userId })
 }
 
 /** Settle one pending authorization request (same resolver as the Feishu card). */

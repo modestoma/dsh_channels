@@ -5,16 +5,18 @@
 | 层 | 负责方 | 落点 |
 |---|---|---|
 | 会话本体（事件日志 + header） | 宿主 `dsh-session-persistence` | `$DSH_HOME/sessions/<workspace>/<sessionId>/session.jsonl.zstd` |
-| 插件自有状态 | 插件 → `ctx.storageDomain` | 域 `channels_routes`，JSON 后端为 `$DSH_HOME/storages/channels_routes.json` |
+| 插件自有状态 | 插件 → `ctx.storageDomain` | 域 `channels_routes_v2`，JSON 后端为 `$DSH_HOME/storages/channels_routes_v2.json` |
 | 工作区 / 话题目录 | 磁盘目录 + 宿主 registry + Session 日志 | 工作区 `<baseDir>/p2p|groups/...`（`baseDir` 可在 Web 面板配置，注册表 `$DSH_HOME/storages/workspace.json`）；每个话题的工作目录（`<工作区>/topics/<话题>` 或 Git worktree）由 Session 日志的 `working-directory/change` 事件恢复 |
 
+
+用户一律以飞书 `user_id` 标识。open_id 时代的旧域 `channels_routes`（`channels_routes.json`）与按 open_id 命名的旧工作区目录不再读取、也不迁移，原样留在磁盘上，确认不需要后可手动删除。
 ## 一、已持久化的内容
 
-1. **路由与过期墓碑**（`src/domain.ts` 域 `channels_routes`）：`routes` 表以 `thread_id` 或降级键 `chat:p2p|group:<chatId>:<openId>` 保存活动 `RouteRecord`（sessionId / chatId / chatType / senderOpenId / workspacePath / sessionDir? / worktreeBranch? / cardMessageId / createdAt / lastActivityAt）；`workspacePath` 是用户工作区（Session header cwd），`sessionDir` 是该话题的实际工作目录（旧记录缺省 = `workspacePath`）；`expired_routes` 以 thread id 保存 TTL 退休后的最小墓碑，跨重启拒绝旧话题误建 Session。`cardMessageId` 每 turn 更新，`lastActivityAt` 供路由退休使用。
+1. **路由与过期墓碑**（`src/domain.ts` 域 `channels_routes_v2`）：`routes` 表以 `thread_id` 或降级键 `chat:p2p|group:<chatId>:<userId>` 保存活动 `RouteRecord`（sessionId / chatId / chatType / senderUserId / workspacePath / sessionDir? / worktreeBranch? / cardMessageId / createdAt / lastActivityAt）；`workspacePath` 是用户工作区（Session header cwd），`sessionDir` 是该话题的实际工作目录（旧记录缺省 = `workspacePath`）；`expired_routes` 以 thread id 保存 TTL 退休后的最小墓碑，跨重启拒绝旧话题误建 Session。`cardMessageId` 每 turn 更新，`lastActivityAt` 供路由退休使用。
 2. **会话本体与事件日志**：宿主代持。插件消费的 `assistant/chunk`、`tool/call`、`tool-workflow/run-*`、`subagent/descriptor` 等全部在持久化日志里，因此 `src/stats.ts` 的 token/缓存统计不单独存，`foldAll()` 重放日志，重启后继续累计。`meta.cwd`、`agentPreset` 随 header 落盘。
 3. **工作区与话题目录**：工作区目录确定性生成、幂等 mkdir，宿主 `workspace.json` 持久化 path/title/sessionIds；话题目录路径记录在路由的 `sessionDir`，实际工作目录同时由 Session 的 `working-directory/change` 事件持久化。
 4. **凭据**：密钥存宿主 `$DSH_HOME/.credentials.yaml`，插件只持引用名。
-5. **准入授权**（`src/domain.ts` 域 `channels_routes`，同样保持 `version: 1` 加法新增）：`access_groups` 表以 `chat_id` 保存已授权群（群名/来源/授权人/时间）；`access_users` 表以 `open_id` 保存全局用户白名单；`access_requests` 表以不透明 token 保存入群/用户授权申请（含 `messageId`，重启后旧授权卡仍可点击结算；过期状态在同一表落审计）。管理员 open_id 与准入模式属于配置层（profile + Web 覆盖），不在这三张表里。
+5. **准入授权**（`src/domain.ts` 域 `channels_routes_v2`，同样保持 `version: 1` 加法新增）：`access_groups` 表以 `chat_id` 保存已授权群（群名/来源/授权人/时间）；`access_users` 表以 `user_id` 保存全局用户白名单；`access_requests` 表以不透明 token 保存入群/用户授权申请（含 `messageId`，重启后旧授权卡仍可点击结算；过期状态在同一表落审计）。管理员 user_id 与准入模式属于配置层（profile + Web 覆盖），不在这三张表里。
 
 ## 二、内存态（有意不持久化）
 
@@ -45,7 +47,7 @@
 
 ## 方案
 
-在 `channels_routes` 域**新增 `inflight` 表**（加法操作，域 `version` 保持 `1` —— 宿主语义：介质版本与 spec 版本不一致会 `version-mismatch` 拒绝打开，因此**不能** bump；spec 里新增的表在介质上不存在时按空表加载）。
+在 `channels_routes_v2` 域**新增 `inflight` 表**（加法操作，域 `version` 保持 `1` —— 宿主语义：介质版本与 spec 版本不一致会 `version-mismatch` 拒绝打开，因此**不能** bump；spec 里新增的表在介质上不存在时按空表加载）。
 
 **键**：主卡（每 turn 第一张卡）的 message id —— 每 turn 唯一且 attach 时已知，避免并发 turn 互相覆盖。
 

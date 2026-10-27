@@ -5,7 +5,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { TurnStreamer } from '../src/streamer.ts'
-import type { Session, SessionEvent, SessionId } from '../src/dsh-types.ts'
+import type { MessageId, Session, SessionEvent, SessionId, UserMessage } from '../src/dsh-types.ts'
 import type { FeishuChannel } from '../src/feishu-channel.ts'
 import { makeSession, sessionEvents } from './helpers.ts'
 
@@ -21,6 +21,7 @@ function channel(): FeishuChannel & { updated: Array<{ messageId: string; card: 
     connect: vi.fn(async () => {}),
     disconnect: vi.fn(async () => {}),
     send: vi.fn(async () => ({ messageId: 'om_1' })),
+    replyMedia: vi.fn(async () => ({ messageId: 'om_1' })),
     updateCard: vi.fn(async (messageId: string, card: object) => {
       updated.push({ messageId, card })
     }),
@@ -535,6 +536,26 @@ describe('TurnStreamer activity status + keep-alive', () => {
     expect(markdownLines(headCard(ch)).join('\n')).not.toContain('调用工具')
   })
 
+  it('replaces the tool line with the approval wait while a card is undecided', async () => {
+    const ch = channel()
+    const streamer = new TurnStreamer(ch, 500, hooks())
+    const session = makeSession('sess-approval-wait')
+    streamer.attach(session, 'om_card', 'om_trigger', undefined)
+    streamer.onSessionEvent(session, {
+      type: 'tool/call', seq: 1,
+      data: { turn: 1, step: 1, callId: 'call-1', name: 'bash', arguments: '{"command":"ls"}' },
+    })
+    streamer.setAwaitingApproval('sess-approval-wait', ['bash'])
+    await vi.advanceTimersByTimeAsync(500)
+    expect(markdownLines(headCard(ch)).join('\n')).toContain('⏳ 等待你审批：bash')
+    expect(markdownLines(headCard(ch)).join('\n')).not.toContain('调用工具')
+
+    streamer.setAwaitingApproval('sess-approval-wait', [])
+    await vi.advanceTimersByTimeAsync(500)
+    expect(markdownLines(headCard(ch)).join('\n')).not.toContain('等待你审批')
+    expect(markdownLines(headCard(ch)).join('\n')).toContain('🔧 调用工具：bash')
+  })
+
   it('shows the activity lines only on the card that is still streaming', async () => {
     const ch = channel()
     const streamer = new TurnStreamer(ch, 500, hooks())
@@ -1038,3 +1059,228 @@ describe('TurnStreamer live assistant frames', () => {
     expect(json).toContain('64,000')
   })
 })
+
+describe('TurnStreamer stop button', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  function buttonsOf(card: object): Array<{ text: { content: string }; disabled?: boolean }> {
+    const elements = (card as { body: { elements: Array<Record<string, unknown>> } }).body.elements
+    return elements.filter(element => element.tag === 'button') as never
+  }
+
+  function streamText(streamer: TurnStreamer, session: Session, text: string): void {
+    streamer.onAssistantFrame(session, { type: 'start', attemptId: 'attempt-1', revision: 1, turn: 1, step: 1 })
+    streamer.onAssistantFrame(session, { type: 'chunk', attemptId: 'attempt-1', revision: 1, index: 0, time: 1, chunk: { type: 'text-delta', index: 0, text } })
+  }
+
+  it('shows the button on the streaming card, then drops it when the turn settles', async () => {
+    const ch = channel()
+    const streamer = new TurnStreamer(ch, 500, hooks())
+    const session = makeSession('sess-stop-live')
+    streamer.attach(session, 'om_card', 'om_trigger', undefined)
+    streamText(streamer, session, '进行中')
+    await vi.advanceTimersByTimeAsync(500)
+    expect(buttonsOf(ch.updated.at(-1)!.card).map(button => button.text.content)).toEqual(['⏹ 停止'])
+    expect(streamer.stopTargetOf('om_card')).toBe('sess-stop-live')
+    expect(streamer.stopTargetOf('om_other')).toBeUndefined()
+
+    streamer.onSessionEvent(session, { type: 'turn/end', seq: 2, data: { turn: 1, reason: { kind: 'completed' } } })
+    expect(buttonsOf(ch.updated.at(-1)!.card)).toHaveLength(0)
+    expect(JSON.stringify(ch.updated.at(-1)!.card)).not.toContain('已按请求停止')
+    expect(streamer.stopTargetOf('om_card')).toBeUndefined()
+  })
+
+  it('moves the button to the newest segment card', async () => {
+    const ch = channel()
+    const streamer = new TurnStreamer(ch, 500, hooks())
+    const session = makeSession('sess-stop-seg')
+    streamer.attach(session, 'om_card', 'om_trigger', undefined)
+    streamText(streamer, session, 'x'.repeat(30_000))
+    await vi.advanceTimersByTimeAsync(500)
+    await vi.advanceTimersByTimeAsync(500)
+    const main = ch.updated.filter(update => update.messageId === 'om_card').at(-1)!
+    const segment = ch.updated.filter(update => update.messageId === 'om_seg_2').at(-1)!
+    expect(buttonsOf(main.card)).toHaveLength(0)
+    expect(buttonsOf(segment.card)).toHaveLength(1)
+    expect(streamer.stopTargetOf('om_seg_2')).toBe('sess-stop-seg')
+  })
+
+  it('renders stopping and denied states, and settles an aborted turn as stopped', async () => {
+    const ch = channel()
+    const streamer = new TurnStreamer(ch, 500, hooks())
+    const session = makeSession('sess-stop-abort')
+    streamer.attach(session, 'om_card', 'om_trigger', undefined)
+    streamText(streamer, session, '进行中')
+    await vi.advanceTimersByTimeAsync(500)
+    const patches = ch.updated.length
+
+    streamer.markStopDenied('sess-stop-abort')
+    streamer.markStopDenied('sess-stop-abort')
+    await vi.advanceTimersByTimeAsync(500)
+    expect(ch.updated).toHaveLength(patches + 1)
+    expect(JSON.stringify(ch.updated.at(-1)!.card)).toContain('仅发起该会话的用户可停止')
+
+    streamer.markStopping('sess-stop-abort')
+    await vi.advanceTimersByTimeAsync(500)
+    const [button] = buttonsOf(ch.updated.at(-1)!.card)
+    expect(button?.text.content).toBe('正在停止…')
+    expect(button?.disabled).toBe(true)
+
+    streamer.onSessionEvent(session, {
+      type: 'turn/end', seq: 2, data: { turn: 1, reason: { kind: 'aborted', reason: { kind: 'user' } } },
+    })
+    const settled = JSON.stringify(ch.updated.at(-1)!.card)
+    expect(settled).toContain('⏹ 已按请求停止本轮回复')
+    expect(settled).not.toContain('正在停止')
+    // Marks on a session without a live turn are no-ops.
+    streamer.markStopping('sess-stop-abort')
+    streamer.markStopping('sess-unknown')
+  })
+
+  it('offers the button only on the active turn, and moves it to the next queued turn', async () => {
+    const ch = channel()
+    const streamer = new TurnStreamer(ch, 500, hooks())
+    const session = makeSession('sess-stop-queue')
+    streamer.attach(session, 'om_first', 'om_t1', undefined)
+    streamer.attach(session, 'om_second', 'om_t2', undefined)
+    await vi.advanceTimersByTimeAsync(500)
+    const latest = (id: string) => ch.updated.filter(update => update.messageId === id).at(-1)
+    expect(buttonsOf(latest('om_first')!.card)).toHaveLength(1)
+    expect(latest('om_second')).toBeUndefined()
+    expect(streamer.stopTargetOf('om_second')).toBeUndefined()
+
+    streamer.onSessionEvent(session, { type: 'turn/end', seq: 1, data: { turn: 1, reason: { kind: 'completed' } } })
+    await vi.advanceTimersByTimeAsync(500)
+    expect(buttonsOf(latest('om_second')!.card)).toHaveLength(1)
+    expect(streamer.stopTargetOf('om_second')).toBe('sess-stop-queue')
+  })
+
+  it('settles a cancellation it did not request as a normal end', async () => {
+    const ch = channel()
+    const streamer = new TurnStreamer(ch, 500, hooks())
+    const session = makeSession('sess-stop-parent')
+    streamer.attach(session, 'om_card', 'om_trigger', undefined)
+    streamText(streamer, session, '进行中')
+    streamer.onSessionEvent(session, {
+      type: 'turn/end', seq: 2, data: { turn: 1, reason: { kind: 'aborted', reason: { kind: 'parent' } } },
+    })
+    const settled = JSON.stringify(ch.updated.at(-1)!.card)
+    expect(settled).not.toContain('已按请求停止')
+    expect(buttonsOf(ch.updated.at(-1)!.card)).toHaveLength(0)
+  })
+})
+
+describe('TurnStreamer queued turns', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  function prompt(id: string): UserMessage {
+    return { id: id as MessageId, role: 'user', content: [{ type: 'text', text: id }], source: { kind: 'user' } }
+  }
+
+  function queued(ch: ReturnType<typeof channel>, sessionId: string) {
+    const streamer = new TurnStreamer(ch, 500, hooks())
+    const session = makeSession(sessionId)
+    streamer.attach(session, 'om_first', 'om_t1', 'react-1', { message: prompt('m1') })
+    streamer.attach(session, 'om_second', 'om_t2', 'react-2', { message: prompt('m2') })
+    return { streamer, session }
+  }
+
+  it('resolves only queued cards that carry their prompt', () => {
+    const ch = channel()
+    const { streamer, session } = queued(ch, 'sess-q')
+    streamer.attach(session, 'om_bare', 'om_t3', undefined)
+    expect(streamer.hasLiveTurn('sess-q')).toBe(true)
+    expect(streamer.hasLiveTurn('sess-other')).toBe(false)
+    expect(streamer.steerTargetOf('om_first')).toBeUndefined()
+    expect(streamer.steerTargetOf('om_second')).toEqual({ sessionId: 'sess-q', message: prompt('m2') })
+    expect(streamer.steerTargetOf('om_bare')).toBeUndefined()
+  })
+
+  it('merges a queued turn into the running one and settles both reactions together', async () => {
+    const ch = channel()
+    const { streamer, session } = queued(ch, 'sess-merge')
+    const steer = vi.fn(() => true)
+    expect(streamer.mergeQueued('om_second', steer)).toBe(true)
+    expect(steer).toHaveBeenCalledWith('sess-merge', prompt('m2'))
+    expect(JSON.stringify(ch.updated.find(update => update.messageId === 'om_second')!.card)).toContain('已补充到当前回复')
+    expect(streamer.steerTargetOf('om_second')).toBeUndefined()
+
+    streamer.onSessionEvent(session, { type: 'turn/end', seq: 1, data: { turn: 1, reason: { kind: 'completed' } } })
+    await vi.advanceTimersByTimeAsync(500)
+    expect(mockCalls(ch.removeReaction)).toEqual([['om_t1', 'react-1'], ['om_t2', 'react-2']])
+    expect(mockCalls(ch.addReaction)).toEqual([['om_t1', 'DONE'], ['om_t2', 'DONE']])
+    // The merged card never streams again and leaves no live turn behind.
+    expect(ch.updated.filter(update => update.messageId === 'om_second')).toHaveLength(1)
+    expect(streamer.hasLiveTurn('sess-merge')).toBe(false)
+  })
+
+  it('retries the merged card patch after a transient failure', async () => {
+    const ch = channel()
+    const errors = hooks()
+    const streamer = new TurnStreamer(ch, 500, errors)
+    const session = makeSession('sess-merge-retry')
+    streamer.attach(session, 'om_first', 'om_t1', undefined, { message: prompt('m1') })
+    streamer.attach(session, 'om_second', 'om_t2', undefined, { message: prompt('m2') })
+    mockFn(ch.updateCard).mockRejectedValueOnce(new Error('transient'))
+    expect(streamer.mergeQueued('om_second', () => true)).toBe(true)
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(JSON.stringify(ch.updated.find(update => update.messageId === 'om_second')!.card)).toContain('已补充到当前回复')
+    expect(errors.onError).not.toHaveBeenCalled()
+
+    streamer.attach(session, 'om_third', 'om_t3', undefined, { message: prompt('m3') })
+    mockFn(ch.updateCard).mockRejectedValue(new Error('down'))
+    expect(streamer.mergeQueued('om_third', () => true)).toBe(true)
+    await vi.advanceTimersByTimeAsync(3_000)
+    expect(errors.onError).toHaveBeenCalledTimes(1)
+  })
+
+  it('refuses to merge while stopping, when the prompt was already claimed, or for unknown cards', () => {
+    const ch = channel()
+    const { streamer } = queued(ch, 'sess-refuse')
+    expect(streamer.mergeQueued('om_second', () => false)).toBe(false)
+    expect(streamer.mergeQueued('om_unknown', () => true)).toBe(false)
+    streamer.markStopping('sess-refuse')
+    const steer = vi.fn(() => true)
+    expect(streamer.mergeQueued('om_second', steer)).toBe(false)
+    expect(steer).not.toHaveBeenCalled()
+    expect(streamer.steerTargetOf('om_second')).toBeDefined()
+  })
+
+  it('renders the queued layout until the turn becomes the front', async () => {
+    const ch = channel()
+    const { streamer, session } = queued(ch, 'sess-layout')
+    streamer.markQueuedDenied('om_second')
+    streamer.markQueuedDenied('om_second')
+    streamer.markQueuedDenied('om_first')
+    await vi.advanceTimersByTimeAsync(500)
+    const second = ch.updated.filter(update => update.messageId === 'om_second')
+    expect(second).toHaveLength(1)
+    expect(JSON.stringify(second[0]!.card)).toContain('仅发起该会话的用户可补充')
+
+    streamer.onSessionEvent(session, { type: 'turn/end', seq: 1, data: { turn: 1, reason: { kind: 'completed' } } })
+    await vi.advanceTimersByTimeAsync(500)
+    const active = JSON.stringify(ch.updated.filter(update => update.messageId === 'om_second').at(-1)!.card)
+    expect(active).not.toContain('排队中')
+    expect(active).toContain('⏹ 停止')
+  })
+})
+
+function mockCalls(fn: unknown): unknown[][] {
+  return (fn as { mock: { calls: unknown[][] } }).mock.calls
+}
+
+function mockFn(fn: unknown): ReturnType<typeof vi.fn> {
+  return fn as ReturnType<typeof vi.fn>
+}

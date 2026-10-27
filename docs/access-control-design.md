@@ -1,6 +1,8 @@
 # dsh-channels 准入与授权（Access Control）设计
 
 > 状态：已实现（P1 + 入群群信息卡/用户授权卡；P3 增强项仍待做）。
+>
+> 用户标识已从 open_id 改为 `user_id`：下文的 open_id / `ou_...` / `adminOpenId` 现在分别对应 `user_id` / `adminUserId`，存储域改为 `channels_routes_v2`，旧数据不迁移（见 README「飞书侧准备」的 `contact:user.employee_id:readonly` 权限）。
 > 目标：唯一管理员（Web 面板配置 open_id）**不受白名单限制**，在任意私聊/群聊（含未授权群）都能直接发起会话；**非管理员**需要「群已授权 + 用户在白名单」两层同时命中。机器人可以被拉进任意群，但非管理员未授权时不做任何回复、不产生任何会话。
 
 ## 0. 一句话方案
@@ -320,8 +322,8 @@ bot 回显过滤 / chatType / 空内容 / dmMode
 
 ```ts
 {
-  name: 'auth', group: '会话', description: '查看/管理访问授权（仅管理员）',
-  usage: '[status|allow|revoke|list|user add <open_id>|user remove <open_id>]',
+  name: 'auth', group: '会话', description: '查看/管理访问授权，可 @ 成员授权（仅管理员）',
+  usage: '[status|allow|revoke|list|user add <@用户|user_id>|user remove <@用户|user_id>]',
   channelPlane: true, agentScoped: false,
 }
 ```
@@ -331,8 +333,9 @@ bot 回显过滤 / chatType / 空内容 / dmMode
 | `/auth` / `/auth status` | 任意 | 显示：当前是否管理员、本群/本私聊是否已授权、白名单数量 |
 | `/auth allow` | 群聊（管理员） | 把**当前群**加入群白名单，回执“已授权本群” |
 | `/auth revoke` | 群聊（管理员） | 把当前群移出白名单，立即生效 |
-| `/auth user add <open_id>` | 私聊/群聊（管理员） | 加入用户白名单（也支持后续的 `@成员` 形式，P3） |
+| `/auth user add <@用户\|user_id>` | 私聊/群聊（管理员） | 加入用户白名单；`@成员` 取 mention 里的 user_id，忽略对机器人的 @，没有 user_id 的外部用户被拒绝 |
 | `/auth user remove <open_id>` | 同上 | 移出用户白名单 |
+| `/auth wiki add <@用户\|user_id>` / `/auth wiki remove <@用户\|user_id>` | 同上 | 加入/移出知识库白名单（`access_wiki_users` 表）：只决定该用户发起的话题能否使用知识库工具，不授予对话权限；管理员始终可用 |
 | `/auth list` | 任意（管理员） | 列出群白名单、用户白名单与待处理申请 |
 
 - 非管理员发 `/auth` 一律拒绝（先校验管理员身份，再解析子命令）。
@@ -524,7 +527,7 @@ UI：
 ### P3：增强
 
 - [ ] 审计表 + 面板最近记录
-- [ ] `/auth user add @成员`（用 mention 里的 openId）
+- [x] `/auth user add @成员`（用 mention 里的 user_id）
 - [ ] 逐群用户授权（`access_users.chatId` 可选作用域）
 - [ ] bot removed / 群解散的授权回收（评估直接订阅原始事件）
 - [ ] health/status 暴露 `accessMode`、`adminConfigured`、pending 数
@@ -547,4 +550,4 @@ UI：
 - 管理员未配置时收到入群事件只记日志，不落申请记录（面板看不到）；
 - 面板结算的 grant `source` 记为 `card`（与飞书卡片共用结算函数），若要区分来源可加参数；
 - 授权申请过期目前只在启动时清扫一次；运行中依赖结算时判断；
-- 逐群用户授权、`/auth user add @成员`、bot removed 自动回收、审计表与面板最近记录等按 §10 P3 处理。
+- 逐群用户授权、bot removed 自动回收、审计表与面板最近记录等按 §10 P3 处理。

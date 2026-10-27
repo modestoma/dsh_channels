@@ -13,7 +13,8 @@
  */
 
 import { z } from 'zod'
-import { WORKSPACE_RETENTION_VALUES } from './cleanup.ts'
+import { FEISHU_USER_ID_PATTERN } from './domain.ts'
+import { parseWikiRootLink, WIKI_ROOT_LINK_ERRORS } from './feishu/wiki/links.ts'
 
 export const FEISHU_LOGGER_LEVELS = ['debug', 'info', 'warn', 'error'] as const
 export type FeishuLoggerLevel = (typeof FEISHU_LOGGER_LEVELS)[number]
@@ -38,12 +39,6 @@ export const DEFAULT_QUESTION_TIMEOUT_MS = 5 * 60 * 1000
 export const ATTACHMENT_STORE_MODES = ['native', 'archive'] as const
 export type AttachmentStoreMode = (typeof ATTACHMENT_STORE_MODES)[number]
 
-/** Default retention of silently registered attachment metadata: 7 days. */
-export const DEFAULT_PENDING_ATTACHMENT_TTL_MS = 7 * 24 * 60 * 60 * 1000
-
-/** Default per-`(chat, thread, sender)` cap of pending attachment rows. */
-export const DEFAULT_PENDING_ATTACHMENT_LIMIT = 10
-
 /** Default per-call attachment count of `feishu_attachment_fetch`. */
 export const DEFAULT_ATTACHMENT_FETCH_MAX_RESOURCES = 10
 
@@ -52,6 +47,9 @@ export const DEFAULT_ATTACHMENT_FETCH_MAX_BYTES = 100 * 1024 * 1024
 
 /** Default whole-call timeout of `feishu_attachment_fetch` (120 s). */
 export const DEFAULT_ATTACHMENT_FETCH_TIMEOUT_MS = 120_000
+
+/** Largest delay Node's `setTimeout` honors (2^31 − 1 ms, about 24.8 days); longer delays fire at once. */
+export const MAX_TIMER_DELAY_MS = 2_147_483_647
 
 /** Default per-image byte cap for trigger-message prefetch (20 MiB). */
 export const DEFAULT_PREFETCH_IMAGE_MAX_BYTES = 20 * 1024 * 1024
@@ -82,6 +80,12 @@ export const DEFAULT_TOPIC_MESSAGES_TIMEOUT_MS = 20_000
  */
 export const DEFAULT_PROMPT_CONTEXT_TIMEOUT_MS = 3_000
 
+/** Conventional credential reference holding the log-platform analyze API bearer token. */
+export const DEFAULT_ANALYZE_TOKEN_REF = 'DSH_CHANNELS_ANALYZE_TOKEN'
+
+/** `host:port` listen address of the analyze API (`[v6]:port` for IPv6 literals). */
+export const ANALYZE_LISTEN_PATTERN = /^(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+):(?:[1-9][0-9]{0,4})$/u
+
 /** A credential reference: `FEISHU_APP_ID`-style name resolved through ctx.credentials. */
 const credentialRefSchema = z.string().regex(
   CREDENTIAL_REF_PATTERN,
@@ -103,13 +107,6 @@ export const configSchema = z.object({
    * against the host process cwd.
    */
   baseDir: z.string().min(1).default('./channels-data'),
-  /**
-   * Optional path of the Web settings overlay (default
-   * `$DSH_HOME/dsh-channels/settings.json`). The Web panel writes only
-   * editable fields there; this path is for embedded hosts, tests, or users
-   * who want multiple instances with different overlays.
-   */
-  settingsFile: z.string().min(1).optional(),
   /** LLM provider route for sessions this plugin creates (optional → deployment default). */
   provider: z.string().optional(),
   /** Model id for sessions this plugin creates (optional → deployment default). */
@@ -193,7 +190,7 @@ export const configSchema = z.object({
    * behind a prompt manifest; with the archive backend the resources are saved
    * below `<workspace>/attachments/` before the turn, exactly like the legacy
    * pipeline. Disabled keeps attachment messages inert (no save, no turn, no
-   * pending metadata registration).
+   * manifest rows).
    */
   acceptAttachments: z.boolean().default(true),
   /**
@@ -264,24 +261,6 @@ export const configSchema = z.object({
   promptContextTimeoutMs: z.number().int().min(100).max(10_000)
     .default(DEFAULT_PROMPT_CONTEXT_TIMEOUT_MS),
   /**
-   * Retention of silently registered attachment metadata (the
-   * `pending_attachments` table). A message that does not trigger a model turn
-   * (attachment-only p2p message, un-mentioned group message, attachment-only
-   * message inside a bound topic) is recorded as metadata only; a later
-   * triggered message in the same `(chat, thread, sender)` scope may list and
-   * fetch it. Rows older than this window are removed by the periodic record
-   * GC. `0` disables age pruning (the per-scope cap still bounds each scope).
-   * Default 7 days.
-   */
-  pendingAttachmentTtlMs: z.number().int().min(0).default(DEFAULT_PENDING_ATTACHMENT_TTL_MS),
-  /**
-   * Maximum silently registered attachment rows kept per `(chat, thread,
-   * sender)` scope. Registering beyond the cap evicts the oldest row of that
-   * scope; the prompt manifest only ever shows the most recent 5 unconsumed
-   * rows. Default 10.
-   */
-  pendingAttachmentLimit: z.number().int().min(1).max(100).default(DEFAULT_PENDING_ATTACHMENT_LIMIT),
-  /**
    * Model-facing Feishu tools.
    *
    * - `attachmentFetch` (default on): register `feishu_attachment_fetch` in
@@ -295,10 +274,12 @@ export const configSchema = z.object({
    *   fetch (1–50). A message with more attachments is refused with a readable
    *   reason so the model can retry per `file_key`.
    * - `attachmentFetchMaxBytes`: total download budget of one tool call
-   *   (default 100 MiB). Files stream to the native attachment library, so the
-   *   limit is enforced while streaming rather than buffered first.
-   * - `attachmentFetchTimeoutMs`: whole-call timeout (default 120 s). On expiry
-   *   the in-flight download is cancelled and reported per attachment.
+   *   (default 100 MiB, no upper bound). Files stream to the native attachment
+   *   library, so the limit is enforced while streaming rather than buffered
+   *   first, and multi-GiB files need only disk space.
+   * - `attachmentFetchTimeoutMs`: whole-call timeout (default 120 s, at most
+   *   {@link MAX_TIMER_DELAY_MS}). On expiry the in-flight download is
+   *   cancelled and reported per attachment.
    * - `topicMessages` (default on): register `feishu_topic_messages` in
    *   channel sessions so the model can read the quoted message / earlier
    *   topic messages on demand and authorize their attachments for fetch.
@@ -312,6 +293,35 @@ export const configSchema = z.object({
    * - `topicMessagesTimeoutMs`: whole-call timeout of one model-initiated
    *   topic read (default 20 s). Passive prompt excerpts use a separate short
    *   (~3 s) budget and never wait this long.
+   * - `sendFile` (default on): register `feishu_send_file` in channel sessions
+   *   so the model can send an image or file from the topic's working
+   *   directory back to the current conversation. Needs the Feishu
+   *   `im:resource` (or `im:resource:upload`) scope; without it a call returns
+   *   a readable failure and the turn continues.
+   *
+   * - `wikiRead` (default off): register `feishu_wiki_list`,
+   *   `feishu_wiki_read`, `feishu_wiki_sheet_read`, and
+   *   `feishu_wiki_base_read` so the model can browse the wiki nodes under
+   *   `wikiRoots` and read docx documents, spreadsheets, and Bases there.
+   *   Needs `wiki:wiki` (or `wiki:wiki:readonly`), `docx:document` (or
+   *   `docx:document:readonly`), `sheets:spreadsheet:read`, and
+   *   `base:table:read` + `base:field:read` + `base:record:read` (the
+   *   classic `sheets:spreadsheet` / `bitable:app` grants do not apply).
+   * - `wikiWrite` (default off): register `feishu_wiki_create`,
+   *   `feishu_wiki_edit`, `feishu_wiki_sheet_edit`, and
+   *   `feishu_wiki_base_edit` so the model can create docx documents,
+   *   spreadsheets, and Bases under `wikiRoots`, edit documents and
+   *   spreadsheets this app owns, and change records of Bases this app owns
+   *   (other Bases accept new records only). Needs `wiki:wiki`,
+   *   `docx:document`, `sheets:spreadsheet:write_only`, and
+   *   `base:record:create` / `base:record:update` / `base:record:delete`,
+   *   plus the read scopes above.
+   *
+   * The wiki tools act with the app identity and are mounted only while
+   * `wikiRoots` is non-empty. Each call is limited to topics whose owner is
+   * the administrator or on the wiki whitelist (`/auth wiki add`); opening a
+   * document, creating one, and editing one each need the topic owner's
+   * consent on an authorization card (a read consent lasts for the topic).
    *
    * The Web panel/metrics ship with `panel_docs_release`.
    */
@@ -319,13 +329,16 @@ export const configSchema = z.object({
     attachmentFetch: z.boolean().default(true),
     attachmentFetchMaxResources: z.number().int().min(1).max(50)
       .default(DEFAULT_ATTACHMENT_FETCH_MAX_RESOURCES),
-    attachmentFetchMaxBytes: z.number().int().min(1).max(1024 * 1024 * 1024)
+    attachmentFetchMaxBytes: z.number().int().min(1)
       .default(DEFAULT_ATTACHMENT_FETCH_MAX_BYTES),
-    attachmentFetchTimeoutMs: z.number().int().min(1_000).max(600_000)
+    attachmentFetchTimeoutMs: z.number().int().min(1_000).max(MAX_TIMER_DELAY_MS)
       .default(DEFAULT_ATTACHMENT_FETCH_TIMEOUT_MS),
     topicMessages: z.boolean().default(true),
     topicMessagesTimeoutMs: z.number().int().min(1_000).max(120_000)
       .default(DEFAULT_TOPIC_MESSAGES_TIMEOUT_MS),
+    sendFile: z.boolean().default(true),
+    wikiRead: z.boolean().default(false),
+    wikiWrite: z.boolean().default(false),
   }).default({
     attachmentFetch: true,
     attachmentFetchMaxResources: DEFAULT_ATTACHMENT_FETCH_MAX_RESOURCES,
@@ -333,28 +346,34 @@ export const configSchema = z.object({
     attachmentFetchTimeoutMs: DEFAULT_ATTACHMENT_FETCH_TIMEOUT_MS,
     topicMessages: true,
     topicMessagesTimeoutMs: DEFAULT_TOPIC_MESSAGES_TIMEOUT_MS,
+    sendFile: true,
+    wikiRead: false,
+    wikiWrite: false,
   }),
   /**
-   * Delete the topic directories of stale conversations, plus legacy
-   * one-workspace-per-topic directories written by older plugin versions.
-   * `off` (default) never deletes; `7d`/`30d`/`90d`/`180d` remove those
-   * directories when their last activity is older than the threshold. User
-   * workspaces themselves are never deleted. The managed Web panel exposes
-   * this as a select, previews the candidates, and can run one cleanup
-   * manually. DSH Session logs are never deleted.
+   * Wiki (知识库) locations the wiki tools may touch: whole spaces
+   * (`https://<tenant>.feishu.cn/wiki/space/<space_id>`) or single nodes with
+   * everything below them (`https://<tenant>.feishu.cn/wiki/<node_token>`).
+   * Browsing, reading, creating, and editing outside these roots fail. Empty
+   * (default) mounts no wiki tool even when `feishuTools.wikiRead`/`wikiWrite`
+   * is on.
    */
-  workspaceRetention: z.enum(WORKSPACE_RETENTION_VALUES).default('off'),
-  /**
-   * Run the retention cleanup at startup and once per day. Off by default:
-   * deletion is irreversible, so it stays an explicit opt-in even when a
-   * retention threshold is configured.
-   */
-  workspaceRetentionAuto: z.boolean().default(false),
+  wikiRoots: z.array(z.string().trim().superRefine((link, issue) => {
+    const parsed = parseWikiRootLink(link)
+    if (!parsed.ok) issue.addIssue({ code: 'custom', message: WIKI_ROOT_LINK_ERRORS[parsed.error] })
+  })).max(20).default([]),
   /**
    * Send a one-time onboarding card on the first private message of a chat
    * (facts + command cheat sheet). Persisted per chat; never repeats.
    */
   welcomeOnboarding: z.boolean().default(true),
+  /**
+   * Sync the command registry to Feishu's native `/` panel on every connect
+   * (needs the `application:app_slash_command:read`/`write` scopes). Off by
+   * default: some tenants forbid apps from adding slash commands. When off,
+   * the plugin neither reads nor writes the panel.
+   */
+  slashCommandPanel: z.boolean().default(false),
   /**
    * Allow `/permissions <name>` to switch this Session's sandbox + approval
    * preset from Feishu. Read-only `/permissions` always works; switching is
@@ -365,23 +384,32 @@ export const configSchema = z.object({
    * Admission policy for inbound Feishu traffic.
    *
    * - `guarded` (default): only the configured administrator can talk in
-   *   private chats, and a group conversation additionally requires the group
-   *   to be authorized and the sender to be the administrator or an explicitly
+   *   private chats (plus whitelisted users when `dmAllowWhitelist` is on),
+   *   and a group conversation additionally requires the group to be
+   *   authorized and the sender to be the administrator or an explicitly
    *   authorized user.
    * - `open`: legacy behavior — any user inside the app's availability scope
    *   can start a conversation. Debug/compatibility only; unsafe.
    */
   accessMode: z.enum(['open', 'guarded']).default('guarded'),
   /**
-   * The unique administrator's Feishu open_id (`ou_...`). Set it in the Web
-   * settings panel (or the profile config). Get it by sending `/userid` to the
-   * bot in a private chat. While `accessMode` is `guarded` and this is unset,
-   * every conversation is refused (fail closed); `/userid` and a fixed notice
-   * stay available so the deployment can be bootstrapped.
+   * In `guarded` mode, also admit users on the global user whitelist
+   * (`/auth user`) in private chats. Off by default: private chats stay
+   * administrator-only. Each private-chat user already has an own workspace.
    */
-  adminOpenId: z.string().regex(
-    /^ou_[A-Za-z0-9_-]+$/,
-    'must be a Feishu open_id such as ou_xxx (send /userid to the bot in a private chat to see it)',
+  dmAllowWhitelist: z.boolean().default(false),
+  /**
+   * The unique administrator's Feishu `user_id`. Set it in the Web
+   * settings panel (or the profile config). Get it by sending `/userid` to the
+   * bot in a private chat. When unset, the Feishu app owner (looked up via
+   * `application.v6.application.get` at connect; needs an app-info read scope)
+   * is the administrator. While `accessMode` is `guarded` and neither is
+   * available, every conversation is refused (fail closed); `/userid` and a
+   * fixed notice stay available so the deployment can be bootstrapped.
+   */
+  adminUserId: z.string().regex(
+    FEISHU_USER_ID_PATTERN,
+    'must be a Feishu user_id, not an open_id (send /userid to the bot in a private chat to see it)',
   ).optional(),
   /**
    * Lifetime of one pending authorization request and of the DM card that asks
@@ -396,6 +424,24 @@ export const configSchema = z.object({
    * its own deadline and is left to the host signal instead.
    */
   questionTimeoutMs: z.number().int().min(10_000).max(3_600_000).default(DEFAULT_QUESTION_TIMEOUT_MS),
+  /**
+   * Listen address (`host:port`, e.g. `0.0.0.0:3090`) of the log-platform
+   * analyze API: a dedicated HTTP listener serving only
+   * `POST /dsh-channels/analyze`, separate from the DSH Web port. Unset
+   * (default) keeps the API off. The listener runs while the Feishu connection
+   * is up and is rebound on reconnect.
+   */
+  analyzeListen: z.string().trim().regex(
+    ANALYZE_LISTEN_PATTERN,
+    'must be host:port, e.g. 0.0.0.0:3090 or 127.0.0.1:3090',
+  ).refine(value => Number(value.slice(value.lastIndexOf(':') + 1)) <= 65_535, 'port must be 1-65535')
+    .optional(),
+  /**
+   * Credential reference holding the analyze API bearer token (defaults to
+   * `DSH_CHANNELS_ANALYZE_TOKEN`). Resolved per request, so rotating the value
+   * applies to the next request; an unresolvable token refuses every request.
+   */
+  analyzeToken: credentialRefSchema.default(DEFAULT_ANALYZE_TOKEN_REF),
 })
 
 export type FeishuConfig = z.infer<typeof configSchema>

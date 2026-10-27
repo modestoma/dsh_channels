@@ -20,10 +20,12 @@ import type {
   CreatedWorktree, WorkingDirectoryService, WorktreeService,
 } from '../src/session/isolation.ts'
 import type {
-  BotAddedEvent, CardActionEvent, ChatInfo, FeishuChannel, FeishuConnectionStatus, NormalizedMessage,
-  RawMessageListParams, SendResult,
+  BotAddedEvent, CardActionEvent, ChatInfo, FeishuChannel, FeishuConnectionStatus, FeishuProfile, NormalizedMessage,
+  OutboundMedia, RawMessageListParams, SendResult,
 } from '../src/feishu-channel.ts'
 import type { RawDomainHandle } from '../src/domain.ts'
+import type { ScopeGrant } from '../src/feishu/scopes.ts'
+import type { SlashCommandApi } from '../src/feishu/slash-commands.ts'
 
 export function makeSession(
   id = `session-${Math.random().toString(36).slice(2, 10)}`,
@@ -317,9 +319,10 @@ export function makeAgent(session: Session, options: AgentOptions = {}, ctx?: Ag
     options,
     session,
     status: 'idle',
-    inbox: { nextTurn: [], nextStep: [] },
+    inbox: { nextTurn: [], nextStep: [], remove: vi.fn(() => true) },
     ctx: ctx ?? makeAgentContext(),
     followup: vi.fn(),
+    steer: vi.fn(),
   }
 }
 
@@ -757,6 +760,18 @@ export interface FakeChannelOptions {
   connectionStatus?: FeishuConnectionStatus
   /** Chat info returned by the `getChatInfo` stub (defaults to a group shell). */
   chatInfo?: (chatId: string) => ChatInfo | Promise<ChatInfo>
+  /** Contact-profile batch stub; omitted = the channel has no profile lookup. */
+  userProfiles?: (userIds: readonly string[]) => Promise<ReadonlyMap<string, FeishuProfile>>
+  /** Chat-profile stub; omitted = the channel has no chat-profile lookup. */
+  chatProfile?: (chatId: string) => Promise<FeishuProfile>
+  /** Chat-member name stub; omitted = the channel has no member-list lookup. */
+  memberName?: (userId: string, chatId: string) => Promise<string | undefined>
+  /** App-owner lookup stub; omitted = the channel has no owner lookup. */
+  appOwnerUserId?: () => Promise<string | undefined>
+  /** Scope-grant stub; omitted = the channel has no scope self-check. */
+  grantedScopes?: () => Promise<readonly ScopeGrant[]>
+  /** Slash-command panel stub; omitted = the channel has no panel sync. */
+  slashCommands?: SlashCommandApi
 }
 
 /**
@@ -795,8 +810,8 @@ export function makeRawMessage(
       ? {}
       : {
         sender: {
-          id: rest.sender_id ?? 'ou_test_user',
-          id_type: 'open_id',
+          id: rest.sender_id ?? 'u_test_user',
+          id_type: 'user_id',
           sender_type: rest.sender_type ?? 'user',
         },
       }),
@@ -828,6 +843,8 @@ export function makeMessageListResponse(
 
 export function makeChannel(options: FakeChannelOptions = {}): FeishuChannel & {
   sent: Array<{ chatId: string; input: object; options?: { replyTo?: string; replyInThread?: boolean } }>
+  /** `replyMedia` calls, in order. */
+  repliedMedia: Array<{ replyTo: string; media: OutboundMedia; options: { replyInThread: boolean } }>
   updated: Array<{ messageId: string; card: object }>
   reactions: Array<{ messageId: string; emojiType: string }>
   removedReactions: Array<{ messageId: string; reactionId: string }>
@@ -839,6 +856,7 @@ export function makeChannel(options: FakeChannelOptions = {}): FeishuChannel & {
   fireBotAdded: (event: BotAddedEvent) => Promise<void>
 } {
   const sent: Array<{ chatId: string; input: object; options?: { replyTo?: string; replyInThread?: boolean } }> = []
+  const repliedMedia: Array<{ replyTo: string; media: OutboundMedia; options: { replyInThread: boolean } }> = []
   const updated: Array<{ messageId: string; card: object }> = []
   const reactions: Array<{ messageId: string; emojiType: string }> = []
   const removedReactions: Array<{ messageId: string; reactionId: string }> = []
@@ -860,6 +878,9 @@ export function makeChannel(options: FakeChannelOptions = {}): FeishuChannel & {
       if (options.chatInfo !== undefined) return options.chatInfo(chatId)
       return { chatId, chatType: 'group' }
     }),
+    ...(options.userProfiles === undefined ? {} : { userProfiles: vi.fn(options.userProfiles) }),
+    ...(options.chatProfile === undefined ? {} : { chatProfile: vi.fn(options.chatProfile) }),
+    ...(options.memberName === undefined ? {} : { memberName: vi.fn(options.memberName) }),
     botOpenId: () => 'bot-open-id',
     getConnectionStatus: vi.fn(() => options.connectionStatus),
     connect: vi.fn(async () => {}),
@@ -876,6 +897,11 @@ export function makeChannel(options: FakeChannelOptions = {}): FeishuChannel & {
       const result: SendResult = { messageId }
       return result
     }),
+    replyMedia: vi.fn(async (replyTo: string, media: OutboundMedia, replyOptions: { replyInThread: boolean }) => {
+      repliedMedia.push({ replyTo, media, options: replyOptions })
+      const result: SendResult = { messageId: `om_${++serial}` }
+      return result
+    }),
     updateCard: vi.fn(async (messageId: string, card: object) => {
       updated.push({ messageId, card })
     }),
@@ -887,6 +913,9 @@ export function makeChannel(options: FakeChannelOptions = {}): FeishuChannel & {
       removedReactions.push({ messageId, reactionId })
     }),
     threadIdOfMessage: options.threadIdOfMessage ?? (async () => `omt_${serial}`),
+    ...(options.appOwnerUserId === undefined ? {} : { appOwnerUserId: options.appOwnerUserId }),
+    ...(options.grantedScopes === undefined ? {} : { grantedScopes: options.grantedScopes }),
+    ...(options.slashCommands === undefined ? {} : { slashCommands: options.slashCommands }),
     ...(options.messageGet === undefined
       ? {}
       : { messageGet: async (messageId: string): Promise<unknown> => await options.messageGet?.(messageId) }),
@@ -912,7 +941,7 @@ export function makeChannel(options: FakeChannelOptions = {}): FeishuChannel & {
     }),
   }
   return Object.assign(channel, {
-    sent, updated, reactions, removedReactions, cardActionHandlers, botAddedHandlers,
+    sent, repliedMedia, updated, reactions, removedReactions, cardActionHandlers, botAddedHandlers,
     fireCardAction: async (event: CardActionEvent) => {
       for (const handler of cardActionHandlers) await handler(event)
     },
@@ -927,7 +956,7 @@ export function makeMessage(partial: Partial<Omit<NormalizedMessage, 'content'>>
     messageId: `om_msg_${Math.random().toString(36).slice(2, 10)}`,
     chatId: 'oc_test_chat',
     chatType: 'group',
-    senderId: 'ou_test_user',
+    senderId: 'u_test_user',
     rawContentType: 'text',
     resources: [],
     mentions: [],

@@ -41,8 +41,8 @@ export const routeRecordSchema = z.object({
   chatId: z.string().min(1),
   /** `p2p` or `group`. */
   chatType: z.enum(['p2p', 'group']),
-  /** Workspace owner (sender open_id). */
-  senderOpenId: z.string().min(1),
+  /** Workspace owner (sender user_id). */
+  senderUserId: z.string().min(1),
   /** Workspace root owning this route: the Session header cwd / sandbox root. */
   workspacePath: z.string().min(1),
   /**
@@ -61,6 +61,12 @@ export const routeRecordSchema = z.object({
   lastActivityAt: z.number().int().nonnegative(),
   /** Sessions this topic has pointed at, oldest first. Optional for v1 compatibility. */
   sessionHistory: z.array(sessionHistoryEntrySchema).optional(),
+  /**
+   * Group-shared route (log-platform analysis topics): every member admitted
+   * in `chatId` may continue the Session and decide its cards, not only
+   * `senderUserId` (who then names the requester). Absent = owner-only.
+   */
+  shared: z.literal(true).optional(),
 })
 
 export type RouteRecord = z.infer<typeof routeRecordSchema>
@@ -81,15 +87,14 @@ export const expiredRouteRecordSchema = z.object({
   /** Original chat type, retained for diagnostics and future policy. */
   chatType: z.enum(['p2p', 'group']),
   /** Original route owner; never used to grant access after expiry. */
-  senderOpenId: z.string().min(1),
+  senderUserId: z.string().min(1),
   /** Epoch ms when the route was retired. */
   expiredAt: z.number().int().nonnegative(),
   /** Workspace the retired route belonged to; absent in tombstones written by
    *  older plugin versions, so the field must stay optional. */
   workspacePath: z.string().min(1).optional(),
   /** Effective working directory the retired route's Session used; absent in
-   *  legacy tombstones (retention cleanup then treats `workspacePath` as the
-   *  directory, matching pre-v2 routes). */
+   *  legacy tombstones, where `workspacePath` was the directory (pre-v2 routes). */
   sessionDir: z.string().min(1).optional(),
   /** Git branch of that directory when it was a worktree checkout. */
   worktreeBranch: z.string().min(1).optional(),
@@ -202,7 +207,7 @@ export const accessGroupRecordSchema = z.object({
   name: z.string().optional(),
   /** Which authorization entry produced this grant. */
   source: z.enum(['command', 'card', 'panel']),
-  /** Administrator open_id that authorized it. */
+  /** Administrator user_id that authorized it. */
   addedBy: z.string().min(1),
   /** Epoch ms when it was authorized. */
   addedAt: z.number().int().nonnegative(),
@@ -211,18 +216,18 @@ export const accessGroupRecordSchema = z.object({
 export type AccessGroupRecord = z.infer<typeof accessGroupRecordSchema>
 
 /**
- * One authorized user (`open_id`), global across every authorized group.
- * Private chats are administrator-only, so this grant only affects group
- * conversations.
+ * One authorized user (`user_id`), global across every authorized group.
+ * Private chats are administrator-only unless `dmAllowWhitelist` is on, so
+ * by default this grant only affects group conversations.
  */
 export const accessUserRecordSchema = z.object({
-  /** Feishu open id (`ou_...`) — also the table key. */
-  openId: z.string().min(1),
+  /** Feishu `user_id` — also the table key. */
+  userId: z.string().min(1),
   /** Display name captured when the user was authorized (optional). */
   name: z.string().optional(),
   /** Which authorization entry produced this grant. */
   source: z.enum(['command', 'card', 'panel']),
-  /** Administrator open_id that authorized it. */
+  /** Administrator user_id that authorized it. */
   addedBy: z.string().min(1),
   /** Epoch ms when it was authorized. */
   addedAt: z.number().int().nonnegative(),
@@ -241,14 +246,14 @@ export const accessRequestRecordSchema = z.object({
   token: z.string().min(1),
   /** What is being requested. */
   kind: z.enum(['group', 'user']),
-  /** `chat_id` for a group request; `open_id` for a user request. */
+  /** `chat_id` for a group request; `user_id` for a user request. */
   targetId: z.string().min(1),
   /** Chat the request originated from, when applicable. */
   chatId: z.string().optional(),
   /** Group name captured for the card (group requests, or the group the user was seen in). */
   groupName: z.string().optional(),
   /** User who triggered a user request. */
-  requesterOpenId: z.string().optional(),
+  requesterUserId: z.string().optional(),
   /** Display name of that user, when the event carried one. */
   requesterName: z.string().optional(),
   /** Lifecycle state; only `pending` requests accept a card action. */
@@ -283,90 +288,69 @@ export const processedRecordSchema = z.object({
 export type ProcessedRecord = z.infer<typeof processedRecordSchema>
 
 /**
- * Silently registered inbound attachment metadata ("pending attachments").
- *
- * A message that does not trigger a model turn — a p2p attachment-only
- * message, an un-mentioned group message, an attachment-only message inside an
- * already-bound topic — is recorded here without downloading bytes, replying,
- * or reacting. A later triggered message in the same `(chat, thread?, sender)`
- * scope can list these entries in its prompt manifest and fetch them on demand
- * through the attachment tool. The table stores metadata only (Feishu resource
- * keys), never bytes.
- *
- * Added without a storage-domain version bump: the host's JSON backend loads a
- * declared table that is missing from the stored document as empty and keeps
- * the stored `unit.version` (1), so existing deployments gain the table with no
- * migration. Downgrading to a plugin build without this table would drop it on
- * the next write — acceptable because plugin builds are replaced in place.
+ * One accepted analyze API request, keyed by its `Idempotency-Key`. Kept
+ * forever: a retried key returns the stored response instead of posting a
+ * second analysis, and a reused key with a different body is refused.
  */
-export const PENDING_ATTACHMENT_KINDS = ['image', 'file', 'post', 'merge_forward'] as const
-
-/** Kind of message that carried the attachment payload. */
-export type PendingAttachmentKind = (typeof PENDING_ATTACHMENT_KINDS)[number]
-
-/**
- * One attachment resource inside a pending record. Feishu downloads resources
- * by `(message id, file key)`; `containerMessageId` is set when only a
- * top-level container id works (merged-forward children).
- */
-export const pendingAttachmentResourceSchema = z.object({
-  /** Resource kind delivered by Feishu. */
-  type: z.enum(['image', 'file']),
-  /** Feishu resource key (`img_v3_...` / `file_v3_...`). */
-  fileKey: z.string().min(1),
-  /** Original file name, when Feishu reports one. */
-  fileName: z.string().min(1).optional(),
-  /** Feishu folder entries cannot be downloaded; recorded so the fetch tool can
-   *  answer with a structured "folder unsupported" instead of a raw API error. */
-  folder: z.boolean().optional(),
-  /** Top-level container message id to download through, when different from
-   *  this record's own `messageId` (merged-forward child resources). */
-  containerMessageId: z.string().min(1).optional(),
+export const analyzeRequestRecordSchema = z.object({
+  /** The request's `Idempotency-Key` (also the table key). */
+  key: z.string().min(1),
+  /** SHA-256 (hex) of the canonical request body. */
+  bodyHash: z.string().min(1),
+  /** Target group chat. */
+  chatId: z.string().min(1),
+  /** Root card message id (the analysis topic's root). */
+  messageId: z.string().min(1),
+  /** Epoch ms when the request was accepted. */
+  acceptedAt: z.number().int().nonnegative(),
+  /** What the root card shows, kept so the card can be redrawn after a restart. */
+  subject: z.object({
+    requesterUserId: z.string(),
+    triggeredAt: z.string(),
+    app: z.string(),
+    errorCode: z.string(),
+    logDetails: z.array(z.object({ name: z.string(), url: z.string() })),
+  }),
+  /**
+   * Root card status. `running` until the first turn settles; a record still
+   * `running` when the channel starts belongs to an analysis the previous
+   * instance never finished, and becomes `interrupted`.
+   */
+  status: z.enum(['running', 'done', 'stopped', 'error', 'failed', 'interrupted']),
 })
 
-export type PendingAttachmentResource = z.infer<typeof pendingAttachmentResourceSchema>
+export type AnalyzeRequestRecord = z.infer<typeof analyzeRequestRecordSchema>
 
 /**
- * One silently registered attachment message. Keyed by its Feishu message id so
- * a redelivered event can never register twice. `scopeKey` is the
- * `(chat, thread?, sender)` isolation unit; `consumed` marks metadata the
- * agent already fetched, which then drops out of the prompt manifest (the
- * record stays as an authorization fact until its TTL).
+ * Where one Feishu-routed Session came from, keyed by its DSH session id.
+ * Written the first time a route record names the Session (new topic,
+ * `/renew`, analyze API) and kept after the route retires, so the Web
+ * client can still show the origin of an old Session. Names are resolved
+ * live when read, never stored.
  */
-export const pendingAttachmentRecordSchema = z.object({
-  /** Key the record is stored under (= `messageId`). */
+export const sessionOriginRecordSchema = z.object({
+  /** DSH session id (also the table key). */
   key: z.string().min(1),
-  /** `(chat, thread?, sender)` isolation key; see `pendingAttachmentScopeKey`. */
-  scopeKey: z.string().min(1),
-  /** Feishu message id of the attachment message (the container id for
-   *  merged-forward records). */
-  messageId: z.string().min(1),
-  /** Feishu chat the message arrived in. */
+  /** Route key the Session was bound under (thread_id or chat:<chatId>). */
+  routeKey: z.string().min(1),
+  /** Topic-scoped (`thread`) or chat-scoped (`chat`) route. */
+  kind: z.enum(['thread', 'chat']),
+  /** Feishu chat the Session was started from. */
   chatId: z.string().min(1),
   /** `p2p` or `group`. */
   chatType: z.enum(['p2p', 'group']),
-  /** Feishu topic the message belongs to, when it has one. */
-  threadId: z.string().min(1).optional(),
-  /** Normalized sender id (open_id) that the scope is bound to. */
-  senderOpenId: z.string().min(1),
-  /** Epoch ms when the metadata was registered (clock seam for tests). */
-  receivedAt: z.number().int().nonnegative(),
-  /** Kind of message that carried the payload. */
-  kind: z.enum(PENDING_ATTACHMENT_KINDS),
-  /** Attachment payloads; empty for merged-forward containers (children are
-   *  listed through the container's own message id on fetch). */
-  resources: z.array(pendingAttachmentResourceSchema),
-  /** Remaining caption text after attachment placeholders, truncated. */
-  textExcerpt: z.string().min(1).optional(),
-  /** Set once the agent fetched the attachment; consumed rows leave the
-   *  manifest but stay queryable by message id until the TTL sweep. */
-  consumed: z.boolean().optional(),
+  /** `user_id` of the user who started the Session (the requester for analyze topics). */
+  senderUserId: z.string().min(1),
+  /** Epoch ms when the Session was bound to the route. */
+  createdAt: z.number().int().nonnegative(),
+  /** Group-shared route (log-platform analysis topic). */
+  shared: z.literal(true).optional(),
 })
 
-export type PendingAttachmentRecord = z.infer<typeof pendingAttachmentRecordSchema>
+export type SessionOriginRecord = z.infer<typeof sessionOriginRecordSchema>
 
 export interface FeishuDomainSpecShape {
-  name: 'channels_routes'
+  name: 'channels_routes_v2'
   version: 1
   global: {
     schema: z.ZodType<FeishuDomainGlobal>
@@ -401,8 +385,16 @@ export interface FeishuDomainSpecShape {
       valueSchema: typeof accessRequestRecordSchema
       __key?: string
     }
-    pending_attachments: {
-      valueSchema: typeof pendingAttachmentRecordSchema
+    access_wiki_users: {
+      valueSchema: typeof accessUserRecordSchema
+      __key?: string
+    }
+    analyze_requests: {
+      valueSchema: typeof analyzeRequestRecordSchema
+      __key?: string
+    }
+    session_origins: {
+      valueSchema: typeof sessionOriginRecordSchema
       __key?: string
     }
   }
@@ -425,7 +417,9 @@ export type FeishuDomainGlobal = z.infer<typeof feishuDomainGlobalSchema>
  * runtime import of `@deepseek-ai/dsh-storage-domain`.
  */
 export const feishuDomain: FeishuDomainSpecShape = {
-  name: 'channels_routes',
+  // v2 keys every user by `user_id`. The open_id-keyed `channels_routes` unit
+  // is neither read nor migrated; it stays on disk untouched.
+  name: 'channels_routes_v2',
   version: 1,
   global: {
     schema: feishuDomainGlobalSchema,
@@ -439,7 +433,14 @@ export const feishuDomain: FeishuDomainSpecShape = {
     access_groups: { valueSchema: accessGroupRecordSchema },
     access_users: { valueSchema: accessUserRecordSchema },
     access_requests: { valueSchema: accessRequestRecordSchema },
-    pending_attachments: { valueSchema: pendingAttachmentRecordSchema },
+    // Wiki whitelist (`/auth wiki add`): same record as `access_users`, an
+    // independent grant. Added without a version bump like the other access
+    // tables: a missing table loads empty.
+    access_wiki_users: { valueSchema: accessUserRecordSchema },
+    // Analyze API idempotency records; a missing table loads empty.
+    analyze_requests: { valueSchema: analyzeRequestRecordSchema },
+    // Session id → Feishu origin; a missing table loads empty.
+    session_origins: { valueSchema: sessionOriginRecordSchema },
   },
 }
 
@@ -490,7 +491,7 @@ export interface AccessGroupsTable {
   entries(): IterableIterator<[string, AccessGroupRecord]>
 }
 
-/** Normalized table handle for authorized users (key = `open_id`). */
+/** Normalized table handle for authorized users (key = `user_id`). */
 export interface AccessUsersTable {
   get(key: string): AccessUserRecord | undefined
   put(key: string, value: AccessUserRecord): Promise<unknown> | void
@@ -506,17 +507,17 @@ export interface AccessRequestsTable {
   entries(): IterableIterator<[string, AccessRequestRecord]>
 }
 
-/**
- * Normalized table handle for silently registered attachment metadata
- * (key = Feishu message id).
- */
-export interface PendingAttachmentsTable {
-  get(key: string): PendingAttachmentRecord | undefined
-  put(key: string, value: PendingAttachmentRecord): Promise<unknown> | void
-  /** Atomic read-modify-write on the host's write chain (`missing-key` when gone). */
-  update(key: string, fn: (current: PendingAttachmentRecord) => PendingAttachmentRecord): Promise<unknown>
-  delete(key: string): Promise<unknown> | void
-  entries(): IterableIterator<[string, PendingAttachmentRecord]>
+/** Normalized table handle for analyze API requests (key = `Idempotency-Key`). */
+export interface AnalyzeRequestsTable {
+  get(key: string): AnalyzeRequestRecord | undefined
+  put(key: string, value: AnalyzeRequestRecord): Promise<unknown> | void
+  entries(): IterableIterator<[string, AnalyzeRequestRecord]>
+}
+
+/** Normalized table handle for the session-origin table (key = DSH session id). */
+export interface SessionOriginsTable {
+  get(key: string): SessionOriginRecord | undefined
+  put(key: string, value: SessionOriginRecord): Promise<unknown> | void
 }
 
 /** Normalized domain handle. */
@@ -528,12 +529,12 @@ export interface FeishuDomainHandle {
   accessGroups: AccessGroupsTable
   accessUsers: AccessUsersTable
   accessRequests: AccessRequestsTable
-  /**
-   * Pending attachment metadata. Optional on purpose: an embedded host whose
-   * storage domain refuses the added table leaves this undefined and the
-   * registry degrades to a process-memory TTL store (records lost on restart).
-   */
-  pendingAttachments?: PendingAttachmentsTable
+  /** Wiki whitelist (key = `user_id`); same records as {@link AccessUsersTable}. */
+  accessWikiUsers: AccessUsersTable
+  /** Analyze API idempotency records. */
+  analyzeRequests: AnalyzeRequestsTable
+  /** Feishu origin of every Session a route ever named. */
+  sessionOrigins: SessionOriginsTable
   getGlobal(): FeishuDomainGlobal
   setGlobal(value: FeishuDomainGlobal): Promise<unknown> | void
   close(): Promise<void>
@@ -558,9 +559,18 @@ export interface RawDomainHandle {
   close(): Promise<void>
 }
 
+/**
+ * Feishu tenant `user_id` (letters, digits, `_`, `-`). It doubles as a
+ * workspace path segment and as a DM target, where the SDK infers the
+ * receive id type from the prefix: `ou_`/`on_`/`oc_` would be sent as an
+ * open_id/union_id/chat_id, so those prefixes are rejected (a pasted open_id
+ * fails validation instead of matching nobody).
+ */
+export const FEISHU_USER_ID_PATTERN = /^(?!ou_|on_|oc_)[A-Za-z0-9_-]+$/u
+
 /** Build a chat-scoped fallback key for degraded (topic-less) routing. */
-export function chatRouteKey(chatType: 'p2p' | 'group', chatId: string, senderOpenId: string): string {
+export function chatRouteKey(chatType: 'p2p' | 'group', chatId: string, senderUserId: string): string {
   return chatType === 'p2p'
-    ? `chat:p2p:${chatId}:${senderOpenId}`
-    : `chat:group:${chatId}:${senderOpenId}`
+    ? `chat:p2p:${chatId}:${senderUserId}`
+    : `chat:group:${chatId}:${senderUserId}`
 }

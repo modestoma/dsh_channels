@@ -38,22 +38,22 @@ describe('AccessStore.load', () => {
   it('从 durable 表读入群、用户与申请', () => {
     const { store, domain } = makeStore()
     const group = groupRecord({ chatId: 'oc_a', addedAt: 20 })
-    const user = userRecord({ openId: 'ou_a', addedAt: 10 })
-    const request = requestRecord({ token: 'tok-a', kind: 'user', targetId: 'ou_b' })
+    const user = userRecord({ userId: 'u_a', addedAt: 10 })
+    const request = requestRecord({ token: 'tok-a', kind: 'user', targetId: 'u_b' })
     void domain.handle.accessGroups.put(group.chatId, group)
-    void domain.handle.accessUsers.put(user.openId, user)
+    void domain.handle.accessUsers.put(user.userId, user)
     void domain.handle.accessRequests.put(request.token, request)
 
     store.load()
 
     expect(store.hasGroup('oc_a')).toBe(true)
-    expect(store.hasUser('ou_a')).toBe(true)
+    expect(store.hasUser('u_a')).toBe(true)
     expect(store.getGroup('oc_a')).toEqual(group)
-    expect(store.getUser('ou_a')).toEqual(user)
+    expect(store.getUser('u_a')).toEqual(user)
     expect(store.getRequest('tok-a')).toEqual(request)
     expect(store.snapshot()).toEqual({
       groups: new Set(['oc_a']),
-      users: new Set(['ou_a']),
+      users: new Set(['u_a']),
     })
   })
 
@@ -61,12 +61,12 @@ describe('AccessStore.load', () => {
     const { store, domain } = makeStore()
     void domain.handle.accessGroups.put('oc_new', groupRecord({ chatId: 'oc_new', addedAt: 300 }))
     void domain.handle.accessGroups.put('oc_old', groupRecord({ chatId: 'oc_old', addedAt: 100 }))
-    void domain.handle.accessUsers.put('ou_new', userRecord({ openId: 'ou_new', addedAt: 300 }))
-    void domain.handle.accessUsers.put('ou_old', userRecord({ openId: 'ou_old', addedAt: 100 }))
+    void domain.handle.accessUsers.put('u_new', userRecord({ userId: 'u_new', addedAt: 300 }))
+    void domain.handle.accessUsers.put('u_old', userRecord({ userId: 'u_old', addedAt: 100 }))
     store.load()
 
     expect(store.groupRecords().map(record => record.chatId)).toEqual(['oc_old', 'oc_new'])
-    expect(store.userRecords().map(record => record.openId)).toEqual(['ou_old', 'ou_new'])
+    expect(store.userRecords().map(record => record.userId)).toEqual(['u_old', 'u_new'])
   })
 
   it('domain 缺失时降级为空白名单并 warn（不抛）', () => {
@@ -107,29 +107,29 @@ describe('AccessStore 授权写穿', () => {
   it('addUser 同时写 domain 表并刷新内存快照', async () => {
     const { store, domain } = makeStore()
     store.load()
-    const record = userRecord({ openId: 'ou_bob', name: 'Bob' })
+    const record = userRecord({ userId: 'u_bob', name: 'Bob' })
 
     await store.addUser(record)
 
-    expect(durableEntries(domain, 'access_users')).toEqual([['ou_bob', record]])
-    expect(store.hasUser('ou_bob')).toBe(true)
-    expect(store.snapshot().users.has('ou_bob')).toBe(true)
+    expect(durableEntries(domain, 'access_users')).toEqual([['u_bob', record]])
+    expect(store.hasUser('u_bob')).toBe(true)
+    expect(store.snapshot().users.has('u_bob')).toBe(true)
   })
 
   it('removeGroup/removeUser 持久删除并即时退出快照；不存在时返回 false', async () => {
     const { store, domain } = makeStore()
     store.load()
     await store.addGroup(groupRecord({ chatId: 'oc_a' }))
-    await store.addUser(userRecord({ openId: 'ou_a' }))
+    await store.addUser(userRecord({ userId: 'u_a' }))
 
     await expect(store.removeGroup('oc_a')).resolves.toBe(true)
-    await expect(store.removeUser('ou_a')).resolves.toBe(true)
+    await expect(store.removeUser('u_a')).resolves.toBe(true)
     expect(durableEntries(domain, 'access_groups')).toEqual([])
     expect(durableEntries(domain, 'access_users')).toEqual([])
     expect(store.snapshot()).toEqual({ groups: new Set(), users: new Set() })
 
     await expect(store.removeGroup('oc_missing')).resolves.toBe(false)
-    await expect(store.removeUser('ou_missing')).resolves.toBe(false)
+    await expect(store.removeUser('u_missing')).resolves.toBe(false)
   })
 
   it('domain 缺失时写操作报错而不是静默成功', async () => {
@@ -143,16 +143,16 @@ describe('AccessStore 授权写穿', () => {
     const { store, domain } = makeStore()
     store.load()
     await store.addGroup(groupRecord({ chatId: 'oc_a' }))
-    await store.addUser(userRecord({ openId: 'ou_a' }))
+    await store.addUser(userRecord({ userId: 'u_a' }))
 
     store.clear()
     expect(store.hasGroup('oc_a')).toBe(false)
-    expect(store.hasUser('ou_a')).toBe(false)
+    expect(store.hasUser('u_a')).toBe(false)
     expect(durableEntries(domain, 'access_groups')).toHaveLength(1)
 
     store.load()
     expect(store.hasGroup('oc_a')).toBe(true)
-    expect(store.hasUser('ou_a')).toBe(true)
+    expect(store.hasUser('u_a')).toBe(true)
   })
 })
 
@@ -184,7 +184,7 @@ describe('AccessStore 申请查询', () => {
       token: 'tok-old', kind: 'group', targetId: 'oc_old', createdAt: 1, expiresAt: now + DAY_MS,
     }))
     await store.putRequest(requestRecord({
-      token: 'tok-new', kind: 'user', targetId: 'ou_new', createdAt: 2, expiresAt: now + DAY_MS,
+      token: 'tok-new', kind: 'user', targetId: 'u_new', createdAt: 2, expiresAt: now + DAY_MS,
     }))
     await store.putRequest(requestRecord({
       token: 'tok-expired', kind: 'group', targetId: 'oc_expired', createdAt: 3, expiresAt: now - 1,
@@ -201,13 +201,13 @@ describe('AccessStore 申请查询', () => {
       token: 'tok-denied', kind: 'group', targetId: 'oc_a', status: 'denied', createdAt: now - 1_000,
     }))
     await store.putRequest(requestRecord({
-      token: 'tok-approved', kind: 'user', targetId: 'ou_a', status: 'approved', createdAt: now - 1_000,
+      token: 'tok-approved', kind: 'user', targetId: 'u_a', status: 'approved', createdAt: now - 1_000,
     }))
 
     expect(store.recentlyDenied('group', 'oc_a', DAY_MS, now)).toBe(true)
     expect(store.recentlyDenied('group', 'oc_a', 500, now)).toBe(false)
     expect(store.recentlyDenied('group', 'oc_other', DAY_MS, now)).toBe(false)
-    expect(store.recentlyDenied('user', 'ou_a', DAY_MS, now)).toBe(false)
+    expect(store.recentlyDenied('user', 'u_a', DAY_MS, now)).toBe(false)
   })
 })
 

@@ -5,7 +5,7 @@
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { ApprovalAnswerer } from '../src/approvals.ts'
+import { ApprovalAnswerer, classifyApprovalReply } from '../src/approvals.ts'
 import type { ApprovalRoute } from '../src/approvals.ts'
 import type { ApprovalOutcome, ApprovalRequest } from '../src/dsh-types.ts'
 import type { CardActionEvent, FeishuChannel, SendResult } from '../src/feishu-channel.ts'
@@ -17,7 +17,7 @@ const ROUTE: ApprovalRoute = {
   chatId: 'oc_test_chat',
   cardMessageId: 'om_main_card',
   inThread: true,
-  senderOpenId: 'ou_owner',
+  senderUserId: 'u_owner',
 }
 
 function makeRequest(sessionId = 'sess-approval', overrides: Partial<ApprovalRequest> = {}): ApprovalRequest {
@@ -29,11 +29,11 @@ function makeRequest(sessionId = 'sess-approval', overrides: Partial<ApprovalReq
   }
 }
 
-function clickEvent(messageId: string, decision: unknown, openId = ROUTE.senderOpenId): CardActionEvent {
+function clickEvent(messageId: string, decision: unknown, userId = ROUTE.senderUserId): CardActionEvent {
   return {
     messageId,
     chatId: ROUTE.chatId,
-    operator: { openId },
+    operator: { openId: 'ou_operator', userId },
     action: { value: { decision }, tag: 'button' },
   }
 }
@@ -140,7 +140,7 @@ describe('ApprovalAnswerer', () => {
       outcome => { settled = true; return outcome },
     )
     await vi.waitFor(() => expect(channel.sent).toHaveLength(1))
-    answerer.onCardAction(clickEvent('om_1', 'allow', 'ou_stranger'))
+    answerer.onCardAction(clickEvent('om_1', 'allow', 'u_stranger'))
     await flush()
     expect(settled).toBe(false)
     expect(answerer.pendingCount()).toBe(1)
@@ -150,11 +150,28 @@ describe('ApprovalAnswerer', () => {
     )
     expect(notices).toHaveLength(1)
     // Second stranger click does not re-patch.
-    answerer.onCardAction(clickEvent('om_1', 'allow', 'ou_stranger'))
+    answerer.onCardAction(clickEvent('om_1', 'allow', 'u_stranger'))
     await flush()
     expect(channel.updated).toHaveLength(1)
     answerer.dispose()
     await expect(pending).resolves.toBe('cancelled')
+  })
+
+  it('lets the shared-route gate decide who may click instead of the owner check', async () => {
+    const channel = makeChannel()
+    const mayDecide = vi.fn((userId: string) => userId === 'u_member')
+    const answerer = new ApprovalAnswerer(channel, {
+      routeFor: () => ({ ...ROUTE, mayDecide }),
+      onError: vi.fn(),
+    }, TIMEOUT)
+    const pending = answerer.onRequest(makeRequest(), nextOf('unavailable'))
+    await vi.waitFor(() => expect(channel.sent).toHaveLength(1))
+    answerer.onCardAction(clickEvent('om_1', 'allow', 'u_outsider'))
+    await flush()
+    expect(answerer.pendingCount()).toBe(1)
+    answerer.onCardAction(clickEvent('om_1', 'allow', 'u_member'))
+    await expect(pending).resolves.toBe('allowed-once')
+    expect(mayDecide).toHaveBeenCalledWith('u_member')
   })
 
   it('ignores clicks with an unknown message id or an unknown decision value', async () => {
@@ -281,5 +298,158 @@ describe('ApprovalAnswerer display reason', () => {
     expect(json).not.toContain('audit-trail reason')
     answerer.dispose()
     await pending
+  })
+})
+
+describe('ApprovalAnswerer usability', () => {
+  const toolCall = (callId: string, args: object | string, turn = 1) => ({
+    type: 'tool/call' as const,
+    seq: 1,
+    data: { turn, step: 1, callId, name: 'bash', arguments: typeof args === 'string' ? args : JSON.stringify(args) },
+  })
+  const sentCard = (channel: ReturnType<typeof makeChannel>, index = 0) =>
+    JSON.stringify((channel.sent[index] as { input: { card: object } }).input.card)
+
+  it('shows the recorded command and escalation target of the asked call', async () => {
+    const { channel, answerer } = makeEnv()
+    answerer.onSessionEvent('sess-approval', toolCall('call-1', {
+      command: 'git push origin main', sandbox_permissions: 'danger-full-access', justification: 'push',
+    }))
+    const pending = answerer.onRequest(makeRequest('sess-approval', { callId: 'call-1' }), nextOf('unavailable'))
+    await vi.waitFor(() => expect(channel.sent).toHaveLength(1))
+    expect(sentCard(channel)).toContain('git push origin main')
+    expect(sentCard(channel)).toContain('提升到 `danger-full-access`')
+    answerer.dispose()
+    await pending
+  })
+
+  it('forgets a turn\'s calls at turn end and falls back to the summary', async () => {
+    const { channel, answerer } = makeEnv()
+    answerer.onSessionEvent('sess-approval', toolCall('call-1', { command: 'echo old' }))
+    answerer.onSessionEvent('sess-approval', { type: 'turn/end', seq: 2, data: { turn: 1, reason: 'completed' } } as never)
+    const pending = answerer.onRequest(makeRequest('sess-approval', { callId: 'call-1' }), nextOf('unavailable'))
+    await vi.waitFor(() => expect(channel.sent).toHaveLength(1))
+    expect(sentCard(channel)).not.toContain('echo old')
+    expect(sentCard(channel)).not.toContain('将执行')
+    answerer.dispose()
+    await pending
+  })
+
+  it('shows raw arguments for non-bash tools and unparseable JSON verbatim', async () => {
+    const { channel, answerer } = makeEnv()
+    answerer.onSessionEvent('sess-approval', { ...toolCall('call-1', '{not json'), data: { ...toolCall('call-1', '{not json').data, name: 'edit' } })
+    answerer.onSessionEvent('sess-approval', { ...toolCall('call-2', { path: 'a.txt' }), data: { ...toolCall('call-2', { path: 'a.txt' }).data, name: 'edit' } })
+    const a = answerer.onRequest(makeRequest('sess-approval', { toolName: 'edit', callId: 'call-1' }), nextOf('unavailable'))
+    const b = answerer.onRequest(makeRequest('sess-approval', { toolName: 'edit', callId: 'call-2' }), nextOf('unavailable'))
+    await vi.waitFor(() => expect(channel.sent).toHaveLength(2))
+    expect(sentCard(channel, 0)).toContain('{not json')
+    expect(sentCard(channel, 1)).toContain('a.txt')
+    answerer.dispose()
+    await Promise.all([a, b])
+  })
+
+  it('stop-asking grants the same tool + mode in the same session only', async () => {
+    const { channel, answerer } = makeEnv()
+    answerer.onSessionEvent('sess-a', toolCall('call-1', { command: 'ls', sandbox_permissions: 'workspace-write' }))
+    const first = answerer.onRequest(makeRequest('sess-a', { callId: 'call-1' }), nextOf('unavailable'))
+    await vi.waitFor(() => expect(channel.sent).toHaveLength(1))
+    answerer.onCardAction(clickEvent('om_1', 'always'))
+    await expect(first).resolves.toBe('allowed-once')
+    await vi.waitFor(() => expect(channel.updated).toHaveLength(1))
+    expect(firstMarkdown(patchedOf(channel))).toContain('本话题不再询问')
+
+    // Same tool + mode in the same session: answered without a card.
+    answerer.onSessionEvent('sess-a', toolCall('call-2', { command: 'pwd', sandbox_permissions: 'workspace-write' }))
+    await expect(answerer.onRequest(makeRequest('sess-a', { callId: 'call-2' }), nextOf('unavailable')))
+      .resolves.toBe('allowed-once')
+    expect(channel.sent).toHaveLength(1)
+
+    // A wider mode, or another session, still asks.
+    answerer.onSessionEvent('sess-a', toolCall('call-3', { command: 'rm x', sandbox_permissions: 'danger-full-access' }))
+    const wider = answerer.onRequest(makeRequest('sess-a', { callId: 'call-3' }), nextOf('unavailable'))
+    answerer.onSessionEvent('sess-b', toolCall('call-1', { command: 'ls', sandbox_permissions: 'workspace-write' }))
+    const other = answerer.onRequest(makeRequest('sess-b', { callId: 'call-1' }), nextOf('unavailable'))
+    await vi.waitFor(() => expect(channel.sent).toHaveLength(3))
+    answerer.dispose()
+    await expect(wider).resolves.toBe('cancelled')
+    await expect(other).resolves.toBe('cancelled')
+  })
+
+  it('stop-asking also allows the other pending cards it covers', async () => {
+    const { channel, answerer } = makeEnv()
+    const a = answerer.onRequest(makeRequest('sess-a'), nextOf('unavailable'))
+    const b = answerer.onRequest(makeRequest('sess-a'), nextOf('unavailable'))
+    const c = answerer.onRequest(makeRequest('sess-a', { toolName: 'edit' }), nextOf('unavailable'))
+    await vi.waitFor(() => expect(channel.sent).toHaveLength(3))
+    answerer.onCardAction(clickEvent('om_2', 'always'))
+    await expect(a).resolves.toBe('allowed-once')
+    await expect(b).resolves.toBe('allowed-once')
+    expect(answerer.pendingCount()).toBe(1)
+    answerer.dispose()
+    await expect(c).resolves.toBe('cancelled')
+  })
+
+  it('typed keywords decide the newest pending card', async () => {
+    const { channel, answerer } = makeEnv()
+    const older = answerer.onRequest(makeRequest('sess-a'), nextOf('unavailable'))
+    const newer = answerer.onRequest(makeRequest('sess-a', { toolName: 'edit' }), nextOf('unavailable'))
+    await vi.waitFor(() => expect(channel.sent).toHaveLength(2))
+    expect(answerer.submitText('sess-a', '允许！')).toBe('allowed')
+    await expect(newer).resolves.toBe('allowed-once')
+    expect(answerer.submitText('sess-a', 'N')).toBe('denied')
+    await expect(older).resolves.toBe('rejected')
+    expect(answerer.submitText('sess-a', '允许')).toBeUndefined()
+    await vi.waitFor(() => expect(channel.updated).toHaveLength(2))
+    expect(channel.updated.map(update => JSON.stringify(update.card)).join('\n')).toContain('文字回复')
+  })
+
+  it('a typed 全部允许 records the stop-asking grant', async () => {
+    const { channel, answerer } = makeEnv()
+    const pending = answerer.onRequest(makeRequest('sess-a'), nextOf('unavailable'))
+    await vi.waitFor(() => expect(channel.sent).toHaveLength(1))
+    expect(answerer.submitText('sess-a', '全部允许')).toBe('remembered')
+    await expect(pending).resolves.toBe('allowed-once')
+    await expect(answerer.onRequest(makeRequest('sess-a'), nextOf('unavailable'))).resolves.toBe('allowed-once')
+  })
+
+  it('any other text rejects every pending card of the session as superseded', async () => {
+    const { channel, answerer } = makeEnv()
+    const a = answerer.onRequest(makeRequest('sess-a'), nextOf('unavailable'))
+    const b = answerer.onRequest(makeRequest('sess-a', { toolName: 'edit' }), nextOf('unavailable'))
+    const other = answerer.onRequest(makeRequest('sess-b'), nextOf('unavailable'))
+    await vi.waitFor(() => expect(channel.sent).toHaveLength(3))
+    expect(answerer.hasPendingFor('sess-a')).toBe(true)
+    expect(answerer.submitText('sess-a', '先别删，改用 git mv')).toBe('superseded')
+    await expect(a).resolves.toBe('rejected')
+    await expect(b).resolves.toBe('rejected')
+    expect(answerer.hasPendingFor('sess-a')).toBe(false)
+    expect(answerer.hasPendingFor('sess-b')).toBe(true)
+    await vi.waitFor(() => expect(channel.updated).toHaveLength(2))
+    expect(JSON.stringify(channel.updated[0]!.card)).toContain('下一条指令')
+    answerer.dispose()
+    await other
+  })
+
+  it('reports the session\'s waiting tools on open and settle', async () => {
+    const channel = makeChannel()
+    const onWaitingChange = vi.fn()
+    const answerer = new ApprovalAnswerer(channel, { routeFor: () => ROUTE, onError: vi.fn(), onWaitingChange }, TIMEOUT)
+    const pending = answerer.onRequest(makeRequest('sess-a'), nextOf('unavailable'))
+    expect(onWaitingChange).toHaveBeenLastCalledWith('sess-a', ['bash'])
+    await vi.waitFor(() => expect(channel.sent).toHaveLength(1))
+    answerer.onCardAction(clickEvent('om_1', 'allow'))
+    await pending
+    expect(onWaitingChange).toHaveBeenLastCalledWith('sess-a', [])
+  })
+})
+
+describe('classifyApprovalReply', () => {
+  it.each([
+    ['允许', 'allow'], ['好的。', 'allow'], ['OK', 'allow'], ['y', 'allow'],
+    ['拒绝', 'deny'], ['不行', 'deny'], ['No!', 'deny'],
+    ['全部允许', 'always'], ['allow all', 'always'],
+    ['允许删除 build 目录', undefined], ['', undefined],
+  ] as const)('%s → %s', (text, expected) => {
+    expect(classifyApprovalReply(text)).toBe(expected)
   })
 })

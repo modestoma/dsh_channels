@@ -5,7 +5,8 @@ on:
     branches: [main, dev]
   pull_request:
     branches: [main, dev]
-  # Releases run only from a manual dispatch on main (stable) or dev (beta).
+  # Pushes to main release a stable version automatically; dev (beta) releases
+  # only from a manual dispatch.
   workflow_dispatch:
     inputs:
       dry_run:
@@ -49,12 +50,14 @@ jobs:
       - name: Typecheck, test, build, and verify loaders
         run: pnpm check
 
-  # Pushes only run checks, so commits accumulate until a manual dispatch.
-  # Dispatching on main publishes a stable version; on dev, a beta prerelease.
+  # A push to main publishes a stable version once checks pass. Pushes to dev
+  # only run checks, so beta commits accumulate until a manual dispatch.
+  # Dispatching on main or dev publishes (or, with dry_run, previews) a release.
   release:
     if: >-
-      github.event_name == 'workflow_dispatch' &&
-      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' &&
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'))
     needs: check
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -88,12 +91,12 @@ jobs:
       - name: Verify package contents
         run: pnpm pack --dry-run
       - name: Preview release
-        if: inputs.dry_run
+        if: github.event_name == 'workflow_dispatch' && inputs.dry_run
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: pnpm exec semantic-release --dry-run
       - name: Publish release
-        if: ${{ !inputs.dry_run }}
+        if: github.event_name == 'push' || !inputs.dry_run
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: pnpm exec semantic-release

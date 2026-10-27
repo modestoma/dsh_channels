@@ -3,13 +3,14 @@
  * topic replies, degradation, and lazy resume.
  */
 
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, utimesSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
 import { gunzip } from 'node:zlib'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { FeishuService } from '../src/service.ts'
+import { FeishuApiError } from '../src/feishu-channel.ts'
 import type { FeishuConfig } from '../src/config.ts'
 import type {
   CardActionEvent, ChannelFactory, FeishuChannel, NormalizedMessage, RawMessageListParams,
@@ -20,6 +21,7 @@ import type { RouteRecord } from '../src/domain.ts'
 import { sessionDirOf } from '../src/domain.ts'
 import { FEISHU_ATTACHMENTS_SECTION } from '../src/feishu/agent-context.ts'
 import { ATTACHMENT_FETCH_TOOL_NAME, TOPIC_MESSAGES_TOOL_NAME } from '../src/feishu/tools.ts'
+import { SEND_FILE_TOOL_NAME } from '../src/feishu/send-file.ts'
 import type { SessionExportBuilder } from '../src/session-export.ts'
 import {
   dispatchAgentRequest, makeHostContext, makeChannel, makeMessage, makeAgentPresets, makeSession, makeAgent,
@@ -48,20 +50,21 @@ function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
     routeTtlMs: 0,
     approvalTimeoutMs: 300_000,
     questionTimeoutMs: 300_000,
+    wikiRoots: [],
     allowPermissionSwitch: false,
     // Tests exercise routing/hitl behavior; access control has its own tests.
     accessMode: 'open',
+    dmAllowWhitelist: false,
     authRequestTtlDays: 7,
     // Onboarding is opt-in per test: it adds a card that would shift send counts.
     welcomeOnboarding: false,
+    slashCommandPanel: false,
     acceptAttachments: true,
     attachmentStore: 'native',
     prefetchImages: true,
     prefetchImageMaxBytes: 20 * 1024 * 1024,
     prefetchTotalMaxBytes: 50 * 1024 * 1024,
     prefetchTimeoutMs: 10_000,
-    pendingAttachmentTtlMs: 7 * 24 * 60 * 60 * 1000,
-    pendingAttachmentLimit: 10,
     // First-turn topic history bootstrap; 0 disables it (bounded, silent on failure).
     historyBootstrapLimit: 10,
     promptContextTimeoutMs: 3_000,
@@ -72,10 +75,12 @@ function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
       attachmentFetchTimeoutMs: 120_000,
       topicMessages: true,
       topicMessagesTimeoutMs: 20_000,
+      sendFile: true,
+      wikiRead: false,
+      wikiWrite: false,
     },
     topicIsolation: 'auto',
-    workspaceRetention: 'off',
-    workspaceRetentionAuto: false,
+    analyzeToken: 'DSH_CHANNELS_ANALYZE_TOKEN',
     ...partial,
   }
 }
@@ -84,6 +89,7 @@ interface Harness {
   service: FeishuService
   channel: FeishuChannel & {
     sent: unknown[]
+    repliedMedia: unknown[]
     updated: unknown[]
     reactions: unknown[]
     removedReactions: unknown[]
@@ -186,7 +192,7 @@ describe('FeishuService', () => {
   it('handles unbound /health without creating a workspace or Session', async () => {
     const h = await setup()
     const msg = makeMessage({
-      chatType: 'group', chatId: 'oc_health', senderId: 'ou_alice',
+      chatType: 'group', chatId: 'oc_health', senderId: 'u_alice',
       mentionedBot: false, messageId: 'om_health', content: '  /health  ',
     })
     await h.onMessage(msg)
@@ -195,6 +201,7 @@ describe('FeishuService', () => {
     expect(h.ctxState.agents.created).toHaveLength(0)
     expect(h.ctxState.workspaces.workspaces.size).toBe(0)
     expect(h.channel.sent).toHaveLength(1)
+    expect((h.channel.sent[0] as { options?: object }).options).toEqual({ replyTo: 'om_health' })
     const json = JSON.stringify((h.channel.sent[0] as { input: object }).input)
     expect(json).toContain('健康检查')
     expect(json).toContain('degraded')
@@ -211,13 +218,14 @@ describe('FeishuService', () => {
   it('lists all supported commands for unbound /help without creating a workspace or Session', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'p2p', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_help', content: '/help',
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
 
     expect(h.ctxState.agents.created).toHaveLength(0)
     expect(h.ctxState.workspaces.workspaces.size).toBe(0)
+    expect((h.channel.sent[0] as { options?: object }).options).toEqual({ replyTo: 'om_help' })
     const json = JSON.stringify((h.channel.sent[0] as { input: object }).input)
     expect(json).toContain('斜杠命令帮助')
     expect(json).toContain('/help')
@@ -237,10 +245,28 @@ describe('FeishuService', () => {
   })
   })
 
+  it('answers /help directly in a plain group and inside an existing topic', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', senderId: 'u_alice', mentionedBot: true,
+      messageId: 'om_help_group', content: '/help',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
+    expect((h.channel.sent[0] as { options?: object }).options).toEqual({ replyTo: 'om_help_group' })
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', senderId: 'u_alice', mentionedBot: true, threadId: 'omt_help',
+      messageId: 'om_help_topic', content: '/help',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
+    expect((h.channel.sent[1] as { options?: object }).options).toEqual({ replyTo: 'om_help_topic', replyInThread: true })
+    expect(h.ctxState.agents.created).toHaveLength(0)
+  })
+
   it('rejects /help arguments without creating a workspace or Session', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'p2p', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_help_args', content: '/help extra',
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
@@ -254,7 +280,7 @@ describe('FeishuService', () => {
   it('returns /userid only in a private chat without creating a workspace or Session', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_private', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_private', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_userid', content: '/userid',
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
@@ -263,7 +289,7 @@ describe('FeishuService', () => {
     expect(h.ctxState.workspaces.workspaces.size).toBe(0)
     const json = JSON.stringify((h.channel.sent[0] as { input: object }).input)
     expect(json).toContain('当前用户 ID')
-    expect(json).toContain('ou_alice')
+    expect(json).toContain('u_alice')
     expect(mock(h.channel.send)).toHaveBeenCalledTimes(1)
     expect((h.channel.sent[0] as { options?: object }).options).toEqual({ replyTo: 'om_userid' })
   await waitUntil(() => {
@@ -277,7 +303,7 @@ describe('FeishuService', () => {
   it('returns /groupid in a group root when the bot is mentioned', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_group', senderId: 'ou_alice', mentionedBot: true,
+      chatType: 'group', chatId: 'oc_group', senderId: 'u_alice', mentionedBot: true,
       messageId: 'om_groupid', content: '/groupid',
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
@@ -302,7 +328,7 @@ describe('FeishuService', () => {
     async command => {
       const h = await setup()
       await h.onMessage(makeMessage({
-        chatType: 'group', chatId: 'oc_group', senderId: 'ou_alice', mentionedBot: false,
+        chatType: 'group', chatId: 'oc_group', senderId: 'u_alice', mentionedBot: false,
         messageId: `om_${command}_unmentioned`, content: `/${command}`,
       }))
       await flush()
@@ -317,21 +343,21 @@ describe('FeishuService', () => {
   it('returns /groupid without a repeated mention inside an existing topic', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_topic_group', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'group', chatId: 'oc_topic_group', senderId: 'u_alice', mentionedBot: false,
       threadId: 'omt_existing', messageId: 'om_groupid_topic', content: '/groupid',
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
 
     expect(JSON.stringify((h.channel.sent[0] as { input: object }).input)).toContain('oc_topic_group')
     expect((h.channel.sent[0] as { options?: object }).options)
-      .toEqual({ replyTo: 'om_groupid_topic' })
+      .toEqual({ replyTo: 'om_groupid_topic', replyInThread: true })
     expect(h.ctxState.agents.created).toHaveLength(0)
   })
 
   it('returns /groupid without a mention when requireMention is disabled', async () => {
     const h = await setup({ requireMention: false })
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_open_group', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'group', chatId: 'oc_open_group', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_groupid_open', content: '/groupid',
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
@@ -342,7 +368,7 @@ describe('FeishuService', () => {
   })
 
   it.each([
-    ['userid', 'group', '命令 /userid 仅支持在私聊中使用。', 'ou_group_user'],
+    ['userid', 'group', '命令 /userid 仅支持在私聊中使用。', 'u_group_user'],
     ['groupid', 'p2p', '命令 /groupid 仅支持在群聊中使用。', 'oc_private_chat'],
   ] as const)('rejects /%s in the wrong chat type without exposing its ID', async (
     command, chatType, expected, hiddenId,
@@ -351,7 +377,7 @@ describe('FeishuService', () => {
     await h.onMessage(makeMessage({
       chatType,
       chatId: chatType === 'group' ? 'oc_group_chat' : hiddenId,
-      senderId: chatType === 'group' ? hiddenId : 'ou_private_user',
+      senderId: chatType === 'group' ? hiddenId : 'u_private_user',
       mentionedBot: true,
       messageId: `om_${command}_wrong_chat`,
       content: `/${command}`,
@@ -400,7 +426,7 @@ describe('FeishuService', () => {
       },
     })
     await h.onMessage(makeMessage({
-      chatType: 'p2p', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', senderId: 'u_alice', mentionedBot: false,
       messageId: `om_health_${state}`, content: '/health',
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
@@ -425,7 +451,7 @@ describe('FeishuService', () => {
     h.ctxState.ctx.registry = { size: runtimes.size, values: () => runtimes.values() }
 
     await h.onMessage(makeMessage({
-      chatType: 'p2p', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', senderId: 'u_alice', mentionedBot: false,
       messageId: `om_health_fiber_${fiberState}`, content: '/health',
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
@@ -443,7 +469,7 @@ describe('FeishuService', () => {
     h.ctxState.ctx.get = name => name === 'llm' ? undefined : get(name)
 
     await h.onMessage(makeMessage({
-      chatType: 'p2p', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_health_missing_llm', content: '/health',
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
@@ -455,23 +481,42 @@ describe('FeishuService', () => {
     expect(json).not.toContain('cause')
   })
 
-  it('rejects an unknown slash command without creating a Session or model turn', async () => {
+  it('forwards a slash line that names no channel command to the Agent as a prompt', async () => {
     const h = await setup()
-    const msg = makeMessage({ chatType: 'p2p', senderId: 'ou_alice', content: '/foo' })
-    await h.onMessage(msg)
+    await h.onMessage(makeMessage({ chatType: 'p2p', senderId: 'u_alice', content: '/guanxiang 订单服务下单报 500' }))
+    await waitForEstablishedSession(h)
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    await waitUntil(() => expect(mock(agent.followup)).toHaveBeenCalledTimes(1))
+
+    expect((mock(agent.followup).mock.calls[0]?.[0] as { content: Array<{ text: string }> }).content[0]?.text)
+      .toBe('/guanxiang 订单服务下单报 500')
+    expect(mock(h.ctxState.ctx.commands.execute)).not.toHaveBeenCalled()
+    expect(JSON.stringify(h.channel.sent)).not.toContain('未知命令')
+  })
+
+  it('forwards an @-mentioned slash prompt in a group chat', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({ chatType: 'group', chatId: 'oc_guanxiang', senderId: 'u_owner', mentionedBot: true, content: '/guanxiang 看下支付回调日志' }))
+    await waitForEstablishedSession(h)
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    await waitUntil(() => expect(mock(agent.followup)).toHaveBeenCalledTimes(1))
+    expect((mock(agent.followup).mock.calls[0]?.[0] as { content: Array<{ text: string }> }).content[0]?.text)
+      .toBe('/guanxiang 看下支付回调日志')
+  })
+
+  it('keeps answering a channel command alias on the command plane', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({ chatType: 'p2p', senderId: 'u_alice', content: '/help' }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
 
     expect(h.ctxState.agents.created).toHaveLength(0)
-    expect(h.channel.sent).toHaveLength(1)
-    const json = JSON.stringify((h.channel.sent[0] as { input: object }).input)
-    expect(json).toContain('未知命令')
-    expect(json).toContain('/health')
+    expect(JSON.stringify((h.channel.sent[0] as { input: object }).input)).toContain('/health')
   })
 
   it('executes a routed command once with one lifecycle pair and no followup', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_commands', senderId: 'ou_owner',
+      chatType: 'group', chatId: 'oc_commands', senderId: 'u_owner',
       messageId: 'om_start', content: '开始',
     }))
     await waitForEstablishedSession(h)
@@ -479,7 +524,7 @@ describe('FeishuService', () => {
     await resetFollowupAfterEstablishment(agent)
 
     const command = makeMessage({
-      chatType: 'group', chatId: 'oc_commands', senderId: 'ou_owner',
+      chatType: 'group', chatId: 'oc_commands', senderId: 'u_owner',
       threadId: 'omt_1', messageId: 'om_status', mentionedBot: false, content: '/status',
     })
     await h.onMessage(command)
@@ -498,7 +543,7 @@ describe('FeishuService', () => {
   it('switches, reports, and resets reasoning effort within the current Session', async () => {
     const h = await setup({ reasoningEffort: 'high' })
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_effort', senderId: 'ou_owner',
+      chatType: 'group', chatId: 'oc_effort', senderId: 'u_owner',
       messageId: 'om_effort_start', content: '开始',
     }))
     await waitForEstablishedSession(h)
@@ -512,7 +557,7 @@ describe('FeishuService', () => {
     const command = async (messageId: string, content: string) => {
       const before = sessionEvents(agent.session).length
       await h.onMessage(makeMessage({
-        chatType: 'group', chatId: 'oc_effort', senderId: 'ou_owner', threadId: 'omt_1',
+        chatType: 'group', chatId: 'oc_effort', senderId: 'u_owner', threadId: 'omt_1',
         mentionedBot: false, messageId, content,
       }))
       await waitUntil(() => expect(sessionEvents(agent.session).length).toBe(before + 2))
@@ -548,13 +593,13 @@ describe('FeishuService', () => {
     const agentsOptions: FakeAgentsOptions = {}
     const h = await setup({ reasoningEffort: 'high' }, {}, undefined, agentsOptions)
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_effort_restore', senderId: 'ou_owner',
+      chatType: 'group', chatId: 'oc_effort_restore', senderId: 'u_owner',
       messageId: 'om_effort_restore_start', content: '开始',
     }))
     await waitForEstablishedSession(h)
     const original = h.ctxState.agents.created[0]!.handle.agent
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_effort_restore', senderId: 'ou_owner', threadId: 'omt_1',
+      chatType: 'group', chatId: 'oc_effort_restore', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_effort_restore_set', content: '/effort tiny',
     }))
     await waitUntil(() => expect(sessionEvents(original.session)).toHaveLength(2))
@@ -567,7 +612,7 @@ describe('FeishuService', () => {
     const registrations = (channel2.onMessage as unknown as ReturnType<typeof vi.fn>).mock.calls
     const onMessage = registrations.at(-1)?.[0] as (msg: NormalizedMessage) => Promise<void> | undefined
     await onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_effort_restore', senderId: 'ou_owner', threadId: 'omt_1',
+      chatType: 'group', chatId: 'oc_effort_restore', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_effort_restore_show', content: '/effort',
     }))
     await waitUntil(() => expect(h.ctxState.agents.resumed).toHaveLength(1))
@@ -585,7 +630,7 @@ describe('FeishuService', () => {
       connectionStatus: { state: 'connected', lastConnectTime: 100, reconnectAttempts: 0 },
     })
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_health_route', senderId: 'ou_owner',
+      chatType: 'group', chatId: 'oc_health_route', senderId: 'u_owner',
       messageId: 'om_health_start', content: '开始',
     }))
     await waitForEstablishedSession(h)
@@ -593,7 +638,7 @@ describe('FeishuService', () => {
     await resetFollowupAfterEstablishment(agent)
 
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_health_route', senderId: 'ou_owner',
+      chatType: 'group', chatId: 'oc_health_route', senderId: 'u_owner',
       threadId: 'omt_1', messageId: 'om_health_bound', mentionedBot: false, content: '/health',
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
@@ -606,7 +651,7 @@ describe('FeishuService', () => {
   it('denies a non-owner /history before resume, command execution, or Session enumeration', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_owned', senderId: 'ou_owner', messageId: 'om_owner', content: '开始',
+      chatType: 'group', chatId: 'oc_owned', senderId: 'u_owner', messageId: 'om_owner', content: '开始',
     }))
     await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
@@ -614,7 +659,7 @@ describe('FeishuService', () => {
     mock(h.ctxState.ctx.commands.execute).mockClear()
 
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_owned', senderId: 'ou_intruder',
+      chatType: 'group', chatId: 'oc_owned', senderId: 'u_intruder',
       threadId: 'omt_1', messageId: 'om_intruder', mentionedBot: false, content: '/history',
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
@@ -630,7 +675,7 @@ describe('FeishuService', () => {
   it('renders /status from the complete durable Session log without starting a model turn', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_status', senderId: 'ou_owner', messageId: 'om_status_start', content: '开始',
+      chatType: 'group', chatId: 'oc_status', senderId: 'u_owner', messageId: 'om_status_start', content: '开始',
     }))
     await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
@@ -661,7 +706,7 @@ describe('FeishuService', () => {
     await resetFollowupAfterEstablishment(agent)
 
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_status', senderId: 'ou_owner', threadId: 'omt_1',
+      chatType: 'group', chatId: 'oc_status', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_status_command', content: '/status',
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
@@ -681,7 +726,7 @@ describe('FeishuService', () => {
   it('returns /workspace only when Session header and route agree', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_workdir', senderId: 'ou_owner', messageId: 'om_workdir_start', content: '开始',
+      chatType: 'group', chatId: 'oc_workdir', senderId: 'u_owner', messageId: 'om_workdir_start', content: '开始',
     }))
     await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
@@ -694,7 +739,7 @@ describe('FeishuService', () => {
     expect(sessionDirOf(route)).not.toBe(cwd)
 
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_workdir', senderId: 'ou_owner', threadId: 'omt_1',
+      chatType: 'group', chatId: 'oc_workdir', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_workspace_command', content: '/workspace',
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
@@ -706,7 +751,7 @@ describe('FeishuService', () => {
   it('rejects a mismatched /workspace and logs no path values', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_workdir_bad', senderId: 'ou_owner', content: '开始',
+      chatType: 'group', chatId: 'oc_workdir_bad', senderId: 'u_owner', content: '开始',
     }))
     await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
@@ -715,7 +760,7 @@ describe('FeishuService', () => {
     header.cwd = '/different/private/workspace'
 
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_workdir_bad', senderId: 'ou_owner', threadId: 'omt_1',
+      chatType: 'group', chatId: 'oc_workdir_bad', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_workspace_bad_command', content: '/workspace',
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
@@ -742,7 +787,7 @@ describe('FeishuService', () => {
       },
     })
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_compact', senderId: 'ou_owner', content: '开始',
+      chatType: 'group', chatId: 'oc_compact', senderId: 'u_owner', content: '开始',
     }))
     await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
@@ -753,7 +798,7 @@ describe('FeishuService', () => {
     await resetFollowupAfterEstablishment(agent)
 
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_compact', senderId: 'ou_owner', threadId: 'omt_1',
+      chatType: 'group', chatId: 'oc_compact', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_compact_command', content: '/compact',
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
@@ -774,12 +819,12 @@ describe('FeishuService', () => {
       handler: () => ({ kind: 'success', text: 'No compactable history yet.' }),
     })
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_compact_empty', senderId: 'ou_owner',
+      chatType: 'group', chatId: 'oc_compact_empty', senderId: 'u_owner',
       messageId: 'om_compact_empty_start', content: '开始',
     }))
     await waitForEstablishedSession(h)
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_compact_empty', senderId: 'ou_owner', threadId: 'omt_1',
+      chatType: 'group', chatId: 'oc_compact_empty', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_compact_empty_command', content: '/compact',
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
@@ -802,12 +847,12 @@ describe('FeishuService', () => {
       handler: () => ({ kind: 'error', text }),
     })
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_compact_error', senderId: 'ou_owner',
+      chatType: 'group', chatId: 'oc_compact_error', senderId: 'u_owner',
       messageId: 'om_compact_error_start', content: '开始',
     }))
     await waitForEstablishedSession(h)
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_compact_error', senderId: 'ou_owner', threadId: 'omt_1',
+      chatType: 'group', chatId: 'oc_compact_error', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_compact_error_command', content: '/compact',
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
@@ -821,12 +866,12 @@ describe('FeishuService', () => {
   it('reports a missing native /compact deployment without executing a command lifecycle', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_no_compact', senderId: 'ou_owner', content: '开始',
+      chatType: 'group', chatId: 'oc_no_compact', senderId: 'u_owner', content: '开始',
     }))
     await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_no_compact', senderId: 'ou_owner', threadId: 'omt_1',
+      chatType: 'group', chatId: 'oc_no_compact', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, content: '/compact',
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
@@ -838,7 +883,7 @@ describe('FeishuService', () => {
   it('renews the topic atomically, preserves history, and routes the next message only to the new Session', async () => {
     const h = await setup({}, {}, { defaultId: 'standard' })
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_renew', senderId: 'ou_owner',
+      chatType: 'group', chatId: 'oc_renew', senderId: 'u_owner',
       messageId: 'om_renew_start', content: '开始',
     }))
     await waitForEstablishedSession(h)
@@ -853,7 +898,7 @@ describe('FeishuService', () => {
     })
 
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_renew', senderId: 'ou_owner', threadId: 'omt_1',
+      chatType: 'group', chatId: 'oc_renew', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_renew_command', content: '/renew',
     }))
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
@@ -890,11 +935,140 @@ describe('FeishuService', () => {
     expect(resultCard).toContain(sessionDirOf(route))
 
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_renew', senderId: 'ou_owner', threadId: 'omt_1',
+      chatType: 'group', chatId: 'oc_renew', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_after_renew', content: '只进入新会话',
     }))
     await waitUntil(() => expect(mock(renewed.handle.agent.followup)).toHaveBeenCalledTimes(1))
     expect(mock(old.handle.agent.followup)).toHaveBeenCalledTimes(1)
+  })
+
+  it('records each Session\'s Feishu origin once and serves it with live names and avatars', async () => {
+    const h = await setup({}, {
+      chatProfile: async () => ({ name: '研发群', avatarUrl: 'https://cdn.example/chat.png' }),
+      userProfiles: async ids => new Map(ids.filter(id => id === 'u_owner').map(id => [id, { name: '张三', avatarUrl: 'https://cdn.example/u.png' }])),
+    })
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_origin', senderId: 'u_owner', messageId: 'om_origin_start', content: '开始',
+    }))
+    await waitForEstablishedSession(h)
+    const old = h.ctxState.agents.created[0]!
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_origin', senderId: 'u_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_origin_renew', content: '/renew',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
+    const renewed = h.ctxState.agents.created[1]!
+    await waitForRenewedRoute(h, 'omt_1', renewed.options.sessionId)
+
+    const origins = h.ctxState.domain.raw.table('session_origins')
+    expect(origins.get(old.options.sessionId)).toMatchObject({
+      routeKey: 'omt_1', kind: 'thread', chatId: 'oc_origin', chatType: 'group', senderUserId: 'u_owner',
+    })
+    expect(await h.service.sessionOrigin(renewed.options.sessionId)).toMatchObject({
+      sessionId: renewed.options.sessionId,
+      chatType: 'group',
+      kind: 'thread',
+      chatName: '研发群',
+      chatAvatarUrl: 'https://cdn.example/chat.png',
+      senderUserId: 'u_owner',
+      senderName: '张三',
+      senderAvatarUrl: 'https://cdn.example/u.png',
+      shared: false,
+      bound: true,
+      chatLink: 'https://applink.feishu.cn/client/chat/open?openChatId=oc_origin',
+    })
+    const previous = await h.service.sessionOrigin(old.options.sessionId)
+    expect(previous).toMatchObject({ bound: false, chatName: '研发群', senderName: '张三' })
+    expect(previous).not.toHaveProperty('lastActivityAt')
+    // Profiles are cached briefly: one lookup serves both Sessions of the same chat and user.
+    expect(mock(h.channel.chatProfile)).toHaveBeenCalledTimes(1)
+    expect(mock(h.channel.userProfiles)).toHaveBeenCalledTimes(1)
+    expect(await h.service.sessionOrigin('not-a-feishu-session')).toBeNull()
+  })
+
+  it('serves a private-chat origin without a chat name and with the user id when no name resolves', async () => {
+    const h = await setup({}, {
+      userProfiles: async () => new Map(),
+      chatProfile: async () => ({ name: '不该查询' }),
+      memberName: async () => '不该查询',
+    })
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_dm', senderId: 'u_dm', messageId: 'om_dm_start', content: '开始',
+    }))
+    await waitForEstablishedSession(h)
+    const sessionId = h.ctxState.agents.created[0]!.options.sessionId
+    const origin = await h.service.sessionOrigin(sessionId)
+    expect(origin).toMatchObject({ chatType: 'p2p', senderUserId: 'u_dm', bound: true })
+    expect(origin).not.toHaveProperty('chatName')
+    expect(origin).not.toHaveProperty('senderName')
+    expect(mock(h.channel.userProfiles)).toHaveBeenCalledWith(['u_dm'])
+    expect(mock(h.channel.chatProfile)).not.toHaveBeenCalled()
+    expect(mock(h.channel.memberName)).not.toHaveBeenCalled()
+  })
+
+  it('names a group sender from the chat member list when the contact profile is unavailable', async () => {
+    const h = await setup({}, {
+      userProfiles: async () => { throw new FeishuApiError('code=99991672 Access denied', 99991672) },
+      chatProfile: async () => ({ name: '研发群' }),
+      memberName: async (userId, chatId) => (userId === 'u_owner' && chatId === 'oc_member' ? '张三' : undefined),
+    })
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_member', senderId: 'u_owner', messageId: 'om_member_start', content: '开始',
+    }))
+    await waitForEstablishedSession(h)
+    const origin = await h.service.sessionOrigin(h.ctxState.agents.created[0]!.options.sessionId)
+    expect(origin).toMatchObject({ chatName: '研发群', senderName: '张三' })
+    expect(origin).not.toHaveProperty('senderAvatarUrl')
+  })
+
+  it('serves panel profiles through a short cache, skipping invalid ids and reporting lookup failures', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    try {
+      const h = await setup({}, {
+        userProfiles: async ids => new Map(ids.filter(id => id !== 'u_unknown').map(id => [id, { name: `名-${id}` }])),
+        chatProfile: async (chatId) => {
+          if (chatId === 'oc_gone') throw new FeishuApiError('code=232011 not found', 232011)
+          return { name: '研发群', avatarUrl: 'https://cdn.example/chat.png' }
+        },
+      })
+      const first = await h.service.feishuProfiles(['u_a', 'u_unknown', 'ou_open', 'u_a'], ['oc_dev', 'oc_gone', 'bad id'])
+      expect(first).toEqual({
+        users: { u_a: { name: '名-u_a' } },
+        chats: { oc_dev: { name: '研发群', avatarUrl: 'https://cdn.example/chat.png' } },
+        warning: '读取群信息失败：code=232011 not found',
+      })
+      expect(mock(h.channel.userProfiles)).toHaveBeenCalledWith(['u_a', 'u_unknown'])
+      await h.service.feishuProfiles(['u_a', 'u_unknown'], ['oc_dev'])
+      expect(mock(h.channel.userProfiles)).toHaveBeenCalledTimes(1)
+      expect(mock(h.channel.chatProfile)).toHaveBeenCalledTimes(2)
+      // A failed chat is not cached; it is asked again on the next entry.
+      await h.service.feishuProfiles([], ['oc_gone'])
+      expect(mock(h.channel.chatProfile)).toHaveBeenCalledTimes(3)
+      vi.setSystemTime(Date.now() + 30_000)
+      await h.service.feishuProfiles(['u_a'], [])
+      expect(mock(h.channel.userProfiles)).toHaveBeenCalledTimes(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('backfills origins for routes written before origins existed', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_backfill', senderId: 'u_owner', messageId: 'om_backfill', content: '开始',
+    }))
+    await waitForEstablishedSession(h)
+    const sessionId = h.ctxState.agents.created[0]!.options.sessionId
+    await h.service.shutdown()
+    await h.ctxState.domain.raw.table('session_origins').delete(sessionId)
+
+    const service2 = new FeishuService(h.ctxState.ctx, h.config, () => makeChannel())
+    await service2.start()
+    await waitUntil(() => expect(h.ctxState.domain.raw.table('session_origins').get(sessionId)).toMatchObject({
+      chatId: 'oc_backfill', senderUserId: 'u_owner',
+    }))
+    expect(await service2.sessionOrigin(sessionId)).toMatchObject({ chatType: 'group', bound: true })
+    await service2.shutdown()
   })
 
   it.each(['running', 'next-turn', 'next-step'] as const)(
@@ -902,7 +1076,7 @@ describe('FeishuService', () => {
     async busyKind => {
       const h = await setup()
       await h.onMessage(makeMessage({
-        chatType: 'group', chatId: 'oc_renew_busy', senderId: 'ou_owner', content: '开始',
+        chatType: 'group', chatId: 'oc_renew_busy', senderId: 'u_owner', content: '开始',
       }))
       await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
       const agent = h.ctxState.agents.created[0]!.handle.agent
@@ -911,7 +1085,7 @@ describe('FeishuService', () => {
       if (busyKind === 'next-step') (agent.inbox.nextStep as unknown[]).push({ queued: true })
 
       await h.onMessage(makeMessage({
-        chatType: 'group', chatId: 'oc_renew_busy', senderId: 'ou_owner', threadId: 'omt_1',
+        chatType: 'group', chatId: 'oc_renew_busy', senderId: 'u_owner', threadId: 'omt_1',
         mentionedBot: false, content: '/renew',
       }))
       await waitUntil(() => expect(sessionEvents(agent.session).at(-1)).toMatchObject({
@@ -931,14 +1105,14 @@ describe('FeishuService', () => {
     const agentsOptions: FakeAgentsOptions = {}
     const h = await setup({}, {}, undefined, agentsOptions)
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_renew_create_fail', senderId: 'ou_owner', content: '开始',
+      chatType: 'group', chatId: 'oc_renew_create_fail', senderId: 'u_owner', content: '开始',
     }))
     await waitForEstablishedSession(h)
     const old = h.ctxState.agents.created[0]!
     agentsOptions.failCreate = new Error('simulated renewed create failure')
 
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_renew_create_fail', senderId: 'ou_owner', threadId: 'omt_1',
+      chatType: 'group', chatId: 'oc_renew_create_fail', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, content: '/renew',
     }))
     await waitUntil(() => expect(sessionEvents(old.handle.agent.session).at(-1)).toMatchObject({
@@ -958,14 +1132,14 @@ describe('FeishuService', () => {
   it('rolls back workspace attachment and the new handle when route commit fails', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_renew_route_fail', senderId: 'ou_owner', content: '开始',
+      chatType: 'group', chatId: 'oc_renew_route_fail', senderId: 'u_owner', content: '开始',
     }))
     await waitForEstablishedSession(h)
     const old = h.ctxState.agents.created[0]!
     mock(h.ctxState.domain.raw.table('routes').put).mockRejectedValueOnce(new Error('route write failed'))
 
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_renew_route_fail', senderId: 'ou_owner', threadId: 'omt_1',
+      chatType: 'group', chatId: 'oc_renew_route_fail', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, content: '/renew',
     }))
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
@@ -979,7 +1153,7 @@ describe('FeishuService', () => {
     expect(mock(old.handle.dispose)).not.toHaveBeenCalled()
 
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_renew_route_fail', senderId: 'ou_owner', threadId: 'omt_1',
+      chatType: 'group', chatId: 'oc_renew_route_fail', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, content: '仍进入旧会话',
     }))
     await waitUntil(() => expect(mock(old.handle.agent.followup)).toHaveBeenCalledTimes(2))
@@ -988,14 +1162,14 @@ describe('FeishuService', () => {
   it('keeps the renewed route usable when both result-card deliveries fail', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_renew_card_fail', senderId: 'ou_owner', content: '开始',
+      chatType: 'group', chatId: 'oc_renew_card_fail', senderId: 'u_owner', content: '开始',
     }))
     await waitForEstablishedSession(h)
     const old = h.ctxState.agents.created[0]!
     h.channel.send = vi.fn(async () => { throw new Error('result delivery failed') })
 
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_renew_card_fail', senderId: 'ou_owner', threadId: 'omt_1',
+      chatType: 'group', chatId: 'oc_renew_card_fail', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, content: '/renew',
     }))
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
@@ -1010,12 +1184,12 @@ describe('FeishuService', () => {
   it('resumes the renewed Session with complete history after a restart', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_renew_restart', senderId: 'ou_owner', content: '开始',
+      chatType: 'group', chatId: 'oc_renew_restart', senderId: 'u_owner', content: '开始',
     }))
     await waitForEstablishedSession(h)
     const oldSessionId = h.ctxState.agents.created[0]!.options.sessionId
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_renew_restart', senderId: 'ou_owner', threadId: 'omt_1',
+      chatType: 'group', chatId: 'oc_renew_restart', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, content: '/renew',
     }))
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
@@ -1028,7 +1202,7 @@ describe('FeishuService', () => {
     const handlers = (channel.onMessage as unknown as ReturnType<typeof vi.fn>).mock.calls
     const onMessage = handlers.at(-1)?.[0] as (msg: NormalizedMessage) => Promise<void> | undefined
     await onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_renew_restart', senderId: 'ou_owner', threadId: 'omt_1',
+      chatType: 'group', chatId: 'oc_renew_restart', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, content: '重启后继续',
     }))
     await waitUntil(() => expect(h.ctxState.agents.resumed).toHaveLength(1))
@@ -1042,20 +1216,20 @@ describe('FeishuService', () => {
   it('renders newest-first /history consistently across restart without resuming historical Agents', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_history', senderId: 'ou_owner',
+      chatType: 'group', chatId: 'oc_history', senderId: 'u_owner',
       messageId: 'om_history_start', content: '开始',
     }))
     await waitForEstablishedSession(h)
     const firstSessionId = h.ctxState.agents.created[0]!.options.sessionId
 
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_history', senderId: 'ou_owner', threadId: 'omt_1',
+      chatType: 'group', chatId: 'oc_history', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_history_renew_1', content: '/renew',
     }))
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
     const secondSessionId = h.ctxState.agents.created[1]!.options.sessionId
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_history', senderId: 'ou_owner', threadId: 'omt_1',
+      chatType: 'group', chatId: 'oc_history', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_history_renew_2', content: '/renew',
     }))
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(3))
@@ -1063,7 +1237,7 @@ describe('FeishuService', () => {
     const currentSessionId = current.options.sessionId
 
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_history', senderId: 'ou_owner', threadId: 'omt_1',
+      chatType: 'group', chatId: 'oc_history', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_history_before_restart', content: '/history',
     }))
     await waitUntil(() => expect(sessionEvents(current.handle.agent.session).at(-1)).toMatchObject({
@@ -1086,7 +1260,7 @@ describe('FeishuService', () => {
     const handlers = (channel.onMessage as unknown as ReturnType<typeof vi.fn>).mock.calls
     const onMessage = handlers.at(-1)?.[0] as (msg: NormalizedMessage) => Promise<void> | undefined
     await onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_history', senderId: 'ou_owner', threadId: 'omt_1',
+      chatType: 'group', chatId: 'oc_history', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_history_after_restart', content: '/history',
     }))
     await waitUntil(() => expect(channel.sent).toHaveLength(1))
@@ -1103,7 +1277,7 @@ describe('FeishuService', () => {
   it('exports one post-command logical snapshot to the owner topic and deduplicates redelivery', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_export', senderId: 'ou_owner',
+      chatType: 'group', chatId: 'oc_export', senderId: 'u_owner',
       messageId: 'om_export_start', content: '开始',
     }))
     await waitForEstablishedSession(h)
@@ -1114,7 +1288,7 @@ describe('FeishuService', () => {
     await resetFollowupAfterEstablishment(agent)
 
     const command = makeMessage({
-      chatType: 'group', chatId: 'oc_export', senderId: 'ou_owner', threadId: 'omt_1',
+      chatType: 'group', chatId: 'oc_export', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_export_command', content: '/export',
     })
     await h.onMessage(command)
@@ -1151,13 +1325,13 @@ describe('FeishuService', () => {
   it('rejects /export arguments without sending a file', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_export_args', senderId: 'ou_owner', content: '开始',
+      chatType: 'group', chatId: 'oc_export_args', senderId: 'u_owner', content: '开始',
     }))
     await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
 
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_export_args', senderId: 'ou_owner', threadId: 'omt_1',
+      chatType: 'group', chatId: 'oc_export_args', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_export_args', content: '/export extra',
     }))
     await waitUntil(() => expect(sessionEvents(agent.session).at(-1)).toMatchObject({
@@ -1172,14 +1346,14 @@ describe('FeishuService', () => {
   it('denies a non-owner /export before Session I/O and does not leak a file or Session id', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_export_owned', senderId: 'ou_owner', content: '开始',
+      chatType: 'group', chatId: 'oc_export_owned', senderId: 'u_owner', content: '开始',
     }))
     await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
     mock(h.ctxState.ctx.commands.execute).mockClear()
 
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_export_owned', senderId: 'ou_intruder', threadId: 'omt_1',
+      chatType: 'group', chatId: 'oc_export_owned', senderId: 'u_intruder', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_export_intruder', content: '/export',
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
@@ -1198,13 +1372,13 @@ describe('FeishuService', () => {
     })
     const h = await setup({}, {}, undefined, {}, buildFailure)
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_export_gzip_fail', senderId: 'ou_owner', content: '开始',
+      chatType: 'group', chatId: 'oc_export_gzip_fail', senderId: 'u_owner', content: '开始',
     }))
     await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
 
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_export_gzip_fail', senderId: 'ou_owner', threadId: 'omt_1',
+      chatType: 'group', chatId: 'oc_export_gzip_fail', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_export_gzip_fail', content: '/export',
     }))
     await waitUntil(() => expect(buildFailure).toHaveBeenCalledTimes(1))
@@ -1220,12 +1394,12 @@ describe('FeishuService', () => {
   it('attempts one file send and reports a Feishu upload failure separately', async () => {
     const h = await setup({}, { failFileSends: true })
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_export_upload_fail', senderId: 'ou_owner', content: '开始',
+      chatType: 'group', chatId: 'oc_export_upload_fail', senderId: 'u_owner', content: '开始',
     }))
     await waitForEstablishedSession(h)
 
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_export_upload_fail', senderId: 'ou_owner', threadId: 'omt_1',
+      chatType: 'group', chatId: 'oc_export_upload_fail', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_export_upload_fail', content: '/export',
     }))
     await waitUntil(() => expect(JSON.stringify(h.channel.sent)).toContain('导出失败，未交付文件'))
@@ -1247,7 +1421,7 @@ describe('FeishuService', () => {
   it('serializes a routed command ahead of a concurrent ordinary message', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_command_serial', senderId: 'ou_owner',
+      chatType: 'group', chatId: 'oc_command_serial', senderId: 'u_owner',
       messageId: 'om_command_serial_start', content: '开始',
     }))
     await waitForEstablishedSession(h)
@@ -1266,12 +1440,12 @@ describe('FeishuService', () => {
     })
 
     const command = h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_command_serial', senderId: 'ou_owner', threadId: 'omt_1',
+      chatType: 'group', chatId: 'oc_command_serial', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_command_serial_status', content: '/status',
     }))
     await commandStarted
     const ordinary = h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_command_serial', senderId: 'ou_owner', threadId: 'omt_1',
+      chatType: 'group', chatId: 'oc_command_serial', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_command_serial_turn', content: '排在命令之后',
     }))
     await flush()
@@ -1295,7 +1469,7 @@ describe('FeishuService', () => {
   it('deduplicates concurrent redelivery of /renew before any route side effect repeats', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_renew_redelivery', senderId: 'ou_owner',
+      chatType: 'group', chatId: 'oc_renew_redelivery', senderId: 'u_owner',
       messageId: 'om_renew_redelivery_start', content: '开始',
     }))
     await waitForEstablishedSession(h)
@@ -1303,7 +1477,7 @@ describe('FeishuService', () => {
     mock(h.ctxState.ctx.commands.execute).mockClear()
 
     const redelivery = makeMessage({
-      chatType: 'group', chatId: 'oc_renew_redelivery', senderId: 'ou_owner', threadId: 'omt_1',
+      chatType: 'group', chatId: 'oc_renew_redelivery', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_renew_redelivery_command', content: '/renew',
     })
     await Promise.all([h.onMessage(redelivery), h.onMessage(redelivery)])
@@ -1323,7 +1497,7 @@ describe('FeishuService', () => {
   it('aborts an in-flight command during shutdown without sending a late result card', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_command_shutdown', senderId: 'ou_owner',
+      chatType: 'group', chatId: 'oc_command_shutdown', senderId: 'u_owner',
       messageId: 'om_command_shutdown_start', content: '开始',
     }))
     await waitForEstablishedSession(h)
@@ -1339,7 +1513,7 @@ describe('FeishuService', () => {
     })
 
     const command = h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_command_shutdown', senderId: 'ou_owner', threadId: 'omt_1',
+      chatType: 'group', chatId: 'oc_command_shutdown', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_command_shutdown_status', content: '/status',
     }))
     await commandStarted
@@ -1358,7 +1532,7 @@ describe('FeishuService', () => {
   it('keeps standalone command cards out of TurnStreamer and restart repair state', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_command_isolation', senderId: 'ou_owner',
+      chatType: 'group', chatId: 'oc_command_isolation', senderId: 'u_owner',
       messageId: 'om_command_isolation_start', content: '开始',
     }))
     await waitForEstablishedSession(h)
@@ -1369,7 +1543,7 @@ describe('FeishuService', () => {
     const streamedPatchCount = h.channel.updated.length
 
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_command_isolation', senderId: 'ou_owner', threadId: 'omt_1',
+      chatType: 'group', chatId: 'oc_command_isolation', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_command_isolation_status', content: '/status',
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
@@ -1390,7 +1564,7 @@ describe('FeishuService', () => {
   it('renews through a borrowed external Agent without disposing its owner handle', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_renew_borrowed', senderId: 'ou_owner', content: '开始',
+      chatType: 'group', chatId: 'oc_renew_borrowed', senderId: 'u_owner', content: '开始',
     }))
     await waitForEstablishedSession(h)
     const route = h.ctxState.domain.raw.table('routes').get('omt_1') as RouteRecord
@@ -1408,7 +1582,7 @@ describe('FeishuService', () => {
     const handlers = (channel.onMessage as unknown as ReturnType<typeof vi.fn>).mock.calls
     const onMessage = handlers.at(-1)?.[0] as (msg: NormalizedMessage) => Promise<void> | undefined
     await onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_renew_borrowed', senderId: 'ou_owner', threadId: 'omt_1',
+      chatType: 'group', chatId: 'oc_renew_borrowed', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, content: '/renew',
     }))
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
@@ -1465,7 +1639,7 @@ describe('FeishuService', () => {
 
   it('creates a topic + session for a p2p message: Typing reaction, workspace dir, route persisted', async () => {
     const h = await setup({ reasoningEffort: 'tiny' }, {}, { reasoningEffort: 'high' })
-    const msg = makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', mentionedBot: false, content: '你好呀' })
+    const msg = makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'u_alice', mentionedBot: false, content: '你好呀' })
     await h.onMessage(msg)
     await waitForEstablishedSession(h)
 
@@ -1480,7 +1654,7 @@ describe('FeishuService', () => {
     // grouped under the project) …
     expect(h.ctxState.agents.created).toHaveLength(1)
     const created = h.ctxState.agents.created[0]!
-    const workspacePath = path.join(h.config.baseDir, 'p2p', 'ou_alice')
+    const workspacePath = path.join(h.config.baseDir, 'p2p', 'u_alice')
     const sessionDir = path.join(workspacePath, 'topics', 'omt_1')
     expect(created.options.meta?.cwd).toBe(workspacePath)
     expect(created.options.agentOptions).toEqual({
@@ -1516,7 +1690,7 @@ describe('FeishuService', () => {
 
   it('composes created sessions from the roster default preset (mount in setup + header meta)', async () => {
     const h = await setup({}, {}, {})
-    await h.onMessage(makeMessage({ chatType: 'p2p', senderId: 'ou_alice', mentionedBot: false, content: 'hi' }))
+    await h.onMessage(makeMessage({ chatType: 'p2p', senderId: 'u_alice', mentionedBot: false, content: 'hi' }))
     await waitForEstablishedSession(h)
 
     const created = h.ctxState.agents.created[0]!
@@ -1532,7 +1706,7 @@ describe('FeishuService', () => {
 
   it('mounts the configured agentPreset id instead of the roster default', async () => {
     const h = await setup({ agentPreset: 'channels' }, {}, { defaultId: 'standard' })
-    await h.onMessage(makeMessage({ chatType: 'p2p', senderId: 'ou_alice', mentionedBot: false, content: 'hi' }))
+    await h.onMessage(makeMessage({ chatType: 'p2p', senderId: 'u_alice', mentionedBot: false, content: 'hi' }))
     await waitForEstablishedSession(h)
 
     const created = h.ctxState.agents.created[0]!
@@ -1544,7 +1718,7 @@ describe('FeishuService', () => {
 
   it('leaves preset composition bare but still mounts channel commands without a roster', async () => {
     const h = await setup()
-    await h.onMessage(makeMessage({ chatType: 'p2p', senderId: 'ou_alice', mentionedBot: false, content: 'hi' }))
+    await h.onMessage(makeMessage({ chatType: 'p2p', senderId: 'u_alice', mentionedBot: false, content: 'hi' }))
     await waitForEstablishedSession(h)
 
     const created = h.ctxState.agents.created[0]!
@@ -1565,7 +1739,7 @@ describe('FeishuService', () => {
 
   it('routes a thread continuation to the SAME session without a mention', async () => {
     const h = await setup()
-    const first = makeMessage({ chatType: 'group', chatId: 'oc_grp', senderId: 'ou_alice', content: '开始' })
+    const first = makeMessage({ chatType: 'group', chatId: 'oc_grp', senderId: 'u_alice', content: '开始' })
     await h.onMessage(first)
     // Deterministic barrier: the route must be durable before the thread
     // message arrives — otherwise the message lands in the (legitimate)
@@ -1578,7 +1752,7 @@ describe('FeishuService', () => {
     const second = makeMessage({
       chatType: 'group',
       chatId: 'oc_grp',
-      senderId: 'ou_alice',
+      senderId: 'u_alice',
       mentionedBot: false,
       threadId: 'omt_1',
       messageId: 'om_second',
@@ -1618,25 +1792,29 @@ describe('FeishuService', () => {
 
   it('gives every group user their own workspace in the same chat', async () => {
     const h = await setup()
-    await h.onMessage(makeMessage({ chatType: 'group', chatId: 'oc_grp', senderId: 'ou_alice', content: 'a' }))
-    await h.onMessage(makeMessage({ chatType: 'group', chatId: 'oc_grp', senderId: 'ou_bob', threadId: 'omt_2', content: 'b' }))
+    await h.onMessage(makeMessage({ chatType: 'group', chatId: 'oc_grp', senderId: 'u_alice', content: 'a' }))
+    await h.onMessage(makeMessage({ chatType: 'group', chatId: 'oc_grp', senderId: 'u_bob', threadId: 'omt_2', content: 'b' }))
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
     const cwds = h.ctxState.agents.created.map(entry => entry.options.meta?.cwd as string)
     expect(cwds).toHaveLength(2)
-    const aliceWorkspace = path.join(h.config.baseDir, 'groups', 'oc_grp', 'ou_alice')
-    const bobWorkspace = path.join(h.config.baseDir, 'groups', 'oc_grp', 'ou_bob')
+    const aliceWorkspace = path.join(h.config.baseDir, 'groups', 'oc_grp', 'u_alice')
+    const bobWorkspace = path.join(h.config.baseDir, 'groups', 'oc_grp', 'u_bob')
     expect(new Set(cwds)).toEqual(new Set([aliceWorkspace, bobWorkspace]))
     // Each user's Session works in its own topic directory below its workspace.
-    const dirs = h.ctxState.workingDirectory.sets.map(entry => entry.path)
-    expect(dirs).toContainEqual(path.join(aliceWorkspace, 'topics', 'omt_1'))
-    expect(dirs).toContainEqual(path.join(bobWorkspace, 'topics', 'omt_2'))
+    // The topic directory is entered after the Agent exists, so wait for both.
+    await waitUntil(() => {
+      const dirs = h.ctxState.workingDirectory.sets.map(entry => entry.path)
+      expect(dirs).toContainEqual(path.join(aliceWorkspace, 'topics', 'omt_1'))
+      expect(dirs).toContainEqual(path.join(bobWorkspace, 'topics', 'omt_2'))
+    })
     expect(aliceWorkspace).not.toBe(bobWorkspace)
   })
 
-  it('ignores messages from the bot itself and empty content', async () => {
+  // Bot/app senders carry no user_id and are dropped by the channel adapter
+  // (tests/feishu-channel.test.ts) before they reach the service.
+  it('ignores empty content', async () => {
     const h = await setup()
-    await h.onMessage(makeMessage({ chatType: 'p2p', senderId: 'bot-open-id', content: 'self echo' }))
-    await h.onMessage(makeMessage({ chatType: 'p2p', senderId: 'ou_alice', content: '   ' }))
+    await h.onMessage(makeMessage({ chatType: 'p2p', senderId: 'u_alice', content: '   ' }))
     await flush()
     expect(h.ctxState.agents.created).toHaveLength(0)
   })
@@ -1653,7 +1831,7 @@ describe('FeishuService', () => {
     // before the follow-up message (same race as the thread test above).
     await waitUntil(() => {
       const entries = [...(h.ctxState.domain.raw.table('routes').entries() as IterableIterator<[string, unknown]>)]
-      expect(entries[0]?.[0]).toBe('chat:group:oc_test_chat:ou_test_user')
+      expect(entries[0]?.[0]).toBe('chat:group:oc_test_chat:u_test_user')
     })
 
     // A later mention in the same chat continues the same session.
@@ -1664,7 +1842,7 @@ describe('FeishuService', () => {
 
   it('resumes the persisted session when the live agent is gone', async () => {
     const h = await setup()
-    await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: 'hello' }))
+    await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'u_alice', content: 'hello' }))
     // Establishment only completes once the first prompt reaches the agent;
     // by then the route record is durable, which the restart below relies on.
     await waitForEstablishedSession(h)
@@ -1677,7 +1855,7 @@ describe('FeishuService', () => {
     await service2.start()
     const registered = (channel2.onMessage as unknown as ReturnType<typeof vi.fn>).mock.calls
     const handler = registered[registered.length - 1]?.[0] as (msg: NormalizedMessage) => Promise<void> | undefined
-    await handler(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: '还在吗', threadId: 'omt_1' }))
+    await handler(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'u_alice', content: '还在吗', threadId: 'omt_1' }))
     await waitUntil(() => expect(h.ctxState.agents.resumed).toHaveLength(1))
     expect(h.ctxState.agents.resumed[0]!.options.resumeSessionId).toBe(sessionId)
     await waitUntil(() => expect(mock(h.ctxState.agents.resumed[0]!.handle.agent.followup)).toHaveBeenCalledTimes(1))
@@ -1686,7 +1864,7 @@ describe('FeishuService', () => {
 
   it('composes resumed sessions from the same preset resolution as creation', async () => {
     const h = await setup({}, {}, {})
-    await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: 'hello' }))
+    await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'u_alice', content: 'hello' }))
     await waitForEstablishedSession(h)
 
     // Simulate a restart: drop live agents, keep the route table.
@@ -1696,7 +1874,7 @@ describe('FeishuService', () => {
     await service2.start()
     const registered = (channel2.onMessage as unknown as ReturnType<typeof vi.fn>).mock.calls
     const handler = registered[registered.length - 1]?.[0] as (msg: NormalizedMessage) => Promise<void> | undefined
-    await handler(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: '还在吗', threadId: 'omt_1' }))
+    await handler(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'u_alice', content: '还在吗', threadId: 'omt_1' }))
     await waitUntil(() => expect(h.ctxState.agents.resumed).toHaveLength(1))
 
     const resumed = h.ctxState.agents.resumed[0]!
@@ -1711,7 +1889,7 @@ describe('FeishuService', () => {
 
   it('borrows a live agent, prepends the configured effort, and releases only that policy', async () => {
     const h = await setup({ reasoningEffort: 'tiny' })
-    await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: 'hello' }))
+    await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'u_alice', content: 'hello' }))
     await waitForEstablishedSession(h)
     const sessionId = h.ctxState.agents.created[0]!.options.sessionId
     await h.service.shutdown()
@@ -1731,7 +1909,7 @@ describe('FeishuService', () => {
     await service2.start()
     const registered = (channel2.onMessage as unknown as ReturnType<typeof vi.fn>).mock.calls
     const handler = registered[registered.length - 1]?.[0] as (msg: NormalizedMessage) => Promise<void> | undefined
-    await handler(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: '还在吗', threadId: 'omt_1' }))
+    await handler(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'u_alice', content: '还在吗', threadId: 'omt_1' }))
 
     // No cold resume: the borrowed agent received the followup directly.
     await waitUntil(() => expect(mock(foreignAgent.followup)).toHaveBeenCalledTimes(1))
@@ -1766,7 +1944,7 @@ describe('FeishuService', () => {
         h.ctxState.agents.liveAgents.set(sessionId, winner)
       },
     })
-    await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: 'hello' }))
+    await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'u_alice', content: 'hello' }))
     await waitForEstablishedSession(h)
     sessionId = h.ctxState.agents.created[0]!.options.sessionId
     await h.service.shutdown()
@@ -1776,7 +1954,7 @@ describe('FeishuService', () => {
     await service2.start()
     const registered = (channel2.onMessage as unknown as ReturnType<typeof vi.fn>).mock.calls
     const handler = registered[registered.length - 1]?.[0] as (msg: NormalizedMessage) => Promise<void> | undefined
-    await handler(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: '还在吗', threadId: 'omt_1' }))
+    await handler(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'u_alice', content: '还在吗', threadId: 'omt_1' }))
 
     await waitUntil(() => expect(winner).toBeDefined())
     await waitUntil(() => expect(mock(winner!.agent.followup)).toHaveBeenCalledTimes(1))
@@ -1789,7 +1967,7 @@ describe('FeishuService', () => {
 
   it('disposes an agent resumed during shutdown instead of leaking it live', async () => {
     const h = await setup()
-    await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: 'hello' }))
+    await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'u_alice', content: 'hello' }))
     await waitForEstablishedSession(h)
     const sessionId = h.ctxState.agents.created[0]!.options.sessionId
     await h.service.shutdown()
@@ -1806,7 +1984,7 @@ describe('FeishuService', () => {
 
     const registered = (channel2.onMessage as unknown as ReturnType<typeof vi.fn>).mock.calls
     const handler = registered[registered.length - 1]?.[0] as (msg: NormalizedMessage) => Promise<void> | undefined
-    void handler(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: '还在吗', threadId: 'omt_1' }))
+    void handler(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'u_alice', content: '还在吗', threadId: 'omt_1' }))
     await waitUntil(() => expect(resumeCalled).toHaveBeenCalled())
     await service2.shutdown()
 
@@ -1833,7 +2011,7 @@ describe('FeishuService', () => {
   it('routes a failed follow-up to a failure card and No without reusing the prior effort', async () => {
     const h = await setup()
     const first = makeMessage({
-      chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice',
+      chatType: 'p2p', chatId: 'oc_p2p', senderId: 'u_alice',
       messageId: 'om_first_trigger', content: '第一轮',
     })
     await h.onMessage(first)
@@ -1862,7 +2040,7 @@ describe('FeishuService', () => {
     }))
 
     const second = makeMessage({
-      chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice',
+      chatType: 'p2p', chatId: 'oc_p2p', senderId: 'u_alice',
       threadId: 'omt_1', messageId: 'om_failed_trigger', content: '第二轮',
     })
     await h.onMessage(second)
@@ -1900,7 +2078,7 @@ describe('FeishuService', () => {
 
   it('sends oversized body segments as continuation cards inside the topic', async () => {
     const h = await setup()
-    await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: '长文' }))
+    await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'u_alice', content: '长文' }))
     await waitForEstablishedSession(h)
 
     const agent = h.ctxState.agents.created[0]!.handle.agent
@@ -1920,7 +2098,7 @@ describe('FeishuService', () => {
 
   it('falls back to plain text for a rejected segment while the initial card succeeded', async () => {
     const h = await setup()
-    await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: '长文' }))
+    await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'u_alice', content: '长文' }))
     await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
 
@@ -1953,7 +2131,7 @@ describe('FeishuService', () => {
 
   it('persists an in-flight snapshot on session start and retires it on turn end', async () => {
     const h = await setup()
-    const msg = makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', mentionedBot: false, content: 'hi' })
+    const msg = makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'u_alice', mentionedBot: false, content: 'hi' })
     await h.onMessage(msg)
     await waitForEstablishedSession(h)
 
@@ -1980,13 +2158,13 @@ describe('FeishuService', () => {
 
   it('writes a fresh snapshot per turn (concurrent turns never overwrite each other)', async () => {
     const h = await setup()
-    const first = makeMessage({ chatType: 'group', chatId: 'oc_grp', senderId: 'ou_alice', content: '一' })
+    const first = makeMessage({ chatType: 'group', chatId: 'oc_grp', senderId: 'u_alice', content: '一' })
     await h.onMessage(first)
     await waitForEstablishedSession(h)
 
     // Second message while the first turn is still "streaming" (never ended).
     const second = makeMessage({
-      chatType: 'group', chatId: 'oc_grp', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'group', chatId: 'oc_grp', senderId: 'u_alice', mentionedBot: false,
       threadId: 'omt_1', messageId: 'om_second_msg', content: '二',
     })
     await h.onMessage(second)
@@ -2002,7 +2180,7 @@ describe('FeishuService', () => {
 
   it('folds resolved segment card ids into the snapshot', async () => {
     const h = await setup()
-    await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: '长文' }))
+    await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'u_alice', content: '长文' }))
     await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
     h.ctxState.assistantStreamListeners[0]!({ agent, frame: { type: 'chunk', attemptId: 'attempt-1', revision: 1, index: 0, time: 1, chunk: { type: 'text-delta', index: 0, text: 'x'.repeat(30_000) } } })
@@ -2029,7 +2207,7 @@ describe('FeishuService', () => {
 
   it('repairs an interrupted turn after restart: terminal card, Typing→DONE, snapshot retired', async () => {
     const h = await setup()
-    const msg = makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: 'hi' })
+    const msg = makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'u_alice', content: 'hi' })
     await h.onMessage(msg)
     await waitForEstablishedSession(h)
 
@@ -2057,7 +2235,7 @@ describe('FeishuService', () => {
 
   it('retries a failed repair once, then retires the snapshot', async () => {
     const h = await setup()
-    await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: 'hi' }))
+    await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'u_alice', content: 'hi' }))
     await waitForEstablishedSession(h)
     await h.service.shutdown()
 
@@ -2084,7 +2262,7 @@ describe('FeishuService', () => {
 
   it('skips text-mode segment cards during repair (content already delivered)', async () => {
     const h = await setup()
-    await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: '长文' }))
+    await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'u_alice', content: '长文' }))
     await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
 
@@ -2134,13 +2312,13 @@ describe('FeishuService', () => {
       return originalSend(chatId, input, options)
     }
 
-    const first = makeMessage({ chatType: 'group', chatId: 'oc_grp', senderId: 'ou_alice', content: '开始' })
+    const first = makeMessage({ chatType: 'group', chatId: 'oc_grp', senderId: 'u_alice', content: '开始' })
     await h.onMessage(first)
     await waitUntil(() => expect(gated).toBe(true))
 
     // Second message already inside the just-created topic, no mention.
     const second = makeMessage({
-      chatType: 'group', chatId: 'oc_grp', senderId: 'ou_alice',
+      chatType: 'group', chatId: 'oc_grp', senderId: 'u_alice',
       mentionedBot: false, threadId: 'omt_1', messageId: 'om_second', content: '继续',
     })
     await h.onMessage(second)
@@ -2163,9 +2341,9 @@ describe('FeishuService', () => {
 
   it('serializes degraded (topic-less) first messages into one chat-scoped session', async () => {
     const h = await setup({}, { failReplyInThread: true })
-    const first = makeMessage({ chatType: 'group', chatId: 'oc_grp', senderId: 'ou_alice', content: '一' })
+    const first = makeMessage({ chatType: 'group', chatId: 'oc_grp', senderId: 'u_alice', content: '一' })
     const second = makeMessage({
-      chatType: 'group', chatId: 'oc_grp', senderId: 'ou_alice', messageId: 'om_second', content: '二',
+      chatType: 'group', chatId: 'oc_grp', senderId: 'u_alice', messageId: 'om_second', content: '二',
     })
     await h.onMessage(first)
     await h.onMessage(second)
@@ -2193,10 +2371,10 @@ describe('FeishuService', () => {
       return originalCreate(options)
     }
 
-    const first = makeMessage({ chatType: 'group', chatId: 'oc_grp', senderId: 'ou_alice', content: '失败的首条' })
+    const first = makeMessage({ chatType: 'group', chatId: 'oc_grp', senderId: 'u_alice', content: '失败的首条' })
     await h.onMessage(first)
     const second = makeMessage({
-      chatType: 'group', chatId: 'oc_grp', senderId: 'ou_alice', messageId: 'om_second', content: '重试',
+      chatType: 'group', chatId: 'oc_grp', senderId: 'u_alice', messageId: 'om_second', content: '重试',
     })
     await h.onMessage(second)
 
@@ -2223,7 +2401,7 @@ describe('FeishuService', () => {
       return originalSend(chatId, input, options)
     }
 
-    const first = makeMessage({ chatType: 'group', chatId: 'oc_grp', senderId: 'ou_alice', content: '开始' })
+    const first = makeMessage({ chatType: 'group', chatId: 'oc_grp', senderId: 'u_alice', content: '开始' })
     await h.onMessage(first)
     await waitUntil(() => expect(gated).toBe(true))
 
@@ -2231,7 +2409,7 @@ describe('FeishuService', () => {
     // for the establishment, then start its own session — never hijack the
     // first one and never race the route write.
     const second = makeMessage({
-      chatType: 'group', chatId: 'oc_grp', senderId: 'ou_alice', messageId: 'om_second', content: '旁路',
+      chatType: 'group', chatId: 'oc_grp', senderId: 'u_alice', messageId: 'om_second', content: '旁路',
     })
     await h.onMessage(second)
 
@@ -2267,7 +2445,7 @@ describe('FeishuService', () => {
       sessionId: `session-${key}`,
       chatId: 'oc_test_chat',
       chatType: 'group',
-      senderOpenId: 'ou_test_user',
+      senderUserId: 'u_test_user',
       workspacePath: '/tmp/ws',
       cardMessageId: `om_${key}`,
       createdAt: lastActivityAt,
@@ -2355,7 +2533,7 @@ describe('FeishuService', () => {
 
     const registered = (restartedChannel.onMessage as unknown as ReturnType<typeof vi.fn>).mock.calls
     const handler = registered[registered.length - 1]?.[0] as (msg: NormalizedMessage) => Promise<void> | undefined
-    await handler(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: '重新开始', threadId: 'omt_gc' }))
+    await handler(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'u_alice', content: '重新开始', threadId: 'omt_gc' }))
 
     await waitUntil(() => expect(restartedChannel.sent).toHaveLength(1))
     expect(ctxState.agents.created).toHaveLength(0)
@@ -2380,7 +2558,7 @@ describe('FeishuService', () => {
     const handler = registered[registered.length - 1]?.[0] as (msg: NormalizedMessage) => Promise<void> | undefined
 
     await handler(makeMessage({
-      chatType: 'group', chatId: 'oc_test_chat', senderId: 'ou_test_user',
+      chatType: 'group', chatId: 'oc_test_chat', senderId: 'u_test_user',
       content: '继续', threadId: 'omt_admission_ttl', mentionedBot: false,
     }))
 
@@ -2398,7 +2576,7 @@ describe('FeishuService', () => {
       key: 'omt_expired_cmd',
       chatId: 'oc_test_chat',
       chatType: 'group',
-      senderOpenId: 'ou_test_user',
+      senderUserId: 'u_test_user',
       expiredAt: Date.now(),
     })
     const channel = makeChannel()
@@ -2408,7 +2586,7 @@ describe('FeishuService', () => {
     const handler = registered[registered.length - 1]?.[0] as (msg: NormalizedMessage) => Promise<void> | undefined
 
     await handler(makeMessage({
-      chatType: 'group', chatId: 'oc_test_chat', senderId: 'ou_test_user',
+      chatType: 'group', chatId: 'oc_test_chat', senderId: 'u_test_user',
       content: '/status', threadId: 'omt_expired_cmd', mentionedBot: false,
     }))
 
@@ -2418,7 +2596,7 @@ describe('FeishuService', () => {
     expect(JSON.stringify(channel.sent[0]!.input)).toContain('话题已过期')
 
     await handler(makeMessage({
-      chatType: 'group', chatId: 'oc_test_chat', senderId: 'ou_test_user',
+      chatType: 'group', chatId: 'oc_test_chat', senderId: 'u_test_user',
       content: '/health', threadId: 'omt_expired_cmd', mentionedBot: false,
       messageId: 'om_expired_health',
     }))
@@ -2428,7 +2606,7 @@ describe('FeishuService', () => {
     expect(ctxState.agents.resumed).toHaveLength(0)
 
     await handler(makeMessage({
-      chatType: 'group', chatId: 'oc_test_chat', senderId: 'ou_test_user',
+      chatType: 'group', chatId: 'oc_test_chat', senderId: 'u_test_user',
       content: '/help', threadId: 'omt_expired_cmd', mentionedBot: false,
       messageId: 'om_expired_help',
     }))
@@ -2441,12 +2619,12 @@ describe('FeishuService', () => {
 
   it('deletes an expired degraded chat route without creating a thread tombstone', async () => {
     const ctxState = makeHostContext()
-    await seedRoute(ctxState.domain.raw, 'chat:p2p:oc_p2p:ou_alice', Date.now() - 40 * DAY_MS, {
-      key: 'chat:p2p:oc_p2p:ou_alice',
+    await seedRoute(ctxState.domain.raw, 'chat:p2p:oc_p2p:u_alice', Date.now() - 40 * DAY_MS, {
+      key: 'chat:p2p:oc_p2p:u_alice',
       kind: 'chat',
       chatId: 'oc_p2p',
       chatType: 'p2p',
-      senderOpenId: 'ou_alice',
+      senderUserId: 'u_alice',
     })
     const channel = makeChannel()
     const service = new FeishuService(ctxState.ctx, makeConfig({ routeTtlMs: 30 * DAY_MS }), () => channel)
@@ -2466,7 +2644,7 @@ describe('FeishuService', () => {
 
   it('ignores a redelivered first message (single session, single card)', async () => {
     const h = await setup()
-    const msg = makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: '你好' })
+    const msg = makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'u_alice', content: '你好' })
     await h.onMessage(msg)
     await h.onMessage(msg) // WS redelivery of the same event
 
@@ -2481,7 +2659,7 @@ describe('FeishuService', () => {
 
   it('ignores a redelivered continuation message (no duplicate turn)', async () => {
     const h = await setup()
-    const first = makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: '开始' })
+    const first = makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'u_alice', content: '开始' })
     await h.onMessage(first)
     await waitForEstablishedSession(h)
     await waitUntil(() => {
@@ -2490,7 +2668,7 @@ describe('FeishuService', () => {
     })
 
     const cont = makeMessage({
-      chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice',
+      chatType: 'p2p', chatId: 'oc_p2p', senderId: 'u_alice',
       threadId: 'omt_1', messageId: 'om_cont', content: '继续',
     })
     await h.onMessage(cont)
@@ -2506,7 +2684,7 @@ describe('FeishuService', () => {
 
   it('deduplicates across restarts through the persisted record', async () => {
     const h = await setup()
-    const msg = makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'ou_alice', content: '跨重启' })
+    const msg = makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'u_alice', content: '跨重启' })
     await h.onMessage(msg)
     await waitForEstablishedSession(h)
     await waitUntil(() => expect(processedEntries(h)).toHaveLength(1))
@@ -2541,37 +2719,6 @@ describe('FeishuService', () => {
     })
     await service.shutdown()
   })
-
-  it('prunes expired pending attachment metadata in the periodic GC sweep', async () => {
-    const ctxState = makeHostContext()
-    const raw = ctxState.domain.raw
-    const now = Date.now()
-    const pendingRecord = (messageId: string, receivedAt: number) => ({
-      key: messageId,
-      scopeKey: 'chat:oc_gc:ou_user',
-      messageId,
-      chatId: 'oc_gc',
-      chatType: 'p2p',
-      senderOpenId: 'ou_user',
-      receivedAt,
-      kind: 'image',
-      resources: [{ type: 'image', fileKey: `img_${messageId}` }],
-    })
-    await raw.table('pending_attachments').put('om_pending_old', pendingRecord('om_pending_old', now - 8 * 24 * 3600 * 1000))
-    await raw.table('pending_attachments').put('om_pending_new', pendingRecord('om_pending_new', now))
-    const channel = makeChannel()
-    const service = new FeishuService(ctxState.ctx, makeConfig({
-      routeTtlMs: 0,
-      pendingAttachmentTtlMs: 7 * 24 * 3600 * 1000,
-    }), () => channel)
-    await service.start()
-
-    await waitUntil(() => {
-      const entries = [...(raw.table('pending_attachments').entries() as IterableIterator<[string, unknown]>)]
-      expect(entries.map(([key]) => key)).toEqual(['om_pending_new'])
-    })
-    await service.shutdown()
-  })
 })
 
 describe('HITL approval wiring', () => {
@@ -2586,7 +2733,7 @@ describe('HITL approval wiring', () => {
   it('answers a routed session\'s approval through a decision card, owner-gated', async () => {
     const h = await setup()
     const msg = makeMessage({
-      chatType: 'group', chatId: 'oc_approval', senderId: 'ou_owner', content: '审批一下',
+      chatType: 'group', chatId: 'oc_approval', senderId: 'u_owner', content: '审批一下',
     })
     await h.onMessage(msg)
     await waitForEstablishedSession(h)
@@ -2622,7 +2769,7 @@ describe('HITL approval wiring', () => {
     await h.channel.fireCardAction({
       messageId: approvalMessageId,
       chatId: 'oc_approval',
-      operator: { openId: 'ou_stranger' },
+      operator: { openId: 'ou_operator', userId: 'u_stranger' },
       action: { value: { decision: 'allow' }, tag: 'button' },
     })
     await flush()
@@ -2635,7 +2782,7 @@ describe('HITL approval wiring', () => {
     await h.channel.fireCardAction({
       messageId: approvalMessageId,
       chatId: 'oc_approval',
-      operator: { openId: 'ou_owner' },
+      operator: { openId: 'ou_operator', userId: 'u_owner' },
       action: { value: { decision: 'allow' }, tag: 'button' },
     })
     await expect(pending).resolves.toBe('allowed-once')
@@ -2660,7 +2807,7 @@ describe('HITL approval wiring', () => {
   it('withdraws in-flight approvals on shutdown', async () => {
     const h = await setup()
     const msg = makeMessage({
-      chatType: 'group', chatId: 'oc_shutdown', senderId: 'ou_owner', content: '先问后关',
+      chatType: 'group', chatId: 'oc_shutdown', senderId: 'u_owner', content: '先问后关',
     })
     await h.onMessage(msg)
     await waitForEstablishedSession(h)
@@ -2687,7 +2834,7 @@ describe('/stop, structured questions, and host projections', () => {
   it('answers a routed session\'s ask_user_question through a card, owner-gated', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_questions', senderId: 'ou_owner', content: '问一下',
+      chatType: 'group', chatId: 'oc_questions', senderId: 'u_owner', content: '问一下',
     }))
     await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
@@ -2721,7 +2868,7 @@ describe('/stop, structured questions, and host projections', () => {
     const value = (button!.behaviors as Array<{ value: unknown }>)[0]!.value
     await h.channel.fireCardAction({
       messageId, chatId: 'oc_questions',
-      operator: { openId: 'ou_stranger' },
+      operator: { openId: 'ou_operator', userId: 'u_stranger' },
       action: { value, tag: 'button' },
     })
     await flush()
@@ -2732,7 +2879,7 @@ describe('/stop, structured questions, and host projections', () => {
 
     await h.channel.fireCardAction({
       messageId, chatId: 'oc_questions',
-      operator: { openId: 'ou_owner' },
+      operator: { openId: 'ou_operator', userId: 'u_owner' },
       action: { value, tag: 'button' },
     })
     await expect(pending).resolves.toEqual({ answers: [{ id: 'q1', selected: ['面'] }] })
@@ -2758,7 +2905,7 @@ describe('/stop, structured questions, and host projections', () => {
   it('withdraws in-flight structured questions on shutdown', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_q_shutdown', senderId: 'ou_owner', content: '先问后关',
+      chatType: 'group', chatId: 'oc_q_shutdown', senderId: 'u_owner', content: '先问后关',
     }))
     await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
@@ -2775,7 +2922,7 @@ describe('/stop, structured questions, and host projections', () => {
   it('cancels the running turn on /stop without starting a model turn', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_stop', senderId: 'ou_owner', messageId: 'om_stop_start', content: '开始',
+      chatType: 'group', chatId: 'oc_stop', senderId: 'u_owner', messageId: 'om_stop_start', content: '开始',
     }))
     await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
@@ -2785,12 +2932,12 @@ describe('/stop, structured questions, and host projections', () => {
     await resetFollowupAfterEstablishment(agent)
 
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_stop', senderId: 'ou_owner', threadId: 'omt_1',
+      chatType: 'group', chatId: 'oc_stop', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_stop_command', content: '/stop',
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
 
-    expect(cancel).toHaveBeenCalledWith({ kind: 'user' })
+    expect(cancel).toHaveBeenCalledWith({ kind: 'user' }, { keepInbox: true })
     const json = JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)
     expect(json).toContain('已请求停止当前回合')
     expect(mock(agent.followup)).not.toHaveBeenCalled()
@@ -2802,7 +2949,7 @@ describe('/stop, structured questions, and host projections', () => {
   it('reports /stop as a no-op when no turn is running', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_stop_idle', senderId: 'ou_owner', content: '开始',
+      chatType: 'group', chatId: 'oc_stop_idle', senderId: 'u_owner', content: '开始',
     }))
     await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
@@ -2810,11 +2957,143 @@ describe('/stop, structured questions, and host projections', () => {
     ;(agent as unknown as { cancel: unknown }).cancel = cancel
 
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_stop_idle', senderId: 'ou_owner', threadId: 'omt_1',
+      chatType: 'group', chatId: 'oc_stop_idle', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_stop_idle_command', content: '/stop',
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
     expect(JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)).toContain('当前没有正在运行的回合')
+    await h.service.shutdown()
+  })
+
+  it('cancels the running turn from the streaming card stop button, owner only', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_stop_btn', senderId: 'u_owner', messageId: 'om_stop_btn_start', content: '开始',
+    }))
+    await waitForEstablishedSession(h)
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    const cancel = vi.fn()
+    ;(agent as unknown as { status: string }).status = 'running'
+    ;(agent as unknown as { cancel: unknown }).cancel = cancel
+    // The first frame has no button; the active turn gains it on its first patch.
+    expect(JSON.stringify((h.channel.sent[0] as { input: object }).input)).not.toContain('⏹ 停止')
+    await waitUntil(() => expect(h.channel.updated.some(update =>
+      JSON.stringify((update as { card: object }).card).includes('⏹ 停止'),
+    )).toBe(true))
+    const value = { decision: 'turn-stop' }
+
+    // A stranger's click only adds the owner-only notice.
+    await h.channel.fireCardAction({
+      messageId: 'om_1', chatId: 'oc_stop_btn',
+      operator: { openId: 'ou_x', userId: 'u_stranger' }, action: { value, tag: 'button' },
+    })
+    expect(cancel).not.toHaveBeenCalled()
+    await waitUntil(() => expect(h.channel.updated.some(update =>
+      JSON.stringify((update as { card: object }).card).includes('仅发起该会话的用户可停止'),
+    )).toBe(true))
+
+    // The owner's click from another chat (a forwarded card) is refused too.
+    await h.channel.fireCardAction({
+      messageId: 'om_1', chatId: 'oc_elsewhere',
+      operator: { openId: 'ou_o', userId: 'u_owner' }, action: { value, tag: 'button' },
+    })
+    expect(cancel).not.toHaveBeenCalled()
+
+    // Unknown cards are ignored.
+    await h.channel.fireCardAction({
+      messageId: 'om_unknown', chatId: 'oc_stop_btn',
+      operator: { openId: 'ou_o', userId: 'u_owner' }, action: { value, tag: 'button' },
+    })
+    expect(cancel).not.toHaveBeenCalled()
+
+    await h.channel.fireCardAction({
+      messageId: 'om_1', chatId: 'oc_stop_btn',
+      operator: { openId: 'ou_o', userId: 'u_owner' }, action: { value, tag: 'button' },
+    })
+    expect(cancel).toHaveBeenCalledWith({ kind: 'user' }, { keepInbox: true })
+    await waitUntil(() => expect(h.channel.updated.some(update =>
+      JSON.stringify((update as { card: object }).card).includes('正在停止'),
+    )).toBe(true))
+    // No reply card: the button answers on the streaming card itself.
+    expect(h.channel.sent).toHaveLength(1)
+    await h.service.shutdown()
+  })
+
+  it('queues a topic message behind the running turn and steers it in from its card, owner only', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_steer', senderId: 'u_owner', messageId: 'om_steer_start', content: '开始',
+    }))
+    await waitForEstablishedSession(h)
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    ;(agent as unknown as { status: string }).status = 'running'
+
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_steer', senderId: 'u_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_steer_more', content: '再补充一点',
+    }))
+    await waitUntil(() => expect(mock(agent.followup)).toHaveBeenCalledTimes(2))
+    const queuedCard = h.channel.sent[1] as { input: object }
+    expect(JSON.stringify(queuedCard.input)).toContain('排队中')
+    const message = mock(agent.followup).mock.calls[1]![0] as { id: string }
+    const value = { decision: 'turn-steer' }
+
+    // A stranger's click only adds the owner-only notice.
+    await h.channel.fireCardAction({
+      messageId: 'om_2', chatId: 'oc_steer',
+      operator: { openId: 'ou_x', userId: 'u_stranger' }, action: { value, tag: 'button' },
+    })
+    expect(mock(agent.steer)).not.toHaveBeenCalled()
+    await waitUntil(() => expect(h.channel.updated.some(update =>
+      JSON.stringify((update as { card: object }).card).includes('仅发起该会话的用户可补充'),
+    )).toBe(true))
+
+    // The running turn's own card is not a queued card.
+    await h.channel.fireCardAction({
+      messageId: 'om_1', chatId: 'oc_steer',
+      operator: { openId: 'ou_o', userId: 'u_owner' }, action: { value, tag: 'button' },
+    })
+    expect(mock(agent.steer)).not.toHaveBeenCalled()
+
+    await h.channel.fireCardAction({
+      messageId: 'om_2', chatId: 'oc_steer',
+      operator: { openId: 'ou_o', userId: 'u_owner' }, action: { value, tag: 'button' },
+    })
+    expect(mock(agent.inbox.remove)).toHaveBeenCalledWith(message.id)
+    expect(mock(agent.steer)).toHaveBeenCalledWith(message)
+    await waitUntil(() => expect(h.channel.updated.some(update =>
+      (update as { messageId: string }).messageId === 'om_2'
+      && JSON.stringify((update as { card: object }).card).includes('已补充到当前回复'),
+    )).toBe(true))
+    expect(h.channel.sent).toHaveLength(2)
+    await h.service.shutdown()
+  })
+
+  it('leaves a queued card alone when the agent is idle or the prompt was already claimed', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_steer_late', senderId: 'u_owner', content: '开始',
+    }))
+    await waitForEstablishedSession(h)
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_steer_late', senderId: 'u_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_steer_late', content: '补充',
+    }))
+    await waitUntil(() => expect(mock(agent.followup)).toHaveBeenCalledTimes(2))
+    const click = () => h.channel.fireCardAction({
+      messageId: 'om_2', chatId: 'oc_steer_late',
+      operator: { openId: 'ou_o', userId: 'u_owner' }, action: { value: { decision: 'turn-steer' }, tag: 'button' },
+    })
+
+    await click()
+    expect(mock(agent.inbox.remove)).not.toHaveBeenCalled()
+
+    ;(agent as unknown as { status: string }).status = 'running'
+    mock(agent.inbox.remove).mockReturnValueOnce(false)
+    await click()
+    expect(mock(agent.inbox.remove)).toHaveBeenCalledTimes(1)
+    expect(mock(agent.steer)).not.toHaveBeenCalled()
     await h.service.shutdown()
   })
 
@@ -2833,7 +3112,7 @@ describe('/stop, structured questions, and host projections', () => {
     }
     const h = await setup({}, {}, undefined, {}, undefined, projections)
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_proj', senderId: 'ou_owner', content: '开始',
+      chatType: 'group', chatId: 'oc_proj', senderId: 'u_owner', content: '开始',
     }))
     await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
@@ -2866,7 +3145,7 @@ describe('/stop, structured questions, and host projections', () => {
   it('drives the streamed card from agent/assistant-stream events', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_stream', senderId: 'ou_owner', content: '开始',
+      chatType: 'group', chatId: 'oc_stream', senderId: 'u_owner', content: '开始',
     }))
     await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
@@ -2889,14 +3168,14 @@ describe('command registry dispatch', () => {
   it('resolves the /new alias to /renew end to end', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_alias', senderId: 'ou_owner',
+      chatType: 'group', chatId: 'oc_alias', senderId: 'u_owner',
       messageId: 'om_alias_start', content: '开始',
     }))
     await waitForEstablishedSession(h)
     const old = h.ctxState.agents.created[0]!
 
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_alias', senderId: 'ou_owner', threadId: 'omt_1',
+      chatType: 'group', chatId: 'oc_alias', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_alias_new', content: '/new',
     }))
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
@@ -2911,21 +3190,23 @@ describe('command registry dispatch', () => {
     await h.service.shutdown()
   })
 
-  it('rejects an unknown command with the registry-derived supported list', async () => {
+  it('sends an unknown slash line in a topic to the bound Session as a prompt', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_unknown', senderId: 'ou_owner', content: '开始',
+      chatType: 'group', chatId: 'oc_unknown', senderId: 'u_owner', content: '开始',
     }))
     await waitForEstablishedSession(h)
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    await waitUntil(() => expect(mock(agent.followup)).toHaveBeenCalledTimes(1))
 
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_unknown', senderId: 'ou_owner', threadId: 'omt_1',
-      mentionedBot: false, messageId: 'om_unknown_cmd', content: '/nope',
+      chatType: 'group', chatId: 'oc_unknown', senderId: 'u_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_unknown_cmd', content: '/nope 继续',
     }))
-    await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
-    const json = JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)
-    expect(json).toContain('未找到命令 /nope')
-    expect(json).toContain('/userid')
+    await waitUntil(() => expect(mock(agent.followup)).toHaveBeenCalledTimes(2))
+    expect((mock(agent.followup).mock.calls[1]?.[0] as { content: Array<{ text: string }> }).content[0]?.text).toBe('/nope 继续')
+    expect(h.ctxState.agents.created).toHaveLength(1)
+    expect(JSON.stringify(h.channel.sent)).not.toContain('未找到命令')
     await h.service.shutdown()
   })
 })
@@ -2934,7 +3215,7 @@ describe('free-text question answers', () => {
   it('routes a plain reply into a pending structured question', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_qtext', senderId: 'ou_owner', content: '问一下',
+      chatType: 'group', chatId: 'oc_qtext', senderId: 'u_owner', content: '问一下',
     }))
     await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
@@ -2947,7 +3228,7 @@ describe('free-text question answers', () => {
     await resetFollowupAfterEstablishment(agent)
 
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_qtext', senderId: 'ou_owner', threadId: 'omt_1',
+      chatType: 'group', chatId: 'oc_qtext', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_qtext_answer', content: '这是答案',
     }))
     await expect(pending).resolves.toEqual({
@@ -2962,16 +3243,57 @@ describe('free-text question answers', () => {
   })
 })
 
+describe('typed approval replies', () => {
+  async function pendingApproval(chatId: string) {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId, senderId: 'u_owner', content: '跑一下',
+    }))
+    await waitForEstablishedSession(h)
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    const { listener } = h.ctxState.approvalListeners[0]!
+    const pending = listener({ agent, toolName: 'bash', reason: '需要提权' }, vi.fn(async () => 'unavailable' as const))
+    await waitUntil(() => expect(h.channel.sent.length).toBe(2))
+    await resetFollowupAfterEstablishment(agent)
+    return { h, agent, pending }
+  }
+
+  it('a keyword reply decides the card without starting a model turn', async () => {
+    const { h, agent, pending } = await pendingApproval('oc_atext')
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_atext', senderId: 'u_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_atext_allow', content: '允许',
+    }))
+    await expect(pending).resolves.toBe('allowed-once')
+    expect(mock(agent.followup)).not.toHaveBeenCalled()
+    await waitUntil(() => expect(JSON.stringify(
+      (h.channel.sent.at(-1) as { input: object }).input,
+    )).toContain('已允许本次操作'))
+    await h.service.shutdown()
+  })
+
+  it('any other reply rejects the card and still reaches the agent', async () => {
+    const { h, agent, pending } = await pendingApproval('oc_aother')
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_aother', senderId: 'u_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_aother', content: '别提权，换个目录写',
+    }))
+    await expect(pending).resolves.toBe('rejected')
+    await waitUntil(() => expect(mock(agent.followup)).toHaveBeenCalled())
+    await h.service.shutdown()
+  })
+})
+
 describe('/permissions and /status extras', () => {
   it('shows the current permission preset and the catalog read-only by default', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_perm', senderId: 'ou_owner', content: '开始',
+      chatType: 'group', chatId: 'oc_perm', senderId: 'u_owner', content: '开始',
     }))
     await waitForEstablishedSession(h)
 
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_perm', senderId: 'ou_owner', threadId: 'omt_1',
+      chatType: 'group', chatId: 'oc_perm', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_perm_view', content: '/permissions',
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
@@ -2983,7 +3305,7 @@ describe('/permissions and /status extras', () => {
 
     // Switching is refused while the deployment keeps the gate closed.
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_perm', senderId: 'ou_owner', threadId: 'omt_1',
+      chatType: 'group', chatId: 'oc_perm', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_perm_set', content: '/permissions read-only',
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(3))
@@ -2995,13 +3317,13 @@ describe('/permissions and /status extras', () => {
   it('switches the permission preset when the deployment opts in', async () => {
     const h = await setup({ allowPermissionSwitch: true })
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_perm_on', senderId: 'ou_owner', content: '开始',
+      chatType: 'group', chatId: 'oc_perm_on', senderId: 'u_owner', content: '开始',
     }))
     await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
 
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_perm_on', senderId: 'ou_owner', threadId: 'omt_1',
+      chatType: 'group', chatId: 'oc_perm_on', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_perm_switch', content: '/permissions read-only',
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
@@ -3013,13 +3335,13 @@ describe('/permissions and /status extras', () => {
   it('renders permission/workspace/uptime extras on /status', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_status_extra', senderId: 'ou_owner', content: '开始',
+      chatType: 'group', chatId: 'oc_status_extra', senderId: 'u_owner', content: '开始',
     }))
     await waitForEstablishedSession(h)
     const route = h.ctxState.domain.raw.table('routes').get('omt_1') as RouteRecord | undefined
 
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_status_extra', senderId: 'ou_owner', threadId: 'omt_1',
+      chatType: 'group', chatId: 'oc_status_extra', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_status_extra', content: '/status',
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
@@ -3036,7 +3358,7 @@ describe('first-contact onboarding', () => {
   it('sends the onboarding card once per private chat and persists it', async () => {
     const h = await setup({ welcomeOnboarding: true })
     await h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_welcome', senderId: 'ou_new', messageId: 'om_w1', content: '你好',
+      chatType: 'p2p', chatId: 'oc_welcome', senderId: 'u_new', messageId: 'om_w1', content: '你好',
     }))
     await waitUntil(() => expect(h.channel.sent.length).toBeGreaterThanOrEqual(2))
 
@@ -3047,7 +3369,7 @@ describe('first-contact onboarding', () => {
     expect(global.welcomedChats).toContain('oc_welcome')
 
     await h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_welcome', senderId: 'ou_new', threadId: 'omt_1',
+      chatType: 'p2p', chatId: 'oc_welcome', senderId: 'u_new', threadId: 'omt_1',
       messageId: 'om_w2', content: '再来一条',
     }))
     await waitUntil(() => expect(h.channel.sent.length).toBeGreaterThanOrEqual(3))
@@ -3060,7 +3382,7 @@ describe('/model', () => {
   it('shows the current model and the advertised catalog', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_model_view', senderId: 'ou_owner', content: '开始',
+      chatType: 'group', chatId: 'oc_model_view', senderId: 'u_owner', content: '开始',
     }))
     await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
@@ -3070,7 +3392,7 @@ describe('/model', () => {
     })
 
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_model_view', senderId: 'ou_owner', threadId: 'omt_1',
+      chatType: 'group', chatId: 'oc_model_view', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_model_view', content: '/model',
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
@@ -3084,14 +3406,14 @@ describe('/model', () => {
   it('switches the model for subsequent requests', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_model_set', senderId: 'ou_owner', content: '开始',
+      chatType: 'group', chatId: 'oc_model_set', senderId: 'u_owner', content: '开始',
     }))
     await waitForEstablishedSession(h)
     const created = h.ctxState.agents.created[0]!
     const agent = created.handle.agent
 
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_model_set', senderId: 'ou_owner', threadId: 'omt_1',
+      chatType: 'group', chatId: 'oc_model_set', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_model_set', content: '/model deepseek-v4-pro',
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
@@ -3108,7 +3430,7 @@ describe('/model', () => {
   it('rejects a model the provider does not advertise', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_model_bad', senderId: 'ou_owner', content: '开始',
+      chatType: 'group', chatId: 'oc_model_bad', senderId: 'u_owner', content: '开始',
     }))
     await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
@@ -3118,7 +3440,7 @@ describe('/model', () => {
     })
 
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_model_bad', senderId: 'ou_owner', threadId: 'omt_1',
+      chatType: 'group', chatId: 'oc_model_bad', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_model_bad', content: '/model nope-model',
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
@@ -3129,11 +3451,173 @@ describe('/model', () => {
   })
 })
 
+describe('command picker cards', () => {
+  function buttonValues(card: object): Array<{ label: string; value: Record<string, unknown> }> {
+    const out: Array<{ label: string; value: Record<string, unknown> }> = []
+    const walk = (elements: Array<Record<string, unknown>>): void => {
+      for (const element of elements) {
+        if (element.tag === 'button') {
+          out.push({
+            label: (element.text as { content: string }).content,
+            value: (element.behaviors as Array<{ value: Record<string, unknown> }>)[0]!.value,
+          })
+        }
+        for (const column of (element.columns as Array<{ elements: Array<Record<string, unknown>> }> | undefined) ?? []) {
+          walk(column.elements)
+        }
+      }
+    }
+    walk((card as { body: { elements: Array<Record<string, unknown>> } }).body.elements)
+    return out
+  }
+
+  const lastCard = (h: SetupResult): object => (h.channel.sent.at(-1) as { input: { card: object } }).input.card
+  const pickerUpdates = (h: SetupResult, messageId: string): object[] =>
+    (h.channel.updated as Array<{ messageId: string; card: object }>)
+      .filter(update => update.messageId === messageId).map(update => update.card)
+
+  async function establishWithModel(h: SetupResult, chatId: string) {
+    await h.onMessage(makeMessage({ chatType: 'group', chatId, senderId: 'u_owner', content: '开始' }))
+    await waitForEstablishedSession(h)
+    const created = h.ctxState.agents.created[0]!
+    ;(sessionEvents(created.handle.agent.session) as unknown as Array<Record<string, unknown>>).push({
+      type: 'request/header', seq: 1, time: 1,
+      data: { header: { config: { provider: 'deepseek-official', model: 'deepseek-v4-flash' } } },
+    })
+    return created
+  }
+
+  it('answers bare /model with model buttons and switches on an owner click', async () => {
+    const h = await setup()
+    const created = await establishWithModel(h, 'oc_pick_model')
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_pick_model', senderId: 'u_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_pick_model', content: '/model',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
+    const buttons = buttonValues(lastCard(h))
+    expect(buttons.map(button => button.label)).toEqual(['✅ deepseek-v4-flash', 'deepseek-v4-pro', '恢复默认'])
+    const pro = buttons[1]!.value
+    expect(pro).toEqual({
+      decision: 'command-pick', command: 'model', arg: 'deepseek-v4-pro', sessionId: created.handle.agent.session.id,
+    })
+
+    // Strangers and forwarded copies are ignored without a reply.
+    await h.channel.fireCardAction({
+      messageId: 'om_2', chatId: 'oc_pick_model',
+      operator: { openId: 'ou_x', userId: 'u_stranger' }, action: { value: pro, tag: 'button' },
+    })
+    await h.channel.fireCardAction({
+      messageId: 'om_2', chatId: 'oc_other',
+      operator: { openId: 'ou_o', userId: 'u_owner' }, action: { value: pro, tag: 'button' },
+    })
+    await h.channel.fireCardAction({
+      messageId: 'om_2', chatId: 'oc_pick_model',
+      operator: { openId: 'ou_o', userId: 'u_owner' },
+      action: { value: { ...pro, sessionId: 'sess-stale' }, tag: 'button' },
+    })
+    await flush()
+    expect(h.channel.sent).toHaveLength(2)
+
+    await h.channel.fireCardAction({
+      messageId: 'om_2', chatId: 'oc_pick_model',
+      operator: { openId: 'ou_o', userId: 'u_owner' }, action: { value: pro, tag: 'button' },
+    })
+    await waitUntil(() => expect(pickerUpdates(h, 'om_2')).toHaveLength(1))
+    expect(JSON.stringify(pickerUpdates(h, 'om_2')[0])).toContain('已切换为')
+    expect(h.channel.sent).toHaveLength(2)
+    await expect(dispatchAgentRequest(created.setupCtx, { provider: 'deepseek-official', model: 'deepseek-v4-flash' }))
+      .resolves.toMatchObject({ model: 'deepseek-v4-pro' })
+    await h.service.shutdown()
+  })
+
+  it('answers bare /effort with the efforts the model advertises', async () => {
+    const h = await setup({ reasoningEffort: 'high' })
+    mock(h.ctxState.ctx.llm!.resolveModelInfo).mockResolvedValue({
+      context: { contextWindow: 128000 },
+      reasoning: { efforts: [{ id: 'low', name: '低' }, { id: 'high', name: '高' }], defaultEffort: 'low' },
+    })
+    const created = await establishWithModel(h, 'oc_pick_effort')
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_pick_effort', senderId: 'u_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_pick_effort', content: '/effort',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
+    const buttons = buttonValues(lastCard(h))
+    expect(buttons.map(button => button.label)).toEqual(['低', '✅ 高', '恢复默认'])
+
+    await h.channel.fireCardAction({
+      messageId: 'om_2', chatId: 'oc_pick_effort',
+      operator: { openId: 'ou_o', userId: 'u_owner' }, action: { value: buttons[0]!.value, tag: 'button' },
+    })
+    await waitUntil(() => expect(pickerUpdates(h, 'om_2')).toHaveLength(1))
+    const settled = JSON.stringify(pickerUpdates(h, 'om_2')[0])
+    expect(settled).toContain('命令执行完成')
+    expect(settled).not.toContain('command-pick')
+    expect(h.channel.sent).toHaveLength(2)
+    await expect(dispatchAgentRequest(created.setupCtx, { provider: 'deepseek-official', model: 'deepseek-v4-flash' }))
+      .resolves.toMatchObject({ reasoningEffort: 'low' })
+    await h.service.shutdown()
+  })
+
+  it('keeps the text answer when the model advertises no efforts or the lookup fails', async () => {
+    const h = await setup()
+    await establishWithModel(h, 'oc_pick_effort_none')
+    const command = async (messageId: string) => {
+      const before = h.channel.sent.length
+      await h.onMessage(makeMessage({
+        chatType: 'group', chatId: 'oc_pick_effort_none', senderId: 'u_owner', threadId: 'omt_1',
+        mentionedBot: false, messageId, content: '/effort',
+      }))
+      await waitUntil(() => expect(h.channel.sent).toHaveLength(before + 1))
+    }
+    await command('om_effort_none')
+    expect(buttonValues(lastCard(h))).toHaveLength(0)
+    mock(h.ctxState.ctx.llm!.resolveModelInfo).mockRejectedValue(new Error('offline'))
+    await command('om_effort_fail')
+    expect(buttonValues(lastCard(h))).toHaveLength(0)
+    await h.service.shutdown()
+  })
+
+  it('answers bare /permissions with preset buttons only when switching is allowed', async () => {
+    const h = await setup({ allowPermissionSwitch: true })
+    await h.onMessage(makeMessage({ chatType: 'group', chatId: 'oc_pick_perm', senderId: 'u_owner', content: '开始' }))
+    await waitForEstablishedSession(h)
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_pick_perm', senderId: 'u_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_pick_perm', content: '/permissions',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
+    const buttons = buttonValues(lastCard(h))
+    expect(buttons.map(button => button.label)).toEqual(['Read only', '✅ Standard'])
+    await h.channel.fireCardAction({
+      messageId: 'om_2', chatId: 'oc_pick_perm',
+      operator: { openId: 'ou_o', userId: 'u_owner' }, action: { value: buttons[0]!.value, tag: 'button' },
+    })
+    await waitUntil(() => expect(pickerUpdates(h, 'om_2')).toHaveLength(1))
+    expect(JSON.stringify(pickerUpdates(h, 'om_2')[0])).toContain('权限预设已切换')
+    expect(h.channel.sent).toHaveLength(2)
+    expect(h.ctxState.permissions.set).toHaveBeenCalledWith(agent.session, 'read-only')
+
+    // A refused patch falls back to replying under the picker card.
+    mock(h.channel.updateCard).mockRejectedValueOnce(new Error('card expired'))
+    await h.channel.fireCardAction({
+      messageId: 'om_2', chatId: 'oc_pick_perm',
+      operator: { openId: 'ou_o', userId: 'u_owner' }, action: { value: buttons[1]!.value, tag: 'button' },
+    })
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(3))
+    expect((h.channel.sent.at(-1) as { options: Record<string, unknown> }).options)
+      .toMatchObject({ replyTo: 'om_2', replyInThread: true })
+    await h.service.shutdown()
+  })
+})
+
 describe('inbound attachments', () => {
   it('registers the attachment guidance with the session workspace path', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_guide', senderId: 'ou_owner',
+      chatType: 'group', chatId: 'oc_guide', senderId: 'u_owner',
       messageId: 'om_guide', content: '开始',
     }))
     await waitForEstablishedSession(h)
@@ -3150,12 +3634,12 @@ describe('inbound attachments', () => {
       downloadResource: () => [new Uint8Array([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])],
     })
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_image', senderId: 'ou_owner', messageId: 'om_image',
+      chatType: 'group', chatId: 'oc_image', senderId: 'u_owner', messageId: 'om_image',
       content: '![image](img_1)',
       resources: [{ type: 'image', fileKey: 'img_1' }] as never,
     }))
 
-    const dir = path.join(h.config.baseDir, '_staging', 'group', 'oc_image', 'ou_owner')
+    const dir = path.join(h.config.baseDir, '_staging', 'group', 'oc_image', 'u_owner')
     const finalFiles = () => readdirSync(dir).filter(name => !name.startsWith('.tmp-'))
     await waitUntil(() => expect(finalFiles()).toHaveLength(1))
     const [name] = finalFiles()
@@ -3170,7 +3654,7 @@ describe('inbound attachments', () => {
       downloadResource: (_messageId, fileKey) => [new TextEncoder().encode(`bytes:${fileKey}`)],
     })
     const chatId = 'oc_file_chat'
-    const senderId = 'ou_owner'
+    const senderId = 'u_owner'
     await h.onMessage(makeMessage({
       chatType: 'group', chatId, senderId, messageId: 'om_file',
       content: '<file key="file_1" name="report.pdf"/>',
@@ -3204,15 +3688,18 @@ describe('inbound attachments', () => {
   it('archives an expanded merged-forward record as text', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_forward', senderId: 'ou_owner', messageId: 'om_forward',
+      chatType: 'group', chatId: 'oc_forward', senderId: 'u_owner', messageId: 'om_forward',
       content: '<forwarded_messages>\n[alice] 明天评审\n</forwarded_messages>',
       rawContentType: 'merge_forward',
     }))
-    const dir = path.join(h.config.baseDir, '_staging', 'group', 'oc_forward', 'ou_owner')
-    await waitUntil(() => expect(readdirSync(dir)).toHaveLength(1))
+    const dir = path.join(h.config.baseDir, '_staging', 'group', 'oc_forward', 'u_owner')
+    // The record file appears before its text is flushed: wait for the content.
+    await waitUntil(() => {
+      expect(readdirSync(dir)).toHaveLength(1)
+      expect(readFileSync(path.join(dir, readdirSync(dir)[0]!), 'utf8')).toContain('明天评审')
+    })
     const [name] = readdirSync(dir)
     expect(name).toMatch(/-forwarded-record\.txt$/)
-    expect(readFileSync(path.join(dir, name!), 'utf8')).toContain('明天评审')
     expect(h.ctxState.agents.created).toHaveLength(0)
     await h.service.shutdown()
   })
@@ -3232,7 +3719,7 @@ describe('inbound attachments', () => {
       },
     }
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_post_file', senderId: 'ou_owner', messageId: 'om_post_file',
+      chatType: 'group', chatId: 'oc_post_file', senderId: 'u_owner', messageId: 'om_post_file',
       rawContentType: 'post', content: '看一下这个文件的内容', raw,
     }))
     await waitForEstablishedSession(h)
@@ -3250,7 +3737,7 @@ describe('inbound attachments', () => {
   it('gives every new topic its own workspace and attachments directory', async () => {
     const h = await setup()
     const chatId = 'oc_iso'
-    const senderId = 'ou_owner'
+    const senderId = 'u_owner'
     const routes = () => [...(h.ctxState.domain.raw.table('routes').entries() as Iterable<[string, RouteRecord]>)]
       .map(([, value]) => value)
 
@@ -3271,6 +3758,8 @@ describe('inbound attachments', () => {
       chatType: 'group', chatId, senderId, messageId: 'om_iso_b', content: '开始 B',
     }))
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
+    // The route record commits after the Agent is created.
+    await waitUntil(() => expect(routes().some(route => route.sessionId !== routeA.sessionId)).toBe(true))
     const routeB = routes().find(route => route.sessionId !== routeA.sessionId)!
     await h.onMessage(makeMessage({
       chatType: 'group', chatId, senderId, threadId: routeB.key, mentionedBot: false,
@@ -3298,10 +3787,10 @@ describe('inbound attachments', () => {
 
   it('uses a Git worktree per topic when the user workspace is a repository', async () => {
     const h = await setup({ topicIsolation: 'auto' })
-    const workspaceDir = path.join(h.config.baseDir, 'p2p', 'ou_alice')
+    const workspaceDir = path.join(h.config.baseDir, 'p2p', 'u_alice')
     mkdirSync(path.join(workspaceDir, '.git'), { recursive: true })
     await h.onMessage(makeMessage({
-      chatType: 'p2p', senderId: 'ou_alice', mentionedBot: false, content: 'hi',
+      chatType: 'p2p', senderId: 'u_alice', mentionedBot: false, content: 'hi',
     }))
     await waitForEstablishedSession(h)
 
@@ -3326,11 +3815,11 @@ describe('inbound attachments', () => {
     const h = await setup({ topicIsolation: 'worktree' })
     h.ctxState.worktrees.failWith = new Error('git denied')
     await h.onMessage(makeMessage({
-      chatType: 'p2p', senderId: 'ou_alice', mentionedBot: false, content: 'hi',
+      chatType: 'p2p', senderId: 'u_alice', mentionedBot: false, content: 'hi',
     }))
     await waitForEstablishedSession(h)
 
-    const workspaceDir = path.join(h.config.baseDir, 'p2p', 'ou_alice')
+    const workspaceDir = path.join(h.config.baseDir, 'p2p', 'u_alice')
     const created = h.ctxState.agents.created[0]!
     expect(created.options.meta?.cwd).toBe(workspaceDir)
     const route = [...(h.ctxState.domain.raw.table('routes').entries() as Iterable<[string, RouteRecord]>)]
@@ -3346,7 +3835,7 @@ describe('inbound attachments', () => {
   it('keeps the same topic directory across continued messages', async () => {
     const h = await setup()
     const first = makeMessage({
-      chatType: 'p2p', senderId: 'ou_alice', mentionedBot: false, content: '开始',
+      chatType: 'p2p', senderId: 'u_alice', mentionedBot: false, content: '开始',
     })
     await h.onMessage(first)
     await waitForEstablishedSession(h)
@@ -3355,7 +3844,7 @@ describe('inbound attachments', () => {
       .map(([, value]) => value)[0]!
 
     await h.onMessage(makeMessage({
-      chatType: 'p2p', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', senderId: 'u_alice', mentionedBot: false,
       threadId: route.key, messageId: 'om_continue', content: '继续',
     }))
     await waitUntil(() => expect(mock(created.handle.agent.followup)).toHaveBeenCalledTimes(2))
@@ -3374,7 +3863,7 @@ describe('inbound attachments', () => {
       },
     })
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_post_fail', senderId: 'ou_owner', messageId: 'om_post_fail',
+      chatType: 'group', chatId: 'oc_post_fail', senderId: 'u_owner', messageId: 'om_post_fail',
       rawContentType: 'post', content: '看一下这个文件的内容',
       raw: {
         message: {
@@ -3399,7 +3888,7 @@ describe('inbound attachments', () => {
   it('turns an image with a caption into one prompt carrying only the caption', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_caption', senderId: 'ou_owner', messageId: 'om_caption',
+      chatType: 'group', chatId: 'oc_caption', senderId: 'u_owner', messageId: 'om_caption',
       content: '看这张图 ![image](img_1) 里有什么',
       resources: [{ type: 'image', fileKey: 'img_1' }] as never,
     }))
@@ -3421,8 +3910,6 @@ describe('native attachment pipeline', () => {
   const routesOf = (h: SetupResult): RouteRecord[] =>
     [...(h.ctxState.domain.raw.table('routes').entries() as Iterable<[string, RouteRecord]>)]
       .map(([, value]) => value)
-  const pendingRowsOf = (h: SetupResult): unknown[] =>
-    [...(h.ctxState.domain.raw.table('pending_attachments').entries() as Iterable<[string, unknown]>)]
   const firstPromptOf = (h: SetupResult) =>
     followupMessagesOf(h.ctxState.agents.created[0]!.handle.agent)[0]!.content
   const textBlocksOf = (content: Array<{ type: string; text?: string }>): string[] =>
@@ -3455,7 +3942,7 @@ describe('native attachment pipeline', () => {
     const gate = new Promise<Uint8Array[]>(resolve => { release = resolve })
     const { h } = await setupNative({}, { downloadResource: () => gate })
     const handling = h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_slow', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_slow', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_slow_image', content: '这是什么 ![image](img_1)', resources: pngResources,
     }))
 
@@ -3487,7 +3974,7 @@ describe('native attachment pipeline', () => {
     })
     const messageId = 'om_file_trigger'
     await h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_lazy', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_lazy', senderId: 'u_alice', mentionedBot: false,
       messageId, content: '看下 <file key="file_1" name="report.pdf"/> 这个文件',
       resources: [{ type: 'file', fileKey: 'file_1', fileName: 'report.pdf' }] as never,
     }))
@@ -3523,7 +4010,7 @@ describe('native attachment pipeline', () => {
   it('prefetches trigger images into image blocks and omits them from the manifest (AC2/AC4)', async () => {
     const { h, attachments } = await setupNative({}, { downloadResource: () => [PNG] })
     await h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_prefetch', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_prefetch', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_image_trigger', content: '这张图是什么 ![image](img_1)', resources: pngResources,
     }))
     await waitForEstablishedSession(h)
@@ -3540,82 +4027,86 @@ describe('native attachment pipeline', () => {
   it('keeps native inbound attachments out of the workspace and staging (AC7)', async () => {
     const { h, attachments } = await setupNative({}, { downloadResource: () => [PNG] })
     await h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_native_cleanup', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_native_cleanup', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_native_cleanup', content: '看这张图 ![image](img_1)', resources: pngResources,
     }))
     await waitForEstablishedSession(h)
     expect(attachments.savedImages).toHaveLength(1)
     const topicDir = sessionDirOf(routesOf(h)[0]!)
     // The native pipeline writes only the native attachment library: no
-    // workspace copy and no legacy staging, so directory cleanup can never
-    // delete an inbound Session attachment.
+    // workspace copy and no legacy staging.
     expect(existsSync(path.join(topicDir, 'attachments'))).toBe(false)
     expect(existsSync(path.join(h.config.baseDir, '_staging'))).toBe(false)
     await h.service.shutdown()
   })
 
-  it('silently registers an attachment-only p2p message and lists it next turn (AC2/AC3)', async () => {
+  /** Recording `message.list` stub serving one scripted page per container type. */
+  const scriptedHistory = (pages: { chat?: unknown[]; thread?: unknown[] }) => {
+    const calls: RawMessageListParams[] = []
+    const messageList = async (params: RawMessageListParams) => {
+      calls.push(params)
+      const items = params.container_id_type === 'chat' ? pages.chat : pages.thread
+      return makeMessageListResponse(items ?? [])
+    }
+    return { calls, messageList }
+  }
+
+  it('keeps attachment-only and un-mentioned messages inert and out of later manifests (AC2/AC3)', async () => {
     const downloads: string[] = []
+    // The main timeline still holds the earlier files: only a quote brings them in.
+    const history = scriptedHistory({
+      chat: [
+        makeRawMessage({
+          message_id: 'om_silent_image', msg_type: 'image', chat_id: 'oc_silent',
+          sender_id: 'u_alice', content: { image_key: 'img_1' },
+        }),
+        makeRawMessage({
+          message_id: 'om_group_silent', msg_type: 'file', chat_id: 'oc_group',
+          sender_id: 'u_alice', content: { file_key: 'g1', file_name: 'a.txt' },
+        }),
+      ],
+    })
     const { h } = await setupNative({}, {
+      messageList: history.messageList,
       downloadResource: (_messageId, fileKey) => {
         downloads.push(fileKey)
         return [PNG]
       },
     })
     await h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_silent', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_silent', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_silent_image', rawContentType: 'image', content: '![image](img_1)', resources: pngResources,
     }))
-
-    await waitUntil(() => expect(pendingRowsOf(h)).toHaveLength(1))
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_group', senderId: 'u_alice', mentionedBot: false,
+      messageId: 'om_group_silent', rawContentType: 'file', content: '<file key="g1" name="a.txt"/>',
+      resources: [{ type: 'file', fileKey: 'g1', fileName: 'a.txt' }] as never,
+    }))
+    await flush()
     expect(h.ctxState.agents.created).toHaveLength(0)
     expect(h.channel.sent).toHaveLength(0)
     expect(h.channel.reactions).toEqual([])
     expect(downloads).toEqual([])
     expect(routesOf(h)).toHaveLength(0)
+    expect(history.calls).toEqual([])
 
-    // A later text trigger surfaces the silently registered attachment in the
-    // manifest of the session it creates (chat-scope rows visible to the topic).
+    // A later un-quoted trigger never reads the main timeline for them.
     await h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_silent', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_silent', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_silent_text', content: '刚才那张图是什么',
     }))
     await waitForEstablishedSession(h)
-    const manifest = manifestOf(firstPromptOf(h))
-    expect(manifest).toContain('message_id=om_silent_image')
-    expect(manifest).toContain('file_key=img_1')
-    expect(manifest).toContain('type=image')
-    // The later trigger itself carries no bytes: still nothing downloaded.
-    expect(downloads).toEqual([])
-    await h.service.shutdown()
-  })
-
-  it('silently registers un-mentioned group attachments and topic-bound attachments (AC3/AC6)', async () => {
-    const downloads: string[] = []
-    const { h } = await setupNative({}, {
-      downloadResource: (_messageId, fileKey) => {
-        downloads.push(fileKey)
-        return [new TextEncoder().encode('bytes')]
-      },
-    })
-    // Un-mentioned group message: metadata only, no turn, no reply.
-    await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_group', senderId: 'ou_alice', mentionedBot: false,
-      messageId: 'om_group_silent', rawContentType: 'file', content: '<file key="g1" name="a.txt"/>',
-      resources: [{ type: 'file', fileKey: 'g1', fileName: 'a.txt' }] as never,
-    }))
-    await waitUntil(() => expect(pendingRowsOf(h)).toHaveLength(1))
-    expect(h.ctxState.agents.created).toHaveLength(0)
-    expect(h.channel.sent).toHaveLength(0)
-    expect(h.channel.reactions).toEqual([])
+    expect(manifestOf(firstPromptOf(h))).toBe('')
+    expect(history.calls.filter(call => call.container_id_type === 'chat')).toEqual([])
     expect(downloads).toEqual([])
     await h.service.shutdown()
   })
 
   it('keeps a bound topic quiet for attachment-only messages but continues on text (AC3/AC6)', async () => {
-    const { h } = await setupNative({}, { downloadResource: () => [PNG] })
+    const history = scriptedHistory({})
+    const { h } = await setupNative({}, { messageList: history.messageList, downloadResource: () => [PNG] })
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_topic', senderId: 'ou_alice', mentionedBot: true,
+      chatType: 'group', chatId: 'oc_topic', senderId: 'u_alice', mentionedBot: true,
       messageId: 'om_topic_first', content: '开始',
     }))
     await waitForEstablishedSession(h)
@@ -3623,24 +4114,25 @@ describe('native attachment pipeline', () => {
     expect(h.channel.sent).toHaveLength(1)
 
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_topic', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'group', chatId: 'oc_topic', senderId: 'u_alice', mentionedBot: false,
       threadId: route.key, messageId: 'om_topic_silent', rawContentType: 'image', content: '![image](img_1)', resources: pngResources,
     }))
     // No second card, no reaction, no download, no new Session.
     expect(h.channel.sent).toHaveLength(1)
     expect(h.ctxState.agents.created).toHaveLength(1)
     expect(h.channel.reactions).toEqual([{ messageId: 'om_topic_first', emojiType: 'Typing' }])
-    await waitUntil(() => expect(pendingRowsOf(h)).toHaveLength(1))
 
+    const callsBefore = history.calls.length
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_topic', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'group', chatId: 'oc_topic', senderId: 'u_alice', mentionedBot: false,
       threadId: route.key, messageId: 'om_topic_text', content: '刚才的图是什么',
     }))
     await waitUntil(() => expect(mock(h.ctxState.agents.created[0]!.handle.agent.followup)).toHaveBeenCalledTimes(2))
     const followups = followupMessagesOf(h.ctxState.agents.created[0]!.handle.agent)
-    const manifest = manifestOf(followups[1]!.content)
-    expect(manifest).toContain('message_id=om_topic_silent')
-    expect(manifest).toContain('file_key=img_1')
+    // The silent image is reachable through a quote or feishu_topic_messages,
+    // never through a history scan on the continuation turn.
+    expect(manifestOf(followups[1]!.content)).toBe('')
+    expect(history.calls).toHaveLength(callsBefore)
     await h.service.shutdown()
   })
 
@@ -3650,7 +4142,7 @@ describe('native attachment pipeline', () => {
       failImage: new Error('fake store exploded'),
     })
     await failing.h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_fail', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_fail', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_fail_image', content: '看图 ![image](img_1)', resources: pngResources,
     }))
     await waitForEstablishedSession(failing.h)
@@ -3662,7 +4154,7 @@ describe('native attachment pipeline', () => {
     // Per-image cap: bytes exceed the configured cap, so the image stays lazy.
     const capped = await setupNative({ prefetchImageMaxBytes: 1 }, { downloadResource: () => [PNG] })
     await capped.h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_cap', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_cap', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_cap_image', content: '看图 ![image](img_1)', resources: pngResources,
     }))
     await waitForEstablishedSession(capped.h)
@@ -3672,7 +4164,7 @@ describe('native attachment pipeline', () => {
     // Explicitly disabled prefetch: images always go through the tool.
     const disabled = await setupNative({ prefetchImages: false }, { downloadResource: () => [PNG] })
     await disabled.h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_no_prefetch', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_no_prefetch', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_no_prefetch', content: '看图 ![image](img_1)', resources: pngResources,
     }))
     await waitForEstablishedSession(disabled.h)
@@ -3687,7 +4179,7 @@ describe('native attachment pipeline', () => {
       downloadResource: () => new Promise<Uint8Array[]>(() => {}),
     })
     await stalled.h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_stall', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_stall', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_stall_image', content: '看图 ![image](img_1)', resources: pngResources,
     }))
     await waitForEstablishedSession(stalled.h)
@@ -3700,7 +4192,7 @@ describe('native attachment pipeline', () => {
   it('turns no attachment into no manifest token (AC2)', async () => {
     const { h } = await setupNative()
     await h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_plain', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_plain', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_plain', content: '普通消息',
     }))
     await waitForEstablishedSession(h)
@@ -3717,7 +4209,7 @@ describe('native attachment pipeline', () => {
       },
     })
     await h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_off', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_off', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_off_image', content: '![image](img_1)', resources: pngResources,
     }))
     await flush()
@@ -3725,12 +4217,11 @@ describe('native attachment pipeline', () => {
     expect(h.channel.sent).toHaveLength(0)
     expect(h.channel.reactions).toEqual([])
     expect(downloads).toEqual([])
-    expect(pendingRowsOf(h)).toHaveLength(0)
 
     // A text turn is still served, with the inert/archive guidance (attachments
     // are disabled, so the native manifest and fetch tool must not be advertised).
     await h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_off', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_off', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_off_text', content: '你好',
     }))
     await waitForEstablishedSession(h)
@@ -3759,17 +4250,16 @@ describe('native attachment pipeline', () => {
       { attachments },
     )
     await archived.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_archive', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_archive', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_archive_image', content: '![image](img_1)', resources: pngResources,
     }))
-    const staging = path.join(archived.config.baseDir, '_staging', 'p2p', 'oc_archive', 'ou_alice')
+    const staging = path.join(archived.config.baseDir, '_staging', 'p2p', 'oc_archive', 'u_alice')
     await waitUntil(() => expect(readdirSync(staging).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1))
     expect(mock(archived.channel.downloadResource)).toHaveBeenCalled()
     expect(archived.ctxState.agents.created).toHaveLength(0)
-    expect(pendingRowsOf(archived)).toHaveLength(0)
     // A text turn in archive mode must not advertise the lazy fetch tool.
     await archived.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_archive', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_archive', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_archive_text', content: '开始',
     }))
     await waitForEstablishedSession(archived)
@@ -3781,7 +4271,7 @@ describe('native attachment pipeline', () => {
     // synchronous download for the triggering message.
     const fallback = await setup({}, { downloadResource: () => [PNG] })
     await fallback.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_fallback', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_fallback', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_fallback_image', content: '看图 ![image](img_1)', resources: pngResources,
     }))
     await waitForEstablishedSession(fallback)
@@ -3801,7 +4291,7 @@ describe('native attachment pipeline', () => {
     const { h } = await setupNative({}, { downloadResource: () => gate })
 
     void h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_order', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_order', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_order_first', rawContentType: 'image',
       content: '看图 ![image](img_1)', resources: pngResources,
     }))
@@ -3813,7 +4303,7 @@ describe('native attachment pipeline', () => {
     // The route is durable while the first prompt is still assembling: a
     // second message in the topic must wait for the first followup.
     void h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_order', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_order', senderId: 'u_alice', mentionedBot: false,
       threadId: route.key, messageId: 'om_order_second', content: '第二句',
     }))
     await flush()
@@ -3838,7 +4328,7 @@ describe('native attachment pipeline', () => {
       },
     })
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_foreign', senderId: 'ou_alice', mentionedBot: true,
+      chatType: 'group', chatId: 'oc_foreign', senderId: 'u_alice', mentionedBot: true,
       messageId: 'om_foreign_owner', content: '开始',
     }))
     await waitForEstablishedSession(h)
@@ -3848,14 +4338,14 @@ describe('native attachment pipeline', () => {
     const processed = h.ctxState.domain.raw.table('processed')
 
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_foreign', senderId: 'ou_bob', mentionedBot: false,
+      chatType: 'group', chatId: 'oc_foreign', senderId: 'u_bob', mentionedBot: false,
       threadId: route.key, messageId: 'om_foreign_image', rawContentType: 'image',
       content: '![image](img_9)', resources: [{ type: 'image', fileKey: 'img_9' }] as never,
     }))
     await waitUntil(() => expect(processed.get('om_foreign_image')).toBeDefined())
 
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_foreign', senderId: 'ou_bob', mentionedBot: false,
+      chatType: 'group', chatId: 'oc_foreign', senderId: 'u_bob', mentionedBot: false,
       threadId: route.key, messageId: 'om_foreign_mixed', rawContentType: 'image',
       content: '看这个 ![image](img_9)', resources: [{ type: 'image', fileKey: 'img_9' }] as never,
     }))
@@ -3863,7 +4353,6 @@ describe('native attachment pipeline', () => {
     await flush()
     await flush()
 
-    expect(pendingRowsOf(h)).toHaveLength(0)
     expect(h.ctxState.agents.created).toHaveLength(1)
     expect(h.channel.sent).toHaveLength(sentBefore)
     expect(h.channel.reactions).toHaveLength(reactionsBefore)
@@ -3871,16 +4360,16 @@ describe('native attachment pipeline', () => {
     await h.service.shutdown()
   })
 
-  it('never registers attachments of a denied sender (AC3)', async () => {
+  it('keeps a denied sender\'s attachments inert (AC3)', async () => {
     const downloads: string[] = []
-    const { h } = await setupNative({ accessMode: 'guarded', adminOpenId: 'ou_admin' }, {
+    const { h } = await setupNative({ accessMode: 'guarded', adminUserId: 'u_admin' }, {
       downloadResource: (_messageId, fileKey) => {
         downloads.push(fileKey)
         return [PNG]
       },
     })
     await h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_denied', senderId: 'ou_mallory', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_denied', senderId: 'u_mallory', mentionedBot: false,
       messageId: 'om_denied_image', rawContentType: 'image', content: '![image](img_x)',
       resources: [{ type: 'image', fileKey: 'img_x' }] as never,
     }))
@@ -3889,7 +4378,6 @@ describe('native attachment pipeline', () => {
     await waitUntil(() => expect(h.channel.sent.length).toBeGreaterThan(0))
     await flush()
 
-    expect(pendingRowsOf(h)).toHaveLength(0)
     expect(h.ctxState.agents.created).toHaveLength(0)
     expect(h.channel.reactions).toEqual([])
     expect(downloads).toEqual([])
@@ -3908,6 +4396,9 @@ describe('native attachment pipeline', () => {
           attachmentFetchTimeoutMs: 120_000,
           topicMessages: true,
           topicMessagesTimeoutMs: 20_000,
+          sendFile: true,
+          wikiRead: false,
+          wikiWrite: false,
         },
       },
       { downloadResource: () => [PNG] },
@@ -3918,7 +4409,7 @@ describe('native attachment pipeline', () => {
       { attachments },
     )
     await h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_tool_off', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_tool_off', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_tool_off', rawContentType: 'image', content: '看图 ![image](img_1)',
       resources: pngResources,
     }))
@@ -3945,7 +4436,7 @@ describe('native attachment pipeline', () => {
   it('mounts the native guidance only when the native library is effective (AC2/AC7)', async () => {
     const { h } = await setupNative()
     await h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_guidance', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_guidance', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_guidance', content: '开始',
     }))
     await waitForEstablishedSession(h)
@@ -4003,7 +4494,7 @@ describe('quote excerpts and first-turn topic history', () => {
         : makeMessageGetResponse([]),
     })
     await h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_quote_text', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_quote_text', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_quote_trigger', replyToMessageId: 'om_quoted_text', content: '接着这个说',
     }))
     await waitForEstablishedSession(h)
@@ -4026,7 +4517,7 @@ describe('quote excerpts and first-turn topic history', () => {
       })]),
     })
     await h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_cont_quote', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_cont_quote', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_cont_trigger', replyToMessageId: 'om_first_quote', content: '第一轮',
     }))
     await waitForEstablishedSession(h)
@@ -4035,7 +4526,7 @@ describe('quote excerpts and first-turn topic history', () => {
 
     const record = routesOf(h)[0]!
     await h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_cont_quote', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_cont_quote', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_cont_followup', threadId: record.key, replyToMessageId: 'om_cont_quote',
       content: '第二轮也引用',
     }))
@@ -4060,7 +4551,7 @@ describe('quote excerpts and first-turn topic history', () => {
       },
     })
     await h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_quote_file', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_quote_file', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_quote_file_trigger', replyToMessageId: 'om_quoted_file', content: '看下引用的文件',
     }))
     await waitForEstablishedSession(h)
@@ -4116,7 +4607,7 @@ describe('quote excerpts and first-turn topic history', () => {
       },
     })
     await h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_forward_quote', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_forward_quote', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_forward_trigger', replyToMessageId: containerId, content: '看下这条转发',
     }))
     await waitForEstablishedSession(h)
@@ -4171,7 +4662,7 @@ describe('quote excerpts and first-turn topic history', () => {
       },
     })
     await h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_history', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_history', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_hist_trigger', content: '当前问题',
     }))
     await waitForEstablishedSession(h)
@@ -4192,13 +4683,14 @@ describe('quote excerpts and first-turn topic history', () => {
     const agent = h.ctxState.agents.created[0]!.handle.agent
     const record = routesOf(h)[0]!
     await h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_history', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_history', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_hist_followup', threadId: record.key, content: '第二句',
     }))
     await waitUntil(() => expect(mock(agent.followup)).toHaveBeenCalledTimes(2))
     const followup = promptOf(h, 1)
     expect(textBlocksOf(followup)).toEqual(['第二句'])
-    expect(listCalls).toHaveLength(1)
+    // Only the recent-attachment scans (one full page each) read again.
+    expect(listCalls.filter(call => call.page_size === 12)).toHaveLength(1)
     await h.service.shutdown()
   })
 
@@ -4218,7 +4710,7 @@ describe('quote excerpts and first-turn topic history', () => {
       },
     })
     await h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_chat_route', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_chat_route', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_chat_route_trigger', content: '降级会话',
     }))
     await waitForEstablishedSession(h)
@@ -4246,7 +4738,7 @@ describe('quote excerpts and first-turn topic history', () => {
       },
     })
     await h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_hist_file', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_hist_file', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_hist_file_trigger', content: '之前那个文件是什么',
     }))
     await waitForEstablishedSession(h)
@@ -4277,7 +4769,7 @@ describe('quote excerpts and first-turn topic history', () => {
     })
     const started = Date.now()
     await h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_prompt_budget', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_prompt_budget', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_prompt_budget', content: '历史读慢一点也没关系',
     }))
     await waitForEstablishedSession(h)
@@ -4289,10 +4781,10 @@ describe('quote excerpts and first-turn topic history', () => {
   })
 
   it('honors historyBootstrapLimit: 0 by never reading history (AC4)', async () => {
-    const list = vi.fn(async () => makeMessageListResponse([]))
+    const list = vi.fn(async (_params: RawMessageListParams) => makeMessageListResponse([]))
     const { h } = await setupTurnReader({ historyBootstrapLimit: 0 }, { messageList: list })
     await h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_hist_off', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_hist_off', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_hist_off', content: '不用历史',
     }))
     await waitForEstablishedSession(h)
@@ -4311,7 +4803,7 @@ describe('quote excerpts and first-turn topic history', () => {
       ]),
     })
     await h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_hist_long', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_hist_long', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_hist_long_trigger', content: '很长吗',
     }))
     await waitForEstablishedSession(h)
@@ -4326,7 +4818,7 @@ describe('quote excerpts and first-turn topic history', () => {
       },
     })
     await denied.h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_hist_denied', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_hist_denied', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_hist_denied', content: '还能继续吗',
     }))
     await waitForEstablishedSession(denied.h)
@@ -4346,7 +4838,7 @@ describe('quote excerpts and first-turn topic history', () => {
       },
     })
     await missingScope.h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_hist_scope', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_hist_scope', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_hist_scope', content: '也没有权限',
     }))
     await waitForEstablishedSession(missingScope.h)
@@ -4363,7 +4855,7 @@ describe('quote excerpts and first-turn topic history', () => {
       },
     })
     await h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_quote_denied', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_quote_denied', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_quote_denied_trigger', replyToMessageId: 'om_missing_quote', content: '引用读不到',
     }))
     await waitForEstablishedSession(h)
@@ -4383,7 +4875,7 @@ describe('quote excerpts and first-turn topic history', () => {
         : makeMessageGetResponse([]),
     })
     await foreignChat.h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_quote_guard', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_quote_guard', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_quote_guard_trigger', replyToMessageId: 'om_foreign_quote', content: '看引用',
     }))
     await waitForEstablishedSession(foreignChat.h)
@@ -4407,7 +4899,7 @@ describe('quote excerpts and first-turn topic history', () => {
         : makeMessageGetResponse([]),
     })
     await foreignThread.h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_quote_guard_thread', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_quote_guard_thread', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_quote_guard_thread_trigger', replyToMessageId: 'om_other_topic_quote',
       content: '看引用',
     }))
@@ -4427,7 +4919,7 @@ describe('quote excerpts and first-turn topic history', () => {
       })]),
     })
     await h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_degraded_quote', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_degraded_quote', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_degraded_trigger', replyToMessageId: 'om_degraded_quote', content: '看这个引用',
     }))
     await waitForEstablishedSession(h)
@@ -4452,7 +4944,7 @@ describe('quote excerpts and first-turn topic history', () => {
       })]),
     })
     await h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_no_chat_quote', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_no_chat_quote', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_no_chat_trigger', replyToMessageId: 'om_no_chat_quote', content: '看引用',
     }))
     await waitForEstablishedSession(h)
@@ -4480,7 +4972,7 @@ describe('quote excerpts and first-turn topic history', () => {
       },
     })
     await h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_topic_tool', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_topic_tool', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_topic_tool_trigger', content: '看看话题历史',
     }))
     await waitForEstablishedSession(h)
@@ -4509,6 +5001,74 @@ describe('quote excerpts and first-turn topic history', () => {
     await h.service.shutdown()
   })
 
+  it('mounts feishu_send_file and sends a topic-directory file as a reply to the route card', async () => {
+    const { h, tools } = await setupTurnReader({}, {})
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_send_file', senderId: 'u_owner',
+      messageId: 'om_send_file_trigger', content: '生成一张图',
+    }))
+    await waitForEstablishedSession(h)
+    const record = [...(h.ctxState.domain.raw.table('routes').entries() as Iterable<[string, RouteRecord]>)]
+      .map(([, value]) => value)[0]!
+    writeFileSync(path.join(sessionDirOf(record), 'chart.png'), Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]))
+    const sendTool = tools.definitions.get(SEND_FILE_TOOL_NAME)
+    expect(sendTool).toBeDefined()
+    const value = await sendTool!.execute({ path: 'chart.png' }, { signal: new AbortController().signal })
+    expect(value).toMatchObject({ ok: true, kind: 'image' })
+    expect(h.channel.repliedMedia).toEqual([{
+      replyTo: record.cardMessageId,
+      media: { kind: 'image', data: expect.any(Buffer) },
+      options: { replyInThread: record.kind === 'thread' },
+    }])
+    await h.service.shutdown()
+  })
+
+  it('mounts the wiki tools, gates them on the wiki whitelist, and routes consent clicks', async () => {
+    const node = {
+      spaceId: '1', nodeToken: 'wikcnServiceDoc01', objToken: 'doc_1', objType: 'docx' as const,
+      nodeType: 'origin' as const, title: '服务测试', hasChild: false,
+    }
+    const wiki = {
+      getNode: vi.fn(async () => node),
+      spaceName: vi.fn(async () => '空间'),
+      listChildren: vi.fn(async () => ({ items: [] })),
+      createNode: vi.fn(async () => node),
+      documentRevision: vi.fn(async () => 1),
+      fetchDocument: vi.fn(async () => ({ revisionId: 1, content: '正文' })),
+      updateDocument: vi.fn(async () => ({ result: 'success', warnings: [] })),
+    }
+    const { h, tools } = await setupTurnReader({
+      adminUserId: 'u_admin',
+      wikiRoots: ['https://mi.feishu.cn/wiki/space/1'],
+      feishuTools: { ...makeConfig().feishuTools, wikiRead: true },
+    }, {})
+    Object.assign(h.channel, { wiki })
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_wiki', senderId: 'u_owner',
+      messageId: 'om_wiki_trigger', content: '读一下知识库',
+    }))
+    await waitForEstablishedSession(h)
+    const readTool = tools.definitions.get('feishu_wiki_read')
+    expect(tools.definitions.has('feishu_wiki_create')).toBe(false)
+    expect(await readTool!.execute({ doc: 'wikcnServiceDoc01' }, { signal: new AbortController().signal }))
+      .toMatchObject({ ok: false, code: 'NOT_AUTHORIZED' })
+
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_admin', senderId: 'u_admin', mentionedBot: false,
+      messageId: 'om_wiki_grant', content: '/auth wiki add u_owner',
+    }))
+    await waitUntil(() => expect(JSON.stringify(h.channel.sent)).toContain('加入知识库白名单'))
+    const before = h.channel.sent.length
+    const pending = readTool!.execute({ doc: 'wikcnServiceDoc01' }, { signal: new AbortController().signal })
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(before + 1))
+    await h.channel.fireCardAction({
+      messageId: `om_${h.channel.sent.length}`, chatId: 'oc_wiki',
+      operator: { openId: 'ou_owner', userId: 'u_owner' }, action: { value: { decision: 'allow' }, tag: 'button' },
+    })
+    expect(await pending).toMatchObject({ ok: true, content: '正文' })
+    await h.service.shutdown()
+  })
+
   it('orders native blocks as text, quote, prefetched image, manifest, history (AC1/AC2/AC4)', async () => {
     const PNG = new Uint8Array([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
     const { h } = await setupTurnReader({}, {
@@ -4525,7 +5085,7 @@ describe('quote excerpts and first-turn topic history', () => {
       downloadResource: () => [PNG],
     })
     await h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_order_quote', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_order_quote', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_order_trigger', replyToMessageId: 'om_order_quote',
       content: '图文一起看',
       resources: [
@@ -4560,7 +5120,7 @@ describe('quote excerpts and first-turn topic history', () => {
       })]),
     })
     await h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_archive_quote', senderId: 'ou_alice', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_archive_quote', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_arch_trigger', replyToMessageId: 'om_arch_quote', content: '归档模式',
     }))
     await waitForEstablishedSession(h)
@@ -4577,150 +5137,16 @@ describe('quote excerpts and first-turn topic history', () => {
   })
 })
 
-
-describe('directory retention cleanup', () => {
-  const STALE = 10 * 24 * 60 * 60 * 1000
-
-  it('previews and deletes a stale legacy topic workspace while retiring its route', async () => {
-    const h = await setup({ workspaceRetention: '7d' })
-    // Legacy layout: one registered workspace per topic below <baseDir>/topics.
-    const dir = path.join(h.config.baseDir, 'topics', 'groups', 'oc_stale', 'ou_old')
-    mkdirSync(path.join(dir, 'attachments'), { recursive: true })
-    writeFileSync(path.join(dir, 'attachments', 'old.txt'), 'stale bytes')
-    const old = new Date(Date.now() - STALE)
-    utimesSync(dir, old, old)
-    await h.ctxState.workspaces.registry.create(dir, '飞书群聊 · oc_stale · ou_old')
-    const record: RouteRecord = {
-      key: 'omt_stale',
-      kind: 'thread',
-      sessionId: 'session-stale',
-      chatId: 'oc_stale',
-      chatType: 'group',
-      senderOpenId: 'ou_old',
-      workspacePath: dir,
-      cardMessageId: 'om_stale_card',
-      createdAt: old.getTime(),
-      lastActivityAt: old.getTime(),
-      sessionHistory: [{ sessionId: 'session-stale', createdAt: old.getTime() }],
-    }
-    await h.ctxState.domain.raw.table('routes').put('omt_stale', record)
-
-    const preview = await h.service.cleanupPreview()
-    expect(preview.retention).toBe('7d')
-    expect(preview.workspaces).toBe(1)
-    expect(preview.candidates).toBe(1)
-    expect(preview.candidateBytes).toBeGreaterThan(0)
-
-    const result = await h.service.runWorkspaceCleanup()
-    expect(result.ok).toBe(true)
-    expect(result.deletedWorkspaces).toBe(1)
-    expect(result.deletedSessionDirs).toBe(0)
-    expect(result.retiredRoutes).toBe(1)
-    expect(result.freedBytes).toBeGreaterThan(0)
-    expect(existsSync(dir)).toBe(false)
-    expect(h.ctxState.workspaces.workspaces.size).toBe(0)
-    expect(h.ctxState.domain.raw.table('routes').get('omt_stale')).toBeUndefined()
-    expect(h.ctxState.domain.raw.table('expired_routes').get('omt_stale')).toMatchObject({
-      workspacePath: dir,
-    })
-    await h.service.shutdown()
-  })
-
-  it('deletes a stale topic directory but keeps the user workspace registered', async () => {
-    const h = await setup({ workspaceRetention: '7d' })
-    // Current layout, seeded without a live Agent (retention never offers a
-    // directory whose Session is still live).
-    const workspaceDir = path.join(h.config.baseDir, 'groups', 'oc_topic_ws', 'ou_owner')
-    const topicDir = path.join(workspaceDir, 'topics', 'omt_topic')
-    mkdirSync(path.join(topicDir, 'attachments'), { recursive: true })
-    writeFileSync(path.join(topicDir, 'attachments', 'old.txt'), 'stale bytes')
-    const old = new Date(Date.now() - STALE)
-    utimesSync(topicDir, old, old)
-    await h.ctxState.workspaces.registry.create(workspaceDir, '飞书群聊 · oc_topic_ws · ou_owner')
-    const record: RouteRecord = {
-      key: 'omt_topic',
-      kind: 'thread',
-      sessionId: 'session-topic',
-      chatId: 'oc_topic_ws',
-      chatType: 'group',
-      senderOpenId: 'ou_owner',
-      workspacePath: workspaceDir,
-      sessionDir: topicDir,
-      cardMessageId: 'om_topic_card',
-      createdAt: old.getTime(),
-      lastActivityAt: old.getTime(),
-      sessionHistory: [{ sessionId: 'session-topic', createdAt: old.getTime() }],
-    }
-    await h.ctxState.domain.raw.table('routes').put(record.key, record)
-
-    const preview = await h.service.cleanupPreview()
-    expect(preview.workspaces).toBe(1)
-    expect(preview.candidates).toBe(1)
-    expect(preview.candidateBytes).toBeGreaterThan(0)
-
-    const result = await h.service.runWorkspaceCleanup()
-    expect(result.ok).toBe(true)
-    expect(result.deletedWorkspaces).toBe(0)
-    expect(result.deletedSessionDirs).toBe(1)
-    expect(result.retiredRoutes).toBe(1)
-    expect(existsSync(topicDir)).toBe(false)
-    expect(existsSync(workspaceDir)).toBe(true)
-    // The user workspace stays registered; the old topic is tombstoned.
-    expect(h.ctxState.workspaces.workspaces.get(workspaceDir)).toBeDefined()
-    expect(h.ctxState.domain.raw.table('routes').get(record.key)).toBeUndefined()
-    expect(h.ctxState.domain.raw.table('expired_routes').get(record.key)).toMatchObject({
-      workspacePath: workspaceDir,
-      sessionDir: topicDir,
-    })
-    await h.service.shutdown()
-  })
-
-  it('never offers a topic directory whose session is still live', async () => {
-    const h = await setup({ workspaceRetention: '7d' })
-    await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_live_ws', senderId: 'ou_owner',
-      messageId: 'om_live_ws', content: '开始',
-    }))
-    await waitForEstablishedSession(h)
-    const record = [...(h.ctxState.domain.raw.table('routes').entries() as Iterable<[string, RouteRecord]>)]
-      .map(([, value]) => value)[0]!
-    const topicDir = sessionDirOf(record)
-    const old = new Date(Date.now() - STALE)
-    utimesSync(topicDir, old, old)
-    await h.ctxState.domain.raw.table('routes').put(record.key, {
-      ...record, lastActivityAt: old.getTime(),
-    })
-
-    const preview = await h.service.cleanupPreview()
-    expect(preview.candidates).toBe(0)
-    const result = await h.service.runWorkspaceCleanup()
-    expect(result.deletedSessionDirs).toBe(0)
-    expect(existsSync(topicDir)).toBe(true)
-    await h.service.shutdown()
-  })
-
-  it('refuses to run while retention is off', async () => {
-    const h = await setup({ workspaceRetention: 'off' })
-    const preview = await h.service.cleanupPreview()
-    expect(preview.candidates).toBe(0)
-    expect(preview.thresholdMs).toBeUndefined()
-    const result = await h.service.runWorkspaceCleanup()
-    expect(result.ok).toBe(false)
-    expect(result.error).toContain('off')
-    await h.service.shutdown()
-  })
-})
-
 describe('/history enrichment', () => {
   it('annotates history entries with host titles', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_hist', senderId: 'ou_owner', content: '开始',
+      chatType: 'group', chatId: 'oc_hist', senderId: 'u_owner', content: '开始',
     }))
     await waitForEstablishedSession(h)
 
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_hist', senderId: 'ou_owner', threadId: 'omt_1',
+      chatType: 'group', chatId: 'oc_hist', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_hist', content: '/history',
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
@@ -4734,13 +5160,13 @@ describe('/history enrichment', () => {
   it('still renders history when the title lookup fails', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_hist_fail', senderId: 'ou_owner', content: '开始',
+      chatType: 'group', chatId: 'oc_hist_fail', senderId: 'u_owner', content: '开始',
     }))
     await waitForEstablishedSession(h)
     h.ctxState.sessionQuery.readTitleSnapshots.mockRejectedValueOnce(new Error('query unavailable'))
 
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_hist_fail', senderId: 'ou_owner', threadId: 'omt_1',
+      chatType: 'group', chatId: 'oc_hist_fail', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_hist_fail', content: '/history',
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))

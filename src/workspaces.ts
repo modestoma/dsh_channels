@@ -2,27 +2,29 @@
  * Workspace directory resolution: one DSH workspace per user, one working
  * directory per Feishu topic.
  *
- * - p2p:   workspace `<baseDir>/p2p/<open_id>/`
- * - group: workspace `<baseDir>/groups/<chat_id>/<open_id>/`
+ * - p2p:   workspace `<baseDir>/p2p/<user_id>/`
+ * - group: workspace `<baseDir>/groups/<chat_id>/<user_id>/`
  * - topic: `<workspace>/topics/<topic-token>/` (the Session's effective cwd)
+ * - log-platform analysis: workspace `<baseDir>/analyze/<app>/<errorCode>/`
  *
  * The workspace root is the Session header cwd: it keeps the Session grouped
  * under the user's project in the GUI and stays the sandbox write boundary.
  * The per-topic directory is where the tools actually work (see
  * `./session/isolation.ts`), so files produced by different topics never mix.
  * Older versions registered one workspace per topic under `<baseDir>/topics/`;
- * those directories are kept verbatim for legacy routes and are only removed
- * by the retention cleanup, never migrated.
+ * those directories are kept verbatim for legacy routes and never migrated.
+ * The plugin never deletes workspace or topic directories; operators remove
+ * stale ones by hand (a missing topic directory is recreated on the next turn).
  *
  * Attachments received before a topic exists were staged by older plugin
- * versions below `<baseDir>/_staging/<chatType>/<chat_id>/<open_id>/` and
+ * versions below `<baseDir>/_staging/<chatType>/<chat_id>/<user_id>/` and
  * adopted into the topic directory once its first Session is created. The v2
  * pipeline stores inbound attachments in the DSH native attachment library and
  * never writes staging, so this is a one-release compatibility path only: it is
  * scheduled for removal in the release cycle after attachment_pipeline_v2 ships
  * (see Roadmap decisions D12 and docs/attachment-pipeline-v2.md).
  *
- * Feishu ids (`ou_…`, `oc_…`) are safe path segments, but they are validated
+ * Feishu ids (`user_id`, `oc_…`) are safe path segments, but they are validated
  * anyway so a hostile id can never escape `baseDir`.
  *
  * @module dsh-channels/workspaces
@@ -145,8 +147,8 @@ export function worktreeBranchFor(topicToken: string): string {
  * Deterministic workspace directory for one user in one chat context: the
  * durable project the user's Sessions are grouped under.
  *
- * - p2p:   `<baseDir>/p2p/<open_id>/`
- * - group: `<baseDir>/groups/<chat_id>/<open_id>/`
+ * - p2p:   `<baseDir>/p2p/<user_id>/`
+ * - group: `<baseDir>/groups/<chat_id>/<user_id>/`
  *
  * These are the same paths older versions used as their shared (user × chat)
  * workspaces, so an upgraded deployment reuses the existing registry record
@@ -156,9 +158,9 @@ export function workspacePathFor(
   baseDir: string,
   chatType: 'p2p' | 'group',
   chatId: string,
-  senderOpenId: string,
+  senderUserId: string,
 ): string {
-  const user = safeSegment(senderOpenId, 'senderOpenId')
+  const user = safeSegment(senderUserId, 'senderUserId')
   if (chatType === 'p2p') return path.join(baseDir, 'p2p', user)
   return path.join(baseDir, 'groups', safeSegment(chatId, 'chatId'), user)
 }
@@ -169,19 +171,10 @@ export function topicDirFor(workspacePath: string, topicToken: string): string {
 }
 
 /**
- * Root of the legacy (one workspace per topic) directories. Legacy workspaces
- * live strictly below this path, which is how the retention cleanup tells them
- * apart from user workspaces that must never be deleted.
- */
-export function legacyTopicWorkspaceRoot(baseDir: string): string {
-  return path.join(baseDir, 'topics')
-}
-
-/**
  * Legacy pre-topic attachment staging root.
  *
- * Only older plugin versions wrote here; the v2 native pipeline never does and
- * the retention cleanup never deletes it. Scheduled for removal together with
+ * Only older plugin versions wrote here; the v2 native pipeline never does.
+ * Scheduled for removal together with
  * the one-time adoption in the release cycle after attachment_pipeline_v2
  * (decisions D12).
  *
@@ -203,10 +196,10 @@ export function stagingPathFor(
   baseDir: string,
   chatType: 'p2p' | 'group',
   chatId: string,
-  senderOpenId: string,
+  senderUserId: string,
 ): string {
   const chat = safeSegment(chatId, 'chatId')
-  const user = safeSegment(senderOpenId, 'senderOpenId')
+  const user = safeSegment(senderUserId, 'senderUserId')
   return path.join(stagingRoot(baseDir), chatType, chat, user)
 }
 
@@ -214,11 +207,11 @@ export function stagingPathFor(
 export function workspaceTitleFor(
   chatType: 'p2p' | 'group',
   chatId: string,
-  senderOpenId: string,
+  senderUserId: string,
 ): string {
   return chatType === 'p2p'
-    ? `飞书私聊 · ${senderOpenId}`
-    : `飞书群聊 · ${chatId} · ${senderOpenId}`
+    ? `飞书私聊 · ${senderUserId}`
+    : `飞书群聊 · ${chatId} · ${senderUserId}`
 }
 
 /**
@@ -231,12 +224,42 @@ export async function ensureWorkspace(
   baseDir: string,
   chatType: 'p2p' | 'group',
   chatId: string,
-  senderOpenId: string,
+  senderUserId: string,
 ): Promise<Workspace> {
-  const dir = workspacePathFor(baseDir, chatType, chatId, senderOpenId)
+  const dir = workspacePathFor(baseDir, chatType, chatId, senderUserId)
   await mkdir(dir, { recursive: true })
   return ctx.workspaceRegistry.create(
     dir,
-    workspaceTitleFor(chatType, chatId, senderOpenId),
+    workspaceTitleFor(chatType, chatId, senderUserId),
   )
+}
+
+/**
+ * Workspace directory of one log-platform analysis subject:
+ * `<baseDir>/analyze/<app>/<errorCode>/`. Every analysis of the same
+ * application and error code is grouped there, each in its own topic
+ * directory.
+ */
+export function analyzeWorkspacePathFor(baseDir: string, app: string, errorCode: string): string {
+  return path.join(baseDir, 'analyze', safeSegment(app, 'app'), safeSegment(errorCode, 'errorCode'))
+}
+
+/** Workspace title of one analysis subject in the DSH workspace list. */
+export function analyzeWorkspaceTitleFor(app: string, errorCode: string): string {
+  return `日志分析 · ${app} · ${errorCode}`
+}
+
+/**
+ * Ensure one analysis subject's workspace exists and is registered (idempotent
+ * like {@link ensureWorkspace}).
+ */
+export async function ensureAnalyzeWorkspace(
+  ctx: HostContext,
+  baseDir: string,
+  app: string,
+  errorCode: string,
+): Promise<Workspace> {
+  const dir = analyzeWorkspacePathFor(baseDir, app, errorCode)
+  await mkdir(dir, { recursive: true })
+  return ctx.workspaceRegistry.create(dir, analyzeWorkspaceTitleFor(app, errorCode))
 }

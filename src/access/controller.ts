@@ -6,14 +6,15 @@
  * matrix lives in `policy.ts`; this module owns the user-facing behavior on
  * denial:
  *
- *  - private chats: non-administrators get one fixed notice (10 s per-sender
+ *  - private chats: denied senders (non-administrators, or non-whitelisted
+ *    users with `dmAllowWhitelist`) get one fixed notice (10 s per-sender
  *    cooldown); with no administrator configured they get the bootstrap
  *    notice instead;
  *  - group chats: fully silent, except that addressed denials call back into
  *    the authorization-request lifecycle so the administrator can be asked;
  *  - slash commands: `/userid` stays available to every private sender, the
  *    administrator's commands always pass (including inside an unauthorized
- *    group), everything else must pass admission.
+ *    group), everything else must pass admission (in private chats too).
  *
  * The controller never creates a Session or a workspace.
  *
@@ -23,15 +24,18 @@
 import type { FeishuConfig } from '../config.ts'
 import type { RouteRecord } from '../domain.ts'
 import type { FeishuChannel, NormalizedMessage } from '../feishu-channel.ts'
-import { decideAccess, isAdminOpenId } from './policy.ts'
+import { decideAccess, isAdminUserId } from './policy.ts'
 import type { AccessDecision } from './policy.ts'
 import type { AccessStore, AccessStoreSnapshot } from './store.ts'
 
 /** Fixed private-chat notice for non-administrators (no model call). */
-export const DM_DENY_TEXT = '非管理员禁用私聊功能哦～如需使用，请在管理员授权的群里 @ 我；或联系管理员把你的 open_id 加入白名单。'
+export const DM_DENY_TEXT = '非管理员禁用私聊功能哦～如需使用，请在管理员授权的群里 @ 我；或联系管理员把你的 user_id 加入白名单。'
+
+/** Fixed private-chat notice for non-whitelisted users while `dmAllowWhitelist` is on. */
+export const DM_DENY_WHITELIST_TEXT = '你还不在白名单里，暂时不能私聊哦～发送 /userid 查看你的 user_id，请管理员加入白名单后即可使用。'
 
 /** Fixed private-chat notice while no administrator is configured. */
-export const DM_UNCONFIGURED_TEXT = '机器人尚未配置管理员。发送 /userid 可查看你的 open_id，交给部署者配置后即可启用。'
+export const DM_UNCONFIGURED_TEXT = '机器人尚未配置管理员。发送 /userid 可查看你的 user_id，交给部署者配置后即可启用。'
 
 /** Per-sender cooldown for the repeated private-chat notice (10 s). */
 const DM_NOTICE_COOLDOWN_MS = 10_000
@@ -55,7 +59,7 @@ export interface AccessControllerDeps {
 }
 
 export class AccessController {
-  /** sender open_id → last fixed-notice delivery instant (DM spam guard). */
+  /** sender user_id → last fixed-notice delivery instant (DM spam guard). */
   private readonly dmNoticeAt = new Map<string, number>()
 
   constructor(private readonly deps: AccessControllerDeps) {}
@@ -68,9 +72,9 @@ export class AccessController {
     return this.deps.now?.() ?? Date.now()
   }
 
-  /** True when `openId` is exactly the configured administrator. */
-  isAdmin(openId?: string): boolean {
-    return isAdminOpenId(this.config(), openId)
+  /** True when `userId` is exactly the configured administrator. */
+  isAdmin(userId?: string): boolean {
+    return isAdminUserId(this.config(), userId)
   }
 
   /** Current whitelist snapshot used by the pure policy. */
@@ -123,8 +127,9 @@ export class AccessController {
   /**
    * Slash-command admission. Runs before any command card/topic/Session side
    * effect. `open` mode keeps the legacy behavior; otherwise private chats
-   * stay administrator-only (with `/userid` as the bootstrap exception) and
-   * group chats must pass the full admission matrix; the administrator is
+   * admit whoever the admission matrix admits (with `/userid` as the
+   * bootstrap exception) and group chats must pass the full admission
+   * matrix; the administrator is
    * never constrained by the whitelists, so all of their commands pass even
    * inside an unauthorized group (`/auth` is the in-conversation grant
    * entry).
@@ -134,9 +139,9 @@ export class AccessController {
     try {
       if (msg.chatType === 'p2p') {
         // `/userid` is the bootstrap entry for everyone: it only echoes the
-        // sender's own open_id and has no storage/model side effect.
+        // sender's own user_id and has no storage/model side effect.
         if (commandName === 'userid') return true
-        if (this.isAdmin(msg.senderId)) return true
+        if (this.decide(msg).kind === 'allow') return true
         await this.noticeDeniedDm(msg)
         return false
       }
@@ -156,7 +161,38 @@ export class AccessController {
    * execution inside someone else's topic.
    */
   ownsRoute(msg: NormalizedMessage, record: RouteRecord): boolean {
-    return record.senderOpenId === msg.senderId && record.chatId === msg.chatId
+    return this.mayActOnRoute(msg.senderId, msg.chatId, record)
+  }
+
+  /**
+   * Whether `userId`, acting in `chatId`, may continue or decide for the
+   * route's Session: the route owner, or, on a group-shared route
+   * (`record.shared`), any user the admission matrix allows in that chat.
+   * @param userId - Feishu user_id of the actor.
+   * @param chatId - chat the action comes from (must be the route's chat).
+   * @param record - the route acted on.
+   * @returns true when the action is allowed.
+   */
+  mayActOnRoute(userId: string | undefined, chatId: string, record: RouteRecord): boolean {
+    if (userId === undefined || record.chatId !== chatId) return false
+    if (record.senderUserId === userId) return true
+    if (record.shared !== true) return false
+    return decideAccess(
+      { chatType: record.chatType, chatId, senderId: userId },
+      this.config(),
+      this.deps.store.snapshot(),
+    ).kind === 'allow'
+  }
+
+  /**
+   * Whether the analyze API may post into `chatId`: an authorized group, or
+   * any group in `open` access mode.
+   * @param chatId - target group chat id.
+   * @returns true when the chat is a permitted target.
+   */
+  mayAnalyzeIn(chatId: string): boolean {
+    if (this.config().accessMode === 'open') return true
+    return this.deps.store.snapshot().groups.has(chatId)
   }
 
   /** Drop in-memory notices (shutdown; durable state lives in the store). */
@@ -176,7 +212,10 @@ export class AccessController {
     const last = this.dmNoticeAt.get(msg.senderId)
     if (last !== undefined && now - last < DM_NOTICE_COOLDOWN_MS) return
     this.dmNoticeAt.set(msg.senderId, now)
-    const text = this.config().adminOpenId === undefined ? DM_UNCONFIGURED_TEXT : DM_DENY_TEXT
+    const config = this.config()
+    const text = config.adminUserId === undefined
+      ? DM_UNCONFIGURED_TEXT
+      : config.dmAllowWhitelist ? DM_DENY_WHITELIST_TEXT : DM_DENY_TEXT
     await this.sendText(msg.chatId, text, msg.messageId)
   }
 

@@ -14,10 +14,10 @@ import type {
   AgentHandle, AttachmentStore, ContentBlock, HostContext, SessionId, UserMessage, Workspace,
 } from '../dsh-types.ts'
 import type { AttachmentStoreMode, FeishuConfig } from '../config.ts'
-import { buildCard, buildOnboardingCard, initialStreamingCard } from '../cards.ts'
+import { buildCard, buildOnboardingCard, initialStreamingCard, queuedStreamingCard } from '../cards.ts'
 import { RouteOperationQueue } from '../commands.ts'
 import { chatRouteKey, sessionDirOf } from '../domain.ts'
-import type { FeishuDomainHandle, PendingAttachmentRecord, RouteRecord } from '../domain.ts'
+import type { FeishuDomainHandle, RouteRecord } from '../domain.ts'
 import type { CardDelivery } from '../feishu/delivery.ts'
 import {
   adoptStagedAttachments, attachmentsDir, attachmentResources, hasAttachmentPayload,
@@ -31,10 +31,10 @@ import {
   InboundAttachmentStore, NativeAttachmentStore, effectiveAttachmentMode,
 } from '../feishu/native-attachments.ts'
 import type { InboundAttachmentStoreResult } from '../feishu/native-attachments.ts'
-import type { PendingAttachmentScope, PendingAttachmentStore } from '../feishu/pending-attachments.ts'
 import type { KnownAttachmentMessageInput, KnownAttachmentSource } from '../feishu/tools.ts'
 import type { FeishuChannel, NormalizedMessage } from '../feishu-channel.ts'
 import type { QuestionAnswerer } from '../interactions/questions.ts'
+import type { ApprovalAnswerer, ApprovalTextResult } from '../interactions/approvals.ts'
 import type { InflightRepair } from '../session/repair.ts'
 import type { SessionManager } from '../session/manager.ts'
 import type { RouteStore } from '../session/routes.ts'
@@ -47,7 +47,13 @@ import { ensureWorkspace, stagingPathFor, topicTokenFor } from '../workspaces.ts
 
 /** The command plane the inbound router delegates admission-time work to. */
 export interface CommandPlanePort {
-  /** Slash-command admission + dispatch. */
+  /**
+   * Whether a `/`-prefixed line names a channel command (including aliases).
+   * Other slash lines are ordinary prompts, so DSH can expand user-invocable
+   * skills such as `/guanxiang`.
+   */
+  owns(line: string): boolean
+  /** Slash-command admission + dispatch for a line {@link owns} accepted. */
   handleSlash(msg: NormalizedMessage, line: string): Promise<void>
 }
 
@@ -120,12 +126,10 @@ export interface InboundDeps {
   nativeAttachments(): AttachmentStore | undefined
   /** Backend-selecting archive/fallback store (legacy workspace download). */
   attachmentStore: InboundAttachmentStore
-  /** Durable metadata registry for silently registered attachments. */
-  pendingAttachments: PendingAttachmentStore
   /**
    * Pre-authorize a message's attachments for `feishu_attachment_fetch`:
-   * `trigger` (the triggering message) by default, `quote`/`history` for the
-   * messages this turn's excerpt/history blocks name.
+   * `trigger` (the triggering message) by default, `quote`/`history`/`recent`
+   * for the messages this turn's excerpt, history and manifest blocks name.
    */
   noteKnownAttachments(
     record: RouteRecord,
@@ -133,9 +137,9 @@ export interface InboundDeps {
     source?: KnownAttachmentSource,
   ): void
   /**
-   * Read-only message access: quoted-message excerpt and first-turn topic
-   * history. Failures degrade silently to a `undefined` value (never a throw
-   * into the turn).
+   * Read-only message access: quoted-message excerpt, first-turn topic
+   * history, and recent attachment messages. Failures degrade silently to an
+   * absent value (never a throw into the turn).
    */
   messageRead: InboundMessageReadPort
   /** Live image-prefetch policy for triggering messages. */
@@ -146,7 +150,15 @@ export interface InboundDeps {
   queue: RouteOperationQueue
   streamer(): TurnStreamer | undefined
   questionAnswerer(): QuestionAnswerer | undefined
+  approvalAnswerer(): ApprovalAnswerer | undefined
   commands: CommandPlanePort
+}
+
+/** Confirmation line for each keyword approval reply. */
+const APPROVAL_TEXT_REPLIES: Record<Exclude<ApprovalTextResult, 'superseded'>, string> = {
+  allowed: '已允许本次操作。',
+  remembered: '已允许，本话题内同类操作不再询问。',
+  denied: '已拒绝本次操作。',
 }
 
 /**
@@ -194,7 +206,7 @@ export function knownAttachmentMessageOf(msg: NormalizedMessage): KnownAttachmen
     messageId: msg.messageId,
     kind: forwarded ? 'merge_forward' : 'message',
     resources,
-    senderOpenId: msg.senderId,
+    senderUserId: msg.senderId,
   }
 }
 
@@ -211,12 +223,30 @@ interface TurnReadContext {
   historyBlock?: string
 }
 
-/** First-turn-only inputs of the prompt assembly. */
+/** Per-turn inputs of the prompt assembly. */
 interface TurnDeliveryOptions {
   /** New Session's first turn: attach the bounded topic history bootstrap. */
   firstTurn?: boolean
-  /** Message ids never shown in the history block (trigger + streaming card). */
+  /**
+   * Message ids never shown in the history block or listed as recent
+   * attachments (trigger + streaming card).
+   */
   excludeMessageIds?: readonly string[]
+}
+
+/**
+ * Register one release gate under `key` in `gates`. The returned closer
+ * resolves the gate and removes it only while it is still the registered one.
+ */
+function openGate(gates: Map<string, { promise: Promise<void>; release(): void }>, key: string): () => void {
+  let settle!: () => void
+  const promise = new Promise<void>((resolve) => { settle = resolve })
+  const release = (): void => {
+    if (gates.get(key)?.promise === promise) gates.delete(key)
+    settle()
+  }
+  gates.set(key, { promise, release })
+  return release
 }
 
 export class InboundRouter {
@@ -242,6 +272,13 @@ export class InboundRouter {
    * racing it, otherwise the topic's turns reach the model out of order.
    */
   private readonly firstDeliveries = new Map<string, { promise: Promise<void>; release(): void }>()
+  /**
+   * topic id → reservation by an external starter (the analyze launcher) that
+   * opened the topic but has not published its route yet. A reply in the topic
+   * waits for the release and then routes against the published record, or
+   * falls through as an unbound topic when the start failed.
+   */
+  private readonly reservedTopics = new Map<string, { promise: Promise<void>; release(): void }>()
 
   constructor(private readonly deps: InboundDeps) {}
 
@@ -253,10 +290,10 @@ export class InboundRouter {
   private get delivery(): CardDelivery { return this.deps.delivery }
   private get sessions(): SessionManager { return this.deps.sessions }
   private get attachmentStore(): InboundAttachmentStore { return this.deps.attachmentStore }
-  private get pendingAttachments(): PendingAttachmentStore { return this.deps.pendingAttachments }
   private get routeOperations(): RouteOperationQueue { return this.deps.queue }
   private get streamer(): TurnStreamer | undefined { return this.deps.streamer() }
   private get questionAnswerer(): QuestionAnswerer | undefined { return this.deps.questionAnswerer() }
+  private get approvalAnswerer(): ApprovalAnswerer | undefined { return this.deps.approvalAnswerer() }
   private get domain(): FeishuDomainHandle | undefined { return this.deps.domain() }
   private get access(): InboundAccessPort { return this.deps.access }
 
@@ -273,14 +310,7 @@ export class InboundRouter {
    * observes its gate. The returned closer must be called exactly once.
    */
   private openDeliveryGate(key: string): () => void {
-    let settle!: () => void
-    const promise = new Promise<void>((resolve) => { settle = resolve })
-    const release = (): void => {
-      if (this.firstDeliveries.get(key)?.promise === promise) this.firstDeliveries.delete(key)
-      settle()
-    }
-    this.firstDeliveries.set(key, { promise, release })
-    return release
+    return openGate(this.firstDeliveries, key)
   }
 
   /** Wait for the in-flight first followup of a route, when one is pending. */
@@ -289,7 +319,19 @@ export class InboundRouter {
     if (pending !== undefined) await pending.promise.catch(() => undefined)
   }
 
-/**
+  /**
+   * Reserve one topic whose route is about to be published by an external
+   * starter. Replies in the topic wait until the returned closer runs; the
+   * closer must be called exactly once, after the route (and its first turn)
+   * is published or the start was abandoned.
+   * @param threadId - the topic id.
+   * @returns the closer releasing waiting replies.
+   */
+  reserveTopic(threadId: string): () => void {
+    return openGate(this.reservedTopics, threadId)
+  }
+
+  /**
    * Send the one-time onboarding card for a private chat, then remember the
    * chat in the domain global. Best-effort: a storage failure only risks a
    * repeated card, never a blocked session.
@@ -318,12 +360,12 @@ export class InboundRouter {
     // first-turn delivery never stays suspended across a teardown.
     for (const entry of [...this.firstDeliveries.values()]) entry.release()
     this.firstDeliveries.clear()
+    for (const entry of [...this.reservedTopics.values()]) entry.release()
+    this.reservedTopics.clear()
   }
 
   /** Entry point: one normalized inbound message. */
   async handle(msg: NormalizedMessage): Promise<void> {
-    const botId = this.delivery.requireChannel().botOpenId()
-    if (botId !== undefined && msg.senderId === botId) return
     if (msg.chatType !== 'p2p' && msg.chatType !== 'group') return
     let content = (msg.content ?? '').trim()
     if (content === '') return
@@ -350,10 +392,12 @@ export class InboundRouter {
       this.ctx.logger?.warn?.('dsh-channels: recording processed message %s failed: %s', msg.messageId, String(error))
     }
 
-    // Slash admission stays behind message-id dedup but ahead of every route,
-    // mention, workspace, Session, card-stream, and model side effect. The
-    // command plane applies its own administrator/bootstrap rules.
-    if (content.startsWith('/')) {
+    // Channel-command admission stays behind message-id dedup but ahead of
+    // every route, mention, workspace, Session, card-stream, and model side
+    // effect. The command plane applies its own administrator/bootstrap rules.
+    // A slash line that names no channel command continues as an ordinary
+    // prompt through the channel-plane admission below.
+    if (content.startsWith('/') && this.deps.commands.owns(content)) {
       await this.deps.commands.handleSlash(msg, content)
       return
     }
@@ -362,6 +406,14 @@ export class InboundRouter {
     // whitelist). Nothing below this point may run for a denied sender: no
     // TTL tombstone, attachment archive, workspace, Session, or model call.
     if (!(await this.access.admit(msg))) return
+
+    // A reserved topic has no route yet: wait for its starter so the TTL,
+    // attachment, mention, and route decisions below see the published record.
+    const reservation = msg.threadId === undefined ? undefined : this.reservedTopics.get(msg.threadId)
+    if (reservation !== undefined) {
+      await reservation.promise
+      if (!this.started) return
+    }
 
     // Enforce TTL at admission as well as in the periodic sweep. A message that
     // arrives after the deadline must not get one chance to revive the route
@@ -399,24 +451,26 @@ export class InboundRouter {
       }
     } else {
       // Native pipeline: classify without downloading. Attachment-only
-      // messages and messages that cannot start a turn are silently registered
-      // (no reply, no reaction, no Session); a mixed caption becomes the prompt
-      // with its placeholders stripped.
+      // messages and messages that cannot start a turn stay inert (no reply,
+      // no reaction, no Session); a mixed caption becomes the prompt with its
+      // placeholders stripped.
       const state = inboundAttachmentState(msg)
       if (state.hasPayload) {
-        const resolution = await this.resolveNativeAttachmentMessage(msg, state)
+        const resolution = this.resolveNativeAttachmentMessage(msg, state)
         if (resolution.kind === 'silent') return
         content = resolution.text
         if (content === '') return
       }
     }
 
+    // A session blocked on an approval card reads the owner's reply as the
+    // decision; any other text rejects the card and continues below as the
+    // next instruction.
+    if (await this.tryAnswerPendingApproval(msg, content)) return
+
     // A session blocked on `ask_user_question` has no other use for an inbound
     // text message: the next reply becomes the free-text answer.
-    if (await this.tryAnswerPendingQuestion(msg, content)) {
-      await this.registerConsumedTriggerAttachments(msg)
-      return
-    }
+    if (await this.tryAnswerPendingQuestion(msg, content)) return
 
     // 1. Real topic route first (works without a mention, per product spec).
     if (msg.threadId !== undefined) {
@@ -571,75 +625,31 @@ export class InboundRouter {
   /**
    * Native-pipeline attachment decision for one message, without downloading.
    *
-   * Returns `{ kind: 'silent' }` when the message must stay inert (metadata
-   * registration only: no reply, no reaction, no Session, no download) and
-   * `{ kind: 'prompt', text }` when a model turn starts with this text. The
-   * caller keeps the message flowing through the normal route decision tree.
+   * Returns `{ kind: 'silent' }` when the message must stay inert (no reply,
+   * no reaction, no Session, no download, no local state; a later turn finds
+   * it through the recent-attachment read) and `{ kind: 'prompt', text }` when
+   * a model turn starts with this text. The caller keeps the message flowing
+   * through the normal route decision tree.
    */
-  private async resolveNativeAttachmentMessage(
+  private resolveNativeAttachmentMessage(
     msg: NormalizedMessage,
     state: InboundAttachmentState,
-  ): Promise<{ kind: 'silent' } | { kind: 'prompt'; text: string }> {
-    // A foreign sender's attachment never registers (and is dropped later by
-    // the route-ownership checks): silent metadata must stay per-sender.
-    const threadRecord = msg.threadId === undefined ? undefined : this.routes.get(msg.threadId)
-    const chatKey = chatRouteKey(msg.chatType, msg.chatId, msg.senderId)
-    const chatRecord = threadRecord === undefined ? this.routes.get(chatKey) : undefined
-    const foreign = (threadRecord !== undefined && !this.access.ownsRoute(msg, threadRecord))
-      || (chatRecord !== undefined && !this.access.ownsRoute(msg, chatRecord))
-    if (foreign) return { kind: 'prompt', text: state.text }
-
-    if (!this.config.acceptAttachments && state.attachmentOnly) return { kind: 'silent' }
-    if (state.attachmentOnly) {
-      await this.registerSilentAttachment(msg)
-      return { kind: 'silent' }
-    }
+  ): { kind: 'silent' } | { kind: 'prompt'; text: string } {
+    if (state.attachmentOnly) return { kind: 'silent' }
     if (!this.config.acceptAttachments) return { kind: 'prompt', text: state.text }
 
     // Group messages without an @-mention (and without an already-bound topic)
-    // never start a turn, but their attachments must remain discoverable from
-    // the topic a later @-mentioned message creates (Roadmap AC-4).
-    const pendingEstablishment = this.establishing.get(chatKey)
+    // never start a turn; their attachments stay discoverable from the topic a
+    // later @-mentioned message creates (Roadmap AC-4).
+    const threadRecord = msg.threadId === undefined ? undefined : this.routes.get(msg.threadId)
+    const chatKey = chatRouteKey(msg.chatType, msg.chatId, msg.senderId)
+    const chatRecord = threadRecord === undefined ? this.routes.get(chatKey) : undefined
     const requiresMention = msg.chatType === 'group' && this.config.requireMention && !msg.mentionedBot
     const triggers = threadRecord !== undefined || chatRecord !== undefined
-      || pendingEstablishment !== undefined || !requiresMention
-    if (!triggers) {
-      await this.registerSilentAttachment(msg)
-      return { kind: 'silent' }
-    }
-    return { kind: 'prompt', text: state.text }
+      || this.establishing.has(chatKey) || !requiresMention
+    return triggers ? { kind: 'prompt', text: state.text } : { kind: 'silent' }
   }
 
-  /**
-   * Record attachment metadata without any side effect beyond the durable
-   * registry write. Never replies, reacts, downloads, or establishes a Session.
-   */
-  private async registerSilentAttachment(msg: NormalizedMessage): Promise<void> {
-    if (!this.config.acceptAttachments) return
-    // `admitted: true` is safe because every call site runs after
-    // `access.admit` returned true; the registry itself has no admission policy.
-    try {
-      await this.pendingAttachments.registerMessage(msg, { admitted: true })
-    } catch (error) {
-      // Metadata only: a registry failure must never fail the inbound pipeline.
-      this.ctx.logger?.warn?.(
-        'dsh-channels: registering pending attachment metadata for %s failed: %s',
-        msg.messageId, String(error),
-      )
-    }
-  }
-
-  /**
-   * A native-pipeline message whose caption was consumed as a structured
-   * question answer starts no model turn, so its attachments would otherwise
-   * vanish from the conversation. Register them silently for later turns;
-   * the archive backend already downloaded them before question interception.
-   */
-  private async registerConsumedTriggerAttachments(msg: NormalizedMessage): Promise<void> {
-    if (this.attachmentBackend() !== 'native') return
-    if (!inboundAttachmentState(msg).hasPayload) return
-    await this.registerSilentAttachment(msg)
-  }
   /**
    * Build the first-turn user message for the native pipeline: the caption
    * text, the quoted-message excerpt, the prefetched trigger images, the
@@ -715,17 +725,6 @@ export class InboundRouter {
     if (context.quoteBlock !== undefined) blocks.push({ type: 'text', text: context.quoteBlock })
     blocks.push(...prefetchedBlocks)
 
-    let pending: readonly PendingAttachmentRecord[] = []
-    if (attachmentPipeline) {
-      try {
-        pending = this.pendingAttachments.list(this.pendingScopeOfRecord(record))
-      } catch (error) {
-        this.ctx.logger?.warn?.(
-          'dsh-channels: listing pending attachments for %s failed: %s',
-          record.key, String(error),
-        )
-      }
-    }
     const manifest = attachmentPipeline
       ? buildFeishuContextBlock({
         trigger: triggerManifestAttachments(msg, loadedFileKeys),
@@ -735,7 +734,6 @@ export class InboundRouter {
         ...(context.quoteMessage === undefined
           ? {}
           : { quote: manifestEntriesOfKnownMessage(context.quoteMessage) }),
-        pending,
       })
       : ''
     if (manifest !== '') blocks.push({ type: 'text', text: manifest })
@@ -903,16 +901,6 @@ export class InboundRouter {
     }
   }
 
-
-  /** Pending-registry isolation scope for one persisted route. */
-  private pendingScopeOfRecord(record: RouteRecord): PendingAttachmentScope {
-    return {
-      chatId: record.chatId,
-      senderOpenId: record.senderOpenId,
-      ...(record.kind === 'thread' ? { threadId: record.key } : {}),
-    }
-  }
-
   /** Live channel accessor for best-effort prefetch; undefined when gone. */
   private liveChannel(): FeishuChannel | undefined {
     try {
@@ -920,6 +908,28 @@ export class InboundRouter {
     } catch {
       return undefined
     }
+  }
+
+  /**
+   * Consume one plain reply as an approval decision. Only the topic owner's
+   * replies in a session with an undecided approval card are intercepted.
+   * @returns true when the reply was a keyword decision and is fully handled;
+   * false when nothing was pending or the reply rejected the pending cards and
+   * must still be delivered as the next instruction.
+   */
+  private async tryAnswerPendingApproval(msg: NormalizedMessage, content: string): Promise<boolean> {
+    const answerer = this.approvalAnswerer
+    if (answerer === undefined || answerer.pendingCount() === 0) return false
+    const route = await this.commandRoute(msg)
+    if (route === undefined || !this.access.ownsRoute(msg, route)) return false
+    if (!answerer.hasPendingFor(route.sessionId)) return false
+    const result = answerer.submitText(route.sessionId, content)
+    if (result === undefined || result === 'superseded') return false
+    await this.delivery.commandCard(msg, {
+      kind: 'success', command: 'approval', sessionId: route.sessionId,
+      text: APPROVAL_TEXT_REPLIES[result],
+    }, { createThread: false })
+    return true
   }
 
   /**
@@ -1086,7 +1096,7 @@ export class InboundRouter {
       sessionId,
       chatId: msg.chatId,
       chatType: msg.chatType,
-      senderOpenId: msg.senderId,
+      senderUserId: msg.senderId,
       workspacePath: workspace.path,
       sessionDir: placement.sessionDir,
       ...(placement.worktreeBranch === undefined ? {} : { worktreeBranch: placement.worktreeBranch }),
@@ -1147,7 +1157,12 @@ export class InboundRouter {
     // deployment follow its next turn (one-time legacy adoption, D12).
     await this.adoptLegacyStagedAttachments(msg, placement.sessionDir, warn)
 
-    const sent = await this.delivery.replyFirstCard(msg, initialStreamingCard(current.sessionId))
+    // A message behind a running turn opens as a queued card whose button can
+    // move it into that turn instead (see `TurnStreamer.mergeQueued`).
+    const firstCard = this.streamer?.hasLiveTurn(current.sessionId) === true
+      ? queuedStreamingCard(current.sessionId)
+      : initialStreamingCard(current.sessionId)
+    const sent = await this.delivery.replyFirstCard(msg, firstCard)
     const typingId = await typingPromise
 
     // Repair snapshot first — same crash-window reasoning as `startSession`.
@@ -1167,7 +1182,10 @@ export class InboundRouter {
       cardMessageId: sent.messageId,
       lastActivityAt: Date.now(),
     })
-    this.streamer?.attach(live.agent.session, sent.messageId, msg.messageId, typingId)
-    live.agent.followup(await this.deliverTurnMessage(msg, current, content))
+    const message = await this.deliverTurnMessage(msg, current, content, {
+      excludeMessageIds: [msg.messageId, sent.messageId],
+    })
+    this.streamer?.attach(live.agent.session, sent.messageId, msg.messageId, typingId, { message })
+    live.agent.followup(message)
   }
 }

@@ -34,7 +34,7 @@ describe('health snapshot', () => {
       fibers,
       dependencies: dependencies(missing),
       connection,
-      botOpenId: 'ou_bot_12345678',
+      botOpenId: 'u_bot_12345678',
       started: true,
       routeCount: 2,
       liveAgentCount: 1,
@@ -61,6 +61,22 @@ describe('health snapshot', () => {
     ])
     expect(snapshot.inactiveFibers).toEqual([{ state: 'pending', label: 'dsh-experimental-inspector' }])
     expect(snapshot.inactiveTotal).toBe(1)
+  })
+
+  it('degrades and explains a failed analyze listener on the snapshot and the card', () => {
+    const snapshot = foldHealthSnapshot({
+      fibers: [{ state: CordisFiberState.ACTIVE, name: 'channels' }],
+      dependencies: dependencies(),
+      connection: { state: 'connected', reconnectAttempts: 0 },
+      started: true,
+      routeCount: 0,
+      liveAgentCount: 0,
+      inflightTurnCount: 0,
+      analyzeListenError: 'listen EADDRINUSE: address already in use 0.0.0.0:3090',
+    })
+    expect(snapshot.level).toBe('degraded')
+    expect(snapshot.reasons).toEqual(['日志分析接口监听失败：listen EADDRINUSE: address already in use 0.0.0.0:3090'])
+    expect(JSON.stringify(buildHealthCard(snapshot))).toContain('❌ 监听失败：listen EADDRINUSE')
   })
 
   it('keeps healthy snapshots reason-free and caps the listed inactive fibers', () => {
@@ -122,7 +138,7 @@ describe('health snapshot', () => {
       connection: {
         state: 'reconnecting', lastConnectTime: 100, nextConnectTime: 200, reconnectAttempts: 3,
       },
-      botOpenId: 'ou_secret_bot_12345678',
+      botOpenId: 'u_secret_bot_12345678',
       started: true,
       routeCount: 4,
       liveAgentCount: 2,
@@ -134,7 +150,7 @@ describe('health snapshot', () => {
     expect(json).toContain('reconnecting')
     expect(json).toContain('…5678')
     expect(json).toContain('持久化路由 4')
-    expect(json).not.toContain('ou_secret_bot_12345678')
+    expect(json).not.toContain('u_secret_bot_12345678')
     expect(json).not.toContain('secret-value')
     expect(json).not.toContain('appSecret')
     expect(json).not.toContain('stack')

@@ -21,8 +21,10 @@ import {
   ACCESS_REQUESTS_ROUTE,
   ACCESS_ROUTE,
   ACCESS_USERS_ROUTE,
+  ACCESS_WIKI_USERS_ROUTE,
+  BYTES_UNIT,
   CATALOG_ROUTE,
-  CLEANUP_ROUTE,
+  COLLAPSED_FIELD_GROUPS,
   CONFIG_ROUTE,
   CREDENTIALS_ROUTE,
   EDITABLE_KEYS,
@@ -30,6 +32,9 @@ import {
   PANEL_COPY,
   PANEL_ROUTE,
   PICK_DIRECTORY_ROUTE,
+  PROFILES_MAX_IDS,
+  PROFILES_ROUTE,
+  SESSION_ORIGIN_ROUTE,
   PANEL_TABS,
   TAB_FIELD_GROUPS,
   RECONNECT_ROUTE,
@@ -40,9 +45,12 @@ import type {
   AccessMutationResponse,
   AccessWire,
   CatalogWire,
-  CleanupPreviewWire,
-  CleanupRunWire,
+  CredentialField,
   EditableValues,
+  ScopeCheckWire,
+  FeishuProfilesWire,
+  SessionOriginWire,
+  SlashCommandSyncWire,
 } from '../src/settings/contract.ts'
 import {
   OverlayStore,
@@ -62,14 +70,15 @@ import {
   FIELD_DESCRIPTORS,
   SettingsSurface,
   emptyCatalog,
-  readOnlyFields,
+  normalizeStringList,
 } from '../src/settings/surface.ts'
+import { WIKI_ROOT_LINK_ERRORS } from '../src/feishu/wiki/links.ts'
 import type { SettingsTarget } from '../src/settings/surface.ts'
 import { createHostCatalog } from '../src/settings/catalog.ts'
 import type { SettingsCatalog } from '../src/settings/catalog.ts'
 import type { SettingsDirectoryPicker } from '../src/settings/directory-picker.ts'
-import { isSameOriginRequest, registerSettingsRoutes } from '../src/settings/routes.ts'
-import type { HostWebServer } from '../src/settings/routes.ts'
+import { isSameOriginRequest, mountSettingsRoutes, registerSettingsRoutes } from '../src/settings/routes.ts'
+import type { HostRequestGate, HostWebServer } from '../src/settings/routes.ts'
 import { normalizeWorkspaceBaseDir, prepareWorkspaceBaseDir } from '../src/workspaces.ts'
 import { makeChannel, makeHostContext } from './helpers.ts'
 
@@ -110,12 +119,10 @@ class FakeTarget implements SettingsTarget {
   runningFlag = true
   restarting = false
   startErrorText: string | undefined
-  credentialInfo: {
-    appId: { configured: boolean; writable: boolean; source?: string }
-    appSecret: { configured: boolean; writable: boolean; source?: string }
-  } = {
+  credentialInfo: Record<CredentialField, { configured: boolean; writable: boolean; source?: string }> = {
     appId: { configured: true, writable: true, source: 'file' },
     appSecret: { configured: true, writable: true, source: 'file' },
+    analyzeToken: { configured: false, writable: true },
   }
   credentialCalls: Array<{ field: string; value?: string }> = []
   applied: OverlayPatch | undefined
@@ -125,25 +132,12 @@ class FakeTarget implements SettingsTarget {
   failRestart: string | undefined
   failConnect: string | undefined
   healthState = healthySnapshot()
-  cleanupState: CleanupPreviewWire = {
-    retention: 'off',
-    auto: false,
-    workspaces: 0,
-    candidates: 0,
-    candidateBytes: 0,
-  }
-  cleanupRun: CleanupRunWire = {
-    ok: true,
-    deletedWorkspaces: 0,
-    deletedSessionDirs: 0,
-    retiredRoutes: 0,
-    freedBytes: 0,
-    failures: [],
-  }
-  failCleanupPreview: string | undefined
-  failCleanupRun: string | undefined
-  cleanupPreviewCalls = 0
-  cleanupRunCalls = 0
+  scopeCheckState: ScopeCheckWire | undefined
+  slashCommandSyncState: SlashCommandSyncWire | undefined
+  /** Origins by session id; absent ids are Sessions Feishu never routed. */
+  origins = new Map<string, SessionOriginWire>()
+  originCalls: string[] = []
+  profileCalls: Array<{ users: readonly string[]; chats: readonly string[] }> = []
   /** Admission snapshot handed to the panel (the real service keeps it in memory). */
   accessState: AccessWire = {
     mode: 'guarded',
@@ -151,6 +145,7 @@ class FakeTarget implements SettingsTarget {
     loaded: true,
     groups: [],
     users: [],
+    wikiUsers: [],
     requests: [],
   }
   /** Every whitelist mutation the surface forwarded (asserted by the tests). */
@@ -185,6 +180,8 @@ class FakeTarget implements SettingsTarget {
   startedAtMs(): number | undefined { return 1_000 }
   uptimeMs(): number | undefined { return this.runningFlag ? 60_000 : undefined }
   startError(): string | undefined { return this.startErrorText }
+  scopeCheck(): ScopeCheckWire | undefined { return this.scopeCheckState }
+  slashCommandSync(): SlashCommandSyncWire | undefined { return this.slashCommandSyncState }
   configSnapshot(): FeishuConfig { return { ...this.config } }
   baseConfigSnapshot(): FeishuConfig { return { ...this.base } }
   runningConfigSnapshot(): FeishuConfig | undefined {
@@ -211,33 +208,18 @@ class FakeTarget implements SettingsTarget {
     this.startErrorText = undefined
   }
 
-  async credentialStates(): Promise<{
-    appId: { configured: boolean; writable: boolean; source?: string }
-    appSecret: { configured: boolean; writable: boolean; source?: string }
-  }> {
+  async credentialStates(): Promise<Record<CredentialField, { configured: boolean; writable: boolean; source?: string }>> {
     return this.credentialInfo
   }
 
-  async setCredential(field: 'appId' | 'appSecret', value: string): Promise<void> {
+  async setCredential(field: CredentialField, value: string): Promise<void> {
     this.credentialCalls.push({ field, value })
     this.credentialInfo[field] = { configured: true, writable: true, source: 'file' }
   }
 
-  async clearCredential(field: 'appId' | 'appSecret'): Promise<void> {
+  async clearCredential(field: CredentialField): Promise<void> {
     this.credentialCalls.push({ field })
     this.credentialInfo[field] = { configured: false, writable: true }
-  }
-
-  async cleanupPreview(): Promise<CleanupPreviewWire> {
-    this.cleanupPreviewCalls++
-    if (this.failCleanupPreview !== undefined) throw new Error(this.failCleanupPreview)
-    return { ...this.cleanupState }
-  }
-
-  async runWorkspaceCleanup(): Promise<CleanupRunWire> {
-    this.cleanupRunCalls++
-    if (this.failCleanupRun !== undefined) throw new Error(this.failCleanupRun)
-    return { ...this.cleanupRun, failures: [...this.cleanupRun.failures] }
   }
 
   accessSnapshot(): AccessWire {
@@ -267,13 +249,13 @@ class FakeTarget implements SettingsTarget {
     return { ok: true, access: this.accessSnapshot() }
   }
 
-  async addAccessUser(openId: string, name?: string): Promise<AccessMutationResponse> {
-    this.accessCalls.push({ op: 'add-user', openId, name })
+  async addAccessUser(userId: string, name?: string): Promise<AccessMutationResponse> {
+    this.accessCalls.push({ op: 'add-user', userId, name })
     const failed = this.accessFailure()
     if (failed !== undefined) return failed
-    if (!this.accessState.users.some(user => user.openId === openId)) {
+    if (!this.accessState.users.some(user => user.userId === userId)) {
       this.accessState.users.push({
-        openId,
+        userId,
         ...(name === undefined ? {} : { name }),
         source: 'panel',
         addedAt: 1_700_000_000_000,
@@ -282,12 +264,48 @@ class FakeTarget implements SettingsTarget {
     return { ok: true, access: this.accessSnapshot() }
   }
 
-  async removeAccessUser(openId: string): Promise<AccessMutationResponse> {
-    this.accessCalls.push({ op: 'remove-user', openId })
+  async removeAccessUser(userId: string): Promise<AccessMutationResponse> {
+    this.accessCalls.push({ op: 'remove-user', userId })
     const failed = this.accessFailure()
     if (failed !== undefined) return failed
-    this.accessState.users = this.accessState.users.filter(user => user.openId !== openId)
+    this.accessState.users = this.accessState.users.filter(user => user.userId !== userId)
     return { ok: true, access: this.accessSnapshot() }
+  }
+
+  async addWikiUser(userId: string, name?: string): Promise<AccessMutationResponse> {
+    this.accessCalls.push({ op: 'add-wiki-user', userId, name })
+    const failed = this.accessFailure()
+    if (failed !== undefined) return failed
+    if (!this.accessState.wikiUsers.some(user => user.userId === userId)) {
+      this.accessState.wikiUsers.push({
+        userId,
+        ...(name === undefined ? {} : { name }),
+        source: 'panel',
+        addedAt: 1_700_000_000_000,
+      })
+    }
+    return { ok: true, access: this.accessSnapshot() }
+  }
+
+  async removeWikiUser(userId: string): Promise<AccessMutationResponse> {
+    this.accessCalls.push({ op: 'remove-wiki-user', userId })
+    const failed = this.accessFailure()
+    if (failed !== undefined) return failed
+    this.accessState.wikiUsers = this.accessState.wikiUsers.filter(user => user.userId !== userId)
+    return { ok: true, access: this.accessSnapshot() }
+  }
+
+  async sessionOrigin(sessionId: string): Promise<SessionOriginWire | null> {
+    this.originCalls.push(sessionId)
+    return this.origins.get(sessionId) ?? null
+  }
+
+  async feishuProfiles(userIds: readonly string[], chatIds: readonly string[]): Promise<FeishuProfilesWire> {
+    this.profileCalls.push({ users: userIds, chats: chatIds })
+    return {
+      users: Object.fromEntries(userIds.map(id => [id, { name: `名-${id}` }])),
+      chats: Object.fromEntries(chatIds.map(id => [id, { name: `群-${id}`, avatarUrl: `https://cdn.example/${id}.png` }])),
+    }
   }
 
   async resolveAccessRequest(token: string, decision: 'allow' | 'deny'): Promise<AccessMutationResponse> {
@@ -307,7 +325,7 @@ class FakeTarget implements SettingsTarget {
         })
       } else {
         this.accessState.users.push({
-          openId: request.targetId,
+          userId: request.targetId,
           ...(request.name === undefined ? {} : { name: request.name }),
           source: 'card',
           addedAt: 1_700_000_000_000,
@@ -463,14 +481,15 @@ describe('overlay paths and validation', () => {
     expect(configValueOf(merged, 'feishuTools.attachmentFetch')).toBe(false)
     expect(configValueOf(merged, 'attachmentStore')).toBe('native')
 
-    // A pre-v2 overlay (flat keys only) still validates, and every new key
-    // falls back to the profile/default layer.
-    const old = normalizeOverlay({ requireMention: false, workspaceRetention: '30d' })
+    // A pre-v2 overlay (flat keys only) still validates, keys of removed
+    // settings (workspace retention) are dropped, and every new key falls back
+    // to the profile/default layer.
+    const old = normalizeOverlay({ requireMention: false, workspaceRetention: '30d', workspaceRetentionAuto: true })
+    expect(old).toEqual({ requireMention: false })
     const migrated = mergeOverlay(base, old)
     expect(migrated.requireMention).toBe(false)
     expect(migrated.attachmentStore).toBe('native')
     expect(migrated.prefetchImages).toBe(true)
-    expect(migrated.pendingAttachmentLimit).toBe(base.pendingAttachmentLimit)
     expect(migrated.feishuTools.attachmentFetch).toBe(true)
   })
 
@@ -540,15 +559,68 @@ describe('field descriptors', () => {
       expect(field.label.length).toBeGreaterThan(0)
     }
     expect(new Set(FIELD_DESCRIPTORS.map(field => field.kind)))
-      .toEqual(new Set(['boolean', 'number', 'text', 'select']))
+      .toEqual(new Set(['boolean', 'number', 'text', 'select', 'string-list']))
   })
 
-  it('renders the read-only advanced facts from the effective config', () => {
-    const fields = readOnlyFields(makeConfig({ maxTokens: 4096, routeTtlMs: 0 }))
-    const byKey = new Map(fields.map(field => [field.key, field.value]))
-    expect(byKey.get('maxTokens')).toBe('4096 tokens')
-    expect(byKey.get('routeTtlMs')).toBe('关闭（不过期）')
-    expect(byKey.has('baseDir')).toBe(false)
+  it('describes the wiki tool switches and the wikiRoots link list in the wiki group', () => {
+    const byKey = new Map(FIELD_DESCRIPTORS.map(field => [field.key, field]))
+    for (const key of ['feishuTools.wikiRead', 'feishuTools.wikiWrite'] as const) {
+      expect(byKey.get(key)).toMatchObject({ kind: 'boolean', group: 'wiki', restartRequired: false })
+    }
+    expect(byKey.get('feishuTools.wikiRead')?.help).toContain('feishu_wiki_read')
+    expect(byKey.get('feishuTools.wikiRead')?.help).toContain('/auth wiki add')
+    expect(byKey.get('feishuTools.wikiWrite')?.help).toContain('feishu_wiki_edit')
+    const roots = byKey.get('wikiRoots')
+    expect(roots).toMatchObject({
+      kind: 'string-list',
+      group: 'wiki',
+      maxItems: 20,
+      itemFormat: 'wiki-root-link',
+      wide: true,
+      restartRequired: false,
+    })
+    expect(roots?.label).toContain('范围')
+    expect(roots?.summary).toContain('为空时不挂载')
+    expect(roots?.placeholder).toContain('/wiki/space/')
+    // Only list fields carry list metadata.
+    expect(FIELD_DESCRIPTORS.filter(field => field.maxItems !== undefined || field.itemFormat !== undefined)
+      .map(field => field.key)).toEqual(['wikiRoots'])
+  })
+
+  it('describes the session timing fields with display units and live application', () => {
+    const byKey = new Map(FIELD_DESCRIPTORS.map(field => [field.key, field]))
+    expect(byKey.get('routeTtlMs')).toMatchObject({
+      kind: 'number', group: 'cards', min: 0, unit: '天', scale: 86_400_000, restartRequired: false,
+    })
+    for (const key of ['approvalTimeoutMs', 'questionTimeoutMs'] as const) {
+      expect(byKey.get(key)).toMatchObject({
+        kind: 'number', group: 'cards', min: 10_000, max: 3_600_000, unit: '秒', scale: 1_000, restartRequired: false,
+      })
+    }
+    expect(byKey.get('topicIsolation')).toMatchObject({ kind: 'select', group: 'workspace', restartRequired: false })
+    expect(byKey.get('topicIsolation')?.options?.map(option => option.value)).toEqual(['auto', 'subdir', 'worktree'])
+    expect(byKey.get('maxTokens')).toMatchObject({
+      kind: 'number', group: 'model', min: 1, optional: true, restartRequired: false,
+    })
+    // Only maxTokens may be saved empty.
+    expect(FIELD_DESCRIPTORS.filter(field => field.optional === true).map(field => field.key)).toEqual(['maxTokens'])
+  })
+
+  it('renders two-value selects as switches with the stored on/off values', () => {
+    const toggles = Object.fromEntries(FIELD_DESCRIPTORS
+      .filter(field => field.toggle !== undefined)
+      .map(field => [field.key, field.toggle]))
+    expect(toggles).toEqual({
+      dmMode: { on: 'open', off: 'disabled' },
+      threadFallback: { on: 'degrade', off: 'strict' },
+      attachmentStore: { on: 'native', off: 'archive' },
+      accessMode: { on: 'open', off: 'guarded' },
+    })
+    for (const field of FIELD_DESCRIPTORS) {
+      if (field.toggle === undefined) continue
+      expect(field.kind).toBe('select')
+      expect(field.options?.map(option => option.value).sort()).toEqual([field.toggle.on, field.toggle.off].sort())
+    }
   })
 
   it('exposes the workspace root as an editable full-width path field', () => {
@@ -582,54 +654,42 @@ describe('field descriptors', () => {
 
   it('describes the access-control fields without restarting the channel', () => {
     const byKey = new Map(FIELD_DESCRIPTORS.map(field => [field.key, field]))
-    for (const key of ['adminOpenId', 'accessMode', 'authRequestTtlDays'] as const) {
+    for (const key of ['adminUserId', 'accessMode', 'dmAllowWhitelist', 'authRequestTtlDays'] as const) {
       expect(EDITABLE_KEYS).toContain(key)
       expect(byKey.get(key)).toMatchObject({ group: 'access', restartRequired: false })
     }
 
-    const admin = byKey.get('adminOpenId')
+    const admin = byKey.get('adminUserId')
     expect(admin).toMatchObject({ kind: 'text' })
     expect(admin?.label).toContain('管理员')
-    expect(admin?.help).toContain('/userid')
+    expect(admin?.summary).toContain('/userid')
     expect(admin?.help).toContain('ou_')
 
     const mode = byKey.get('accessMode')
-    expect(mode).toMatchObject({ kind: 'select' })
+    expect(mode).toMatchObject({ kind: 'select', toggle: { on: 'open', off: 'guarded' } })
+    expect(mode?.label).toBe('调试模式')
     expect(mode?.options?.map(option => option.value)).toEqual(['guarded', 'open'])
-    expect(mode?.options?.find(option => option.value === 'guarded')?.label).toContain('守卫')
-    expect(mode?.options?.find(option => option.value === 'open')?.label).toContain('不安全')
+    expect(mode?.summary).toContain('不安全')
+
+    expect(byKey.get('dmAllowWhitelist')).toMatchObject({ kind: 'boolean', label: '白名单用户可私聊' })
 
     const ttl = byKey.get('authRequestTtlDays')
     expect(ttl).toMatchObject({ kind: 'number', min: 1, max: 30, step: 1 })
     expect(ttl?.label).toContain('有效期')
-    expect(ttl?.help).toContain('过期')
+    expect(ttl?.unit).toBe('天')
   })
 
-  it('describes the retention select and attachment toggle instead of the old image keys', () => {
+  it('describes the attachment toggle instead of the old image and retention keys', () => {
     const keys = EDITABLE_KEYS as readonly string[]
     expect(keys).not.toContain('acceptImages')
     expect(keys).not.toContain('maxImagesPerMessage')
+    expect(keys).not.toContain('workspaceRetention')
+    expect(keys).not.toContain('workspaceRetentionAuto')
 
     const byKey = new Map(FIELD_DESCRIPTORS.map(field => [field.key, field]))
-    const retention = byKey.get('workspaceRetention')
-    expect(retention).toMatchObject({
-      key: 'workspaceRetention',
-      kind: 'select',
-      group: 'workspace',
-      restartRequired: false,
-    })
-    expect(retention?.options?.map(option => option.value)).toEqual(['off', '7d', '30d', '90d', '180d'])
-    expect(retention?.options?.find(option => option.value === 'off')?.label).toContain('关闭')
-    expect(retention?.options?.find(option => option.value === '30d')?.label).toBe('30 天')
-
-    expect(byKey.get('workspaceRetentionAuto')).toMatchObject({
-      kind: 'boolean',
-      group: 'workspace',
-      restartRequired: false,
-    })
     expect(byKey.get('acceptAttachments')).toMatchObject({
       kind: 'boolean',
-      group: 'content',
+      group: 'attachments',
       restartRequired: false,
     })
   })
@@ -637,21 +697,19 @@ describe('field descriptors', () => {
   it('describes the v2 attachment pipeline and model-tool fields with bounds', () => {
     const byKey = new Map(FIELD_DESCRIPTORS.map(field => [field.key, field]))
     const store = byKey.get('attachmentStore')
-    expect(store).toMatchObject({ kind: 'select', group: 'content', restartRequired: false })
+    expect(store).toMatchObject({ kind: 'select', group: 'attachments', restartRequired: false })
     expect(store?.options?.map(option => option.value)).toEqual(['native', 'archive'])
-    expect(store?.options?.find(option => option.value === 'native')?.label).toContain('原生')
+    expect(store?.label).toContain('原生附件库')
     expect(store?.help).toContain('不可变')
 
-    expect(byKey.get('prefetchImages')).toMatchObject({ kind: 'boolean', group: 'content' })
+    expect(byKey.get('prefetchImages')).toMatchObject({ kind: 'boolean', group: 'attachments' })
     expect(byKey.get('prefetchTimeoutMs')).toMatchObject({
-      kind: 'number', group: 'content', min: 100, max: 120_000,
+      kind: 'number', group: 'limits', min: 100, max: 120_000,
     })
     expect(byKey.get('prefetchImageMaxBytes')).toMatchObject({ kind: 'number', min: 1 })
     expect(byKey.get('prefetchTotalMaxBytes')).toMatchObject({ kind: 'number', min: 1 })
-    expect(byKey.get('pendingAttachmentTtlMs')).toMatchObject({ kind: 'number', min: 0 })
-    expect(byKey.get('pendingAttachmentLimit')).toMatchObject({ kind: 'number', min: 1, max: 100 })
     expect(byKey.get('historyBootstrapLimit')).toMatchObject({ kind: 'number', min: 0, max: 20 })
-    expect(byKey.get('promptContextTimeoutMs')).toMatchObject({ kind: 'number', group: 'tools' })
+    expect(byKey.get('promptContextTimeoutMs')).toMatchObject({ kind: 'number', group: 'limits' })
     expect(byKey.get('feishuTools.attachmentFetch')).toMatchObject({
       kind: 'boolean', group: 'tools', restartRequired: false,
     })
@@ -660,34 +718,30 @@ describe('field descriptors', () => {
     })
     expect(byKey.get('feishuTools.attachmentFetchMaxBytes')).toMatchObject({ kind: 'number', min: 1 })
     expect(byKey.get('feishuTools.attachmentFetchTimeoutMs')).toMatchObject({
-      kind: 'number', min: 1_000, max: 600_000,
+      kind: 'number', min: 1_000, max: 2_147_483_647,
     })
     expect(byKey.get('feishuTools.topicMessages')).toMatchObject({ kind: 'boolean', group: 'tools' })
     expect(byKey.get('feishuTools.topicMessagesTimeoutMs')).toMatchObject({
       kind: 'number', min: 1_000, max: 120_000,
     })
-    // Every new descriptor renders under the「会话与行为」tab.
-    const toolOrContent = new Set([
-      'attachmentStore', 'prefetchImages', 'prefetchTimeoutMs', 'pendingAttachmentTtlMs',
+    // The attachment pipeline and model tools render under「附件与工具」.
+    const attachmentsTab = new Set([
+      'attachmentStore', 'prefetchImages', 'prefetchTimeoutMs',
       'historyBootstrapLimit', 'feishuTools.attachmentFetch', 'feishuTools.topicMessages',
     ])
     for (const field of FIELD_DESCRIPTORS) {
-      if (!toolOrContent.has(field.key)) continue
-      expect(TAB_FIELD_GROUPS.sessions).toContain(field.group)
+      if (!attachmentsTab.has(field.key)) continue
+      expect(TAB_FIELD_GROUPS.attachments).toContain(field.group)
     }
   })
 
-  it('describes the cleanup boundary as workspace/agent artifacts only', () => {
-    expect(PANEL_COPY.cleanupCardHelp).toContain('只清理工作区与 Agent 产物')
-    expect(PANEL_COPY.cleanupCardHelp).toContain('不影响 Session 附件')
-    expect(PANEL_COPY.cleanupConfirm).toContain('不影响 Session 附件')
-    expect(PANEL_COPY.cleanupConfirm).toContain('不可恢复')
-    expect(PANEL_COPY.workspaceTabHelp).toContain('原生附件库')
-
-    const byKey = new Map(FIELD_DESCRIPTORS.map(field => [field.key, field]))
-    expect(byKey.get('workspaceRetention')?.help).toContain('不影响 Session 附件')
-    expect(byKey.get('workspaceRetentionAuto')?.help).toContain('不影响 Session 附件')
-    expect(byKey.get('acceptAttachments')?.help).toContain('原生附件库')
+  it('collapses only the limits group and labels byte limits in bytes', () => {
+    expect(COLLAPSED_FIELD_GROUPS).toEqual(['limits'])
+    const byteKeys = FIELD_DESCRIPTORS.filter(field => field.unit === BYTES_UNIT).map(field => field.key)
+    expect(byteKeys).toEqual(['prefetchImageMaxBytes', 'prefetchTotalMaxBytes', 'feishuTools.attachmentFetchMaxBytes'])
+    for (const key of byteKeys) {
+      expect(FIELD_DESCRIPTORS.find(field => field.key === key)?.group).toBe('limits')
+    }
   })
 })
 
@@ -1033,6 +1087,24 @@ describe('SettingsSurface', () => {
     expect(status.missingConfig).toEqual(['FEISHU_APP_SECRET（飞书 App Secret）'])
   })
 
+  it('carries the scope self-check only while the channel runs', async () => {
+    const { surface, target } = makeSurface()
+    expect((await surface.status()).scopeCheck).toBeUndefined()
+    target.scopeCheckState = { state: 'ok', checkedAt: 5 }
+    expect((await surface.status()).scopeCheck).toEqual({ state: 'ok', checkedAt: 5 })
+    target.runningFlag = false
+    expect((await surface.status()).scopeCheck).toBeUndefined()
+  })
+
+  it('carries the slash-command panel sync only while the channel runs', async () => {
+    const { surface, target } = makeSurface()
+    expect((await surface.status()).slashCommandSync).toBeUndefined()
+    target.slashCommandSyncState = { state: 'ok', checkedAt: 5, created: 1, updated: 0, removed: 0, total: 15 }
+    expect((await surface.status()).slashCommandSync).toEqual({ state: 'ok', checkedAt: 5, created: 1, updated: 0, removed: 0, total: 15 })
+    target.runningFlag = false
+    expect((await surface.status()).slashCommandSync).toBeUndefined()
+  })
+
   it('surfaces the health reasons that explain a degraded level', async () => {
     const { surface, target } = makeSurface()
     target.healthState = healthySnapshot({
@@ -1067,26 +1139,15 @@ describe('SettingsSurface', () => {
     expect(result.panel.config.overriddenKeys).toEqual(['requireMention', 'acceptAttachments'])
   })
 
-  it('saves the workspace retention fields and the attachment toggle', async () => {
+  it('saves the attachment toggle', async () => {
     const { surface, target, store } = makeSurface()
-    const result = await surface.save({
-      workspaceRetention: '30d',
-      workspaceRetentionAuto: true,
-      acceptAttachments: false,
-    })
+    const result = await surface.save({ acceptAttachments: false })
     expect(result.ok).toBe(true)
     if (!result.ok) return
-    const saved = { workspaceRetention: '30d', workspaceRetentionAuto: true, acceptAttachments: false }
+    const saved = { acceptAttachments: false }
     await expect(store.load()).resolves.toEqual(saved)
     expect(target.applied).toEqual(saved)
-    expect(result.panel.config.effective.workspaceRetention).toBe('30d')
-    expect(result.panel.config.effective.workspaceRetentionAuto).toBe(true)
-    expect(result.panel.config.overriddenKeys).toEqual(['workspaceRetention', 'workspaceRetentionAuto', 'acceptAttachments'])
-
-    const invalid = await surface.save({ workspaceRetention: '1d' } as unknown as EditableValues)
-    expect(invalid.ok).toBe(false)
-    if (invalid.ok) return
-    expect(invalid.issues?.map(issue => issue.key)).toContain('workspaceRetention')
+    expect(result.panel.config.overriddenKeys).toEqual(['acceptAttachments'])
   })
 
   it('saves the v2 attachment pipeline fields, including nested feishuTools keys', async () => {
@@ -1098,8 +1159,6 @@ describe('SettingsSurface', () => {
       prefetchImageMaxBytes: 1024,
       prefetchTotalMaxBytes: 4096,
       historyBootstrapLimit: 3,
-      pendingAttachmentTtlMs: 0,
-      pendingAttachmentLimit: 5,
       promptContextTimeoutMs: 1_500,
       'feishuTools.attachmentFetch': false,
       'feishuTools.attachmentFetchMaxResources': 4,
@@ -1118,8 +1177,6 @@ describe('SettingsSurface', () => {
       prefetchImageMaxBytes: 1024,
       prefetchTotalMaxBytes: 4096,
       historyBootstrapLimit: 3,
-      pendingAttachmentTtlMs: 0,
-      pendingAttachmentLimit: 5,
       promptContextTimeoutMs: 1_500,
       feishuTools: {
         attachmentFetch: false,
@@ -1146,6 +1203,108 @@ describe('SettingsSurface', () => {
       topicMessages: true,
       attachmentFetchTimeoutMs: 30_000,
     })
+  })
+
+  it('saves the wiki switches and trims wikiRoots, dropping empty inputs', async () => {
+    const { surface, target, store } = makeSurface()
+    const result = await surface.save({
+      'feishuTools.wikiRead': true,
+      'feishuTools.wikiWrite': true,
+      wikiRoots: [
+        '  https://acme.feishu.cn/wiki/space/7012345678901234567 ',
+        '',
+        '   ',
+        'https://acme.feishu.cn/wiki/AbCdEf1234567890',
+      ],
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    const saved = {
+      feishuTools: { wikiRead: true, wikiWrite: true },
+      wikiRoots: [
+        'https://acme.feishu.cn/wiki/space/7012345678901234567',
+        'https://acme.feishu.cn/wiki/AbCdEf1234567890',
+      ],
+    }
+    await expect(store.load()).resolves.toEqual(saved)
+    expect(target.applied).toEqual(saved)
+    expect(result.panel.config.effective.wikiRoots).toEqual(saved.wikiRoots)
+    expect(result.panel.config.overlay.wikiRoots).toEqual(saved.wikiRoots)
+    expect(result.panel.config.overriddenKeys).toEqual(expect.arrayContaining([
+      'feishuTools.wikiRead', 'feishuTools.wikiWrite', 'wikiRoots',
+    ]))
+
+    // Removing every entry persists an explicit empty list (no wiki tool mounted).
+    const emptied = await surface.save({ wikiRoots: [''] })
+    expect(emptied.ok).toBe(true)
+    await expect(store.load()).resolves.toMatchObject({ wikiRoots: [] })
+  })
+
+  it('rejects an invalid wikiRoots entry naming its position, and writes nothing', async () => {
+    const { surface, target, store } = makeSurface()
+    const result = await surface.save({
+      'feishuTools.wikiRead': true,
+      wikiRoots: [
+        'https://acme.feishu.cn/wiki/space/7012345678901234567',
+        '',
+        'http://acme.feishu.cn/wiki/space/1',
+        'https://acme.feishu.cn/docx/AbCdEf1234567890',
+        'not a link',
+      ],
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error).toBe('配置校验失败')
+    expect(result.issues).toEqual([
+      { key: 'wikiRoots', index: 2, message: `第 3 项「http://acme.feishu.cn/wiki/space/1」：${WIKI_ROOT_LINK_ERRORS['not-https']}` },
+      { key: 'wikiRoots', index: 3, message: `第 4 项「https://acme.feishu.cn/docx/AbCdEf1234567890」：${WIKI_ROOT_LINK_ERRORS['not-a-wiki-link']}` },
+      { key: 'wikiRoots', index: 4, message: `第 5 项「not a link」：${WIKI_ROOT_LINK_ERRORS['not-a-url']}` },
+    ])
+    await expect(store.load()).resolves.toEqual({})
+    expect(target.applied).toBeUndefined()
+  })
+
+  it('rejects a non-list wikiRoots value and more than maxItems entries', async () => {
+    const { surface } = makeSurface()
+    const notList = await surface.save({ wikiRoots: 'https://acme.feishu.cn/wiki/space/1' })
+    expect(notList.ok).toBe(false)
+    if (notList.ok) return
+    expect(notList.issues).toEqual([{ key: 'wikiRoots', message: PANEL_COPY.listNotArray }])
+
+    const notStrings = await surface.save(JSON.parse('{"wikiRoots":[42]}') as EditableValues)
+    expect(notStrings.ok).toBe(false)
+    if (notStrings.ok) return
+    expect(notStrings.issues).toEqual([{ key: 'wikiRoots', index: 0, message: '第 1 项必须是字符串' }])
+
+    const many = Array.from({ length: 21 }, (_, index) => `https://acme.feishu.cn/wiki/space/${index + 1}`)
+    const tooMany = await surface.save({ wikiRoots: [...many, '', ''] })
+    expect(tooMany.ok).toBe(false)
+    if (tooMany.ok) return
+    expect(tooMany.issues).toEqual([{ key: 'wikiRoots', message: '最多 20 项（空输入框不计）' }])
+
+    // Exactly maxItems non-empty entries plus blank inputs is accepted.
+    const atLimit = await surface.save({ wikiRoots: [...many.slice(0, 20), ' '] })
+    expect(atLimit.ok).toBe(true)
+  })
+
+  it('normalizes string lists generically, without an entry format', () => {
+    expect(normalizeStringList('wikiRoots', [' a ', '', 'b'], { maxItems: 2 }))
+      .toEqual({ ok: true, value: ['a', 'b'] })
+    expect(normalizeStringList('wikiRoots', ['a', 'b', 'c'], { maxItems: 2 }).ok).toBe(false)
+  })
+
+  it('round-trips wikiRoots through the overlay file and keeps it top-level', async () => {
+    const store = new OverlayStore(tempOverlayFile())
+    await store.save({ wikiRoots: ['https://acme.feishu.cn/wiki/space/1'], feishuTools: { wikiRead: true } })
+    const loaded = await store.load()
+    expect(loaded).toEqual({ wikiRoots: ['https://acme.feishu.cn/wiki/space/1'], feishuTools: { wikiRead: true } })
+    const merged = mergeOverlay(makeConfig(), loaded)
+    expect(configValueOf(merged, 'wikiRoots')).toEqual(['https://acme.feishu.cn/wiki/space/1'])
+    expect(merged.feishuTools.wikiWrite).toBe(false)
+    expect(merged.feishuTools.sendFile).toBe(true)
+    // A hand-edited file with an invalid link degrades to no overlay.
+    writeFileSync(store.file, JSON.stringify({ wikiRoots: ['https://acme.feishu.cn/docx/x'] }))
+    await expect(store.load()).resolves.toEqual({})
   })
 
   it('rejects the removed image keys as unknown configuration', async () => {
@@ -1184,30 +1343,60 @@ describe('SettingsSurface', () => {
 
   it('saves the access-control config and clears the administrator override', async () => {
     const { surface, store } = makeSurface()
-    const saved = await surface.save({ adminOpenId: 'ou_admin', accessMode: 'open', authRequestTtlDays: 14 })
+    const saved = await surface.save({ adminUserId: 'u_admin', accessMode: 'open', authRequestTtlDays: 14 })
     expect(saved.ok).toBe(true)
     if (!saved.ok) return
     await expect(store.load()).resolves.toEqual({
-      adminOpenId: 'ou_admin',
+      adminUserId: 'u_admin',
       accessMode: 'open',
       authRequestTtlDays: 14,
     })
-    expect(saved.panel.config.effective.adminOpenId).toBe('ou_admin')
+    expect(saved.panel.config.effective.adminUserId).toBe('u_admin')
     expect(saved.panel.config.effective.accessMode).toBe('open')
     expect(saved.panel.config.effective.authRequestTtlDays).toBe(14)
     expect(saved.panel.config.restartPendingKeys).toEqual([])
 
-    const invalid = await surface.save({ adminOpenId: 'alice', authRequestTtlDays: 0 })
+    const invalid = await surface.save({ adminUserId: 'ou_alice', authRequestTtlDays: 0 })
     expect(invalid.ok).toBe(false)
     if (invalid.ok) return
     expect(invalid.issues?.map(issue => issue.key))
-      .toEqual(expect.arrayContaining(['adminOpenId', 'authRequestTtlDays']))
+      .toEqual(expect.arrayContaining(['adminUserId', 'authRequestTtlDays']))
 
-    const cleared = await surface.save({ adminOpenId: '' })
+    const cleared = await surface.save({ adminUserId: '' })
     expect(cleared.ok).toBe(true)
     const overlay = await store.load()
-    expect(overlay.adminOpenId).toBeUndefined()
+    expect(overlay.adminUserId).toBeUndefined()
     expect(overlay.accessMode).toBe('open')
+  })
+
+  it('saves the newly editable session and model fields live and clears maxTokens on empty', async () => {
+    const { surface, store } = makeSurface()
+    const saved = await surface.save({
+      topicIsolation: 'subdir',
+      routeTtlMs: 86_400_000,
+      approvalTimeoutMs: 60_000,
+      questionTimeoutMs: 120_000,
+      maxTokens: 4096,
+    })
+    expect(saved.ok).toBe(true)
+    if (!saved.ok) return
+    expect(saved.panel.config.restartPendingKeys).toEqual([])
+    expect(saved.panel.config.effective).toMatchObject({
+      topicIsolation: 'subdir',
+      routeTtlMs: 86_400_000,
+      approvalTimeoutMs: 60_000,
+      questionTimeoutMs: 120_000,
+      maxTokens: 4096,
+    })
+
+    const invalid = await surface.save({ approvalTimeoutMs: 1_000 })
+    expect(invalid.ok).toBe(false)
+
+    const cleared = await surface.save({ maxTokens: '' })
+    expect(cleared.ok).toBe(true)
+    const overlay = await store.load()
+    expect(overlay.maxTokens).toBeUndefined()
+    expect(overlay.topicIsolation).toBe('subdir')
   })
 
   it('rejects unknown keys and invalid values with per-field issues', async () => {
@@ -1298,84 +1487,14 @@ describe('SettingsSurface', () => {
   })
 })
 
-describe('SettingsSurface workspace cleanup', () => {
-  const DAY = 86_400_000
-
-  it('carries the cleanup preview into the panel', async () => {
-    const { surface, target } = makeSurface()
-    target.cleanupState = {
-      retention: '30d',
-      thresholdMs: 30 * DAY,
-      auto: true,
-      workspaces: 6,
-      candidates: 2,
-      candidateBytes: 8 * 1024 * 1024,
-    }
-    const panel = await surface.panel()
-    expect(panel.cleanup).toEqual(target.cleanupState)
-    expect(target.cleanupPreviewCalls).toBe(1)
-  })
-
-  it('degrades a failed preview to zero counts and the effective retention', async () => {
-    const { surface, target } = makeSurface({ workspaceRetention: '7d', workspaceRetentionAuto: true })
-    target.failCleanupPreview = 'workspace scan failed'
-    const panel = await surface.panel()
-    expect(panel.cleanup).toMatchObject({
-      retention: '7d',
-      auto: true,
-      workspaces: 0,
-      candidates: 0,
-      candidateBytes: 0,
-    })
-    expect(panel.cleanup.error).toContain('workspace scan failed')
-    expect(panel.config.overriddenKeys).toEqual([])
-  })
-
-  it('runs the cleanup once and returns the refreshed panel', async () => {
-    const { surface, target } = makeSurface({ workspaceRetention: '30d' })
-    target.cleanupState = {
-      retention: '30d',
-      thresholdMs: 30 * DAY,
-      auto: false,
-      workspaces: 4,
-      candidates: 3,
-      candidateBytes: 10_240,
-    }
-    target.cleanupRun = {
-      ok: true,
-      deletedWorkspaces: 3,
-      deletedSessionDirs: 2,
-      retiredRoutes: 5,
-      freedBytes: 10_240,
-      failures: ['/ws/one: EBUSY'],
-    }
-    const result = await surface.runCleanup()
-    expect(result.ok).toBe(true)
-    if (!result.ok) return
-    expect(result.result).toEqual(target.cleanupRun)
-    expect(target.cleanupRunCalls).toBe(1)
-    expect(result.panel.cleanup).toEqual(target.cleanupState)
-    expect(result.panel.config.effective.workspaceRetention).toBe('30d')
-  })
-
-  it('reports a crashed cleanup run as a failure without a panel', async () => {
-    const { surface, target } = makeSurface()
-    target.failCleanupRun = 'permission denied'
-    const result = await surface.runCleanup()
-    expect(result.ok).toBe(false)
-    if (result.ok) return
-    expect(result.error).toContain('permission denied')
-    expect(target.cleanupRunCalls).toBe(1)
-  })
-})
-
 describe('SettingsSurface access control', () => {
   const SAMPLE_ACCESS: AccessWire = {
     mode: 'guarded',
-    admin: { openId: 'ou_admin', configured: true },
+    admin: { userId: 'u_admin', configured: true },
     loaded: true,
     groups: [{ chatId: 'oc_team', name: '研发群', source: 'card', addedAt: 1_700_000_000_000 }],
-    users: [{ openId: 'ou_alice', name: 'Alice', source: 'command', addedAt: 1_700_000_100_000 }],
+    users: [{ userId: 'u_alice', name: 'Alice', source: 'command', addedAt: 1_700_000_100_000 }],
+    wikiUsers: [{ userId: 'u_wiki', source: 'command', addedAt: 1_700_000_000_000 }],
     requests: [{
       token: 'tok_1',
       kind: 'group',
@@ -1405,6 +1524,7 @@ describe('SettingsSurface access control', () => {
       loaded: false,
       groups: [],
       users: [],
+      wikiUsers: [],
       requests: [],
     })
     await expect(surface.access()).rejects.toThrow('access store down')
@@ -1422,18 +1542,18 @@ describe('SettingsSurface access control', () => {
       addedAt: 1_700_000_000_000,
     }])
 
-    const user = await surface.saveAccessUser(' ou_alice ', ' Alice ')
+    const user = await surface.saveAccessUser(' u_alice ', ' Alice ')
     expect(user.ok).toBe(true)
     if (!user.ok) return
     expect(user.access.users).toEqual([{
-      openId: 'ou_alice',
+      userId: 'u_alice',
       name: 'Alice',
       source: 'panel',
       addedAt: 1_700_000_000_000,
     }])
     expect(target.accessCalls).toEqual([
       { op: 'add-group', chatId: 'oc_team', name: '研发群' },
-      { op: 'add-user', openId: 'ou_alice', name: 'Alice' },
+      { op: 'add-user', userId: 'u_alice', name: 'Alice' },
     ])
   })
 
@@ -1443,14 +1563,17 @@ describe('SettingsSurface access control', () => {
       const result = await surface.saveAccessGroup(chatId)
       expect(result.ok).toBe(false)
     }
-    for (const openId of ['alice', 'user@example.com', 'ou_', 'ou_bad id']) {
-      const result = await surface.saveAccessUser(openId)
+    for (const userId of ['ou_alice', 'on_alice', 'user@example.com', 'bad id']) {
+      const result = await surface.saveAccessUser(userId)
       expect(result.ok).toBe(false)
       if (result.ok) return
       expect(result.error).toContain('ou_')
     }
-    const badName = await surface.saveAccessUser('ou_bob', 'x'.repeat(129))
+    const badName = await surface.saveAccessUser('u_bob', 'x'.repeat(129))
     expect(badName.ok).toBe(false)
+    expect((await surface.saveWikiUser('ou_bob')).ok).toBe(false)
+    expect((await surface.saveWikiUser('u_bob', 'x'.repeat(129))).ok).toBe(false)
+    expect((await surface.removeWikiUser('bad id')).ok).toBe(false)
     expect(target.accessCalls).toEqual([])
   })
 
@@ -1460,8 +1583,12 @@ describe('SettingsSurface access control', () => {
 
     const removedGroup = await surface.removeAccessGroup('oc_team')
     expect(removedGroup.ok).toBe(true)
-    const removedUser = await surface.removeAccessUser('ou_alice')
+    const removedUser = await surface.removeAccessUser('u_alice')
     expect(removedUser.ok).toBe(true)
+    const removedWiki = await surface.removeWikiUser('u_wiki')
+    expect(removedWiki.ok).toBe(true)
+    if (!removedWiki.ok) return
+    expect(removedWiki.access.wikiUsers).toEqual([])
     const allowed = await surface.resolveAccessRequest('tok_1', 'allow')
     expect(allowed.ok).toBe(true)
     if (!allowed.ok) return
@@ -1469,7 +1596,8 @@ describe('SettingsSurface access control', () => {
     expect(allowed.access.groups.map(group => group.chatId)).toEqual(['oc_new'])
     expect(target.accessCalls).toEqual([
       { op: 'remove-group', chatId: 'oc_team' },
-      { op: 'remove-user', openId: 'ou_alice' },
+      { op: 'remove-user', userId: 'u_alice' },
+      { op: 'remove-wiki-user', userId: 'u_wiki' },
       { op: 'resolve', token: 'tok_1', decision: 'allow' },
     ])
   })
@@ -1481,7 +1609,7 @@ describe('SettingsSurface access control', () => {
 
     target.failAccess = undefined
     target.throwAccess = 'domain not open'
-    await expect(surface.removeAccessUser('ou_bob')).resolves.toEqual({ ok: false, error: 'domain not open' })
+    await expect(surface.removeAccessUser('u_bob')).resolves.toEqual({ ok: false, error: 'domain not open' })
 
     target.throwAccess = undefined
     target.accessState = structuredClone(SAMPLE_ACCESS)
@@ -1579,6 +1707,25 @@ describe('SettingsSurface credentials', () => {
     expect(stopped.target.restartCalls).toBe(0)
   })
 
+  it('stores and removes the analyze API token without touching the Feishu connection', async () => {
+    for (const running of [true, false]) {
+      const { surface, target } = makeSurface()
+      target.runningFlag = running
+      const saved = await surface.saveCredentials({ analyzeToken: ' tok_new ' })
+      expect(saved.ok).toBe(true)
+      if (!saved.ok) return
+      expect(saved.reconnect).toBe('not-needed')
+      expect(saved.panel.config.credentials.analyzeToken).toMatchObject({ ref: 'DSH_CHANNELS_ANALYZE_TOKEN', configured: true })
+      const cleared = await surface.clearCredential('analyzeToken')
+      expect(cleared.ok).toBe(true)
+      if (!cleared.ok) return
+      expect(cleared.reconnect).toBe('not-needed')
+      expect(cleared.panel.config.credentials.analyzeToken.configured).toBe(false)
+      expect(target.credentialCalls).toEqual([{ field: 'analyzeToken', value: 'tok_new' }, { field: 'analyzeToken' }])
+      expect(target.connectCalls + target.restartCalls).toBe(0)
+    }
+  })
+
   it('refuses unknown credential fields', async () => {
     const result = await makeSurface().surface.clearCredential('nope' as 'appId')
     expect(result.ok).toBe(false)
@@ -1658,7 +1805,64 @@ function makeWebServer(): { server: HostWebServer; routes: Map<string, RouteHand
   return { server, routes }
 }
 
+/** A host gate that admits every request (authentication tested separately). */
+const allowAll: HostRequestGate = { requestRejection: () => undefined }
+
+const ALL_SETTINGS_ROUTES: Array<{ route: string; method: string }> = [
+  { route: STATUS_ROUTE, method: 'GET' },
+  { route: PANEL_ROUTE, method: 'GET' },
+  { route: CATALOG_ROUTE, method: 'GET' },
+  { route: CONFIG_ROUTE, method: 'PUT' },
+  { route: CONFIG_ROUTE, method: 'DELETE' },
+  { route: CREDENTIALS_ROUTE, method: 'PUT' },
+  { route: CREDENTIALS_ROUTE, method: 'DELETE' },
+  { route: RECONNECT_ROUTE, method: 'POST' },
+  { route: PICK_DIRECTORY_ROUTE, method: 'POST' },
+  { route: ACCESS_ROUTE, method: 'GET' },
+  { route: ACCESS_GROUPS_ROUTE, method: 'POST' },
+  { route: ACCESS_USERS_ROUTE, method: 'POST' },
+  { route: ACCESS_WIKI_USERS_ROUTE, method: 'POST' },
+  { route: ACCESS_REQUESTS_ROUTE, method: 'POST' },
+  { route: SESSION_ORIGIN_ROUTE, method: 'GET' },
+  { route: PROFILES_ROUTE, method: 'GET' },
+]
+
 describe('settings routes', () => {
+  it('refuses every route the host connection gate rejects, before touching the surface', async () => {
+    for (const rejection of [401, 403] as const) {
+      const { surface, store, target } = makeSurface()
+      await store.save({ dmMode: 'disabled' })
+      const { server, routes } = makeWebServer()
+      const seen: IncomingMessage[] = []
+      registerSettingsRoutes(server, {
+        requestRejection: (req) => {
+          seen.push(req as IncomingMessage)
+          return rejection
+        },
+      }, surface)
+
+      for (const { route, method } of ALL_SETTINGS_ROUTES) {
+        const req = makeRequest({
+          method,
+          url: route,
+          headers: { 'content-type': 'application/json', host: '10.0.0.5:3000' },
+          body: JSON.stringify({ values: { dmMode: 'open' }, appId: 'cli_evil', field: 'appSecret', chatId: 'oc_x', userId: 'u_x', token: 't', decision: 'allow' }),
+        })
+        const response = await call(routes, route, req)
+        expect(response.status, `${method} ${route}`).toBe(rejection)
+        expect(JSON.parse(response.body).ok).toBe(false)
+        expect(response.body).not.toContain('dmMode')
+        expect(seen.at(-1)).toBe(req)
+      }
+      expect(seen).toHaveLength(ALL_SETTINGS_ROUTES.length)
+      await expect(store.load()).resolves.toEqual({ dmMode: 'disabled' })
+      expect(target.restartCalls).toBe(0)
+      expect(target.accessCalls).toEqual([])
+      expect(target.originCalls).toEqual([])
+      expect(target.profileCalls).toEqual([])
+    }
+  })
+
   it('recognises same-origin and cross-origin mutations', () => {
     expect(isSameOriginRequest(makeRequest())).toBe(true)
     expect(isSameOriginRequest(makeRequest({
@@ -1675,7 +1879,7 @@ describe('settings routes', () => {
   it('serves status and panel, and rejects other methods with 405', async () => {
     const { surface } = makeSurface()
     const { server, routes } = makeWebServer()
-    registerSettingsRoutes(server, surface)
+    registerSettingsRoutes(server, allowAll, surface)
 
     const status = await call(routes, STATUS_ROUTE, makeRequest())
     expect(status.status).toBe(200)
@@ -1690,11 +1894,61 @@ describe('settings routes', () => {
     expect(notAllowed.headers.allow).toBe('GET, HEAD')
   })
 
+  it('serves a Session origin over GET, null for other Sessions, and requires sessionId', async () => {
+    const { surface, target } = makeSurface()
+    const origin: SessionOriginWire = {
+      sessionId: 's_feishu', chatType: 'group', kind: 'thread', chatId: 'oc_1', chatName: '研发群',
+      senderUserId: 'u_1', senderName: '张三', shared: false, createdAt: 1, bound: true, lastActivityAt: 2,
+      chatLink: 'https://applink.feishu.cn/client/chat/open?openChatId=oc_1',
+    }
+    target.origins.set('s_feishu', origin)
+    const { server, routes } = makeWebServer()
+    registerSettingsRoutes(server, allowAll, surface)
+
+    const hit = await call(routes, SESSION_ORIGIN_ROUTE, makeRequest({ url: `${SESSION_ORIGIN_ROUTE}?sessionId=s_feishu` }))
+    expect(hit.status).toBe(200)
+    expect(JSON.parse(hit.body)).toEqual({ origin })
+
+    const miss = await call(routes, SESSION_ORIGIN_ROUTE, makeRequest({ url: `${SESSION_ORIGIN_ROUTE}?sessionId=s_web` }))
+    expect(JSON.parse(miss.body)).toEqual({ origin: null })
+
+    const missing = await call(routes, SESSION_ORIGIN_ROUTE, makeRequest({ url: `${SESSION_ORIGIN_ROUTE}?sessionId=%20` }))
+    expect(missing.status).toBe(400)
+    expect(target.originCalls).toEqual(['s_feishu', 's_web'])
+
+    const post = await call(routes, SESSION_ORIGIN_ROUTE, makeRequest({ method: 'POST', url: SESSION_ORIGIN_ROUTE }))
+    expect(post.status).toBe(405)
+  })
+
+  it('serves Feishu profiles for comma-separated ids over GET and bounds the id count', async () => {
+    const { surface, target } = makeSurface()
+    const { server, routes } = makeWebServer()
+    registerSettingsRoutes(server, allowAll, surface)
+
+    const hit = await call(routes, PROFILES_ROUTE, makeRequest({ url: `${PROFILES_ROUTE}?users=u_1,%20u_2,u_1,&chats=oc_1` }))
+    expect(hit.status).toBe(200)
+    expect(JSON.parse(hit.body)).toEqual({
+      users: { u_1: { name: '名-u_1' }, u_2: { name: '名-u_2' } },
+      chats: { oc_1: { name: '群-oc_1', avatarUrl: 'https://cdn.example/oc_1.png' } },
+    })
+    const none = await call(routes, PROFILES_ROUTE, makeRequest({ url: PROFILES_ROUTE }))
+    expect(JSON.parse(none.body)).toEqual({ users: {}, chats: {} })
+    expect(target.profileCalls).toEqual([{ users: ['u_1', 'u_2'], chats: ['oc_1'] }, { users: [], chats: [] }])
+
+    const many = Array.from({ length: PROFILES_MAX_IDS + 1 }, (_, index) => `u_${index}`).join(',')
+    const tooMany = await call(routes, PROFILES_ROUTE, makeRequest({ url: `${PROFILES_ROUTE}?users=${many}` }))
+    expect(tooMany.status).toBe(400)
+    expect(target.profileCalls).toHaveLength(2)
+
+    const post = await call(routes, PROFILES_ROUTE, makeRequest({ method: 'POST', url: PROFILES_ROUTE }))
+    expect(post.status).toBe(405)
+  })
+
   it('serves the selector catalog over GET and rejects writes', async () => {
     const fake = makeCatalog()
     const { surface } = makeSurface({ provider: 'deepseek-account', model: 'deepseek-flash' }, fake.catalog)
     const { server, routes } = makeWebServer()
-    registerSettingsRoutes(server, surface)
+    registerSettingsRoutes(server, allowAll, surface)
 
     const catalog = await call(routes, CATALOG_ROUTE, makeRequest({
       url: `${CATALOG_ROUTE}?provider=deepseek-account&model=deepseek-flash`,
@@ -1716,7 +1970,7 @@ describe('settings routes', () => {
   it('writes config via PUT and enforces same-origin + JSON', async () => {
     const { surface, store } = makeSurface()
     const { server, routes } = makeWebServer()
-    registerSettingsRoutes(server, surface)
+    registerSettingsRoutes(server, allowAll, surface)
 
     const crossSite = await call(routes, CONFIG_ROUTE, makeRequest({
       method: 'PUT',
@@ -1753,7 +2007,7 @@ describe('settings routes', () => {
   it('clears overrides via DELETE and reconnects via POST', async () => {
     const { surface, store, target } = makeSurface()
     const { server, routes } = makeWebServer()
-    registerSettingsRoutes(server, surface)
+    registerSettingsRoutes(server, allowAll, surface)
     await store.save({ dmMode: 'disabled' })
 
     const cleared = await call(routes, CONFIG_ROUTE, makeRequest({ method: 'DELETE', headers: { host: 'h' } }))
@@ -1774,7 +2028,7 @@ describe('settings routes', () => {
     target.runningFlag = false
     target.credentialInfo.appSecret = { configured: false, writable: true }
     const { server, routes } = makeWebServer()
-    registerSettingsRoutes(server, surface)
+    registerSettingsRoutes(server, allowAll, surface)
 
     const response = await call(routes, RECONNECT_ROUTE, makeRequest({ method: 'POST', headers: { host: 'h' } }))
     expect(response.status).toBe(400)
@@ -1784,41 +2038,10 @@ describe('settings routes', () => {
     expect(target.connectCalls).toBe(0)
   })
 
-  it('runs the workspace cleanup via POST with the same guards', async () => {
-    const { surface, target } = makeSurface()
-    target.cleanupState = { retention: '30d', thresholdMs: 30 * 86_400_000, auto: false, workspaces: 2, candidates: 1, candidateBytes: 512 }
-    target.cleanupRun = { ok: true, deletedWorkspaces: 1, deletedSessionDirs: 2, retiredRoutes: 2, freedBytes: 512, failures: [] }
-    const { server, routes } = makeWebServer()
-    registerSettingsRoutes(server, surface)
-
-    const crossSite = await call(routes, CLEANUP_ROUTE, makeRequest({
-      method: 'POST',
-      headers: { origin: 'https://evil.example', host: '127.0.0.1:52555' },
-    }))
-    expect(crossSite.status).toBe(403)
-    expect(target.cleanupRunCalls).toBe(0)
-
-    const notAllowed = await call(routes, CLEANUP_ROUTE, makeRequest({ method: 'GET' }))
-    expect(notAllowed.status).toBe(405)
-    expect(notAllowed.headers.allow).toBe('POST')
-
-    const ok = await call(routes, CLEANUP_ROUTE, makeRequest({ method: 'POST', headers: { host: 'h' } }))
-    expect(ok.status).toBe(200)
-    const body = JSON.parse(ok.body)
-    expect(body.ok).toBe(true)
-    expect(body.result).toEqual(target.cleanupRun)
-    expect(body.panel.cleanup).toEqual(target.cleanupState)
-
-    target.failCleanupRun = 'disk unavailable'
-    const failed = await call(routes, CLEANUP_ROUTE, makeRequest({ method: 'POST', headers: { host: 'h' } }))
-    expect(failed.status).toBe(500)
-    expect(JSON.parse(failed.body).error).toContain('disk unavailable')
-  })
-
   it('opens the native directory chooser and returns the picked path', async () => {
     const { surface } = makeSurface({}, undefined, stubPicker(async () => '/Users/me/workspaces'))
     const { server, routes } = makeWebServer()
-    registerSettingsRoutes(server, surface)
+    registerSettingsRoutes(server, allowAll, surface)
 
     const crossSite = await call(routes, PICK_DIRECTORY_ROUTE, makeRequest({
       method: 'POST',
@@ -1842,7 +2065,7 @@ describe('settings routes', () => {
     let outcome: () => Promise<string | null> = async () => null
     const { surface } = makeSurface({}, undefined, { available: true, pick: () => outcome() })
     const { server, routes } = makeWebServer()
-    registerSettingsRoutes(server, surface)
+    registerSettingsRoutes(server, allowAll, surface)
 
     const canceled = await call(routes, PICK_DIRECTORY_ROUTE, makeRequest({
       method: 'POST',
@@ -1864,7 +2087,7 @@ describe('settings routes', () => {
     // No picker seam (remote/headless host): the route still exists but refuses.
     const headless = makeSurface()
     const headlessServer = makeWebServer()
-    registerSettingsRoutes(headlessServer.server, headless.surface)
+    registerSettingsRoutes(headlessServer.server, allowAll, headless.surface)
     const unavailable = await call(headlessServer.routes, PICK_DIRECTORY_ROUTE, makeRequest({
       method: 'POST',
       headers: { host: 'h' },
@@ -1877,10 +2100,11 @@ describe('settings routes', () => {
     const { surface, target } = makeSurface()
     target.accessState = {
       mode: 'guarded',
-      admin: { openId: 'ou_admin', configured: true },
+      admin: { userId: 'u_admin', configured: true },
       loaded: true,
       groups: [{ chatId: 'oc_team', name: '研发群', source: 'card', addedAt: 1_700_000_000_000 }],
       users: [],
+      wikiUsers: [],
       requests: [{
         token: 'tok_1',
         kind: 'group',
@@ -1891,12 +2115,12 @@ describe('settings routes', () => {
       }],
     }
     const { server, routes } = makeWebServer()
-    registerSettingsRoutes(server, surface)
+    registerSettingsRoutes(server, allowAll, surface)
 
     const read = await call(routes, ACCESS_ROUTE, makeRequest())
     expect(read.status).toBe(200)
     const snapshot = JSON.parse(read.body) as AccessWire
-    expect(snapshot.admin).toEqual({ openId: 'ou_admin', configured: true })
+    expect(snapshot.admin).toEqual({ userId: 'u_admin', configured: true })
     expect(snapshot.groups).toEqual(target.accessState.groups)
 
     const head = await call(routes, ACCESS_ROUTE, makeRequest({ method: 'HEAD', url: ACCESS_ROUTE }))
@@ -1906,8 +2130,10 @@ describe('settings routes', () => {
     const writes: Array<{ route: string; method: string; body: Record<string, unknown> }> = [
       { route: ACCESS_GROUPS_ROUTE, method: 'POST', body: { chatId: 'oc_team' } },
       { route: ACCESS_GROUPS_ROUTE, method: 'DELETE', body: { chatId: 'oc_team' } },
-      { route: ACCESS_USERS_ROUTE, method: 'POST', body: { openId: 'ou_alice' } },
-      { route: ACCESS_USERS_ROUTE, method: 'DELETE', body: { openId: 'ou_alice' } },
+      { route: ACCESS_USERS_ROUTE, method: 'POST', body: { userId: 'u_alice' } },
+      { route: ACCESS_USERS_ROUTE, method: 'DELETE', body: { userId: 'u_alice' } },
+      { route: ACCESS_WIKI_USERS_ROUTE, method: 'POST', body: { userId: 'u_alice' } },
+      { route: ACCESS_WIKI_USERS_ROUTE, method: 'DELETE', body: { userId: 'u_alice' } },
       { route: ACCESS_REQUESTS_ROUTE, method: 'POST', body: { token: 'tok_1', decision: 'allow' } },
     ]
     for (const write of writes) {
@@ -1933,7 +2159,7 @@ describe('settings routes', () => {
     const invalidUser = await call(routes, ACCESS_USERS_ROUTE, makeRequest({
       method: 'POST',
       headers: { 'content-type': 'application/json', host: 'h' },
-      body: JSON.stringify({ openId: 'alice' }),
+      body: JSON.stringify({ userId: 'ou_alice' }),
     }))
     expect(invalidUser.status).toBe(400)
     expect(JSON.parse(invalidUser.body).error).toContain('ou_')
@@ -1944,6 +2170,26 @@ describe('settings routes', () => {
       body: JSON.stringify({ chatId: 'oc_team' }),
     }))
     expect(removed.status).toBe(200)
+
+    const addedWiki = await call(routes, ACCESS_WIKI_USERS_ROUTE, makeRequest({
+      method: 'POST',
+      headers: { 'content-type': 'application/json', host: 'h' },
+      body: JSON.stringify({ userId: 'u_wiki', name: 'Wiki' }),
+    }))
+    expect(addedWiki.status).toBe(200)
+    expect(JSON.parse(addedWiki.body).access.wikiUsers.map((user: { userId: string }) => user.userId)).toEqual(['u_wiki'])
+    const removedWiki = await call(routes, ACCESS_WIKI_USERS_ROUTE, makeRequest({
+      method: 'DELETE',
+      headers: { 'content-type': 'application/json', host: 'h' },
+      body: JSON.stringify({ userId: 'u_wiki' }),
+    }))
+    expect(JSON.parse(removedWiki.body).access.wikiUsers).toEqual([])
+    const invalidWiki = await call(routes, ACCESS_WIKI_USERS_ROUTE, makeRequest({
+      method: 'POST',
+      headers: { 'content-type': 'application/json', host: 'h' },
+      body: JSON.stringify({ userId: 'ou_wiki' }),
+    }))
+    expect(invalidWiki.status).toBe(400)
 
     const resolved = await call(routes, ACCESS_REQUESTS_ROUTE, makeRequest({
       method: 'POST',
@@ -1969,7 +2215,7 @@ describe('settings routes', () => {
   it('writes and removes credentials via PUT / DELETE with the same guards', async () => {
     const { surface } = makeSurface()
     const { server, routes } = makeWebServer()
-    registerSettingsRoutes(server, surface)
+    registerSettingsRoutes(server, allowAll, surface)
 
     const crossSite = await call(routes, CREDENTIALS_ROUTE, makeRequest({
       method: 'PUT',
@@ -2008,6 +2254,21 @@ describe('settings routes', () => {
     expect(removed.status).toBe(200)
     expect(JSON.parse(removed.body).ok).toBe(true)
 
+    const token = await call(routes, CREDENTIALS_ROUTE, makeRequest({
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', host: 'h' },
+      body: JSON.stringify({ analyzeToken: 'tok_new' }),
+    }))
+    expect(token.status).toBe(200)
+    expect(JSON.parse(token.body).reconnect).toBe('not-needed')
+
+    const tokenRemoved = await call(routes, CREDENTIALS_ROUTE, makeRequest({
+      method: 'DELETE',
+      headers: { 'content-type': 'application/json', host: 'h' },
+      body: JSON.stringify({ field: 'analyzeToken' }),
+    }))
+    expect(tokenRemoved.status).toBe(200)
+
     const notAllowed = await call(routes, CREDENTIALS_ROUTE, makeRequest({ method: 'GET' }))
     expect(notAllowed.status).toBe(405)
   })
@@ -2025,30 +2286,39 @@ describe('apply() web wiring', () => {
     const childCtx = {
       ...base,
       effect,
-      get: (name: string) => (name === 'webServer' ? server : base.get?.(name)),
+      get: (name: string) => {
+        if (name === 'webServer') return server
+        if (name === 'connection') return allowAll
+        return base.get?.(name)
+      },
     }
+    const injected: string[][] = []
     const ctx = {
       ...base,
       effect,
-      inject: (_dependencies: string[], callback: (child: HostContext) => void) => callback(childCtx as unknown as HostContext),
+      inject: (dependencies: string[], callback: (child: HostContext) => void) => {
+        injected.push(dependencies)
+        callback(childCtx as unknown as HostContext)
+      },
     } as unknown as HostContext
 
     const channel = makeChannel()
+    const dshHome = mkdtempSync(path.join(tmpdir(), 'dsh-channels-home-'))
+    vi.stubEnv('DSH_HOME', dshHome)
     apply(ctx, {
       appId: 'FEISHU_APP_ID',
       appSecret: 'FEISHU_APP_SECRET',
-      settingsFile: tempOverlayFile(),
       baseDir: mkdtempSync(path.join(tmpdir(), 'dsh-channels-apply-')),
       channelFactory: () => channel,
     })
 
+    expect(injected).toContainEqual(['webServer', 'connection'])
     expect(routes.has(PANEL_ROUTE)).toBe(true)
     expect(routes.has(STATUS_ROUTE)).toBe(true)
     expect(routes.has(CATALOG_ROUTE)).toBe(true)
     expect(routes.has(CONFIG_ROUTE)).toBe(true)
     expect(routes.has(CREDENTIALS_ROUTE)).toBe(true)
     expect(routes.has(RECONNECT_ROUTE)).toBe(true)
-    expect(routes.has(CLEANUP_ROUTE)).toBe(true)
     expect(routes.has(ACCESS_ROUTE)).toBe(true)
     expect(routes.has(ACCESS_GROUPS_ROUTE)).toBe(true)
     expect(routes.has(ACCESS_USERS_ROUTE)).toBe(true)
@@ -2075,8 +2345,30 @@ describe('apply() web wiring', () => {
       body: JSON.stringify({ values: { requireMention: false } }),
     }))
     expect(saved.status).toBe(200)
+    expect(JSON.parse(readFileSync(path.join(dshHome, 'dsh-channels', 'settings.json'), 'utf8')))
+      .toMatchObject({ requireMention: false })
 
     for (const cleanup of cleanups.reverse()) await cleanup()
+    vi.unstubAllEnvs()
+  })
+})
+
+describe('mountSettingsRoutes', () => {
+  it('mounts nothing when the host has a webServer but no connection gate', () => {
+    const { surface } = makeSurface()
+    const { server, routes } = makeWebServer()
+    const { ctx: base } = makeHostContext()
+    const ctx = {
+      ...base,
+      effect: (callback: () => unknown) => { callback() },
+      get: (name: string) => (name === 'webServer' ? server : undefined),
+    } as unknown as HostContext
+    mountSettingsRoutes(ctx, surface)
+    expect(routes.size).toBe(0)
+
+    const gated = { ...ctx, get: (name: string) => (name === 'webServer' ? server : name === 'connection' ? allowAll : undefined) }
+    mountSettingsRoutes(gated as unknown as HostContext, surface)
+    expect(routes.has(CONFIG_ROUTE)).toBe(true)
   })
 })
 
@@ -2225,17 +2517,8 @@ describe('FeishuService settings integration', () => {
     expect(panel.status.lastStartError).toBeUndefined()
     expect(panel.status.running).toBe(false)
     // Unconnected the storage domain is closed: the whitelists are unknown
-    // rather than empty, and the cleanup preview explains why it is unavailable.
+    // rather than empty.
     expect(panel.access.loaded).toBe(false)
-    expect(panel.cleanup.error).toContain('飞书连接建立后')
-    expect(panel.cleanup.candidates).toBe(0)
-
-    // Cleanup is refused server-side while the storage domain is closed.
-    const run = await surface.runCleanup()
-    expect(run.ok).toBe(true)
-    if (!run.ok) return
-    expect(run.result.ok).toBe(false)
-    expect(run.result.error).toContain('飞书连接建立后')
 
     // Saving the missing secret from the panel connects immediately.
     const saved = await surface.saveCredentials({ appSecret: 'secret' })
@@ -2306,6 +2589,20 @@ describe('FeishuService settings integration', () => {
     if (!cleared.ok) return
     expect(cleared.reconnect).toBe('pending')
     expect(h.credentials.values.FEISHU_APP_SECRET).toBeUndefined()
+    await service.shutdown()
+  })
+
+  it('writes the analyze API token to its credential ref through the real service', async () => {
+    const h = harness({}, {})
+    const service = new FeishuService(h.ctx, h.config, () => h.channel, undefined, h.store)
+    const surface = new SettingsSurface(service, h.store)
+    await service.boot()
+    const saved = await surface.saveCredentials({ analyzeToken: 'tok_secret' })
+    expect(saved.ok).toBe(true)
+    expect(h.credentials.values.DSH_CHANNELS_ANALYZE_TOKEN).toBe('tok_secret')
+    expect(service.isRunning()).toBe(false)
+    await surface.clearCredential('analyzeToken')
+    expect(h.credentials.values.DSH_CHANNELS_ANALYZE_TOKEN).toBeUndefined()
     await service.shutdown()
   })
 

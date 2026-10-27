@@ -177,7 +177,7 @@ export interface InboundAttachmentState {
  * anything or touching state outside the message itself.
  *
  * The rules are exactly the ones the archive intake and the native storage
- * layer already use, so admission can decide "silent register" versus "start a
+ * layer already use, so admission can decide "stay inert" versus "start a
  * turn" before any Session exists: no resources and no merged-forward record
  * means "no payload" and the raw content is the prompt; otherwise placeholders
  * are stripped and an empty remainder marks an attachment-only message.

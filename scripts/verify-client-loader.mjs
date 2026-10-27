@@ -2,7 +2,7 @@
  * Client bundle smoke test: load lib/client.js through a minimal
  * __ModuleLoader__ + require shim (same shape as the browser kernel), then
  * call the plugin's apply() against a fake slots registry. Fails loudly if the
- * factory throws, requires an unknown module, or registers the wrong section.
+ * factory throws, requires an unknown module, or registers the wrong slots.
  *
  * Run after `pnpm build:client`: node scripts/verify-client-loader.mjs
  */
@@ -53,22 +53,47 @@ assert.equal(typeof plugin.name, 'string')
 
 const registrations = []
 const effects = []
+const tabTypes = []
+const opened = []
+const scopeDeps = []
+const fakeSlots = {
+  inject: (slot, contribution) => { contribution() },
+  register: (declaration, component) => {
+    registrations.push({ declaration, component })
+    return () => {}
+  },
+}
 plugin.apply({
   effect: callback => { effects.push(callback()) },
-  slots: {
-    inject: (slot, contribution) => { contribution() },
-    register: (declaration, component) => {
-      registrations.push({ declaration, component })
-      return () => {}
-    },
+  slots: fakeSlots,
+  inject: (deps, callback) => {
+    scopeDeps.push(deps)
+    callback({
+      effect: callback => { effects.push(callback()) },
+      slots: fakeSlots,
+      sidebarRightTabs: { register: definition => { tabTypes.push(definition); return () => {} } },
+      sidebarRight: { openTab: kind => { opened.push(kind) } },
+    })
   },
 })
 
 assert.equal(styles.length, 1, 'stylesheet was not installed')
-assert.equal(registrations.length, 1, 'expected exactly one slot registration')
-const [registration] = registrations
-assert.equal(registration.declaration.name, 'settings.section')
-assert.equal(registration.declaration.id, 'feishu-channels')
-assert.equal(typeof registration.component, 'function')
+assert.deepEqual(
+  registrations.map(({ declaration }) => declaration.name),
+  ['main', 'sidebar.panellist', 'sidebar.right.pane.tab', 'conversation.session.header.actions'],
+  'expected the main page, the left-sidebar entry, the origin tab body, and the header entry',
+)
+const [page, entry, originTab, originAction] = registrations
+assert.equal(page.declaration.key, 'feishu-channels')
+assert.equal(entry.declaration.id, 'feishu-channels', 'sidebar row id must address the main page key')
+assert.equal(entry.declaration.label(), '飞书渠道')
+for (const { component } of registrations) assert.equal(typeof component, 'function')
 
-console.log('OK: lib/client.js loads through the module-loader shim and registers 设置 → 飞书渠道')
+assert.deepEqual(scopeDeps, [['sidebarRightTabs', 'sidebarRight']])
+assert.equal(tabTypes.length, 1, 'origin tab type was not registered')
+assert.equal(originTab.declaration.key, tabTypes[0].id, 'tab body must be keyed by the tab type id')
+assert.equal(tabTypes[0].title(''), '飞书来源')
+originAction.declaration.inject('s_1').openOrigin()
+assert.deepEqual(opened, [tabTypes[0].kind], 'header entry must open the origin tab kind')
+
+console.log('OK: lib/client.js loads through the module-loader shim and registers the 飞书渠道 sidebar entry, page, and origin tab')

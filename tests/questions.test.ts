@@ -13,7 +13,7 @@ const ROUTE: ApprovalRoute = {
   chatId: 'oc_test_chat',
   cardMessageId: 'om_main',
   inThread: true,
-  senderOpenId: 'ou_owner',
+  senderUserId: 'u_owner',
 }
 
 function makeAnswerer(overrides: Partial<ApprovalRoute> = {}): {
@@ -45,11 +45,11 @@ function actionValue(card: object, label: string): Record<string, unknown> {
   throw new Error(`no button labelled ${label}`)
 }
 
-function click(channel: ReturnType<typeof makeChannel>, messageId: string, value: Record<string, unknown>, openId = 'ou_owner'): Promise<void> {
+function click(channel: ReturnType<typeof makeChannel>, messageId: string, value: Record<string, unknown>, userId = 'u_owner'): Promise<void> {
   const event: CardActionEvent = {
     messageId,
     chatId: 'oc_test_chat',
-    operator: { openId },
+    operator: { openId: 'ou_operator', userId },
     action: { value, tag: 'button' },
   }
   return channel.fireCardAction(event)
@@ -156,7 +156,7 @@ describe('QuestionAnswerer', () => {
     }, vi.fn(async () => ({ answers: [] }))).then(value => { settled = value })
 
     await vi.advanceTimersByTimeAsync(0)
-    await click(channel, 'om_1', actionValue(questionCardOf(channel), 'A'), 'ou_stranger')
+    await click(channel, 'om_1', actionValue(questionCardOf(channel), 'A'), 'u_stranger')
     await vi.advanceTimersByTimeAsync(0)
     expect(settled).toBeUndefined()
     expect(JSON.stringify(channel.updated.at(-1)!.card)).toContain('仅发起该会话的用户')

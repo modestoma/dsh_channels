@@ -20,10 +20,16 @@
    | `im:message`（获取与发送单聊、群组消息） | 收发消息、回复话题、下载消息内图片/文件资源（`messageResource.get`，具体 scope 以控制台该接口要求为准） |
    | `im:message:readonly`（读取单聊、群组消息内容） | 引用摘录、话题历史、`feishu_topic_messages` 的消息读取（message.get / mget / list），以及附件资源定位与合并转发子资源读取 |
    | `im:message.p2p_msg:readonly`（读取用户发给机器人的单聊消息） | 私聊通道 |
+   | `contact:user.employee_id:readonly`（获取用户 user ID，**必需**） | 插件用 `user_id` 识别用户（准入、话题归属、工作区目录）；未开通时所有用户消息都会被丢弃（控制台打印 warn）。外部联系人/跨租户用户没有本租户 `user_id`，无法使用 |
    | `im:message.group_msg`（读取群组中所有消息，**敏感权限**） | 读取群/话题中机器人入群前或未 @ 机器人的历史消息；控制台要求时申请并由企业管理员审批，未开通时按“机器人可见范围”降级 |
    | `im:message.reactions:write_only`（发送、删除消息表情回复） | Typing / DONE / No 表态 |
+   | `im:resource`（获取与上传图片或文件资源，**可选**；`im:resource:upload` 亦可） | 模型用 `feishu_send_file` 把生成的图片/文件发给用户；不开通时该工具返回可读错误 |
    | `im:message:update`（更新消息卡片） | 流式卡片刷新（patch） |
-   | `im:chat:readonly` 一类（获取群信息） | 入群通知卡展示群名/成员数（具体 scope 以控制台要求为准） |
+   | `wiki:wiki`、`docx:document`（只读可用对应的 `:readonly` 权限），电子表格 `sheets:spreadsheet:read` / `sheets:spreadsheet:write_only`，多维表格 `base:table:read`、`base:field:read`、`base:record:read` / `base:record:create`、`base:record:update`、`base:record:delete`（**可选**；旧版 `sheets:spreadsheet` / `bitable:app` 对新版接口不生效） | 知识库工具（`feishuTools.wikiRead` / `wikiWrite` + `wikiRoots`）：浏览知识库，读取/新建/修改飞书文档、电子表格、多维表格；应用还需是目标知识空间的成员 |
+   | `im:chat:readonly` 一类（获取群信息） | 入群通知卡展示群名/成员数；Web 设置页和对话「飞书来源」显示群名、群头像，并在缺少通讯录权限时从群成员列表读取发起人姓名（具体 scope 以控制台要求为准） |
+   | `contact:user.base:readonly`（获取用户基本信息，**可选**） | Web 设置页（管理员、白名单、待处理申请、知识库用户）和对话「飞书来源」显示用户真实姓名与头像；还要求用户在应用的「通讯录权限范围」内（最简单是选全部成员）。缺失时显示授权时记下的名字或 user_id，「飞书来源」的群聊发起人退回群成员列表取名字（没有头像） |
+   | 「获取应用信息」一类（如 `admin:app.info:readonly` / `application:application:self_manage`，**可选**，以控制台要求为准） | 未配置 `adminUserId` 时连接后自动把应用所有者设为管理员；不便申请时跳过即可，按 3.3 手动设置管理员 |
+   | `application:app_slash_command:read` 与 `application:app_slash_command:write`（读取/管理应用斜杠指令，可选，仅 `slashCommandPanel: true` 时需要） | 连接后把插件命令同步到飞书原生斜杠指令面板（输入 `/` 时列出，客户端约 5 分钟后刷新）；缺失时只是面板没有列表，直接输入命令不受影响 |
 
    > 卡片更新接口本身支持 `im:message` 一项即可，但建议把 `im:message:update` 也加上，避免组合差异。
    >
@@ -33,7 +39,7 @@
 4. **事件与回调** → 事件订阅方式选择 **使用长连接接收事件**（WebSocket，免公网 IP）。
    - 添加事件：**接收消息 im.message.receive_v1**（勾选“接收群聊中 @ 机器人消息”）。
    - 添加事件：**机器人进群 im.chat.member.bot.added_v1**（机器人被拉进群后私聊管理员发群信息卡；未订阅时退化为“群里第一次未授权 @ 时补发”）。
-   - 添加回调：**卡片回传交互 card.action.trigger**（HITL 审批、授权卡的按钮回传，同样走长连接）。
+   - 添加回调：**卡片回传交互 card.action.trigger**（流式卡停止按钮、选择卡、HITL 审批、授权卡的按钮回传，同样走长连接）。
 5. **凭证与基础信息** 页复制 `App ID` 与 `App Secret`。
 6. **版本管理与发布** → 创建版本（权限与事件配置随版本生效）→ 发布。
 7. **可用范围**：把自己（和测试同事）加入可用范围。
@@ -113,7 +119,7 @@ chmod 600 $DSH_HOME/.credentials.yaml
     dmMode: 'open'                      # 私聊通道开关
     threadFallback: 'degrade'           # 话题被拒时降级为会话级路由
     topicIsolation: 'auto'              # 话题目录隔离：auto（Git 仓库用 worktree，否则子目录）/ subdir / worktree
-    acceptAttachments: true             # 接收飞书附件：native 下图片预取、文件懒取、纯附件静默登记
+    acceptAttachments: true             # 接收飞书附件：native 下图片预取、文件懒取、纯附件静默不回复
     attachmentStore: 'native'           # 入站附件后端：native（DSH 原生附件库）/ archive（旧版工作区 attachments/）
     prefetchImages: true                # 触发消息图片预取为首轮 ImageBlock
     prefetchImageMaxBytes: 20971520     # 单张预取图片上限（20 MiB）
@@ -121,8 +127,6 @@ chmod 600 $DSH_HOME/.credentials.yaml
     prefetchTimeoutMs: 10000            # 图片预取整段超时（10 s）
     historyBootstrapLimit: 10           # 新会话首轮话题历史条数（0 关闭，上限 20）
     promptContextTimeoutMs: 3000        # 被动引用/历史读取预算（3 s）
-    pendingAttachmentTtlMs: 604800000   # 静默登记保留期（7 天；0 = 不按时间清理）
-    pendingAttachmentLimit: 10          # 每个 (会话,话题,发送者) scope 的静默登记容量
     feishuTools:                        # 模型工具（Web 面板按子键合并，不写空未改子键）
       attachmentFetch: true             # feishu_attachment_fetch：按需懒取已知消息的图片/文件
       attachmentFetchMaxResources: 10   # 单次最多取回资源数（1–50）
@@ -132,7 +136,7 @@ chmod 600 $DSH_HOME/.credentials.yaml
       topicMessagesTimeoutMs: 20000     # 单次话题读取整段超时（20 s）
     approvalTimeoutMs: 300000           # HITL 审批决策卡等待时长（默认 5 分钟）
     accessMode: 'guarded'               # 准入模式：guarded（默认）| open（旧行为，不安全）
-    adminOpenId: 'ou_xxx'               # 管理员 open_id（可留空，留空时 guarded 下拒绝一切对话）
+    adminUserId: 'a1b2c3d4'            # 管理员 user_id（可留空，留空时自动使用应用所有者；都没有时 guarded 下拒绝一切对话）
     authRequestTtlDays: 7               # 入群/用户授权申请卡有效期（天）
     loggerLevel: 'info'
 ```
@@ -142,7 +146,7 @@ chmod 600 $DSH_HOME/.credentials.yaml
 | 配置项 | 默认 | 说明 |
 |--------|------|------|
 | `appId` / `appSecret` | `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | 凭据引用名（shell 标识符），经 `ctx.credentials` 解析；仅当凭据库使用其它变量名时才需要覆盖。明文密钥会被拒绝 |
-| `baseDir` | `./channels-data` | 工作区目录树根：每个用户一个工作区（私聊 `p2p/<open_id>/`，群聊 `groups/<chat_id>/<open_id>/`），每个话题的工作目录为 `<工作区>/topics/<话题>/`（模型/工具产生文件的落点）；Web 面板可覆盖，只接受绝对路径，`~` 展开，保存时创建并校验目录，只影响之后新建的会话 |
+| `baseDir` | `./channels-data` | 工作区目录树根：每个用户一个工作区（私聊 `p2p/<user_id>/`，群聊 `groups/<chat_id>/<user_id>/`），每个话题的工作目录为 `<工作区>/topics/<话题>/`（模型/工具产生文件的落点）；Web 面板可覆盖，只接受绝对路径，`~` 展开，保存时创建并校验目录，只影响之后新建的会话 |
 | `provider` / `model` | 部署默认 | 新建 session 的路由；省略时继承部署默认 |
 | `reasoningEffort` | 适配器/provider 默认 | Session 初始/重置推理档位；可在话题内用 `/effort` 覆盖 |
 | `maxTokens` | 适配器默认 | 每次模型请求输出上限 |
@@ -153,44 +157,43 @@ chmod 600 $DSH_HOME/.credentials.yaml
 | `topicIsolation` | `auto` | 话题工作目录形式：`auto`（工作区含 `.git` 时用 Git worktree，否则普通子目录）/ `subdir` / `worktree`（失败回退子目录） |
 | `approvalTimeoutMs` | `300000` | HITL 审批决策卡等待时长（10s–1h）；超时自动拒绝 |
 | `accessMode` | `guarded` | 准入模式：`guarded` 仅管理员+白名单；`open` 保留旧行为（任何可用范围用户可对话，不安全） |
-| `adminOpenId` | 未设置 | 唯一管理员 open_id（`ou_` 开头）；留空 + guarded = 拒绝一切对话（`/userid` 引导仍可用）。面板可改 |
+| `adminUserId` | 未设置 = 应用所有者 | 唯一管理员 user_id（不是 `ou_` 开头的 open_id）；留空时连接后自动使用应用所有者（需可选的「获取应用信息」权限），两者都没有 + guarded = 拒绝一切对话（`/userid` 引导仍可用）。面板可改 |
 | `authRequestTtlDays` | `7` | 入群/用户授权申请卡有效期（1–30 天） |
-| `acceptAttachments` | `true` | 接收飞书图片/文件/合并转发记录。native 下触发消息图片预取、文件懒取、纯附件静默登记；`false` 时附件消息完全惰性（不保存、不触发、不登记） |
+| `acceptAttachments` | `true` | 接收飞书图片/文件/合并转发记录。native 下触发消息图片预取、文件懒取、纯附件静默不回复（引用该消息再提问时列入清单）；`false` 时附件消息完全惰性（不保存、不触发、不列入清单） |
 | `attachmentStore` | `native` | 入站附件后端：`native`（DSH 原生附件库，默认；不可变、内容寻址去重、随 Session 回放、不自动清理）/ `archive`（旧版下载到话题工作区 `attachments/`，会阻塞会话建立） |
 | `prefetchImages` | `true` | native 下把触发消息图片预取为首轮 `ImageBlock`；失败/超限/超时降级为清单懒取项。关闭后图片也需 `feishu_attachment_fetch` |
 | `prefetchImageMaxBytes` | `20971520` | 单张预取图片字节上限（20 MiB，1 B–200 MiB） |
 | `prefetchTotalMaxBytes` | `52428800` | 一次触发消息预取的总字节预算（50 MiB，1 B–1 GiB）；用尽后剩余图片降级清单 |
 | `prefetchTimeoutMs` | `10000` | 图片预取整段超时（100–120000 ms）；到期保留已取回图片、其余降级清单。注意配置键是 `prefetchTimeoutMs`（早期 Issue 草稿写作 `prefetchImageTimeoutMs`） |
-| `pendingAttachmentTtlMs` | `604800000` | 静默登记元数据保留期（7 天，≥0；`0` = 不按时间清理，每 scope 容量上限仍生效） |
-| `pendingAttachmentLimit` | `10` | 每个 `(会话, 话题, 发送者)` scope 的静默登记容量（1–100）；超出淘汰该 scope 最旧记录 |
 | `historyBootstrapLimit` | `10` | 新会话首轮自动附带本话题最近 N 条消息摘要（0 关闭，上限 20；失败静默降级）；更早的消息用 `feishu_topic_messages` 翻页 |
 | `promptContextTimeoutMs` | `3000` | 被动引用/首轮历史读取的整段预算（100–10000 ms）；超时即省略对应块、回合照跑。模型主动调用工具的读取超时另由 `feishuTools.topicMessagesTimeoutMs` 控制 |
 | `feishuTools.attachmentFetch` | `true` | 是否挂载 `feishu_attachment_fetch`；关闭后文件无法懒取，插件**整体回退 archive 后端** |
 | `feishuTools.attachmentFetchMaxResources` | `10` | 单次工具调用最多取回的附件数（1–50）；超出返回可读原因，可按 `file_key` 拆分重试 |
-| `feishuTools.attachmentFetchMaxBytes` | `104857600` | 单次工具调用的总下载字节预算（100 MiB，1 B–1 GiB）；文件流式写入、不整文件缓冲 |
-| `feishuTools.attachmentFetchTimeoutMs` | `120000` | 单次 `feishu_attachment_fetch` 整段超时（1000–600000 ms）；到期取消并逐项报告 |
+| `feishuTools.attachmentFetchMaxBytes` | `104857600` | 单次工具调用的总下载字节预算（100 MiB，≥ 1 B，无上限）；文件流式写入、不整文件缓冲 |
+| `feishuTools.attachmentFetchTimeoutMs` | `120000` | 单次 `feishu_attachment_fetch` 整段超时（1000–2147483647 ms）；到期取消并逐项报告；大文件需同步调大 |
 | `feishuTools.topicMessages` | `true` | 是否挂载 `feishu_topic_messages`；只影响模型工具，被动引用/历史摘录仍生效 |
 | `feishuTools.topicMessagesTimeoutMs` | `20000` | 单次 `feishu_topic_messages` 整段超时（1000–120000 ms） |
 | `loggerLevel` | `info` | 官方 SDK 日志级别 |
 
-> **面板与配置位置**：v2 附件配置已加入 Web 面板「设置 → 飞书渠道 → 会话与行为」：`acceptAttachments` / `attachmentStore` / `prefetch*` / `pendingAttachment*` / `historyBootstrapLimit` 在「内容与附件」组，`feishuTools.*` 与 `promptContextTimeoutMs` 在「模型工具」组；保存写入同一 Web 覆盖文件，`feishuTools.*` 按子键合并（不会把未修改子键写空）。直接写 profile 补丁层同样生效，面板覆盖优先。其中 `feishuTools.topicMessages=false` 只关闭模型工具，被动的引用/历史 prompt 摘录仍生效；要完全关闭首轮历史请设 `historyBootstrapLimit: 0`。archive 后端下 `feishu_attachment_fetch` 不挂载，`feishu_topic_messages` 仍可读取历史文本，但工具描述会提示附件不可取。
+> **面板与配置位置**：v2 附件配置在 Web 面板「左侧栏 → 飞书渠道 → 附件与工具」：`acceptAttachments` / `attachmentStore` / `prefetchImages` / `historyBootstrapLimit` 在「入站附件」组，`feishuTools.*` 开关在「工具」组，各项字节上限与超时在「限额与超时」组；保存写入同一 Web 覆盖文件，`feishuTools.*` 按子键合并（不会把未修改子键写空）。直接写 profile 补丁层同样生效，面板覆盖优先。其中 `feishuTools.topicMessages=false` 只关闭模型工具，被动的引用/历史 prompt 摘录仍生效；要完全关闭首轮历史请设 `historyBootstrapLimit: 0`。archive 后端下 `feishu_attachment_fetch` 不挂载，`feishu_topic_messages` 仍可读取历史文本，但工具描述会提示附件不可取。
 
 ### 3.3 初始化管理员与授权（默认准入）
 
-插件默认 `accessMode: 'guarded'`：**没有配置管理员时，所有对话都会被拒绝**（这是 fail-closed 的安全默认值）。初始化顺序：
+插件默认 `accessMode: 'guarded'`：**没有管理员时，所有对话都会被拒绝**（这是 fail-closed 的安全默认值）。如果应用开通了可选的「获取应用信息」权限，留空 `adminUserId` 时连接后会自动把应用所有者设为管理员（Web「访问授权」页显示“已自动使用应用所有者”），可以跳过下面第 1–2 步；没开通或查询失败时按以下顺序手动设置：
 
-1. 启动 dsh 后在飞书**私聊机器人**发送 `/userid`（未配置管理员时任何私聊用户都可以用，只回固定文本，不建会话）→ 复制返回的 `ou_...`；
-2. 打开 Web **设置 → 飞书渠道 → 访问授权**，把 `ou_...` 填进「管理员 open_id」并保存（立即生效）；也可以直接写 profile 的 `adminOpenId`；
+1. 启动 dsh 后在飞书**私聊机器人**发送 `/userid`（未配置管理员时任何私聊用户都可以用，只回固定文本，不建会话）→ 复制返回的 user_id；
+2. 打开 Web 左侧栏 **飞书渠道 → 访问授权**，把它填进「管理员 user_id」并保存（立即生效）；也可以直接写 profile 的 `adminUserId`；
 3. 现在管理员私聊机器人即可正常对话。**其他用户私聊会收到一条固定提示**（“非管理员禁用私聊功能哦…”），不会建会话；
 4. **给群授权**（三种入口任选；目的是放行**非管理员**，管理员本人在任何群都能直接对话）：
    - 机器人被拉进群 → 管理员私聊收到**群信息卡**（群名/`chat_id`/成员数/邀请人）→ 点「授权本群」；
    - 管理员在群里发 `/auth allow` → 回执「已授权本群」；`/auth revoke` 撤销；
    - Web 面板「访问与授权 → 已授权群」手动添加 `chat_id`（可用 `/groupid` 查看）；
 5. **给用户授权**（三种入口任选）：
-   - 已授权群里未授权用户 @ 机器人 → 管理员收到**用户授权申请卡**（含昵称/open_id）→ 点「授权用户」；
-   - 管理员发 `/auth user add ou_xxx`；`/auth user remove ou_xxx` 撤销；
-   - Web 面板「访问与授权 → 已授权用户」手动添加 open_id（用户可用 `/userid` 查看）；
-6. 授权/撤销**立即生效**；白名单与待处理申请持久化在插件 `channels_routes` 域，重启不丢。`/auth list` 可随时查看白名单与待处理申请。
+   - 已授权群里未授权用户 @ 机器人 → 管理员收到**用户授权申请卡**（含昵称/user_id）→ 点「授权用户」；
+   - 管理员在群里发 `/auth user add @用户`（或 `/auth user add <user_id>`）；`/auth user remove @用户` 撤销；外部用户没有 user_id，无法授权；
+   - Web 面板「访问与授权 → 已授权用户」手动添加 user_id（用户可用 `/userid` 查看）；
+   - 知识库工具另有一份**知识库白名单**：管理员发 `/auth wiki add @用户`（或 `<user_id>`）后，该用户发起的话题才能使用知识库工具，`/auth wiki remove @用户` 撤销；管理员始终可用；
+6. 授权/撤销**立即生效**；白名单与待处理申请持久化在插件 `channels_routes_v2` 域，重启不丢。`/auth list` 可随时查看白名单与待处理申请。
 
 > 说明：**管理员不受白名单限制**——机器人被拉进新群后，管理员可以直接 @ 机器人开会话，不需要先授权该群；授权群/用户只影响**非管理员**。管理员在任意群里都可以使用 `/auth`、`/groupid` 等命令。
 
@@ -216,7 +219,9 @@ DSH_HOME=$DSH_HOME pnpm dsh web        # 默认 http://127.0.0.1:3080
 [dsh-channels] 准入=guarded，管理员已配置
 ```
 
-> 准入相关控制台输出：`准入=open`（不安全，仅调试）、`准入=guarded，管理员已配置`、`准入=guarded 但未配置管理员 open_id：所有对话都会被拒绝…`（此时按 §3.3 配置管理员即可）。
+> 斜杠指令面板：连接后日志出现 `slash command panel synced (N commands, x created, y updated, z removed)` 即同步成功，此时在飞书聊天框输入 `/` 应能看到插件命令；`飞书原生斜杠指令面板同步失败（直接输入命令不受影响）：…` 表示同步失败，原因同时显示在面板「连接」页。
+
+> 准入相关控制台输出：`准入=open`（不安全，仅调试）、`准入=guarded，管理员已配置`、`准入=guarded 但未配置管理员 user_id：所有对话都会被拒绝…`（此时按 §3.3 配置管理员即可）。
 
 > 第二行只在宿主挂载了 `approval` 服务时出现；若显示 `主机未挂载 approval 服务，HITL 审批应答关闭`，说明该部署未启用 HITL（`approval/request` 事件永远不会派发），并非插件故障。
 
@@ -227,10 +232,9 @@ DSH_HOME=$DSH_HOME pnpm dsh web        # 默认 http://127.0.0.1:3080
 | `attachmentStore=native 但宿主未挂载 ctx.attachments，入站附件回退话题 attachments/ 工作区落盘` | 宿主没有 DSH 原生附件库：入站附件按旧 archive 行为处理；如需 native 请确认 web profile 启用 `dsh-attachment-local` |
 | `feishu_attachment_fetch 未挂载：宿主 tools/attachments 服务不可用（会话继续）` | 缺 `tools` 或 `attachments` 服务：该工具不注册，会话照常建立 |
 | `feishu_topic_messages 未挂载：宿主 tools 服务不可用（会话继续）` | 缺 `tools` 服务：话题读取工具不注册 |
-| `pending attachment storage domain unavailable; using a process-memory TTL fallback…` | 宿主拒绝 `pending_attachments` 表：静默登记退化为进程内 TTL，重启丢失（仅防御场景） |
 | `adopted N legacy staged attachment(s) into …; the one-time _staging migration is deprecated and will be removed after one release cycle` | 旧版 `_staging` 遗留文件被一次性迁入话题目录；按 D12，该兼容路径在 v2 发布后的下一个 minor 版本移除，可据此清理旧数据 |
 
-**未配置凭据（不是启动失败）**：日志会提示 `飞书应用凭据未配置完整（缺少 FEISHU_APP_…）`，插件照常加载但**不连接**；打开 Web **设置 → 飞书渠道 → 连接**，按三步引导填写 App ID / App Secret 并保存后自动连接。
+**未配置凭据（不是启动失败）**：日志会提示 `飞书应用凭据未配置完整（缺少 FEISHU_APP_…）`，插件照常加载但**不连接**；打开 Web 左侧栏 **飞书渠道 → 连接**，按三步引导填写 App ID / App Secret 并保存后自动连接。
 
 **常见连接失败**（插件保持加载，面板「连接」标签页显示原因，可重试）：
 
@@ -255,18 +259,20 @@ DSH_HOME=$DSH_HOME pnpm dsh web        # 默认 http://127.0.0.1:3080
 | 2 | 私聊续聊 | 在刚建的话题里直接再发消息（**不 @**） | 继续同一 session：完成后主卡结算页脚第一行的 session id 不变，input/output token 累计增长 |
 | 3 | 群聊 @ | 在普通群 @ 机器人发消息 | 同 #1；该消息成为新话题根 |
 | 4 | 群聊话题内 | 在上一步的话题里直接发消息（不 @） | 延续该 session，不再要求 @ |
-| 5 | 同群第二个用户 | 换另一个人 @ 机器人 | 新话题 + 新 session；dsh 工作区列表中出现**该用户的独立工作区**（`groups/<chat_id>/<用户 open_id>/`），会话实际工作在它自己的 `topics/<话题>/` 下，与原用户的话题目录互不可见 |
+| 5 | 同群第二个用户 | 换另一个人 @ 机器人 | 新话题 + 新 session；dsh 工作区列表中出现**该用户的独立工作区**（`groups/<chat_id>/<用户 user_id>/`），会话实际工作在它自己的 `topics/<话题>/` 下，与原用户的话题目录互不可见 |
 | 6 | 话题群 | 在话题群某话题中 @ 机器人 | 机器人直接在该话题内回复卡片（不新建话题） |
 | 7 | 折叠面板 | 点面板标题 | 展开推理内容，右侧箭头翻转向上；再点收起 |
 | 8 | 重启恢复 | 重启 dsh 后在旧话题里发消息 | 机器人懒恢复原 session，token 统计继续累计 |
 | 9 | 降级路径 | 在关闭话题功能的群里 @ 机器人 | 正常回复（普通回复气泡），后续 @ 延续同一 session |
 | 10 | HITL 审批 | 让模型执行需要审批的动作（如提示沙箱升级：`bash` 被沙箱拒绝后带 `sandbox_permissions` 重试） | 同一话题内出现独立的「⚠️ 需要你的审批」卡片（✅ 允许 / ❌ 拒绝）；点允许后卡片变「✅ 已允许执行」且动作继续，点拒绝变「❌ 已拒绝」；不点则到时（默认 5 分钟）变「⏱ 已超时未处理，自动拒绝」 |
-| 11 | 管理员初始化（准入） | 未配置 `adminOpenId` 时私聊 `/userid`，把 open_id 填入面板保存 | 未配置时 `/userid` 也只回固定文本、不建会话；保存后面板显示管理员已配置，管理员私聊正常对话 |
+| 11 | 管理员初始化（准入） | 未配置 `adminUserId` 时私聊 `/userid`，把 user_id 填入面板保存 | 未配置时 `/userid` 也只回固定文本、不建会话；保存后面板显示管理员已配置，管理员私聊正常对话 |
 | 12 | 非管理员私聊 | 用另一个飞书账号私聊机器人 | 只收到一条固定提示（“非管理员禁用私聊功能哦…”）；不建话题/会话、不产生模型调用；该账号发 `/userid` 仍可拿到自己的 ID |
 | 13 | 入群通知 | 把机器人拉进一个新群 | 管理员私聊收到群信息卡（群名/`chat_id`/成员数/邀请人），未授权群带「授权本群 / 忽略」按钮；群里没有任何机器人消息 |
 | 14 | 管理员直通（免群授权） | 刚被拉进未授权群时，管理员直接 @ 机器人发消息 | 正常开会话（管理员不受白名单限制）；不授权该群也不影响管理员使用 |
-| 14a | 群授权与群内准入 | 管理员点「授权本群」（或在群内发 `/auth allow`）；未授权用户 @；管理员 `/auth user add <open_id>` 后该用户再 @ | 授权前非管理员 @ 无响应（管理员除外）；授权后白名单用户可分别开会话；未授权用户 @ 不建会话且管理员收到用户授权卡；授权该用户后可正常开会话 |
-| 15 | 撤销与持久化 | `/auth revoke`（群内）/ `/auth user remove <open_id>`；重启 dsh 后再试 | 撤销后对应主体立即无法开启对话；重启后已授权群/用户仍有效（持久化） |
+| 14a | 群授权与群内准入 | 管理员点「授权本群」（或在群内发 `/auth allow`）；未授权用户 @；管理员 `/auth user add <user_id>` 后该用户再 @ | 授权前非管理员 @ 无响应（管理员除外）；授权后白名单用户可分别开会话；未授权用户 @ 不建会话且管理员收到用户授权卡；授权该用户后可正常开会话 |
+| 15 | 撤销与持久化 | `/auth revoke`（群内）/ `/auth user remove <user_id>`；重启 dsh 后再试 | 撤销后对应主体立即无法开启对话；重启后已授权群/用户仍有效（持久化） |
+| 15a | 知识库读写 | 开启 `wikiRead`/`wikiWrite`、配置 `wikiRoots`；白名单用户在话题里让模型列目录、读一篇文档、新建一篇、再修改它 | 列目录不弹卡；第一次读取弹「📚 知识库授权」卡，只有话题发起人能点，允许后同一篇再读不弹卡；新建、修改每次都弹卡；修改人工创建的文档返回 `NOT_OWNED`；不在白名单的用户发起的话题返回 `NOT_AUTHORIZED` |
+| 15b | 知识库表格 | 同上；让模型读一个电子表格、新建一个电子表格并写入几行再追加一行；读一个人建的多维表格并新增一条记录、尝试修改已有记录；新建一个多维表格后增改删记录 | 表格读取返回带 `[row=N]` 的 CSV；写入和追加落在正确的单元格；人建的电子表格修改返回 `NOT_OWNED`；人建的多维表格能新增记录、修改/删除返回 `NOT_OWNED`；本应用建的多维表格可增改删；每次写入都弹卡 |
 | 16 | 话题越权防护 | 授权群里用户 A 创建话题后，用户 B 在 A 的话题里发普通消息/附件/回答提问 | B 的消息被静默丢弃，不会进入 A 的 Session、不会写入 A 的话题目录；A 自己发言正常 |
 
 ### 5.0 HITL 审批验证点（重点）
@@ -286,13 +292,13 @@ DSH_HOME=$DSH_HOME pnpm dsh web        # 默认 http://127.0.0.1:3080
 打开 dsh Web GUI → 工作区列表，应看到**每人一个**项目：
 
 ```
-飞书私聊 · ou_xxx          （对应 <baseDir>/p2p/ou_xxx/）
-飞书群聊 · oc_yyy · ou_xxx （对应 <baseDir>/groups/oc_yyy/ou_xxx/）
+飞书私聊 · <user_id>          （对应 <baseDir>/p2p/<user_id>/）
+飞书群聊 · oc_yyy · <user_id> （对应 <baseDir>/groups/oc_yyy/<user_id>/）
 ```
 
 每个新话题在该工作区内创建独立的话题工作目录 `<工作区>/topics/<话题 id>/`，会话列表仍归属该项目；同一话题内 `/renew` 复用同一话题目录。也可在飞书里用 `/workspace` 查看当前会话的实际工作目录。
 
-**附件落点（v2）**：默认 `attachmentStore: 'native'` 下入站图片/文件存入 **DSH 原生附件库**（`$DSH_HOME/attachments/v1` 一类宿主目录，由宿主管理），**话题目录下不会出现 `attachments/`**；只有显式 archive 后端或宿主缺原生附件库时才会看到 `<工作区>/topics/<话题>/attachments/`。v2 主路径也不再写 `<baseDir>/_staging/`：该目录只保留旧版遗留文件的一次性迁入（成功时一条 warn），按 D12 在 v2 发布后的下一个 minor 版本移除；`_staging` 被显式排除在「目录清理」之外，不会被保留期清理误删。
+**附件落点（v2）**：默认 `attachmentStore: 'native'` 下入站图片/文件存入 **DSH 原生附件库**（`$DSH_HOME/attachments/v1` 一类宿主目录，由宿主管理），**话题目录下不会出现 `attachments/`**；只有显式 archive 后端或宿主缺原生附件库时才会看到 `<工作区>/topics/<话题>/attachments/`。v2 主路径也不再写 `<baseDir>/_staging/`：该目录只保留旧版遗留文件的一次性迁入（成功时一条 warn），按 D12 在 v2 发布后的下一个 minor 版本移除。插件不会自动删除工作区或话题目录。
 
 ### 5.3 引用与话题历史（P2）验证点
 
@@ -316,8 +322,8 @@ DSH_HOME=$DSH_HOME pnpm dsh web        # 默认 http://127.0.0.1:3080
 | A1 | 私聊·文本 | 私聊发送一条普通文字 | Typing → 卡片**立即**出现并流式回复；会话/话题正常建立 | ✅ 已真机（P1/P2） |
 | A2 | 私聊·图片 | 发一张截图 + “这是什么” | 卡片先出现；首轮含 `ImageBlock`，模型不调用 fetch 即可描述（可能另用 `read_image`）；首轮清单不列该已预取图片；原生库对象数 +1、话题目录无 `attachments/` | ✅ 已真机（P1 步骤 2） |
 | A3 | 私聊·文件懒取 | 发 “看下这个文件” + 一个文件（如 48 MB zip） | 卡片先出现；首轮只有清单行（`message_id/file_key/name`），**下载发生在回合开始之后**；模型调 `feishu_attachment_fetch` 后结果为 `[text, file]` + 只读路径；文件字节进原生库、话题目录无 `attachments/`、无 `_staging` | ✅ 已真机（P1 步骤 3） |
-| A4 | 私聊·纯附件静默 | 只发一张图片（不带文字），然后再发一条文件（不带文字） | 无回复、无表情、无新话题/会话、无下载；`pending_attachments` 各新增 1 行（scope=chat，kind=image/file），原生库对象数与工作区文件不变 | ✅ 已真机（P1 步骤 1 图片；P2 步骤 3a 文件） |
-| A5 | 私聊·静默引用 | 在 A4 之后发普通文字：“刚发的文件叫什么/内容是什么” | 首轮清单列出静默登记的文件；模型 fetch 取回后正确回答；对应 pending 行变 `consumed=true` | ✅ 已真机（P1 步骤 4；P2 步骤 3b） |
+| A4 | 私聊·纯附件静默 | 只发一张图片（不带文字），然后再发一条文件（不带文字） | 无回复、无表情、无新话题/会话、无下载；本地不写记录，原生库对象数与工作区文件不变 | ✅ 已真机（P1 步骤 1 图片；P2 步骤 3a 文件） |
+| A5 | 私聊·静默引用 | 在 A4 之后引用刚才的文件消息发文字：“这个文件叫什么/内容是什么” | 清单列出被引用的文件；模型 fetch 取回后正确回答。不引用直接问时清单里没有该文件（预期） | ⏳ 待手测（2026-10-21 改为只靠引用，需重测） |
 | A6 | 私聊·引用文件 | 引用一条带文件的消息，问文件内容 | prompt 出现 `<feishu_quote>`（含 message_id），清单出现 quote 行；模型 fetch 成功 | ✅ 已真机（P2 步骤 3c） |
 | A7 | 私聊·引用合并转发 | 合并转发两条消息（含一个文件），引用它问“总结/取其中文件” | quote 块展开子消息并标“合并转发，共 N 条”；清单为容器行；fetch 用**顶层容器 message_id** 成功（子消息 id 会 400，属预期） | ✅ 已真机（P2 步骤 4） |
 | A8 | 私聊·大文件 | 发 ≥100 MB（如有 1 GB 级更好）文件 + “看下这个文件” | 卡片立即出现、不等待；清单先列文件；模型调 fetch 后流式入库，超过 `attachmentFetchTimeoutMs` 时返回可读超时，不阻塞后续对话 | ⏳ 待手测（P0 已验 980 MB 下载/取消，admission 链路未验；自动测试覆盖超时/取消） |
@@ -335,8 +341,7 @@ DSH_HOME=$DSH_HOME pnpm dsh web        # 默认 http://127.0.0.1:3080
 | D4 | 关闭附件接收 | 面板关闭 `acceptAttachments` 后发纯附件 / 文件+文字 | 纯附件：无回复/无登记/无下载；文件+文字：只以文字触发，附件不保存不登记 | ⏳ 待手测（自动测试覆盖） |
 | E1 | 权限缺失·读取 | 临时移除 `im:message:readonly`（或让 `im:message.group_msg` 未审批）后发布版本，发引用消息/在群内 @ | 普通对话正常；引用/历史块静默省略；首次降级一条 warn；显式 `feishu_topic_messages` 返回可读 `PERMISSION_DENIED`；恢复权限并重发版本后恢复 | ⏳ 待手测（用户已决定跳过；自动测试覆盖 throw/resolved 两种降级） |
 | E2 | 权限缺失·下载 | 临时移除消息资源读取相关 scope，让模型 fetch 一个文件 | 工具逐资源返回可读失败（403/权限说明），回合不崩；archive 下则加 `No` 并回纯文字失败提示 | ⏳ 待手测（自动测试覆盖） |
-| F1 | 面板配置 | 在 Web 「会话与行为」依次修改存储后端、预取开关/上限、登记 TTL/容量、两个工具开关与上限并保存，新建会话验证生效 | 面板读写与帮助文案正确；嵌套 `feishuTools.*` 只改被改子键；旧值不丢；保存后入站行为即时按新配置判定、工具挂载对新会话生效；非法值被拒 | ⏳ 待手测 + 自动测试（settings 覆盖） |
-| F2 | 清理语义 | 在 native 后端执行「目录清理」，再回到旧话题发消息 | 只删过期话题/旧版目录；用户工作区与会话日志保留；native 附件不受影响（Session 历史仍可读）；archive 后端下话题目录内 `attachments/` 随目录删除 | ⏳ 待手测（cleanup/settings 自动测试覆盖） |
+| F1 | 面板配置 | 在 Web 「附件与工具」依次修改存储后端、预取开关/上限、登记 TTL/容量、两个工具开关与上限并保存，新建会话验证生效 | 面板读写与帮助文案正确；嵌套 `feishuTools.*` 只改被改子键；旧值不丢；保存后入站行为即时按新配置判定、工具挂载对新会话生效；非法值被拒 | ⏳ 待手测 + 自动测试（settings 覆盖） |
 
 **记录要求**：每个「待手测」项执行后，在 `acceptance.md` 对应 AC 下写「操作 / 实际结果 / 结论 / 环境（构建 SHA、profile、日期）」；失败的项保留原文与日志摘录，修复后复测再更新。`historyBootstrapLimit: 0`、非本 route 负向、`acceptAttachments=false` 等用户已决定跳过真机的项，标注「自动测试覆盖，用户决定跳过真机」，不要写成已验证。
 
@@ -345,17 +350,17 @@ DSH_HOME=$DSH_HOME pnpm dsh web        # 默认 http://127.0.0.1:3080
 | 现象 | 排查 |
 |------|------|
 | 私聊无响应 | 用户是否在应用**可用范围**内；权限 `im:message.p2p_msg:readonly` 是否随版本发布；若返回的是“非管理员禁用私聊功能哦”，说明准入生效（把该用户加入白名单或让管理员对话） |
-| 私聊提示“机器人尚未配置管理员” | `accessMode: 'guarded'` 且未配置 `adminOpenId`：按 §3.3 在面板填写管理员 open_id |
+| 私聊提示“机器人尚未配置管理员” | `accessMode: 'guarded'` 且未配置 `adminUserId`：按 §3.3 在面板填写管理员 user_id |
 | 机器人被拉进群但管理员没收到群信息卡 | 是否订阅 **im.chat.member.bot.added_v1** 事件并重新发布版本；群信息读取权限是否已开通（`getChatInfo` 失败只会缺群名，不影响卡片本体） |
 | 群内 @ 机器人无响应（登录台无 access 报错） | 管理员不受白名单限制，可直接对话；**非管理员**需要该群已授权且自己在用户白名单里。可用 `/auth status`（管理员）或 Web 面板「访问授权」标签页确认 |
 | `/auth` 无反应 | `/auth` 仅管理员可用；非管理员在群里会被静默忽略、私聊会收到固定提示 |
 | 群聊 @ 无响应 | 事件订阅是否勾选“接收群聊中 @ 机器人消息”；机器人是否在群内且未被群主禁言 |
 | 模型说看不到刚发的文件 / 文件没有自动出现 | 属 v2 设计：文件默认不加载，只在 `<feishu_context>` 清单里声明；模型需调用 `feishu_attachment_fetch`。可明确要求“用 feishu_attachment_fetch 取清单里 message_id=… 的附件”；若工具没注册，检查启动日志 `feishu_attachment_fetch 未挂载` 与宿主 `tools`/`attachments` 服务 |
-| 只发附件（不带文字）机器人毫无反应 | native 后端下的**预期行为**：纯附件消息静默登记，不回复、不建会话、不下载；随后发一条文字即可引用清单里的附件。archive 后端下会看到 `DONE` 表情且附件落到话题目录 |
+| 只发附件（不带文字）机器人毫无反应 | native 后端下的**预期行为**：纯附件消息静默，不回复、不建会话、不下载；随后引用这条附件消息发文字提问，附件即列入清单；不引用时模型看不到它。若引用后仍没有，检查消息读取权限（群聊需 `im:message.group_msg`）。archive 后端下会看到 `DONE` 表情且附件落到话题目录 |
 | 模型没有调用 feishu_attachment_fetch | 检查 `<feishu_context>` 清单是否出现在 prompt（有未加载附件时才有）；确认工具开关 `feishuTools.attachmentFetch` 与 native 后端；必要时在消息里点明“用附件工具取一下”。漏调风险由清单措辞 / 工具描述 / guidance 收敛，没有预下载兜底（决定 D4） |
 | 引用或话题历史内容缺失 | 缺消息读取 scope（`im:message:readonly` / 敏感的 `im:message.group_msg`）：引用/历史块静默省略、普通对话不受影响；启动后首次降级有一条 warn，之后 debug 级。按 §1 申请权限并重新发布版本；显式调用 `feishu_topic_messages` 会返回可读 `PERMISSION_DENIED` |
 | `feishu_attachment_fetch` 超时 / 报字节超限 | 大文件受 `feishuTools.attachmentFetchTimeoutMs`（默认 120 s）与 `attachmentFetchMaxBytes`（默认 100 MiB）限制：可调大上限/超时，或用 `file_key` 分批取；资源过期/被撤回时逐资源返回可读失败，可直接重试或让用户重发 |
-| 升级到 v2 后在旧话题里“找不到以前的附件” | 旧 archive 部署的附件仍在旧话题 `attachments/`，但新会话不再枚举该目录；Session 历史里的只读路径仍可读。需要长期保留请勿启用目录清理，或从历史消息重新发送/引用 |
+| 升级到 v2 后在旧话题里“找不到以前的附件” | 旧 archive 部署的附件仍在旧话题 `attachments/`，但新会话不再枚举该目录；Session 历史里的只读路径仍可读。需要长期保留请勿手动删除该话题目录，或从历史消息重新发送/引用 |
 | 话题目录里出现 `attachments/` | 当前生效的是 archive 后端：检查 `attachmentStore`（是否显式设为 `archive`）、宿主是否挂载 `ctx.attachments`、`feishuTools.attachmentFetch` 是否为 `false`。native 后端不会写话题 `attachments/` |
 | 有 Typing 但无卡片 | 权限 `im:message` / `im:message:update`；卡片 2.0 需要较新的飞书客户端（升级客户端后重试） |
 | 卡片正文只到某长度 | 旧版行为；新版单卡目标 28 KB（`CARD_TARGET_BYTES`，飞书上限 30 KB 留 2 KB 冗余），超长正文自动分段为多张续卡（「📄 回复分段 n」，每卡 ≤ 5 个表格，断点避开代码围栏与表格），续卡无面板/页脚、可用满 28 KB，全文保留；推理面板独立 5 KB 上限，超出的推理只保留开头并追加「已截断」提示 |

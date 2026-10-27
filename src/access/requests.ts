@@ -25,7 +25,7 @@ import type {
 } from '../feishu-channel.ts'
 import { buildGroupInfoCard, buildRequestSettledCard, buildUserRequestCard } from './cards.ts'
 import type { SettledRequestStatus } from './cards.ts'
-import { isAdminOpenId } from './policy.ts'
+import { isAdminUserId } from './policy.ts'
 import type { AccessStore } from './store.ts'
 
 /** Same-target re-notification cooldown after a request was denied (24 h). */
@@ -94,7 +94,7 @@ function addressedToBot(msg: NormalizedMessage): boolean {
 export class AccessRequests {
   /** Targets with an in-flight create/deliver pass (avoids duplicate cards). */
   private readonly creating = new Set<string>()
-  /** `${messageId}:${openId}` of non-administrator card clicks already answered. */
+  /** `${messageId}:${userId}` of non-administrator card clicks already answered. */
   private readonly unauthorizedNotified = new Set<string>()
 
   constructor(private readonly deps: AccessRequestsDeps) {}
@@ -107,8 +107,8 @@ export class AccessRequests {
     return this.deps.config()
   }
 
-  private adminOpenId(): string | undefined {
-    const admin = this.config().adminOpenId?.trim()
+  private adminUserId(): string | undefined {
+    const admin = this.config().adminUserId?.trim()
     return admin === undefined || admin === '' ? undefined : admin
   }
 
@@ -124,10 +124,10 @@ export class AccessRequests {
    */
   async handleBotAdded(event: BotAddedEvent): Promise<void> {
     try {
-      const admin = this.adminOpenId()
+      const admin = this.adminUserId()
       if (admin === undefined) {
         this.deps.warn(
-          'dsh-channels: bot added to %s but no administrator open_id is configured; group card skipped',
+          'dsh-channels: bot added to %s but no administrator user_id is configured; group card skipped',
           event.chatId,
         )
         return
@@ -140,13 +140,13 @@ export class AccessRequests {
           ...(info?.name === undefined ? {} : { name: info.name }),
           ...(info?.memberCount === undefined ? {} : { memberCount: info.memberCount }),
           ...(info?.ownerId === undefined ? {} : { ownerId: info.ownerId }),
-          inviterOpenId: event.operator.openId,
+          ...(event.operator.userId === undefined ? {} : { inviterUserId: event.operator.userId }),
           authorized: true,
           now,
         }))
         return
       }
-      if (!(await this.beginGroupRequest(event.chatId, event.operator.openId, now))) return
+      if (!(await this.beginGroupRequest(event.chatId, event.operator.userId, now))) return
     } catch (error) {
       this.deps.warn('dsh-channels: bot-added group notice failed: %s', String(error))
     }
@@ -160,10 +160,10 @@ export class AccessRequests {
   async ensureGroupRequest(msg: NormalizedMessage): Promise<void> {
     if (!addressedToBot(msg) || msg.chatType !== 'group') return
     try {
-      const admin = this.adminOpenId()
+      const admin = this.adminUserId()
       if (admin === undefined) {
         this.deps.warn(
-          'dsh-channels: group %s needs authorization but no administrator open_id is configured',
+          'dsh-channels: group %s needs authorization but no administrator user_id is configured',
           msg.chatId,
         )
         return
@@ -183,10 +183,10 @@ export class AccessRequests {
   async ensureUserRequest(msg: NormalizedMessage): Promise<void> {
     if (!addressedToBot(msg) || msg.chatType !== 'group') return
     try {
-      const admin = this.adminOpenId()
+      const admin = this.adminUserId()
       if (admin === undefined) {
         this.deps.warn(
-          'dsh-channels: user %s needs authorization but no administrator open_id is configured',
+          'dsh-channels: user %s needs authorization but no administrator user_id is configured',
           msg.senderId,
         )
         return
@@ -211,7 +211,8 @@ export class AccessRequests {
       if (decision === undefined) return
       const record = this.deps.store.getRequest(decision.token)
       if (record === undefined) return
-      if (!isAdminOpenId(this.config(), event.operator.openId)) {
+      const actor = event.operator.userId
+      if (actor === undefined || !isAdminUserId(this.config(), actor)) {
         await this.notifyUnauthorized(event)
         return
       }
@@ -223,7 +224,7 @@ export class AccessRequests {
         await this.settleExpired(record)
         return
       }
-      const result = await this.resolve(decision.token, decision.action, event.operator.openId)
+      const result = await this.resolve(decision.token, decision.action, actor)
       if (!result.ok) {
         this.deps.warn('dsh-channels: settling access request %s failed: %s', decision.token, result.error)
       }
@@ -240,9 +241,9 @@ export class AccessRequests {
   async resolve(
     token: string,
     decision: 'allow' | 'deny',
-    actorOpenId: string,
+    actorUserId: string,
   ): Promise<{ ok: true } | { ok: false; error: string }> {
-    if (!isAdminOpenId(this.config(), actorOpenId)) return { ok: false, error: '仅管理员可处理授权申请' }
+    if (!isAdminUserId(this.config(), actorUserId)) return { ok: false, error: '仅管理员可处理授权申请' }
     const record = this.deps.store.getRequest(token)
     if (record === undefined) return { ok: false, error: '授权申请不存在' }
     if (record.status !== 'pending') {
@@ -255,7 +256,7 @@ export class AccessRequests {
     }
     const status = decision === 'allow' ? 'approved' : 'denied'
     try {
-      if (decision === 'allow') await this.grant(record, actorOpenId, now)
+      if (decision === 'allow') await this.grant(record, actorUserId, now)
       await this.deps.store.putRequest({ ...record, status })
     } catch (error) {
       this.deps.warn('dsh-channels: persisting access request %s settlement failed: %s', token, String(error))
@@ -289,8 +290,8 @@ export class AccessRequests {
   // ---- internals -------------------------------------------------------
 
   /** Create + DM one group request unless deduplicated/cooling down. */
-  private async beginGroupRequest(chatId: string, inviterOpenId: string, now: number): Promise<boolean> {
-    const admin = this.adminOpenId()
+  private async beginGroupRequest(chatId: string, inviterUserId: string | undefined, now: number): Promise<boolean> {
+    const admin = this.adminUserId()
     if (admin === undefined) return false
     if (await this.hasLivePending('group', chatId, now)) return false
     if (this.deps.store.recentlyDenied('group', chatId, DENIED_COOLDOWN_MS, now)) return false
@@ -304,7 +305,7 @@ export class AccessRequests {
         targetId: chatId,
         chatId,
         ...(info?.name === undefined ? {} : { groupName: info.name }),
-        requesterOpenId: inviterOpenId,
+        ...(inviterUserId === undefined ? {} : { requesterUserId: inviterUserId }),
       })
       if (!(await this.persist(record))) return false
       await this.sendCard(admin, buildGroupInfoCard({
@@ -312,7 +313,7 @@ export class AccessRequests {
         ...(info?.name === undefined ? {} : { name: info.name }),
         ...(info?.memberCount === undefined ? {} : { memberCount: info.memberCount }),
         ...(info?.ownerId === undefined ? {} : { ownerId: info.ownerId }),
-        inviterOpenId,
+        ...(inviterUserId === undefined ? {} : { inviterUserId }),
         authorized: false,
         token: record.token,
         now,
@@ -325,7 +326,7 @@ export class AccessRequests {
 
   /** Create + DM one user request unless deduplicated/cooling down. */
   private async beginUserRequest(msg: NormalizedMessage, groupName: string | undefined, now: number): Promise<boolean> {
-    const admin = this.adminOpenId()
+    const admin = this.adminUserId()
     if (admin === undefined) return false
     if (await this.hasLivePending('user', msg.senderId, now)) return false
     if (this.deps.store.recentlyDenied('user', msg.senderId, DENIED_COOLDOWN_MS, now)) return false
@@ -338,17 +339,18 @@ export class AccessRequests {
         targetId: msg.senderId,
         chatId: msg.chatId,
         ...(groupName === undefined ? {} : { groupName }),
-        requesterOpenId: msg.senderId,
+        requesterUserId: msg.senderId,
         ...(msg.senderName === undefined ? {} : { requesterName: msg.senderName }),
       })
       if (!(await this.persist(record))) return false
       await this.sendCard(admin, buildUserRequestCard({
-        openId: msg.senderId,
+        userId: msg.senderId,
         ...(msg.senderName === undefined ? {} : { name: msg.senderName }),
         chatId: msg.chatId,
         ...(groupName === undefined ? {} : { groupName }),
         ...(msg.senderName === undefined ? {} : { requesterName: msg.senderName }),
         token: record.token,
+        dmAllowWhitelist: this.config().dmAllowWhitelist,
         now,
       }), record)
       return true
@@ -380,7 +382,7 @@ export class AccessRequests {
     targetId: string
     chatId?: string
     groupName?: string
-    requesterOpenId?: string
+    requesterUserId?: string
     requesterName?: string
   }): AccessRequestRecord {
     const now = this.now()
@@ -390,7 +392,7 @@ export class AccessRequests {
       targetId: input.targetId,
       ...(input.chatId === undefined ? {} : { chatId: input.chatId }),
       ...(input.groupName === undefined || input.groupName === '' ? {} : { groupName: input.groupName }),
-      ...(input.requesterOpenId === undefined ? {} : { requesterOpenId: input.requesterOpenId }),
+      ...(input.requesterUserId === undefined ? {} : { requesterUserId: input.requesterUserId }),
       ...(input.requesterName === undefined || input.requesterName === '' ? {} : { requesterName: input.requesterName }),
       status: 'pending',
       createdAt: now,
@@ -445,22 +447,22 @@ export class AccessRequests {
   }
 
   /** Write the actual grant; throws so `resolve()` can report the failure. */
-  private async grant(record: AccessRequestRecord, actorOpenId: string, now: number): Promise<void> {
+  private async grant(record: AccessRequestRecord, actorUserId: string, now: number): Promise<void> {
     if (record.kind === 'group') {
       await this.deps.store.addGroup({
         chatId: record.targetId,
         ...(record.groupName === undefined ? {} : { name: record.groupName }),
         source: 'card',
-        addedBy: actorOpenId,
+        addedBy: actorUserId,
         addedAt: now,
       })
       return
     }
     await this.deps.store.addUser({
-      openId: record.targetId,
+      userId: record.targetId,
       ...(record.requesterName === undefined ? {} : { name: record.requesterName }),
       source: 'card',
-      addedBy: actorOpenId,
+      addedBy: actorUserId,
       addedAt: now,
     })
   }
@@ -498,7 +500,7 @@ export class AccessRequests {
 
   /** One control card is delivered once; non-administrator clicks get one notice. */
   private async notifyUnauthorized(event: CardActionEvent): Promise<void> {
-    const key = `${event.messageId}:${event.operator.openId}`
+    const key = `${event.messageId}:${event.operator.userId ?? event.operator.openId}`
     if (this.unauthorizedNotified.has(key)) return
     this.unauthorizedNotified.add(key)
     const channel = this.deps.channel()
