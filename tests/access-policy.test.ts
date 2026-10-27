@@ -15,7 +15,7 @@ function snapshot(groups: string[] = [], users: string[] = []): AccessSnapshot {
 }
 
 function config(partial: Partial<AccessPolicyConfig> = {}): AccessPolicyConfig {
-  return { accessMode: 'guarded', adminUserId: ADMIN, ...partial }
+  return { accessMode: 'guarded', adminUserId: ADMIN, dmAllowWhitelist: false, ...partial }
 }
 
 function p2p(senderId: string, chatId = 'oc_p2p'): Parameters<typeof decideAccess>[0] {
@@ -87,6 +87,22 @@ describe('decideAccess：私聊', () => {
         kind: 'deny', reason: 'dm-non-admin',
       })
     }
+  })
+
+  it('dmAllowWhitelist 打开：白名单用户放行，其他人仍拒绝', () => {
+    const on = config({ dmAllowWhitelist: true })
+    expect(decideAccess(p2p('u_alice'), on, snapshot([], ['u_alice']))).toEqual({
+      kind: 'allow', reason: 'authorized-user',
+    })
+    expect(decideAccess(p2p('u_stranger'), on, snapshot([], ['u_alice']))).toEqual({
+      kind: 'deny', reason: 'dm-non-admin',
+    })
+    expect(decideAccess(p2p(ADMIN), on, snapshot())).toEqual({ kind: 'allow', reason: 'admin' })
+  })
+
+  it('dmAllowWhitelist 打开但未配置管理员：仍 fail closed', () => {
+    expect(decideAccess(p2p('u_alice'), config({ dmAllowWhitelist: true, adminUserId: undefined }), snapshot([], ['u_alice'])))
+      .toEqual({ kind: 'deny', reason: 'admin-missing' })
   })
 
   it('私聊拒绝不携带任何授权申请类型（私聊不推卡）', () => {

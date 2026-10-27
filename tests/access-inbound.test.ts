@@ -146,6 +146,43 @@ describe('guarded 模式：准入零副作用', () => {
     await h.service.shutdown()
   })
 
+  it('dmAllowWhitelist：白名单用户私聊可建会话、用命令；非白名单收到白名单提示；撤销立即生效', async () => {
+    const h = await setup({ dmAllowWhitelist: true })
+    await h.service.addAccessUser('u_bob')
+
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_p2p_bob', senderId: 'u_bob',
+      mentionedBot: false, messageId: 'om_dm_bob', content: '你好',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
+    expect(h.channel.sent.some(entry => sentJson(entry).includes('非管理员禁用私聊'))).toBe(false)
+
+    const before = h.channel.sent.length
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_p2p_bob', senderId: 'u_bob',
+      mentionedBot: false, messageId: 'om_dm_bob_help', content: '/help',
+    }))
+    await waitUntil(() => expect(h.channel.sent.length).toBeGreaterThan(before))
+    expect(sentJson(h.channel.sent.at(-1)!)).not.toContain('白名单')
+
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_p2p_carol', senderId: 'u_carol',
+      mentionedBot: false, messageId: 'om_dm_carol', content: '你好',
+    }))
+    await waitUntil(() => expect(h.channel.sent.some(entry => sentJson(entry).includes('你还不在白名单里'))).toBe(true))
+
+    expect(await h.service.removeAccessUser('u_bob')).toMatchObject({ ok: true })
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_p2p_bob', senderId: 'u_bob',
+      mentionedBot: false, messageId: 'om_dm_bob_revoked', content: '还在吗',
+    }))
+    await waitUntil(() => expect(
+      h.channel.sent.filter(entry => sentJson(entry).includes('你还不在白名单里')),
+    ).toHaveLength(2))
+    expect(h.ctxState.agents.created).toHaveLength(1)
+    await h.service.shutdown()
+  })
+
   it('管理员未配置时 fail closed：私聊固定引导、群聊静默、/userid 仍可用', async () => {
     const h = await setup({ adminUserId: undefined })
     await h.onMessage(makeMessage({

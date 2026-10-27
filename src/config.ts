@@ -384,13 +384,20 @@ export const configSchema = z.object({
    * Admission policy for inbound Feishu traffic.
    *
    * - `guarded` (default): only the configured administrator can talk in
-   *   private chats, and a group conversation additionally requires the group
-   *   to be authorized and the sender to be the administrator or an explicitly
+   *   private chats (plus whitelisted users when `dmAllowWhitelist` is on),
+   *   and a group conversation additionally requires the group to be
+   *   authorized and the sender to be the administrator or an explicitly
    *   authorized user.
    * - `open`: legacy behavior — any user inside the app's availability scope
    *   can start a conversation. Debug/compatibility only; unsafe.
    */
   accessMode: z.enum(['open', 'guarded']).default('guarded'),
+  /**
+   * In `guarded` mode, also admit users on the global user whitelist
+   * (`/auth user`) in private chats. Off by default: private chats stay
+   * administrator-only. Each private-chat user already has an own workspace.
+   */
+  dmAllowWhitelist: z.boolean().default(false),
   /**
    * The unique administrator's Feishu `user_id`. Set it in the Web
    * settings panel (or the profile config). Get it by sending `/userid` to the

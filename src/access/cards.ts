@@ -49,6 +49,8 @@ export interface UserRequestCardInput {
   requesterName?: string
   /** Opaque request token. */
   token: string
+  /** Whether whitelisted users may also use private chats (`dmAllowWhitelist`). */
+  dmAllowWhitelist?: boolean
   /** Render timestamp (defaults to now). */
   now?: number
 }
@@ -158,7 +160,9 @@ export function buildUserRequestCard(input: UserRequestCardInput): object {
   }
   elements.push(field('申请时间', formatTime(input.now)))
   elements.push(divider())
-  elements.push(note('授权后该用户可在所有已授权群里使用；私聊仍仅管理员可用。'))
+  elements.push(note(input.dmAllowWhitelist === true
+    ? '授权后该用户可在所有已授权群里使用，也可以私聊机器人。'
+    : '授权后该用户可在所有已授权群里使用；私聊仍仅管理员可用。'))
   elements.push(decisionButtons(input.token, '授权用户', '忽略'))
   return standaloneCard('**🙋 用户授权申请**', elements)
 }

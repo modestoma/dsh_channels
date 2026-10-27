@@ -153,6 +153,7 @@ const BOOLEAN_KEYS = new Set<EditableKey>([
   'welcomeOnboarding',
   'slashCommandPanel',
   'allowPermissionSwitch',
+  'dmAllowWhitelist',
   'acceptAttachments',
   'prefetchImages',
   'feishuTools.attachmentFetch',
@@ -401,7 +402,13 @@ const FIELD_META: Record<EditableKey, FieldMeta> = {
     label: '调试模式',
     group: 'access',
     summary: '打开后所有人都能聊，不安全，只在调试时用',
-    help: '关闭时（默认）：管理员随时可用；非管理员私聊会被拒绝；群聊要同时满足群已授权、发言人在用户白名单里。授权入口有三个：群里 /auth 命令、授权卡、本页。撤销立即生效。',
+    help: '关闭时（默认）：管理员随时可用；非管理员私聊会被拒绝（打开「白名单用户可私聊」后白名单用户也可以）；群聊要同时满足群已授权、发言人在用户白名单里。授权入口有三个：群里 /auth 命令、授权卡、本页。撤销立即生效。',
+  },
+  dmAllowWhitelist: {
+    label: '白名单用户可私聊',
+    group: 'access',
+    summary: '关闭时私聊仅管理员可用',
+    help: '打开后「已授权用户」里的人也可以私聊机器人，各自使用独立的私聊工作区，能力与群聊相同；不在白名单的人仍收到固定提示。撤销用户立即生效。',
   },
   adminUserId: {
     label: '管理员 user_id',
