@@ -6,14 +6,15 @@
  * matrix lives in `policy.ts`; this module owns the user-facing behavior on
  * denial:
  *
- *  - private chats: non-administrators get one fixed notice (10 s per-sender
+ *  - private chats: denied senders (non-administrators, or non-whitelisted
+ *    users with `dmAllowWhitelist`) get one fixed notice (10 s per-sender
  *    cooldown); with no administrator configured they get the bootstrap
  *    notice instead;
  *  - group chats: fully silent, except that addressed denials call back into
  *    the authorization-request lifecycle so the administrator can be asked;
  *  - slash commands: `/userid` stays available to every private sender, the
  *    administrator's commands always pass (including inside an unauthorized
- *    group), everything else must pass admission.
+ *    group), everything else must pass admission (in private chats too).
  *
  * The controller never creates a Session or a workspace.
  *
@@ -29,6 +30,9 @@ import type { AccessStore, AccessStoreSnapshot } from './store.ts'
 
 /** Fixed private-chat notice for non-administrators (no model call). */
 export const DM_DENY_TEXT = '非管理员禁用私聊功能哦～如需使用，请在管理员授权的群里 @ 我；或联系管理员把你的 user_id 加入白名单。'
+
+/** Fixed private-chat notice for non-whitelisted users while `dmAllowWhitelist` is on. */
+export const DM_DENY_WHITELIST_TEXT = '你还不在白名单里，暂时不能私聊哦～发送 /userid 查看你的 user_id，请管理员加入白名单后即可使用。'
 
 /** Fixed private-chat notice while no administrator is configured. */
 export const DM_UNCONFIGURED_TEXT = '机器人尚未配置管理员。发送 /userid 可查看你的 user_id，交给部署者配置后即可启用。'
@@ -123,8 +127,9 @@ export class AccessController {
   /**
    * Slash-command admission. Runs before any command card/topic/Session side
    * effect. `open` mode keeps the legacy behavior; otherwise private chats
-   * stay administrator-only (with `/userid` as the bootstrap exception) and
-   * group chats must pass the full admission matrix; the administrator is
+   * admit whoever the admission matrix admits (with `/userid` as the
+   * bootstrap exception) and group chats must pass the full admission
+   * matrix; the administrator is
    * never constrained by the whitelists, so all of their commands pass even
    * inside an unauthorized group (`/auth` is the in-conversation grant
    * entry).
@@ -136,7 +141,7 @@ export class AccessController {
         // `/userid` is the bootstrap entry for everyone: it only echoes the
         // sender's own user_id and has no storage/model side effect.
         if (commandName === 'userid') return true
-        if (this.isAdmin(msg.senderId)) return true
+        if (this.decide(msg).kind === 'allow') return true
         await this.noticeDeniedDm(msg)
         return false
       }
@@ -207,7 +212,10 @@ export class AccessController {
     const last = this.dmNoticeAt.get(msg.senderId)
     if (last !== undefined && now - last < DM_NOTICE_COOLDOWN_MS) return
     this.dmNoticeAt.set(msg.senderId, now)
-    const text = this.config().adminUserId === undefined ? DM_UNCONFIGURED_TEXT : DM_DENY_TEXT
+    const config = this.config()
+    const text = config.adminUserId === undefined
+      ? DM_UNCONFIGURED_TEXT
+      : config.dmAllowWhitelist ? DM_DENY_WHITELIST_TEXT : DM_DENY_TEXT
     await this.sendText(msg.chatId, text, msg.messageId)
   }
 

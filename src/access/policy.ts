@@ -11,7 +11,9 @@
  * Access model:
  *  - the administrator may start/continue a conversation in any private chat
  *    or any group, regardless of the whitelists;
- *  - private chats: non-administrators are refused;
+ *  - private chats: non-administrators are refused, unless
+ *    `dmAllowWhitelist` is on and their user_id is on the global user
+ *    whitelist;
  *  - group chats: non-administrators need the group to be authorized AND
  *    their user_id to be on the global user whitelist.
  *
@@ -56,7 +58,7 @@ export type AccessDecision =
   }
 
 /** The configuration slice admission reads (allows easy fakes in tests). */
-export type AccessPolicyConfig = Pick<FeishuConfig, 'accessMode' | 'adminUserId'>
+export type AccessPolicyConfig = Pick<FeishuConfig, 'accessMode' | 'adminUserId' | 'dmAllowWhitelist'>
 
 /** True when `userId` is exactly the configured administrator. */
 export function isAdminUserId(
@@ -90,6 +92,9 @@ export function decideAccess(
   if (subject.senderId.trim() === admin) return { kind: 'allow', reason: 'admin' }
 
   if (subject.chatType === 'p2p') {
+    if (config.dmAllowWhitelist && snapshot.users.has(subject.senderId)) {
+      return { kind: 'allow', reason: 'authorized-user' }
+    }
     return { kind: 'deny', reason: 'dm-non-admin' }
   }
 

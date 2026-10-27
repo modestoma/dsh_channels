@@ -350,6 +350,7 @@ export class AccessRequests {
         ...(groupName === undefined ? {} : { groupName }),
         ...(msg.senderName === undefined ? {} : { requesterName: msg.senderName }),
         token: record.token,
+        dmAllowWhitelist: this.config().dmAllowWhitelist,
         now,
       }), record)
       return true

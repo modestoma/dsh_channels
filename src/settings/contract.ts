@@ -164,6 +164,7 @@ export const EDITABLE_KEYS = [
   'promptContextTimeoutMs',
   // 准入与授权（白名单由「访问授权」tab 的列表管理）
   'accessMode',
+  'dmAllowWhitelist',
   'adminUserId',
   'authRequestTtlDays',
   // 知识库（顶层 `wikiRoots` 字符串列表；为空时不挂载任何知识库工具）

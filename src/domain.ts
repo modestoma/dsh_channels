@@ -217,8 +217,8 @@ export type AccessGroupRecord = z.infer<typeof accessGroupRecordSchema>
 
 /**
  * One authorized user (`user_id`), global across every authorized group.
- * Private chats are administrator-only, so this grant only affects group
- * conversations.
+ * Private chats are administrator-only unless `dmAllowWhitelist` is on, so
+ * by default this grant only affects group conversations.
  */
 export const accessUserRecordSchema = z.object({
   /** Feishu `user_id` — also the table key. */

@@ -1922,6 +1922,7 @@ export class FeishuService {
         await this.delivery.standaloneReply(msg, standaloneInfoCard('**🔐 访问授权状态**', [
           `**准入模式**：\`${this.config.accessMode}\``,
           `**管理员**：${this.adminStatusLine()}`,
+          `**私聊**：${this.config.dmAllowWhitelist ? '管理员与白名单用户' : '仅管理员'}`,
           ...(msg.chatType === 'group'
             ? [`**本群**：${this.accessStore.hasGroup(msg.chatId) ? '已授权' : '未授权'}（\`${msg.chatId}\`）`]
             : []),

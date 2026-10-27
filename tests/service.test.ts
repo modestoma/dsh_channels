@@ -54,6 +54,7 @@ function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
     allowPermissionSwitch: false,
     // Tests exercise routing/hitl behavior; access control has its own tests.
     accessMode: 'open',
+    dmAllowWhitelist: false,
     authRequestTtlDays: 7,
     // Onboarding is opt-in per test: it adds a card that would shift send counts.
     welcomeOnboarding: false,

@@ -654,7 +654,7 @@ describe('field descriptors', () => {
 
   it('describes the access-control fields without restarting the channel', () => {
     const byKey = new Map(FIELD_DESCRIPTORS.map(field => [field.key, field]))
-    for (const key of ['adminUserId', 'accessMode', 'authRequestTtlDays'] as const) {
+    for (const key of ['adminUserId', 'accessMode', 'dmAllowWhitelist', 'authRequestTtlDays'] as const) {
       expect(EDITABLE_KEYS).toContain(key)
       expect(byKey.get(key)).toMatchObject({ group: 'access', restartRequired: false })
     }
@@ -670,6 +670,8 @@ describe('field descriptors', () => {
     expect(mode?.label).toBe('调试模式')
     expect(mode?.options?.map(option => option.value)).toEqual(['guarded', 'open'])
     expect(mode?.summary).toContain('不安全')
+
+    expect(byKey.get('dmAllowWhitelist')).toMatchObject({ kind: 'boolean', label: '白名单用户可私聊' })
 
     const ttl = byKey.get('authRequestTtlDays')
     expect(ttl).toMatchObject({ kind: 'number', min: 1, max: 30, step: 1 })
