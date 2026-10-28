@@ -185,12 +185,12 @@ export class AccessController {
   }
 
   /**
-   * Whether the analyze API may post into `chatId`: an authorized group, or
-   * any group in `open` access mode.
+   * Whether a `feishuTopics` launch may post into `chatId`: an authorized
+   * group, or any group in `open` access mode.
    * @param chatId - target group chat id.
    * @returns true when the chat is a permitted target.
    */
-  mayAnalyzeIn(chatId: string): boolean {
+  mayLaunchIn(chatId: string): boolean {
     if (this.config().accessMode === 'open') return true
     return this.deps.store.snapshot().groups.has(chatId)
   }

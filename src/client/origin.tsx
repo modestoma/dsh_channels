@@ -171,7 +171,7 @@ function OriginDetails({ origin, onRefresh }: { origin: SessionOriginWire; onRef
     </span>
   )])
   const heading = originHeading(origin)
-  if (origin.shared) rows.push(['说明', '日志平台分析话题，群内成员都可以继续'])
+  if (origin.shared) rows.push(['说明', '群共享话题，群内成员都可以继续'])
   rows.push(['开始于', formatTime(origin.createdAt)])
   rows.push(origin.bound && origin.lastActivityAt !== undefined
     ? ['最近活跃', formatTime(origin.lastActivityAt)]

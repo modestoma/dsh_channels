@@ -52,12 +52,11 @@ import type { PermissionPresets, SessionQuery } from './dsh-types.ts'
 import { FEISHU_USER_ID_PATTERN, feishuDomain, sessionDirOf } from './domain.ts'
 import type {
   AccessGroupRecord, AccessRequestRecord, AccessUserRecord,
-  AnalyzeRequestRecord, ExpiredRouteRecord, FeishuDomainGlobal, FeishuDomainHandle, InflightSnapshot,
-  ProcessedRecord, RawDomainHandle, RouteRecord, SessionOriginRecord,
+  ExpiredRouteRecord, FeishuDomainGlobal, FeishuDomainHandle, InflightSnapshot,
+  ProcessedRecord, RawDomainHandle, RouteRecord, SessionOriginRecord, TopicLaunchRecord,
 } from './domain.ts'
 import { RouteStore } from './session/routes.ts'
-import { AnalyzeLauncher } from './analyze/launcher.ts'
-import type { AnalyzeHandler } from './analyze/server.ts'
+import { TopicLauncher } from './topics/launcher.ts'
 import { InflightRepair } from './session/repair.ts'
 import { SessionManager } from './session/manager.ts'
 import type { LiveAgent, RenewCommit } from './session/manager.ts'
@@ -168,7 +167,7 @@ async function openFeishuDomain(ctx: HostContext): Promise<FeishuDomainHandle> {
   const accessUsersRaw = domain.table('access_users')
   const accessRequestsRaw = domain.table('access_requests')
   const accessWikiUsersRaw = domain.table('access_wiki_users')
-  const analyzeRequestsRaw = domain.table('analyze_requests')
+  const topicLaunchesRaw = domain.table('analyze_requests')
   const sessionOriginsRaw = domain.table('session_origins')
   return {
     routes: {
@@ -219,10 +218,10 @@ async function openFeishuDomain(ctx: HostContext): Promise<FeishuDomainHandle> {
       delete: key => accessWikiUsersRaw.delete(key),
       entries: () => accessWikiUsersRaw.entries() as IterableIterator<[string, AccessUserRecord]>,
     },
-    analyzeRequests: {
-      get: key => analyzeRequestsRaw.get(key) as AnalyzeRequestRecord | undefined,
-      put: (key, value) => analyzeRequestsRaw.put(key, value),
-      entries: () => analyzeRequestsRaw.entries() as IterableIterator<[string, AnalyzeRequestRecord]>,
+    topicLaunches: {
+      get: key => topicLaunchesRaw.get(key) as TopicLaunchRecord | undefined,
+      put: (key, value) => topicLaunchesRaw.put(key, value),
+      entries: () => topicLaunchesRaw.entries() as IterableIterator<[string, TopicLaunchRecord]>,
     },
     sessionOrigins: {
       get: key => sessionOriginsRaw.get(key) as SessionOriginRecord | undefined,
@@ -310,8 +309,8 @@ export class FeishuService {
   private readonly messageReader = new MessageReader({ channel: () => this.channel })
   /** Inbound routing: dedup, admission, decision tree, session establishment. */
   private readonly inbound: InboundRouter
-  /** Log-platform analyze API business side (requests → shared analysis topics). */
-  private readonly analyzeLauncher: AnalyzeLauncher
+  /** The `feishuTopics` service (other plugins' launches → shared topics). */
+  private readonly topicLauncher: TopicLauncher
   /** Agent/session lifecycle: live registry, resume, presets, renew. */
   private readonly sessions: SessionManager
   /**
@@ -591,7 +590,7 @@ export class FeishuService {
         handleSlash: (msg, line) => this.handleSlashMessage(msg, line),
       },
     })
-    this.analyzeLauncher = new AnalyzeLauncher({
+    this.topicLauncher = new TopicLauncher({
       ctx: this.ctx,
       config: this.config,
       started: () => this.started,
@@ -603,8 +602,7 @@ export class FeishuService {
       streamer: () => this.streamer,
       queue: this.routeOperations,
       reserveTopic: threadId => this.inbound.reserveTopic(threadId),
-      mayAnalyzeIn: chatId => this.accessController.mayAnalyzeIn(chatId),
-      resolveToken: () => resolveCredentialRef(this.ctx, this.config.analyzeToken).catch(() => undefined),
+      mayLaunchIn: chatId => this.accessController.mayLaunchIn(chatId),
     })
   }
 
@@ -975,8 +973,8 @@ export class FeishuService {
     }
   }
 
-  /** The analyze API's business side, for the Web route. */
-  analyzeHandler(): AnalyzeHandler { return this.analyzeLauncher }
+  /** The `feishuTopics` service, provided by `apply()`. */
+  topics(): TopicLauncher { return this.topicLauncher }
   isRunning(): boolean { return this.started }
   isRestarting(): boolean { return this.restarting }
   /** True while the panel's explicit connect action is in flight. */
@@ -1475,10 +1473,8 @@ export class FeishuService {
         return { configured: false, writable: false }
       }
     }
-    const [appId, appSecret, analyzeToken] = await Promise.all([
-      read(this.config.appId), read(this.config.appSecret), read(this.config.analyzeToken),
-    ])
-    return { appId, appSecret, analyzeToken }
+    const [appId, appSecret] = await Promise.all([read(this.config.appId), read(this.config.appSecret)])
+    return { appId, appSecret }
   }
 
   /** The host credentials seam, when mounted. */
@@ -1521,7 +1517,6 @@ export class FeishuService {
     switch (field) {
       case 'appId': return this.config.appId
       case 'appSecret': return this.config.appSecret
-      case 'analyzeToken': return this.config.analyzeToken
     }
   }
 
@@ -1658,8 +1653,8 @@ export class FeishuService {
     void this.runScopeCheck(channel, appId, ownerLookup)
     if (this.config.slashCommandPanel) void this.runSlashCommandSync(channel)
     // Before admission opens, so every `running` record left is a previous instance's.
-    await this.analyzeLauncher.markInterrupted()
-    this.analyzeLauncher.open()
+    await this.topicLauncher.markInterrupted()
+    this.topicLauncher.open()
     // Repair cards a previous instance left mid-flight (best-effort, background).
     void this.repair.repairAll().catch((error: unknown) => {
       this.ctx.logger?.warn?.('dsh-channels: inflight repair failed: %s', String(error))
@@ -1723,8 +1718,8 @@ export class FeishuService {
     // before their Agent/channel/storage dependencies are disposed, while
     // already queued route operations observe `started === false` and retire.
     this.started = false
-    this.analyzeLauncher.close()
-    await this.analyzeLauncher.drain()
+    this.topicLauncher.close()
+    await this.topicLauncher.drain()
     for (const controller of this.commandControllers) controller.abort()
     await Promise.allSettled([...this.commandOperations])
     this.commandControllers.clear()

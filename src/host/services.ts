@@ -288,6 +288,11 @@ export interface HostContext {
   logger?: HostLogger
   /** Safe service lookup (returns undefined for absent services). */
   get?(name: string): unknown
+  /**
+   * Provide a service owned by this plugin's fiber; it is withdrawn when the
+   * plugin unloads. Optional so test contexts may omit it.
+   */
+  provide?(name: string, value: unknown): () => void
   /** Host events this plugin subscribes to (overloads per event). */
   on(name: 'session/event', listener: (session: Session, event: SessionEvent) => void): () => boolean
   /** Live (transient) model stream for every agent; replaces the removed `assistant/chunk` events. */

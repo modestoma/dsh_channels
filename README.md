@@ -82,7 +82,7 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 | 附件与工具 | 「入站附件」：接收图片和文件、使用 DSH 原生附件库（开关，关闭则存到话题目录 `attachments/`）、图片预取、首轮话题历史；「工具」：`feishu_attachment_fetch` / `feishu_topic_messages` / `feishu_send_file` 开关；「限额与超时」：预取上限、读取附件上限与超时、读取话题消息超时、引用摘录与历史超时（共 8 项，默认收起，有改动或错误时自动展开） |
 | 访问授权 | 待处理申请（置顶，一键授权 / 忽略）、调试模式（`accessMode`，开关）、白名单用户可私聊（`dmAllowWhitelist`，开关）、管理员 user_id、申请有效期；已授权群 / 用户白名单（添加表单默认收起） |
 | 知识库 | 知识库读 / 写开关（`feishuTools.wikiRead` / `feishuTools.wikiWrite`）、可访问范围 `wikiRoots`（每条链接一个输入框，逐条校验）；「可使用的人」：知识库白名单增删（与用户白名单独立，等同 `/auth wiki add|remove`） |
-| 高级 | 日志分析接口（开关 `analyzeEnabled` 与访问令牌）、SDK 日志级别、Web 覆盖文件路径与「恢复 profile 配置」 |
+| 高级 | SDK 日志级别、Web 覆盖文件路径与「恢复 profile 配置」 |
 
 **调试模式**：「访问授权 → 调试模式」打开即 `accessMode: open`，所有人都能和机器人聊天；打开期间面板顶部常驻黄色警告。默认关闭（`guarded`）。
 
@@ -124,11 +124,11 @@ pnpm verify:client    # 用 __ModuleLoader__ shim 做 loader 冒烟
 
 ## 对话里的飞书来源
 
-从飞书发起的会话（话题、会话级降级、`/renew` 新开的会话、日志平台分析话题）在 Web/桌面端对话标题旁会出现一个来源按钮：群聊显示群名，私聊显示「私聊 · 对方姓名」（读不到姓名时为「飞书私聊」）。点击后在右侧栏打开「飞书来源」标签页，内容包括：
+从飞书发起的会话（话题、会话级降级、`/renew` 新开的会话、其他插件经 `feishuTopics` 发起的群共享话题，如观象的日志分析）在 Web/桌面端对话标题旁会出现一个来源按钮：群聊显示群名，私聊显示「私聊 · 对方姓名」（读不到姓名时为「飞书私聊」）。点击后在右侧栏打开「飞书来源」标签页，内容包括：
 
 - **标题**：群聊为群头像和群名，私聊为对方头像和姓名；
 - **来源**：私聊 / 群聊 / 群聊 · 话题；群名读不到时显示群 ID；
-- **发起人**：头像、姓名 + `user_id`（日志平台分析话题显示请求人，并注明群内成员都可以继续）；
+- **发起人**：头像、姓名 + `user_id`（群共享话题显示发起人，并注明群内成员都可以继续）；
 - **开始于 / 最近活跃**：飞书侧已经换到新会话（`/renew`、`/new`）或路由过期后，「最近活跃」换成「状态：飞书侧已切换到新会话或已过期」；
 - **在飞书中打开**（飞书 applink 打开对应聊天）与「刷新」。
 
@@ -167,7 +167,7 @@ src/
 │   ├── streaming.ts       #   流式回复卡构成（面板/活动行/正文/停止按钮/结算页脚）、分段、字节/表格预算
 │   ├── picker.ts          #   /model、/effort、/permissions 选择卡与按钮回传解析
 │   ├── onboarding.ts      #   私聊首次触达引导卡
-│   ├── analyze.ts         #   日志分析卡（详情页表格、状态标签）
+│   ├── topic.ts           #   群话题服务的根卡片（引导句、链接表格、状态标签）
 │   ├── approval.ts        #   审批决策卡
 │   └── question.ts        #   结构化问答卡
 ├── approvals.ts           # 审批 barrel → src/interactions/
@@ -302,8 +302,6 @@ npm 发行包已包含构建产物：Host 入口是 `lib/index.js`（profile 直
     dmAllowWhitelist: false             # guarded 下用户白名单里的人也可私聊（默认关：私聊仅管理员）
     adminUserId: 'a1b2c3d4'            # 管理员 user_id（可留空，留空时自动使用应用所有者；都没有时 guarded 下拒绝所有对话；面板可改）
     authRequestTtlDays: 7               # 入群/用户授权申请卡有效期（天，1–30）
-    analyzeEnabled: false               # 日志平台分析接口开关（POST /open-api/logalyze，挂在 DSH Web 端口；改后立即生效）
-    analyzeToken: 'DSH_CHANNELS_ANALYZE_TOKEN' # 分析接口 Bearer 令牌的凭据引用名（值在面板填写或写进 .credentials.yaml）
     loggerLevel: 'info'
 ```
 
@@ -364,7 +362,7 @@ FEISHU_APP_SECRET: xxxxxxxx
 |---|---|---|
 | 私聊 | `<baseDir>/p2p/<user_id>/` | `<工作区>/topics/<话题 id>/` |
 | 群聊 | `<baseDir>/groups/<chat_id>/<user_id>/` | 同上 |
-| 日志平台分析 | `<baseDir>/analyze/<应用>/<错误码>/` | 同上 |
+| 其他插件经 `feishuTopics` 发起的话题 | `<baseDir>/<调用方给的路径段>/`（观象的日志分析是 `analyze/<应用>/<错误码>/`） | 同上 |
 
 - 群聊必须是「群 × 用户」：同一个人在不同群之间不共享文件，避免 A 群会话把 B 群内容带出来。
 - 会话创建时以工作区为 header cwd（保证 GUI 里归属该项目、沙箱边界稳定），随后通过 `ctx.workingDirectory` 把实际工作目录切到话题目录；冷恢复会从 Session 日志还原该目录。因此话题之间的文件互不干扰，而工作区数量只随用户增长。
@@ -375,55 +373,40 @@ FEISHU_APP_SECRET: xxxxxxxx
 - 旧版本「一个话题一个工作区」（`<baseDir>/topics/...`）不会自动迁移：旧话题继续用原目录；旧版「用户 × 聊天」共享工作区正好作为新的用户工作区复用。
 - 设计取舍与约束详见 [docs/workspace-isolation-design.md](docs/workspace-isolation-design.md)。
 
-## 日志平台分析接口
+## 群话题服务（feishuTopics）
 
-日志平台调用插件的分析接口：插件在指定群里发一张分析卡（发起人、触发时间、应用、错误码和日志详情页表格），在卡片下开话题，把平台给的 prompt 原样交给一个新 Session（prompt 开头的斜杠命令由 DSH 展开成对应 skill），分析过程在话题内流式输出，和用户自己发起的会话一样。分析结束后分析卡的状态标签随之更新。群里通过准入的成员都可以在该话题内追问。插件只负责接收 prompt 和开会话：日志包地址写在 prompt 里，下载、解压、超时都由日志分析 skill 自己处理（Session 的沙箱需要能访问日志存储地址）。
+插件向其他 DSH 插件提供 Cordis 服务 `feishuTopics`：调用方给出目标群、发起人、根卡片内容、工作区和 prompt，插件在群里发一张根卡片，在卡片下开话题，把 prompt 原样交给一个新 Session（prompt 开头的斜杠命令由 DSH 展开成对应 skill），过程在话题内流式输出，和用户自己发起的会话一样。首轮结束后根卡片的状态标签随之更新。群里通过准入的成员都可以在该话题内追问。观象（[@modesto_ma/dsh-guanxiang](https://github.com/modestoma/dsh-guanxiang)）的日志平台分析接口 `POST /open-api/logalyze` 就建在这个服务上。
 
-**开启**：在面板「高级 → 日志分析接口」打开开关（`analyzeEnabled`，默认关，改后立即生效、不需要重连），并在同一处的「访问令牌」卡片填写令牌（建议 32 位以上随机串；写入 DSH 凭据库的 `DSH_CHANNELS_ANALYZE_TOKEN`，也可直接写进 `$DSH_HOME/.credentials.yaml`，引用名可用 `analyzeToken` 修改）。接口挂在 DSH Web 服务上（与 Web 界面同一端口），路径 `/open-api/logalyze` 刻意放在 DSH 的 `/api` 之外，网关可以把它与需要登录的 DSH API 分开放行；只有带 Web 的 profile（web、desktop）有这个接口，headless 没有。DSH 通过反向代理挂在前缀下时，地址随之带上前缀（如 `https://<域名>/dsh/open-api/logalyze`）。该路由不走 DSH 登录 cookie，访问令牌是唯一凭据。开关关闭时所有请求返回 404；令牌每次请求都重新解析，轮换后下一次请求生效；令牌缺失时所有请求返回 503。
+**日志平台分析接口已迁到观象**：接口的路径、请求体和响应都没有变，但开关和令牌改在观象面板「分析接口」中设置，令牌的凭据引用名改为 `GUANXIANG_ANALYZE_TOKEN`。本插件不再注册这个路由，也不再读取 `analyzeEnabled` / `analyzeToken`；`cordis.yml` 或 Web 覆盖文件里还留着这两项时，启动日志会提示一次。升级步骤：
 
-**请求**：
+1. 把 dsh-channels 和观象一起升级（观象需要支持 `feishuTopics` 的版本）。只升级 dsh-channels 时没有插件提供这个接口，请求会得到 404。
+2. 在观象面板「分析接口」中打开开关，保存令牌。平台继续用原来的令牌值时，把同一个值存进去即可。
+3. 从 `cordis.yml` 中删掉 `analyzeEnabled` / `analyzeToken`。
 
-```http
-POST /open-api/logalyze
-Authorization: Bearer <令牌>
-Idempotency-Key: <平台生成的唯一值，1-200 个可见 ASCII 字符>
-Content-Type: application/json
+升级前已发出的分析卡、话题和追问权限都不受影响；升级时仍在「分析中」的分析卡会在重新连上飞书后改成「已中断」。
 
-{
-  "requesterUserId": "a1b2c3d4",
-  "triggeredAt": "2026-10-22 19:30",
-  "app": "camera",
-  "errorCode": "E1001",
-  "logDetails": [
-    { "name": "设备 A 崩溃日志", "url": "https://logs.example.com/detail/1" },
-    { "name": "设备 B 崩溃日志", "url": "https://logs.example.com/detail/2" }
-  ],
-  "chatId": "oc_xxx",
-  "prompt": "/log-analyze https://logs.example.com/1.zip https://logs.example.com/2.zip 请分析这些日志"
-}
+**调用方式**：类型在包子路径 `@modesto_ma/dsh-channels/topics`（只有类型，没有运行时导出），调用方用 `import type` 引用，在每次调用时用 `ctx.get('feishuTopics')` 取服务（本插件未加载或正在重载时取不到），并检查 `version`（当前为 `1`）。不要把 `feishuTopics` 写进调用方插件的主 `inject`：那样本插件每次重载（例如改配置后重连）都会连带重载调用方。需要随服务上下线挂载路由时，在子作用域里 `ctx.inject(['feishuTopics'], …)`。
+
+```ts
+const topics = ctx.get('feishuTopics') as FeishuTopicService | undefined
+const result = await topics?.launch({
+  key, fingerprint, chatId, requesterUserId,
+  card: { title: '日志分析', taskName: '分析', lead: [{ text: '于 … 发起了对 ' }, { text: 'camera', bold: true }, …], links },
+  workspace: { segments: ['analyze', 'camera', 'E1001'], title: '日志分析 · camera · E1001' },
+  prompt,
+})
 ```
 
-- `requesterUserId`：平台发起人的飞书 user_id，分析卡 @ 此人；路由记录里也以此人作为发起人。
-- `triggeredAt`：平台上发起分析的时间，1–64 字符，原样显示在分析卡上（时区和格式由平台决定）。
-- `app` / `errorCode`：只允许 `A-Z a-z 0-9 . _ -`（1–128 字符），决定工作区 `<baseDir>/analyze/<app>/<errorCode>/`；同一应用同一错误码的所有分析都在这个工作区里，每次分析各有一个话题目录。
-- `logDetails`：触发分析的日志在日志平台上的详情页，1–50 条，每条 `name`（1–200 字符）+ `url`（http/https）。只在分析卡的表格里列出（每页 10 行），插件不会访问这些地址。
+- `key` / `fingerprint`：幂等键（1–200 个可见 ASCII 字符）与调用方定义的请求指纹。同一个键再次发起（包括并发）返回第一次的根卡片（`replayed: true`），指纹不同则拒绝（`key-conflict`）。记录永久保存在 `channels_routes_v2` 域的 `analyze_requests` 表（沿用旧接口的表名）；根卡片发出后的失败不会回滚记录，根卡片显示「失败」和原因，需要重试时换一个新键。
 - `chatId`：目标群，必须是已授权群（`/auth group add` 或面板「访问与授权」），机器人需在群内；`accessMode: open` 时不校验。
-- `prompt`：1–100000 字符，原样作为首条用户消息，插件不追加任何内容。
-- 只接受以上 7 个字段，多余字段返回 400。
+- `card`：标题、任务名（状态文字里用，如「分析中」「分析已完成」）、跟在 @发起人 后的引导句（可加粗片段）、可选的链接表格（最多 50 行，每页 10 行）。
+- `workspace`：`<baseDir>` 下的 1–8 个路径段（只允许 `A-Z a-z 0-9 . _ -`，第一段不能是本插件自用的 `p2p`、`groups`、`topics`、`_staging`）和它在 DSH 工作区列表里的标题。路径段相同的发起共用一个工作区，各有一个话题目录。
+- `prompt`：1–100000 字符，原样作为首条用户消息。
+- 结果：成功时返回根卡片 `messageId`；失败时返回 `code` 和中文 `message`：`invalid`（参数不合法）、`not-connected`（飞书未连接或正在关闭）、`forbidden-chat`（目标群未授权）、`key-conflict`、`send-failed`（根卡片发送失败，如机器人不在群里）。
 
-**响应**：校验通过、分析卡发出后立即返回 `202`：
+**群里看到的**：先是根卡片「@发起人 <引导句>」，下面是链接表格，标题栏标签为「<任务名>中」；紧接着话题内一张流式卡片（它同时创建话题），首轮在这里流式输出，带停止按钮。首轮结束后根卡片的标签变成「已完成」「已停止」或「失败」，并加上 DONE / No 表情；之后的追问不再改动根卡片。启动失败时话题里的流式卡片和根卡片都会写明原因。过程中出现的审批卡、提问卡发在话题内。DSH 在首轮进行中重启或重连飞书时，话题里的流式卡片照常由中断修复处理；重新连上后，插件把仍是「<任务名>中」的根卡片改成「已中断」（橙色），提示在话题内回复即可继续，原来的 Session 会接着追问。根卡片状态同时记在发起记录里（连同重画卡片所需的内容）。
 
-```json
-{ "ok": true, "chatId": "oc_xxx", "messageId": "om_xxx" }
-```
-
-`messageId` 是分析卡的消息 id，分析话题挂在它下面。同步错误都带中文 `error`：`401` 令牌无效、`404` 接口开关未打开、`400` 参数或 `Idempotency-Key` 不合法、`403` 目标群未授权、`409` 同一个 `Idempotency-Key` 已被内容不同的请求使用、`413` 请求体超过 1 MiB、`415` 不是 JSON、`502` 分析卡发送失败（如机器人不在群里）、`503` 飞书未连接或未配置令牌。
-
-**去重**：同一个 `Idempotency-Key` 再次请求（包括并发重试）原样返回第一次的结果，不会再发卡、再分析。记录永久保存在 `channels_routes_v2` 域的 `analyze_requests` 表。分析卡发出后的失败（话题创建、Session 创建）不会回滚这条记录：分析卡的状态变成「失败」并写明原因，需要重试时请换一个新的 `Idempotency-Key`。
-
-**群里看到的**：先是分析卡「@发起人 于 <triggeredAt> 发起了对 X 应用 Y 错误码不良日志的分析」，下面是日志详情页表格，标题栏标签为「分析中」；紧接着话题内一张流式卡片（它同时创建话题），首轮分析在这里流式输出，带停止按钮。首轮结束后分析卡的标签变成「已完成」「已停止」或「失败」，并加上 DONE / No 表情；之后的追问不再改动分析卡。启动失败时话题里的流式卡片和分析卡都会写明原因。分析过程中出现的审批卡、提问卡发在话题内。DSH 在首轮进行中重启或重连飞书时，话题里的流式卡片照常由中断修复处理；重新连上后，插件把仍是「分析中」的分析卡改成「已中断」（橙色），提示在话题内回复即可继续，原来的 Session 会接着追问。分析卡状态同时记在 `analyze_requests` 记录里（连同重画卡片所需的发起人、时间、应用、错误码和详情页）。
-
-**追问与权限**：分析话题的路由是**群内共享**的（路由记录 `shared: true`）：群里任何通过准入的成员（管理员，或该群已授权且本人在用户白名单）都可以在话题内直接回复追问（无需 @），也可以点停止按钮、回答审批卡与提问卡、在话题里执行会话命令；未授权的人仍被静默忽略。追问的回复照常流式输出。话题之间互不读取，和普通话题一样。分析结果 markdown 怎么回传给平台由日志分析插件自己负责，本插件不参与。
+**追问与权限**：这类话题的路由是**群内共享**的（路由记录 `shared: true`）：群里任何通过准入的成员（管理员，或该群已授权且本人在用户白名单）都可以在话题内直接回复追问（无需 @），也可以点停止按钮、回答审批卡与提问卡、在话题里执行会话命令；未授权的人仍被静默忽略。追问的回复照常流式输出。话题之间互不读取，和普通话题一样。结果怎么回传给外部系统由调用方插件负责，本插件不参与。
 
 ## 行为与降级
 

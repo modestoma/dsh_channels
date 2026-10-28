@@ -175,13 +175,12 @@ export function registerSettingsRoutes(connection: HostConnection, surface: Sett
       const values: SaveCredentialsRequest = {}
       if (payload.appId !== undefined) values.appId = payload.appId as string
       if (payload.appSecret !== undefined) values.appSecret = payload.appSecret as string
-      if (payload.analyzeToken !== undefined) values.analyzeToken = payload.analyzeToken as string
       return result(await surface.saveCredentials(values))
     }),
     post(CLEAR_CREDENTIAL_ROUTE, async (request) => {
       const field = (await readJsonObject(request)).field
-      if (field !== 'appId' && field !== 'appSecret' && field !== 'analyzeToken') {
-        return json(400, { ok: false, error: 'field 必须是 appId、appSecret 或 analyzeToken' })
+      if (field !== 'appId' && field !== 'appSecret') {
+        return json(400, { ok: false, error: 'field 必须是 appId 或 appSecret' })
       }
       return result(await surface.clearCredential(field as CredentialField))
     }),

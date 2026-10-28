@@ -5,7 +5,8 @@
  * - p2p:   workspace `<baseDir>/p2p/<user_id>/`
  * - group: workspace `<baseDir>/groups/<chat_id>/<user_id>/`
  * - topic: `<workspace>/topics/<topic-token>/` (the Session's effective cwd)
- * - log-platform analysis: workspace `<baseDir>/analyze/<app>/<errorCode>/`
+ * - `feishuTopics` launch: workspace `<baseDir>/<caller segments…>/` (观象's
+ *   log analyses use `<baseDir>/analyze/<app>/<errorCode>/`)
  *
  * The workspace root is the Session header cwd: it keeps the Session grouped
  * under the user's project in the GUI and stays the sandbox write boundary.
@@ -235,31 +236,37 @@ export async function ensureWorkspace(
 }
 
 /**
- * Workspace directory of one log-platform analysis subject:
- * `<baseDir>/analyze/<app>/<errorCode>/`. Every analysis of the same
- * application and error code is grouped there, each in its own topic
- * directory.
+ * First path segments this module lays out itself; a `feishuTopics` launch
+ * workspace may not start with one of them.
  */
-export function analyzeWorkspacePathFor(baseDir: string, app: string, errorCode: string): string {
-  return path.join(baseDir, 'analyze', safeSegment(app, 'app'), safeSegment(errorCode, 'errorCode'))
-}
+export const RESERVED_WORKSPACE_ROOTS: readonly string[] = ['p2p', 'groups', 'topics', '_staging']
 
-/** Workspace title of one analysis subject in the DSH workspace list. */
-export function analyzeWorkspaceTitleFor(app: string, errorCode: string): string {
-  return `日志分析 · ${app} · ${errorCode}`
+/**
+ * Workspace directory of one `feishuTopics` launch:
+ * `<baseDir>/<segments…>/`. Launches with the same segments share it, each in
+ * its own topic directory.
+ * @throws when a segment is unsafe or the first one is reserved.
+ */
+export function launchWorkspacePathFor(baseDir: string, segments: readonly string[]): string {
+  if (segments.length === 0) throw new Error('dsh-channels: a launch workspace needs at least one path segment')
+  const safe = segments.map(segment => safeSegment(segment, 'launch workspace segment'))
+  if (RESERVED_WORKSPACE_ROOTS.includes(safe[0]!)) {
+    throw new Error(`dsh-channels: launch workspace may not start with reserved segment ${JSON.stringify(safe[0])}`)
+  }
+  return path.join(baseDir, ...safe)
 }
 
 /**
- * Ensure one analysis subject's workspace exists and is registered (idempotent
- * like {@link ensureWorkspace}).
+ * Ensure one launch workspace exists and is registered (idempotent like
+ * {@link ensureWorkspace}).
  */
-export async function ensureAnalyzeWorkspace(
+export async function ensureLaunchWorkspace(
   ctx: HostContext,
   baseDir: string,
-  app: string,
-  errorCode: string,
+  segments: readonly string[],
+  title: string,
 ): Promise<Workspace> {
-  const dir = analyzeWorkspacePathFor(baseDir, app, errorCode)
+  const dir = launchWorkspacePathFor(baseDir, segments)
   await mkdir(dir, { recursive: true })
-  return ctx.workspaceRegistry.create(dir, analyzeWorkspaceTitleFor(app, errorCode))
+  return ctx.workspaceRegistry.create(dir, title)
 }

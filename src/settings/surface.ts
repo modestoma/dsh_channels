@@ -135,7 +135,7 @@ export interface CredentialInfo {
 const RESTART_SET = new Set<string>(RESTART_KEYS)
 
 /** Every credential slot the panel writes, in form order. */
-const CREDENTIAL_FIELDS: readonly CredentialField[] = ['appId', 'appSecret', 'analyzeToken']
+const CREDENTIAL_FIELDS: readonly CredentialField[] = ['appId', 'appSecret']
 
 /** Optional fields: an empty string in the panel clears the override. */
 const OPTIONAL_TEXT_KEYS = new Set<EditableKey>([
@@ -160,7 +160,6 @@ const BOOLEAN_KEYS = new Set<EditableKey>([
   'feishuTools.sendFile',
   'feishuTools.wikiRead',
   'feishuTools.wikiWrite',
-  'analyzeEnabled',
 ])
 
 /** Bounds and entry format of one `string-list` field. */
@@ -437,12 +436,6 @@ const FIELD_META: Record<EditableKey, FieldMeta> = {
     help: '整个知识空间 https://<租户>.feishu.cn/wiki/space/<space_id>，或节点 https://<租户>.feishu.cn/wiki/<node_token>（含其下所有节点）。最多 20 项，空行保存时忽略。对新会话生效。',
     placeholder: 'https://<租户>.feishu.cn/wiki/space/<space_id>',
     wide: true,
-  },
-  analyzeEnabled: {
-    label: '日志分析接口',
-    group: 'analyze',
-    summary: '关闭时接口返回 404',
-    help: '接口挂在 DSH Web 端口上：POST /open-api/logalyze，请求需带 Authorization: Bearer <访问令牌>。只有带 Web 的 profile 才有这个接口。改后立即生效，不需要重连。',
   },
   loggerLevel: { label: 'SDK 日志级别', group: 'logging' },
 }
@@ -785,7 +778,6 @@ export class SettingsSurface {
     let credentialStates: Record<CredentialField, CredentialInfo> = {
       appId: { configured: false, writable: false },
       appSecret: { configured: false, writable: false },
-      analyzeToken: { configured: false, writable: false },
     }
     try {
       credentialStates = await this.target.credentialStates()
@@ -801,7 +793,6 @@ export class SettingsSurface {
     const credentials: PanelConfigWire['credentials'] = {
       appId: toWire(effective.appId, credentialStates.appId),
       appSecret: toWire(effective.appSecret, credentialStates.appSecret),
-      analyzeToken: toWire(effective.analyzeToken, credentialStates.analyzeToken),
     }
 
     // The access snapshot comes from in-memory maps, but a broken seam must
@@ -963,9 +954,6 @@ export class SettingsSurface {
     } catch (error) {
       return { ok: false, error: messageOf(error) }
     }
-    if (writes.every(write => write.field === 'analyzeToken')) {
-      return { ok: true, panel: await this.panel(), reconnect: 'not-needed' }
-    }
     return this.finishCredentialChange('save')
   }
 
@@ -981,7 +969,6 @@ export class SettingsSurface {
     } catch (error) {
       return { ok: false, error: messageOf(error) }
     }
-    if (field === 'analyzeToken') return { ok: true, panel: await this.panel(), reconnect: 'not-needed' }
     return this.finishCredentialChange('clear')
   }
 

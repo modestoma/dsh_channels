@@ -125,7 +125,6 @@ class FakeTarget implements SettingsTarget {
   credentialInfo: Record<CredentialField, { configured: boolean; writable: boolean; source?: string }> = {
     appId: { configured: true, writable: true, source: 'file' },
     appSecret: { configured: true, writable: true, source: 'file' },
-    analyzeToken: { configured: false, writable: true },
   }
   credentialCalls: Array<{ field: string; value?: string }> = []
   applied: OverlayPatch | undefined
@@ -1710,25 +1709,6 @@ describe('SettingsSurface credentials', () => {
     expect(stopped.target.restartCalls).toBe(0)
   })
 
-  it('stores and removes the analyze API token without touching the Feishu connection', async () => {
-    for (const running of [true, false]) {
-      const { surface, target } = makeSurface()
-      target.runningFlag = running
-      const saved = await surface.saveCredentials({ analyzeToken: ' tok_new ' })
-      expect(saved.ok).toBe(true)
-      if (!saved.ok) return
-      expect(saved.reconnect).toBe('not-needed')
-      expect(saved.panel.config.credentials.analyzeToken).toMatchObject({ ref: 'DSH_CHANNELS_ANALYZE_TOKEN', configured: true })
-      const cleared = await surface.clearCredential('analyzeToken')
-      expect(cleared.ok).toBe(true)
-      if (!cleared.ok) return
-      expect(cleared.reconnect).toBe('not-needed')
-      expect(cleared.panel.config.credentials.analyzeToken.configured).toBe(false)
-      expect(target.credentialCalls).toEqual([{ field: 'analyzeToken', value: 'tok_new' }, { field: 'analyzeToken' }])
-      expect(target.connectCalls + target.restartCalls).toBe(0)
-    }
-  })
-
   it('refuses unknown credential fields', async () => {
     const result = await makeSurface().surface.clearCredential('nope' as 'appId')
     expect(result.ok).toBe(false)
@@ -2089,12 +2069,8 @@ describe('settings routes', () => {
     expect(removed.status).toBe(200)
     expect(JSON.parse(removed.body).ok).toBe(true)
 
-    const token = await call(routes, SAVE_CREDENTIALS_ROUTE, post({ analyzeToken: 'tok_new' }))
-    expect(token.status).toBe(200)
-    expect(JSON.parse(token.body).reconnect).toBe('not-needed')
-
-    const tokenRemoved = await call(routes, CLEAR_CREDENTIAL_ROUTE, post({ field: 'analyzeToken' }))
-    expect(tokenRemoved.status).toBe(200)
+    const movedField = await call(routes, CLEAR_CREDENTIAL_ROUTE, post({ field: 'analyzeToken' }))
+    expect(movedField.status).toBe(400)
 
     expect((await call(routes, SAVE_CREDENTIALS_ROUTE)).status).toBe(404)
   })
@@ -2402,20 +2378,6 @@ describe('FeishuService settings integration', () => {
     if (!cleared.ok) return
     expect(cleared.reconnect).toBe('pending')
     expect(h.credentials.values.FEISHU_APP_SECRET).toBeUndefined()
-    await service.shutdown()
-  })
-
-  it('writes the analyze API token to its credential ref through the real service', async () => {
-    const h = harness({}, {})
-    const service = new FeishuService(h.ctx, h.config, () => h.channel, undefined, h.store)
-    const surface = new SettingsSurface(service, h.store)
-    await service.boot()
-    const saved = await surface.saveCredentials({ analyzeToken: 'tok_secret' })
-    expect(saved.ok).toBe(true)
-    expect(h.credentials.values.DSH_CHANNELS_ANALYZE_TOKEN).toBe('tok_secret')
-    expect(service.isRunning()).toBe(false)
-    await surface.clearCredential('analyzeToken')
-    expect(h.credentials.values.DSH_CHANNELS_ANALYZE_TOKEN).toBeUndefined()
     await service.shutdown()
   })
 
