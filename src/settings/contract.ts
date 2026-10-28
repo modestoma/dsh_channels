@@ -172,7 +172,7 @@ export const EDITABLE_KEYS = [
   'feishuTools.wikiWrite',
   'wikiRoots',
   // 日志平台分析接口（访问令牌是凭据引用 analyzeToken，值写在 DSH 凭据里）
-  'analyzeListen',
+  'analyzeEnabled',
   // 日志
   'loggerLevel',
 ] as const
@@ -187,7 +187,6 @@ export const RESTART_KEYS = [
   'dmMode',
   'requireMention',
   'slashCommandPanel',
-  'analyzeListen',
   'refreshMs',
   'statusRefreshMs',
   'loggerLevel',

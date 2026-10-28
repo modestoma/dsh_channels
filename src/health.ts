@@ -55,8 +55,6 @@ export interface HealthSnapshotInput {
   routeCount: number
   liveAgentCount: number
   inflightTurnCount: number
-  /** Why the configured analyze listener could not bind; absent when it is bound or not configured. */
-  analyzeListenError?: string
 }
 
 export interface HealthSnapshot extends Omit<HealthSnapshotInput, 'fibers' | 'botOpenId'> {
@@ -150,7 +148,6 @@ export function foldHealthSnapshot(input: HealthSnapshotInput): HealthSnapshot {
     || fibers.pending > 0
     || fibers.loading > 0
     || fibers.unloading > 0
-    || input.analyzeListenError !== undefined
   ) {
     level = 'degraded'
   } else {
@@ -179,10 +176,6 @@ export function foldHealthSnapshot(input: HealthSnapshotInput): HealthSnapshot {
     )
   }
 
-  if (input.analyzeListenError !== undefined) {
-    reasons.push(`日志分析接口监听失败：${input.analyzeListenError}`)
-  }
-
   return {
     level,
     fibers,
@@ -193,7 +186,6 @@ export function foldHealthSnapshot(input: HealthSnapshotInput): HealthSnapshot {
     routeCount: input.routeCount,
     liveAgentCount: input.liveAgentCount,
     inflightTurnCount: input.inflightTurnCount,
-    ...(input.analyzeListenError === undefined ? {} : { analyzeListenError: input.analyzeListenError }),
     inactiveFibers: inactive,
     inactiveTotal,
     reasons,
@@ -237,9 +229,5 @@ export function buildHealthCard(snapshot: HealthSnapshot): object {
       tag: 'markdown',
       content: `**dsh-channels**\n${snapshot.started ? 'started' : 'stopped'} · 持久化路由 ${snapshot.routeCount} · live Agent ${snapshot.liveAgentCount} · in-flight turn ${snapshot.inflightTurnCount}`,
     },
-    ...(snapshot.analyzeListenError === undefined ? [] : [{
-      tag: 'markdown',
-      content: `**日志分析接口**\n❌ 监听失败：${snapshot.analyzeListenError}`,
-    }]),
   ])
 }

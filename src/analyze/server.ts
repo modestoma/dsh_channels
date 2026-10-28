@@ -1,26 +1,33 @@
 /**
- * The analyze API's dedicated HTTP listener.
+ * The analyze API's HTTP route on the DSH Web server.
  *
- * Serves exactly `POST /dsh-channels/analyze` (see `./contract.ts`) on the
- * `analyzeListen` address. This module owns the transport-level checks, in
- * order: path, method, bearer token, `Idempotency-Key`, media type, body size,
- * and JSON validation; everything after validation belongs to the
- * {@link AnalyzeHandler}. Bodies, tokens, and prompts are never logged.
+ * Registers the exact route `POST /api/dsh-channels.logalyze` (see
+ * `./contract.ts`) on the host `webServer`; hosts without one (headless) have
+ * no analyze API. This module owns the transport-level checks, in order:
+ * path, the `analyzeEnabled` switch, method, bearer token, `Idempotency-Key`,
+ * media type, body size, and JSON validation; everything after validation
+ * belongs to the {@link AnalyzeHandler}. Bodies, tokens, and prompts are never
+ * logged.
  *
  * @module dsh-channels/analyze/server
  */
 
 import { createHash, timingSafeEqual } from 'node:crypto'
-import { createServer } from 'node:http'
-import type { IncomingMessage, Server, ServerResponse } from 'node:http'
-import type { AddressInfo } from 'node:net'
+import type { IncomingMessage, ServerResponse } from 'node:http'
+import type { HostContext } from '../dsh-types.ts'
+import type { HostWebServer } from '../settings/routes.ts'
 import {
   ANALYZE_MAX_BODY_BYTES, ANALYZE_ROUTE, IDEMPOTENCY_KEY_PATTERN, parseAnalyzeRequest,
 } from './contract.ts'
 import type { AnalyzeRequest, AnalyzeResponse } from './contract.ts'
 
-/** The business side of the listener. */
+/** The business side of the route. */
 export interface AnalyzeHandler {
+  /**
+   * Whether the API is switched on (`analyzeEnabled`), read per request.
+   * @returns false to answer every request with 404.
+   */
+  enabled(): boolean
   /**
    * Resolve the expected bearer token for this request.
    * @returns the token, or undefined when it is not configured.
@@ -33,14 +40,6 @@ export interface AnalyzeHandler {
    * @returns the HTTP answer.
    */
   analyze(request: AnalyzeRequest, idempotencyKey: string): Promise<AnalyzeResponse>
-}
-
-/** A bound analyze listener. */
-export interface AnalyzeServer {
-  /** The bound address (the real port when `0` was requested). */
-  readonly address: AddressInfo
-  /** Stop accepting connections and close idle ones. */
-  close(): Promise<void>
 }
 
 class HttpError extends Error {
@@ -112,6 +111,10 @@ export async function handleAnalyzeHttp(
     refuse(res, 404, '未知路径')
     return
   }
+  if (!handler.enabled()) {
+    refuse(res, 404, '日志分析接口未开启，请在设置面板「高级 → 日志分析接口」打开开关')
+    return
+  }
   if ((req.method ?? 'GET').toUpperCase() !== 'POST') {
     refuse(res, 405, '只接受 POST', { allow: 'POST' })
     return
@@ -155,47 +158,42 @@ export async function handleAnalyzeHttp(
   send(res, await handler.analyze(parsed.value, idempotencyKey))
 }
 
-/** Split `host:port` (`[v6]:port` allowed) into listen arguments. */
-export function parseListenAddress(listen: string): { host: string; port: number } {
-  const separator = listen.lastIndexOf(':')
-  const host = listen.slice(0, separator).replace(/^\[(.*)\]$/u, '$1')
-  return { host, port: Number(listen.slice(separator + 1)) }
-}
-
 /**
- * Bind the analyze listener.
- * @param listen - `host:port` address (`analyzeListen`).
+ * Register the analyze route on the host Web server once it is available.
+ * Requests skip the DSH login gate on purpose: the bearer token is this API's
+ * only credential.
+ * @param ctx - the plugin context.
  * @param handler - the business side.
  * @param warn - diagnostics sink for unexpected handler failures.
- * @returns the bound server; rejects when the address cannot be bound.
  */
-export async function startAnalyzeServer(
-  listen: string,
+export function mountAnalyzeRoute(
+  ctx: HostContext,
   handler: AnalyzeHandler,
   warn: (message: string, ...args: unknown[]) => void,
-): Promise<AnalyzeServer> {
-  const server: Server = createServer((req, res) => {
-    handleAnalyzeHttp(req, res, handler).catch((error: unknown) => {
-      warn('dsh-channels: analyze request failed: %s', String(error))
-      if (!res.headersSent) refuse(res, 500, `分析请求处理失败：${String(error)}`)
-      else res.destroy()
-    })
-  })
-  const { host, port } = parseListenAddress(listen)
-  await new Promise<void>((resolve, reject) => {
-    const onError = (error: Error): void => { reject(error) }
-    server.once('error', onError)
-    server.listen(port, host, () => {
-      server.off('error', onError)
-      resolve()
-    })
-  })
-  server.on('error', (error) => { warn('dsh-channels: analyze listener error: %s', String(error)) })
-  return {
-    address: server.address() as AddressInfo,
-    close: () => new Promise<void>((resolve) => {
-      server.close(() => { resolve() })
-      server.closeIdleConnections()
-    }),
+): void {
+  const attach = (webCtx: HostContext): void => {
+    const server = webCtx.get?.('webServer') as HostWebServer | undefined
+    if (server === undefined) return
+    webCtx.effect(() => server.register({
+      kind: 'exact',
+      path: ANALYZE_ROUTE,
+      handler: async (req, res) => {
+        try {
+          await handleAnalyzeHttp(req, res, handler)
+        } catch (error) {
+          warn('dsh-channels: analyze request failed: %s', String(error))
+          if (!res.headersSent) refuse(res, 500, `分析请求处理失败：${String(error)}`)
+          else res.destroy()
+        }
+      },
+    }), 'dsh-channels: analyze route')
   }
+  const inject = (ctx as {
+    inject?: (dependencies: string[], callback: (child: HostContext) => void) => unknown
+  }).inject
+  if (typeof inject === 'function') {
+    inject.call(ctx, ['webServer'], attach)
+    return
+  }
+  attach(ctx)
 }

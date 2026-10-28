@@ -57,8 +57,7 @@ import type {
 } from './domain.ts'
 import { RouteStore } from './session/routes.ts'
 import { AnalyzeLauncher } from './analyze/launcher.ts'
-import { startAnalyzeServer } from './analyze/server.ts'
-import type { AnalyzeServer } from './analyze/server.ts'
+import type { AnalyzeHandler } from './analyze/server.ts'
 import { InflightRepair } from './session/repair.ts'
 import { SessionManager } from './session/manager.ts'
 import type { LiveAgent, RenewCommit } from './session/manager.ts'
@@ -313,10 +312,6 @@ export class FeishuService {
   private readonly inbound: InboundRouter
   /** Log-platform analyze API business side (requests → shared analysis topics). */
   private readonly analyzeLauncher: AnalyzeLauncher
-  /** Bound analyze listener while connected with `analyzeListen` set. */
-  private analyzeServer: AnalyzeServer | undefined
-  /** Why the analyze listener could not bind at the last connect. */
-  private analyzeListenError: string | undefined
   /** Agent/session lifecycle: live registry, resume, presets, renew. */
   private readonly sessions: SessionManager
   /**
@@ -980,6 +975,8 @@ export class FeishuService {
     }
   }
 
+  /** The analyze API's business side, for the Web route. */
+  analyzeHandler(): AnalyzeHandler { return this.analyzeLauncher }
   isRunning(): boolean { return this.started }
   isRestarting(): boolean { return this.restarting }
   /** True while the panel's explicit connect action is in flight. */
@@ -1660,9 +1657,9 @@ export class FeishuService {
     // Background: the results only feed the panel and the log.
     void this.runScopeCheck(channel, appId, ownerLookup)
     if (this.config.slashCommandPanel) void this.runSlashCommandSync(channel)
-    // Before the listener opens, so every `running` record left is a previous instance's.
+    // Before admission opens, so every `running` record left is a previous instance's.
     await this.analyzeLauncher.markInterrupted()
-    await this.openAnalyzeListener()
+    this.analyzeLauncher.open()
     // Repair cards a previous instance left mid-flight (best-effort, background).
     void this.repair.repairAll().catch((error: unknown) => {
       this.ctx.logger?.warn?.('dsh-channels: inflight repair failed: %s', String(error))
@@ -1720,37 +1717,13 @@ export class FeishuService {
     )
   }
 
-  /**
-   * Bind the analyze listener when `analyzeListen` is set. A bind failure is
-   * logged and folded into the health snapshot (panel reasons, `/health`); the Feishu connection stays up.
-   */
-  private async openAnalyzeListener(): Promise<void> {
-    this.analyzeListenError = undefined
-    const listen = this.config.analyzeListen
-    if (listen === undefined) return
-    try {
-      this.analyzeServer = await startAnalyzeServer(
-        listen,
-        this.analyzeLauncher,
-        (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
-      )
-      console.info('[dsh-channels] 日志分析接口已监听', listen)
-    } catch (error) {
-      this.analyzeListenError = messageOf(error)
-      this.ctx.logger?.error?.('dsh-channels: analyze listener on %s failed: %s', listen, this.analyzeListenError)
-      console.error('[dsh-channels] 日志分析接口监听失败:', listen, error)
-    }
-  }
-
   /** Tear down: close the connection and dispose all live agents. */
   async shutdown(): Promise<void> {
     // Close admission first. In-flight Host commands receive cancellation
     // before their Agent/channel/storage dependencies are disposed, while
     // already queued route operations observe `started === false` and retire.
     this.started = false
-    const analyzeServer = this.analyzeServer
-    this.analyzeServer = undefined
-    await analyzeServer?.close()
+    this.analyzeLauncher.close()
     await this.analyzeLauncher.drain()
     for (const controller of this.commandControllers) controller.abort()
     await Promise.allSettled([...this.commandOperations])
@@ -2717,7 +2690,6 @@ export class FeishuService {
       routeCount: this.routes.size(),
       liveAgentCount: this.sessions.liveCount(),
       inflightTurnCount,
-      ...(this.analyzeListenError === undefined ? {} : { analyzeListenError: this.analyzeListenError }),
     })
   }
 

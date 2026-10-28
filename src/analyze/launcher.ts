@@ -85,8 +85,27 @@ export class AnalyzeLauncher implements AnalyzeHandler {
   private readonly accepting = new Map<string, PendingAccept>()
   /** Background analyses still starting (drained on shutdown). */
   private readonly running = new Set<Promise<void>>()
+  /** Whether requests are admitted: from {@link open} after start until {@link close}. */
+  private admitting = false
 
   constructor(private readonly deps: AnalyzeLauncherDeps) {}
+
+  /**
+   * Start admitting requests. Called at channel start after
+   * {@link markInterrupted}, so a new request is never marked interrupted.
+   */
+  open(): void {
+    this.admitting = true
+  }
+
+  /** Stop admitting requests (503) ahead of shutdown. */
+  close(): void {
+    this.admitting = false
+  }
+
+  enabled(): boolean {
+    return this.deps.config.analyzeEnabled
+  }
 
   async token(): Promise<string | undefined> {
     return await this.deps.resolveToken()
@@ -119,7 +138,7 @@ export class AnalyzeLauncher implements AnalyzeHandler {
 
   /**
    * Mark every analysis still `running` as interrupted, on its card and in
-   * its record. Called at channel start before the listener opens, so each
+   * its record. Called at channel start before admission opens, so each
    * such record belongs to a previous instance whose first turn never
    * settled. A card that cannot be updated (deleted, recalled) is logged and
    * still recorded as interrupted, so it is not retried on every start.
@@ -141,7 +160,7 @@ export class AnalyzeLauncher implements AnalyzeHandler {
   private async accept(request: AnalyzeRequest, key: string, bodyHash: string): Promise<AnalyzeResponse> {
     const channel = this.deps.channel()
     const domain = this.deps.domain()
-    if (!this.deps.started() || channel === undefined || domain === undefined) {
+    if (!this.admitting || !this.deps.started() || channel === undefined || domain === undefined) {
       return refused(503, '飞书渠道尚未连接，请稍后重试')
     }
     const stored = domain.analyzeRequests.get(key)

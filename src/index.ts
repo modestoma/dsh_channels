@@ -23,6 +23,7 @@ import { defaultChannelFactory } from './feishu-channel.ts'
 import type { ChannelFactory } from './feishu-channel.ts'
 import { OverlayStore, defaultOverlayPath } from './settings/overlay.ts'
 import { mountSettingsRoutes } from './settings/routes.ts'
+import { mountAnalyzeRoute } from './analyze/server.ts'
 import { SettingsSurface } from './settings/surface.ts'
 import { createHostCatalog } from './settings/catalog.ts'
 import { createSettingsDirectoryPicker } from './settings/directory-picker.ts'
@@ -124,6 +125,7 @@ export function apply(ctx: HostContext, config?: unknown): void {
     createHostCatalog(ctx, warn),
     createSettingsDirectoryPicker(ctx),
   ))
+  mountAnalyzeRoute(ctx, service.analyzeHandler(), warn)
   ctx.effect(() => {
     // Boot loads the Web overlay and connects only when the Feishu application
     // credentials are complete; an incomplete configuration or a failed

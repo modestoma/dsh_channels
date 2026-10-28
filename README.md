@@ -82,7 +82,7 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 | 附件与工具 | 「入站附件」：接收图片和文件、使用 DSH 原生附件库（开关，关闭则存到话题目录 `attachments/`）、图片预取、首轮话题历史；「工具」：`feishu_attachment_fetch` / `feishu_topic_messages` / `feishu_send_file` 开关；「限额与超时」：预取上限、读取附件上限与超时、读取话题消息超时、引用摘录与历史超时（共 8 项，默认收起，有改动或错误时自动展开） |
 | 访问授权 | 待处理申请（置顶，一键授权 / 忽略）、调试模式（`accessMode`，开关）、白名单用户可私聊（`dmAllowWhitelist`，开关）、管理员 user_id、申请有效期；已授权群 / 用户白名单（添加表单默认收起） |
 | 知识库 | 知识库读 / 写开关（`feishuTools.wikiRead` / `feishuTools.wikiWrite`）、可访问范围 `wikiRoots`（每条链接一个输入框，逐条校验）；「可使用的人」：知识库白名单增删（与用户白名单独立，等同 `/auth wiki add|remove`） |
-| 高级 | 日志分析接口（监听地址 `analyzeListen` 与访问令牌）、SDK 日志级别、Web 覆盖文件路径与「恢复 profile 配置」 |
+| 高级 | 日志分析接口（开关 `analyzeEnabled` 与访问令牌）、SDK 日志级别、Web 覆盖文件路径与「恢复 profile 配置」 |
 
 **调试模式**：「访问授权 → 调试模式」打开即 `accessMode: open`，所有人都能和机器人聊天；打开期间面板顶部常驻黄色警告。默认关闭（`guarded`）。
 
@@ -302,7 +302,7 @@ npm 发行包已包含构建产物：Host 入口是 `lib/index.js`（profile 直
     dmAllowWhitelist: false             # guarded 下用户白名单里的人也可私聊（默认关：私聊仅管理员）
     adminUserId: 'a1b2c3d4'            # 管理员 user_id（可留空，留空时自动使用应用所有者；都没有时 guarded 下拒绝所有对话；面板可改）
     authRequestTtlDays: 7               # 入群/用户授权申请卡有效期（天，1–30）
-    analyzeListen: '0.0.0.0:3090'       # 日志平台分析接口的独立监听地址（不填 = 关闭；改后需重连）
+    analyzeEnabled: false               # 日志平台分析接口开关（POST /api/dsh-channels.logalyze，挂在 DSH Web 端口；改后立即生效）
     analyzeToken: 'DSH_CHANNELS_ANALYZE_TOKEN' # 分析接口 Bearer 令牌的凭据引用名（值在面板填写或写进 .credentials.yaml）
     loggerLevel: 'info'
 ```
@@ -379,12 +379,12 @@ FEISHU_APP_SECRET: xxxxxxxx
 
 日志平台调用插件的分析接口：插件在指定群里发一张分析卡（发起人、触发时间、应用、错误码和日志详情页表格），在卡片下开话题，把平台给的 prompt 原样交给一个新 Session（prompt 开头的斜杠命令由 DSH 展开成对应 skill），分析过程在话题内流式输出，和用户自己发起的会话一样。分析结束后分析卡的状态标签随之更新。群里通过准入的成员都可以在该话题内追问。插件只负责接收 prompt 和开会话：日志包地址写在 prompt 里，下载、解压、超时都由日志分析 skill 自己处理（Session 的沙箱需要能访问日志存储地址）。
 
-**开启**：配置 `analyzeListen`（如 `0.0.0.0:3090`，面板「行为」页可改，需重连），并在同一页的「日志分析接口令牌」卡片填写访问令牌（建议 32 位以上随机串；写入 DSH 凭据库的 `DSH_CHANNELS_ANALYZE_TOKEN`，也可直接写进 `$DSH_HOME/.credentials.yaml`，引用名可用 `analyzeToken` 修改）。接口跑在独立端口上，与 DSH Web 端口无关；令牌每次请求都重新解析，轮换后下一次请求生效；令牌缺失时所有请求返回 503。端口绑定失败不影响飞书连接，健康等级降为「降级」，面板「健康判定」与 `/health` 卡片会显示失败原因。
+**开启**：在面板「高级 → 日志分析接口」打开开关（`analyzeEnabled`，默认关，改后立即生效、不需要重连），并在同一处的「访问令牌」卡片填写令牌（建议 32 位以上随机串；写入 DSH 凭据库的 `DSH_CHANNELS_ANALYZE_TOKEN`，也可直接写进 `$DSH_HOME/.credentials.yaml`，引用名可用 `analyzeToken` 修改）。接口挂在 DSH Web 服务上（与 Web 界面同一端口），路径 `/api/dsh-channels.logalyze` 按 DSH 纯 HTTP 路由 `/api/<名字>.<方法>` 的命名；只有带 Web 的 profile（web、desktop）有这个接口，headless 没有。DSH 通过反向代理挂在前缀下时，地址随之带上前缀（如 `https://<域名>/dsh/api/dsh-channels.logalyze`）。该路由不走 DSH 登录 cookie，访问令牌是唯一凭据。开关关闭时所有请求返回 404；令牌每次请求都重新解析，轮换后下一次请求生效；令牌缺失时所有请求返回 503。
 
 **请求**：
 
 ```http
-POST /dsh-channels/analyze
+POST /api/dsh-channels.logalyze
 Authorization: Bearer <令牌>
 Idempotency-Key: <平台生成的唯一值，1-200 个可见 ASCII 字符>
 Content-Type: application/json
@@ -417,7 +417,7 @@ Content-Type: application/json
 { "ok": true, "chatId": "oc_xxx", "messageId": "om_xxx" }
 ```
 
-`messageId` 是分析卡的消息 id，分析话题挂在它下面。同步错误都带中文 `error`：`401` 令牌无效、`400` 参数或 `Idempotency-Key` 不合法、`403` 目标群未授权、`409` 同一个 `Idempotency-Key` 已被内容不同的请求使用、`413` 请求体超过 1 MiB、`415` 不是 JSON、`502` 分析卡发送失败（如机器人不在群里）、`503` 飞书未连接或未配置令牌。
+`messageId` 是分析卡的消息 id，分析话题挂在它下面。同步错误都带中文 `error`：`401` 令牌无效、`404` 接口开关未打开、`400` 参数或 `Idempotency-Key` 不合法、`403` 目标群未授权、`409` 同一个 `Idempotency-Key` 已被内容不同的请求使用、`413` 请求体超过 1 MiB、`415` 不是 JSON、`502` 分析卡发送失败（如机器人不在群里）、`503` 飞书未连接或未配置令牌。
 
 **去重**：同一个 `Idempotency-Key` 再次请求（包括并发重试）原样返回第一次的结果，不会再发卡、再分析。记录永久保存在 `channels_routes_v2` 域的 `analyze_requests` 表。分析卡发出后的失败（话题创建、Session 创建）不会回滚这条记录：分析卡的状态变成「失败」并写明原因，需要重试时请换一个新的 `Idempotency-Key`。
 

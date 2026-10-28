@@ -83,9 +83,6 @@ export const DEFAULT_PROMPT_CONTEXT_TIMEOUT_MS = 3_000
 /** Conventional credential reference holding the log-platform analyze API bearer token. */
 export const DEFAULT_ANALYZE_TOKEN_REF = 'DSH_CHANNELS_ANALYZE_TOKEN'
 
-/** `host:port` listen address of the analyze API (`[v6]:port` for IPv6 literals). */
-export const ANALYZE_LISTEN_PATTERN = /^(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+):(?:[1-9][0-9]{0,4})$/u
-
 /** A credential reference: `FEISHU_APP_ID`-style name resolved through ctx.credentials. */
 const credentialRefSchema = z.string().regex(
   CREDENTIAL_REF_PATTERN,
@@ -425,17 +422,11 @@ export const configSchema = z.object({
    */
   questionTimeoutMs: z.number().int().min(10_000).max(3_600_000).default(DEFAULT_QUESTION_TIMEOUT_MS),
   /**
-   * Listen address (`host:port`, e.g. `0.0.0.0:3090`) of the log-platform
-   * analyze API: a dedicated HTTP listener serving only
-   * `POST /dsh-channels/analyze`, separate from the DSH Web port. Unset
-   * (default) keeps the API off. The listener runs while the Feishu connection
-   * is up and is rebound on reconnect.
+   * Switch for the log-platform analyze API (`POST /api/dsh-channels.logalyze`
+   * on the DSH Web server). Off (default) answers 404; read per request, so
+   * toggling it needs no reconnect. Needs a host with a Web server.
    */
-  analyzeListen: z.string().trim().regex(
-    ANALYZE_LISTEN_PATTERN,
-    'must be host:port, e.g. 0.0.0.0:3090 or 127.0.0.1:3090',
-  ).refine(value => Number(value.slice(value.lastIndexOf(':') + 1)) <= 65_535, 'port must be 1-65535')
-    .optional(),
+  analyzeEnabled: z.boolean().default(false),
   /**
    * Credential reference holding the analyze API bearer token (defaults to
    * `DSH_CHANNELS_ANALYZE_TOKEN`). Resolved per request, so rotating the value
