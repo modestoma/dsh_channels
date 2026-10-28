@@ -128,11 +128,15 @@ export class AnalyzeLauncher implements AnalyzeHandler {
   }
 
   /**
-   * Wait for every background analysis that is still starting. Called after
-   * `started` turns false, so each one ends on its failure card or, when its
-   * first prompt was already sent, as an ordinary topic.
+   * Wait for every acceptance in flight, then every background analysis that
+   * is still starting. Called after `started` turns false, so each one ends on
+   * its failure card or, when its first prompt was already sent, as an
+   * ordinary topic.
    */
   async drain(): Promise<void> {
+    // Acceptances still sending the root card or writing the record finish
+    // first; each one adds its launch to `running` before it settles.
+    await Promise.allSettled([...this.accepting.values()].map(pending => pending.response))
     await Promise.allSettled([...this.running])
   }
 

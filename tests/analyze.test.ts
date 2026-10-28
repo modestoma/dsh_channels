@@ -372,6 +372,28 @@ describe('analyze service flow', () => {
     expect(await h.launcher.analyze(request(), 'key-1')).toMatchObject({ status: 503 })
   })
 
+  it('waits for an acceptance still sending its root card before shutdown finishes', async () => {
+    const h = await setup()
+    await h.service.addAccessGroup('oc_group')
+    const sendMock = vi.mocked(h.channel.send)
+    const send = sendMock.getMockImplementation()!
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    sendMock.mockImplementationOnce(async (...args: Parameters<typeof send>) => {
+      await gate
+      return await send(...args)
+    })
+    const accepted = h.launcher.analyze(request(), 'key-1')
+    let shutDown = false
+    const shutdown = h.service.shutdown().then(() => { shutDown = true })
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(shutDown).toBe(false)
+    release()
+    await shutdown
+    expect(await accepted).toMatchObject({ status: 202 })
+    expect(h.record('key-1')).toMatchObject({ messageId: 'om_1' })
+  })
+
   it('refuses requests until the channel start has marked earlier analyses interrupted', async () => {
     const config = makeConfig()
     const ctxState = makeHostContext()
