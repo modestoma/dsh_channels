@@ -422,7 +422,7 @@ export const configSchema = z.object({
    */
   questionTimeoutMs: z.number().int().min(10_000).max(3_600_000).default(DEFAULT_QUESTION_TIMEOUT_MS),
   /**
-   * Switch for the log-platform analyze API (`POST /open-api/logalyze/analyze`
+   * Switch for the log-platform analyze API (`POST /open-api/logalyze`
    * on the DSH Web server). Off (default) answers 404; read per request, so
    * toggling it needs no reconnect. Needs a host with a Web server.
    */
