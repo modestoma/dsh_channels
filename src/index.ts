@@ -23,6 +23,7 @@ import { defaultChannelFactory } from './feishu-channel.ts'
 import type { ChannelFactory } from './feishu-channel.ts'
 import { OverlayStore, defaultOverlayPath } from './settings/overlay.ts'
 import { mountSettingsRoutes } from './settings/routes.ts'
+import { mountAnalyzeRoute } from './analyze/server.ts'
 import { SettingsSurface } from './settings/surface.ts'
 import { createHostCatalog } from './settings/catalog.ts'
 import { createSettingsDirectoryPicker } from './settings/directory-picker.ts'
@@ -41,7 +42,7 @@ export type * from './questions.ts'
 export type * from './settings/contract.ts'
 export * from './access/index.ts'
 export type { AccessGroupRecord, AccessRequestRecord, AccessUserRecord } from './domain.ts'
-export { CATALOG_ROUTE, CONFIG_ROUTE, CREDENTIALS_ROUTE, EDITABLE_KEYS, PANEL_COPY, PANEL_ROUTE, PICK_DIRECTORY_ROUTE, RECONNECT_ROUTE, RESTART_KEYS, STATUS_ROUTE } from './settings/contract.ts'
+export { CATALOG_ROUTE, CLEAR_CONFIG_ROUTE, CLEAR_CREDENTIAL_ROUTE, EDITABLE_KEYS, PANEL_COPY, PANEL_ROUTE, PICK_DIRECTORY_ROUTE, RECONNECT_ROUTE, RESTART_KEYS, SAVE_CONFIG_ROUTE, SAVE_CREDENTIALS_ROUTE, STATUS_ROUTE } from './settings/contract.ts'
 export type { PickDirectoryResponse } from './settings/contract.ts'
 export { defaultOverlayPath, mergeOverlay, normalizeOverlay, OverlayStore, parseOverlay, pickEditable, resolveDshHome } from './settings/overlay.ts'
 export { applyCatalog, emptyCatalog, FIELD_DESCRIPTORS, normalizeCredentialValue, SettingsSurface, withDirectoryBrowse } from './settings/surface.ts'
@@ -50,8 +51,8 @@ export { createHostCatalog } from './settings/catalog.ts'
 export type { CatalogWarn, SettingsCatalog } from './settings/catalog.ts'
 export { createSettingsDirectoryPicker } from './settings/directory-picker.ts'
 export type { HostDirectoryPickerService, SettingsDirectoryPicker } from './settings/directory-picker.ts'
-export { isSameOriginRequest, mountSettingsRoutes, registerSettingsRoutes } from './settings/routes.ts'
-export type { HostRequestGate, HostWebServer } from './settings/routes.ts'
+export { mountSettingsRoutes, registerSettingsRoutes } from './settings/routes.ts'
+export type { HostConnection, HostFetchRoute } from './settings/routes.ts'
 export type { ApprovalOutcome, ApprovalRequest, ApprovalAnswererListener, AssistantStreamFrame, AskUserQuestionAnswer, AskUserQuestionAnswerItem, AskUserQuestionItem, AskUserQuestionRequestEvent, UserQuestionAnswererListener, AgentCancelCause, SessionStatsView, TokenUsageView, ContextPressureView, SessionProjections } from './dsh-types.ts'
 export { buildCard, buildInterruptionCard, cardJsonBytes, CARD_MAX_BYTES, CARD_TARGET_BYTES, REASONING_MAX_BYTES, INTERRUPTION_NOTICE, MAX_TABLES_PER_CARD, PANEL_TITLES, PANEL_CHEVRON_TOKEN, segmentCardContent, splitBodyForCard, stripTables, tableBlocks, TRUNCATION_SUFFIX, buildApprovalCard, buildApprovalSettledCard, buildQuestionCard, buildQuestionSettledCard, MAX_QUESTION_OPTIONS } from './cards.ts'
 export { ApprovalAnswerer } from './approvals.ts'
@@ -112,7 +113,7 @@ export function apply(ctx: HostContext, config?: unknown): void {
     { warn: (message, ...args) => ctx.logger?.warn?.(message, ...args) },
   )
   const service = new FeishuService(ctx, resolved, factory, undefined, overlay)
-  // Settings routes ride the host's web server when this deployment has one.
+  // Settings routes ride DSH's authenticated `/api` channel when this deployment has one.
   // The catalog resolves the panel's model selectors from live host services;
   // the optional native directory picker backs the workspace-root「选择目录…」
   // button (absent in headless/remote compositions → plain text input).
@@ -124,6 +125,7 @@ export function apply(ctx: HostContext, config?: unknown): void {
     createHostCatalog(ctx, warn),
     createSettingsDirectoryPicker(ctx),
   ))
+  mountAnalyzeRoute(ctx, service.analyzeHandler(), warn)
   ctx.effect(() => {
     // Boot loads the Web overlay and connects only when the Feishu application
     // credentials are complete; an incomplete configuration or a failed

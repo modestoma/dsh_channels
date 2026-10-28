@@ -614,8 +614,9 @@ export class TurnStreamer {
 
     // Subagent children live in their OWN sessions (header.parentSession →
     // caller). Their events never touch the parent's log, so fold their
-    // status into the parent turn's activity line here.
-    const parentId = session.header.parentSession
+    // status into the parent turn's activity line here. Historical ordinary
+    // forks may also carry parentSession; only `origin` marks a subagent.
+    const parentId = session.header.origin === 'subagent' ? session.header.parentSession : undefined
     if (parentId !== undefined) {
       const parentState = this.front(parentId)
       if (parentState !== undefined) {

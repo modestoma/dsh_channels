@@ -82,7 +82,7 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 | 附件与工具 | 「入站附件」：接收图片和文件、使用 DSH 原生附件库（开关，关闭则存到话题目录 `attachments/`）、图片预取、首轮话题历史；「工具」：`feishu_attachment_fetch` / `feishu_topic_messages` / `feishu_send_file` 开关；「限额与超时」：预取上限、读取附件上限与超时、读取话题消息超时、引用摘录与历史超时（共 8 项，默认收起，有改动或错误时自动展开） |
 | 访问授权 | 待处理申请（置顶，一键授权 / 忽略）、调试模式（`accessMode`，开关）、白名单用户可私聊（`dmAllowWhitelist`，开关）、管理员 user_id、申请有效期；已授权群 / 用户白名单（添加表单默认收起） |
 | 知识库 | 知识库读 / 写开关（`feishuTools.wikiRead` / `feishuTools.wikiWrite`）、可访问范围 `wikiRoots`（每条链接一个输入框，逐条校验）；「可使用的人」：知识库白名单增删（与用户白名单独立，等同 `/auth wiki add|remove`） |
-| 高级 | 日志分析接口（监听地址 `analyzeListen` 与访问令牌）、SDK 日志级别、Web 覆盖文件路径与「恢复 profile 配置」 |
+| 高级 | 日志分析接口（开关 `analyzeEnabled` 与访问令牌）、SDK 日志级别、Web 覆盖文件路径与「恢复 profile 配置」 |
 
 **调试模式**：「访问授权 → 调试模式」打开即 `accessMode: open`，所有人都能和机器人聊天；打开期间面板顶部常驻黄色警告。默认关闭（`guarded`）。
 
@@ -100,19 +100,19 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 
 **统一保存**：除连接类操作外，可编辑字段共用一个跨标签页的草稿；有未保存改动时页面底部浮出保存栏（「N 项未保存」、其中需重连的项数、「放弃 / 保存」），没有改动时不显示。只提交改动过的字段，标注「需重连」的项在下次连接时生效；保存后「连接」标签页顶部横幅列出待生效项并提供一键重连。
 
-**模型选择器**：模型与推理在面板里是**独立的「模型」标签页**：宿主 LLM 服务可用时，`provider` / `model` / `reasoningEffort` 与 `agentPreset` 渲染为**下拉选择**而不是手填：provider 来自 `ctx.llm.listProviders()`，model 来自所选 provider 的 `listModels()`，推理档位来自 `resolveModelInfo(provider, model).reasoning.efforts`，Agent 预设来自 `agentPresets.list()`。每个选择器的首项是「留空 = 部署默认 / 适配器默认 / roster 默认」，有部署默认模型（`agentDefaultModel`）或 roster 默认预设时会在标签里带上具体值。选择按依赖级联：先选 provider 才会加载 model，选了 model 才会加载推理档位；宿主暂时无法枚举的项（服务未挂载、适配器查询失败/超时）自动退回原来的自由文本框，已保存但当前列表里没有的值会作为「当前配置，不在宿主机列表中」选项保留，不会在打开面板时被静默改掉。级联查询走只读的 `GET /dsh-channels/catalog?provider=…&model=…`（Host 侧短 TTL 缓存，单次查询 4 秒上限）。`provider` 与 `model` 在宿主侧是一条完整的请求路由，因此面板保存时要求**两者同时设置或同时留空**，不允许只选一半。
+**模型选择器**：模型与推理在面板里是**独立的「模型」标签页**：宿主 LLM 服务可用时，`provider` / `model` / `reasoningEffort` 与 `agentPreset` 渲染为**下拉选择**而不是手填：provider 来自 `ctx.llm.listProviders()`，model 来自所选 provider 的 `listModels()`，推理档位来自 `resolveModelInfo(provider, model).reasoning.efforts`，Agent 预设来自 `agentPresets.list()`。每个选择器的首项是「留空 = 部署默认 / 适配器默认 / roster 默认」，有部署默认模型（`agentDefaultModel`）或 roster 默认预设时会在标签里带上具体值。选择按依赖级联：先选 provider 才会加载 model，选了 model 才会加载推理档位；宿主暂时无法枚举的项（服务未挂载、适配器查询失败/超时）自动退回原来的自由文本框，已保存但当前列表里没有的值会作为「当前配置，不在宿主机列表中」选项保留，不会在打开面板时被静默改掉。级联查询走只读的 `GET /api/dsh-channels.catalog?provider=…&model=…`（Host 侧短 TTL 缓存，单次查询 4 秒上限）。`provider` 与 `model` 在宿主侧是一条完整的请求路由，因此面板保存时要求**两者同时设置或同时留空**，不允许只选一半。
 
 `baseDir` 是**模型/工具产生文件的落点**（入站附件默认进 DSH 原生附件库、不落这里；仅 archive 后端才写话题目录）：**每个用户拥有一个独立工作区**（私聊 `<baseDir>/p2p/<user_id>/`，群聊 `<baseDir>/groups/<chat_id>/<user_id>/`，同一群里不同用户互不影响；旧版本的「用户 × 聊天」共享工作区正好复用为这个新工作区）。每个话题在工作区内拥有独立工作目录 `<工作区>/topics/<话题 id>/`（无话题的降级会话用 session id），所以话题之间的文件互不干扰，而工作区数量只随用户增长。面板里只接受**绝对路径**（`~` 开头按家目录展开，拒绝文件系统根目录），保存时会创建并校验该目录，不可用时当场报错，不会等到飞书里提示「会话创建失败」。已有 Session / 目录不会被迁移，因此切到新目录后旧话题继续用旧目录（话题内 `/renew` 也一样），只有之后新开的会话使用新目录。
 
 **可视化选择工作区根目录**：输入框旁的「选择目录…」按钮会调用**宿主机的系统目录选择框**（macOS 的 NSOpenPanel / Windows 的文件夹对话框），选中后把绝对路径填进草稿，仍需点「保存更改」才落盘。该能力转发自宿主可选的 `ctx.directoryPicker` 服务：桌面端/本机 GUI 会话（native 后端）提供按钮；headless、远程或 SSH 会话没有可服务的显示会话（browse 后端），面板不显示按钮、保留手写输入，插件在缺少该服务的旧宿主上照常加载。选择框打开期间请求保持挂起；取消是正常结果，不会报错。
 
-**访问授权**：「访问授权」标签页集中管理准入：管理员 user_id（私聊 `/userid` 获取）、调试模式、白名单用户可私聊、授权申请有效期；「已授权群」「已授权用户」列表支持增删（群 ID 可从入群群信息卡或 `/groupid` 获得，用户 user_id 可用 `/userid` 查看）；「待处理申请」可一键授权/忽略。白名单只约束非管理员：管理员在任何私聊/群聊都直接放行。管理员留空时自动使用飞书应用所有者（连接时通过「获取应用信息」接口查询），管理员设置下方的「当前管理员」一行会注明“应用所有者”；`guarded` 且既未配置管理员、也查不到应用所有者时，标签页顶部会红字提示“当前会拒绝所有对话”并附上查询失败原因。管理员、群和用户白名单、待处理申请、知识库白名单在每次进入页面时实时读取飞书头像和名字（`GET /dsh-channels/profiles?users=…&chats=…`，每类最多 200 个，Host 侧缓存 30 秒）：用户需要 `contact:user.base:readonly` 且在应用的通讯录权限范围内，群需要 `im:chat:readonly`；读不到时显示授权时记下的名字或 ID，并在标签页顶部注明失败原因。授权白名单与申请记录保存在插件 `storageDomain`（`channels_routes_v2` 域），重启后保留；未建立飞书连接时白名单尚未加载，标签页会提示「连接建立后加载授权列表」并禁用写操作。
+**访问授权**：「访问授权」标签页集中管理准入：管理员 user_id（私聊 `/userid` 获取）、调试模式、白名单用户可私聊、授权申请有效期；「已授权群」「已授权用户」列表支持增删（群 ID 可从入群群信息卡或 `/groupid` 获得，用户 user_id 可用 `/userid` 查看）；「待处理申请」可一键授权/忽略。白名单只约束非管理员：管理员在任何私聊/群聊都直接放行。管理员留空时自动使用飞书应用所有者（连接时通过「获取应用信息」接口查询），管理员设置下方的「当前管理员」一行会注明“应用所有者”；`guarded` 且既未配置管理员、也查不到应用所有者时，标签页顶部会红字提示“当前会拒绝所有对话”并附上查询失败原因。管理员、群和用户白名单、待处理申请、知识库白名单在每次进入页面时实时读取飞书头像和名字（`GET /api/dsh-channels.profiles?users=…&chats=…`，每类最多 200 个，Host 侧缓存 30 秒）：用户需要 `contact:user.base:readonly` 且在应用的通讯录权限范围内，群需要 `im:chat:readonly`；读不到时显示授权时记下的名字或 ID，并在标签页顶部注明失败原因。授权白名单与申请记录保存在插件 `storageDomain`（`channels_routes_v2` 域），重启后保留；未建立飞书连接时白名单尚未加载，标签页会提示「连接建立后加载授权列表」并禁用写操作。
 
 **配置层级**：`configSchema` 默认值 < profile `cordis.patch.yml` 的 `config` < Web 面板覆盖。面板只把可编辑字段写入 `$DSH_HOME/dsh-channels/settings.json`；「高级 → 恢复 profile 配置」确认后删除该文件并回落到 profile 配置。`baseDir` 与 `topicIsolation` 在「会话 → 工作区」编辑（只影响之后新建的话题）；话题过期、审批 / 提问卡片等待与 `maxTokens` 保存后立即生效，不需要重连。凭据**值**在「连接 → 飞书应用凭据」编辑，凭据**引用名**（`appId` / `appSecret` 配置项）仍由 profile 配置决定。已移除的目录清理配置 `workspaceRetention` / `workspaceRetentionAuto` 与覆盖文件路径配置 `settingsFile` 若仍留在 profile 或覆盖文件中会被静默忽略，面板下次保存时从覆盖文件中去掉。
 
 **为什么落在插件自己的文件而不是 profile 的 `cordis.patch.yml`？** DSH 提供官方 `ctx.configEditor.edit()`，可以安全写 profile patch（完整 Config 校验、保留注释与 `!!js`、原子替换、失败回滚、与 HMR 串行）；但它是「完整配置编辑」通道——本插件的 Config 是 zod，没有 schemastery `.volatile()` 标记，普通字段写入会触发 Loader 重载插件，等于每次保存都断开并重连飞书；而且该服务只在有 `profileContext` 的启动器（桌面端 / `dsh web`）存在。`$DSH_HOME/<plugin>/` 是 DSH 插件保存运行时数据的惯例（如 dsh-pet 的 `$DSH_HOME/dsh-pet/`），因此面板偏好写入 `$DSH_HOME/dsh-channels/settings.json`：保存即生效（需重连字段除外）、可一键清除回退、不依赖 `profileContext`；profile 的 `cordis.patch.yml` 继续作为部署级基础配置层。若将来要求「所有配置统一进 profile」，迁移路径是改用 `ctx.configEditor.edit()` 并接受保存触发插件重载。
 
-**安全边界**：每个面板路由（读和写）都复用 DSH 宿主 `connection` 服务的 `requestRejection`，与 DSH 自己的 `/api` 走同一套 Host/Origin 校验和登录 cookie 鉴权：未登录返回 401，Host/Origin 不受信任返回 403，请求体不会被读取；宿主没有 `connection` 服务时面板路由不挂载。写操作（PUT / DELETE / POST）另保留 `Origin` 与 `Host` 同源校验。**授权白名单与待处理申请同样面板可写，因此“已登录 DSH Web = 可授权”**；非回环绑定时登录 cookie 走明文 HTTP，建议给 DSH Web 服务配置 TLS。凭据值只走写路径、响应永不回显，也不会写进 Web 覆盖文件。`baseDir` 可写意味着同源页面能改变模型文件的落点（面板已拒绝文件系统根目录）。
+**安全边界**：面板路由都通过宿主 `connection.fetch` 注册为 DSH `/api` 下的精确路由 `/api/dsh-channels.<方法>`（读用 GET，写一律 POST），由 DSH 的 `/api` 统一做 Host/Origin 校验和登录 cookie 鉴权：未登录返回 401，Host/Origin 不受信任返回 403，只有通过的请求才会到达插件；宿主没有 `connection` 服务时面板路由不挂载。浏览器按相对路径请求（DSH 页面带 `<base href="./">`），DSH 挂在反向代理前缀下（如 `/dsh/`）时请求自动带上前缀。**授权白名单与待处理申请同样面板可写，因此“已登录 DSH Web = 可授权”**；非回环绑定时登录 cookie 走明文 HTTP，建议给 DSH Web 服务配置 TLS。凭据值只走写路径、响应永不回显，也不会写进 Web 覆盖文件。`baseDir` 可写意味着同源页面能改变模型文件的落点（面板已拒绝文件系统根目录）。
 
 **构建**：DSH 只加载已构建的浏览器 bundle，改了 `src/client/` 或 `src/settings/contract.ts` 后需要重新构建并重启应用：
 
@@ -132,7 +132,7 @@ pnpm verify:client    # 用 __ModuleLoader__ shim 做 loader 冒烟
 - **开始于 / 最近活跃**：飞书侧已经换到新会话（`/renew`、`/new`）或路由过期后，「最近活跃」换成「状态：飞书侧已切换到新会话或已过期」；
 - **在飞书中打开**（飞书 applink 打开对应聊天）与「刷新」。
 
-Web 里直接新建的会话不显示按钮。来源在 Host 侧按会话 id 持久保存（存储表 `session_origins`，路由过期后仍可查；升级前已有的路由在启动时补写）。群名、群头像、姓名与头像在每次打开「飞书来源」标签页时实时读取（Host 侧缓存 30 秒，标题旁按钮与标签页同时打开只查一次）：群用 `im:chat:readonly`，用户优先用通讯录 `contact:user.base:readonly`，缺失时群聊从群成员列表查姓名（没有头像），私聊只显示 `user_id`。接口为 `GET /dsh-channels/session-origin?sessionId=…`，与设置面板一样需要 DSH 登录。右侧栏不可用的宿主（如 headless）不注册这部分。
+Web 里直接新建的会话不显示按钮。来源在 Host 侧按会话 id 持久保存（存储表 `session_origins`，路由过期后仍可查；升级前已有的路由在启动时补写）。群名、群头像、姓名与头像在每次打开「飞书来源」标签页时实时读取（Host 侧缓存 30 秒，标题旁按钮与标签页同时打开只查一次）：群用 `im:chat:readonly`，用户优先用通讯录 `contact:user.base:readonly`，缺失时群聊从群成员列表查姓名（没有头像），私聊只显示 `user_id`。接口为 `GET /api/dsh-channels.sessionOrigin?sessionId=…`，与设置面板一样需要 DSH 登录。右侧栏不可用的宿主（如 headless）不注册这部分。
 
 ## 发布
 
@@ -302,12 +302,12 @@ npm 发行包已包含构建产物：Host 入口是 `lib/index.js`（profile 直
     dmAllowWhitelist: false             # guarded 下用户白名单里的人也可私聊（默认关：私聊仅管理员）
     adminUserId: 'a1b2c3d4'            # 管理员 user_id（可留空，留空时自动使用应用所有者；都没有时 guarded 下拒绝所有对话；面板可改）
     authRequestTtlDays: 7               # 入群/用户授权申请卡有效期（天，1–30）
-    analyzeListen: '0.0.0.0:3090'       # 日志平台分析接口的独立监听地址（不填 = 关闭；改后需重连）
+    analyzeEnabled: false               # 日志平台分析接口开关（POST /api/dsh-channels.logalyze，挂在 DSH Web 端口；改后立即生效）
     analyzeToken: 'DSH_CHANNELS_ANALYZE_TOKEN' # 分析接口 Bearer 令牌的凭据引用名（值在面板填写或写进 .credentials.yaml）
     loggerLevel: 'info'
 ```
 
-`reasoningEffort` 是每个 Session 的初始/重置默认值，并在新建、恢复或借用 Agent 的作用域内以 `prepend` 外层覆盖 `agent/request`，因此胜过已存在的模型选择与 provider 默认；借用外部 Agent 时，插件关闭只移除这条频道策略，不销毁外部 Agent。话题所有者可用 `/effort <档位-id>` 覆盖当前 Session，`/effort` 查看生效来源，`/effort reset` 恢复该配置值（未配置时恢复模型适配器/provider 默认）。成功选择由 Session 自带的 `command/run` / `command/done` 日志恢复，重启后仍生效；新建 Session 不继承旧 Session 的覆盖。
+`reasoningEffort` 是每个 Session 的初始/重置默认值。DSH 0.2.2 起模型选择归 Agent 所有（`agent.model`），插件在新建、恢复、借用 Agent 以及 `/model`、`/effort` 成功后用 `agent.model.select()` 记录生效的 provider/model/推理强度（`/model reset` 回到 Agent 的部署默认路由）；DSH 0.2.1 没有 `agent.model`，插件改为在该 Agent 作用域内以 `prepend` 外层覆盖 `agent/request`，因此胜过已存在的模型选择与 provider 默认。两种宿主自动识别，无需配置；借用外部 Agent 时，插件关闭只移除这条频道策略，不销毁外部 Agent。话题所有者可用 `/effort <档位-id>` 覆盖当前 Session，`/effort` 查看生效来源，`/effort reset` 恢复该配置值（未配置时恢复模型适配器/provider 默认）。成功选择由 Session 自带的 `command/run` / `command/done` 日志恢复，重启后仍生效；新建 Session 不继承旧 Session 的覆盖。
 
 推理档位是适配器拥有的不透明 id（常见如 `off`、`low`、`high`、`max`），命令不会猜测或预校验 provider 的能力；不受支持的值会在下一次模型请求前被 Harness 拒绝，并按失败终态显示错误。
 
@@ -379,12 +379,12 @@ FEISHU_APP_SECRET: xxxxxxxx
 
 日志平台调用插件的分析接口：插件在指定群里发一张分析卡（发起人、触发时间、应用、错误码和日志详情页表格），在卡片下开话题，把平台给的 prompt 原样交给一个新 Session（prompt 开头的斜杠命令由 DSH 展开成对应 skill），分析过程在话题内流式输出，和用户自己发起的会话一样。分析结束后分析卡的状态标签随之更新。群里通过准入的成员都可以在该话题内追问。插件只负责接收 prompt 和开会话：日志包地址写在 prompt 里，下载、解压、超时都由日志分析 skill 自己处理（Session 的沙箱需要能访问日志存储地址）。
 
-**开启**：配置 `analyzeListen`（如 `0.0.0.0:3090`，面板「行为」页可改，需重连），并在同一页的「日志分析接口令牌」卡片填写访问令牌（建议 32 位以上随机串；写入 DSH 凭据库的 `DSH_CHANNELS_ANALYZE_TOKEN`，也可直接写进 `$DSH_HOME/.credentials.yaml`，引用名可用 `analyzeToken` 修改）。接口跑在独立端口上，与 DSH Web 端口无关；令牌每次请求都重新解析，轮换后下一次请求生效；令牌缺失时所有请求返回 503。端口绑定失败不影响飞书连接，健康等级降为「降级」，面板「健康判定」与 `/health` 卡片会显示失败原因。
+**开启**：在面板「高级 → 日志分析接口」打开开关（`analyzeEnabled`，默认关，改后立即生效、不需要重连），并在同一处的「访问令牌」卡片填写令牌（建议 32 位以上随机串；写入 DSH 凭据库的 `DSH_CHANNELS_ANALYZE_TOKEN`，也可直接写进 `$DSH_HOME/.credentials.yaml`，引用名可用 `analyzeToken` 修改）。接口挂在 DSH Web 服务上（与 Web 界面同一端口），路径 `/api/dsh-channels.logalyze` 按 DSH 纯 HTTP 路由 `/api/<名字>.<方法>` 的命名；只有带 Web 的 profile（web、desktop）有这个接口，headless 没有。DSH 通过反向代理挂在前缀下时，地址随之带上前缀（如 `https://<域名>/dsh/api/dsh-channels.logalyze`）。该路由不走 DSH 登录 cookie，访问令牌是唯一凭据。开关关闭时所有请求返回 404；令牌每次请求都重新解析，轮换后下一次请求生效；令牌缺失时所有请求返回 503。
 
 **请求**：
 
 ```http
-POST /dsh-channels/analyze
+POST /api/dsh-channels.logalyze
 Authorization: Bearer <令牌>
 Idempotency-Key: <平台生成的唯一值，1-200 个可见 ASCII 字符>
 Content-Type: application/json
@@ -417,7 +417,7 @@ Content-Type: application/json
 { "ok": true, "chatId": "oc_xxx", "messageId": "om_xxx" }
 ```
 
-`messageId` 是分析卡的消息 id，分析话题挂在它下面。同步错误都带中文 `error`：`401` 令牌无效、`400` 参数或 `Idempotency-Key` 不合法、`403` 目标群未授权、`409` 同一个 `Idempotency-Key` 已被内容不同的请求使用、`413` 请求体超过 1 MiB、`415` 不是 JSON、`502` 分析卡发送失败（如机器人不在群里）、`503` 飞书未连接或未配置令牌。
+`messageId` 是分析卡的消息 id，分析话题挂在它下面。同步错误都带中文 `error`：`401` 令牌无效、`404` 接口开关未打开、`400` 参数或 `Idempotency-Key` 不合法、`403` 目标群未授权、`409` 同一个 `Idempotency-Key` 已被内容不同的请求使用、`413` 请求体超过 1 MiB、`415` 不是 JSON、`502` 分析卡发送失败（如机器人不在群里）、`503` 飞书未连接或未配置令牌。
 
 **去重**：同一个 `Idempotency-Key` 再次请求（包括并发重试）原样返回第一次的结果，不会再发卡、再分析。记录永久保存在 `channels_routes_v2` 域的 `analyze_requests` 表。分析卡发出后的失败（话题创建、Session 创建）不会回滚这条记录：分析卡的状态变成「失败」并写明原因，需要重试时请换一个新的 `Idempotency-Key`。
 

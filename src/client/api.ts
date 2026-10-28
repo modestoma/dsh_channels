@@ -1,24 +1,29 @@
 /**
  * Same-origin HTTP client for the settings panel. No typert contract: the
- * Host half registers plain exact routes and this module fetches them.
+ * Host half registers exact DSH `/api` Fetch routes and this module fetches them.
  *
  * @module dsh-channels/client/api
  */
 
 import {
-  ACCESS_GROUPS_ROUTE,
-  ACCESS_REQUESTS_ROUTE,
   ACCESS_ROUTE,
-  ACCESS_USERS_ROUTE,
-  ACCESS_WIKI_USERS_ROUTE,
+  ADD_ACCESS_GROUP_ROUTE,
+  ADD_ACCESS_USER_ROUTE,
+  ADD_WIKI_USER_ROUTE,
   CATALOG_ROUTE,
-  CONFIG_ROUTE,
-  CREDENTIALS_ROUTE,
+  CLEAR_CONFIG_ROUTE,
+  CLEAR_CREDENTIAL_ROUTE,
   PANEL_ROUTE,
   PICK_DIRECTORY_ROUTE,
   PROFILES_MAX_IDS,
   PROFILES_ROUTE,
   RECONNECT_ROUTE,
+  REMOVE_ACCESS_GROUP_ROUTE,
+  REMOVE_ACCESS_USER_ROUTE,
+  REMOVE_WIKI_USER_ROUTE,
+  RESOLVE_ACCESS_REQUEST_ROUTE,
+  SAVE_CONFIG_ROUTE,
+  SAVE_CREDENTIALS_ROUTE,
   SESSION_ORIGIN_ROUTE,
   STATUS_ROUTE,
 } from '../settings/contract.ts'
@@ -138,8 +143,8 @@ export async function fetchCatalog(provider?: string, model?: string): Promise<C
 
 /** Persist a partial edit. Validation failures come back as `{ok:false}`. */
 export async function saveConfig(values: EditableValues): Promise<SaveConfigResponse> {
-  const response = await request(CONFIG_ROUTE, {
-    method: 'PUT',
+  const response = await request(SAVE_CONFIG_ROUTE, {
+    method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ values }),
   })
@@ -158,7 +163,7 @@ export async function saveConfig(values: EditableValues): Promise<SaveConfigResp
 
 /** Drop every Web override and return the refreshed panel. */
 export async function clearConfig(): Promise<ClearConfigResponse> {
-  const response = await request(CONFIG_ROUTE, { method: 'DELETE' })
+  const response = await request(CLEAR_CONFIG_ROUTE, { method: 'POST' })
   const text = await response.text()
   if (response.status === 400) {
     try {
@@ -205,8 +210,8 @@ export async function pickDirectory(): Promise<PickDirectoryResponse> {
 
 /** Store provided credential values (the request/response never carry stored values). */
 export async function saveCredentials(values: SaveCredentialsRequest): Promise<SaveCredentialsResponse> {
-  const response = await request(CREDENTIALS_ROUTE, {
-    method: 'PUT',
+  const response = await request(SAVE_CREDENTIALS_ROUTE, {
+    method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(values),
   })
@@ -224,8 +229,8 @@ export async function saveCredentials(values: SaveCredentialsRequest): Promise<S
 
 /** Remove the stored value behind one credential reference. */
 export async function clearCredential(field: CredentialField): Promise<ClearCredentialResponse> {
-  const response = await request(CREDENTIALS_ROUTE, {
-    method: 'DELETE',
+  const response = await request(CLEAR_CREDENTIAL_ROUTE, {
+    method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ field }),
   })
@@ -247,13 +252,9 @@ export async function fetchAccess(): Promise<AccessWire> {
 }
 
 /** One access write: a 400 body already is the wire union; others throw. */
-async function mutateAccess(
-  path: string,
-  method: 'POST' | 'DELETE',
-  body: unknown,
-): Promise<AccessMutationResponse> {
+async function mutateAccess(path: string, body: unknown): Promise<AccessMutationResponse> {
   const response = await request(path, {
-    method,
+    method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
   })
@@ -272,43 +273,40 @@ async function mutateAccess(
 /** Authorize one group; resolves with the refreshed access snapshot. */
 export async function addAccessGroup(chatId: string, name?: string): Promise<AccessMutationResponse> {
   return mutateAccess(
-    ACCESS_GROUPS_ROUTE,
-    'POST',
+    ADD_ACCESS_GROUP_ROUTE,
     name === undefined || name === '' ? { chatId } : { chatId, name },
   )
 }
 
 /** Revoke one group authorization (takes effect on the next message). */
 export async function removeAccessGroup(chatId: string): Promise<AccessMutationResponse> {
-  return mutateAccess(ACCESS_GROUPS_ROUTE, 'DELETE', { chatId })
+  return mutateAccess(REMOVE_ACCESS_GROUP_ROUTE, { chatId })
 }
 
 /** Authorize one user `user_id` (global across authorized groups). */
 export async function addAccessUser(userId: string, name?: string): Promise<AccessMutationResponse> {
   return mutateAccess(
-    ACCESS_USERS_ROUTE,
-    'POST',
+    ADD_ACCESS_USER_ROUTE,
     name === undefined || name === '' ? { userId } : { userId, name },
   )
 }
 
 /** Revoke one user authorization (takes effect on the next message). */
 export async function removeAccessUser(userId: string): Promise<AccessMutationResponse> {
-  return mutateAccess(ACCESS_USERS_ROUTE, 'DELETE', { userId })
+  return mutateAccess(REMOVE_ACCESS_USER_ROUTE, { userId })
 }
 
 /** Add one user `user_id` to the wiki whitelist. */
 export async function addWikiUser(userId: string, name?: string): Promise<AccessMutationResponse> {
   return mutateAccess(
-    ACCESS_WIKI_USERS_ROUTE,
-    'POST',
+    ADD_WIKI_USER_ROUTE,
     name === undefined || name === '' ? { userId } : { userId, name },
   )
 }
 
 /** Remove one user from the wiki whitelist (takes effect on the next wiki tool call). */
 export async function removeWikiUser(userId: string): Promise<AccessMutationResponse> {
-  return mutateAccess(ACCESS_WIKI_USERS_ROUTE, 'DELETE', { userId })
+  return mutateAccess(REMOVE_WIKI_USER_ROUTE, { userId })
 }
 
 /** Settle one pending authorization request (same resolver as the Feishu card). */
@@ -316,5 +314,5 @@ export async function resolveAccessRequest(
   token: string,
   decision: 'allow' | 'deny',
 ): Promise<AccessMutationResponse> {
-  return mutateAccess(ACCESS_REQUESTS_ROUTE, 'POST', { token, decision })
+  return mutateAccess(RESOLVE_ACCESS_REQUEST_ROUTE, { token, decision })
 }

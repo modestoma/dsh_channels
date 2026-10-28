@@ -26,13 +26,14 @@ describe('settings client routes', () => {
     await removeAccessUser('u1')
     await fetchFeishuProfiles(['u1', 'u2'], ['oc_1'])
     expect(fetcher.mock.calls.map(call => call[0])).toEqual([
-      'dsh-channels/panel',
-      'dsh-channels/catalog?provider=deepseek&model=chat',
-      'dsh-channels/access/users',
-      'dsh-channels/profiles?users=u1%2Cu2&chats=oc_1',
+      'api/dsh-channels.panel',
+      'api/dsh-channels.catalog?provider=deepseek&model=chat',
+      'api/dsh-channels.removeAccessUser',
+      'api/dsh-channels.profiles?users=u1%2Cu2&chats=oc_1',
     ])
+    expect(fetcher.mock.calls[2]?.[1]).toMatchObject({ method: 'POST', body: JSON.stringify({ userId: 'u1' }) })
     for (const target of fetcher.mock.calls.map(call => String(call[0]))) {
-      expect(new URL(target, 'https://example.com/dsh/').pathname.startsWith('/dsh/dsh-channels/')).toBe(true)
+      expect(new URL(target, 'https://example.com/dsh/').pathname.startsWith('/dsh/api/dsh-channels.')).toBe(true)
     }
   })
 })
@@ -52,7 +53,7 @@ describe('fetchFeishuProfiles', () => {
     const ids = Array.from({ length: PROFILES_MAX_IDS + 1 }, (_, index) => `u_${index}`)
     const result = await fetchFeishuProfiles(ids, ['oc_1'])
     expect(fetcher).toHaveBeenCalledTimes(2)
-    expect(String(fetcher.mock.calls[1]?.[0])).toBe(`dsh-channels/profiles?users=u_${PROFILES_MAX_IDS}&chats=`)
+    expect(String(fetcher.mock.calls[1]?.[0])).toBe(`api/dsh-channels.profiles?users=u_${PROFILES_MAX_IDS}&chats=`)
     expect(Object.keys(result.users)).toHaveLength(PROFILES_MAX_IDS + 1)
     expect(result.warning).toBe('code=1 denied')
   })

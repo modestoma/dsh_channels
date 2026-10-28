@@ -7,6 +7,12 @@
  * rewrite the request after `next()` resolves. The outer channel wrapper
  * therefore writes last.
  *
+ * DSH 0.2.2 moved model choice onto the Agent (`agent.model`) and fails a
+ * step whose `agent/request` listener changes provider, model, or reasoning
+ * effort. On such hosts the waterfall passes the request through and `sync`
+ * records the effective policy with `agent.model.select()` instead; DSH 0.2.1
+ * hosts (no `agent.model`) keep the waterfall override.
+ *
  * Session overrides are recovered from successful command lifecycles
  * (`/effort`, `/model`). Reusing Harness' durable `command/run` /
  * `command/done` pair avoids inventing an out-of-repo Session event that
@@ -15,7 +21,7 @@
  * @module dsh-channels/session/request-policy
  */
 
-import type { AgentContext, CommandId, SessionEvent } from '../dsh-types.ts'
+import type { Agent, AgentContext, AgentModel, CommandId, SessionEvent } from '../dsh-types.ts'
 
 /** A model selection override: a bare model keeps the composed provider. */
 export interface ModelOverride {
@@ -51,8 +57,16 @@ export interface RequestPolicyState {
 
 export interface RequestPolicyController {
   readonly state: RequestPolicyState
-  /** Re-fold the durable log after resume or a settled command lifecycle. */
-  sync(events: readonly SessionEvent[]): void
+  /**
+   * Re-fold the durable log after resume or a settled command lifecycle.
+   * With an `agent` whose host owns model selection, a changed policy is
+   * recorded through `agent.model.select()` for the next step. `reconcile`
+   * names a just-settled `/effort` or `/model` switch: the policy is recorded
+   * even when this controller saw no change, so a reset also clears a
+   * selection persisted before the controller existed (earlier plugin
+   * instance or since-removed config default).
+   */
+  sync(events: readonly SessionEvent[], agent?: Agent, reconcile?: 'effort' | 'model'): void
   /** Remove only this controller's Agent-scoped request wrapper. */
   dispose(): void
 }
@@ -134,6 +148,39 @@ export function foldModelOverride(events: readonly SessionEvent[]): ModelOverrid
   return foldRequestPolicy(events).model
 }
 
+/** Policy values last recorded through `agent.model`, compared to skip no-op selections. */
+interface AppliedPolicy {
+  readonly effort: string | undefined
+  readonly model: ModelOverride | undefined
+}
+
+function sameModel(left: ModelOverride | undefined, right: ModelOverride | undefined): boolean {
+  return left?.provider === right?.provider && left?.model === right?.model
+}
+
+/**
+ * Record one effective policy as the Agent's next-step selection. A policy
+ * without a model keeps the current route, except right after a model
+ * override is cleared, when the Agent's live options (deployment default)
+ * supply it again. Without a resolvable provider and model nothing is recorded.
+ */
+function selectPolicy(
+  model: AgentModel,
+  agent: Agent,
+  effort: string | undefined,
+  target: ModelOverride | undefined,
+  modelCleared: boolean,
+): void {
+  const current = model.current()
+  const base = modelCleared && agent.options.provider !== undefined && agent.options.model !== undefined
+    ? { provider: agent.options.provider, model: agent.options.model }
+    : current
+  const provider = target?.provider ?? base?.provider
+  const modelId = target?.model ?? base?.model
+  if (provider === undefined || provider === '' || modelId === undefined || modelId === '') return
+  model.select({ provider, model: modelId, ...(effort === undefined ? {} : { reasoningEffort: effort }) })
+}
+
 /** Install the mutable request policy outside every other request wrapper. */
 export function installRequestPolicy(
   agentCtx: AgentContext,
@@ -142,12 +189,16 @@ export function installRequestPolicy(
   let effortOverride: string | undefined
   let modelOverride: ModelOverride | undefined
   let disposed = false
+  /** Last policy recorded through `agent.model`; undefined until the first selecting sync. */
+  let applied: AppliedPolicy | undefined
   const configuredModel: ModelOverride | undefined = config.provider !== undefined && config.model !== undefined
     ? { provider: config.provider, model: config.model }
     : undefined
 
-  const disposeListener = agentCtx.on('agent/request', async (_payload, next) => {
+  const disposeListener = agentCtx.on('agent/request', async (payload, next) => {
     const request = await next()
+    // Hosts that own model selection reject a changed route or effort here.
+    if (payload.agent?.model !== undefined) return request
     const effort = effortOverride ?? config.effort
     const model = modelOverride ?? configuredModel
     if (effort === undefined && model === undefined) return request
@@ -178,10 +229,18 @@ export function installRequestPolicy(
           : configuredModel !== undefined ? 'config' : 'deployment-default',
       }
     },
-    sync(events) {
+    sync(events, agent, reconcile) {
       const folded = foldRequestPolicy(events)
       effortOverride = folded.effort
       modelOverride = folded.model
+      const model = agent?.model
+      if (agent === undefined || model === undefined || disposed) return
+      const next: AppliedPolicy = { effort: effortOverride ?? config.effort, model: modelOverride ?? configuredModel }
+      const previous = applied ?? { effort: undefined, model: undefined }
+      applied = next
+      if (reconcile === undefined && previous.effort === next.effort && sameModel(previous.model, next.model)) return
+      const modelCleared = next.model === undefined && (reconcile === 'model' || previous.model !== undefined)
+      selectPolicy(model, agent, next.effort, next.model, modelCleared)
     },
     dispose() {
       if (disposed) return

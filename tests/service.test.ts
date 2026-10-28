@@ -56,6 +56,7 @@ function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
     accessMode: 'open',
     dmAllowWhitelist: false,
     authRequestTtlDays: 7,
+    analyzeEnabled: false,
     // Onboarding is opt-in per test: it adds a card that would shift send counts.
     welcomeOnboarding: false,
     slashCommandPanel: false,
