@@ -1,6 +1,8 @@
 import { Context } from '@deepseek-ai/cordis'
 import { describe, expect, it } from 'vitest'
-import type { AgentContext, AgentRequestConfig, AgentRequestListener, SessionEvent } from '../src/dsh-types.ts'
+import type {
+  Agent, AgentContext, AgentModel, AgentRequestConfig, AgentRequestListener, ModelSelection, SessionEvent,
+} from '../src/dsh-types.ts'
 import { foldEffortOverride, foldModelOverride, installRequestPolicy } from '../src/session/request-policy.ts'
 
 type RequestWaterfall = (
@@ -147,6 +149,115 @@ describe('installRequestPolicy model switching', () => {
       effortSource: 'config',
     })
 
+    controller.dispose()
+    await ctx.fiber.dispose()
+  })
+})
+
+describe('installRequestPolicy on hosts that own model selection', () => {
+  const event = (type: string, seq: number, data: unknown): SessionEvent => (
+    { type, seq, time: seq, data } as unknown as SessionEvent
+  )
+  const command = (seq: number, id: string, name: string, args: string): SessionEvent[] => [
+    event('command/run', seq, { commandId: id, name, args: ` ${args}`, source: { kind: 'user' } }),
+    event('command/done', seq + 1, { commandId: id, kind: 'success' }),
+  ]
+
+  function selectingAgent(options: { provider?: string; model?: string } = { provider: 'deployment', model: 'default-model' }) {
+    let recorded: ModelSelection | undefined
+    const selections: ModelSelection[] = []
+    const model: AgentModel = {
+      current: () => recorded ?? (options.provider !== undefined && options.model !== undefined
+        ? { provider: options.provider, model: options.model }
+        : undefined),
+      select: (selection) => {
+        recorded = { ...selection }
+        selections.push(recorded)
+      },
+    }
+    const agent = { options, model } as unknown as Agent
+    return { agent, selections }
+  }
+
+  it('passes the composed request through instead of rewriting the route', async () => {
+    const ctx = new Context()
+    const controller = installRequestPolicy(ctx as unknown as AgentContext, {
+      effort: 'high', provider: 'provider-a', model: 'model-a',
+    })
+    const { agent } = selectingAgent()
+    const waterfall = ctx.waterfall.bind(ctx) as unknown as (
+      name: 'agent/request',
+      payload: { turn: number; step: number; signal: AbortSignal; agent: Agent },
+      next: () => Promise<AgentRequestConfig>,
+    ) => Promise<AgentRequestConfig>
+    await expect(waterfall(
+      'agent/request',
+      { turn: 1, step: 0, signal: new AbortController().signal, agent },
+      async () => ({ provider: 'deployment', model: 'default-model' }),
+    )).resolves.toEqual({ provider: 'deployment', model: 'default-model' })
+    controller.dispose()
+    await ctx.fiber.dispose()
+  })
+
+  it('records config defaults and Session overrides through agent.model.select', async () => {
+    const ctx = new Context()
+    const controller = installRequestPolicy(ctx as unknown as AgentContext, { effort: 'high' })
+    const { agent, selections } = selectingAgent()
+
+    controller.sync([], agent)
+    expect(selections).toEqual([{ provider: 'deployment', model: 'default-model', reasoningEffort: 'high' }])
+
+    // An unchanged policy records nothing more.
+    controller.sync([], agent)
+    expect(selections).toHaveLength(1)
+
+    const events = [...command(0, 'm1', 'model', 'provider-b/model-b'), ...command(2, 'e1', 'effort', 'tiny')]
+    controller.sync(events, agent)
+    expect(selections.at(-1)).toEqual({ provider: 'provider-b', model: 'model-b', reasoningEffort: 'tiny' })
+
+    // A bare model keeps the selected provider.
+    controller.sync([...events, ...command(4, 'm2', 'model', 'model-c')], agent)
+    expect(selections.at(-1)).toEqual({ provider: 'provider-b', model: 'model-c', reasoningEffort: 'tiny' })
+
+    // Reset returns to the Agent's live (deployment-default) route and the config effort.
+    controller.sync([
+      ...events, ...command(4, 'm2', 'model', 'model-c'),
+      ...command(6, 'm3', 'model', 'reset'), ...command(8, 'e2', 'effort', 'reset'),
+    ], agent)
+    expect(selections.at(-1)).toEqual({ provider: 'deployment', model: 'default-model', reasoningEffort: 'high' })
+
+    controller.dispose()
+    await ctx.fiber.dispose()
+  })
+
+  it('records nothing without a policy or a resolvable route', async () => {
+    const ctx = new Context()
+    const noPolicy = installRequestPolicy(ctx as unknown as AgentContext)
+    const first = selectingAgent()
+    noPolicy.sync([], first.agent)
+    expect(first.selections).toEqual([])
+
+    const effortOnly = installRequestPolicy(ctx as unknown as AgentContext, { effort: 'high' })
+    const routeless = selectingAgent({})
+    effortOnly.sync([], routeless.agent)
+    expect(routeless.selections).toEqual([])
+
+    noPolicy.dispose()
+    effortOnly.dispose()
+    await ctx.fiber.dispose()
+  })
+
+  it('keeps the request override on hosts without agent.model', async () => {
+    const ctx = new Context()
+    const controller = installRequestPolicy(ctx as unknown as AgentContext, { effort: 'high' })
+    const legacyAgent = { options: {} } as unknown as Agent
+    controller.sync(command(0, 'e1', 'effort', 'tiny'), legacyAgent)
+    const waterfall = ctx.waterfall.bind(ctx) as unknown as RequestWaterfall
+    await expect(waterfall(
+      'agent/request',
+      { turn: 1, step: 0, signal: new AbortController().signal },
+      async () => ({ provider: 'p', model: 'm' }),
+    )).resolves.toEqual({ provider: 'p', model: 'm', reasoningEffort: 'tiny' })
     controller.dispose()
     await ctx.fiber.dispose()
   })

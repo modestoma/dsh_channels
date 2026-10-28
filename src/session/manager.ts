@@ -207,7 +207,7 @@ export class SessionManager {
 
   /** Borrow one foreign live agent and mount this channel's scoped policy. */
   private async borrow(sessionId: string, agent: Agent): Promise<LiveAgent> {
-    const borrowed = borrowLiveAgent(agent, this.mountRequestPolicy(agent.ctx, agent.session))
+    const borrowed = borrowLiveAgent(agent, this.mountRequestPolicy(agent.ctx, agent))
     this.live.set(sessionId, borrowed)
     // Best-effort tool backfill (D7): the foreign owner may have composed the
     // session without this plugin's setup (web UI resolver, previous plugin
@@ -253,13 +253,13 @@ export class SessionManager {
   }
 
   /** Mount one mutable Session-aware request policy outside every other wrapper. */
-  mountRequestPolicy(agentCtx: AgentContext, session?: Session): () => void {
+  mountRequestPolicy(agentCtx: AgentContext, agent?: Agent): () => void {
     const controller = installRequestPolicy(agentCtx, {
       effort: this.deps.config.reasoningEffort,
       provider: this.deps.config.provider,
       model: this.deps.config.model,
     })
-    if (session !== undefined) controller.sync(session.snapshotEvents())
+    if (agent !== undefined) controller.sync(agent.session.snapshotEvents(), agent)
     this.policies.set(agentCtx, controller)
     return () => {
       controller.dispose()
@@ -273,7 +273,7 @@ export class SessionManager {
     if (controller === undefined) {
       throw new Error('dsh-channels: request policy is not mounted for this Agent')
     }
-    controller.sync(agent.session.snapshotEvents())
+    controller.sync(agent.session.snapshotEvents(), agent)
     return controller
   }
 

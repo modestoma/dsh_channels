@@ -35,9 +35,30 @@ export interface AgentRequestConfig {
 
 /** Agent-scoped request override installed before the first prompt assembly. */
 export type AgentRequestListener = (
-  payload: { turn: number; step: number; signal: AbortSignal },
+  payload: { turn: number; step: number; signal: AbortSignal; agent?: Agent },
   next: () => Promise<AgentRequestConfig>,
 ) => Promise<AgentRequestConfig>
+
+/** Complete provider, model, and optional reasoning effort for one Session's model steps. */
+export interface ModelSelection {
+  readonly provider: string
+  readonly model: string
+  /** Absent means the adapter/provider default effort. */
+  readonly reasoningEffort?: string
+}
+
+/**
+ * Agent-owned durable model choice (`agent.model`, DSH 0.2.2-alpha.1 and
+ * later). On these hosts an `agent/request` listener that changes provider,
+ * model, or reasoning effort fails the step, so a switch must go through
+ * `select()` before the next step starts.
+ */
+export interface AgentModel {
+  /** Choice for the next step: recorded selection, then last request, then live options. */
+  current(): Readonly<ModelSelection> | undefined
+  /** Record the next step's complete selection (`model/selection`); an equal recorded choice is a no-op. */
+  select(selection: Readonly<ModelSelection>): void
+}
 
 /** Cordis listener placement used to make an explicit channel override outermost. */
 export interface AgentRequestListenerOptions {
@@ -133,6 +154,8 @@ export interface AgentContext {
 export interface Agent {
   readonly id: SessionId
   readonly options: AgentOptions
+  /** Durable model choice; absent on DSH 0.2.1 hosts, which route through `agent/request`. */
+  readonly model?: AgentModel
   readonly session: Session
   readonly status: 'idle' | 'running'
   readonly inbox: {

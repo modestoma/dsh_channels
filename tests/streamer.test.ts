@@ -832,6 +832,24 @@ describe('TurnStreamer subagent child folding', () => {
     expect(markdownLines(headCard(ch)).join('\n')).toContain('调用子代理：检索实现方案')
   })
 
+  it('does not fold an ordinary fork that still carries parentSession into its source card', async () => {
+    const ch = channel()
+    const streamer = new TurnStreamer(ch, 500, hooks())
+    const session = makeSession('sess-source')
+    streamer.attach(session, 'om_card', 'om_trigger', undefined)
+
+    const fork = makeChildSession('fork-1', 'sess-source')
+    const header = { ...fork.header, origin: undefined }
+    const historicalFork = { ...fork, header } as unknown as Session
+    streamer.onSessionEvent(historicalFork, {
+      type: 'tool/call', seq: 1,
+      data: { turn: 1, step: 1, callId: 'f-call-1', name: 'read', arguments: '{"path":"src"}' },
+    })
+    await vi.advanceTimersByTimeAsync(500)
+    expect(ch.updated.filter(update => update.messageId === 'om_card').map(update => markdownLines(update.card).join('\n')).join('\n'))
+      .not.toContain('子代理执行中')
+  })
+
   it('summarizes finished subagents on the settled card (tool line disappears)', async () => {
     const ch = channel()
     const streamer = new TurnStreamer(ch, 500, hooks())
