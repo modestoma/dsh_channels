@@ -142,9 +142,9 @@ describe('analyze route', () => {
     'content-type': 'application/json',
   }
 
-  it('registers one exact route under the DSH /api namespace', async () => {
+  it('registers one exact route under /open-api, outside the DSH /api namespace', async () => {
     const { routes } = await serve()
-    expect(ANALYZE_ROUTE).toBe('/api/dsh-channels.logalyze')
+    expect(ANALYZE_ROUTE).toBe('/open-api/logalyze/analyze')
     expect(routes.map(({ kind, path: routePath }) => ({ kind, path: routePath }))).toEqual([{ kind: 'exact', path: ANALYZE_ROUTE }])
   })
 

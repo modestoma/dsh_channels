@@ -1,7 +1,7 @@
 /**
  * The analyze API's HTTP route on the DSH Web server.
  *
- * Registers the exact route `POST /api/dsh-channels.logalyze` (see
+ * Registers the exact route `POST /open-api/logalyze/analyze` (see
  * `./contract.ts`) on the host `webServer`; hosts without one (headless) have
  * no analyze API. This module owns the transport-level checks, in order:
  * path, the `analyzeEnabled` switch, method, bearer token, `Idempotency-Key`,

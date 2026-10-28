@@ -442,7 +442,7 @@ const FIELD_META: Record<EditableKey, FieldMeta> = {
     label: '日志分析接口',
     group: 'analyze',
     summary: '关闭时接口返回 404',
-    help: '接口挂在 DSH Web 端口上：POST /api/dsh-channels.logalyze，请求需带 Authorization: Bearer <访问令牌>。只有带 Web 的 profile 才有这个接口。改后立即生效，不需要重连。',
+    help: '接口挂在 DSH Web 端口上：POST /open-api/logalyze/analyze，请求需带 Authorization: Bearer <访问令牌>。只有带 Web 的 profile 才有这个接口。改后立即生效，不需要重连。',
   },
   loggerLevel: { label: 'SDK 日志级别', group: 'logging' },
 }

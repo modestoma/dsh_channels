@@ -302,7 +302,7 @@ npm 发行包已包含构建产物：Host 入口是 `lib/index.js`（profile 直
     dmAllowWhitelist: false             # guarded 下用户白名单里的人也可私聊（默认关：私聊仅管理员）
     adminUserId: 'a1b2c3d4'            # 管理员 user_id（可留空，留空时自动使用应用所有者；都没有时 guarded 下拒绝所有对话；面板可改）
     authRequestTtlDays: 7               # 入群/用户授权申请卡有效期（天，1–30）
-    analyzeEnabled: false               # 日志平台分析接口开关（POST /api/dsh-channels.logalyze，挂在 DSH Web 端口；改后立即生效）
+    analyzeEnabled: false               # 日志平台分析接口开关（POST /open-api/logalyze/analyze，挂在 DSH Web 端口；改后立即生效）
     analyzeToken: 'DSH_CHANNELS_ANALYZE_TOKEN' # 分析接口 Bearer 令牌的凭据引用名（值在面板填写或写进 .credentials.yaml）
     loggerLevel: 'info'
 ```
@@ -379,12 +379,12 @@ FEISHU_APP_SECRET: xxxxxxxx
 
 日志平台调用插件的分析接口：插件在指定群里发一张分析卡（发起人、触发时间、应用、错误码和日志详情页表格），在卡片下开话题，把平台给的 prompt 原样交给一个新 Session（prompt 开头的斜杠命令由 DSH 展开成对应 skill），分析过程在话题内流式输出，和用户自己发起的会话一样。分析结束后分析卡的状态标签随之更新。群里通过准入的成员都可以在该话题内追问。插件只负责接收 prompt 和开会话：日志包地址写在 prompt 里，下载、解压、超时都由日志分析 skill 自己处理（Session 的沙箱需要能访问日志存储地址）。
 
-**开启**：在面板「高级 → 日志分析接口」打开开关（`analyzeEnabled`，默认关，改后立即生效、不需要重连），并在同一处的「访问令牌」卡片填写令牌（建议 32 位以上随机串；写入 DSH 凭据库的 `DSH_CHANNELS_ANALYZE_TOKEN`，也可直接写进 `$DSH_HOME/.credentials.yaml`，引用名可用 `analyzeToken` 修改）。接口挂在 DSH Web 服务上（与 Web 界面同一端口），路径 `/api/dsh-channels.logalyze` 按 DSH 纯 HTTP 路由 `/api/<名字>.<方法>` 的命名；只有带 Web 的 profile（web、desktop）有这个接口，headless 没有。DSH 通过反向代理挂在前缀下时，地址随之带上前缀（如 `https://<域名>/dsh/api/dsh-channels.logalyze`）。该路由不走 DSH 登录 cookie，访问令牌是唯一凭据。开关关闭时所有请求返回 404；令牌每次请求都重新解析，轮换后下一次请求生效；令牌缺失时所有请求返回 503。
+**开启**：在面板「高级 → 日志分析接口」打开开关（`analyzeEnabled`，默认关，改后立即生效、不需要重连），并在同一处的「访问令牌」卡片填写令牌（建议 32 位以上随机串；写入 DSH 凭据库的 `DSH_CHANNELS_ANALYZE_TOKEN`，也可直接写进 `$DSH_HOME/.credentials.yaml`，引用名可用 `analyzeToken` 修改）。接口挂在 DSH Web 服务上（与 Web 界面同一端口），路径 `/open-api/logalyze/analyze` 刻意放在 DSH 的 `/api` 之外，网关可以把它与需要登录的 DSH API 分开放行；只有带 Web 的 profile（web、desktop）有这个接口，headless 没有。DSH 通过反向代理挂在前缀下时，地址随之带上前缀（如 `https://<域名>/dsh/open-api/logalyze/analyze`）。该路由不走 DSH 登录 cookie，访问令牌是唯一凭据。开关关闭时所有请求返回 404；令牌每次请求都重新解析，轮换后下一次请求生效；令牌缺失时所有请求返回 503。
 
 **请求**：
 
 ```http
-POST /api/dsh-channels.logalyze
+POST /open-api/logalyze/analyze
 Authorization: Bearer <令牌>
 Idempotency-Key: <平台生成的唯一值，1-200 个可见 ASCII 字符>
 Content-Type: application/json

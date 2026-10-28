@@ -1,7 +1,7 @@
 /**
  * Wire contract of the log-platform analyze API.
  *
- * `POST /api/dsh-channels.logalyze` on the DSH Web server, with
+ * `POST /open-api/logalyze/analyze` on the DSH Web server, with
  * `Authorization: Bearer <token>`, an `Idempotency-Key` header, and a JSON
  * body naming the requester, the trigger time, the subject (application +
  * error code), the log-platform detail pages, the target group, and the
@@ -18,11 +18,12 @@ import { z } from 'zod'
 import { FEISHU_USER_ID_PATTERN } from '../domain.ts'
 
 /**
- * Exact DSH Web route of the analyze API. It follows the host's plain-HTTP
- * `/api/<name>.<method>` naming; an exact route wins over the `/api` RPC prefix
- * route, so the request carries this API's bearer token, not a DSH login.
+ * Exact DSH Web route of the analyze API. It sits outside DSH's `/api`
+ * namespace so a gateway in front of DSH can expose it separately from the
+ * login-protected DSH API; the request carries this API's bearer token, not a
+ * DSH login.
  */
-export const ANALYZE_ROUTE = '/api/dsh-channels.logalyze'
+export const ANALYZE_ROUTE = '/open-api/logalyze/analyze'
 
 /** Largest accepted request body (the prompt dominates it). */
 export const ANALYZE_MAX_BODY_BYTES = 1024 * 1024
