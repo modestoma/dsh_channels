@@ -82,8 +82,8 @@ export const DEFAULT_PROMPT_CONTEXT_TIMEOUT_MS = 3_000
 
 /**
  * Keys of the log-platform analyze API, which moved to 观象
- * (`@modesto_ma/dsh-guanxiang`). The schema no longer has them, so a value
- * still set in `cordis.yml` or the Web overlay is ignored;
+ * (`@modesto_ma/dsh-guanxiang`). A value still set in `cordis.yml` or the Web
+ * overlay is ignored; the loader schema passes them through and
  * {@link movedAnalyzeKeysOf} finds them so the deployment is told.
  */
 export const MOVED_ANALYZE_KEYS = ['analyzeEnabled', 'analyzeToken'] as const
@@ -448,9 +448,13 @@ export type FeishuConfig = z.infer<typeof configSchema>
  * `config` object; the loader validates that row with `undefined` before the
  * user's patch layer supplies values. Accept that absence and fill the same
  * defaults as {@link resolveConfig}, so enabling the plugin from the Web UI
- * cannot fail with "expected object, received undefined".
+ * cannot fail with "expected object, received undefined". The moved analyze
+ * keys pass through unchanged so `apply()` can warn about them.
  */
-export const pluginConfigSchema = configSchema.prefault({})
+export const pluginConfigSchema = configSchema.extend({
+  analyzeEnabled: z.unknown().optional(),
+  analyzeToken: z.unknown().optional(),
+}).prefault({})
 
 /**
  * Validate the raw loader config. Values stay credential *references*; the
