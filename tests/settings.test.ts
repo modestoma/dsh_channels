@@ -6,8 +6,6 @@
 import { mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import path from 'node:path'
-import { Readable } from 'node:stream'
-import type { IncomingMessage, ServerResponse } from 'node:http'
 import { describe, expect, it, vi } from 'vitest'
 import { resolveConfig } from '../src/config.ts'
 import type { FeishuConfig } from '../src/config.ts'
@@ -17,16 +15,15 @@ import { HEALTH_DEPENDENCY_NAMES } from '../src/health.ts'
 import type { HealthSnapshot } from '../src/health.ts'
 import type { FeishuChannel } from '../src/feishu-channel.ts'
 import {
-  ACCESS_GROUPS_ROUTE,
-  ACCESS_REQUESTS_ROUTE,
   ACCESS_ROUTE,
-  ACCESS_USERS_ROUTE,
-  ACCESS_WIKI_USERS_ROUTE,
+  ADD_ACCESS_GROUP_ROUTE,
+  ADD_ACCESS_USER_ROUTE,
+  ADD_WIKI_USER_ROUTE,
   BYTES_UNIT,
   CATALOG_ROUTE,
+  CLEAR_CONFIG_ROUTE,
+  CLEAR_CREDENTIAL_ROUTE,
   COLLAPSED_FIELD_GROUPS,
-  CONFIG_ROUTE,
-  CREDENTIALS_ROUTE,
   EDITABLE_KEYS,
   FIELD_GROUP_LABELS,
   PANEL_COPY,
@@ -38,7 +35,13 @@ import {
   PANEL_TABS,
   TAB_FIELD_GROUPS,
   RECONNECT_ROUTE,
+  REMOVE_ACCESS_GROUP_ROUTE,
+  REMOVE_ACCESS_USER_ROUTE,
+  REMOVE_WIKI_USER_ROUTE,
+  RESOLVE_ACCESS_REQUEST_ROUTE,
   RESTART_KEYS,
+  SAVE_CONFIG_ROUTE,
+  SAVE_CREDENTIALS_ROUTE,
   STATUS_ROUTE,
 } from '../src/settings/contract.ts'
 import type {
@@ -77,8 +80,8 @@ import type { SettingsTarget } from '../src/settings/surface.ts'
 import { createHostCatalog } from '../src/settings/catalog.ts'
 import type { SettingsCatalog } from '../src/settings/catalog.ts'
 import type { SettingsDirectoryPicker } from '../src/settings/directory-picker.ts'
-import { isSameOriginRequest, mountSettingsRoutes, registerSettingsRoutes } from '../src/settings/routes.ts'
-import type { HostRequestGate, HostWebServer } from '../src/settings/routes.ts'
+import { mountSettingsRoutes, registerSettingsRoutes } from '../src/settings/routes.ts'
+import type { HostConnection, HostFetchRoute } from '../src/settings/routes.ts'
 import { normalizeWorkspaceBaseDir, prepareWorkspaceBaseDir } from '../src/workspaces.ts'
 import { makeChannel, makeHostContext } from './helpers.ts'
 
@@ -1734,164 +1737,106 @@ describe('SettingsSurface credentials', () => {
 
 interface CapturedResponse {
   status: number
-  headers: Record<string, unknown>
   body: string
 }
 
-function makeRequest(options: {
-  method?: string
-  url?: string
-  headers?: Record<string, string>
-  body?: string
-} = {}): IncomingMessage {
-  const chunks = options.body === undefined ? [] : [Buffer.from(options.body)]
-  const stream = Readable.from(chunks)
-  return Object.assign(stream, {
-    method: options.method ?? 'GET',
-    url: options.url ?? '/',
-    headers: options.headers ?? {},
-  }) as unknown as IncomingMessage
-}
-
-function makeResponse(): { res: ServerResponse; captured: CapturedResponse } {
-  const captured: CapturedResponse = { status: 0, headers: {}, body: '' }
-  const listeners = new Map<string, Array<() => void>>()
-  const res = {
-    headersSent: false,
-    writableEnded: false,
-    writeHead(status: number, headers?: Record<string, unknown>) {
-      captured.status = status
-      Object.assign(captured.headers, headers ?? {})
-      res.headersSent = true
-      return res
-    },
-    setHeader() {},
-    on(event: string, listener: () => void) {
-      const bucket = listeners.get(event) ?? []
-      bucket.push(listener)
-      listeners.set(event, bucket)
-      return res
-    },
-    emit(event: string) {
-      for (const listener of listeners.get(event) ?? []) listener()
-      return res
-    },
-    end(chunk?: unknown) {
-      if (chunk !== undefined && chunk !== null) captured.body += String(chunk)
-      res.writableEnded = true
+/** Fake DSH `connection`: exact `/api` Fetch routes; an unowned method falls through to 404 like DSH. */
+function makeConnection(): { connection: HostConnection; routes: Map<string, HostFetchRoute> } {
+  const routes = new Map<string, HostFetchRoute>()
+  const connection: HostConnection = {
+    fetch: {
+      register(route) {
+        if (routes.has(route.path)) throw new Error(`duplicate route ${route.path}`)
+        routes.set(route.path, route)
+        return async () => { routes.delete(route.path) }
+      },
     },
   }
-  return { res: res as unknown as ServerResponse, captured }
+  return { connection, routes }
 }
 
-type RouteHandler = (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
-
-async function call(routes: Map<string, RouteHandler>, route: string, req: IncomingMessage): Promise<CapturedResponse> {
-  const handler = routes.get(route)
-  if (handler === undefined) throw new Error(`route not registered: ${route}`)
-  const { res, captured } = makeResponse()
-  await handler(req, res)
-  return captured
+async function call(
+  routes: Map<string, HostFetchRoute>,
+  route: string,
+  options: { method?: string; query?: string; body?: string; contentType?: string; signal?: AbortSignal } = {},
+): Promise<CapturedResponse> {
+  const registered = routes.get(route)
+  if (registered === undefined) throw new Error(`route not registered: ${route}`)
+  const method = options.method ?? 'GET'
+  if (!(registered.methods as readonly string[]).includes(method)) return { status: 404, body: 'not found' }
+  const request = new Request(`http://127.0.0.1:3080${route}${options.query === undefined ? '' : `?${options.query}`}`, {
+    method,
+    ...(options.body === undefined ? {} : {
+      body: options.body,
+      headers: { 'content-type': options.contentType ?? 'application/json' },
+    }),
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
+  })
+  const response = await registered.fetch(request)
+  return { status: response.status, body: await response.text() }
 }
 
-function makeWebServer(): { server: HostWebServer; routes: Map<string, RouteHandler> } {
-  const routes = new Map<string, RouteHandler>()
-  const server: HostWebServer = {
-    register(route) {
-      routes.set(route.path, route.handler)
-      return () => { routes.delete(route.path) }
-    },
-  }
-  return { server, routes }
-}
-
-/** A host gate that admits every request (authentication tested separately). */
-const allowAll: HostRequestGate = { requestRejection: () => undefined }
-
-const ALL_SETTINGS_ROUTES: Array<{ route: string; method: string }> = [
-  { route: STATUS_ROUTE, method: 'GET' },
-  { route: PANEL_ROUTE, method: 'GET' },
-  { route: CATALOG_ROUTE, method: 'GET' },
-  { route: CONFIG_ROUTE, method: 'PUT' },
-  { route: CONFIG_ROUTE, method: 'DELETE' },
-  { route: CREDENTIALS_ROUTE, method: 'PUT' },
-  { route: CREDENTIALS_ROUTE, method: 'DELETE' },
-  { route: RECONNECT_ROUTE, method: 'POST' },
-  { route: PICK_DIRECTORY_ROUTE, method: 'POST' },
-  { route: ACCESS_ROUTE, method: 'GET' },
-  { route: ACCESS_GROUPS_ROUTE, method: 'POST' },
-  { route: ACCESS_USERS_ROUTE, method: 'POST' },
-  { route: ACCESS_WIKI_USERS_ROUTE, method: 'POST' },
-  { route: ACCESS_REQUESTS_ROUTE, method: 'POST' },
-  { route: SESSION_ORIGIN_ROUTE, method: 'GET' },
-  { route: PROFILES_ROUTE, method: 'GET' },
-]
+const post = (body?: unknown, contentType?: string) => ({
+  method: 'POST',
+  ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  ...(contentType === undefined ? {} : { contentType }),
+})
 
 describe('settings routes', () => {
-  it('refuses every route the host connection gate rejects, before touching the surface', async () => {
-    for (const rejection of [401, 403] as const) {
-      const { surface, store, target } = makeSurface()
-      await store.save({ dmMode: 'disabled' })
-      const { server, routes } = makeWebServer()
-      const seen: IncomingMessage[] = []
-      registerSettingsRoutes(server, {
-        requestRejection: (req) => {
-          seen.push(req as IncomingMessage)
-          return rejection
-        },
-      }, surface)
-
-      for (const { route, method } of ALL_SETTINGS_ROUTES) {
-        const req = makeRequest({
-          method,
-          url: route,
-          headers: { 'content-type': 'application/json', host: '10.0.0.5:3000' },
-          body: JSON.stringify({ values: { dmMode: 'open' }, appId: 'cli_evil', field: 'appSecret', chatId: 'oc_x', userId: 'u_x', token: 't', decision: 'allow' }),
-        })
-        const response = await call(routes, route, req)
-        expect(response.status, `${method} ${route}`).toBe(rejection)
-        expect(JSON.parse(response.body).ok).toBe(false)
-        expect(response.body).not.toContain('dmMode')
-        expect(seen.at(-1)).toBe(req)
-      }
-      expect(seen).toHaveLength(ALL_SETTINGS_ROUTES.length)
-      await expect(store.load()).resolves.toEqual({ dmMode: 'disabled' })
-      expect(target.restartCalls).toBe(0)
-      expect(target.accessCalls).toEqual([])
-      expect(target.originCalls).toEqual([])
-      expect(target.profileCalls).toEqual([])
+  it('registers every route as an exact DSH /api route named /api/dsh-channels.<method>, GET for reads and POST for writes', () => {
+    const { surface } = makeSurface()
+    const { connection, routes } = makeConnection()
+    registerSettingsRoutes(connection, surface)
+    const table = Object.fromEntries([...routes.values()].map(route => [route.path, route.methods.join(',')]))
+    expect(table).toEqual({
+      [STATUS_ROUTE]: 'GET',
+      [PANEL_ROUTE]: 'GET',
+      [CATALOG_ROUTE]: 'GET',
+      [SESSION_ORIGIN_ROUTE]: 'GET',
+      [PROFILES_ROUTE]: 'GET',
+      [ACCESS_ROUTE]: 'GET',
+      [SAVE_CONFIG_ROUTE]: 'POST',
+      [CLEAR_CONFIG_ROUTE]: 'POST',
+      [SAVE_CREDENTIALS_ROUTE]: 'POST',
+      [CLEAR_CREDENTIAL_ROUTE]: 'POST',
+      [RECONNECT_ROUTE]: 'POST',
+      [PICK_DIRECTORY_ROUTE]: 'POST',
+      [ADD_ACCESS_GROUP_ROUTE]: 'POST',
+      [REMOVE_ACCESS_GROUP_ROUTE]: 'POST',
+      [ADD_ACCESS_USER_ROUTE]: 'POST',
+      [REMOVE_ACCESS_USER_ROUTE]: 'POST',
+      [ADD_WIKI_USER_ROUTE]: 'POST',
+      [REMOVE_WIKI_USER_ROUTE]: 'POST',
+      [RESOLVE_ACCESS_REQUEST_ROUTE]: 'POST',
+    })
+    for (const route of routes.values()) {
+      expect(route.path).toMatch(/^\/api\/dsh-channels\.[a-z][A-Za-z]+$/u)
+      expect(route.requestBody).toBe('buffered')
     }
   })
 
-  it('recognises same-origin and cross-origin mutations', () => {
-    expect(isSameOriginRequest(makeRequest())).toBe(true)
-    expect(isSameOriginRequest(makeRequest({
-      headers: { origin: 'http://127.0.0.1:52555', host: '127.0.0.1:52555' },
-    }))).toBe(true)
-    expect(isSameOriginRequest(makeRequest({
-      headers: { origin: 'https://evil.example', host: '127.0.0.1:52555' },
-    }))).toBe(false)
-    expect(isSameOriginRequest(makeRequest({
-      headers: { origin: 'null', host: '127.0.0.1:52555' },
-    }))).toBe(false)
+  it('removes every route on dispose', async () => {
+    const { surface } = makeSurface()
+    const { connection, routes } = makeConnection()
+    const dispose = registerSettingsRoutes(connection, surface)
+    dispose()
+    await vi.waitFor(() => expect(routes.size).toBe(0))
   })
 
-  it('serves status and panel, and rejects other methods with 405', async () => {
+  it('serves status and panel over GET only', async () => {
     const { surface } = makeSurface()
-    const { server, routes } = makeWebServer()
-    registerSettingsRoutes(server, allowAll, surface)
+    const { connection, routes } = makeConnection()
+    registerSettingsRoutes(connection, surface)
 
-    const status = await call(routes, STATUS_ROUTE, makeRequest())
+    const status = await call(routes, STATUS_ROUTE)
     expect(status.status).toBe(200)
     expect(JSON.parse(status.body).running).toBe(true)
 
-    const panel = await call(routes, PANEL_ROUTE, makeRequest())
+    const panel = await call(routes, PANEL_ROUTE)
     expect(panel.status).toBe(200)
     expect(JSON.parse(panel.body).config.fields).toHaveLength(EDITABLE_KEYS.length)
 
-    const notAllowed = await call(routes, STATUS_ROUTE, makeRequest({ method: 'POST' }))
-    expect(notAllowed.status).toBe(405)
-    expect(notAllowed.headers.allow).toBe('GET, HEAD')
+    expect((await call(routes, STATUS_ROUTE, { method: 'POST' })).status).toBe(404)
   })
 
   it('serves a Session origin over GET, null for other Sessions, and requires sessionId', async () => {
@@ -1902,124 +1847,99 @@ describe('settings routes', () => {
       chatLink: 'https://applink.feishu.cn/client/chat/open?openChatId=oc_1',
     }
     target.origins.set('s_feishu', origin)
-    const { server, routes } = makeWebServer()
-    registerSettingsRoutes(server, allowAll, surface)
+    const { connection, routes } = makeConnection()
+    registerSettingsRoutes(connection, surface)
 
-    const hit = await call(routes, SESSION_ORIGIN_ROUTE, makeRequest({ url: `${SESSION_ORIGIN_ROUTE}?sessionId=s_feishu` }))
+    const hit = await call(routes, SESSION_ORIGIN_ROUTE, { query: 'sessionId=s_feishu' })
     expect(hit.status).toBe(200)
     expect(JSON.parse(hit.body)).toEqual({ origin })
 
-    const miss = await call(routes, SESSION_ORIGIN_ROUTE, makeRequest({ url: `${SESSION_ORIGIN_ROUTE}?sessionId=s_web` }))
+    const miss = await call(routes, SESSION_ORIGIN_ROUTE, { query: 'sessionId=s_web' })
     expect(JSON.parse(miss.body)).toEqual({ origin: null })
 
-    const missing = await call(routes, SESSION_ORIGIN_ROUTE, makeRequest({ url: `${SESSION_ORIGIN_ROUTE}?sessionId=%20` }))
+    const missing = await call(routes, SESSION_ORIGIN_ROUTE, { query: 'sessionId=%20' })
     expect(missing.status).toBe(400)
     expect(target.originCalls).toEqual(['s_feishu', 's_web'])
-
-    const post = await call(routes, SESSION_ORIGIN_ROUTE, makeRequest({ method: 'POST', url: SESSION_ORIGIN_ROUTE }))
-    expect(post.status).toBe(405)
   })
 
   it('serves Feishu profiles for comma-separated ids over GET and bounds the id count', async () => {
     const { surface, target } = makeSurface()
-    const { server, routes } = makeWebServer()
-    registerSettingsRoutes(server, allowAll, surface)
+    const { connection, routes } = makeConnection()
+    registerSettingsRoutes(connection, surface)
 
-    const hit = await call(routes, PROFILES_ROUTE, makeRequest({ url: `${PROFILES_ROUTE}?users=u_1,%20u_2,u_1,&chats=oc_1` }))
+    const hit = await call(routes, PROFILES_ROUTE, { query: 'users=u_1,%20u_2,u_1,&chats=oc_1' })
     expect(hit.status).toBe(200)
     expect(JSON.parse(hit.body)).toEqual({
       users: { u_1: { name: '名-u_1' }, u_2: { name: '名-u_2' } },
       chats: { oc_1: { name: '群-oc_1', avatarUrl: 'https://cdn.example/oc_1.png' } },
     })
-    const none = await call(routes, PROFILES_ROUTE, makeRequest({ url: PROFILES_ROUTE }))
+    const none = await call(routes, PROFILES_ROUTE)
     expect(JSON.parse(none.body)).toEqual({ users: {}, chats: {} })
     expect(target.profileCalls).toEqual([{ users: ['u_1', 'u_2'], chats: ['oc_1'] }, { users: [], chats: [] }])
 
     const many = Array.from({ length: PROFILES_MAX_IDS + 1 }, (_, index) => `u_${index}`).join(',')
-    const tooMany = await call(routes, PROFILES_ROUTE, makeRequest({ url: `${PROFILES_ROUTE}?users=${many}` }))
+    const tooMany = await call(routes, PROFILES_ROUTE, { query: `users=${many}` })
     expect(tooMany.status).toBe(400)
     expect(target.profileCalls).toHaveLength(2)
-
-    const post = await call(routes, PROFILES_ROUTE, makeRequest({ method: 'POST', url: PROFILES_ROUTE }))
-    expect(post.status).toBe(405)
   })
 
-  it('serves the selector catalog over GET and rejects writes', async () => {
+  it('serves the selector catalog over GET', async () => {
     const fake = makeCatalog()
     const { surface } = makeSurface({ provider: 'deepseek-account', model: 'deepseek-flash' }, fake.catalog)
-    const { server, routes } = makeWebServer()
-    registerSettingsRoutes(server, allowAll, surface)
+    const { connection, routes } = makeConnection()
+    registerSettingsRoutes(connection, surface)
 
-    const catalog = await call(routes, CATALOG_ROUTE, makeRequest({
-      url: `${CATALOG_ROUTE}?provider=deepseek-account&model=deepseek-flash`,
-    }))
+    const catalog = await call(routes, CATALOG_ROUTE, { query: 'provider=deepseek-account&model=deepseek-flash' })
     expect(catalog.status).toBe(200)
     const body = JSON.parse(catalog.body) as CatalogWire
     expect(body.provider.selectable).toBe(true)
     expect(fake.calls).toEqual([{ provider: 'deepseek-account', model: 'deepseek-flash' }])
-
-    const head = await call(routes, CATALOG_ROUTE, makeRequest({ method: 'HEAD', url: CATALOG_ROUTE }))
-    expect(head.status).toBe(200)
-    expect(head.body).toBe('')
-
-    const post = await call(routes, CATALOG_ROUTE, makeRequest({ method: 'POST', url: CATALOG_ROUTE }))
-    expect(post.status).toBe(405)
-    expect(post.headers.allow).toBe('GET, HEAD')
   })
 
-  it('writes config via PUT and enforces same-origin + JSON', async () => {
+  it('saves config from a JSON body and refuses other media types', async () => {
     const { surface, store } = makeSurface()
-    const { server, routes } = makeWebServer()
-    registerSettingsRoutes(server, allowAll, surface)
+    const { connection, routes } = makeConnection()
+    registerSettingsRoutes(connection, surface)
 
-    const crossSite = await call(routes, CONFIG_ROUTE, makeRequest({
-      method: 'PUT',
-      headers: { 'content-type': 'application/json', origin: 'https://evil.example', host: '127.0.0.1:52555' },
-      body: JSON.stringify({ values: { dmMode: 'disabled' } }),
-    }))
-    expect(crossSite.status).toBe(403)
-
-    const wrongType = await call(routes, CONFIG_ROUTE, makeRequest({
-      method: 'PUT',
-      headers: { 'content-type': 'text/plain', host: '127.0.0.1:52555' },
-      body: JSON.stringify({ values: { dmMode: 'disabled' } }),
-    }))
+    const wrongType = await call(routes, SAVE_CONFIG_ROUTE, post({ values: { dmMode: 'disabled' } }, 'text/plain'))
     expect(wrongType.status).toBe(415)
 
-    const ok = await call(routes, CONFIG_ROUTE, makeRequest({
-      method: 'PUT',
-      headers: { 'content-type': 'application/json', host: '127.0.0.1:52555' },
-      body: JSON.stringify({ values: { dmMode: 'disabled' } }),
-    }))
+    const noValues = await call(routes, SAVE_CONFIG_ROUTE, post({}))
+    expect(noValues.status).toBe(400)
+
+    const ok = await call(routes, SAVE_CONFIG_ROUTE, post({ values: { dmMode: 'disabled' } }))
     expect(ok.status).toBe(200)
     expect(JSON.parse(ok.body).ok).toBe(true)
     await expect(store.load()).resolves.toEqual({ dmMode: 'disabled' })
 
-    const invalid = await call(routes, CONFIG_ROUTE, makeRequest({
-      method: 'PUT',
-      headers: { 'content-type': 'application/json', host: '127.0.0.1:52555' },
-      body: JSON.stringify({ values: { refreshMs: 1 } }),
-    }))
+    const invalid = await call(routes, SAVE_CONFIG_ROUTE, post({ values: { refreshMs: 1 } }))
     expect(invalid.status).toBe(400)
     expect(JSON.parse(invalid.body).issues[0].key).toBe('refreshMs')
+
+    const malformed = await call(routes, SAVE_CONFIG_ROUTE, { method: 'POST', body: '{' })
+    expect(malformed.status).toBe(400)
+    const array = await call(routes, SAVE_CONFIG_ROUTE, post([]))
+    expect(array.status).toBe(400)
+    const oversized = await call(routes, SAVE_CONFIG_ROUTE, post({ values: {}, pad: 'x'.repeat(70 * 1024) }))
+    expect(oversized.status).toBe(413)
   })
 
-  it('clears overrides via DELETE and reconnects via POST', async () => {
+  it('clears overrides and reconnects over POST', async () => {
     const { surface, store, target } = makeSurface()
-    const { server, routes } = makeWebServer()
-    registerSettingsRoutes(server, allowAll, surface)
+    const { connection, routes } = makeConnection()
+    registerSettingsRoutes(connection, surface)
     await store.save({ dmMode: 'disabled' })
 
-    const cleared = await call(routes, CONFIG_ROUTE, makeRequest({ method: 'DELETE', headers: { host: 'h' } }))
+    const cleared = await call(routes, CLEAR_CONFIG_ROUTE, post())
     expect(cleared.status).toBe(200)
     await expect(store.load()).resolves.toEqual({})
 
-    const reconnected = await call(routes, RECONNECT_ROUTE, makeRequest({ method: 'POST', headers: { host: 'h' } }))
+    const reconnected = await call(routes, RECONNECT_ROUTE, post())
     expect(reconnected.status).toBe(200)
     expect(target.restartCalls).toBe(1)
 
     target.failRestart = 'still down'
-    const failed = await call(routes, RECONNECT_ROUTE, makeRequest({ method: 'POST', headers: { host: 'h' } }))
+    const failed = await call(routes, RECONNECT_ROUTE, post())
     expect(failed.status).toBe(500)
   })
 
@@ -2027,10 +1947,10 @@ describe('settings routes', () => {
     const { surface, target } = makeSurface()
     target.runningFlag = false
     target.credentialInfo.appSecret = { configured: false, writable: true }
-    const { server, routes } = makeWebServer()
-    registerSettingsRoutes(server, allowAll, surface)
+    const { connection, routes } = makeConnection()
+    registerSettingsRoutes(connection, surface)
 
-    const response = await call(routes, RECONNECT_ROUTE, makeRequest({ method: 'POST', headers: { host: 'h' } }))
+    const response = await call(routes, RECONNECT_ROUTE, post())
     expect(response.status).toBe(400)
     const body = JSON.parse(response.body) as { ok: boolean; unconfigured?: boolean }
     expect(body.ok).toBe(false)
@@ -2038,47 +1958,41 @@ describe('settings routes', () => {
     expect(target.connectCalls).toBe(0)
   })
 
-  it('opens the native directory chooser and returns the picked path', async () => {
-    const { surface } = makeSurface({}, undefined, stubPicker(async () => '/Users/me/workspaces'))
-    const { server, routes } = makeWebServer()
-    registerSettingsRoutes(server, allowAll, surface)
+  it('opens the native directory chooser with the request signal and returns the picked path', async () => {
+    const signals: AbortSignal[] = []
+    const { surface } = makeSurface({}, undefined, {
+      available: true,
+      pick: async (signal) => {
+        if (signal !== undefined) signals.push(signal)
+        return '/Users/me/workspaces'
+      },
+    })
+    const { connection, routes } = makeConnection()
+    registerSettingsRoutes(connection, surface)
 
-    const crossSite = await call(routes, PICK_DIRECTORY_ROUTE, makeRequest({
-      method: 'POST',
-      headers: { origin: 'https://evil.example', host: '127.0.0.1:52555' },
-    }))
-    expect(crossSite.status).toBe(403)
+    expect((await call(routes, PICK_DIRECTORY_ROUTE)).status).toBe(404)
 
-    const notAllowed = await call(routes, PICK_DIRECTORY_ROUTE, makeRequest({ method: 'GET' }))
-    expect(notAllowed.status).toBe(405)
-    expect(notAllowed.headers.allow).toBe('POST')
-
-    const picked = await call(routes, PICK_DIRECTORY_ROUTE, makeRequest({
-      method: 'POST',
-      headers: { host: '127.0.0.1:52555' },
-    }))
+    const controller = new AbortController()
+    const picked = await call(routes, PICK_DIRECTORY_ROUTE, { method: 'POST', signal: controller.signal })
     expect(picked.status).toBe(200)
     expect(JSON.parse(picked.body)).toEqual({ ok: true, path: '/Users/me/workspaces' })
+    expect(signals).toHaveLength(1)
+    controller.abort()
+    expect(signals[0]!.aborted).toBe(true)
   })
 
   it('reports a canceled chooser as a normal outcome, and failures as JSON errors', async () => {
     let outcome: () => Promise<string | null> = async () => null
     const { surface } = makeSurface({}, undefined, { available: true, pick: () => outcome() })
-    const { server, routes } = makeWebServer()
-    registerSettingsRoutes(server, allowAll, surface)
+    const { connection, routes } = makeConnection()
+    registerSettingsRoutes(connection, surface)
 
-    const canceled = await call(routes, PICK_DIRECTORY_ROUTE, makeRequest({
-      method: 'POST',
-      headers: { host: 'h' },
-    }))
+    const canceled = await call(routes, PICK_DIRECTORY_ROUTE, post())
     expect(canceled.status).toBe(200)
     expect(JSON.parse(canceled.body)).toEqual({ ok: true, canceled: true })
 
     outcome = async () => { throw new Error('dialog failed') }
-    const failed = await call(routes, PICK_DIRECTORY_ROUTE, makeRequest({
-      method: 'POST',
-      headers: { host: 'h' },
-    }))
+    const failed = await call(routes, PICK_DIRECTORY_ROUTE, post())
     expect(failed.status).toBe(500)
     const body = JSON.parse(failed.body) as { ok: boolean; error: string }
     expect(body.ok).toBe(false)
@@ -2086,17 +2000,14 @@ describe('settings routes', () => {
 
     // No picker seam (remote/headless host): the route still exists but refuses.
     const headless = makeSurface()
-    const headlessServer = makeWebServer()
-    registerSettingsRoutes(headlessServer.server, allowAll, headless.surface)
-    const unavailable = await call(headlessServer.routes, PICK_DIRECTORY_ROUTE, makeRequest({
-      method: 'POST',
-      headers: { host: 'h' },
-    }))
+    const headlessConnection = makeConnection()
+    registerSettingsRoutes(headlessConnection.connection, headless.surface)
+    const unavailable = await call(headlessConnection.routes, PICK_DIRECTORY_ROUTE, post())
     expect(unavailable.status).toBe(500)
     expect(JSON.parse(unavailable.body).error).toContain(PANEL_COPY.directoryPickFailed)
   })
 
-  it('serves the access snapshot and guards every whitelist write', async () => {
+  it('serves the access snapshot and every whitelist write', async () => {
     const { surface, target } = makeSurface()
     target.accessState = {
       mode: 'guarded',
@@ -2114,170 +2025,86 @@ describe('settings routes', () => {
         expiresAt: 1_700_000_800_000,
       }],
     }
-    const { server, routes } = makeWebServer()
-    registerSettingsRoutes(server, allowAll, surface)
+    const { connection, routes } = makeConnection()
+    registerSettingsRoutes(connection, surface)
 
-    const read = await call(routes, ACCESS_ROUTE, makeRequest())
+    const read = await call(routes, ACCESS_ROUTE)
     expect(read.status).toBe(200)
     const snapshot = JSON.parse(read.body) as AccessWire
     expect(snapshot.admin).toEqual({ userId: 'u_admin', configured: true })
     expect(snapshot.groups).toEqual(target.accessState.groups)
 
-    const head = await call(routes, ACCESS_ROUTE, makeRequest({ method: 'HEAD', url: ACCESS_ROUTE }))
-    expect(head.status).toBe(200)
-    expect(head.body).toBe('')
-
-    const writes: Array<{ route: string; method: string; body: Record<string, unknown> }> = [
-      { route: ACCESS_GROUPS_ROUTE, method: 'POST', body: { chatId: 'oc_team' } },
-      { route: ACCESS_GROUPS_ROUTE, method: 'DELETE', body: { chatId: 'oc_team' } },
-      { route: ACCESS_USERS_ROUTE, method: 'POST', body: { userId: 'u_alice' } },
-      { route: ACCESS_USERS_ROUTE, method: 'DELETE', body: { userId: 'u_alice' } },
-      { route: ACCESS_WIKI_USERS_ROUTE, method: 'POST', body: { userId: 'u_alice' } },
-      { route: ACCESS_WIKI_USERS_ROUTE, method: 'DELETE', body: { userId: 'u_alice' } },
-      { route: ACCESS_REQUESTS_ROUTE, method: 'POST', body: { token: 'tok_1', decision: 'allow' } },
-    ]
-    for (const write of writes) {
-      const crossSite = await call(routes, write.route, makeRequest({
-        method: write.method,
-        headers: { 'content-type': 'application/json', origin: 'https://evil.example', host: '127.0.0.1:52555' },
-        body: JSON.stringify(write.body),
-      }))
-      expect(crossSite.status).toBe(403)
-    }
-    expect(target.accessCalls).toEqual([])
-
-    const addedGroup = await call(routes, ACCESS_GROUPS_ROUTE, makeRequest({
-      method: 'POST',
-      headers: { 'content-type': 'application/json', host: 'h' },
-      body: JSON.stringify({ chatId: 'oc_team', name: '研发群' }),
-    }))
+    const addedGroup = await call(routes, ADD_ACCESS_GROUP_ROUTE, post({ chatId: 'oc_team', name: '研发群' }))
     expect(addedGroup.status).toBe(200)
     expect(JSON.parse(addedGroup.body).ok).toBe(true)
     expect(JSON.parse(addedGroup.body).access.groups.map((group: { chatId: string }) => group.chatId))
       .toContain('oc_team')
 
-    const invalidUser = await call(routes, ACCESS_USERS_ROUTE, makeRequest({
-      method: 'POST',
-      headers: { 'content-type': 'application/json', host: 'h' },
-      body: JSON.stringify({ userId: 'ou_alice' }),
-    }))
+    const invalidUser = await call(routes, ADD_ACCESS_USER_ROUTE, post({ userId: 'ou_alice' }))
     expect(invalidUser.status).toBe(400)
     expect(JSON.parse(invalidUser.body).error).toContain('ou_')
 
-    const removed = await call(routes, ACCESS_GROUPS_ROUTE, makeRequest({
-      method: 'DELETE',
-      headers: { 'content-type': 'application/json', host: 'h' },
-      body: JSON.stringify({ chatId: 'oc_team' }),
-    }))
+    const addedUser = await call(routes, ADD_ACCESS_USER_ROUTE, post({ userId: 'u_alice' }))
+    expect(JSON.parse(addedUser.body).access.users.map((user: { userId: string }) => user.userId)).toEqual(['u_alice'])
+    const removedUser = await call(routes, REMOVE_ACCESS_USER_ROUTE, post({ userId: 'u_alice' }))
+    expect(JSON.parse(removedUser.body).access.users).toEqual([])
+
+    const removed = await call(routes, REMOVE_ACCESS_GROUP_ROUTE, post({ chatId: 'oc_team' }))
     expect(removed.status).toBe(200)
 
-    const addedWiki = await call(routes, ACCESS_WIKI_USERS_ROUTE, makeRequest({
-      method: 'POST',
-      headers: { 'content-type': 'application/json', host: 'h' },
-      body: JSON.stringify({ userId: 'u_wiki', name: 'Wiki' }),
-    }))
+    const addedWiki = await call(routes, ADD_WIKI_USER_ROUTE, post({ userId: 'u_wiki', name: 'Wiki' }))
     expect(addedWiki.status).toBe(200)
     expect(JSON.parse(addedWiki.body).access.wikiUsers.map((user: { userId: string }) => user.userId)).toEqual(['u_wiki'])
-    const removedWiki = await call(routes, ACCESS_WIKI_USERS_ROUTE, makeRequest({
-      method: 'DELETE',
-      headers: { 'content-type': 'application/json', host: 'h' },
-      body: JSON.stringify({ userId: 'u_wiki' }),
-    }))
+    const removedWiki = await call(routes, REMOVE_WIKI_USER_ROUTE, post({ userId: 'u_wiki' }))
     expect(JSON.parse(removedWiki.body).access.wikiUsers).toEqual([])
-    const invalidWiki = await call(routes, ACCESS_WIKI_USERS_ROUTE, makeRequest({
-      method: 'POST',
-      headers: { 'content-type': 'application/json', host: 'h' },
-      body: JSON.stringify({ userId: 'ou_wiki' }),
-    }))
+    const invalidWiki = await call(routes, ADD_WIKI_USER_ROUTE, post({ userId: 'ou_wiki' }))
     expect(invalidWiki.status).toBe(400)
 
-    const resolved = await call(routes, ACCESS_REQUESTS_ROUTE, makeRequest({
-      method: 'POST',
-      headers: { 'content-type': 'application/json', host: 'h' },
-      body: JSON.stringify({ token: 'tok_1', decision: 'allow' }),
-    }))
+    const resolved = await call(routes, RESOLVE_ACCESS_REQUEST_ROUTE, post({ token: 'tok_1', decision: 'allow' }))
     expect(resolved.status).toBe(200)
     expect(JSON.parse(resolved.body).access.requests).toEqual([])
 
-    const missing = await call(routes, ACCESS_GROUPS_ROUTE, makeRequest({
-      method: 'POST',
-      headers: { 'content-type': 'application/json', host: 'h' },
-      body: JSON.stringify({}),
-    }))
+    const missing = await call(routes, ADD_ACCESS_GROUP_ROUTE, post({}))
     expect(missing.status).toBe(400)
 
-    const notAllowed = await call(routes, ACCESS_GROUPS_ROUTE, makeRequest({ method: 'GET' }))
-    expect(notAllowed.status).toBe(405)
-    expect(notAllowed.headers.allow).toBe('POST, DELETE')
+    expect((await call(routes, ADD_ACCESS_GROUP_ROUTE)).status).toBe(404)
   })
-})
 
-  it('writes and removes credentials via PUT / DELETE with the same guards', async () => {
+  it('writes and removes credentials over POST', async () => {
     const { surface } = makeSurface()
-    const { server, routes } = makeWebServer()
-    registerSettingsRoutes(server, allowAll, surface)
+    const { connection, routes } = makeConnection()
+    registerSettingsRoutes(connection, surface)
 
-    const crossSite = await call(routes, CREDENTIALS_ROUTE, makeRequest({
-      method: 'PUT',
-      headers: { 'content-type': 'application/json', origin: 'https://evil.example', host: '127.0.0.1:52555' },
-      body: JSON.stringify({ appId: 'cli_x' }),
-    }))
-    expect(crossSite.status).toBe(403)
-
-    const saved = await call(routes, CREDENTIALS_ROUTE, makeRequest({
-      method: 'PUT',
-      headers: { 'content-type': 'application/json', host: '127.0.0.1:52555' },
-      body: JSON.stringify({ appId: 'cli_x' }),
-    }))
+    const saved = await call(routes, SAVE_CREDENTIALS_ROUTE, post({ appId: 'cli_x' }))
     expect(saved.status).toBe(200)
     expect(JSON.parse(saved.body).ok).toBe(true)
 
-    const invalid = await call(routes, CREDENTIALS_ROUTE, makeRequest({
-      method: 'PUT',
-      headers: { 'content-type': 'application/json', host: 'h' },
-      body: JSON.stringify({ appId: '   ' }),
-    }))
+    const invalid = await call(routes, SAVE_CREDENTIALS_ROUTE, post({ appId: '   ' }))
     expect(invalid.status).toBe(400)
 
-    const badField = await call(routes, CREDENTIALS_ROUTE, makeRequest({
-      method: 'DELETE',
-      headers: { 'content-type': 'application/json', host: 'h' },
-      body: JSON.stringify({ field: 'nope' }),
-    }))
+    const badField = await call(routes, CLEAR_CREDENTIAL_ROUTE, post({ field: 'nope' }))
     expect(badField.status).toBe(400)
 
-    const removed = await call(routes, CREDENTIALS_ROUTE, makeRequest({
-      method: 'DELETE',
-      headers: { 'content-type': 'application/json', host: 'h' },
-      body: JSON.stringify({ field: 'appSecret' }),
-    }))
+    const removed = await call(routes, CLEAR_CREDENTIAL_ROUTE, post({ field: 'appSecret' }))
     expect(removed.status).toBe(200)
     expect(JSON.parse(removed.body).ok).toBe(true)
 
-    const token = await call(routes, CREDENTIALS_ROUTE, makeRequest({
-      method: 'PUT',
-      headers: { 'content-type': 'application/json', host: 'h' },
-      body: JSON.stringify({ analyzeToken: 'tok_new' }),
-    }))
+    const token = await call(routes, SAVE_CREDENTIALS_ROUTE, post({ analyzeToken: 'tok_new' }))
     expect(token.status).toBe(200)
     expect(JSON.parse(token.body).reconnect).toBe('not-needed')
 
-    const tokenRemoved = await call(routes, CREDENTIALS_ROUTE, makeRequest({
-      method: 'DELETE',
-      headers: { 'content-type': 'application/json', host: 'h' },
-      body: JSON.stringify({ field: 'analyzeToken' }),
-    }))
+    const tokenRemoved = await call(routes, CLEAR_CREDENTIAL_ROUTE, post({ field: 'analyzeToken' }))
     expect(tokenRemoved.status).toBe(200)
 
-    const notAllowed = await call(routes, CREDENTIALS_ROUTE, makeRequest({ method: 'GET' }))
-    expect(notAllowed.status).toBe(405)
+    expect((await call(routes, SAVE_CREDENTIALS_ROUTE)).status).toBe(404)
   })
+})
 
 describe('apply() web wiring', () => {
-  it('mounts the panel routes through an optional webServer and boots the channel', async () => {
+  it('mounts the panel routes through an optional connection and boots the channel', async () => {
     const { apply } = await import('../src/index.ts')
     const { ctx: base } = makeHostContext()
-    const { server, routes } = makeWebServer()
+    const { connection, routes } = makeConnection()
     const cleanups: Array<() => void | Promise<void>> = []
     const effect = (callback: () => void | (() => void | Promise<void>)): void => {
       const cleanup = callback()
@@ -2287,8 +2114,7 @@ describe('apply() web wiring', () => {
       ...base,
       effect,
       get: (name: string) => {
-        if (name === 'webServer') return server
-        if (name === 'connection') return allowAll
+        if (name === 'connection') return connection
         return base.get?.(name)
       },
     }
@@ -2312,19 +2138,10 @@ describe('apply() web wiring', () => {
       channelFactory: () => channel,
     })
 
-    expect(injected).toContainEqual(['webServer', 'connection'])
-    expect(routes.has(PANEL_ROUTE)).toBe(true)
-    expect(routes.has(STATUS_ROUTE)).toBe(true)
-    expect(routes.has(CATALOG_ROUTE)).toBe(true)
-    expect(routes.has(CONFIG_ROUTE)).toBe(true)
-    expect(routes.has(CREDENTIALS_ROUTE)).toBe(true)
-    expect(routes.has(RECONNECT_ROUTE)).toBe(true)
-    expect(routes.has(ACCESS_ROUTE)).toBe(true)
-    expect(routes.has(ACCESS_GROUPS_ROUTE)).toBe(true)
-    expect(routes.has(ACCESS_USERS_ROUTE)).toBe(true)
-    expect(routes.has(ACCESS_REQUESTS_ROUTE)).toBe(true)
+    expect(injected).toContainEqual(['connection'])
+    expect(routes.size).toBe(19)
 
-    const panel = await call(routes, PANEL_ROUTE, makeRequest())
+    const panel = await call(routes, PANEL_ROUTE)
     expect(panel.status).toBe(200)
     const panelBody = JSON.parse(panel.body)
     expect(panelBody.config.fields).toHaveLength(EDITABLE_KEYS.length)
@@ -2335,15 +2152,11 @@ describe('apply() web wiring', () => {
     expect(providerField.kind).toBe('select')
 
     await vi.waitFor(async () => {
-      const status = await call(routes, STATUS_ROUTE, makeRequest())
+      const status = await call(routes, STATUS_ROUTE)
       expect(JSON.parse(status.body).running).toBe(true)
     })
 
-    const saved = await call(routes, CONFIG_ROUTE, makeRequest({
-      method: 'PUT',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ values: { requireMention: false } }),
-    }))
+    const saved = await call(routes, SAVE_CONFIG_ROUTE, post({ values: { requireMention: false } }))
     expect(saved.status).toBe(200)
     expect(JSON.parse(readFileSync(path.join(dshHome, 'dsh-channels', 'settings.json'), 'utf8')))
       .toMatchObject({ requireMention: false })
@@ -2354,21 +2167,21 @@ describe('apply() web wiring', () => {
 })
 
 describe('mountSettingsRoutes', () => {
-  it('mounts nothing when the host has a webServer but no connection gate', () => {
+  it('mounts nothing without the host connection service, and every route with it', () => {
     const { surface } = makeSurface()
-    const { server, routes } = makeWebServer()
+    const { connection, routes } = makeConnection()
     const { ctx: base } = makeHostContext()
     const ctx = {
       ...base,
       effect: (callback: () => unknown) => { callback() },
-      get: (name: string) => (name === 'webServer' ? server : undefined),
+      get: () => undefined,
     } as unknown as HostContext
     mountSettingsRoutes(ctx, surface)
     expect(routes.size).toBe(0)
 
-    const gated = { ...ctx, get: (name: string) => (name === 'webServer' ? server : name === 'connection' ? allowAll : undefined) }
-    mountSettingsRoutes(gated as unknown as HostContext, surface)
-    expect(routes.has(CONFIG_ROUTE)).toBe(true)
+    const connected = { ...ctx, get: (name: string) => (name === 'connection' ? connection : undefined) }
+    mountSettingsRoutes(connected as unknown as HostContext, surface)
+    expect(routes.has(SAVE_CONFIG_ROUTE)).toBe(true)
   })
 })
 

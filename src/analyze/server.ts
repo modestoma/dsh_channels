@@ -15,11 +15,19 @@
 import { createHash, timingSafeEqual } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { HostContext } from '../dsh-types.ts'
-import type { HostWebServer } from '../settings/routes.ts'
 import {
   ANALYZE_MAX_BODY_BYTES, ANALYZE_ROUTE, IDEMPOTENCY_KEY_PATTERN, parseAnalyzeRequest,
 } from './contract.ts'
 import type { AnalyzeRequest, AnalyzeResponse } from './contract.ts'
+
+/** The narrow `ctx.webServer` surface the analyze route registers into. */
+export interface HostWebServer {
+  register(route: {
+    kind: 'exact'
+    path: string
+    handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
+  }): () => void
+}
 
 /** The business side of the route. */
 export interface AnalyzeHandler {

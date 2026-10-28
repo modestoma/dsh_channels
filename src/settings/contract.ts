@@ -7,29 +7,45 @@
  * @module dsh-channels/settings/contract
  */
 
-/** Same-origin routes the settings panel talks to. */
-export const STATUS_ROUTE = '/dsh-channels/status'
-export const PANEL_ROUTE = '/dsh-channels/panel'
-export const CONFIG_ROUTE = '/dsh-channels/config'
-export const CREDENTIALS_ROUTE = '/dsh-channels/credentials'
+/**
+ * Settings panel routes: exact DSH `/api` Fetch routes named
+ * `/api/dsh-channels.<method>`. Reads are GET; every write is POST, because
+ * DSH exact `/api` routes accept only GET, HEAD, and POST.
+ */
+export const STATUS_ROUTE = '/api/dsh-channels.status'
+export const PANEL_ROUTE = '/api/dsh-channels.panel'
+/** Persist a partial config edit (POST, body `{ values }`). */
+export const SAVE_CONFIG_ROUTE = '/api/dsh-channels.saveConfig'
+/** Drop every Web override (POST, no body). */
+export const CLEAR_CONFIG_ROUTE = '/api/dsh-channels.clearConfig'
+/** Store credential values (POST, body `SaveCredentialsRequest`). */
+export const SAVE_CREDENTIALS_ROUTE = '/api/dsh-channels.saveCredentials'
+/** Remove one stored credential (POST, body `{ field }`). */
+export const CLEAR_CREDENTIAL_ROUTE = '/api/dsh-channels.clearCredential'
 /**
  * Connection lifecycle action (POST). While the channel runs it restarts the
  * long connection; while it is stopped it opens one — so the panel has exactly
  * one "connect / reconnect" button. Credentials are resolved again either way.
  */
-export const RECONNECT_ROUTE = '/dsh-channels/reconnect'
+export const RECONNECT_ROUTE = '/api/dsh-channels.reconnect'
 /** 模型/推理档位/预设选择器的宿主目录（provider → model → effort 级联刷新）。 */
-export const CATALOG_ROUTE = '/dsh-channels/catalog'
-/** 访问与授权只读快照（GET/HEAD）：准入模式、管理员、群/用户/知识库白名单、待处理申请。 */
-export const ACCESS_ROUTE = '/dsh-channels/access'
-/** 群白名单增删（POST/DELETE，body `{ chatId, name? }` / `{ chatId }`）。 */
-export const ACCESS_GROUPS_ROUTE = '/dsh-channels/access/groups'
-/** 用户白名单增删（POST/DELETE，body `{ userId, name? }` / `{ userId }`）。 */
-export const ACCESS_USERS_ROUTE = '/dsh-channels/access/users'
-/** 知识库白名单增删（POST/DELETE，body `{ userId, name? }` / `{ userId }`）。 */
-export const ACCESS_WIKI_USERS_ROUTE = '/dsh-channels/access/wiki-users'
+export const CATALOG_ROUTE = '/api/dsh-channels.catalog'
+/** 访问与授权只读快照（GET）：准入模式、管理员、群/用户/知识库白名单、待处理申请。 */
+export const ACCESS_ROUTE = '/api/dsh-channels.access'
+/** 授权一个群（POST，body `{ chatId, name? }`）。 */
+export const ADD_ACCESS_GROUP_ROUTE = '/api/dsh-channels.addAccessGroup'
+/** 撤销一个群（POST，body `{ chatId }`）。 */
+export const REMOVE_ACCESS_GROUP_ROUTE = '/api/dsh-channels.removeAccessGroup'
+/** 用户白名单添加（POST，body `{ userId, name? }`）。 */
+export const ADD_ACCESS_USER_ROUTE = '/api/dsh-channels.addAccessUser'
+/** 用户白名单移除（POST，body `{ userId }`）。 */
+export const REMOVE_ACCESS_USER_ROUTE = '/api/dsh-channels.removeAccessUser'
+/** 知识库白名单添加（POST，body `{ userId, name? }`）。 */
+export const ADD_WIKI_USER_ROUTE = '/api/dsh-channels.addWikiUser'
+/** 知识库白名单移除（POST，body `{ userId }`）。 */
+export const REMOVE_WIKI_USER_ROUTE = '/api/dsh-channels.removeWikiUser'
 /** 结算一条待处理授权申请（POST，body `{ token, decision }`）。 */
-export const ACCESS_REQUESTS_ROUTE = '/dsh-channels/access/requests'
+export const RESOLVE_ACCESS_REQUEST_ROUTE = '/api/dsh-channels.resolveAccessRequest'
 /**
  * 打开宿主机的系统目录选择框（POST，无请求体），返回绝对路径。
  *
@@ -37,9 +53,9 @@ export const ACCESS_REQUESTS_ROUTE = '/dsh-channels/access/requests'
  * 会注册实际选择逻辑；远程/无头会话的 browse 后端不可用，面板不下发
  * [`EditableFieldWire.browse`]，保留手写输入。
  */
-export const PICK_DIRECTORY_ROUTE = '/dsh-channels/pick-directory'
-/** 会话的飞书来源（GET/HEAD，`?sessionId=`）：对话右侧栏「飞书来源」标签与会话头部入口使用。 */
-export const SESSION_ORIGIN_ROUTE = '/dsh-channels/session-origin'
+export const PICK_DIRECTORY_ROUTE = '/api/dsh-channels.pickDirectory'
+/** 会话的飞书来源（GET，`?sessionId=`）：对话右侧栏「飞书来源」标签与会话头部入口使用。 */
+export const SESSION_ORIGIN_ROUTE = '/api/dsh-channels.sessionOrigin'
 
 /** Where one Feishu-routed Session came from; names are resolved live and may be absent. */
 export interface SessionOriginWire {
@@ -76,7 +92,7 @@ export interface SessionOriginWire {
  * names and avatars for the users and chats the panel shows. At most
  * {@link PROFILES_MAX_IDS} ids per list.
  */
-export const PROFILES_ROUTE = '/dsh-channels/profiles'
+export const PROFILES_ROUTE = '/api/dsh-channels.profiles'
 
 /** Most `user_id`s, and separately most `chat_id`s, one profiles request may name. */
 export const PROFILES_MAX_IDS = 200
@@ -111,7 +127,7 @@ export interface SessionOriginResponse {
  * `cordis.patch.yml`（见 README「Web 设置面板」）。
  *
  * 刻意不包含 `appId` / `appSecret`：它们是**凭据引用名**，面板改为直接
- * 编辑引用背后的值（`PUT /dsh-channels/credentials`，经 DSH 凭据服务写入），
+ * 编辑引用背后的值（`POST /api/dsh-channels.saveCredentials`，经 DSH 凭据服务写入），
  * 因此不会落进覆盖层文件。
  *
  * `baseDir`（工作区根目录 = 模型/工具产生文件的落点）可覆盖，但面板只接受
@@ -304,7 +320,7 @@ export interface SelectCatalogWire {
   help?: string
 }
 
-/** `GET /dsh-channels/catalog` payload: the model-facing selector catalog. */
+/** `GET /api/dsh-channels.catalog` payload: the model-facing selector catalog. */
 export interface CatalogWire {
   provider: SelectCatalogWire
   model: SelectCatalogWire
@@ -498,7 +514,7 @@ export interface AccessRequestWire {
 }
 
 /**
- * `GET /dsh-channels/access` payload: admission mode, the administrator
+ * `GET /api/dsh-channels.access` payload: admission mode, the administrator
  * reference, the group, user, and wiki whitelists, and the still-pending
  * authorization requests.
  */
@@ -527,12 +543,12 @@ export interface AccessWire {
   requests: AccessRequestWire[]
 }
 
-/** Write responses for every `/dsh-channels/access*` mutation. */
+/** Write responses for every access mutation route. */
 export type AccessMutationResponse =
   | { ok: true; access: AccessWire }
   | { ok: false; error: string }
 
-/** `GET /dsh-channels/panel` payload. */
+/** `GET /api/dsh-channels.panel` payload. */
 export interface PanelWire {
   status: ChannelStatusWire
   config: PanelConfigWire
@@ -541,7 +557,7 @@ export interface PanelWire {
 }
 
 /**
- * `POST /dsh-channels/pick-directory` response. `canceled` is a normal
+ * `POST /api/dsh-channels.pickDirectory` response. `canceled` is a normal
  * outcome (the operator dismissed the OS dialog), not an error; `path` is an
  * absolute directory the Host's native chooser returned.
  */
@@ -550,7 +566,7 @@ export type PickDirectoryResponse =
   | { ok: true; canceled: true }
   | { ok: false; error: string }
 
-/** `PUT /dsh-channels/config` body. */
+/** `POST /api/dsh-channels.saveConfig` body. */
 export interface SaveConfigRequest {
   values: EditableValues
 }
@@ -566,30 +582,30 @@ export interface FieldIssueWire {
   index?: number
 }
 
-/** `PUT /dsh-channels/config` response. */
+/** `POST /api/dsh-channels.saveConfig` response. */
 export type SaveConfigResponse =
   | { ok: true; panel: PanelWire; clearedKeys: EditableKey[] }
   | { ok: false; error: string; issues?: FieldIssueWire[] }
 
-/** `POST /dsh-channels/reconnect` response. */
+/** `POST /api/dsh-channels.reconnect` response. */
 export type ReconnectResponse =
   | { ok: true; panel: PanelWire }
   /** `unconfigured` tells the panel to route the user to the credentials form. */
   | { ok: false; error: string; unconfigured?: boolean }
 
-/** `DELETE /dsh-channels/config` response. */
+/** `POST /api/dsh-channels.clearConfig` response. */
 export type ClearConfigResponse =
   | { ok: true; panel: PanelWire }
   | { ok: false; error: string }
 
-/** `PUT /dsh-channels/credentials` body: only provided, non-empty values are written. */
+/** `POST /api/dsh-channels.saveCredentials` body: only provided, non-empty values are written. */
 export interface SaveCredentialsRequest {
   appId?: string
   appSecret?: string
   analyzeToken?: string
 }
 
-/** `DELETE /dsh-channels/credentials` body. */
+/** `POST /api/dsh-channels.clearCredential` body. */
 export interface ClearCredentialRequest {
   field: CredentialField
 }
