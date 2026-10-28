@@ -230,6 +230,27 @@ describe('installRequestPolicy on hosts that own model selection', () => {
     await ctx.fiber.dispose()
   })
 
+  it('lets a settled reset clear a selection persisted before this controller existed', async () => {
+    const ctx = new Context()
+    const controller = installRequestPolicy(ctx as unknown as AgentContext)
+    const { agent, selections } = selectingAgent()
+    // An earlier plugin instance (or a since-removed config default) recorded these.
+    agent.model!.select({ provider: 'provider-old', model: 'model-old', reasoningEffort: 'high' })
+    selections.length = 0
+
+    controller.sync([], agent)
+    expect(selections).toEqual([])
+
+    controller.sync(command(0, 'e1', 'effort', 'reset'), agent, 'effort')
+    expect(selections.at(-1)).toEqual({ provider: 'provider-old', model: 'model-old' })
+
+    controller.sync([...command(0, 'e1', 'effort', 'reset'), ...command(2, 'm1', 'model', 'reset')], agent, 'model')
+    expect(selections.at(-1)).toEqual({ provider: 'deployment', model: 'default-model' })
+
+    controller.dispose()
+    await ctx.fiber.dispose()
+  })
+
   it('records nothing without a policy or a resolvable route', async () => {
     const ctx = new Context()
     const noPolicy = installRequestPolicy(ctx as unknown as AgentContext)

@@ -60,9 +60,13 @@ export interface RequestPolicyController {
   /**
    * Re-fold the durable log after resume or a settled command lifecycle.
    * With an `agent` whose host owns model selection, a changed policy is
-   * recorded through `agent.model.select()` for the next step.
+   * recorded through `agent.model.select()` for the next step. `reconcile`
+   * names a just-settled `/effort` or `/model` switch: the policy is recorded
+   * even when this controller saw no change, so a reset also clears a
+   * selection persisted before the controller existed (earlier plugin
+   * instance or since-removed config default).
    */
-  sync(events: readonly SessionEvent[], agent?: Agent): void
+  sync(events: readonly SessionEvent[], agent?: Agent, reconcile?: 'effort' | 'model'): void
   /** Remove only this controller's Agent-scoped request wrapper. */
   dispose(): void
 }
@@ -225,7 +229,7 @@ export function installRequestPolicy(
           : configuredModel !== undefined ? 'config' : 'deployment-default',
       }
     },
-    sync(events, agent) {
+    sync(events, agent, reconcile) {
       const folded = foldRequestPolicy(events)
       effortOverride = folded.effort
       modelOverride = folded.model
@@ -234,8 +238,9 @@ export function installRequestPolicy(
       const next: AppliedPolicy = { effort: effortOverride ?? config.effort, model: modelOverride ?? configuredModel }
       const previous = applied ?? { effort: undefined, model: undefined }
       applied = next
-      if (previous.effort === next.effort && sameModel(previous.model, next.model)) return
-      selectPolicy(model, agent, next.effort, next.model, previous.model !== undefined && next.model === undefined)
+      if (reconcile === undefined && previous.effort === next.effort && sameModel(previous.model, next.model)) return
+      const modelCleared = next.model === undefined && (reconcile === 'model' || previous.model !== undefined)
+      selectPolicy(model, agent, next.effort, next.model, modelCleared)
     },
     dispose() {
       if (disposed) return

@@ -2488,8 +2488,15 @@ export class FeishuService {
     modelAdmission: ModelAdmission | undefined
   }): Promise<void> {
     const { spec, msg, current, live, result, compactBefore, renewAdmission, effortAdmission, modelAdmission } = input
-    if (spec.name === 'effort') effortAdmission?.controller.sync(live.agent.session.snapshotEvents(), live.agent)
-    if (spec.name === 'model') modelAdmission?.controller.sync(live.agent.session.snapshotEvents(), live.agent)
+    // A settled switch (not a bare view) reconciles the Agent's selection even
+    // when the folded policy looks unchanged, e.g. a reset after restart.
+    const reconcile = !input.bare && result.kind === 'success' ? spec.name : undefined
+    if (spec.name === 'effort') {
+      effortAdmission?.controller.sync(live.agent.session.snapshotEvents(), live.agent, reconcile === 'effort' ? 'effort' : undefined)
+    }
+    if (spec.name === 'model') {
+      modelAdmission?.controller.sync(live.agent.session.snapshotEvents(), live.agent, reconcile === 'model' ? 'model' : undefined)
+    }
     if (input.bare && result.kind === 'success') {
       const picker = spec.name === 'model' && modelAdmission !== undefined
         ? await this.modelPicker(current, live, modelAdmission)
