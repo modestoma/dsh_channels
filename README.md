@@ -307,7 +307,7 @@ npm 发行包已包含构建产物：Host 入口是 `lib/index.js`（profile 直
     loggerLevel: 'info'
 ```
 
-`reasoningEffort` 是每个 Session 的初始/重置默认值，并在新建、恢复或借用 Agent 的作用域内以 `prepend` 外层覆盖 `agent/request`，因此胜过已存在的模型选择与 provider 默认；借用外部 Agent 时，插件关闭只移除这条频道策略，不销毁外部 Agent。话题所有者可用 `/effort <档位-id>` 覆盖当前 Session，`/effort` 查看生效来源，`/effort reset` 恢复该配置值（未配置时恢复模型适配器/provider 默认）。成功选择由 Session 自带的 `command/run` / `command/done` 日志恢复，重启后仍生效；新建 Session 不继承旧 Session 的覆盖。
+`reasoningEffort` 是每个 Session 的初始/重置默认值。DSH 0.2.2 起模型选择归 Agent 所有（`agent.model`），插件在新建、恢复、借用 Agent 以及 `/model`、`/effort` 成功后用 `agent.model.select()` 记录生效的 provider/model/推理强度（`/model reset` 回到 Agent 的部署默认路由）；DSH 0.2.1 没有 `agent.model`，插件改为在该 Agent 作用域内以 `prepend` 外层覆盖 `agent/request`，因此胜过已存在的模型选择与 provider 默认。两种宿主自动识别，无需配置；借用外部 Agent 时，插件关闭只移除这条频道策略，不销毁外部 Agent。话题所有者可用 `/effort <档位-id>` 覆盖当前 Session，`/effort` 查看生效来源，`/effort reset` 恢复该配置值（未配置时恢复模型适配器/provider 默认）。成功选择由 Session 自带的 `command/run` / `command/done` 日志恢复，重启后仍生效；新建 Session 不继承旧 Session 的覆盖。
 
 推理档位是适配器拥有的不透明 id（常见如 `off`、`low`、`high`、`max`），命令不会猜测或预校验 provider 的能力；不受支持的值会在下一次模型请求前被 Harness 拒绝，并按失败终态显示错误。
 
