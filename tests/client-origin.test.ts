@@ -23,7 +23,7 @@ describe('loadSessionOrigin', () => {
     await expect(loadSessionOrigin('s_cache')).resolves.toEqual(origin)
     await expect(loadSessionOrigin('s_cache')).resolves.toEqual(origin)
     expect(fetch).toHaveBeenCalledTimes(1)
-    expect(fetch.mock.calls[0]?.[0]).toBe('dsh-channels/session-origin?sessionId=s_cache')
+    expect(fetch.mock.calls[0]?.[0]).toBe('api/dsh-channels.sessionOrigin?sessionId=s_cache')
     await loadSessionOrigin('s_cache', true)
     expect(fetch).toHaveBeenCalledTimes(2)
   })

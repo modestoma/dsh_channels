@@ -145,7 +145,6 @@ const OPTIONAL_TEXT_KEYS = new Set<EditableKey>([
   'agentPreset',
   'maxTokens',
   'adminUserId',
-  'analyzeListen',
 ])
 
 const BOOLEAN_KEYS = new Set<EditableKey>([
@@ -161,6 +160,7 @@ const BOOLEAN_KEYS = new Set<EditableKey>([
   'feishuTools.sendFile',
   'feishuTools.wikiRead',
   'feishuTools.wikiWrite',
+  'analyzeEnabled',
 ])
 
 /** Bounds and entry format of one `string-list` field. */
@@ -438,12 +438,11 @@ const FIELD_META: Record<EditableKey, FieldMeta> = {
     placeholder: 'https://<租户>.feishu.cn/wiki/space/<space_id>',
     wide: true,
   },
-  analyzeListen: {
-    label: '监听地址',
+  analyzeEnabled: {
+    label: '日志分析接口',
     group: 'analyze',
-    summary: '日志平台调用分析接口的 host:port，留空关闭',
-    help: '接口路径 POST /dsh-channels/analyze，请求需带 Authorization: Bearer <访问令牌>。',
-    placeholder: '例如 0.0.0.0:3090',
+    summary: '关闭时接口返回 404',
+    help: '接口挂在 DSH Web 端口上：POST /api/dsh-channels.logalyze，请求需带 Authorization: Bearer <访问令牌>。只有带 Web 的 profile 才有这个接口。改后立即生效，不需要重连。',
   },
   loggerLevel: { label: 'SDK 日志级别', group: 'logging' },
 }

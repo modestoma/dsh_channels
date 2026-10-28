@@ -1,5 +1,5 @@
 /**
- * 「高级」tab：日志分析接口（监听地址字段 + 访问令牌凭据行）、SDK 日志级别
+ * 「高级」tab：日志分析接口（开关 + 访问令牌凭据行）、SDK 日志级别
  * 与 Web 覆盖文件（「恢复 profile 配置」删除整个覆盖层，不走 draft）。
  *
  * @module dsh-channels/client/panel/advanced-tab

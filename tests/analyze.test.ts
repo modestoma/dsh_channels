@@ -1,9 +1,12 @@
 /**
- * Log-platform analyze API: wire contract, HTTP listener, and the service
+ * Log-platform analyze API: wire contract, DSH Web route, and the service
  * flow from an accepted request to a group-shared topic.
  */
 
 import { mkdtempSync } from 'node:fs'
+import { createServer } from 'node:http'
+import type { IncomingMessage, ServerResponse } from 'node:http'
+import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -12,11 +15,12 @@ import {
 } from '../src/analyze/contract.ts'
 import type { AnalyzeRequest, AnalyzeResponse } from '../src/analyze/contract.ts'
 import type { AnalyzeLauncher } from '../src/analyze/launcher.ts'
-import { parseListenAddress, startAnalyzeServer } from '../src/analyze/server.ts'
-import type { AnalyzeHandler, AnalyzeServer } from '../src/analyze/server.ts'
+import { mountAnalyzeRoute } from '../src/analyze/server.ts'
+import type { AnalyzeHandler } from '../src/analyze/server.ts'
 import { buildAnalyzeRootCard } from '../src/cards.ts'
 import { resolveConfig } from '../src/config.ts'
 import type { FeishuConfig } from '../src/config.ts'
+import type { HostContext } from '../src/dsh-types.ts'
 import type { AnalyzeRequestRecord, RouteRecord } from '../src/domain.ts'
 import type { CardActionEvent, ChannelFactory, NormalizedMessage } from '../src/feishu-channel.ts'
 import { FeishuService } from '../src/service.ts'
@@ -93,28 +97,43 @@ describe('analyze contract', () => {
     expect(stopped).toContain('"template":"grey"')
   })
 
-  it('validates the listen address and token reference in config', () => {
-    expect(resolveConfig({ analyzeListen: '0.0.0.0:3090' }).analyzeListen).toBe('0.0.0.0:3090')
+  it('defaults the switch off, validates the token reference, and ignores the removed listen address', () => {
+    expect(resolveConfig({}).analyzeEnabled).toBe(false)
+    expect(resolveConfig({ analyzeEnabled: true }).analyzeEnabled).toBe(true)
     expect(resolveConfig({}).analyzeToken).toBe('DSH_CHANNELS_ANALYZE_TOKEN')
-    expect(() => resolveConfig({ analyzeListen: '3090' })).toThrow(/analyzeListen/)
-    expect(() => resolveConfig({ analyzeListen: '0.0.0.0:70000' })).toThrow(/analyzeListen/)
     expect(() => resolveConfig({ analyzeToken: 'plain secret' })).toThrow(/analyzeToken/)
-    expect(parseListenAddress('[::1]:3090')).toEqual({ host: '::1', port: 3090 })
+    expect(resolveConfig({ analyzeListen: '0.0.0.0:3090' })).not.toHaveProperty('analyzeListen')
   })
 })
 
-describe('analyze listener', () => {
-  async function listen(handler: Partial<AnalyzeHandler> = {}): Promise<{ url: string; calls: unknown[][] }> {
+describe('analyze route', () => {
+  type Route = { kind: 'exact'; path: string; handler: (req: IncomingMessage, res: ServerResponse) => Promise<void> | void }
+
+  /** Mount the route on a fake `webServer` served by a real HTTP server (exact match, else 404). */
+  async function serve(handler: Partial<AnalyzeHandler> = {}): Promise<{ url: string; calls: unknown[][]; routes: Route[] }> {
     const calls: unknown[][] = []
-    const server: AnalyzeServer = await startAnalyzeServer('127.0.0.1:0', {
+    const routes: Route[] = []
+    const webServer = { register: (route: Route) => { routes.push(route); return () => {} } }
+    const ctx = { get: (name: string) => (name === 'webServer' ? webServer : undefined), effect: (fn: () => unknown) => fn() }
+    mountAnalyzeRoute(ctx as unknown as HostContext, {
+      enabled: handler.enabled ?? (() => true),
       token: handler.token ?? (async () => 'secret-token'),
       analyze: handler.analyze ?? (async (...args): Promise<AnalyzeResponse> => {
         calls.push(args)
         return { status: 202, body: { ok: true, chatId: 'oc_group', messageId: 'om_1' } }
       }),
     }, vi.fn())
-    servers.push(server)
-    return { url: `http://127.0.0.1:${server.address.port}`, calls }
+    const server = createServer((req, res) => {
+      const route = routes.find(entry => entry.path === new URL(req.url ?? '/', 'http://x').pathname)
+      if (route === undefined) {
+        res.writeHead(404).end()
+        return
+      }
+      void route.handler(req, res)
+    })
+    await new Promise<void>((resolve) => { server.listen(0, '127.0.0.1', resolve) })
+    servers.push({ close: () => new Promise<void>((resolve) => { server.close(() => { resolve() }); server.closeAllConnections() }) })
+    return { url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, calls, routes }
   }
 
   const headers = {
@@ -123,8 +142,20 @@ describe('analyze listener', () => {
     'content-type': 'application/json',
   }
 
+  it('registers one exact route under the DSH /api namespace', async () => {
+    const { routes } = await serve()
+    expect(ANALYZE_ROUTE).toBe('/api/dsh-channels.logalyze')
+    expect(routes.map(({ kind, path: routePath }) => ({ kind, path: routePath }))).toEqual([{ kind: 'exact', path: ANALYZE_ROUTE }])
+  })
+
+  it('mounts nothing on hosts without a Web server', () => {
+    const ctx = { get: () => undefined, effect: vi.fn() }
+    mountAnalyzeRoute(ctx as unknown as HostContext, { enabled: () => true, token: async () => 't', analyze: vi.fn() }, vi.fn())
+    expect(ctx.effect).not.toHaveBeenCalled()
+  })
+
   it('passes a valid request to the handler', async () => {
-    const { url, calls } = await listen()
+    const { url, calls } = await serve()
     const res = await fetch(`${url}${ANALYZE_ROUTE}`, { method: 'POST', headers, body: JSON.stringify(request()) })
     expect(res.status).toBe(202)
     expect(await res.json()).toMatchObject({ ok: true, messageId: 'om_1' })
@@ -132,18 +163,17 @@ describe('analyze listener', () => {
   })
 
   it.each([
-    ['unknown path', '/other', {}, JSON.stringify(request()), 404],
-    ['wrong method', ANALYZE_ROUTE, { method: 'GET' }, undefined, 405],
-    ['wrong token', ANALYZE_ROUTE, { headers: { ...headers, authorization: 'Bearer nope' } }, JSON.stringify(request()), 401],
-    ['missing token', ANALYZE_ROUTE, { headers: { ...headers, authorization: '' } }, JSON.stringify(request()), 401],
-    ['missing key', ANALYZE_ROUTE, { headers: { ...headers, 'idempotency-key': '' } }, JSON.stringify(request()), 400],
-    ['wrong media type', ANALYZE_ROUTE, { headers: { ...headers, 'content-type': 'text/plain' } }, JSON.stringify(request()), 415],
-    ['invalid JSON', ANALYZE_ROUTE, {}, '{', 400],
-    ['invalid body', ANALYZE_ROUTE, {}, JSON.stringify({ ...request(), prompt: '' }), 400],
-    ['oversized body', ANALYZE_ROUTE, {}, JSON.stringify({ ...request(), prompt: 'x'.repeat(1_100_000) }), 413],
-  ])('refuses %s', async (_name, route, init, body, status) => {
-    const { url, calls } = await listen()
-    const res = await fetch(`${url}${route}`, {
+    ['wrong method', { method: 'GET' }, undefined, 405],
+    ['wrong token', { headers: { ...headers, authorization: 'Bearer nope' } }, JSON.stringify(request()), 401],
+    ['missing token', { headers: { ...headers, authorization: '' } }, JSON.stringify(request()), 401],
+    ['missing key', { headers: { ...headers, 'idempotency-key': '' } }, JSON.stringify(request()), 400],
+    ['wrong media type', { headers: { ...headers, 'content-type': 'text/plain' } }, JSON.stringify(request()), 415],
+    ['invalid JSON', {}, '{', 400],
+    ['invalid body', {}, JSON.stringify({ ...request(), prompt: '' }), 400],
+    ['oversized body', {}, JSON.stringify({ ...request(), prompt: 'x'.repeat(1_100_000) }), 413],
+  ])('refuses %s', async (_name, init, body, status) => {
+    const { url, calls } = await serve()
+    const res = await fetch(`${url}${ANALYZE_ROUTE}`, {
       method: 'POST', headers, ...(body === undefined ? {} : { body }), ...init,
     })
     expect(res.status).toBe(status)
@@ -151,19 +181,28 @@ describe('analyze listener', () => {
     expect(calls).toHaveLength(0)
   })
 
+  it('answers 404 while the switch is off, even with a valid token', async () => {
+    const token = vi.fn(async () => 'secret-token')
+    const { url, calls } = await serve({ enabled: () => false, token })
+    const res = await fetch(`${url}${ANALYZE_ROUTE}`, { method: 'POST', headers, body: JSON.stringify(request()) })
+    expect(res.status).toBe(404)
+    expect(await res.json()).toMatchObject({ ok: false, error: expect.stringContaining('未开启') })
+    expect(token).not.toHaveBeenCalled()
+    expect(calls).toHaveLength(0)
+  })
+
   it('refuses every request while the token is not configured', async () => {
-    const { url, calls } = await listen({ token: async () => undefined })
+    const { url, calls } = await serve({ token: async () => undefined })
     const res = await fetch(`${url}${ANALYZE_ROUTE}`, { method: 'POST', headers, body: JSON.stringify(request()) })
     expect(res.status).toBe(503)
     expect(calls).toHaveLength(0)
   })
 
-  it('rejects when the address cannot be bound', async () => {
-    const first = await startAnalyzeServer('127.0.0.1:0', { token: async () => 't', analyze: vi.fn() }, vi.fn())
-    servers.push(first)
-    await expect(startAnalyzeServer(`127.0.0.1:${first.address.port}`, {
-      token: async () => 't', analyze: vi.fn(),
-    }, vi.fn())).rejects.toThrow(/EADDRINUSE/)
+  it('answers 500 when the handler throws', async () => {
+    const { url } = await serve({ analyze: async () => { throw new Error('boom') } })
+    const res = await fetch(`${url}${ANALYZE_ROUTE}`, { method: 'POST', headers, body: JSON.stringify(request()) })
+    expect(res.status).toBe(500)
+    expect(await res.json()).toMatchObject({ ok: false, error: expect.stringContaining('boom') })
   })
 })
 
@@ -331,6 +370,43 @@ describe('analyze service flow', () => {
     const h = await setup()
     await h.service.shutdown()
     expect(await h.launcher.analyze(request(), 'key-1')).toMatchObject({ status: 503 })
+  })
+
+  it('waits for an acceptance still sending its root card before shutdown finishes', async () => {
+    const h = await setup()
+    await h.service.addAccessGroup('oc_group')
+    const sendMock = vi.mocked(h.channel.send)
+    const send = sendMock.getMockImplementation()!
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    sendMock.mockImplementationOnce(async (...args: Parameters<typeof send>) => {
+      await gate
+      return await send(...args)
+    })
+    const accepted = h.launcher.analyze(request(), 'key-1')
+    let shutDown = false
+    const shutdown = h.service.shutdown().then(() => { shutDown = true })
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(shutDown).toBe(false)
+    release()
+    await shutdown
+    expect(await accepted).toMatchObject({ status: 202 })
+    expect(h.record('key-1')).toMatchObject({ messageId: 'om_1' })
+  })
+
+  it('refuses requests until the channel start has marked earlier analyses interrupted', async () => {
+    const config = makeConfig()
+    const ctxState = makeHostContext()
+    const service = new FeishuService(ctxState.ctx, config, () => makeChannel())
+    const launcher = service.analyzeHandler() as AnalyzeLauncher
+    expect(await launcher.analyze(request(), 'key-1')).toMatchObject({ status: 503 })
+  })
+
+  it('reads the switch from the live config', async () => {
+    const h = await setup()
+    expect(h.service.analyzeHandler().enabled()).toBe(false)
+    h.service.applyOverlay({ analyzeEnabled: true })
+    expect(h.service.analyzeHandler().enabled()).toBe(true)
   })
 
   it('ends on a failure card without a route when setup fails', async () => {
