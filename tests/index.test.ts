@@ -7,6 +7,7 @@ import { CordisFiberState } from '../src/dsh-types.ts'
 import type { HostContext } from '../src/dsh-types.ts'
 import { apply, Config, inject, name } from '../src/index.ts'
 import type { FeishuConfig } from '../src/index.ts'
+import { movedAnalyzeKeysOf } from '../src/config.ts'
 
 /** The shape `resolveConfig` reads from a plugin runtime (Cordis loader path). */
 type ConfigRuntime = Parameters<typeof resolveConfig>[0]
@@ -50,6 +51,12 @@ describe('plugin config declaration', () => {
     expect(config.dmMode).toBe('open')
     expect(config.requireMention).toBe(true)
     expect(config).not.toHaveProperty('unknownKey')
+  })
+
+  it('passes the moved analyze keys through so apply() can warn about them', () => {
+    const config = resolveConfig(runtime, { analyzeEnabled: true, analyzeToken: 'OLD_TOKEN' })
+    expect(movedAnalyzeKeysOf(config)).toEqual(['analyzeEnabled', 'analyzeToken'])
+    expect(movedAnalyzeKeysOf(resolveConfig(runtime, {}))).toEqual([])
   })
 
   it('accepts an omitted config and fills credential-reference defaults', () => {

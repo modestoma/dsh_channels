@@ -273,7 +273,7 @@ export class InboundRouter {
    */
   private readonly firstDeliveries = new Map<string, { promise: Promise<void>; release(): void }>()
   /**
-   * topic id → reservation by an external starter (the analyze launcher) that
+   * topic id → reservation by an external starter (the `feishuTopics` launcher) that
    * opened the topic but has not published its route yet. A reply in the topic
    * waits for the release and then routes against the published record, or
    * falls through as an unbound topic when the start failed.

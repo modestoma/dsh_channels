@@ -1,216 +1,134 @@
 /**
- * Log-platform analyze API: wire contract, DSH Web route, and the service
- * flow from an accepted request to a group-shared topic.
+ * The `feishuTopics` service: spec validation, the root card, the service flow
+ * from an accepted launch to a group-shared topic, records written by the
+ * former analyze API, and the plugin providing the service.
  */
 
-import { mkdtempSync } from 'node:fs'
-import { createServer } from 'node:http'
-import type { IncomingMessage, ServerResponse } from 'node:http'
-import type { AddressInfo } from 'node:net'
+import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { afterEach, describe, expect, it, vi } from 'vitest'
-import {
-  ANALYZE_ROUTE, analyzeRequestHash, parseAnalyzeRequest,
-} from '../src/analyze/contract.ts'
-import type { AnalyzeRequest, AnalyzeResponse } from '../src/analyze/contract.ts'
-import type { AnalyzeLauncher } from '../src/analyze/launcher.ts'
-import { mountAnalyzeRoute } from '../src/analyze/server.ts'
-import type { AnalyzeHandler } from '../src/analyze/server.ts'
-import { buildAnalyzeRootCard } from '../src/cards.ts'
-import { resolveConfig } from '../src/config.ts'
+import { Context } from '@deepseek-ai/cordis'
+import { describe, expect, it, vi } from 'vitest'
+import { buildTopicRootCard } from '../src/cards.ts'
+import { MOVED_ANALYZE_NOTICE, movedAnalyzeKeysOf, resolveConfig } from '../src/config.ts'
 import type { FeishuConfig } from '../src/config.ts'
 import type { HostContext } from '../src/dsh-types.ts'
-import type { AnalyzeRequestRecord, RouteRecord } from '../src/domain.ts'
+import { rootCardOf } from '../src/domain.ts'
+import type { RouteRecord, TopicLaunchRecord } from '../src/domain.ts'
 import type { CardActionEvent, ChannelFactory, NormalizedMessage } from '../src/feishu-channel.ts'
+import { apply, inject, name } from '../src/index.ts'
 import { FeishuService } from '../src/service.ts'
+import { OverlayStore } from '../src/settings/overlay.ts'
 import type { SessionManager } from '../src/session/manager.ts'
+import type { FeishuTopicService, TopicLaunchSpec } from '../src/topics/contract.ts'
+import { FEISHU_TOPICS_SERVICE, TopicLauncher } from '../src/topics/launcher.ts'
 import { followupMessagesOf, makeChannel, makeHostContext, makeMessage } from './helpers.ts'
 
-const servers: Array<{ close(): Promise<void> }> = []
+const PROMPT = '/guanxiang https://logs.example/a.zip 分析这些日志'
 
-afterEach(async () => {
-  for (const server of servers.splice(0)) await server.close()
-})
-
-function request(partial: Partial<AnalyzeRequest> = {}): AnalyzeRequest {
+function spec(partial: Partial<TopicLaunchSpec> = {}): TopicLaunchSpec {
   return {
-    requesterUserId: 'u_alice',
-    triggeredAt: '2026-10-22 19:30',
-    app: 'camera',
-    errorCode: 'E1001',
-    logDetails: [{ name: '设备 A 崩溃日志', url: 'https://logs.example/detail/1' }],
+    key: 'key-1',
+    fingerprint: 'fp-1',
     chatId: 'oc_group',
-    prompt: '/log-analyze https://logs.example/a.zip 分析这些日志',
+    requesterUserId: 'u_alice',
+    card: {
+      title: '日志分析',
+      taskName: '分析',
+      lead: [
+        { text: '于 2026-10-22 19:30 发起了对 ' },
+        { text: 'camera', bold: true },
+        { text: ' 应用 ' },
+        { text: 'E1001', bold: true },
+        { text: ' 错误码不良日志的分析。' },
+      ],
+      links: { nameHeader: '日志', linkHeader: '详情页', rows: [{ name: '设备 A 崩溃日志', url: 'https://logs.example/detail/1' }] },
+    },
+    workspace: { segments: ['analyze', 'camera', 'E1001'], title: '日志分析 · camera · E1001' },
+    prompt: PROMPT,
     ...partial,
   }
 }
 
-describe('analyze contract', () => {
-  it('accepts a complete request and refuses unknown fields', () => {
-    expect(parseAnalyzeRequest(request())).toEqual({ ok: true, value: request() })
-    const extra = parseAnalyzeRequest({ ...request(), logUrls: ['https://logs.example/a.zip'] })
-    expect(extra.ok).toBe(false)
-  })
-
-  it('names every invalid field', () => {
-    const result = parseAnalyzeRequest({
-      ...request(),
-      requesterUserId: 'ou_open_id',
-      triggeredAt: ' ',
-      app: '../etc',
-      chatId: 'not-a-chat',
-      errorCode: '..',
-      prompt: '   ',
-    })
-    expect(result.ok).toBe(false)
-    if (result.ok) return
-    for (const field of ['requesterUserId', 'triggeredAt', 'app', 'errorCode', 'chatId', 'prompt']) {
-      expect(result.error).toContain(field)
-    }
-  })
-
-  it('requires one to fifty http(s) detail pages', () => {
-    const details = (count: number, url = 'https://logs.example/d') =>
-      Array.from({ length: count }, (_, index) => ({ name: `日志 ${index}`, url }))
-    expect(parseAnalyzeRequest(request({ logDetails: details(50) })).ok).toBe(true)
-    for (const logDetails of [details(0), details(51), details(1, 'javascript:alert(1)'), details(1, 'ftp://logs')]) {
-      const result = parseAnalyzeRequest(request({ logDetails }))
-      expect(result.ok).toBe(false)
-      if (!result.ok) expect(result.error).toContain('logDetails')
-    }
-  })
-
-  it('hashes the request content, not the object identity', () => {
-    expect(analyzeRequestHash(request())).toBe(analyzeRequestHash(request()))
-    expect(analyzeRequestHash(request({ prompt: 'other' }))).not.toBe(analyzeRequestHash(request()))
-    expect(analyzeRequestHash(request({ triggeredAt: 'other' }))).not.toBe(analyzeRequestHash(request()))
-    expect(analyzeRequestHash(request({ logDetails: [{ name: 'other', url: 'https://logs.example/detail/1' }] })))
-      .not.toBe(analyzeRequestHash(request()))
-  })
-
-  it('renders the root card status and keeps detail links intact', () => {
-    const subject = { ...request(), logDetails: [{ name: 'a', url: 'https://logs.example/d (1)' }] }
-    const stopped = JSON.stringify(buildAnalyzeRootCard(subject, { kind: 'stopped' }))
+describe('topic root card', () => {
+  it('mentions the requester, emphasizes bold runs, and keeps link targets intact', () => {
+    const card = { ...spec().card, links: { nameHeader: '日志', linkHeader: '详情页', rows: [{ name: 'a', url: 'https://logs.example/d (1)' }] } }
+    const stopped = JSON.stringify(buildTopicRootCard('u_alice', card, { kind: 'stopped' }))
+    expect(stopped).toContain('<at id=u_alice></at> 于 2026-10-22 19:30 发起了对 **camera** 应用 **E1001** 错误码不良日志的分析。')
     expect(stopped).toContain('[查看](https://logs.example/d%20%281%29)')
     expect(stopped).toContain('已停止')
     expect(stopped).toContain('"template":"grey"')
   })
 
-  it('defaults the switch off, validates the token reference, and ignores the removed listen address', () => {
-    expect(resolveConfig({}).analyzeEnabled).toBe(false)
-    expect(resolveConfig({ analyzeEnabled: true }).analyzeEnabled).toBe(true)
-    expect(resolveConfig({}).analyzeToken).toBe('DSH_CHANNELS_ANALYZE_TOKEN')
-    expect(() => resolveConfig({ analyzeToken: 'plain secret' })).toThrow(/analyzeToken/)
-    expect(resolveConfig({ analyzeListen: '0.0.0.0:3090' })).not.toHaveProperty('analyzeListen')
+  it('names the task in the status texts and escapes caller markdown', () => {
+    const card = { title: '巡检', taskName: '巡检', lead: [{ text: '*not bold*' }] }
+    const running = JSON.stringify(buildTopicRootCard('u_alice', card, { kind: 'running' }))
+    expect(running).toContain('巡检中')
+    expect(running).toContain('巡检过程在本卡片下的话题内实时输出')
+    expect(running).toContain('\\\\*not bold\\\\*')
+    expect(running).not.toContain('"tag":"table"')
+  })
+
+  it('redraws records the former analyze API wrote as the card it drew', () => {
+    const legacy: TopicLaunchRecord = {
+      key: 'req-1', bodyHash: 'h', chatId: 'oc_group', messageId: 'om_1', acceptedAt: 1, status: 'running',
+      subject: {
+        requesterUserId: 'u_alice', triggeredAt: '2026-10-22 19:30', app: 'camera', errorCode: 'E1001',
+        logDetails: [{ name: '设备 A 崩溃日志', url: 'https://logs.example/detail/1' }],
+      },
+    }
+    const root = rootCardOf(legacy)!
+    expect(root).toEqual({ requesterUserId: 'u_alice', card: spec().card })
+    expect(rootCardOf({ ...legacy, subject: undefined })).toBeUndefined()
   })
 })
 
-describe('analyze route', () => {
-  type Route = { kind: 'exact'; path: string; handler: (req: IncomingMessage, res: ServerResponse) => Promise<void> | void }
-
-  /** Mount the route on a fake `webServer` served by a real HTTP server (exact match, else 404). */
-  async function serve(handler: Partial<AnalyzeHandler> = {}): Promise<{ url: string; calls: unknown[][]; routes: Route[] }> {
-    const calls: unknown[][] = []
-    const routes: Route[] = []
-    const webServer = { register: (route: Route) => { routes.push(route); return () => {} } }
-    const ctx = { get: (name: string) => (name === 'webServer' ? webServer : undefined), effect: (fn: () => unknown) => fn() }
-    mountAnalyzeRoute(ctx as unknown as HostContext, {
-      enabled: handler.enabled ?? (() => true),
-      token: handler.token ?? (async () => 'secret-token'),
-      analyze: handler.analyze ?? (async (...args): Promise<AnalyzeResponse> => {
-        calls.push(args)
-        return { status: 202, body: { ok: true, chatId: 'oc_group', messageId: 'om_1' } }
-      }),
-    }, vi.fn())
-    const server = createServer((req, res) => {
-      const route = routes.find(entry => entry.path === new URL(req.url ?? '/', 'http://x').pathname)
-      if (route === undefined) {
-        res.writeHead(404).end()
-        return
-      }
-      void route.handler(req, res)
-    })
-    await new Promise<void>((resolve) => { server.listen(0, '127.0.0.1', resolve) })
-    servers.push({ close: () => new Promise<void>((resolve) => { server.close(() => { resolve() }); server.closeAllConnections() }) })
-    return { url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, calls, routes }
-  }
-
-  const headers = {
-    authorization: 'Bearer secret-token',
-    'idempotency-key': 'req-1',
-    'content-type': 'application/json',
-  }
-
-  it('registers one exact route under /open-api, outside the DSH /api namespace', async () => {
-    const { routes } = await serve()
-    expect(ANALYZE_ROUTE).toBe('/open-api/logalyze')
-    expect(routes.map(({ kind, path: routePath }) => ({ kind, path: routePath }))).toEqual([{ kind: 'exact', path: ANALYZE_ROUTE }])
+describe('moved analyze settings', () => {
+  it('finds the analyze API keys a config or overlay still sets', () => {
+    expect(movedAnalyzeKeysOf({ analyzeEnabled: true, analyzeToken: 'X', baseDir: '/x' })).toEqual(['analyzeEnabled', 'analyzeToken'])
+    expect(movedAnalyzeKeysOf({ baseDir: '/x' })).toEqual([])
+    expect(movedAnalyzeKeysOf(undefined)).toEqual([])
+    expect(resolveConfig({ analyzeEnabled: true })).not.toHaveProperty('analyzeEnabled')
   })
 
-  it('mounts nothing on hosts without a Web server', () => {
-    const ctx = { get: () => undefined, effect: vi.fn() }
-    mountAnalyzeRoute(ctx as unknown as HostContext, { enabled: () => true, token: async () => 't', analyze: vi.fn() }, vi.fn())
-    expect(ctx.effect).not.toHaveBeenCalled()
-  })
-
-  it('passes a valid request to the handler', async () => {
-    const { url, calls } = await serve()
-    const res = await fetch(`${url}${ANALYZE_ROUTE}`, { method: 'POST', headers, body: JSON.stringify(request()) })
-    expect(res.status).toBe(202)
-    expect(await res.json()).toMatchObject({ ok: true, messageId: 'om_1' })
-    expect(calls).toEqual([[request(), 'req-1']])
-  })
-
-  it.each([
-    ['wrong method', { method: 'GET' }, undefined, 405],
-    ['wrong token', { headers: { ...headers, authorization: 'Bearer nope' } }, JSON.stringify(request()), 401],
-    ['missing token', { headers: { ...headers, authorization: '' } }, JSON.stringify(request()), 401],
-    ['missing key', { headers: { ...headers, 'idempotency-key': '' } }, JSON.stringify(request()), 400],
-    ['wrong media type', { headers: { ...headers, 'content-type': 'text/plain' } }, JSON.stringify(request()), 415],
-    ['invalid JSON', {}, '{', 400],
-    ['invalid body', {}, JSON.stringify({ ...request(), prompt: '' }), 400],
-    ['oversized body', {}, JSON.stringify({ ...request(), prompt: 'x'.repeat(1_100_000) }), 413],
-  ])('refuses %s', async (_name, init, body, status) => {
-    const { url, calls } = await serve()
-    const res = await fetch(`${url}${ANALYZE_ROUTE}`, {
-      method: 'POST', headers, ...(body === undefined ? {} : { body }), ...init,
-    })
-    expect(res.status).toBe(status)
-    expect(await res.json()).toMatchObject({ ok: false })
-    expect(calls).toHaveLength(0)
-  })
-
-  it('answers 404 while the switch is off, even with a valid token', async () => {
-    const token = vi.fn(async () => 'secret-token')
-    const { url, calls } = await serve({ enabled: () => false, token })
-    const res = await fetch(`${url}${ANALYZE_ROUTE}`, { method: 'POST', headers, body: JSON.stringify(request()) })
-    expect(res.status).toBe(404)
-    expect(await res.json()).toMatchObject({ ok: false, error: expect.stringContaining('未开启') })
-    expect(token).not.toHaveBeenCalled()
-    expect(calls).toHaveLength(0)
-  })
-
-  it('refuses every request while the token is not configured', async () => {
-    const { url, calls } = await serve({ token: async () => undefined })
-    const res = await fetch(`${url}${ANALYZE_ROUTE}`, { method: 'POST', headers, body: JSON.stringify(request()) })
-    expect(res.status).toBe(503)
-    expect(calls).toHaveLength(0)
-  })
-
-  it('answers 500 when the handler throws', async () => {
-    const { url } = await serve({ analyze: async () => { throw new Error('boom') } })
-    const res = await fetch(`${url}${ANALYZE_ROUTE}`, { method: 'POST', headers, body: JSON.stringify(request()) })
-    expect(res.status).toBe(500)
-    expect(await res.json()).toMatchObject({ ok: false, error: expect.stringContaining('boom') })
+  it('warns once when the Web overlay still sets them, and keeps the other overrides', async () => {
+    const file = path.join(mkdtempSync(path.join(tmpdir(), 'dsh-topics-overlay-')), 'settings.json')
+    writeFileSync(file, JSON.stringify({ analyzeEnabled: true, refreshMs: 800 }))
+    const warn = vi.fn()
+    expect(await new OverlayStore(file, { warn }).load()).toEqual({ refreshMs: 800 })
+    expect(warn).toHaveBeenCalledTimes(1)
+    expect(warn).toHaveBeenCalledWith(MOVED_ANALYZE_NOTICE, `${file} 中的 analyzeEnabled`)
   })
 })
 
+describe('feishuTopics service provision', () => {
+  it('provides the launcher, which refuses launches until the channel connects', async () => {
+    const ctx = new Context()
+    for (const dependency of inject) ctx.provide(dependency, {})
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const fiber = ctx.plugin({
+      name,
+      inject: [...inject],
+      apply(pluginCtx: Context, config: unknown) {
+        apply(pluginCtx as unknown as HostContext, config)
+      },
+    })
+    await vi.waitFor(() => expect(ctx.get(FEISHU_TOPICS_SERVICE)).toBeDefined())
+    const service = ctx.get(FEISHU_TOPICS_SERVICE) as FeishuTopicService
+    expect(service).toBeInstanceOf(TopicLauncher)
+    expect(service.version).toBe(1)
+    expect(await service.launch(spec())).toMatchObject({ ok: false, code: 'not-connected' })
+    await fiber.dispose()
+    expect(ctx.get(FEISHU_TOPICS_SERVICE)).toBeUndefined()
+    await ctx.fiber.dispose()
+    errors.mockRestore()
+  })
+})
 
-describe('analyze service flow', () => {
+describe('topic launch flow', () => {
   function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
     return resolveConfig({
-      baseDir: mkdtempSync(path.join(tmpdir(), 'dsh-analyze-ws-')),
+      baseDir: mkdtempSync(path.join(tmpdir(), 'dsh-topics-ws-')),
       statusRefreshMs: 60_000,
       accessMode: 'guarded',
       adminUserId: 'u_admin',
@@ -229,22 +147,22 @@ describe('analyze service flow', () => {
     await service.start()
     const handler = (channel.onMessage as unknown as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0] as
       (msg: NormalizedMessage) => Promise<void>
-    const launcher = (service as unknown as { analyzeLauncher: AnalyzeLauncher }).analyzeLauncher
+    const launcher = service.topics()
     return {
       service, channel, ctxState, config, launcher,
       onMessage: (msg: NormalizedMessage) => Promise.resolve(handler(msg)),
       routes: () => [...ctxState.domain.raw.table('routes').entries()].map(([, value]) => value as RouteRecord),
-      record: (key: string) => ctxState.domain.raw.table('analyze_requests').get(key) as AnalyzeRequestRecord | undefined,
+      record: (key: string) => ctxState.domain.raw.table('analyze_requests').get(key) as TopicLaunchRecord | undefined,
     }
   }
 
   /** Session manager the launcher uses (its guidance mount is the last setup step before the route). */
-  function sessionsOf(launcher: AnalyzeLauncher): SessionManager {
+  function sessionsOf(launcher: TopicLauncher): SessionManager {
     return (launcher as unknown as { deps: { sessions: SessionManager } }).deps.sessions
   }
 
   /** Hold every launch between Session creation and the first prompt until `release()`. */
-  function holdSetup(launcher: AnalyzeLauncher): { release(): void } {
+  function holdSetup(launcher: TopicLauncher): { release(): void } {
     const sessions = sessionsOf(launcher)
     const mount = sessions.mountGuidance.bind(sessions)
     let release!: () => void
@@ -267,14 +185,9 @@ describe('analyze service flow', () => {
   it('posts the root card, opens a shared topic with a streaming card, and forwards the prompt verbatim', async () => {
     const h = await setup()
     await h.service.addAccessGroup('oc_group')
-    const response = await h.launcher.analyze(request(), 'key-1')
+    const response = await h.launcher.launch(spec())
 
-    expect(response).toEqual({
-      status: 202,
-      body: {
-        ok: true, chatId: 'oc_group', messageId: 'om_1',
-      },
-    })
+    expect(response).toEqual({ ok: true, replayed: false, chatId: 'oc_group', messageId: 'om_1' })
     const root = h.channel.sent[0]!
     expect(root.options).toBeUndefined()
     const rootCard = JSON.stringify(root.input)
@@ -292,13 +205,13 @@ describe('analyze service flow', () => {
       workspacePath: path.join(h.config.baseDir, 'analyze', 'camera', 'E1001'),
     })
     const agent = h.ctxState.agents.created[0]!.handle.agent
-    expect(followupMessagesOf(agent).map(message => message.content[0]!.text)).toEqual([request().prompt])
+    expect(followupMessagesOf(agent).map(message => message.content[0]!.text)).toEqual([PROMPT])
   })
 
   it('streams the first turn in the topic and marks the root card when it settles', async () => {
     const h = await setup()
     await h.service.addAccessGroup('oc_group')
-    await h.launcher.analyze(request(), 'key-1')
+    await h.launcher.launch(spec())
     await waitUntil(() => expect(h.routes()).toHaveLength(1))
     const agent = h.ctxState.agents.created[0]!.handle.agent
     h.ctxState.assistantStreamListeners[0]!({ agent, frame: { type: 'chunk', attemptId: 'attempt-1', revision: 1, index: 0, time: 1, chunk: { type: 'text-delta', index: 0, text: '根因：内存溢出' } } })
@@ -315,7 +228,7 @@ describe('analyze service flow', () => {
   it('marks the root card failed when the first turn fails', async () => {
     const h = await setup()
     await h.service.addAccessGroup('oc_group')
-    await h.launcher.analyze(request(), 'key-1')
+    await h.launcher.launch(spec())
     await waitUntil(() => expect(h.routes()).toHaveLength(1))
     const agent = h.ctxState.agents.created[0]!.handle.agent
     h.ctxState.sessionListeners[0]!(agent.session, {
@@ -329,12 +242,12 @@ describe('analyze service flow', () => {
   it('marks analyses a previous instance never finished as interrupted at start', async () => {
     const h = await setup()
     await h.service.addAccessGroup('oc_group')
-    await h.launcher.analyze(request(), 'key-done')
+    await h.launcher.launch(spec({ key: 'key-done' }))
     await waitUntil(() => expect(h.routes()).toHaveLength(1))
     const first = h.ctxState.agents.created[0]!.handle.agent
     h.ctxState.sessionListeners[0]!(first.session, { type: 'turn/end', seq: 1, data: { turn: 1, reason: 'stop' } })
     await waitUntil(() => expect(h.record('key-done')?.status).toBe('done'))
-    await h.launcher.analyze(request({ prompt: 'second' }), 'key-open')
+    await h.launcher.launch(spec({ key: 'key-open', fingerprint: 'fp-2', prompt: 'second' }))
     await waitUntil(() => expect(h.routes()).toHaveLength(2))
     expect(h.record('key-open')?.status).toBe('running')
 
@@ -351,25 +264,25 @@ describe('analyze service flow', () => {
   it('replays a retried key and refuses a reused one', async () => {
     const h = await setup()
     await h.service.addAccessGroup('oc_group')
-    const body = request()
-    const [first, concurrent] = await Promise.all([h.launcher.analyze(body, 'key-1'), h.launcher.analyze(body, 'key-1')])
-    const replay = await h.launcher.analyze(body, 'key-1')
+    const [first, concurrent] = await Promise.all([h.launcher.launch(spec()), h.launcher.launch(spec())])
+    const replay = await h.launcher.launch(spec())
+    expect(first).toMatchObject({ ok: true, replayed: false })
     expect(concurrent).toEqual(first)
-    expect(replay).toEqual(first)
+    expect(replay).toEqual({ ...first, replayed: true })
     expect(h.channel.sent.filter(entry => entry.options === undefined)).toHaveLength(1)
-    expect(await h.launcher.analyze({ ...body, prompt: 'other' }, 'key-1')).toMatchObject({ status: 409 })
+    expect(await h.launcher.launch(spec({ fingerprint: 'fp-other', prompt: 'other' }))).toMatchObject({ ok: false, code: 'key-conflict' })
   })
 
   it('refuses groups that are not authorized', async () => {
     const h = await setup()
-    expect(await h.launcher.analyze(request(), 'key-1')).toMatchObject({ status: 403 })
+    expect(await h.launcher.launch(spec())).toMatchObject({ ok: false, code: 'forbidden-chat' })
     expect(h.channel.sent).toHaveLength(0)
   })
 
   it('refuses requests while disconnected', async () => {
     const h = await setup()
     await h.service.shutdown()
-    expect(await h.launcher.analyze(request(), 'key-1')).toMatchObject({ status: 503 })
+    expect(await h.launcher.launch(spec())).toMatchObject({ ok: false, code: 'not-connected' })
   })
 
   it('waits for an acceptance still sending its root card before shutdown finishes', async () => {
@@ -383,37 +296,76 @@ describe('analyze service flow', () => {
       await gate
       return await send(...args)
     })
-    const accepted = h.launcher.analyze(request(), 'key-1')
+    const accepted = h.launcher.launch(spec())
     let shutDown = false
     const shutdown = h.service.shutdown().then(() => { shutDown = true })
     await new Promise(resolve => setTimeout(resolve, 20))
     expect(shutDown).toBe(false)
     release()
     await shutdown
-    expect(await accepted).toMatchObject({ status: 202 })
+    expect(await accepted).toMatchObject({ ok: true })
     expect(h.record('key-1')).toMatchObject({ messageId: 'om_1' })
   })
 
-  it('refuses requests until the channel start has marked earlier analyses interrupted', async () => {
+  it('refuses launches until the channel start has marked earlier topics interrupted', async () => {
     const config = makeConfig()
     const ctxState = makeHostContext()
     const service = new FeishuService(ctxState.ctx, config, () => makeChannel())
-    const launcher = service.analyzeHandler() as AnalyzeLauncher
-    expect(await launcher.analyze(request(), 'key-1')).toMatchObject({ status: 503 })
+    expect(await service.topics().launch(spec())).toMatchObject({ ok: false, code: 'not-connected' })
   })
 
-  it('reads the switch from the live config', async () => {
+  it('refuses invalid specs before posting anything', async () => {
     const h = await setup()
-    expect(h.service.analyzeHandler().enabled()).toBe(false)
-    h.service.applyOverlay({ analyzeEnabled: true })
-    expect(h.service.analyzeHandler().enabled()).toBe(true)
+    await h.service.addAccessGroup('oc_group')
+    const invalid: Array<[string, TopicLaunchSpec]> = [
+      ['workspace.segments', spec({ workspace: { segments: ['..'], title: 't' } })],
+      ['workspace.segments', spec({ workspace: { segments: ['p2p', 'u_alice'], title: 't' } })],
+      ['workspace.segments', spec({ workspace: { segments: [], title: 't' } })],
+      ['chatId', spec({ chatId: 'ou_user' })],
+      ['requesterUserId', spec({ requesterUserId: 'ou_open_id' })],
+      ['key', spec({ key: 'has space' })],
+      ['prompt', spec({ prompt: '  ' })],
+      ['card.links.rows.0.url', spec({ card: { ...spec().card, links: { nameHeader: 'a', linkHeader: 'b', rows: [{ name: 'x', url: 'javascript:alert(1)' }] } } })],
+    ]
+    for (const [field, value] of invalid) {
+      const result = await h.launcher.launch(value)
+      expect(result).toMatchObject({ ok: false, code: 'invalid' })
+      if (!result.ok) expect(result.message).toContain(field)
+    }
+    expect(h.channel.sent).toHaveLength(0)
+  })
+
+  it('reports a root card Feishu refuses as send-failed', async () => {
+    const h = await setup()
+    await h.service.addAccessGroup('oc_group')
+    vi.mocked(h.channel.send).mockRejectedValueOnce(new Error('bot not in chat'))
+    expect(await h.launcher.launch(spec())).toMatchObject({ ok: false, code: 'send-failed', message: expect.stringContaining('bot not in chat') })
+    expect(h.record('key-1')).toBeUndefined()
+  })
+
+  it('marks a running record the former analyze API wrote as interrupted at start', async () => {
+    const h = await setup()
+    await h.ctxState.domain.raw.table('analyze_requests').put('req-legacy', {
+      key: 'req-legacy', bodyHash: 'h', chatId: 'oc_group', messageId: 'om_legacy', acceptedAt: 1, status: 'running',
+      subject: {
+        requesterUserId: 'u_alice', triggeredAt: '2026-10-22 19:30', app: 'camera', errorCode: 'E1001',
+        logDetails: [{ name: '设备 A 崩溃日志', url: 'https://logs.example/detail/1' }],
+      },
+    })
+    await h.service.shutdown()
+    await h.service.start()
+    await waitUntil(() => expect(h.record('req-legacy')?.status).toBe('interrupted'))
+    const card = lastCard(h, 'om_legacy')
+    expect(card).toContain('已中断')
+    expect(card).toContain('<at id=u_alice></at> 于 2026-10-22 19:30 发起了对 **camera** 应用 **E1001** 错误码不良日志的分析。')
+    expect(card).toContain('设备 A 崩溃日志')
   })
 
   it('ends on a failure card without a route when setup fails', async () => {
     const h = await setup()
     await h.service.addAccessGroup('oc_group')
     sessionsOf(h.launcher).mountGuidance = async () => { throw new Error('mount failed') }
-    await h.launcher.analyze(request(), 'key-1')
+    await h.launcher.launch(spec())
     await waitUntil(() => expect(h.record('key-1')?.status).toBe('failed'))
     expect(lastCard(h, 'om_1')).toContain('分析未能开始：mount failed')
     expect(lastCard(h, 'om_1')).toContain('"template":"red"')
@@ -427,7 +379,7 @@ describe('analyze service flow', () => {
     await h.service.addAccessGroup('oc_group')
     await h.service.addAccessUser('u_bob')
     const held = holdSetup(h.launcher)
-    await h.launcher.analyze(request(), 'key-1')
+    await h.launcher.launch(spec())
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
     const agent = h.ctxState.agents.created[0]!.handle.agent
 
@@ -440,14 +392,14 @@ describe('analyze service flow', () => {
 
     held.release()
     await waitUntil(() => expect(followupMessagesOf(agent)).toHaveLength(2))
-    expect(followupMessagesOf(agent).map(message => message.content[0]!.text)).toEqual([request().prompt, '顺便看下内存'])
+    expect(followupMessagesOf(agent).map(message => message.content[0]!.text)).toEqual([PROMPT, '顺便看下内存'])
   })
 
   it('removes the published route when the first prompt cannot be delivered', async () => {
     const h = await setup()
     await h.service.addAccessGroup('oc_group')
     const held = holdSetup(h.launcher)
-    await h.launcher.analyze(request(), 'key-1')
+    await h.launcher.launch(spec())
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
     const { handle } = h.ctxState.agents.created[0]!
     vi.mocked(handle.agent.followup).mockImplementationOnce(() => { throw new Error('session closed') })
@@ -462,7 +414,7 @@ describe('analyze service flow', () => {
     const h = await setup()
     await h.service.addAccessGroup('oc_group')
     const held = holdSetup(h.launcher)
-    await h.launcher.analyze(request(), 'key-1')
+    await h.launcher.launch(spec())
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
 
     const shutdown = h.service.shutdown()
@@ -476,7 +428,7 @@ describe('analyze service flow', () => {
     const h = await setup()
     await h.service.addAccessGroup('oc_group')
     await h.service.addAccessUser('u_bob')
-    await h.launcher.analyze(request(), 'key-1')
+    await h.launcher.launch(spec())
     await waitUntil(() => expect(h.routes()).toHaveLength(1))
     const agent = h.ctxState.agents.created[0]!.handle.agent
     const thread = { chatId: 'oc_group', threadId: 'omt_2', mentionedBot: false }

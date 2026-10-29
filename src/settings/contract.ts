@@ -69,13 +69,13 @@ export interface SessionOriginWire {
   chatName?: string
   /** 群头像 URL（群聊且能读取群信息时）。 */
   chatAvatarUrl?: string
-  /** 发起人 user_id（日志平台分析话题为请求人）。 */
+  /** 发起人 user_id（群共享话题为调用方指定的发起人）。 */
   senderUserId: string
   /** 发起人姓名（通讯录或群成员列表能查到时）。 */
   senderName?: string
   /** 发起人头像 URL（通讯录能查到时）。 */
   senderAvatarUrl?: string
-  /** 日志平台分析话题：群内成员都可以继续。 */
+  /** 群共享话题（经 `feishuTopics` 发起）：群内成员都可以继续。 */
   shared: boolean
   /** Epoch ms when the Session was bound to its Feishu route. */
   createdAt: number
@@ -187,8 +187,6 @@ export const EDITABLE_KEYS = [
   'feishuTools.wikiRead',
   'feishuTools.wikiWrite',
   'wikiRoots',
-  // 日志平台分析接口（访问令牌是凭据引用 analyzeToken，值写在 DSH 凭据里）
-  'analyzeEnabled',
   // 日志
   'loggerLevel',
 ] as const
@@ -242,7 +240,6 @@ export type FieldGroup =
   | 'limits'
   | 'access'
   | 'wiki'
-  | 'analyze'
   | 'logging'
 
 /** One selectable value rendered by the generic form. */
@@ -355,11 +352,8 @@ export interface CredentialRefWire {
   source?: string
 }
 
-/**
- * The credential slots the panel may write: the Feishu application pair
- * (resolved on connect) and the analyze API token (resolved per request).
- */
-export type CredentialField = 'appId' | 'appSecret' | 'analyzeToken'
+/** The credential slots the panel may write: the Feishu application pair (resolved on connect). */
+export type CredentialField = 'appId' | 'appSecret'
 
 /** Official-SDK WebSocket lifecycle snapshot (structural copy, no SDK import on the wire). */
 export interface ConnectionWire {
@@ -466,7 +460,6 @@ export interface PanelConfigWire {
   credentials: {
     appId: CredentialRefWire
     appSecret: CredentialRefWire
-    analyzeToken: CredentialRefWire
   }
 }
 
@@ -602,7 +595,6 @@ export type ClearConfigResponse =
 export interface SaveCredentialsRequest {
   appId?: string
   appSecret?: string
-  analyzeToken?: string
 }
 
 /** `POST /api/dsh-channels.clearCredential` body. */
@@ -615,8 +607,7 @@ export interface ClearCredentialRequest {
  *
  * - `auto`: the channel was stopped and connected immediately after the save.
  * - `pending`: the channel is running; reconnect for the value to take effect.
- * - `not-needed`: removed while stopped, or only the analyze API token
- *   changed (it applies to the next request), nothing to reconnect.
+ * - `not-needed`: removed while stopped, nothing to reconnect.
  * - `unconfigured`: saved, but the other credential of the pair is still
  *   missing — the plugin keeps waiting (no connection attempt) until it is
  *   configured.
@@ -666,7 +657,7 @@ export const TAB_FIELD_GROUPS: Readonly<Record<PanelTabId, readonly FieldGroup[]
   attachments: ['attachments', 'tools', 'limits'],
   access: ['access'],
   wiki: ['wiki'],
-  advanced: ['analyze', 'logging'],
+  advanced: ['logging'],
 }
 
 /** Section heading for one field group inside its tab. */
@@ -681,7 +672,6 @@ export const FIELD_GROUP_LABELS: Readonly<Record<FieldGroup, string>> = {
   limits: '限额与超时',
   access: '准入',
   wiki: '知识库工具',
-  analyze: '日志分析接口',
   logging: '日志',
 }
 
@@ -808,11 +798,6 @@ export const PANEL_COPY = {
   loading: '加载中…',
   loadFailed: '设置面板加载失败',
   // ---- advanced -----------------------------------------------------------
-  analyzeTokenLabel: '访问令牌',
-  analyzeTokenSummary: '请求头 Authorization: Bearer 的值，保存后立即生效；未配置时接口拒绝所有请求',
-  analyzeTokenPlaceholder: '填写新令牌（建议 32 位以上随机串）',
-  analyzeTokenSaved: '令牌已保存，下一次请求生效',
-  analyzeTokenRemoved: '令牌已移除，接口将拒绝所有请求',
   overlayTitle: 'Web 覆盖',
   overlayPath: '覆盖文件',
   overlayCount: '{n} 项配置由面板覆盖',

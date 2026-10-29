@@ -9,6 +9,7 @@
  */
 
 import { z } from 'zod'
+import type { TopicRootCard } from './topics/contract.ts'
 
 /**
  * Route key kinds. `thread` = real Feishu topic; `chat` = degraded chat-scoped
@@ -62,7 +63,7 @@ export const routeRecordSchema = z.object({
   /** Sessions this topic has pointed at, oldest first. Optional for v1 compatibility. */
   sessionHistory: z.array(sessionHistoryEntrySchema).optional(),
   /**
-   * Group-shared route (log-platform analysis topics): every member admitted
+   * Group-shared route (topics started through `feishuTopics`): every member admitted
    * in `chatId` may continue the Session and decide its cards, not only
    * `senderUserId` (who then names the requester). Absent = owner-only.
    */
@@ -287,44 +288,100 @@ export const processedRecordSchema = z.object({
 
 export type ProcessedRecord = z.infer<typeof processedRecordSchema>
 
+/** {@link TopicRootCard} as stored in a launch record. */
+export const topicRootCardSchema = z.object({
+  title: z.string(),
+  taskName: z.string(),
+  lead: z.array(z.object({ text: z.string(), bold: z.boolean().optional() })),
+  links: z.object({
+    nameHeader: z.string(),
+    linkHeader: z.string(),
+    rows: z.array(z.object({ name: z.string(), url: z.string() })),
+  }).optional(),
+})
+
 /**
- * One accepted analyze API request, keyed by its `Idempotency-Key`. Kept
- * forever: a retried key returns the stored response instead of posting a
- * second analysis, and a reused key with a different body is refused.
+ * Root card content written by plugin versions before the `feishuTopics`
+ * service (the built-in log-platform analyze API). Read only; converted by
+ * {@link rootCardOf}.
  */
-export const analyzeRequestRecordSchema = z.object({
-  /** The request's `Idempotency-Key` (also the table key). */
+const legacyAnalyzeSubjectSchema = z.object({
+  requesterUserId: z.string(),
+  triggeredAt: z.string(),
+  app: z.string(),
+  errorCode: z.string(),
+  logDetails: z.array(z.object({ name: z.string(), url: z.string() })),
+})
+
+/**
+ * One accepted `feishuTopics` launch, keyed by its idempotency key. Kept
+ * forever: a retried key answers the stored root card instead of posting a
+ * second topic, and a reused key with another fingerprint is refused. The
+ * records live in the `analyze_requests` table, named after the analyze API
+ * that wrote the first of them; those older records carry `subject` instead
+ * of `requesterUserId` + `card`, and their keys are the analyze API's
+ * `Idempotency-Key`s.
+ */
+export const topicLaunchRecordSchema = z.object({
+  /** The launch's idempotency key (also the table key). */
   key: z.string().min(1),
-  /** SHA-256 (hex) of the canonical request body. */
+  /** The launch's fingerprint (older records: SHA-256 of the analyze request). */
   bodyHash: z.string().min(1),
   /** Target group chat. */
   chatId: z.string().min(1),
-  /** Root card message id (the analysis topic's root). */
+  /** Root card message id (the topic's root). */
   messageId: z.string().min(1),
-  /** Epoch ms when the request was accepted. */
+  /** Epoch ms when the launch was accepted. */
   acceptedAt: z.number().int().nonnegative(),
-  /** What the root card shows, kept so the card can be redrawn after a restart. */
-  subject: z.object({
-    requesterUserId: z.string(),
-    triggeredAt: z.string(),
-    app: z.string(),
-    errorCode: z.string(),
-    logDetails: z.array(z.object({ name: z.string(), url: z.string() })),
-  }),
+  /** Requester @-mentioned on the root card; absent on older records. */
+  requesterUserId: z.string().optional(),
+  /** What the root card shows, kept so the card can be redrawn after a restart; absent on older records. */
+  card: topicRootCardSchema.optional(),
+  /** Root card content of older records. */
+  subject: legacyAnalyzeSubjectSchema.optional(),
   /**
    * Root card status. `running` until the first turn settles; a record still
-   * `running` when the channel starts belongs to an analysis the previous
+   * `running` when the channel starts belongs to a topic the previous
    * instance never finished, and becomes `interrupted`.
    */
   status: z.enum(['running', 'done', 'stopped', 'error', 'failed', 'interrupted']),
 })
 
-export type AnalyzeRequestRecord = z.infer<typeof analyzeRequestRecordSchema>
+export type TopicLaunchRecord = z.infer<typeof topicLaunchRecordSchema>
+
+/**
+ * The requester and root card content of one launch record, converting the
+ * analyze API's older records to the card that API drew.
+ * @param record - stored launch record.
+ * @returns what to redraw, or undefined for a record carrying neither form.
+ */
+export function rootCardOf(record: TopicLaunchRecord): { requesterUserId: string; card: TopicRootCard } | undefined {
+  if (record.card !== undefined && record.requesterUserId !== undefined) {
+    return { requesterUserId: record.requesterUserId, card: record.card }
+  }
+  const subject = record.subject
+  if (subject === undefined) return undefined
+  return {
+    requesterUserId: subject.requesterUserId,
+    card: {
+      title: '日志分析',
+      taskName: '分析',
+      lead: [
+        { text: `于 ${subject.triggeredAt} 发起了对 ` },
+        { text: subject.app, bold: true },
+        { text: ' 应用 ' },
+        { text: subject.errorCode, bold: true },
+        { text: ' 错误码不良日志的分析。' },
+      ],
+      links: { nameHeader: '日志', linkHeader: '详情页', rows: subject.logDetails },
+    },
+  }
+}
 
 /**
  * Where one Feishu-routed Session came from, keyed by its DSH session id.
  * Written the first time a route record names the Session (new topic,
- * `/renew`, analyze API) and kept after the route retires, so the Web
+ * `/renew`, `feishuTopics` launch) and kept after the route retires, so the Web
  * client can still show the origin of an old Session. Names are resolved
  * live when read, never stored.
  */
@@ -339,11 +396,11 @@ export const sessionOriginRecordSchema = z.object({
   chatId: z.string().min(1),
   /** `p2p` or `group`. */
   chatType: z.enum(['p2p', 'group']),
-  /** `user_id` of the user who started the Session (the requester for analyze topics). */
+  /** `user_id` of the user who started the Session (the requester for launched topics). */
   senderUserId: z.string().min(1),
   /** Epoch ms when the Session was bound to the route. */
   createdAt: z.number().int().nonnegative(),
-  /** Group-shared route (log-platform analysis topic). */
+  /** Group-shared route (topic started through `feishuTopics`). */
   shared: z.literal(true).optional(),
 })
 
@@ -390,7 +447,7 @@ export interface FeishuDomainSpecShape {
       __key?: string
     }
     analyze_requests: {
-      valueSchema: typeof analyzeRequestRecordSchema
+      valueSchema: typeof topicLaunchRecordSchema
       __key?: string
     }
     session_origins: {
@@ -437,8 +494,8 @@ export const feishuDomain: FeishuDomainSpecShape = {
     // independent grant. Added without a version bump like the other access
     // tables: a missing table loads empty.
     access_wiki_users: { valueSchema: accessUserRecordSchema },
-    // Analyze API idempotency records; a missing table loads empty.
-    analyze_requests: { valueSchema: analyzeRequestRecordSchema },
+    // `feishuTopics` launch records (historical name); a missing table loads empty.
+    analyze_requests: { valueSchema: topicLaunchRecordSchema },
     // Session id → Feishu origin; a missing table loads empty.
     session_origins: { valueSchema: sessionOriginRecordSchema },
   },
@@ -507,11 +564,11 @@ export interface AccessRequestsTable {
   entries(): IterableIterator<[string, AccessRequestRecord]>
 }
 
-/** Normalized table handle for analyze API requests (key = `Idempotency-Key`). */
-export interface AnalyzeRequestsTable {
-  get(key: string): AnalyzeRequestRecord | undefined
-  put(key: string, value: AnalyzeRequestRecord): Promise<unknown> | void
-  entries(): IterableIterator<[string, AnalyzeRequestRecord]>
+/** Normalized table handle for `feishuTopics` launches (key = idempotency key). */
+export interface TopicLaunchesTable {
+  get(key: string): TopicLaunchRecord | undefined
+  put(key: string, value: TopicLaunchRecord): Promise<unknown> | void
+  entries(): IterableIterator<[string, TopicLaunchRecord]>
 }
 
 /** Normalized table handle for the session-origin table (key = DSH session id). */
@@ -531,8 +588,8 @@ export interface FeishuDomainHandle {
   accessRequests: AccessRequestsTable
   /** Wiki whitelist (key = `user_id`); same records as {@link AccessUsersTable}. */
   accessWikiUsers: AccessUsersTable
-  /** Analyze API idempotency records. */
-  analyzeRequests: AnalyzeRequestsTable
+  /** `feishuTopics` launch records. */
+  topicLaunches: TopicLaunchesTable
   /** Feishu origin of every Session a route ever named. */
   sessionOrigins: SessionOriginsTable
   getGlobal(): FeishuDomainGlobal

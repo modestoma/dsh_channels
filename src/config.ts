@@ -80,8 +80,26 @@ export const DEFAULT_TOPIC_MESSAGES_TIMEOUT_MS = 20_000
  */
 export const DEFAULT_PROMPT_CONTEXT_TIMEOUT_MS = 3_000
 
-/** Conventional credential reference holding the log-platform analyze API bearer token. */
-export const DEFAULT_ANALYZE_TOKEN_REF = 'DSH_CHANNELS_ANALYZE_TOKEN'
+/**
+ * Keys of the log-platform analyze API, which moved to 观象
+ * (`@modesto_ma/dsh-guanxiang`). A value still set in `cordis.yml` or the Web
+ * overlay is ignored; the loader schema passes them through and
+ * {@link movedAnalyzeKeysOf} finds them so the deployment is told.
+ */
+export const MOVED_ANALYZE_KEYS = ['analyzeEnabled', 'analyzeToken'] as const
+
+/** Log line naming where the moved analyze API settings went. */
+export const MOVED_ANALYZE_NOTICE = 'dsh-channels: 日志分析接口已迁到观象（@modesto_ma/dsh-guanxiang），忽略 %s：请在观象面板「分析接口」中开启并保存令牌（GUANXIANG_ANALYZE_TOKEN）'
+
+/**
+ * The moved analyze API keys one raw config or overlay object still sets.
+ * @param raw - undecoded `config` or overlay JSON.
+ * @returns the keys present, in {@link MOVED_ANALYZE_KEYS} order.
+ */
+export function movedAnalyzeKeysOf(raw: unknown): string[] {
+  if (typeof raw !== 'object' || raw === null) return []
+  return MOVED_ANALYZE_KEYS.filter(key => Object.hasOwn(raw, key))
+}
 
 /** A credential reference: `FEISHU_APP_ID`-style name resolved through ctx.credentials. */
 const credentialRefSchema = z.string().regex(
@@ -421,18 +439,6 @@ export const configSchema = z.object({
    * its own deadline and is left to the host signal instead.
    */
   questionTimeoutMs: z.number().int().min(10_000).max(3_600_000).default(DEFAULT_QUESTION_TIMEOUT_MS),
-  /**
-   * Switch for the log-platform analyze API (`POST /open-api/logalyze`
-   * on the DSH Web server). Off (default) answers 404; read per request, so
-   * toggling it needs no reconnect. Needs a host with a Web server.
-   */
-  analyzeEnabled: z.boolean().default(false),
-  /**
-   * Credential reference holding the analyze API bearer token (defaults to
-   * `DSH_CHANNELS_ANALYZE_TOKEN`). Resolved per request, so rotating the value
-   * applies to the next request; an unresolvable token refuses every request.
-   */
-  analyzeToken: credentialRefSchema.default(DEFAULT_ANALYZE_TOKEN_REF),
 })
 
 export type FeishuConfig = z.infer<typeof configSchema>
@@ -442,9 +448,13 @@ export type FeishuConfig = z.infer<typeof configSchema>
  * `config` object; the loader validates that row with `undefined` before the
  * user's patch layer supplies values. Accept that absence and fill the same
  * defaults as {@link resolveConfig}, so enabling the plugin from the Web UI
- * cannot fail with "expected object, received undefined".
+ * cannot fail with "expected object, received undefined". The moved analyze
+ * keys pass through unchanged so `apply()` can warn about them.
  */
-export const pluginConfigSchema = configSchema.prefault({})
+export const pluginConfigSchema = configSchema.extend({
+  analyzeEnabled: z.unknown().optional(),
+  analyzeToken: z.unknown().optional(),
+}).prefault({})
 
 /**
  * Validate the raw loader config. Values stay credential *references*; the

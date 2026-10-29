@@ -17,13 +17,13 @@
 
 import type { HostContext } from './dsh-types.ts'
 import { FeishuService } from './service.ts'
-import { pluginConfigSchema, resolveConfig } from './config.ts'
+import { MOVED_ANALYZE_NOTICE, movedAnalyzeKeysOf, pluginConfigSchema, resolveConfig } from './config.ts'
 import type { FeishuConfig } from './config.ts'
 import { defaultChannelFactory } from './feishu-channel.ts'
 import type { ChannelFactory } from './feishu-channel.ts'
 import { OverlayStore, defaultOverlayPath } from './settings/overlay.ts'
 import { mountSettingsRoutes } from './settings/routes.ts'
-import { mountAnalyzeRoute } from './analyze/server.ts'
+import { FEISHU_TOPICS_SERVICE } from './topics/launcher.ts'
 import { SettingsSurface } from './settings/surface.ts'
 import { createHostCatalog } from './settings/catalog.ts'
 import { createSettingsDirectoryPicker } from './settings/directory-picker.ts'
@@ -40,6 +40,7 @@ export type * from './session-export.ts'
 export type * from './stats.ts'
 export type * from './questions.ts'
 export type * from './settings/contract.ts'
+export type * from './topics/contract.ts'
 export * from './access/index.ts'
 export type { AccessGroupRecord, AccessRequestRecord, AccessUserRecord } from './domain.ts'
 export { CATALOG_ROUTE, CLEAR_CONFIG_ROUTE, CLEAR_CREDENTIAL_ROUTE, EDITABLE_KEYS, PANEL_COPY, PANEL_ROUTE, PICK_DIRECTORY_ROUTE, RECONNECT_ROUTE, RESTART_KEYS, SAVE_CONFIG_ROUTE, SAVE_CREDENTIALS_ROUTE, STATUS_ROUTE } from './settings/contract.ts'
@@ -54,7 +55,7 @@ export type { HostDirectoryPickerService, SettingsDirectoryPicker } from './sett
 export { mountSettingsRoutes, registerSettingsRoutes } from './settings/routes.ts'
 export type { HostConnection, HostFetchRoute } from './settings/routes.ts'
 export type { ApprovalOutcome, ApprovalRequest, ApprovalAnswererListener, AssistantStreamFrame, AskUserQuestionAnswer, AskUserQuestionAnswerItem, AskUserQuestionItem, AskUserQuestionRequestEvent, UserQuestionAnswererListener, AgentCancelCause, SessionStatsView, TokenUsageView, ContextPressureView, SessionProjections } from './dsh-types.ts'
-export { buildCard, buildInterruptionCard, cardJsonBytes, CARD_MAX_BYTES, CARD_TARGET_BYTES, REASONING_MAX_BYTES, INTERRUPTION_NOTICE, MAX_TABLES_PER_CARD, PANEL_TITLES, PANEL_CHEVRON_TOKEN, segmentCardContent, splitBodyForCard, stripTables, tableBlocks, TRUNCATION_SUFFIX, buildApprovalCard, buildApprovalSettledCard, buildQuestionCard, buildQuestionSettledCard, MAX_QUESTION_OPTIONS } from './cards.ts'
+export { buildCard, buildInterruptionCard, cardJsonBytes, CARD_MAX_BYTES, CARD_TARGET_BYTES, REASONING_MAX_BYTES, INTERRUPTION_NOTICE, MAX_TABLES_PER_CARD, PANEL_TITLES, PANEL_CHEVRON_TOKEN, segmentCardContent, splitBodyForCard, stripTables, tableBlocks, TRUNCATION_SUFFIX, buildApprovalCard, buildApprovalSettledCard, buildQuestionCard, buildQuestionSettledCard, buildTopicRootCard, MAX_QUESTION_OPTIONS } from './cards.ts'
 export { ApprovalAnswerer } from './approvals.ts'
 export { QuestionAnswerer } from './questions.ts'
 export { armModelCommand, buildCommandResultCard, CHANNEL_COMMAND_NAMES, commandResultCardKind, isSupportedCommand, parseSlashCommand, registerChannelCommands, registerModelCommand, RouteOperationQueue, SUPPORTED_COMMAND_NAMES, supportedCommandHelp, supportedCommandList } from './commands.ts'
@@ -63,6 +64,8 @@ export { buildCompactComparisonCard, buildRenewCard, buildSessionHistoryCard, bu
 export { createLogicalSessionExport, DSH_CHANNELS_VERSION, LOGICAL_EXPORT_FORMAT, LOGICAL_EXPORT_FORMAT_VERSION, serializeLogicalSession } from './session-export.ts'
 export { addUsage, applyProjectionViews, averageDecodeTokensPerSecond, averageTtftMs, cacheHitPct, EMPTY_TOTALS, foldAll, foldEvent, foldSessionStats, measureSessionContext, readProjectionViews, usageFromBuckets } from './stats.ts'
 export { FeishuService } from './service.ts'
+export { FEISHU_TOPICS_SERVICE, FEISHU_TOPICS_VERSION, TopicLauncher } from './topics/launcher.ts'
+export type { TopicLauncherDeps } from './topics/launcher.ts'
 export { TurnStreamer } from './streamer.ts'
 export { ensureWorkspace, stagingPathFor, stagingRoot, topicDirFor, topicTokenFor, workspacePathFor, workspaceTitleFor, worktreeBranchFor } from './workspaces.ts'
 export { accessGroupRecordSchema, accessRequestRecordSchema, accessUserRecordSchema, appendSessionHistory, chatRouteKey, expiredRouteRecordSchema, feishuDomain, normalizeRouteRecord, normalizeSessionHistory, routeRecordSchema, sessionDirOf, sessionHistoryEntrySchema, inflightSnapshotSchema, processedRecordSchema } from './domain.ts'
@@ -125,7 +128,11 @@ export function apply(ctx: HostContext, config?: unknown): void {
     createHostCatalog(ctx, warn),
     createSettingsDirectoryPicker(ctx),
   ))
-  mountAnalyzeRoute(ctx, service.analyzeHandler(), warn)
+  // Other plugins (观象's analyze API) start group-shared topics through this
+  // service; it answers `not-connected` until the Feishu connection is up.
+  ctx.provide?.(FEISHU_TOPICS_SERVICE, service.topics())
+  const moved = movedAnalyzeKeysOf(config)
+  if (moved.length > 0) warn(MOVED_ANALYZE_NOTICE, `cordis.yml 中的 ${moved.join('、')}`)
   ctx.effect(() => {
     // Boot loads the Web overlay and connects only when the Feishu application
     // credentials are complete; an incomplete configuration or a failed
