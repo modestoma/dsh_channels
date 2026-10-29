@@ -136,7 +136,7 @@ Web 里直接新建的会话不显示按钮。来源在 Host 侧按会话 id 持
 
 ## 发布
 
-版本号由 semantic-release 按 Conventional Commits 计算。推送（含合并 PR）到 `main` 在检查通过后**自动发布**正式版；推送到 `dev` 只跑检查，beta 版**只在手动触发时发布**，可以先累积多笔提交。
+版本号由 semantic-release 按 Conventional Commits 计算。1.0 之前，破坏性变更（`BREAKING CHANGE`）只升次版本号（如 0.7 → 0.8）。推送（含合并 PR）到 `main` 在检查通过后**自动发布**正式版；推送到 `dev` 只跑检查，beta 版**只在手动触发时发布**，可以先累积多笔提交。
 
 | 分支 | 版本 | npm dist-tag |
 | --- | --- | --- |
