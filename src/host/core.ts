@@ -317,10 +317,39 @@ export interface AgentPresetSelectedEvent extends SessionEventEnvelope {
   data: { agentPreset: string }
 }
 
+/**
+ * Durable record of one model-request retry scheduled by `dsh-llm-retry`
+ * (DSH `packages/llm/llm-retry/src/types.ts`), appended before the backoff
+ * wait. The retry re-runs the failed step inside the SAME open turn: only
+ * `turn/end` ends the turn.
+ */
+export interface LlmRetryEvent extends SessionEventEnvelope {
+  type: 'llm/retry'
+  data: {
+    turn: number
+    step: number
+    provider: string
+    mode: 'normal' | 'always'
+    /** 1-based retry number. */
+    retry: number
+    /** Retry budget in `normal` mode; absent in `always` mode (unbounded). */
+    maxRetries?: number
+    delayMs: number
+    failure: { message: string; code: string; [key: string]: unknown }
+    [key: string]: unknown
+  }
+}
+
+/** Appended when a retry's backoff wait ends, right before the retried request starts. */
+export interface LlmRetryStartedEvent extends SessionEventEnvelope {
+  type: 'llm/retry-started'
+  data: { turn: number; step: number; retry: number; [key: string]: unknown }
+}
+
 export interface OtherSessionEvent extends SessionEventEnvelope {
   /** Unknown/extension event types are ignored by the folds. */
   type: Exclude<string, 'assistant/message' | 'step/start' | 'turn/end' | 'request/header'
-    | 'tool/call' | 'tool/result' | 'subagent/descriptor'
+    | 'tool/call' | 'tool/result' | 'subagent/descriptor' | 'llm/retry' | 'llm/retry-started'
     | 'command/run' | 'command/done'
     | 'tool-workflow/run-start' | 'tool-workflow/agent-start' | 'tool-workflow/agent-end' | 'tool-workflow/run-end'>
   data: unknown
@@ -342,4 +371,6 @@ export type SessionEvent =
   | ToolWorkflowAgentStartEvent
   | ToolWorkflowAgentEndEvent
   | ToolWorkflowRunEndEvent
+  | LlmRetryEvent
+  | LlmRetryStartedEvent
 
