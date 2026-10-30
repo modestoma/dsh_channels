@@ -874,11 +874,13 @@ export class TurnStreamer {
   }
 
   /**
-   * Drop one abandoned attempt's deltas. The attempt's text is a contiguous
+   * Drop one discarded attempt's deltas. The attempt's text is a contiguous
    * suffix of the logical body: segments created during the attempt are
    * removed, the segment that was last at `start` is truncated, and the
    * reasoning tail is cut. Already-delivered plain-text segments cannot be
-   * retracted and stop the removal.
+   * retracted and stop the removal; segment cards already sent (or being
+   * sent) cannot be withdrawn, so they are emptied and kept. The newest
+   * remaining card is reopened so a retry streams into it again.
    */
   private rollbackAttempt(state: TurnState, mark: AttemptMark): void {
     const lastIndex = mark.cardCount - 1
@@ -886,6 +888,11 @@ export class TurnStreamer {
       const card = state.cards[index]
       if (card === undefined) continue
       if (card.mode === 'text' && card.messageId !== undefined) break
+      if (card.messageId !== undefined || card.sending) {
+        card.body = ''
+        card.dirty = true
+        continue
+      }
       state.cards.splice(index, 1)
     }
     const tail = state.cards[lastIndex]
@@ -895,8 +902,16 @@ export class TurnStreamer {
       tail.body = tail.body.slice(0, length)
       tail.dirty = true
     }
+    const last = state.cards[state.cards.length - 1]
+    if (last !== undefined) {
+      if ((last.mode === 'text' && last.messageId !== undefined) || last.failed) {
+        state.cards.push(this.freshSegment(''))
+      } else {
+        last.frozen = false
+      }
+    }
     state.reasoning = state.reasoning.slice(0, mark.reasoningLength)
-    // The abandoned attempt's reasoning time is not part of the visible turn.
+    // The discarded attempt's reasoning time is not part of the visible turn.
     state.reasoningMs = mark.reasoningMs
     state.reasoningSince = mark.reasoningSince
   }

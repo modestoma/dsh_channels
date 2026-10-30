@@ -1112,6 +1112,73 @@ describe('TurnStreamer live assistant frames', () => {
     expect(ch.addReaction).toHaveBeenLastCalledWith('om_trigger', 'DONE')
   })
 
+  it('reopens a writable card after rolling back a failed attempt that spilled into a continuation', async () => {
+    const ch = channel()
+    const hooksInstance = hooks()
+    const streamer = new TurnStreamer(ch, 500, hooksInstance)
+    const session = makeSession('sess-retry-segment')
+    streamer.attach(session, 'om_card', 'om_trigger', undefined)
+
+    streamer.onAssistantFrame(session, { type: 'start', attemptId: 'a1', revision: 1, turn: 1, step: 1 })
+    streamer.onAssistantFrame(session, {
+      type: 'chunk', attemptId: 'a1', revision: 1, index: 0, time: 1,
+      chunk: { type: 'text-delta', index: 0, text: 'x'.repeat(30_000) },
+    })
+    // Flush splits the body and the continuation card is delivered.
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(hooksInstance.sendSegmentCard).toHaveBeenCalledTimes(1)
+
+    streamer.onAssistantFrame(session, {
+      type: 'end', attemptId: 'a1', revision: 1, index: 1,
+      outcome: { kind: 'committed', eventType: 'assistant/attempt', seq: 4 },
+    })
+    streamer.onAssistantFrame(session, { type: 'start', attemptId: 'a2', revision: 2, turn: 1, step: 1 })
+    streamer.onAssistantFrame(session, {
+      type: 'chunk', attemptId: 'a2', revision: 2, index: 0, time: 2,
+      chunk: { type: 'text-delta', index: 0, text: '重试答案' },
+    })
+    streamer.onSessionEvent(session, { type: 'turn/end', seq: 6, data: { turn: 1, reason: { kind: 'completed' } } })
+    await vi.advanceTimersByTimeAsync(0)
+
+    const head = JSON.stringify(ch.updated.filter(update => update.messageId === 'om_card').at(-1)!.card)
+    const segment = JSON.stringify(ch.updated.filter(update => update.messageId === 'om_seg_2').at(-1)!.card)
+    expect(head).not.toContain('xxxx')
+    // The delivered continuation cannot be withdrawn: it is emptied and
+    // carries the retried reply instead of the failed attempt's text.
+    expect(segment).not.toContain('xxxx')
+    expect(segment).toContain('重试答案')
+  })
+
+  it('streams the retry into the head card when the failed continuation was never sent', async () => {
+    const ch = channel()
+    const hooksInstance = hooks()
+    const streamer = new TurnStreamer(ch, 500, hooksInstance)
+    const session = makeSession('sess-retry-unsent')
+    streamer.attach(session, 'om_card', 'om_trigger', undefined)
+
+    streamer.onAssistantFrame(session, { type: 'start', attemptId: 'a1', revision: 1, turn: 1, step: 1 })
+    streamer.onAssistantFrame(session, {
+      type: 'chunk', attemptId: 'a1', revision: 1, index: 0, time: 1,
+      chunk: { type: 'text-delta', index: 0, text: 'x'.repeat(30_000) },
+    })
+    streamer.onAssistantFrame(session, {
+      type: 'end', attemptId: 'a1', revision: 1, index: 1,
+      outcome: { kind: 'committed', eventType: 'assistant/attempt', seq: 4 },
+    })
+    streamer.onAssistantFrame(session, { type: 'start', attemptId: 'a2', revision: 2, turn: 1, step: 1 })
+    streamer.onAssistantFrame(session, {
+      type: 'chunk', attemptId: 'a2', revision: 2, index: 0, time: 2,
+      chunk: { type: 'text-delta', index: 0, text: '重试答案' },
+    })
+    streamer.onSessionEvent(session, { type: 'turn/end', seq: 6, data: { turn: 1, reason: { kind: 'completed' } } })
+    await vi.advanceTimersByTimeAsync(0)
+
+    const head = JSON.stringify(ch.updated.filter(update => update.messageId === 'om_card').at(-1)!.card)
+    expect(head).toContain('重试答案')
+    expect(head).not.toContain('xxxx')
+    expect(hooksInstance.sendSegmentCard).not.toHaveBeenCalled()
+  })
+
   it('reports the retry count when retries run out and the turn fails', async () => {
     const ch = channel()
     const streamer = new TurnStreamer(ch, 500, hooks())
