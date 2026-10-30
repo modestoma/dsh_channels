@@ -245,12 +245,34 @@ interface TurnState {
    * durable model history, so the card must drop them again.
    */
   attempts: Map<string, AttemptMark>
+  /**
+   * The model-request retry `dsh-llm-retry` scheduled for the current step
+   * (`llm/retry`), shown on the tool line until the retried request produces
+   * output. A retry stays inside the open turn: only `turn/end` settles it.
+   */
+  retry: RetryActivity | undefined
+  /** Retries scheduled during this turn (reported on a failed settled card). */
+  retries: number
   /** The owner clicked stop; the button renders disabled until the turn settles. */
   stopRequested: boolean
   /** A non-owner clicked stop; the owner-only notice renders under the button. */
   stopDenied: boolean
   /** A non-owner clicked the queued card's steer button. */
   queuedDenied: boolean
+}
+
+/** One scheduled model-request retry (`llm/retry` → `llm/retry-started`). */
+interface RetryActivity {
+  /** 1-based retry number. */
+  retry: number
+  /** Normal-mode budget; undefined in always mode. */
+  maxRetries: number | undefined
+  /** Failure code of the attempt that triggered the retry. */
+  code: string
+  /** Unix ms when the backoff wait ends. */
+  until: number
+  /** Set by `llm/retry-started`: the retried request is in flight. */
+  started: boolean
 }
 
 /** Card/body lengths captured at one stream attempt's `start` frame. */
@@ -426,6 +448,8 @@ export class TurnStreamer {
       toolKind: '',
       heartbeatTimer: undefined,
       attempts: new Map(),
+      retry: undefined,
+      retries: 0,
       stopRequested: false,
       stopDenied: false,
       queuedDenied: false,
@@ -638,6 +662,10 @@ export class TurnStreamer {
       }
       case 'assistant/message': {
         if (state.turn === undefined) state.turn = event.data.turn
+        if (state.retry !== undefined) {
+          state.retry = undefined
+          this.markDirty(session.id, state)
+        }
         if (event.data.usage !== undefined) {
           state.lastUsage = {
             usage: event.data.usage,
@@ -726,6 +754,28 @@ export class TurnStreamer {
         }
         break
       }
+      case 'llm/retry': {
+        // The failed attempt ended the step's request, not the turn: the loop
+        // re-runs the step after the backoff, so the card stays live.
+        if (state.turn === undefined) state.turn = event.data.turn
+        state.retry = {
+          retry: event.data.retry,
+          maxRetries: event.data.mode === 'normal' ? event.data.maxRetries : undefined,
+          code: event.data.failure.code,
+          until: Date.now() + Math.max(0, event.data.delayMs),
+          started: false,
+        }
+        state.retries++
+        this.markDirty(session.id, state)
+        break
+      }
+      case 'llm/retry-started': {
+        if (state.retry !== undefined && state.retry.retry === event.data.retry) {
+          state.retry.started = true
+          this.markDirty(session.id, state)
+        }
+        break
+      }
       case 'turn/end': {
         // The ended turn belongs to the front state: assign it if a turn was
         // rejected/emptied before any step started.
@@ -762,6 +812,12 @@ export class TurnStreamer {
       }
       case 'chunk': {
         const chunk = frame.chunk
+        if ((chunk.type === 'text-delta' || chunk.type === 'reasoning-delta')
+          && chunk.text !== '' && state.retry !== undefined) {
+          // The retried request is producing output again.
+          state.retry = undefined
+          this.markDirty(session.id, state)
+        }
         if (chunk.type === 'text-delta') {
           if (chunk.text !== '') this.closeReasoning(state)
           const last = state.cards[state.cards.length - 1]
@@ -784,7 +840,13 @@ export class TurnStreamer {
         this.closeReasoning(state)
         const mark = state.attempts.get(frame.attemptId)
         state.attempts.delete(frame.attemptId)
-        if (frame.outcome.kind === 'abandoned' && mark !== undefined) {
+        // A failed request attempt settles as `assistant/attempt`: like an
+        // abandoned one, its partial output is not model-visible history, and
+        // a retry streams the step again from scratch — keeping it would
+        // repeat the reply on the card.
+        const discarded = frame.outcome.kind === 'abandoned'
+          || frame.outcome.eventType === 'assistant/attempt'
+        if (discarded && mark !== undefined) {
           this.rollbackAttempt(state, mark)
           this.markDirty(session.id, state)
         }
@@ -1049,6 +1111,13 @@ export class TurnStreamer {
     if (state.awaitingApproval.length > 0) {
       return clipActivity(`⏳ 等待你审批：${[...new Set(state.awaitingApproval)].join('、')}`)
     }
+    const retry = state.retry
+    if (retry !== undefined) {
+      const count = retry.maxRetries === undefined ? `${retry.retry}` : `${retry.retry}/${retry.maxRetries}`
+      if (retry.started) return clipActivity(`🔁 模型请求重试中（第 ${count} 次）`)
+      const wait = Math.max(0, Math.ceil((retry.until - now) / 1_000))
+      return clipActivity(`⚠️ 模型请求失败（${retry.code}），${wait} 秒后第 ${count} 次重试`)
+    }
     const tool = state.toolActivity
     if (tool === undefined) return ''
     const prefix = tool.name === 'subagent'
@@ -1295,7 +1364,8 @@ export class TurnStreamer {
     this.closeReasoning(state)
     if (failure !== undefined) {
       const code = failure.code === undefined ? '' : `\n\n错误码：\`${failure.code}\``
-      const notice = `❌ **本轮运行失败**\n\n${failure.message}${code}`
+      const retried = state.retries === 0 ? '' : `\n\n已自动重试 ${state.retries} 次`
+      const notice = `❌ **本轮运行失败**\n\n${failure.message}${code}${retried}`
       const tail = state.cards[state.cards.length - 1]
       if (tail !== undefined) {
         if (tail.mode === 'text' || tail.failed) {
@@ -1322,6 +1392,7 @@ export class TurnStreamer {
       state.heartbeatTimer = undefined
     }
     state.tool = ''
+    state.retry = undefined
     // Freeze the tail and spawn any remaining segment cards.
     this.splitOverflow(sessionId, state)
 

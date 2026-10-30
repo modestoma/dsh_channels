@@ -1048,6 +1048,100 @@ describe('TurnStreamer live assistant frames', () => {
     expect(markdownOf(ch.updated.at(-1)!.card, 0)).toContain('好答案')
   })
 
+  it('keeps the card live through a model-request retry and drops the failed attempt', async () => {
+    const ch = channel()
+    const hooksInstance = hooks()
+    const streamer = new TurnStreamer(ch, 500, hooksInstance, 1_000)
+    const session = makeSession('sess-retry')
+    streamer.attach(session, 'om_card', 'om_trigger', 'react-typing')
+    const text = (): string => JSON.stringify(ch.updated.at(-1)!.card)
+
+    // Attempt 1 streams, then the request fails with a rate limit: the loop
+    // settles it as `assistant/attempt` and dsh-llm-retry schedules a retry
+    // inside the same turn.
+    streamer.onAssistantFrame(session, { type: 'start', attemptId: 'a1', revision: 1, turn: 1, step: 1 })
+    streamer.onAssistantFrame(session, {
+      type: 'chunk', attemptId: 'a1', revision: 1, index: 0, time: 1,
+      chunk: { type: 'text-delta', index: 0, text: '半截' },
+    })
+    streamer.onAssistantFrame(session, {
+      type: 'end', attemptId: 'a1', revision: 1, index: 1,
+      outcome: { kind: 'committed', eventType: 'assistant/attempt', seq: 4 },
+    })
+    streamer.onSessionEvent(session, {
+      type: 'llm/retry', seq: 5,
+      data: {
+        retryId: 'r1', turn: 1, step: 1, provider: 'deepseek', mode: 'normal', policyKey: 'k',
+        retry: 1, maxRetries: 5, delayMs: 3_000,
+        failure: { message: 'Rate limit reached', code: 'RATE_LIMIT' },
+      },
+    })
+    await vi.advanceTimersByTimeAsync(500)
+    expect(text()).not.toContain('半截')
+    expect(text()).toContain('⚠️ 模型请求失败（RATE_LIMIT），3 秒后第 1/5 次重试')
+    expect(hooksInstance.onTurnFinalized).not.toHaveBeenCalled()
+
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(text()).toContain('2 秒后第 1/5 次重试')
+
+    streamer.onSessionEvent(session, {
+      type: 'llm/retry-started', seq: 6, data: { retryId: 'r1', turn: 1, step: 1, retry: 1 },
+    })
+    await vi.advanceTimersByTimeAsync(500)
+    expect(text()).toContain('🔁 模型请求重试中（第 1/5 次）')
+
+    // The retried request streams the reply; the retry line disappears.
+    streamer.onAssistantFrame(session, { type: 'start', attemptId: 'a2', revision: 2, turn: 1, step: 1 })
+    streamer.onAssistantFrame(session, {
+      type: 'chunk', attemptId: 'a2', revision: 2, index: 0, time: 2,
+      chunk: { type: 'text-delta', index: 0, text: '完整答案' },
+    })
+    await vi.advanceTimersByTimeAsync(500)
+    expect(text()).toContain('完整答案')
+    expect(text()).not.toContain('重试')
+
+    streamer.onAssistantFrame(session, {
+      type: 'end', attemptId: 'a2', revision: 2, index: 1,
+      outcome: { kind: 'committed', eventType: 'assistant/message', seq: 7 },
+    })
+    streamer.onSessionEvent(session, { type: 'turn/end', seq: 8, data: { turn: 1, reason: { kind: 'completed' } } })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(hooksInstance.onTurnFinalized).toHaveBeenCalledTimes(1)
+    expect(text()).toContain('完整答案')
+    expect(text()).not.toContain('半截')
+    expect(ch.addReaction).toHaveBeenLastCalledWith('om_trigger', 'DONE')
+  })
+
+  it('reports the retry count when retries run out and the turn fails', async () => {
+    const ch = channel()
+    const streamer = new TurnStreamer(ch, 500, hooks())
+    const session = makeSession('sess-retry-exhausted')
+    streamer.attach(session, 'om_card', 'om_trigger', undefined)
+
+    for (const retry of [1, 2]) {
+      streamer.onSessionEvent(session, {
+        type: 'llm/retry', seq: retry * 2,
+        data: {
+          retryId: 'r1', turn: 1, step: 1, provider: 'deepseek', mode: 'normal', policyKey: 'k',
+          retry, maxRetries: 2, delayMs: 500,
+          failure: { message: 'Rate limit reached', code: 'RATE_LIMIT' },
+        },
+      })
+      streamer.onSessionEvent(session, {
+        type: 'llm/retry-started', seq: retry * 2 + 1, data: { retryId: 'r1', turn: 1, step: 1, retry },
+      })
+    }
+    streamer.onSessionEvent(session, {
+      type: 'turn/end', seq: 9,
+      data: { turn: 1, reason: { kind: 'error', error: { message: 'Rate limit reached', code: 'RATE_LIMIT' } } },
+    })
+    await vi.advanceTimersByTimeAsync(0)
+    const card = JSON.stringify(ch.updated.at(-1)!.card)
+    expect(card).toContain('本轮运行失败')
+    expect(card).toContain('已自动重试 2 次')
+    expect(card).not.toContain('🔁')
+  })
+
   it('prefers host projection figures for tokens, cache and window', async () => {
     const ch = channel()
     const hooksInstance = hooks()
