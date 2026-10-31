@@ -376,7 +376,7 @@ FEISHU_APP_SECRET: xxxxxxxx
 
 ## 群话题服务（feishuTopics）
 
-插件向其他 DSH 插件提供 Cordis 服务 `feishuTopics`：调用方给出目标群、发起人、根卡片内容、工作区和 prompt，插件在群里发一张根卡片，在卡片下开话题，把 prompt 原样交给一个新 Session（prompt 开头的斜杠命令由 DSH 展开成对应 skill），过程在话题内流式输出，和用户自己发起的会话一样。首轮结束后根卡片的状态标签随之更新。群里通过准入的成员都可以在该话题内追问。观象（[dsh-logalyze](https://github.com/modestoma/dsh-guanxiang)）的日志平台分析接口 `POST /open-api/logalyze` 就建在这个服务上。
+插件向其他 DSH 插件提供 Cordis 服务 `feishuTopics`：调用方给出目标群、发起人、根卡片内容、工作区和 prompt，插件在群里发一张根卡片，在卡片下开话题，把 prompt 原样交给一个新 Session（prompt 开头的斜杠命令由 DSH 展开成对应 skill），过程在话题内流式输出，和用户自己发起的会话一样。首轮结束后根卡片的状态标签随之更新。群里通过准入的成员都可以在该话题内追问。观象（[dsh-logalyze](https://github.com/modestoma/dsh-logalyze)）的日志平台分析接口 `POST /open-api/logalyze` 就建在这个服务上。
 
 **日志平台分析接口已迁到观象**：接口的路径、请求体和响应都没有变，但开关和令牌改在观象面板「分析接口」中设置，令牌的凭据引用名改为 `LOGALYZE_ANALYZE_TOKEN`。本插件不再注册这个路由，也不再读取 `analyzeEnabled` / `analyzeToken`；`cordis.yml` 或 Web 覆盖文件里还留着这两项时，启动日志会提示一次。升级步骤：
 
