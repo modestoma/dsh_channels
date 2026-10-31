@@ -5,7 +5,7 @@
  */
 
 import { spawn } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, rmSync, rmdirSync, utimesSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, rmdirSync, utimesSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -35,16 +35,18 @@ afterEach(async () => {
 
 describe('lockAddress', () => {
   it('derives a short, App-ID-free address per platform', () => {
-    const unix = lockAddress('cli_secret_app', 'linux', '/tmp')
+    const unix = lockAddress('cli_secret_app', 'darwin', '/tmp')
     expect(unix).toMatch(/^\/tmp\/dsh-channels-[0-9a-f]{16}\.sock$/)
     expect(unix).not.toContain('cli_secret_app')
     expect(lockAddress('cli_secret_app', 'win32')).toMatch(/^\\\\\.\\pipe\\dsh-channels-[0-9a-f]{16}$/)
-    expect(lockAddress('cli_other', 'linux', '/tmp')).not.toBe(unix)
+    expect(lockAddress('cli_secret_app', 'linux', '/tmp')).toMatch(/^\0dsh-channels-[0-9a-f]{16}$/)
+    expect(lockAddress('cli_other', 'darwin', '/tmp')).not.toBe(unix)
   })
 })
 
-describeUnix('createInstanceLockProvider', () => {
-  const provider = () => createInstanceLockProvider({ dir: mkdtempSync(path.join(tmpdir(), 'dsh-lock-')), sameProcessWaitMs: 0 })
+describeUnix('createInstanceLockProvider (socket file)', () => {
+  // The socket-file endpoint of macOS, exercised on any Unix host.
+  const provider = () => createInstanceLockProvider({ dir: mkdtempSync(path.join(tmpdir(), 'dsh-lock-')), platform: 'darwin', sameProcessWaitMs: 0 })
 
   it('grants the first owner and refuses the next with the owner identity', async () => {
     const locks = provider()
@@ -73,7 +75,7 @@ describeUnix('createInstanceLockProvider', () => {
 
   it('waits for a holder in this same process to release', async () => {
     const dir = mkdtempSync(path.join(tmpdir(), 'dsh-lock-'))
-    const locks = createInstanceLockProvider({ dir, sameProcessWaitMs: 2_000 })
+    const locks = createInstanceLockProvider({ dir, platform: 'darwin', sameProcessWaitMs: 2_000 })
     const address = locks.address('cli_a')
     const first = await locks.acquire(options(address, identity(process.pid)))
     if (!first.ok) throw new Error('first acquisition refused')
@@ -238,5 +240,45 @@ describe('FeishuService instance lock', () => {
 
     await second.shutdown()
     expect(locks.owners.size).toBe(0)
+  })
+})
+
+const describeLinux = process.platform === 'linux' ? describe : describe.skip
+
+describeLinux('createInstanceLockProvider (Linux abstract socket)', () => {
+  // A unique App ID per test keeps the machine-wide abstract names apart.
+  const appId = () => `cli_test_${process.pid}_${Math.random().toString(36).slice(2)}`
+
+  it('leaves no file behind and frees the address on release', async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'dsh-lock-'))
+    const locks = createInstanceLockProvider({ dir, sameProcessWaitMs: 0 })
+    const address = locks.address(appId())
+    expect(address.startsWith('\0')).toBe(true)
+    const first = await locks.acquire(options(address, identity(process.pid)))
+    if (!first.ok) throw new Error('first acquisition refused')
+    expect(readdirSync(dir)).toEqual([])
+    expect(await locks.acquire(options(address, identity(process.pid, '/home/b/.dsh')))).toEqual({ ok: false, holder: identity(process.pid) })
+
+    await first.lock.release()
+    const again = await locks.acquire(options(address, identity(process.pid, '/home/b/.dsh')))
+    expect(again.ok).toBe(true)
+    if (again.ok) held.push(again.lock)
+  })
+
+  it('frees the address the moment its owner is killed', async () => {
+    const locks = createInstanceLockProvider({ sameProcessWaitMs: 0 })
+    const address = locks.address(appId())
+    const child = spawn(process.execPath, ['-e', `require('node:net').createServer().listen(${JSON.stringify(address)}, () => console.log('ready'))`])
+    await new Promise<void>((resolve, reject) => {
+      child.stdout.once('data', () => resolve())
+      child.once('error', reject)
+    })
+    expect(await locks.acquire(options(address, identity(process.pid)))).toEqual({ ok: false, holder: undefined })
+
+    child.kill('SIGKILL')
+    await new Promise(resolve => child.once('exit', resolve))
+    const recovered = await locks.acquire(options(address, identity(process.pid)))
+    expect(recovered.ok).toBe(true)
+    if (recovered.ok) held.push(recovered.lock)
   })
 })
