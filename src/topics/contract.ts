@@ -1,7 +1,6 @@
 /**
  * Types of the `feishuTopics` service: another DSH plugin starts a
- * group-shared Feishu topic Session from an external trigger (for example
- * 观象's log-platform analyze API).
+ * group-shared Feishu topic Session from an external trigger.
  *
  * One launch posts a root card into an authorized group, opens a topic below
  * it, creates the Session in a workspace below the channel's `baseDir`, and

@@ -16,7 +16,7 @@ import { promises as fs } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import type { z } from 'zod'
-import { configSchema, MOVED_ANALYZE_NOTICE, movedAnalyzeKeysOf } from '../config.ts'
+import { configSchema } from '../config.ts'
 import type { FeishuConfig } from '../config.ts'
 import { normalizeWorkspaceBaseDir } from '../workspaces.ts'
 import { EDITABLE_KEYS } from './contract.ts'
@@ -245,8 +245,6 @@ export class OverlayStore {
       this.logger?.warn?.('dsh-channels: Web 覆盖配置不是合法 JSON（%s），按未覆盖处理：%s', this.file, String(error))
       return {}
     }
-    const moved = movedAnalyzeKeysOf(raw)
-    if (moved.length > 0) this.logger?.warn?.(MOVED_ANALYZE_NOTICE, `${this.file} 中的 ${moved.join('、')}`)
     const parsed = parseOverlay(raw)
     if (!parsed.ok) {
       this.logger?.warn?.(

@@ -80,27 +80,6 @@ export const DEFAULT_TOPIC_MESSAGES_TIMEOUT_MS = 20_000
  */
 export const DEFAULT_PROMPT_CONTEXT_TIMEOUT_MS = 3_000
 
-/**
- * Keys of the log-platform analyze API, which moved to 观象
- * (`dsh-logalyze`). A value still set in `cordis.yml` or the Web
- * overlay is ignored; the loader schema passes them through and
- * {@link movedAnalyzeKeysOf} finds them so the deployment is told.
- */
-export const MOVED_ANALYZE_KEYS = ['analyzeEnabled', 'analyzeToken'] as const
-
-/** Log line naming where the moved analyze API settings went. */
-export const MOVED_ANALYZE_NOTICE = 'dsh-channels: 日志分析接口已迁到观象（dsh-logalyze），忽略 %s：请在观象面板「分析接口」中开启并保存令牌（LOGALYZE_ANALYZE_TOKEN）'
-
-/**
- * The moved analyze API keys one raw config or overlay object still sets.
- * @param raw - undecoded `config` or overlay JSON.
- * @returns the keys present, in {@link MOVED_ANALYZE_KEYS} order.
- */
-export function movedAnalyzeKeysOf(raw: unknown): string[] {
-  if (typeof raw !== 'object' || raw === null) return []
-  return MOVED_ANALYZE_KEYS.filter(key => Object.hasOwn(raw, key))
-}
-
 /** A credential reference: `FEISHU_APP_ID`-style name resolved through ctx.credentials. */
 const credentialRefSchema = z.string().regex(
   CREDENTIAL_REF_PATTERN,
@@ -456,13 +435,9 @@ export type FeishuConfig = z.infer<typeof configSchema>
  * `config` object; the loader validates that row with `undefined` before the
  * user's patch layer supplies values. Accept that absence and fill the same
  * defaults as {@link resolveConfig}, so enabling the plugin from the Web UI
- * cannot fail with "expected object, received undefined". The moved analyze
- * keys pass through unchanged so `apply()` can warn about them.
+ * cannot fail with "expected object, received undefined".
  */
-export const pluginConfigSchema = configSchema.extend({
-  analyzeEnabled: z.unknown().optional(),
-  analyzeToken: z.unknown().optional(),
-}).prefault({})
+export const pluginConfigSchema = configSchema.prefault({})
 
 /**
  * Validate the raw loader config. Values stay credential *references*; the

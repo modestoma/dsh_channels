@@ -5,8 +5,7 @@
  * - p2p:   workspace `<baseDir>/p2p/<user_id>/`
  * - group: workspace `<baseDir>/groups/<chat_id>/<user_id>/`
  * - topic: `<workspace>/topics/<topic-token>/` (the Session's effective cwd)
- * - `feishuTopics` launch: workspace `<baseDir>/<caller segments…>/` (观象's
- *   log analyses use `<baseDir>/analyze/<app>/<errorCode>/`)
+ * - `feishuTopics` launch: workspace `<baseDir>/<caller segments…>/`
  *
  * The workspace root is the Session header cwd: it keeps the Session grouped
  * under the user's project in the GUI and stays the sandbox write boundary.
