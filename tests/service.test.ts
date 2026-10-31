@@ -10,6 +10,7 @@ import { promisify } from 'node:util'
 import { gunzip } from 'node:zlib'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { TestFeishuService as FeishuService } from './helpers.ts'
+import { MISSED_RUN_ACTION } from '../src/cards/missed.ts'
 import { hostTurnOriginLine } from '../src/service.ts'
 import { FeishuApiError } from '../src/feishu-channel.ts'
 import type { FeishuConfig } from '../src/config.ts'
@@ -63,6 +64,8 @@ function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
     hostTurnCards: true,
     // Restart recovery as before replay existed; the recovery tests opt in.
     replay: { pending: false, interrupted: 'notify' },
+    // Catch-up stores a heartbeat in the domain global; its tests opt in.
+    missed: { enabled: false, windowMs: 30 * 60_000, heartbeatMs: 60_000, maxMessages: 200 },
     slashCommandPanel: false,
     acceptAttachments: true,
     attachmentStore: 'native',
@@ -2402,6 +2405,11 @@ describe('FeishuService', () => {
 
   const recoveryConfig = { replay: { pending: true, interrupted: 'ask' as const } }
 
+  /** Every prompt any fake Agent received, serialized. */
+  function allFollowups(h: Harness): string {
+    return JSON.stringify([...h.ctxState.agents.created, ...h.ctxState.agents.resumed].map(entry => mock(entry.handle.agent.followup).mock.calls))
+  }
+
   /** Establish one p2p session, then restart with its turn left unfinished. */
   async function restartMidTurn(
     prepareLog: (session: Session, prompt: { id: string }, agent: Agent) => void,
@@ -2557,6 +2565,55 @@ describe('FeishuService', () => {
     await waitUntil(() => expect(mock(h.ctxState.ctx.logger!.info!).mock.calls).toContainEqual([expect.stringContaining('recovered'), 'om_1', 'interrupted']))
     expect(clicked).toBe(true)
     expect(inflightEntries(h)).toEqual([['om_1', expect.objectContaining({ message: expect.objectContaining({ content: [{ type: 'text', text: expect.stringContaining('从中断处继续') }] }) })]])
+    await service2.shutdown()
+  })
+
+  it('handles a message that arrived while no instance was connected, once', async () => {
+    const h = await setup({ missed: { enabled: true, windowMs: 30 * 60_000, heartbeatMs: 60_000, maxMessages: 200 } })
+    await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'u_alice', content: 'hi' }))
+    await waitForEstablishedSession(h)
+    await h.service.shutdown()
+
+    const missed = makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'u_alice', content: '离线时发的', createTime: Date.now() })
+    const channel2 = Object.assign(makeChannel(), {
+      historyIds: vi.fn(async () => ({ ids: [{ messageId: missed.messageId, createTime: missed.createTime }], truncated: false })),
+      historyMessages: vi.fn(async () => [missed]),
+    })
+    const service2 = new FeishuService(h.ctxState.ctx, h.config, () => channel2)
+    await service2.start()
+    await waitUntil(() => expect(allFollowups(h)).toContain('离线时发的'))
+    expect(channel2.historyIds).toHaveBeenCalledWith({ type: 'chat', id: 'oc_p2p', chatType: 'p2p' }, expect.any(Number), 200)
+
+    // The same message delivered live afterwards is a duplicate.
+    const before = allFollowups(h)
+    await mock(channel2.onMessage).mock.calls[0]![0](missed)
+    await flush()
+    expect(allFollowups(h)).toBe(before)
+    await service2.shutdown()
+  })
+
+  it('offers older missed messages on a card and handles them on the sender\'s click', async () => {
+    const h = await setup({ missed: { enabled: true, windowMs: 30 * 60_000, heartbeatMs: 60_000, maxMessages: 200 } })
+    await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'u_alice', content: 'hi' }))
+    await waitForEstablishedSession(h)
+    await h.service.shutdown()
+    // The previous instance went away two hours ago.
+    const global = h.ctxState.domain.raw.global
+    await global.set({ ...(global.get() as object), lastAliveAt: Date.now() - 2 * 60 * 60_000 })
+
+    const old = makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'u_alice', content: '很早发的', createTime: Date.now() - 90 * 60_000 })
+    const channel2 = Object.assign(makeChannel(), {
+      historyIds: vi.fn(async () => ({ ids: [{ messageId: old.messageId, createTime: old.createTime }], truncated: false })),
+      historyMessages: vi.fn(async () => [old]),
+    })
+    const service2 = new FeishuService(h.ctxState.ctx, h.config, () => channel2)
+    await service2.start()
+    await waitUntil(() => expect(JSON.stringify(channel2.sent)).toContain('离线期间收到 1 条消息'))
+    const card = channel2.sent.find(sent => JSON.stringify(sent).includes('离线期间'))!
+    const value = { decision: MISSED_RUN_ACTION, chat: 'oc_p2p', chatType: 'p2p', ids: [old.messageId], senders: ['u_alice'] }
+    expect(JSON.stringify(card.input)).toContain(JSON.stringify(value))
+    await channel2.fireCardAction({ messageId: 'om_card_missed', chatId: 'oc_p2p', operator: { openId: 'ou_a', userId: 'u_alice' }, action: { value, tag: 'button' } })
+    await waitUntil(() => expect(allFollowups(h)).toContain('很早发的'))
     await service2.shutdown()
   })
 

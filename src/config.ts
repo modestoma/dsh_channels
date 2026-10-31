@@ -382,6 +382,20 @@ export const configSchema = z.object({
     interrupted: z.enum(['ask', 'notify']).default('ask'),
   }).default({ pending: true, interrupted: 'ask' }),
   /**
+   * Catch-up of messages that arrived while the long connection was down (a
+   * restart or a reconnect; see `routing/missed.ts`). Messages newer than
+   * `windowMs` are handled as if delivered live; older ones in the same chats
+   * are offered on a pending card (handle all / ignore). `heartbeatMs` is how
+   * often the last-alive time is stored, which bounds how far back a restart
+   * after a crash looks. At most `maxMessages` messages are read per catch-up.
+   */
+  missed: z.object({
+    enabled: z.boolean().default(true),
+    windowMs: z.number().int().min(60_000).max(24 * 60 * 60_000).default(30 * 60_000),
+    heartbeatMs: z.number().int().min(5_000).max(10 * 60_000).default(60_000),
+    maxMessages: z.number().int().min(1).max(1_000).default(200),
+  }).default({ enabled: true, windowMs: 30 * 60_000, heartbeatMs: 60_000, maxMessages: 200 }),
+  /**
    * Sync the command registry to Feishu's native `/` panel on every connect
    * (needs the `application:app_slash_command:read`/`write` scopes). Off by
    * default: some tenants forbid apps from adding slash commands. When off,

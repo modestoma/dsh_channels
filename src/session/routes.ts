@@ -123,6 +123,11 @@ export class RouteStore {
     return this.active.size
   }
 
+  /** Every active route record. */
+  records(): RouteRecord[] {
+    return [...this.active.values()]
+  }
+
   clear(): void {
     this.active.clear()
     this.expired.clear()

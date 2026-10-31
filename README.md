@@ -144,14 +144,14 @@ Web 里直接新建的会话不显示按钮。来源在 Host 侧按会话 id 持
 
 ## 发布
 
-版本号由 semantic-release 按 Conventional Commits 计算。1.0 之前，破坏性变更（`BREAKING CHANGE`）只升次版本号（如 0.7 → 0.8）。推送（含合并 PR）到 `main` 在检查通过后**自动发布**正式版；推送到 `dev` 只跑检查，beta 版**只在手动触发时发布**，可以先累积多笔提交。
+版本号由 semantic-release 按 Conventional Commits 计算。版本号始终保持 0.x：破坏性变更（`BREAKING CHANGE`）只升次版本号（如 0.7 → 0.8），不会升到 1.0.0。推送（含合并 PR）到 `dev` 在检查通过后**自动发布** beta 版；正式版**只在手动触发时发布**，推送到 `main` 只跑检查。
 
-| 分支 | 版本 | npm dist-tag |
-| --- | --- | --- |
-| `main` | 正式版，如 `0.5.0` | `latest` |
-| `dev` | 预发布版，如 `0.5.0-beta.1` | `beta` |
+| 分支 | 触发 | 版本 | npm dist-tag |
+| --- | --- | --- | --- |
+| `main` | 手动 | 正式版，如 `0.5.0` | `latest` |
+| `dev` | 推送自动 | 预发布版，如 `0.5.0-beta.1` | `beta` |
 
-手动发布：在 GitHub Actions 的 `pipeline` workflow 点击 **Run workflow**，选择 `dev`（或需要补发时选 `main`）：`dry_run` 默认勾选，只预览下一个版本号；取消勾选才真正发布 npm 包、打 tag 并创建 GitHub Release。安装 beta 版用 `@modesto_ma/dsh-channels@beta`。
+发布正式版：在 GitHub Actions 的 `pipeline` workflow 点击 **Run workflow** 并选择 `main`。`dry_run` 默认勾选，只预览下一个版本号；取消勾选才真正发布 npm 包、打 tag 并创建 GitHub Release。在 `dev` 上手动触发同样可用，用来预览或补发 beta。安装 beta 版用 `@modesto_ma/dsh-channels@beta`。
 
 ## 目录结构
 
@@ -177,6 +177,7 @@ src/
 │   ├── onboarding.ts      #   私聊首次触达引导卡
 │   ├── topic.ts           #   群话题服务的根卡片（引导句、链接表格、状态标签）
 │   ├── approval.ts        #   审批决策卡
+│   ├── missed.ts          #   断连补偿的待处理卡
 │   └── question.ts        #   结构化问答卡
 ├── approvals.ts           # 审批 barrel → src/interactions/
 ├── questions.ts           # 问答 barrel → src/interactions/
@@ -196,13 +197,15 @@ src/
 │   ├── inbound-attachments.ts # 入站附件：不下载分类、图片预取、旧版工作区存档（archive）
 │   ├── manifest.ts        # <feishu_context> 清单：只列未加载附件、去重、转义、行上限
 │   ├── message-read.ts    # 消息读取：get/mget/list、引用摘录、首轮历史、统一渲染
+│   ├── history-events.ts  # 把消息历史还原成长连接事件（断连补偿用）
 │   ├── slash-commands.ts  # 连接后把命令注册表幂等同步到飞书原生斜杠指令面板
 │   ├── tools.ts           # feishu_attachment_fetch / feishu_topic_messages 与每 route 白名单
 │   ├── send-file.ts       # feishu_send_file：把话题工作目录内的图片/文件发回当前会话
 │   ├── wiki/              # 知识库工具：links（wikiRoots 链接解析）、api（wiki/docx/docs_ai 接口）、sheet-api / base-api（电子表格、多维表格接口）、scope（范围判定）、consent（授权卡）、shared（失败码与公共步骤）、tools / sheet-tools / base-tools、a1（A1 范围）
 │   └── agent-context.ts   # agent 作用域 system prompt：native/archive 双模式附件指引
 ├── routing/
-│   └── inbound.ts         # 入站路由：去重、准入、路由决策树、建/续会话、首触引导
+│   ├── inbound.ts         # 入站路由：去重、准入、路由决策树、建/续会话、首触引导
+│   └── missed.ts          # 断连补偿：最后在线时间、读回漏掉的消息、待处理卡
 ├── commands.ts            # 斜杠命令解析、agent 作用域注册与结果卡
 ├── commands/registry.ts   # 命令注册表：词表 / 准入规则 / 分组 help 的单一事实来源
 ├── session-commands.ts    # /status /workspace /renew /history /compact 渲染
@@ -311,6 +314,11 @@ npm 发行包已包含构建产物：Host 入口是 `lib/index.js`（profile 直
     replay:                             # 重启恢复：pending 重放还没轮到处理的消息；interrupted: ask（带继续按钮）| notify
       pending: true
       interrupted: 'ask'
+    missed:                             # 断连补偿：重启或断线重连后读回期间漏掉的消息
+      enabled: true
+      windowMs: 1800000                 # 30 分钟内的消息直接处理；更早的发一张待处理卡（全部处理 / 忽略）
+      heartbeatMs: 60000                # 多久记录一次「最后在线时间」，崩溃重启时从这里往回读
+      maxMessages: 200                  # 每次补偿最多读多少条
     slashCommandPanel: false            # 连接时把命令同步到飞书原生 / 面板（需 app_slash_command 读写权限；改后需重连）
     allowPermissionSwitch: false        # 是否允许 /permissions <name> 从飞书侧切换权限预设（安全敏感）
     accessMode: 'guarded'               # 准入模式：guarded（默认，仅管理员+白名单）| open（旧行为，不安全）
@@ -439,6 +447,7 @@ const result = await topics?.launch({
   - **被打断**：卡片改成「⚠️ 服务已重启，本轮回复中断」，主卡带「▶️ 继续」按钮（`replay.interrupted: 'ask'`，默认）。话题发起人点了之后，同一张卡片开始新一轮，让模型从中断处接着完成；每张卡片只能点一次。设成 `notify` 时只显示中断提示，不带按钮。
 
   路由已失效、Session 换过（`/renew`）或恢复失败时，按「被打断」处理但不带按钮。卡片更新失败会重试一次（上限 2 次）后放弃。持久化盘点与缺口清单见 [docs/persistence.md](docs/persistence.md)。
+- **断连补偿**：长连接断开期间（服务重启、崩溃或断线重连）发来的消息飞书不会补推，插件连上后自己从消息历史里读回来（`missed`，默认开启）。启动时从上一个实例记下的「最后在线时间」开始读（连接期间每 `heartbeatMs` 记一次，正常关闭时记下关闭时刻），断线重连时从断开的那一刻开始读，最远不超过 24 小时。读取范围是插件知道的会话：有路由的私聊和群、已授权的群、发过引导卡的私聊，以及最近活跃的话题。`windowMs`（默认 30 分钟）以内的消息按正常消息处理，已经处理过的会被下面的去重丢掉；更早的消息里会触发机器人的那些（私聊、@ 机器人、已有话题里的回复）按会话汇总成一张「离线期间收到 N 条消息」卡片，消息发送者或管理员点「全部处理」后按顺序处理，点「忽略」则不再处理。每次最多读 `maxMessages` 条。读历史用到 `im:message:readonly`，群消息还需要 `im:message.group_msg`；没有权限的会话会跳过并记一条 warn。
 - **消息去重（WS 重投幂等）**：飞书长连接重连会重投未 ack 的事件；每条消息在任何副作用之前先落一条 `processed` 记录（键 = message id，飞书全局唯一），重投消息被直接丢弃——同进程靠内存守卫、跨重启靠持久化记录，每条消息至多处理一次。记录保留 24 小时后由 GC 清扫。
 - **路由表 GC 与过期话题拒绝**：超过 `routeTtlMs`（默认 30 天）无活动的真实话题路由会先写入最小持久化墓碑，再删除活动路由；此后该话题中的普通消息和 Session 命令会收到「话题已过期」提示，插件不会恢复旧 Session，也不会在可见历史仍属于旧 Session 的话题里新建 Session（`/help`、`/userid`、`/groupid`、`/health` 仍可用）。墓碑跨重启保留，仅含 thread/chat/owner/工作区路径/会话目录/最后活动时间；旧 DSH Session、日志与话题目录都不删除。降级的 chat-scoped 路由没有独立话题边界，仍直接清理。陈年 in-flight 快照同时在启动时及每 6 小时清扫。`routeTtlMs: 0` 关闭后续路由过期处理，已产生的墓碑仍保持拒绝语义。
 - **准入与授权**：`accessMode: 'guarded'`（默认）下，入站先过频道准入：**管理员不受任何白名单限制**，私聊/任意群聊（含未授权群）都可直接开会话；**非管理员**私聊回固定提示（`/userid` 例外；`dmAllowWhitelist: true` 时全局用户白名单里的人可私聊，命令与群聊相同，`/auth` 仍仅管理员），群聊要求 **群在白名单** 且 **user_id 在全局用户白名单**，两者缺一不可。未授权消息不建 Session、不建话题目录、不落附件、不调模型；群里静默、私聊回固定文案。机器人被拉进任意群时（订阅 `im.chat.member.bot.added_v1`），插件私聊管理员发群信息卡（群名/`chat_id`/成员数/邀请人），未授权群附「授权本群 / 忽略」按钮；已授权群里未授权用户 @ 机器人时，管理员会收到用户授权申请卡（含昵称/user_id）。授权状态持久化在 `channels_routes_v2` 域的 `access_groups` / `access_users` / `access_requests` 表，撤销立即生效。管理员 user_id 在 Web 面板配置，留空时为飞书应用所有者（连接时查询，需可选的「获取应用信息」权限；查询失败则 fail closed，手动填写管理员即可）；`/auth` 命令、授权卡、面板三种入口等价。
