@@ -184,8 +184,10 @@ export function RecordsTab(): JSX.Element {
                         {RECORDS_COPY.groupsTitle}
                         <span className="dsh-channels-rec__secCount">{groups.length}</span>
                       </h3>
-                      {groups.length === 0 ? <div className="dsh-channels-rec__card dsh-channels-rec__muted">{RECORDS_COPY.emptyGroups}</div> : null}
-                      {groups.map(group => <GroupCard key={group.chatId} group={group} tree={tree} />)}
+                      <div className="dsh-channels-rec__card">
+                        {groups.length === 0 ? <div className="dsh-channels-rec__muted">{RECORDS_COPY.emptyGroups}</div> : null}
+                        {groups.map(group => <GroupItem key={group.chatId} group={group} tree={tree} />)}
+                      </div>
                     </section>
                   )}
               {searching && directs.length === 0
@@ -208,7 +210,7 @@ export function RecordsTab(): JSX.Element {
   )
 }
 
-function GroupCard(props: { group: SessionRecordGroupWire; tree: TreeProps }): JSX.Element {
+function GroupItem(props: { group: SessionRecordGroupWire; tree: TreeProps }): JSX.Element {
   const { group, tree } = props
   const key = `group:${group.chatId}`
   const open = tree.isOpen(key)
@@ -216,7 +218,7 @@ function GroupCard(props: { group: SessionRecordGroupWire; tree: TreeProps }): J
   const sessions = group.users.reduce((sum, user) => sum + user.sessions.length, 0)
   const latest = Math.max(...group.users.map(latestOf))
   return (
-    <div className={`dsh-channels-rec__card${open ? ' dsh-channels-rec__card--open' : ''}`}>
+    <div className="dsh-channels-rec__item">
       <button
         type="button"
         className="dsh-channels-rec__head dsh-channels-rec__head--group"
@@ -225,7 +227,7 @@ function GroupCard(props: { group: SessionRecordGroupWire; tree: TreeProps }): J
         onClick={() => tree.onToggle(key)}
       >
         <ChevronIcon className="dsh-channels-rec__chevron" />
-        <Avatar text={title} url={group.chatAvatarUrl} size={32} />
+        <Avatar text={title} url={group.chatAvatarUrl} size={24} />
         <span className="dsh-channels-rec__headText">
           <span className="dsh-channels-rec__name">{title}</span>
           <span className="dsh-channels-rec__meta">
@@ -233,6 +235,7 @@ function GroupCard(props: { group: SessionRecordGroupWire; tree: TreeProps }): J
           </span>
         </span>
         <span className="dsh-channels-rec__time" title={formatTime(latest)}>{formatRelativeTime(latest)}</span>
+        <span className="dsh-channels-rec__action" />
       </button>
       {open
         ? (
@@ -261,7 +264,7 @@ function UserBlock(props: {
   const hasWorkspace = user.workspaces.length > 0
   const latest = latestOf(user)
   return (
-    <div className="dsh-channels-rec__user">
+    <div className={`dsh-channels-rec__user${groupName === undefined ? ' dsh-channels-rec__item' : ''}`}>
       <div className="dsh-channels-rec__userRow">
         <button
           type="button"
@@ -271,7 +274,7 @@ function UserBlock(props: {
           onClick={() => tree.onToggle(toggleKey)}
         >
           <ChevronIcon className="dsh-channels-rec__chevron" />
-          <Avatar text={title} url={user.avatarUrl} size={26} />
+          <Avatar text={title} url={user.avatarUrl} size={22} />
           <span className="dsh-channels-rec__headText">
             <span className="dsh-channels-rec__name">{title}</span>
             <span className="dsh-channels-rec__meta">{fillCopy(RECORDS_COPY.userMeta, { sessions: String(user.sessions.length) })}</span>
@@ -323,10 +326,12 @@ function SessionRow(props: { record: SessionRecordWire; navigator: SessionNaviga
         aria-label={`${RECORDS_COPY.openHint}：${record.title ?? RECORDS_COPY.untitled}`}
         onClick={() => navigator?.openSession(record.sessionId)}
       >
-        <span
-          className={`dsh-channels-rec__status${record.bound ? ' dsh-channels-rec__status--bound' : ''}`}
-          title={record.bound ? RECORDS_COPY.boundHint : RECORDS_COPY.unboundHint}
-        />
+        <span className="dsh-channels-rec__lead">
+          <span
+            className={`dsh-channels-rec__status${record.bound ? ' dsh-channels-rec__status--bound' : ''}`}
+            title={record.bound ? RECORDS_COPY.boundHint : RECORDS_COPY.unboundHint}
+          />
+        </span>
         <span className={`dsh-channels-rec__sessionTitle${record.title === undefined ? ' dsh-channels-rec__sessionTitle--untitled' : ''}`}>
           {record.title ?? RECORDS_COPY.untitled}
         </span>
