@@ -8,8 +8,8 @@ export default {
       '@semantic-release/commit-analyzer',
       {
         preset: 'conventionalcommits',
-        // 0.x: a breaking change bumps the minor version, never to 1.0.0.
-        // Remove this rule when the plugin is ready for 1.0.
+        // Versions stay 0.x: a breaking change bumps the minor version and
+        // never reaches 1.0.0.
         releaseRules: [{ breaking: true, release: 'minor' }],
       },
     ],
