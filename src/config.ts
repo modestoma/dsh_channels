@@ -82,14 +82,14 @@ export const DEFAULT_PROMPT_CONTEXT_TIMEOUT_MS = 3_000
 
 /**
  * Keys of the log-platform analyze API, which moved to 观象
- * (`@modesto_ma/dsh-guanxiang`). A value still set in `cordis.yml` or the Web
+ * (`dsh-logalyze`). A value still set in `cordis.yml` or the Web
  * overlay is ignored; the loader schema passes them through and
  * {@link movedAnalyzeKeysOf} finds them so the deployment is told.
  */
 export const MOVED_ANALYZE_KEYS = ['analyzeEnabled', 'analyzeToken'] as const
 
 /** Log line naming where the moved analyze API settings went. */
-export const MOVED_ANALYZE_NOTICE = 'dsh-channels: 日志分析接口已迁到观象（@modesto_ma/dsh-guanxiang），忽略 %s：请在观象面板「分析接口」中开启并保存令牌（GUANXIANG_ANALYZE_TOKEN）'
+export const MOVED_ANALYZE_NOTICE = 'dsh-channels: 日志分析接口已迁到观象（dsh-logalyze），忽略 %s：请在观象面板「分析接口」中开启并保存令牌（LOGALYZE_ANALYZE_TOKEN）'
 
 /**
  * The moved analyze API keys one raw config or overlay object still sets.
