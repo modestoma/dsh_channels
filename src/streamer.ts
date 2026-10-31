@@ -1392,7 +1392,8 @@ export class TurnStreamer {
             this.cardState(sessionId, state, card.body, index === state.cards.length - 1),
             segmentCardOptions(index),
           )
-          const delivery = await this.hooks.sendSegmentCard(sessionId, index + 1, snapshot, card.body)
+          const sentBody = card.body
+          const delivery = await this.hooks.sendSegmentCard(sessionId, index + 1, snapshot, sentBody)
           card.sending = false
           card.messageId = delivery.messageId
           card.mode = delivery.mode
@@ -1406,10 +1407,13 @@ export class TurnStreamer {
             card.dirty = true
             this.markDirty(sessionId, state)
           } else if (!card.frozen && !state.disposed) {
-            // Text fallback: this card is final; keep streaming into a new one.
+            // Text fallback: this card is final; keep streaming into a new one,
+            // which also carries whatever arrived while the text was sent.
             card.frozen = true
             if (state.cards[state.cards.length - 1] === card) {
-              state.cards.push(this.freshSegment(''))
+              const pending = card.body.startsWith(sentBody) ? card.body.slice(sentBody.length) : ''
+              card.body = sentBody
+              state.cards.push(this.freshSegment(pending))
             }
             this.markDirty(sessionId, state)
           }

@@ -1555,6 +1555,31 @@ describe('TurnStreamer host turns', () => {
     await vi.waitFor(() => expect(ch.addReaction).toHaveBeenCalledWith('om_trigger', 'DONE'))
   })
 
+  it('keeps output that arrived while a host card fell back to text', async () => {
+    const ch = channel()
+    let deliver: (() => void) | undefined
+    const sendSegmentCard = vi.fn(async (_sessionId: string, segment: number, _card: object, fallbackText: string) => {
+      if (segment === 1 && deliver === undefined) {
+        await new Promise<void>(resolve => { deliver = resolve })
+        return { messageId: 'om_text_1', mode: 'text' as const }
+      }
+      return { messageId: `om_seg_${segment}_${fallbackText.length}`, mode: 'card' as const }
+    })
+    const hooksInstance = { ...hooks(), sendSegmentCard, hostTurnOrigin: vi.fn(() => 'origin') }
+    const streamer = new DrivenStreamer(ch, 500, hooksInstance)
+    const session = makeSession('sess-fallback')
+
+    streamer.hostTurn(session, prompt('job-done', 'tool-jobs'))
+    await vi.advanceTimersByTimeAsync(0)
+    frame(streamer, session, 1, '发送期间产生的回答')
+    deliver!()
+    await vi.advanceTimersByTimeAsync(500)
+
+    expect(sendSegmentCard).toHaveBeenCalledTimes(2)
+    expect(sendSegmentCard.mock.calls[0]![3]).toBe('')
+    expect(JSON.stringify(sendSegmentCard.mock.calls[1]![2])).toContain('发送期间产生的回答')
+  })
+
   it('renders a host turn nowhere when no origin is returned', async () => {
     const ch = channel()
     const hooksInstance = { ...hooks(), hostTurnOrigin: vi.fn(() => undefined) }
