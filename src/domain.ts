@@ -172,6 +172,17 @@ export const inflightCardSchema = z.object({
 
 export type InflightCard = z.infer<typeof inflightCardSchema>
 
+/** Largest serialized prompt kept in a snapshot for restart replay. */
+export const INFLIGHT_PROMPT_MAX_BYTES = 256 * 1024
+
+/** A persisted `UserMessage` (content blocks are kept as the host wrote them). */
+export const inflightMessageSchema = z.object({
+  id: z.string().min(1),
+  role: z.literal('user'),
+  content: z.array(z.looseObject({ type: z.string() })),
+  source: z.looseObject({ kind: z.string() }),
+})
+
 export const inflightSnapshotSchema = z.object({
   /** Key the snapshot is stored under (= `cards[0].messageId`, the main card). */
   key: z.string().min(1),
@@ -179,8 +190,21 @@ export const inflightSnapshotSchema = z.object({
   sessionId: z.string().min(1),
   /** Feishu chat the cards live in (reaction targeting). */
   chatId: z.string().min(1),
-  /** User message that triggered the turn (Typing/DONE reaction anchor). */
-  triggerMessageId: z.string().min(1),
+  /**
+   * User message that triggered the turn (Typing/DONE reaction anchor).
+   * Absent for a turn no Feishu message started (a host-turn card).
+   */
+  triggerMessageId: z.string().min(1).optional(),
+  /** Route the turn ran under; restart recovery resumes its Session. */
+  routeKey: z.string().min(1).optional(),
+  /**
+   * The prompt handed to `followup()` (absent while it is being assembled, for
+   * a host turn, or when it exceeded `INFLIGHT_PROMPT_MAX_BYTES`). Restart
+   * recovery replays it when the Session log shows the turn never claimed it.
+   */
+  message: inflightMessageSchema.optional(),
+  /** How often restart recovery already replayed `message` (cap: 1). */
+  replays: z.number().int().nonnegative().optional(),
   /** Reaction id of the Typing reaction (absent when the add failed). */
   reactionId: z.string().optional(),
   /** Segment cards in order; `[0]` is the main card. */

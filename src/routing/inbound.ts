@@ -1052,6 +1052,7 @@ export class InboundRouter {
       sessionId,
       chatId: msg.chatId,
       triggerMessageId: msg.messageId,
+      routeKey: key,
       reactionId: typingId,
       cards: [{ messageId: sent.messageId, mode: 'card' }],
       startedAt: Date.now(),
@@ -1123,6 +1124,7 @@ export class InboundRouter {
         firstTurn: true,
         excludeMessageIds: [msg.messageId, sent.messageId],
       })
+      await this.repair.recordMessage(sent.messageId, message)
       this.streamer?.attach(handle.agent.session, sent.messageId, msg.messageId, typingId, { message })
       handle.agent.followup(message)
     } finally {
@@ -1172,6 +1174,7 @@ export class InboundRouter {
       sessionId: current.sessionId,
       chatId: msg.chatId,
       triggerMessageId: msg.messageId,
+      routeKey: current.key,
       reactionId: typingId,
       cards: [{ messageId: sent.messageId, mode: 'card' }],
       startedAt: Date.now(),
@@ -1186,6 +1189,7 @@ export class InboundRouter {
     const message = await this.deliverTurnMessage(msg, current, content, {
       excludeMessageIds: [msg.messageId, sent.messageId],
     })
+    await this.repair.recordMessage(sent.messageId, message)
     this.streamer?.attach(live.agent.session, sent.messageId, msg.messageId, typingId, { message })
     live.agent.followup(message)
   }

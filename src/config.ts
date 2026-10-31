@@ -391,6 +391,18 @@ export const configSchema = z.object({
    */
   hostTurnCards: z.boolean().default(true),
   /**
+   * Restart recovery of turns the previous process left unfinished (see
+   * `session/repair.ts`). `pending`: a message that was still queued (the
+   * Agent never claimed it) runs again into its own card, once. `interrupted`:
+   * a turn cut off mid-way gets a continue button (`ask`) or only the
+   * interruption notice (`notify`). A turn that completed unseen always gets
+   * its final reply re-rendered from the Session log.
+   */
+  replay: z.object({
+    pending: z.boolean().default(true),
+    interrupted: z.enum(['ask', 'notify']).default('ask'),
+  }).default({ pending: true, interrupted: 'ask' }),
+  /**
    * Sync the command registry to Feishu's native `/` panel on every connect
    * (needs the `application:app_slash_command:read`/`write` scopes). Off by
    * default: some tenants forbid apps from adding slash commands. When off,

@@ -357,17 +357,24 @@ export interface LlmRetryStartedEvent extends SessionEventEnvelope {
   data: { turn: number; step: number; retry: number; [key: string]: unknown }
 }
 
+/** A prompt the Agent admitted into a request (its `UserMessage`, id included). */
+export interface UserMessageEvent extends SessionEventEnvelope {
+  type: 'user/message'
+  data: UserMessage
+}
+
 export interface OtherSessionEvent extends SessionEventEnvelope {
   /** Unknown/extension event types are ignored by the folds. */
   type: Exclude<string, 'assistant/message' | 'step/start' | 'turn/end' | 'request/header'
     | 'tool/call' | 'tool/result' | 'subagent/descriptor' | 'llm/retry' | 'llm/retry-started'
-    | 'command/run' | 'command/done'
+    | 'command/run' | 'command/done' | 'user/message'
     | 'tool-workflow/run-start' | 'tool-workflow/agent-start' | 'tool-workflow/agent-end' | 'tool-workflow/run-end'>
   data: unknown
 }
 
 export type SessionEvent =
   | AssistantMessageEvent
+  | UserMessageEvent
   | StepStartEvent
   | StepEndEvent
   | TurnEndEvent

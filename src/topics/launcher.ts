@@ -40,6 +40,7 @@ import { enterTopic, placementServices, planTopic } from '../session/isolation.t
 import type { TopicPlacement } from '../session/isolation.ts'
 import type { SessionManager } from '../session/manager.ts'
 import type { InflightRepair } from '../session/repair.ts'
+import { storableMessage } from '../session/repair.ts'
 import type { RouteStore } from '../session/routes.ts'
 import type { TurnStreamer } from '../streamer.ts'
 import { ensureLaunchWorkspace, RESERVED_WORKSPACE_ROOTS, topicTokenFor } from '../workspaces.ts'
@@ -309,11 +310,15 @@ export class TopicLauncher implements FeishuTopicService {
         sessionHistory: [{ sessionId, createdAt }],
         shared: true,
       }
+      const message = feishuUserMessage(spec.prompt)
+      const stored = storableMessage(message)
       await this.deps.repair.write({
         key: cardId,
         sessionId,
         chatId: spec.chatId,
         triggerMessageId: rootId,
+        routeKey: threadId,
+        ...(stored === undefined ? {} : { message: stored }),
         cards: [{ messageId: cardId, mode: 'card' }],
         startedAt: Date.now(),
         attempts: 0,
@@ -327,7 +332,6 @@ export class TopicLauncher implements FeishuTopicService {
         this.assertStarted()
         await this.deps.routes.put(routeKey, record)
         published = true
-        const message = feishuUserMessage(spec.prompt)
         this.deps.streamer()?.attach(agent.session, streamCardId, rootId, undefined, {
           onSettled: outcome => { void showStatus({ kind: outcome }) },
           message,

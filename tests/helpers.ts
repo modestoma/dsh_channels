@@ -323,8 +323,14 @@ function mockCallsOf(fn: unknown): unknown[][] {
 export class FakeTurnDriver {
   private readonly bySession = new Map<string, { session: Session; turn: number; busy: boolean; queue: UserMessage[] }>()
 
-  /** @param claim - receives every `agent/inbox/claimed` the fake loop emits. */
-  constructor(private readonly claim: (session: Session, message: UserMessage, turn: number) => void) {}
+  /**
+   * @param claim - receives every `agent/inbox/claimed` the fake loop emits.
+   * @param logClaims - also append each claimed prompt as `user/message`.
+   */
+  constructor(
+    private readonly claim: (session: Session, message: UserMessage, turn: number) => void,
+    private readonly logClaims = false,
+  ) {}
 
   /**
    * Queue a followup, claiming it now when nothing runs.
@@ -335,6 +341,14 @@ export class FakeTurnDriver {
     const entry = this.of(session)
     if (entry.busy) entry.queue.push(message)
     else this.start(entry, message)
+  }
+
+  /**
+   * Forget a session's inbox and running turn, as a process restart does.
+   * @param sessionId - the session.
+   */
+  forget(sessionId: string): void {
+    this.bySession.delete(sessionId)
   }
 
   /**
@@ -377,6 +391,11 @@ export class FakeTurnDriver {
     entry.busy = true
     entry.turn += 1
     this.claim(entry.session, message, entry.turn)
+    // The loop logs the claimed prompt when the turn's first request starts.
+    if (this.logClaims) {
+      const log = sessionEvents(entry.session)
+      log.push({ type: 'user/message', seq: log.length, data: message })
+    }
   }
 }
 
@@ -682,6 +701,8 @@ export function makeHostContext(
   }
   sessionListeners: Array<(session: Session, event: SessionEvent) => void>
   assistantStreamListeners: Array<(payload: AssistantStreamPayload) => void>
+  /** The fake inbox loop behind every fake Agent's `followup`. */
+  driver: FakeTurnDriver
   approvalListeners: Array<{ listener: ApprovalAnswererListener; options: { prepend?: boolean } | undefined }>
   questionListeners: Array<{ listener: UserQuestionAnswererListener; options: { prepend?: boolean } | undefined }>
   permissions: PermissionPresets & { set: ReturnType<typeof vi.fn>; preset: string }
@@ -811,7 +832,7 @@ export function makeHostContext(
     effect: vi.fn(),
   }
   return {
-    ctx, agents, workspaces, domain, credentials, sessionListeners,
+    ctx, agents, workspaces, domain, credentials, sessionListeners, driver,
     assistantStreamListeners, approvalListeners, questionListeners, permissions, sessionQuery,
     workingDirectory, worktrees,
   }
