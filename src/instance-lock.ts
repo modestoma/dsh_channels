@@ -9,13 +9,21 @@
  * does not know the topic. The lock lets exactly one process per application
  * open the long connection.
  *
- * The lock is a local IPC endpoint (a Unix domain socket under the OS temp
- * directory, or a Windows named pipe) whose address is derived from the App
- * ID, so it covers every profile and every `$DSH_HOME` of the current OS user.
- * The OS frees the endpoint when the owning process exits, crashes, or is
- * killed: no heartbeat, PID file, or PID-reuse check is involved. A stale Unix
- * socket file left by a dead owner refuses connections and is removed before
- * the next attempt.
+ * The lock is a local IPC endpoint whose address is derived from the App ID,
+ * so it covers every profile and every `$DSH_HOME` on the machine. The OS
+ * frees the endpoint when the owning process exits, crashes, or is killed: no
+ * heartbeat, PID file, or PID-reuse check is involved. Per platform:
+ * - Linux: an abstract Unix socket (no file); nothing outlives its owner.
+ * - Windows: a named pipe; it disappears with its owner as well.
+ * - macOS and other Unix systems: a socket file in the OS temp directory. A
+ *   file left by a dead owner refuses connections. It is removed and the
+ *   address rebound under a recovery directory (`<address>.recover`, created
+ *   atomically with `mkdir`), so two processes recovering at once cannot
+ *   unlink the socket the other one has just bound. A recovery directory left
+ *   by a process that crashed while recovering is reclaimed by age; two
+ *   contenders reclaiming the same directory at once can still both acquire
+ *   (the file system offers no atomic compare-and-delete), which needs that
+ *   crash plus a simultaneous start.
  *
  * The endpoint answers two newline-delimited JSON requests:
  * - `hello` returns the owner's {@link LockHolderInfo} for the settings panel;
@@ -27,7 +35,7 @@
  */
 
 import { createHash } from 'node:crypto'
-import { unlink } from 'node:fs/promises'
+import { mkdir, rmdir, stat, unlink } from 'node:fs/promises'
 import { createConnection, createServer } from 'node:net'
 import type { Server, Socket } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -107,11 +115,16 @@ const RETRY_DELAY_MS = 200
 const REQUEST_TIMEOUT_MS = 2_000
 /** Upper bound for one request or response line. */
 const MAX_LINE_BYTES = 4_096
+/**
+ * A recovery directory older than this was left by a process that crashed
+ * while recovering (recovery itself takes milliseconds) and is removed.
+ */
+const ABANDONED_RECOVERY_MS = 10_000
 
 /**
- * Endpoint address for one App ID: a named pipe on Windows, otherwise a socket
- * file in the OS temp directory. The App ID is hashed so the address stays
- * short and reveals nothing.
+ * Endpoint address for one App ID: an abstract socket on Linux, a named pipe
+ * on Windows, otherwise a socket file in the OS temp directory. The App ID is
+ * hashed so the address stays short and reveals nothing.
  * @param appId - resolved Feishu App ID.
  * @param platform - platform seam (tests).
  * @param dir - temp directory seam (tests).
@@ -119,7 +132,14 @@ const MAX_LINE_BYTES = 4_096
  */
 export function lockAddress(appId: string, platform: NodeJS.Platform = process.platform, dir: string = tmpdir()): string {
   const hash = createHash('sha256').update(appId).digest('hex').slice(0, 16)
-  return platform === 'win32' ? `\\\\.\\pipe\\dsh-channels-${hash}` : join(dir, `dsh-channels-${hash}.sock`)
+  if (platform === 'win32') return `\\\\.\\pipe\\dsh-channels-${hash}`
+  if (platform === 'linux') return `\0dsh-channels-${hash}`
+  return join(dir, `dsh-channels-${hash}.sock`)
+}
+
+/** Whether a platform's endpoint is a socket file that can outlive its owner. */
+function usesSocketFile(platform: NodeJS.Platform): boolean {
+  return platform !== 'win32' && platform !== 'linux'
 }
 
 type Request = { op: 'hello' } | { op: 'yield'; from: LockHolderInfo }
@@ -238,6 +258,49 @@ function roundTrip(address: string, request: Request): Promise<Response | 'refus
   })
 }
 
+function ignoreMissing(error: unknown): void {
+  // Already removed by another process; nothing left to clean up.
+  if (errorCode(error) !== 'ENOENT') throw error
+}
+
+/**
+ * Replace a dead owner's socket file while holding the recovery directory.
+ * The probe, unlink, and rebind all happen under it, so a contender can only
+ * unlink a socket that still refuses connections, never one another contender
+ * has just bound.
+ * @param address - the Unix socket path.
+ * @returns the bound server; `busy` after waiting while another process
+ *   recovers; undefined when the address was taken in the meantime.
+ */
+async function recoverStaleSocket(address: string): Promise<Server | 'busy' | undefined> {
+  const recovery = `${address}.recover`
+  try {
+    await mkdir(recovery)
+  } catch (error) {
+    if (errorCode(error) !== 'EEXIST') throw error
+    const info = await stat(recovery).catch((statError: unknown) => { ignoreMissing(statError) })
+    if (info !== undefined && Date.now() - info.mtimeMs > ABANDONED_RECOVERY_MS) {
+      await rmdir(recovery).catch(ignoreMissing)
+    } else {
+      await delay(RETRY_DELAY_MS)
+    }
+    return 'busy'
+  }
+  try {
+    if (await roundTrip(address, { op: 'hello' }) !== 'refused') return undefined
+    await unlink(address).catch(ignoreMissing)
+    try {
+      return await listen(address)
+    } catch (error) {
+      // A process that found the address free bound it first; the retry asks it.
+      if (errorCode(error) === 'EADDRINUSE') return undefined
+      throw error
+    }
+  } finally {
+    await rmdir(recovery).catch(ignoreMissing)
+  }
+}
+
 function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
@@ -293,6 +356,8 @@ class HeldLock implements InstanceLock {
 export interface InstanceLockProviderOptions {
   /** Directory of Unix socket files (default: the OS temp directory). */
   dir?: string
+  /** Platform whose endpoint kind is used (default: `process.platform`). */
+  platform?: NodeJS.Platform
   /** How long a holder in this same process is waited for (default {@link SAME_PROCESS_WAIT_MS}). */
   sameProcessWaitMs?: number
 }
@@ -304,9 +369,10 @@ export interface InstanceLockProviderOptions {
  */
 export function createInstanceLockProvider(providerOptions: InstanceLockProviderOptions = {}): InstanceLockProvider {
   const dir = providerOptions.dir ?? tmpdir()
+  const platform = providerOptions.platform ?? process.platform
   const sameProcessWaitMs = providerOptions.sameProcessWaitMs ?? SAME_PROCESS_WAIT_MS
   return {
-    address: appId => lockAddress(appId, process.platform, dir),
+    address: appId => lockAddress(appId, platform, dir),
 
     async acquire(options: AcquireOptions): Promise<AcquireResult> {
       const sameProcessDeadline = Date.now() + sameProcessWaitMs
@@ -320,16 +386,15 @@ export function createInstanceLockProvider(providerOptions: InstanceLockProvider
         }
         const answer = await roundTrip(options.address, { op: 'hello' })
         if (answer === 'refused') {
-          // Nobody listens: a socket file left by a dead owner (Unix only; a
-          // Windows pipe disappears with its owner). Remove it and retry, a few
-          // times at most so an address that keeps failing cannot spin forever.
+          // Nobody listens: a socket file left by a dead owner (abstract
+          // sockets and pipes disappear with their owner, so they just retry).
+          // Recover a few times at most so an address that keeps failing cannot
+          // spin forever; waiting for another process's recovery is bounded by
+          // ABANDONED_RECOVERY_MS.
+          const recovered = usesSocketFile(platform) ? await recoverStaleSocket(options.address) : undefined
+          if (recovered === 'busy') continue
+          if (recovered !== undefined) return { ok: true, lock: new HeldLock(recovered, options) }
           if (++staleRemovals > 3) return { ok: false, holder: undefined }
-          if (process.platform !== 'win32') {
-            await unlink(options.address).catch((error: unknown) => {
-              // Another process removed or replaced it first; the retry decides.
-              if (errorCode(error) !== 'ENOENT') throw error
-            })
-          }
           continue
         }
         const holder = answer !== undefined && answer.ok && 'holder' in answer && isHolderInfo(answer.holder)
