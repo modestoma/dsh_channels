@@ -303,6 +303,9 @@ export type AccessRequestRecord = z.infer<typeof accessRequestRecordSchema>
  */
 export const PROCESSED_VERSION = 1
 
+/** Retention of `processed` records; also the farthest back missed-message catch-up reads. */
+export const PROCESSED_RETENTION_MS = 24 * 60 * 60 * 1000
+
 export const processedRecordSchema = z.object({
   /** Key the record is stored under (the Feishu message id). */
   key: z.string().min(1),
@@ -488,6 +491,8 @@ export const feishuDomainGlobalSchema = z.object({
   chevronImgKey: z.string().optional(),
   /** p2p chats already shown the one-time onboarding card (bounded list). */
   welcomedChats: z.array(z.string()).optional(),
+  /** Epoch ms the long connection was last known up (missed-message catch-up). */
+  lastAliveAt: z.number().int().nonnegative().optional(),
 })
 
 export type FeishuDomainGlobal = z.infer<typeof feishuDomainGlobalSchema>

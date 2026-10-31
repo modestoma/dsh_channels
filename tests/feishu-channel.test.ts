@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const sdk = vi.hoisted(() => {
   const channel = {
-    on: vi.fn(() => () => {}),
+    on: vi.fn((_event: string, _handler: () => void) => () => {}),
     botIdentity: { openId: 'ou_bot' },
     connect: vi.fn(async () => {}),
     disconnect: vi.fn(async () => {}),
@@ -20,7 +20,7 @@ const sdk = vi.hoisted(() => {
           scope: { list: vi.fn(async (): Promise<unknown> => ({ code: 0, data: {} })) },
         },
       },
-      request: vi.fn(async (): Promise<unknown> => ({ data: { items: [] } })),
+      request: vi.fn(async (_input?: unknown): Promise<unknown> => ({ data: { items: [] } })),
       contact: {
         v3: { user: { batch: vi.fn(async (): Promise<unknown> => ({ code: 0, data: { items: [] } })) } },
       },
@@ -30,18 +30,20 @@ const sdk = vi.hoisted(() => {
           chatMembers: { get: vi.fn(async (): Promise<unknown> => ({ code: 0, data: { items: [] } })) },
           message: {
             get: vi.fn(async () => ({ data: { items: [] } })),
-            list: vi.fn(async () => ({ data: { items: [], has_more: false } })),
+            list: vi.fn(async (_input?: unknown): Promise<unknown> => ({ data: { items: [], has_more: false } })),
           },
           messageResource: { get: vi.fn() },
         },
       },
     },
   }
-  return { channel, createLarkChannel: vi.fn(() => channel) }
+  const normalize = vi.fn(async (event: { message: { message_id: string } }) => ({ messageId: event.message.message_id, senderId: 'ou_a' }))
+  return { channel, createLarkChannel: vi.fn(() => channel), normalize }
 })
 
 vi.mock('@larksuiteoapi/node-sdk', () => ({
   createLarkChannel: sdk.createLarkChannel,
+  normalize: sdk.normalize,
   LoggerLevel: { debug: 0, info: 1, warn: 2, error: 3 },
 }))
 
@@ -392,5 +394,39 @@ describe('large-file ranged download', () => {
       toEqual(Buffer.from('image-bytes'))
     expect(get).toHaveBeenCalledTimes(1)
     expect(get.mock.calls[0]![1]).toBeUndefined()
+  })
+
+  it('reads missed messages back through message.list and both mget id types', async () => {
+    const channel = defaultChannelFactory(options)
+    sdk.channel.rawClient.im.v1.message.list.mockResolvedValueOnce({
+      data: { items: [{ message_id: 'om_1', msg_type: 'text', create_time: '5000', chat_id: 'oc_1', sender: { id: 'ou_a', id_type: 'open_id', sender_type: 'user' }, body: { content: '{}' } }], has_more: false },
+    })
+    await expect(channel.historyIds?.({ type: 'chat', id: 'oc_1', chatType: 'p2p' }, 4_000, 10))
+      .resolves.toEqual({ ids: [{ messageId: 'om_1', createTime: 5000 }], truncated: false })
+    expect(sdk.channel.rawClient.im.v1.message.list).toHaveBeenCalledWith({
+      params: { container_id_type: 'chat', container_id: 'oc_1', start_time: '4', sort_type: 'ByCreateTimeAsc', page_size: 50 },
+    })
+
+    sdk.channel.rawClient.request.mockImplementation(async (input: unknown) => {
+      const user = String((input as { url: string }).url).endsWith('user_id_type=user_id')
+      return { code: 0, data: { items: [{ message_id: 'om_1', msg_type: 'text', create_time: '5000', chat_id: 'oc_1', sender: { id: user ? 'u_a' : 'ou_a', id_type: user ? 'user_id' : 'open_id', sender_type: 'user' }, body: { content: '{}' } }] } }
+    })
+    await expect(channel.historyMessages?.(['om_1'], 'p2p')).resolves.toEqual([{ messageId: 'om_1', senderId: 'u_a' }])
+    expect(sdk.channel.rawClient.request).toHaveBeenCalledWith(expect.objectContaining({ url: expect.stringContaining('user_id_type=open_id') }))
+    expect(sdk.normalize).toHaveBeenCalledWith(
+      expect.objectContaining({ sender: expect.objectContaining({ sender_id: { open_id: 'ou_a', user_id: 'u_a' } }) }),
+      expect.objectContaining({ botIdentity: { openId: 'ou_bot' }, stripBotMentions: true, includeRaw: true }),
+    )
+    sdk.channel.rawClient.request.mockReset()
+  })
+
+  it('reports connection loss and recovery', () => {
+    const channel = defaultChannelFactory(options)
+    const changes: string[] = []
+    channel.onConnectionChange?.(change => { changes.push(change) })
+    const handlers = new Map(sdk.channel.on.mock.calls)
+    handlers.get('reconnecting')!()
+    handlers.get('reconnected')!()
+    expect(changes).toEqual(['reconnecting', 'reconnected'])
   })
 })
