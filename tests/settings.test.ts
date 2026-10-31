@@ -2087,9 +2087,6 @@ describe('settings routes', () => {
     expect(removed.status).toBe(200)
     expect(JSON.parse(removed.body).ok).toBe(true)
 
-    const movedField = await call(routes, CLEAR_CREDENTIAL_ROUTE, post({ field: 'analyzeToken' }))
-    expect(movedField.status).toBe(400)
-
     expect((await call(routes, SAVE_CREDENTIALS_ROUTE)).status).toBe(404)
   })
 })

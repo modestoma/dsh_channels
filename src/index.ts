@@ -17,7 +17,7 @@
 
 import type { HostContext } from './dsh-types.ts'
 import { FeishuService } from './service.ts'
-import { MOVED_ANALYZE_NOTICE, movedAnalyzeKeysOf, pluginConfigSchema, resolveConfig } from './config.ts'
+import { pluginConfigSchema, resolveConfig } from './config.ts'
 import type { FeishuConfig } from './config.ts'
 import { defaultChannelFactory } from './feishu-channel.ts'
 import type { ChannelFactory } from './feishu-channel.ts'
@@ -128,11 +128,9 @@ export function apply(ctx: HostContext, config?: unknown): void {
     createHostCatalog(ctx, warn),
     createSettingsDirectoryPicker(ctx),
   ))
-  // Other plugins (观象's analyze API) start group-shared topics through this
+  // Other plugins start group-shared topics through this
   // service; it answers `not-connected` until the Feishu connection is up.
   ctx.provide?.(FEISHU_TOPICS_SERVICE, service.topics())
-  const moved = movedAnalyzeKeysOf(config)
-  if (moved.length > 0) warn(MOVED_ANALYZE_NOTICE, `cordis.yml 中的 ${moved.join('、')}`)
   ctx.effect(() => {
     // Boot loads the Web overlay and connects only when the Feishu application
     // credentials are complete; an incomplete configuration or a failed

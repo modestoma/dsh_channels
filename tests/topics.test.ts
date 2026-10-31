@@ -4,13 +4,13 @@
  * former analyze API, and the plugin providing the service.
  */
 
-import { mkdtempSync, writeFileSync } from 'node:fs'
+import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import { describe, expect, it, vi } from 'vitest'
 import { buildTopicRootCard } from '../src/cards.ts'
-import { MOVED_ANALYZE_NOTICE, movedAnalyzeKeysOf, resolveConfig } from '../src/config.ts'
+import { resolveConfig } from '../src/config.ts'
 import type { FeishuConfig } from '../src/config.ts'
 import type { HostContext } from '../src/dsh-types.ts'
 import { rootCardOf } from '../src/domain.ts'
@@ -18,13 +18,12 @@ import type { RouteRecord, TopicLaunchRecord } from '../src/domain.ts'
 import type { CardActionEvent, ChannelFactory, NormalizedMessage } from '../src/feishu-channel.ts'
 import { apply, inject, name } from '../src/index.ts'
 import { TestFeishuService as FeishuService } from './helpers.ts'
-import { OverlayStore } from '../src/settings/overlay.ts'
 import type { SessionManager } from '../src/session/manager.ts'
 import type { FeishuTopicService, TopicLaunchSpec } from '../src/topics/contract.ts'
 import { FEISHU_TOPICS_SERVICE, TopicLauncher } from '../src/topics/launcher.ts'
 import { followupMessagesOf, makeChannel, makeHostContext, makeMessage } from './helpers.ts'
 
-const PROMPT = '/logalyze https://logs.example/a.zip 分析这些日志'
+const PROMPT = '/some-skill https://logs.example/a.zip 分析这些日志'
 
 function spec(partial: Partial<TopicLaunchSpec> = {}): TopicLaunchSpec {
   return {
@@ -80,24 +79,6 @@ describe('topic root card', () => {
     const root = rootCardOf(legacy)!
     expect(root).toEqual({ requesterUserId: 'u_alice', card: spec().card })
     expect(rootCardOf({ ...legacy, subject: undefined })).toBeUndefined()
-  })
-})
-
-describe('moved analyze settings', () => {
-  it('finds the analyze API keys a config or overlay still sets', () => {
-    expect(movedAnalyzeKeysOf({ analyzeEnabled: true, analyzeToken: 'X', baseDir: '/x' })).toEqual(['analyzeEnabled', 'analyzeToken'])
-    expect(movedAnalyzeKeysOf({ baseDir: '/x' })).toEqual([])
-    expect(movedAnalyzeKeysOf(undefined)).toEqual([])
-    expect(resolveConfig({ analyzeEnabled: true })).not.toHaveProperty('analyzeEnabled')
-  })
-
-  it('warns once when the Web overlay still sets them, and keeps the other overrides', async () => {
-    const file = path.join(mkdtempSync(path.join(tmpdir(), 'dsh-topics-overlay-')), 'settings.json')
-    writeFileSync(file, JSON.stringify({ analyzeEnabled: true, refreshMs: 800 }))
-    const warn = vi.fn()
-    expect(await new OverlayStore(file, { warn }).load()).toEqual({ refreshMs: 800 })
-    expect(warn).toHaveBeenCalledTimes(1)
-    expect(warn).toHaveBeenCalledWith(MOVED_ANALYZE_NOTICE, `${file} 中的 analyzeEnabled`)
   })
 })
 
