@@ -39,7 +39,7 @@
 
 ---
 
-# 缺口 1：in-flight turn 快照与重启修复（已实现）
+# 缺口 1：in-flight turn 快照与重启恢复（已实现）
 
 ## 问题
 
@@ -58,36 +58,45 @@
   key: string                    // = 主卡 message id
   sessionId: string
   chatId: string                 // 修复操作（表情/卡片 patch）的目标会话
-  triggerMessageId: string       // Typing/DONE 表情锚点（用户触发消息）
+  triggerMessageId?: string      // Typing/DONE 表情锚点（用户触发消息）；后台唤醒卡片没有
   reactionId?: string            // Typing 表情的 reaction id（add 失败时缺省）
+  routeKey?: string              // 这一轮所在的路由，恢复时据此找回 Session
+  message?: UserMessage          // 交给 followup() 的消息（序列化 ≤ 256 KB，超出不存）
+  replays?: number               // 已重放次数（上限 1）
   cards: Array<{ messageId: string; mode: 'card' | 'text' }>  // 段卡列表，[0] = 主卡
-  startedAt: number              // 附加时间（未来 TTL 清理可用）
+  startedAt: number              // 附加时间（TTL 清理用）
   attempts: number               // 修复重试计数（上限 2，防永久重试循环）
 }
 ```
 
+新增字段都是可选的，不升域版本：旧快照没有 `routeKey` 时按 `sessionId` 找路由，没有 `message` 时按「被打断」处理。
+
 ## 生命周期
 
-1. **写入**（`service.ts`，`startSession` / `continueSession`）：回复卡发出、Typing 结果就绪后**先写快照、再写路由**（快照优先：崩溃窗口更偏安全侧——最多产生孤儿快照，修复无害）。
-2. **段卡更新**（`streamer.ts`）：续卡发送成功、message id 解析后经新钩子 `onSegmentDelivered(mainCardMessageId, index, messageId, mode)` 上报；服务端通过 `table.update()`（宿主原子 read-modify-write）合并进快照。
+1. **写入**（`routing/inbound.ts` `startSession` / `continueSession`、`topics/launcher.ts`）：回复卡发出、Typing 结果就绪后**先写快照、再写路由**（快照优先：崩溃窗口更偏安全侧——最多产生孤儿快照，修复无害）。消息组装完成后、`followup()` 之前经 `recordMessage()` 补写 `message`。后台唤醒卡片在主卡送达时经 `onHostCardDelivered` 写快照（没有 trigger）。
+2. **段卡更新**（`streamer.ts`）：续卡发送成功、message id 解析后经钩子 `onSegmentDelivered(mainCardMessageId, index, messageId, mode)` 上报；服务端通过 `table.update()`（宿主原子 read-modify-write）合并进快照。
 3. **清除**（`streamer.ts` `finalize`）：turn 结束即经 `onTurnFinalized(sessionId, turn, mainCardMessageId)` 删除快照。会话创建失败路径（卡片已落「会话创建失败」终态）同样主动清除。
-4. **修复**（`service.ts` `start()`，长连接建立后后台执行 `repairInflight()`）：
-   - 对每条快照：所有 `mode: 'card'` 的卡 patch 为终态中断卡（`buildInterruptionCard`：正文为「⚠️ 服务已重启，本次回复中断，请重新发送消息。」一条 markdown；主卡只有该条正文、**不带折叠面板**，续卡额外带 `📄 回复分段 n · 回复中断` 的 notation 分段头；不带 token 统计）；移除 Typing、补 DONE（表情操作 best-effort）。
-   - 成功后删除快照；失败则 `attempts + 1`，达到 2 次后删除（一次性修复 + 有限重试，防止对无法接受 patch 的介质无限重试）。
+4. **恢复**（`session/repair.ts` `repairAll()`，长连接建立后后台执行）：对每条快照恢复它的 Session（不在线时冷恢复），用 `classifyTurn()` 读会话日志：
+   - 日志里没有 `message.id` 对应的 `user/message`（还在排队）且 `replay.pending` 开启、未重放过：`replays + 1` 后把消息重新 `followup()` 进主卡，快照保留到新一轮结束。
+   - 这条消息之后的 `turn/end` 是正常结束（`completed` / `max-tokens`）：用其后各步 `assistant/message` 的文字重画全部卡片（`buildRecoveredReplyCards`），补 DONE。
+   - 其余情况（冷恢复补写的 `interrupted`、出错、停止、没有 `turn/end`）：所有 `mode: 'card'` 的卡 patch 为中断卡；`replay.interrupted: 'ask'` 时主卡带「▶️ 继续」按钮（`RESUME_ACTION`，值里带 sessionId 和 trigger），点击后在同一张卡片里新开一轮，并为这一轮写新快照。
+   - 路由已失效、Session 已换或恢复失败时，按「被打断」处理且不带按钮。
+   - 成功后删除快照（重放除外）；失败则 `attempts + 1`，达到 2 次后删除。
 
-## 已知取舍（v1）
+## 已知取舍
 
-- 修复卡**全量替换**原卡：中断前已流出的部分正文会被替换掉（本地没有旧正文副本，patch 是全量语义）。
-- 残余竞态窗口：`finalize` 同步删快照，而最终 patch 的 HTTP 请求尚未落定；若恰在此微秒级窗口崩溃，卡片可能被再次 patch 成中断卡（幂等无害）。
+- 中断卡**全量替换**原卡：中断前已流出的部分正文会被替换掉（本地没有旧正文副本，patch 是全量语义）。点「继续」后模型从会话日志里看得到被打断前的内容。
+- 恢复需要冷恢复 Session，会在启动时为每条遗留快照恢复一次 Agent。
+- 残余竞态窗口：`finalize` 同步删快照，而最终 patch 的 HTTP 请求尚未落定；若恰在此微秒级窗口崩溃，卡片会按「已完成」从日志重画（结果与原卡一致）。
 - `text` 降级段卡内容已完整送达，修复时跳过（不 patch）。
-- 修复不依赖 session 恢复（不读 token 统计），中断卡不带虚假的 token 行。
 
 ## 涉及文件
 
 - `src/domain.ts` — `inflight` 表 schema / 句柄
-- `src/service.ts` — 快照写入/更新/清除、`repairInflight()` 启动修复
-- `src/streamer.ts` — 钩子扩展：`onTurnFinalized` 携带主卡 id、新增 `onSegmentDelivered`
-- `src/cards.ts` — `buildInterruptionCard()` 终态中断卡
+- `src/session/repair.ts` — 快照读写、`classifyTurn()`、`repairAll()` 启动恢复
+- `src/service.ts` — 恢复所需的 Session 接线（`recoveryAgent`、`runIntoCard`）、继续按钮、后台卡快照
+- `src/streamer.ts` — 钩子：`onTurnFinalized` 携带主卡 id、`onSegmentDelivered`、`onHostCardDelivered`
+- `src/cards/streaming.ts` — `buildInterruptionCard()`（可带继续按钮）、`buildRecoveredReplyCards()`
 - `tests/` — 快照生命周期与启动修复用例
 
 ---

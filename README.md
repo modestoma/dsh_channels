@@ -183,7 +183,7 @@ src/
 │   └── questions.ts       #   结构化提问应答器
 ├── session/               # 会话侧基础设施
 │   ├── routes.ts          #   路由存储 + TTL 墓碑
-│   ├── repair.ts          #   inflight 快照 + 重启修复
+│   ├── repair.ts          #   inflight 快照 + 重启恢复（重放 / 补画 / 继续）
 │   ├── manager.ts         #   live Agent、冷恢复、preset、/renew 事务
 │   ├── isolation.ts       #   话题工作目录编排：workingDirectory 切换 / Git worktree + 降级
 │   └── request-policy.ts  #   会话级 provider/model/reasoningEffort 覆盖（/model、/effort）
@@ -302,6 +302,9 @@ npm 发行包已包含构建产物：Host 入口是 `lib/index.js`（profile 直
       - 'https://mi.feishu.cn/wiki/AbCdEfGhIjKlMn'             # 某个节点及其下所有子节点
     welcomeOnboarding: true             # 私聊首次触达发一张引导卡（按 chat 持久化去重）
     hostTurnCards: true                 # 子代理 / 后台任务 / 定时跟进 / dsh 客户端输入唤醒会话时，在话题里新发一张流式卡
+    replay:                             # 重启恢复：pending 重放还没轮到处理的消息；interrupted: ask（带继续按钮）| notify
+      pending: true
+      interrupted: 'ask'
     slashCommandPanel: false            # 连接时把命令同步到飞书原生 / 面板（需 app_slash_command 读写权限；改后需重连）
     allowPermissionSwitch: false        # 是否允许 /permissions <name> 从飞书侧切换权限预设（安全敏感）
     accessMode: 'guarded'               # 准入模式：guarded（默认，仅管理员+白名单）| open（旧行为，不安全）
@@ -424,7 +427,12 @@ const result = await topics?.launch({
 - **话题延续**：`im.message.receive_v1` 事件自带 `thread_id`，命中路由表即 `agent.followup()`，无需 @。同一 (chat, user) 的**并发首消息会被串行化**：后到的消息等待在途的会话建立完成，再按串行语义续聊同一 session 或另起新话题——不会重复建 session、覆盖路由，也不会落入“无路由、无 @”的丢弃窗口。
 - **降级（`threadFallback: 'degrade'`）**：私聊或群聊拒绝话题回复（如 230071）时，自动改为普通回复，路由键退化为 `chat:p2p:<chat_id>:<user_id>` / `chat:group:<chat_id>:<user_id>`（会话级延续）；`strict` 则直接失败。
 - **重启恢复**：路由表持久化在 `storageDomain`；消息到达时 `ctx.agents.resume()` 懒恢复 session。若会话已被其他 owner 恢复为 live（如 Web UI 打开过该会话、并发冷恢复竞态），插件**借用**该 live agent 直接 `followup()`，不再报 "cannot prepare session … while it is live"。借用的 agent 不归插件 dispose；shutdown 与在途 resume 竞态时，刚发布的 agent 会被立即 dispose 以避免泄漏进下一实例的 live 注册表。
-- **重启修复（流式中断）**：每条正在流式的 turn 会把自己的修复凭据（trigger 消息、Typing reaction id、全部段卡 id）写入 `channels_routes_v2` 域的 `inflight` 表（键 = 主卡 message id，turn 结束即删）。重启后长连接一建立，插件就把上一实例留下的中途卡片 patch 成「⚠️ 服务已重启，本次回复中断，请重新发送消息。」终态并补 DONE 表情；patch 失败重试一次（上限 2 次）后放弃。持久化盘点与缺口清单见 [docs/persistence.md](docs/persistence.md)。
+- **重启恢复（流式中断）**：每条正在流式的 turn 会把恢复所需的信息写入 `channels_routes_v2` 域的 `inflight` 表（键 = 主卡 message id，turn 结束即删）：trigger 消息、Typing reaction id、全部段卡 id、路由，以及交给模型的那条消息（序列化后不超过 256 KB；更大时不保存）。后台唤醒卡片也会写，只是没有 trigger 消息。重启后长连接一建立，插件就恢复这些 turn 所在的 Session，读会话日志，按三种情况处理：
+  - **还没轮到处理**（日志里没有这条消息，说明它当时还在排队）：同一张卡片里重新运行一次（`replay.pending`，默认开启；每条消息最多重放一次，再中断就按下面的「被打断」处理）。
+  - **已经完成**（日志里这一轮正常结束，只是卡片没来得及更新）：用日志里的最终回复重画卡片，顶部注明「这轮回复在服务重启前已完成」，正文按原来的卡片数依次铺开，放不下时提示到 dsh 客户端查看。
+  - **被打断**：卡片改成「⚠️ 服务已重启，本轮回复中断」，主卡带「▶️ 继续」按钮（`replay.interrupted: 'ask'`，默认）。话题发起人点了之后，同一张卡片开始新一轮，让模型从中断处接着完成；每张卡片只能点一次。设成 `notify` 时只显示中断提示，不带按钮。
+
+  路由已失效、Session 换过（`/renew`）或恢复失败时，按「被打断」处理但不带按钮。卡片更新失败会重试一次（上限 2 次）后放弃。持久化盘点与缺口清单见 [docs/persistence.md](docs/persistence.md)。
 - **消息去重（WS 重投幂等）**：飞书长连接重连会重投未 ack 的事件；每条消息在任何副作用之前先落一条 `processed` 记录（键 = message id，飞书全局唯一），重投消息被直接丢弃——同进程靠内存守卫、跨重启靠持久化记录，每条消息至多处理一次。记录保留 24 小时后由 GC 清扫。
 - **路由表 GC 与过期话题拒绝**：超过 `routeTtlMs`（默认 30 天）无活动的真实话题路由会先写入最小持久化墓碑，再删除活动路由；此后该话题中的普通消息和 Session 命令会收到「话题已过期」提示，插件不会恢复旧 Session，也不会在可见历史仍属于旧 Session 的话题里新建 Session（`/help`、`/userid`、`/groupid`、`/health` 仍可用）。墓碑跨重启保留，仅含 thread/chat/owner/工作区路径/会话目录/最后活动时间；旧 DSH Session、日志与话题目录都不删除。降级的 chat-scoped 路由没有独立话题边界，仍直接清理。陈年 in-flight 快照同时在启动时及每 6 小时清扫。`routeTtlMs: 0` 关闭后续路由过期处理，已产生的墓碑仍保持拒绝语义。
 - **准入与授权**：`accessMode: 'guarded'`（默认）下，入站先过频道准入：**管理员不受任何白名单限制**，私聊/任意群聊（含未授权群）都可直接开会话；**非管理员**私聊回固定提示（`/userid` 例外；`dmAllowWhitelist: true` 时全局用户白名单里的人可私聊，命令与群聊相同，`/auth` 仍仅管理员），群聊要求 **群在白名单** 且 **user_id 在全局用户白名单**，两者缺一不可。未授权消息不建 Session、不建话题目录、不落附件、不调模型；群里静默、私聊回固定文案。机器人被拉进任意群时（订阅 `im.chat.member.bot.added_v1`），插件私聊管理员发群信息卡（群名/`chat_id`/成员数/邀请人），未授权群附「授权本群 / 忽略」按钮；已授权群里未授权用户 @ 机器人时，管理员会收到用户授权申请卡（含昵称/user_id）。授权状态持久化在 `channels_routes_v2` 域的 `access_groups` / `access_users` / `access_requests` 表，撤销立即生效。管理员 user_id 在 Web 面板配置，留空时为飞书应用所有者（连接时查询，需可选的「获取应用信息」权限；查询失败则 fail closed，手动填写管理员即可）；`/auth` 命令、授权卡、面板三种入口等价。

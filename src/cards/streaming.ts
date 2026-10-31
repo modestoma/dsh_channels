@@ -55,6 +55,9 @@ export const PANEL_TITLES: Record<PanelPhase, string> = {
   error: '回复失败',
 }
 
+/** `decision` carried by the interrupted card's continue button. */
+export const RESUME_ACTION = 'turn-resume'
+
 /** `decision` carried by the streaming card's stop button. */
 export const STOP_ACTION = 'turn-stop'
 
@@ -590,6 +593,21 @@ export function segmentCardOptions(index: number): CardOptions {
 /** Interruption notice body for cards repaired after a restart mid-turn. */
 export const INTERRUPTION_NOTICE = '⚠️ 服务已重启，本次回复中断，请重新发送消息。'
 
+/** Interruption notice on a main card that offers to continue the turn. */
+export const RESUMABLE_INTERRUPTION_NOTICE = '⚠️ 服务已重启，本轮回复中断。点击「继续」让它从中断处接着完成，或重新发送消息。'
+
+/** Label of the interrupted card's continue button. */
+export const RESUME_LABEL = '▶️ 继续'
+
+/**
+ * What the continue button resumes: the interrupted turn's Session, and the
+ * message whose reaction the continued turn settles (absent for a host turn).
+ */
+export interface ResumeTarget {
+  sessionId: string
+  triggerMessageId?: string
+}
+
 /**
  * Terminal "interrupted" card used by the restart repair pass (`repairInflight`).
  *
@@ -597,13 +615,89 @@ export const INTERRUPTION_NOTICE = '⚠️ 服务已重启，本次回复中断�
  * the partial body/reasoning the card previously streamed (patch is full
  * replacement), and fabricating zero-valued token stats would be misleading.
  * The card is therefore minimal — a plain notice (+ segment header on
- * continuation cards) — and always far inside the size budget.
+ * continuation cards) — and always far inside the size budget. With `resume`,
+ * the main card carries the continue button (`RESUME_ACTION`).
  */
-export function buildInterruptionCard(options: CardOptions = {}): object {
+export function buildInterruptionCard(options: CardOptions = {}, resume?: ResumeTarget): object {
   const elements: object[] = []
   if (options.segment !== undefined) elements.push(note(interruptionHeader(options.segment)))
-  elements.push(markdown(INTERRUPTION_NOTICE))
+  if (resume === undefined || options.segment !== undefined) {
+    elements.push(markdown(INTERRUPTION_NOTICE))
+    return card(elements)
+  }
+  elements.push(markdown(RESUMABLE_INTERRUPTION_NOTICE), textButton({
+    label: RESUME_LABEL,
+    type: 'primary',
+    width: 'default',
+    margin: '8px 0 0 0',
+    value: {
+      decision: RESUME_ACTION,
+      sessionId: resume.sessionId,
+      ...(resume.triggerMessageId === undefined ? {} : { trigger: resume.triggerMessageId }),
+    },
+  }))
   return card(elements)
+}
+
+/**
+ * Parse a continue-button click value.
+ * @param value - `action.value` of a card click.
+ * @returns the resume target, or undefined for any other click.
+ */
+export function parseResumeAction(value: unknown): ResumeTarget | undefined {
+  if (typeof value !== 'object' || value === null) return undefined
+  const record = value as Record<string, unknown>
+  if (record.decision !== RESUME_ACTION || typeof record.sessionId !== 'string' || record.sessionId === '') return undefined
+  return typeof record.trigger === 'string' && record.trigger !== ''
+    ? { sessionId: record.sessionId, triggerMessageId: record.trigger }
+    : { sessionId: record.sessionId }
+}
+
+/** Main-card line of a reply recovered from the Session log after a restart. */
+export const RECOVERED_REPLY_NOTICE = '♻️ 这轮回复在服务重启前已完成，以下是最终回复'
+
+/** Suffix of a recovered reply that did not fit the cards the turn had. */
+export const RECOVERED_REPLY_CLIPPED = '\n\n…（回复较长，完整内容请在 dsh 客户端查看）'
+
+function recoveredCard(body: string, options: CardOptions): object {
+  const elements: object[] = []
+  if (options.segment === undefined) elements.push(note(RECOVERED_REPLY_NOTICE))
+  else elements.push(note(segmentHeader(options.segment)))
+  elements.push(markdown(body))
+  return card(elements)
+}
+
+/**
+ * Settled cards for a turn that completed while its cards were not being
+ * patched (the process restarted first): the final reply text, re-read from
+ * the Session log, spread over the turn's existing cards in order. Text that
+ * does not fit those cards is clipped with a pointer to the dsh client.
+ * @param text - the turn's final reply text.
+ * @param count - how many cards the turn has (≥ 1).
+ * @returns one card per existing card, main card first.
+ */
+export function buildRecoveredReplyCards(text: string, count: number): object[] {
+  const cards: object[] = []
+  let remaining = text.trim() === '' ? '（本轮没有文字回复）' : text
+  for (let index = 0; index < count; index++) {
+    const options = segmentCardOptions(index)
+    const last = index === count - 1
+    const limit = fitPrefix(
+      remaining,
+      CARD_TARGET_BYTES,
+      content => cardJsonBytes(recoveredCard(last ? `${content}${RECOVERED_REPLY_CLIPPED}` : content, options)),
+    ).length
+    const split = splitBodyForCard(remaining, limit)
+    const body = last && split.tail !== '' ? `${split.head}${RECOVERED_REPLY_CLIPPED}` : split.head
+    cards.push(recoveredCard(body, options))
+    remaining = split.tail
+    if (remaining === '') {
+      // Later cards keep their place in the topic with an empty segment.
+      for (let rest = index + 1; rest < count; rest++) cards.push(recoveredCard('（续片内容已合并到上一张卡片）', segmentCardOptions(rest)))
+      break
+    }
+  }
+  return cards
 }
 
 /**

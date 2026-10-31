@@ -145,6 +145,12 @@ export interface StreamerHooks {
    * {@link sendSegmentCard} as segment 1.
    */
   hostTurnOrigin?(sessionId: string, message: UserMessage): string | undefined
+  /**
+   * A host turn's main card was delivered (see {@link hostTurnOrigin}); the
+   * returned promise settles before any later card of that turn is sent, so a
+   * restart snapshot written here precedes its segment updates.
+   */
+  onHostCardDelivered?(sessionId: string, messageId: string, mode: 'card' | 'text', message: UserMessage): Promise<void>
 }
 
 /** One segment card of a turn. Card 1 is the attached reply card; further
@@ -426,7 +432,7 @@ export class TurnStreamer {
   attach(
     session: Session,
     cardMessageId: string,
-    triggerMessageId: string,
+    triggerMessageId: string | undefined,
     reactionId: string | undefined,
     options: AttachOptions,
   ): void {
@@ -549,7 +555,7 @@ export class TurnStreamer {
       onSettled: undefined,
       triggerMessageId: undefined,
       reactionId: undefined,
-      message: undefined,
+      message,
       origin,
       cardMessageId: undefined,
     })
@@ -1397,6 +1403,10 @@ export class TurnStreamer {
           card.sending = false
           card.messageId = delivery.messageId
           card.mode = delivery.mode
+          // A turn that settled before its card arrived needs no restart snapshot.
+          if (index === 0 && state.origin !== undefined && state.message !== undefined && !state.finalized) {
+            await this.hooks.onHostCardDelivered?.(sessionId, delivery.messageId, delivery.mode, state.message)
+          }
           this.hooks.onSegmentDelivered?.(
             state.cards[0]?.messageId ?? '',
             index,

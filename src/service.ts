@@ -26,6 +26,7 @@ import { ApprovalAnswerer } from './approvals.ts'
 import type { ApprovalRoute } from './approvals.ts'
 import { QuestionAnswerer } from './questions.ts'
 import type {
+  Agent,
   CommandInvocation,
   CommandResult,
   CredentialInfo,
@@ -40,7 +41,7 @@ import type {
   TokenMeter,
   UserMessage,
 } from './dsh-types.ts'
-import { buildPickerCard, parsePickAction, standaloneInfoCard, STEER_ACTION, STOP_ACTION } from './cards.ts'
+import { buildPickerCard, parsePickAction, parseResumeAction, standaloneInfoCard, STEER_ACTION, STOP_ACTION } from './cards.ts'
 import type { PickerOption } from './cards.ts'
 import {
   armEffortCommand, armModelCommand, armRenewCommand, registerModelCommand, commandResultCardKind, parseSlashCommand,
@@ -58,7 +59,7 @@ import type {
 } from './domain.ts'
 import { RouteStore } from './session/routes.ts'
 import { TopicLauncher } from './topics/launcher.ts'
-import { InflightRepair } from './session/repair.ts'
+import { InflightRepair, storableMessage } from './session/repair.ts'
 import { SessionManager } from './session/manager.ts'
 import type { LiveAgent, RenewCommit } from './session/manager.ts'
 import { CardDelivery } from './feishu/delivery.ts'
@@ -76,7 +77,7 @@ import {
 } from './feishu/message-read.ts'
 import type { MessageReadRoute, RawMessageItem } from './feishu/message-read.ts'
 import type { AttachmentStore } from './host/attachments.ts'
-import { InboundRouter } from './routing/inbound.ts'
+import { feishuUserMessage, InboundRouter } from './routing/inbound.ts'
 import type { RequestPolicyController } from './session/request-policy.ts'
 import type { CardActionEvent, ChannelFactory, FeishuChannel, NormalizedMessage } from './feishu-channel.ts'
 import { AppOwnerLookupError, FeishuApiError } from './feishu-channel.ts'
@@ -297,6 +298,9 @@ export function describeLockHolder(holder: LockHolderInfo | undefined): string {
   return `pid ${holder.pid} · DSH_HOME ${holder.home} · v${holder.version}`
 }
 
+/** Prompt of the turn an interrupted card's continue button starts. */
+export const RESUME_PROMPT = '服务重启打断了上一轮回复。请查看上文，从中断处继续完成上一轮的任务。'
+
 /**
  * Origin line of a host-started turn's card, by the claimed message's source.
  * @param kind - `UserMessage.source.kind` of the message that opened the turn.
@@ -412,6 +416,8 @@ export class FeishuService {
   private gcTimer: ReturnType<typeof setInterval> | undefined
   /** HITL approval answerer (created in `start()`). */
   private approvalAnswerer: ApprovalAnswerer | undefined
+  /** Interrupted cards whose continue button already started a turn. */
+  private readonly resumedCards = new Set<string>()
   /** HITL structured-question answerer (`ask_user_question`). */
   private questionAnswerer: QuestionAnswerer | undefined
   /** Disposers for the host approval waterfall listener + card actions. */
@@ -465,6 +471,14 @@ export class FeishuService {
       ttlMs: () => this.config.routeTtlMs,
       info: (message, ...args) => this.ctx.logger?.info?.(message, ...args),
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
+      recovery: {
+        policy: () => this.config.replay,
+        liveAgent: snapshot => this.recoveryAgent(snapshot),
+        replay: (agent, snapshot, message, submit) => {
+          this.streamer?.attach(agent.session, snapshot.cards[0]!.messageId, snapshot.triggerMessageId, snapshot.reactionId, { message })
+          if (submit) agent.followup(message)
+        },
+      },
     })
     this.sessions = new SessionManager({
       ctx: this.ctx,
@@ -1098,6 +1112,27 @@ export class FeishuService {
     return hostTurnOriginLine(message.source.kind)
   }
 
+  /** Restart snapshot of a host turn's card (no trigger message to settle). */
+  private async writeHostSnapshot(sessionId: string, messageId: string, mode: 'card' | 'text', message: UserMessage): Promise<void> {
+    const route = this.routes.findBySession(sessionId)
+    if (route === undefined) return
+    const stored = storableMessage(message)
+    try {
+      await this.repair.write({
+        key: messageId,
+        sessionId,
+        chatId: route.chatId,
+        routeKey: route.key,
+        ...(stored === undefined ? {} : { message: stored }),
+        cards: [{ messageId, mode }],
+        startedAt: Date.now(),
+        attempts: 0,
+      })
+    } catch (error) {
+      this.ctx.logger?.warn?.('dsh-channels: writing the host-turn snapshot %s failed: %s', messageId, String(error))
+    }
+  }
+
   /** The `feishuTopics` service, provided by `apply()`. */
   topics(): TopicLauncher { return this.topicLauncher }
   isRunning(): boolean { return this.started }
@@ -1698,6 +1733,7 @@ export class FeishuService {
       sendSegmentCard: (sessionId, segment, card, fallbackText) =>
         this.delivery.segmentCard(sessionId, segment, card, fallbackText),
       hostTurnOrigin: (sessionId, message) => this.hostTurnOrigin(sessionId, message),
+      onHostCardDelivered: (sessionId, messageId, mode, message) => this.writeHostSnapshot(sessionId, messageId, mode, message),
     }
     this.streamer = new TurnStreamer(
       channel,
@@ -1762,6 +1798,9 @@ export class FeishuService {
       this.wikiConsent.onCardAction(event)
       this.onStopAction(event)
       this.onSteerAction(event)
+      void this.onResumeAction(event).catch((error: unknown) => {
+        this.ctx.logger?.warn?.('dsh-channels: continue action failed: %s', String(error))
+      })
       void this.onPickAction(event).catch((error: unknown) => {
         this.ctx.logger?.warn?.('dsh-channels: picker card action failed: %s', String(error))
       })
@@ -2379,6 +2418,72 @@ export class FeishuService {
     }) === true
     // The queued card no longer owns a turn: retire its restart-repair snapshot.
     if (merged) void this.repair.clear(event.messageId)
+  }
+
+  /**
+   * The live Agent of an interrupted turn's route, cold-resumed when needed;
+   * undefined when the route is gone, was renewed to another Session, or the
+   * resume failed.
+   */
+  private async recoveryAgent(snapshot: InflightSnapshot): Promise<Agent | undefined> {
+    const route = snapshot.routeKey === undefined
+      ? this.routes.findBySession(snapshot.sessionId)
+      : this.routes.get(snapshot.routeKey)
+    if (route === undefined || route.sessionId !== snapshot.sessionId) return undefined
+    try {
+      return (await this.sessions.ensureLive(route)).agent
+    } catch (error) {
+      this.ctx.logger?.warn?.('dsh-channels: resuming session %s for recovery failed: %s', snapshot.sessionId, String(error))
+      return undefined
+    }
+  }
+
+  /** Stream a new turn running `message` into an existing card. */
+  private runIntoCard(
+    agent: Agent,
+    cardMessageId: string,
+    triggerMessageId: string | undefined,
+    reactionId: string | undefined,
+    message: UserMessage,
+  ): void {
+    this.streamer?.attach(agent.session, cardMessageId, triggerMessageId, reactionId, { message })
+    agent.followup(message)
+  }
+
+  /**
+   * Interrupted-card continue button: a user who may act on the route,
+   * clicking inside the session's own chat, starts a turn that continues the
+   * interrupted work, streaming into the clicked card. Each card continues
+   * at most once.
+   */
+  private async onResumeAction(event: CardActionEvent): Promise<void> {
+    if (!this.started) return
+    const target = parseResumeAction(event.action.value)
+    if (target === undefined || this.resumedCards.has(event.messageId)) return
+    const route = this.routes.findBySession(target.sessionId)
+    if (route === undefined) return
+    if (!this.accessController.mayActOnRoute(event.operator.userId, event.chatId, route)) return
+    this.resumedCards.add(event.messageId)
+    try {
+      const live = await this.sessions.ensureLive(route)
+      const message = feishuUserMessage(RESUME_PROMPT)
+      const stored = storableMessage(message)
+      await this.repair.write({
+        key: event.messageId,
+        sessionId: route.sessionId,
+        chatId: route.chatId,
+        ...(target.triggerMessageId === undefined ? {} : { triggerMessageId: target.triggerMessageId }),
+        routeKey: route.key,
+        ...(stored === undefined ? {} : { message: stored }),
+        cards: [{ messageId: event.messageId, mode: 'card' }],
+        startedAt: Date.now(),
+        attempts: 0,
+      })
+      this.runIntoCard(live.agent, event.messageId, target.triggerMessageId, undefined, message)
+    } catch (error) {
+      this.resumedCards.delete(event.messageId)
+      throw error
+    }
   }
 
   /**

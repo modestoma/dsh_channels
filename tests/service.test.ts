@@ -17,7 +17,8 @@ import type {
   CardActionEvent, ChannelFactory, FeishuChannel, NormalizedMessage, RawMessageListParams,
 } from '../src/feishu-channel.ts'
 import { CordisFiberState } from '../src/dsh-types.ts'
-import type { AgentHandle, ApprovalOutcome, CordisPluginRuntime, MessageId, SessionId, SessionProjections } from '../src/dsh-types.ts'
+import type { Agent, AgentHandle, ApprovalOutcome, CordisPluginRuntime, MessageId, Session, SessionId, SessionProjections, UserMessage } from '../src/dsh-types.ts'
+import { RESUME_ACTION } from '../src/cards.ts'
 import type { RouteRecord } from '../src/domain.ts'
 import { sessionDirOf } from '../src/domain.ts'
 import { FEISHU_ATTACHMENTS_SECTION } from '../src/feishu/agent-context.ts'
@@ -60,6 +61,8 @@ function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
     // Onboarding is opt-in per test: it adds a card that would shift send counts.
     welcomeOnboarding: false,
     hostTurnCards: true,
+    // Restart recovery as before replay existed; the recovery tests opt in.
+    replay: { pending: false, interrupted: 'notify' },
     slashCommandPanel: false,
     acceptAttachments: true,
     attachmentStore: 'native',
@@ -2008,6 +2011,10 @@ describe('FeishuService', () => {
     await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'u_alice', content: 'hello' }))
     await waitForEstablishedSession(h)
     const sessionId = h.ctxState.agents.created[0]!.options.sessionId
+    // The turn settles first, so restart recovery has nothing to resume.
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    h.ctxState.sessionListeners[0]!(agent.session, { type: 'turn/end', seq: 1, data: { turn: 1, reason: 'stop' } })
+    await waitUntil(() => expect(inflightEntries(h)).toHaveLength(0))
     await h.service.shutdown()
 
     const channel2 = makeChannel()
@@ -2330,6 +2337,187 @@ describe('FeishuService', () => {
     expect(patchedIds).not.toContain('om_2')
     await waitUntil(() => expect(inflightEntries(h)).toHaveLength(0))
     await service2.shutdown()
+  })
+
+  // ---- restart recovery (replay / completed / continue) -------------------
+
+  const recoveryConfig = { replay: { pending: true, interrupted: 'ask' as const } }
+
+  /** Establish one p2p session, then restart with its turn left unfinished. */
+  async function restartMidTurn(
+    prepareLog: (session: Session, prompt: { id: string }, agent: Agent) => void,
+    options: { live?: boolean; beforeStart?: (channel: ReturnType<typeof makeChannel>) => void } = {},
+  ): Promise<{ h: Harness; channel2: ReturnType<typeof makeChannel>; service2: FeishuService; original: Agent; prompt: { id: string }; trigger: string }> {
+    const agentsOptions: FakeAgentsOptions = {}
+    const h = await setup(recoveryConfig, {}, undefined, agentsOptions)
+    const msg = makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'u_alice', content: 'hi' })
+    await h.onMessage(msg)
+    await waitForEstablishedSession(h)
+    const original = h.ctxState.agents.created[0]!.handle.agent
+    const prompt = mock(original.followup).mock.calls[0]![0] as { id: string }
+    prepareLog(original.session, prompt, original)
+    await h.service.shutdown()
+    if (options.live !== true) {
+      // A new process: the durable log survives, the inbox does not.
+      agentsOptions.resumeSession = original.session
+      h.ctxState.driver.forget(original.session.id)
+      h.ctxState.agents.liveAgents.delete(original.session.id)
+    } else {
+      // The host still runs the Agent the previous channel instance used.
+      h.ctxState.agents.liveAgents.set(original.session.id, { agent: original, dispose: vi.fn(async () => {}) })
+    }
+    const channel2 = makeChannel()
+    options.beforeStart?.(channel2)
+    const service2 = new FeishuService(h.ctxState.ctx, h.config, () => channel2)
+    await service2.start()
+    return { h, channel2, service2, original, prompt, trigger: msg.messageId }
+  }
+
+  it('replays a prompt the Agent never claimed into the same card, once', async () => {
+    const { h, channel2, service2, prompt } = await restartMidTurn(() => {})
+    await waitUntil(() => expect(h.ctxState.agents.resumed).toHaveLength(1))
+    const resumed = h.ctxState.agents.resumed[0]!.handle.agent
+    await waitUntil(() => expect(mock(resumed.followup)).toHaveBeenCalledTimes(1))
+    expect((mock(resumed.followup).mock.calls[0]![0] as { id: string }).id).toBe(prompt.id)
+    expect(inflightEntries(h)).toEqual([['om_1', expect.objectContaining({ replays: 1 })]])
+
+    // The replayed turn streams into the original card and settles it.
+    h.ctxState.assistantStreamListeners.at(-1)!({ agent: resumed, frame: { type: 'start', attemptId: 'a', revision: 1, turn: 1, step: 1 } })
+    h.ctxState.assistantStreamListeners.at(-1)!({ agent: resumed, frame: { type: 'chunk', attemptId: 'a', revision: 1, index: 0, time: 1, chunk: { type: 'text-delta', index: 0, text: '重放后的回答' } } })
+    h.ctxState.sessionListeners.at(-1)!(resumed.session, { type: 'turn/end', seq: 1, data: { turn: 1, reason: { kind: 'completed' } } })
+    await waitUntil(() => expect(JSON.stringify(channel2.updated.filter(update => update.messageId === 'om_1').at(-1))).toContain('重放后的回答'))
+    await waitUntil(() => expect(inflightEntries(h)).toHaveLength(0))
+    expect(channel2.sent).toHaveLength(0)
+    await service2.shutdown()
+  })
+
+  it('renders the final reply of a turn that completed before its card was patched', async () => {
+    const { h, channel2, service2, trigger } = await restartMidTurn((session, prompt) => {
+      sessionEvents(session).push(
+        { type: 'user/message', seq: 0, data: prompt as UserMessage },
+        { type: 'assistant/message', seq: 1, data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: '已经写完的回答' }] } } },
+        { type: 'turn/end', seq: 2, data: { turn: 1, reason: { kind: 'completed' } } },
+      )
+    })
+    await waitUntil(() => expect(channel2.updated.length).toBeGreaterThan(0))
+    const card = JSON.stringify(channel2.updated[0])
+    expect(card).toContain('om_1')
+    expect(card).toContain('服务重启前已完成')
+    expect(card).toContain('已经写完的回答')
+    expect(channel2.reactions).toContainEqual({ messageId: trigger, emojiType: 'DONE' })
+    await waitUntil(() => expect(inflightEntries(h)).toHaveLength(0))
+    expect(mock(h.ctxState.agents.resumed[0]!.handle.agent.followup)).not.toHaveBeenCalled()
+    await service2.shutdown()
+  })
+
+  it('offers to continue an interrupted turn, and continues it into the same card', async () => {
+    const { h, channel2, service2 } = await restartMidTurn((session, prompt) => {
+      sessionEvents(session).push({ type: 'user/message', seq: 0, data: prompt as UserMessage })
+    })
+    await waitUntil(() => expect(channel2.updated.length).toBeGreaterThan(0))
+    const card = JSON.stringify(channel2.updated[0])
+    expect(card).toContain('服务已重启')
+    expect(card).toContain(RESUME_ACTION)
+    await waitUntil(() => expect(inflightEntries(h)).toHaveLength(0))
+    const resumed = h.ctxState.agents.resumed[0]!.handle.agent
+    expect(mock(resumed.followup)).not.toHaveBeenCalled()
+
+    const value = { decision: RESUME_ACTION, sessionId: resumed.session.id, trigger: 'om_msg_1' }
+    // Someone else's click changes nothing.
+    await channel2.fireCardAction({ messageId: 'om_1', chatId: 'oc_p2p', operator: { openId: 'ou_x', userId: 'u_mallory' }, action: { value, tag: 'button' } })
+    await flush()
+    expect(mock(resumed.followup)).not.toHaveBeenCalled()
+
+    await channel2.fireCardAction({ messageId: 'om_1', chatId: 'oc_p2p', operator: { openId: 'ou_a', userId: 'u_alice' }, action: { value, tag: 'button' } })
+    await waitUntil(() => expect(mock(resumed.followup)).toHaveBeenCalledTimes(1))
+    expect(JSON.stringify(mock(resumed.followup).mock.calls[0]![0])).toContain('从中断处继续')
+    expect(inflightEntries(h)).toEqual([['om_1', expect.objectContaining({ triggerMessageId: 'om_msg_1', routeKey: expect.any(String) })]])
+    await waitUntil(() => expect(JSON.stringify(channel2.updated.at(-1))).toContain('turn-stop'))
+
+    // A second click does not start another turn.
+    await channel2.fireCardAction({ messageId: 'om_1', chatId: 'oc_p2p', operator: { openId: 'ou_a', userId: 'u_alice' }, action: { value, tag: 'button' } })
+    await flush()
+    expect(mock(resumed.followup)).toHaveBeenCalledTimes(1)
+    await service2.shutdown()
+  })
+
+  it('reattaches the card of a prompt still queued in a live Agent instead of submitting it again', async () => {
+    const { h, channel2, service2, original, prompt } = await restartMidTurn((_session, prompt, agent) => {
+      Object.assign(agent, { inbox: { ...agent.inbox, nextTurn: [prompt] } })
+    }, { live: true })
+    await waitUntil(() => expect(mock(h.ctxState.ctx.logger!.info!).mock.calls).toContainEqual([expect.stringContaining('recovered'), 'om_1', 'replayed']))
+    expect(h.ctxState.agents.resumed).toHaveLength(0)
+    expect(mock(original.followup)).toHaveBeenCalledTimes(1)
+    expect((mock(original.followup).mock.calls[0]![0] as { id: string }).id).toBe(prompt.id)
+    expect(inflightEntries(h).map(([key]) => key)).toEqual(['om_1'])
+    expect(inflightEntries(h)[0]![1]).not.toHaveProperty('replays')
+
+    // The surviving loop claims the queued prompt on its own.
+    h.ctxState.driver.forget(original.session.id)
+    h.ctxState.driver.followup(original.session, prompt as UserMessage)
+
+    h.ctxState.assistantStreamListeners.at(-1)!({ agent: original, frame: { type: 'start', attemptId: 'a', revision: 1, turn: 1, step: 1 } })
+    h.ctxState.assistantStreamListeners.at(-1)!({ agent: original, frame: { type: 'chunk', attemptId: 'a', revision: 1, index: 0, time: 1, chunk: { type: 'text-delta', index: 0, text: '排队后的回答' } } })
+    h.ctxState.sessionListeners.at(-1)!(original.session, { type: 'turn/end', seq: 1, data: { turn: 1, reason: { kind: 'completed' } } })
+    await waitUntil(() => expect(JSON.stringify(channel2.updated.filter(update => update.messageId === 'om_1').at(-1))).toContain('排队后的回答'))
+    await waitUntil(() => expect(inflightEntries(h)).toHaveLength(0))
+    await service2.shutdown()
+  })
+
+  it('settles the card of a running live Agent without replaying or offering to continue', async () => {
+    const { h, channel2, service2, original } = await restartMidTurn((_session, _prompt, agent) => {
+      Object.assign(agent, { status: 'running' })
+    }, { live: true })
+    await waitUntil(() => expect(channel2.updated.length).toBeGreaterThan(0))
+    const card = JSON.stringify(channel2.updated[0])
+    expect(card).toContain('服务已重启')
+    expect(card).not.toContain(RESUME_ACTION)
+    await waitUntil(() => expect(inflightEntries(h)).toHaveLength(0))
+    expect(mock(original.followup)).toHaveBeenCalledTimes(1)
+    await service2.shutdown()
+  })
+
+  it('keeps the snapshot of a continue click that lands while recovery is still settling the card', async () => {
+    let clicked = false
+    const { h, service2, original } = await restartMidTurn((session, prompt) => {
+      sessionEvents(session).push({ type: 'user/message', seq: 0, data: prompt as UserMessage })
+    }, {
+      beforeStart: channel => {
+        const addReaction = channel.addReaction
+        channel.addReaction = vi.fn(async (messageId: string, emojiType: string) => {
+          if (emojiType === 'DONE' && !clicked) {
+            clicked = true
+            const value = { decision: RESUME_ACTION, sessionId: original.session.id, trigger: messageId }
+            await channel.fireCardAction({ messageId: 'om_1', chatId: 'oc_p2p', operator: { openId: 'ou_a', userId: 'u_alice' }, action: { value, tag: 'button' } })
+            await waitUntil(() => expect(mock(h.ctxState.agents.resumed[0]!.handle.agent.followup)).toHaveBeenCalledTimes(1))
+          }
+          return addReaction(messageId, emojiType)
+        })
+      },
+    })
+    await waitUntil(() => expect(mock(h.ctxState.ctx.logger!.info!).mock.calls).toContainEqual([expect.stringContaining('recovered'), 'om_1', 'interrupted']))
+    expect(clicked).toBe(true)
+    expect(inflightEntries(h)).toEqual([['om_1', expect.objectContaining({ message: expect.objectContaining({ content: [{ type: 'text', text: expect.stringContaining('从中断处继续') }] }) })]])
+    await service2.shutdown()
+  })
+
+  it('settles a host turn card left unfinished by a restart', async () => {
+    const h = await setup({ ...recoveryConfig, hostTurnCards: true })
+    await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'u_alice', content: 'hi' }))
+    await waitForEstablishedSession(h)
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    h.ctxState.sessionListeners[0]!(agent.session, { type: 'turn/end', seq: 1, data: { turn: 1, reason: 'stop' } })
+    await waitUntil(() => expect(inflightEntries(h)).toHaveLength(0))
+    agent.followup({ id: 'msg_job' as MessageId, role: 'user', content: [{ type: 'text', text: 'job done' }], source: { kind: 'tool-jobs' } })
+    await waitUntil(() => expect(inflightEntries(h)).toHaveLength(1))
+    const [key, snapshot] = inflightEntries(h)[0]!
+    expect(key).toBe('om_2')
+    expect(snapshot).not.toHaveProperty('triggerMessageId')
+    expect(snapshot).toMatchObject({ message: { id: 'msg_job' }, cards: [{ messageId: 'om_2', mode: 'card' }] })
+
+    h.ctxState.sessionListeners[0]!(agent.session, { type: 'turn/end', seq: 2, data: { turn: 2, reason: 'stop' } })
+    await waitUntil(() => expect(inflightEntries(h)).toHaveLength(0))
+    await h.service.shutdown()
   })
 
   // ---- establishment serialization (gap 5: concurrent first messages) ----
@@ -2726,6 +2914,10 @@ describe('FeishuService', () => {
     await h.onMessage(msg)
     await waitForEstablishedSession(h)
     await waitUntil(() => expect(processedEntries(h)).toHaveLength(1))
+    // The turn settles first, so restart recovery has nothing to resume.
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    h.ctxState.sessionListeners[0]!(agent.session, { type: 'turn/end', seq: 1, data: { turn: 1, reason: 'stop' } })
+    await waitUntil(() => expect(inflightEntries(h)).toHaveLength(0))
     await h.service.shutdown()
 
     const channel2 = makeChannel()
