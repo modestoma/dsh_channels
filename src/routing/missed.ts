@@ -139,7 +139,8 @@ export class MissedMessages {
       if (this.stopping) return
       await this.catchUp(since)
       this.uncovered = undefined
-      await this.storeAlive(Date.now())
+      // A connection lost meanwhile has its own catch-up to come.
+      await this.storeAlive(this.lostAt ?? Date.now())
     })
   }
 
@@ -263,18 +264,25 @@ export class MissedMessages {
   private async decide(cardMessageId: string, decision: 'run' | 'ignore', batch: MissedBatch): Promise<void> {
     const channel = this.deps.channel()
     if (channel === undefined) return
-    await channel.updateCard(cardMessageId, buildMissedDecidedCard(batch.messageIds.length, decision)).catch((error: unknown) => {
-      this.deps.warn('dsh-channels: updating the missed-message card failed: %s', String(error))
-    })
-    if (decision === 'ignore') {
-      const processed = this.deps.domain()?.processed
-      for (const messageId of batch.messageIds) {
-        await processed?.put(messageId, { key: messageId, processedAt: Date.now() })
+    try {
+      if (decision === 'ignore') {
+        const processed = this.deps.domain()?.processed
+        for (const messageId of batch.messageIds) {
+          await processed?.put(messageId, { key: messageId, processedAt: Date.now() })
+        }
       }
-      return
+      const messages = decision === 'run' && channel.historyMessages !== undefined
+        ? await channel.historyMessages(batch.messageIds, batch.chatType)
+        : []
+      // The card loses its buttons only once the decision can no longer fail.
+      await channel.updateCard(cardMessageId, buildMissedDecidedCard(batch.messageIds.length, decision)).catch((error: unknown) => {
+        this.deps.warn('dsh-channels: updating the missed-message card failed: %s', String(error))
+      })
+      for (const message of messages) await this.deps.handle(message)
+    } catch (error) {
+      // The card keeps its buttons, so a later click retries.
+      this.decided.delete(cardMessageId)
+      throw error
     }
-    if (channel.historyMessages === undefined) return
-    const messages = await channel.historyMessages(batch.messageIds, batch.chatType)
-    for (const message of messages) await this.deps.handle(message)
   }
 }

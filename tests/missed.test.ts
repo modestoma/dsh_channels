@@ -23,7 +23,7 @@ function route(partial: Partial<RouteRecord> & Pick<RouteRecord, 'key' | 'chatId
 
 interface Setup {
   missed: MissedMessages
-  channel: ReturnType<typeof makeChannel>
+  channel: ReturnType<typeof makeChannel> & { historyMessages: Mock<NonNullable<FeishuChannel['historyMessages']>> }
   handled: NormalizedMessage[]
   global: FeishuDomainGlobal
   processed: Map<string, ProcessedRecord>
@@ -55,7 +55,7 @@ function setup(options: {
   })
   const channel = Object.assign(makeChannel(), {
     historyIds,
-    historyMessages: vi.fn(async (ids: readonly string[]) => ids.flatMap(id => messages.filter(message => message.messageId === id))),
+    historyMessages: vi.fn<NonNullable<FeishuChannel['historyMessages']>>(async ids => ids.flatMap(id => messages.filter(message => message.messageId === id))),
   })
   const handled: NormalizedMessage[] = []
   const warn = vi.fn()
@@ -247,6 +247,40 @@ describe('MissedMessages', () => {
     expect([...t.processed.keys()]).toEqual(['om_old_1', 'om_old_2'])
     expect(JSON.stringify(t.channel.updated.at(-1))).toContain('已忽略')
     expect(t.handled).toHaveLength(2)
+  })
+
+  it('keeps the disconnect time when the connection drops during a catch-up', async () => {
+    const t = setup({ lastAliveAt: NOW - 20 * MINUTE, welcomed: ['oc_p2p'] })
+    let release: () => void = () => {}
+    const read = t.historyIds.getMockImplementation()!
+    t.historyIds.mockImplementation(async (container, since, limit) => {
+      await new Promise<void>(resolve => { release = resolve })
+      return await read(container, since, limit)
+    })
+    t.missed.start()
+    await vi.waitFor(() => expect(t.historyIds).toHaveBeenCalled())
+    vi.setSystemTime(NOW + MINUTE)
+    t.missed.onReconnecting()
+    vi.setSystemTime(NOW + 10 * MINUTE)
+    release()
+    await t.missed.settled()
+    expect(t.global.lastAliveAt).toBe(NOW + MINUTE)
+  })
+
+  it('keeps a pending card clickable when reading its messages fails', async () => {
+    const t = setup({ welcomed: ['oc_p2p'], messages: [message('om_old_1', 90)] })
+    const value = { decision: MISSED_RUN_ACTION, chat: 'oc_p2p', chatType: 'p2p', ids: ['om_old_1'], senders: ['u_alice'] }
+    t.channel.historyMessages.mockRejectedValueOnce(new Error('rate limited'))
+    t.missed.onCardAction(click('om_card', value))
+    await t.missed.settled()
+    expect(t.handled).toHaveLength(0)
+    expect(t.channel.updated).toHaveLength(0)
+    expect(t.warn).toHaveBeenCalledWith(expect.stringContaining('catch-up failed'), expect.stringContaining('rate limited'))
+
+    t.missed.onCardAction(click('om_card', value))
+    await t.missed.settled()
+    expect(t.handled.map(handled => handled.messageId)).toEqual(['om_old_1'])
+    expect(JSON.stringify(t.channel.updated.at(-1))).toContain('已按顺序开始处理')
   })
 
   it('does nothing when disabled', async () => {
