@@ -14,8 +14,10 @@
  * ID, so it covers every profile and every `$DSH_HOME` of the current OS user.
  * The OS frees the endpoint when the owning process exits, crashes, or is
  * killed: no heartbeat, PID file, or PID-reuse check is involved. A stale Unix
- * socket file left by a dead owner refuses connections and is removed before
- * the next attempt.
+ * socket file left by a dead owner refuses connections. It is removed and the
+ * address rebound under a recovery directory (`<address>.recover`, created
+ * atomically with `mkdir`), so two processes recovering at once cannot unlink
+ * the socket the other one has just bound.
  *
  * The endpoint answers two newline-delimited JSON requests:
  * - `hello` returns the owner's {@link LockHolderInfo} for the settings panel;
@@ -27,7 +29,7 @@
  */
 
 import { createHash } from 'node:crypto'
-import { unlink } from 'node:fs/promises'
+import { mkdir, rmdir, stat, unlink } from 'node:fs/promises'
 import { createConnection, createServer } from 'node:net'
 import type { Server, Socket } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -107,6 +109,11 @@ const RETRY_DELAY_MS = 200
 const REQUEST_TIMEOUT_MS = 2_000
 /** Upper bound for one request or response line. */
 const MAX_LINE_BYTES = 4_096
+/**
+ * A recovery directory older than this was left by a process that crashed
+ * while recovering (recovery itself takes milliseconds) and is removed.
+ */
+const ABANDONED_RECOVERY_MS = 10_000
 
 /**
  * Endpoint address for one App ID: a named pipe on Windows, otherwise a socket
@@ -238,6 +245,49 @@ function roundTrip(address: string, request: Request): Promise<Response | 'refus
   })
 }
 
+function ignoreMissing(error: unknown): void {
+  // Already removed by another process; nothing left to clean up.
+  if (errorCode(error) !== 'ENOENT') throw error
+}
+
+/**
+ * Replace a dead owner's socket file while holding the recovery directory.
+ * The probe, unlink, and rebind all happen under it, so a contender can only
+ * unlink a socket that still refuses connections, never one another contender
+ * has just bound.
+ * @param address - the Unix socket path.
+ * @returns the bound server; `busy` after waiting while another process
+ *   recovers; undefined when the address was taken in the meantime.
+ */
+async function recoverStaleSocket(address: string): Promise<Server | 'busy' | undefined> {
+  const recovery = `${address}.recover`
+  try {
+    await mkdir(recovery)
+  } catch (error) {
+    if (errorCode(error) !== 'EEXIST') throw error
+    const info = await stat(recovery).catch((statError: unknown) => { ignoreMissing(statError) })
+    if (info !== undefined && Date.now() - info.mtimeMs > ABANDONED_RECOVERY_MS) {
+      await rmdir(recovery).catch(ignoreMissing)
+    } else {
+      await delay(RETRY_DELAY_MS)
+    }
+    return 'busy'
+  }
+  try {
+    if (await roundTrip(address, { op: 'hello' }) !== 'refused') return undefined
+    await unlink(address).catch(ignoreMissing)
+    try {
+      return await listen(address)
+    } catch (error) {
+      // A process that found the address free bound it first; the retry asks it.
+      if (errorCode(error) === 'EADDRINUSE') return undefined
+      throw error
+    }
+  } finally {
+    await rmdir(recovery).catch(ignoreMissing)
+  }
+}
+
 function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
@@ -321,15 +371,13 @@ export function createInstanceLockProvider(providerOptions: InstanceLockProvider
         const answer = await roundTrip(options.address, { op: 'hello' })
         if (answer === 'refused') {
           // Nobody listens: a socket file left by a dead owner (Unix only; a
-          // Windows pipe disappears with its owner). Remove it and retry, a few
-          // times at most so an address that keeps failing cannot spin forever.
+          // Windows pipe disappears with its owner). Recover a few times at
+          // most so an address that keeps failing cannot spin forever; waiting
+          // for another process's recovery is bounded by ABANDONED_RECOVERY_MS.
+          const recovered = process.platform === 'win32' ? undefined : await recoverStaleSocket(options.address)
+          if (recovered === 'busy') continue
+          if (recovered !== undefined) return { ok: true, lock: new HeldLock(recovered, options) }
           if (++staleRemovals > 3) return { ok: false, holder: undefined }
-          if (process.platform !== 'win32') {
-            await unlink(options.address).catch((error: unknown) => {
-              // Another process removed or replaced it first; the retry decides.
-              if (errorCode(error) !== 'ENOENT') throw error
-            })
-          }
           continue
         }
         const holder = answer !== undefined && answer.ok && 'holder' in answer && isHolderInfo(answer.holder)

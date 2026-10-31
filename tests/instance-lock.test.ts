@@ -5,7 +5,7 @@
  */
 
 import { spawn } from 'node:child_process'
-import { existsSync, mkdtempSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, rmdirSync, utimesSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -105,6 +105,68 @@ describeUnix('createInstanceLockProvider', () => {
     const recovered = await locks.acquire(options(address, identity(process.pid)))
     expect(recovered.ok).toBe(true)
     if (recovered.ok) held.push(recovered.lock)
+  })
+
+  /** Leave a socket file whose owner was SIGKILLed: it refuses connections. */
+  async function staleSocket(address: string): Promise<void> {
+    const child = spawn(process.execPath, ['-e', `require('node:net').createServer().listen(${JSON.stringify(address)}, () => console.log('ready'))`])
+    await new Promise<void>((resolve, reject) => {
+      child.stdout.once('data', () => resolve())
+      child.once('error', reject)
+    })
+    child.kill('SIGKILL')
+    await new Promise(resolve => child.once('exit', resolve))
+    expect(existsSync(address)).toBe(true)
+  }
+
+  it('grants a stale address to exactly one of several concurrent contenders', async () => {
+    const locks = provider()
+    const address = locks.address('cli_a')
+    await staleSocket(address)
+
+    const results = await Promise.all([1, 2, 3, 4, 5, 6].map(n =>
+      locks.acquire(options(address, identity(process.pid, `/home/${n}/.dsh`)))))
+    const winners = results.filter(result => result.ok)
+    expect(winners).toHaveLength(1)
+    for (const result of results) if (result.ok) held.push(result.lock)
+    const holders = results.flatMap(result => result.ok ? [] : [result.holder?.home])
+    expect(new Set(holders).size).toBe(1)
+    expect(holders[0]).toMatch(/^\/home\/\d\/\.dsh$/)
+    expect(existsSync(`${address}.recover`)).toBe(false)
+  })
+
+  it('never unlinks the socket another process bound while it recovered the address', async () => {
+    const locks = provider()
+    const address = locks.address('cli_a')
+    await staleSocket(address)
+    // Another process is mid-recovery: it holds the recovery directory.
+    mkdirSync(`${address}.recover`)
+    const contender = locks.acquire(options(address, identity(process.pid, '/home/b/.dsh')))
+    await new Promise(resolve => setTimeout(resolve, 300))
+    // That process finishes: it replaces the stale file with its live socket.
+    rmSync(address)
+    const owner = await locks.acquire(options(address, identity(process.pid, '/home/a/.dsh')))
+    if (!owner.ok) throw new Error('owner acquisition refused')
+    held.push(owner.lock)
+    rmdirSync(`${address}.recover`)
+
+    // The contender's earlier probe saw a refusing socket; it must not remove the live one.
+    await expect(contender).resolves.toEqual({ ok: false, holder: identity(process.pid, '/home/a/.dsh') })
+    const again = await locks.acquire(options(address, identity(process.pid, '/home/c/.dsh')))
+    expect(again).toEqual({ ok: false, holder: identity(process.pid, '/home/a/.dsh') })
+  })
+
+  it('removes a recovery directory abandoned by a crashed process', async () => {
+    const locks = provider()
+    const address = locks.address('cli_a')
+    await staleSocket(address)
+    mkdirSync(`${address}.recover`)
+    const longAgo = new Date(Date.now() - 60_000)
+    utimesSync(`${address}.recover`, longAgo, longAgo)
+
+    const result = await locks.acquire(options(address, identity(process.pid)))
+    expect(result.ok).toBe(true)
+    if (result.ok) held.push(result.lock)
   })
 
   it('answers a yield request, then lets the requester acquire once the owner released', async () => {
