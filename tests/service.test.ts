@@ -10,13 +10,14 @@ import { promisify } from 'node:util'
 import { gunzip } from 'node:zlib'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { TestFeishuService as FeishuService } from './helpers.ts'
+import { hostTurnOriginLine } from '../src/service.ts'
 import { FeishuApiError } from '../src/feishu-channel.ts'
 import type { FeishuConfig } from '../src/config.ts'
 import type {
   CardActionEvent, ChannelFactory, FeishuChannel, NormalizedMessage, RawMessageListParams,
 } from '../src/feishu-channel.ts'
 import { CordisFiberState } from '../src/dsh-types.ts'
-import type { AgentHandle, ApprovalOutcome, CordisPluginRuntime, SessionId, SessionProjections } from '../src/dsh-types.ts'
+import type { AgentHandle, ApprovalOutcome, CordisPluginRuntime, MessageId, SessionId, SessionProjections } from '../src/dsh-types.ts'
 import type { RouteRecord } from '../src/domain.ts'
 import { sessionDirOf } from '../src/domain.ts'
 import { FEISHU_ATTACHMENTS_SECTION } from '../src/feishu/agent-context.ts'
@@ -58,6 +59,7 @@ function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
     authRequestTtlDays: 7,
     // Onboarding is opt-in per test: it adds a card that would shift send counts.
     welcomeOnboarding: false,
+    hostTurnCards: true,
     slashCommandPanel: false,
     acceptAttachments: true,
     attachmentStore: 'native',
@@ -1526,6 +1528,43 @@ describe('FeishuService', () => {
     expect(h.channel.sent).toHaveLength(1)
     expect(JSON.stringify(h.channel.sent)).not.toContain('命令执行失败')
     expect(JSON.stringify(h.channel.sent)).not.toContain('处理失败')
+  })
+
+  it.each([
+    { hostTurnCards: true, cards: 2 },
+    { hostTurnCards: false, cards: 1 },
+  ])('opens a card in the topic for a subagent-started turn (hostTurnCards: $hostTurnCards)', async ({ hostTurnCards, cards }) => {
+    const h = await setup({ hostTurnCards })
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_host_turn', senderId: 'u_owner',
+      messageId: 'om_host_turn_start', content: '开始',
+    }))
+    await waitForEstablishedSession(h)
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    const listener = h.ctxState.sessionListeners[0]!
+    listener(agent.session, { type: 'turn/end', seq: 1, data: { turn: 1, reason: 'stop' } })
+    await waitUntil(() => expect(inflightEntries(h)).toHaveLength(0))
+    expect(h.channel.sent).toHaveLength(1)
+
+    // The host wakes the parent after a background subagent settles.
+    agent.followup({
+      id: 'msg_subagent' as MessageId, role: 'user',
+      content: [{ type: 'text', text: 'subagent result' }], source: { kind: 'subagent-settled' },
+    })
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(cards))
+    await flush()
+    expect(h.channel.sent).toHaveLength(cards)
+    if (hostTurnCards) expect(JSON.stringify(h.channel.sent.at(-1))).toContain('子代理已结束')
+    await h.service.shutdown()
+  })
+
+  it('maps host turn sources to origin lines', () => {
+    expect(hostTurnOriginLine('subagent-settled')).toContain('子代理已结束')
+    expect(hostTurnOriginLine('agent-message')).toContain('子代理的消息')
+    expect(hostTurnOriginLine('tool-jobs')).toContain('后台任务')
+    expect(hostTurnOriginLine('schedule')).toContain('定时')
+    expect(hostTurnOriginLine('user')).toContain('dsh 客户端')
+    expect(hostTurnOriginLine('plugin-x')).toContain('会话被唤醒')
   })
 
   it('keeps standalone command cards out of TurnStreamer and restart repair state', async () => {

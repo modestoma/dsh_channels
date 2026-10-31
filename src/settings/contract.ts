@@ -154,6 +154,7 @@ export const EDITABLE_KEYS = [
   'statusRefreshMs',
   // 会话：飞书侧功能
   'welcomeOnboarding',
+  'hostTurnCards',
   'slashCommandPanel',
   'allowPermissionSwitch',
   // 模型

@@ -8,7 +8,7 @@
 
 import type { AgentRegistry } from './agent.ts'
 import type { CommandRuntime } from './commands.ts'
-import type { AssistantStreamPayload, Session, SessionEvent, SessionId } from './core.ts'
+import type { AssistantStreamPayload, InboxClaimedPayload, Session, SessionEvent, SessionId } from './core.ts'
 import type { ApprovalAnswererListener, UserQuestionAnswererListener } from './interaction.ts'
 
 // ---- Workspace surface --------------------------------------------------
@@ -297,6 +297,8 @@ export interface HostContext {
   on(name: 'session/event', listener: (session: Session, event: SessionEvent) => void): () => boolean
   /** Live (transient) model stream for every agent; replaces the removed `assistant/chunk` events. */
   on(name: 'agent/assistant-stream', listener: (payload: AssistantStreamPayload) => void): () => boolean
+  /** A turn claimed an inbox message; binds Feishu cards to the turn their prompt starts. */
+  on(name: 'agent/inbox/claimed', listener: (payload: InboxClaimedPayload) => void): () => boolean
   /**
    * The host's structured-question waterfall (`ask_user_question`). Same
    * shape as `approval/request`: return an answer to claim, or delegate with

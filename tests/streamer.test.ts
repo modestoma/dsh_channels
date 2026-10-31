@@ -5,9 +5,57 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { TurnStreamer } from '../src/streamer.ts'
+import type { AttachOptions } from '../src/streamer.ts'
 import type { MessageId, Session, SessionEvent, SessionId, UserMessage } from '../src/dsh-types.ts'
 import type { FeishuChannel } from '../src/feishu-channel.ts'
-import { makeSession, sessionEvents } from './helpers.ts'
+import { FakeTurnDriver, makeSession, sessionEvents } from './helpers.ts'
+
+function prompt(id: string, kind = 'user'): UserMessage {
+  return { id: id as MessageId, role: 'user', content: [{ type: 'text', text: id }], source: { kind } }
+}
+
+/**
+ * A streamer driven the way the Agent loop drives it: every attached prompt
+ * is a followup the fake loop claims as its own turn (at once when idle, after
+ * the running turn's `turn/end` otherwise), and a merged prompt is steered.
+ */
+class DrivenStreamer extends TurnStreamer {
+  private nextPrompt = 0
+  private readonly attached = new Map<string, Session>()
+  private readonly driver = new FakeTurnDriver((session, message, turn) => this.onInboxClaimed(session, message, turn))
+
+  override attach(
+    session: Session,
+    cardMessageId: string,
+    triggerMessageId: string,
+    reactionId: string | undefined,
+    options: Partial<AttachOptions> = {},
+  ): void {
+    const message = options.message ?? prompt(`auto-${++this.nextPrompt}`)
+    this.attached.set(session.id, session)
+    super.attach(session, cardMessageId, triggerMessageId, reactionId, { ...options, message })
+    this.driver.followup(session, message)
+  }
+
+  /** Start a turn no Feishu message triggered (subagent, job, schedule). */
+  hostTurn(session: Session, message: UserMessage): void {
+    this.driver.followup(session, message)
+  }
+
+  override onSessionEvent(session: Session, event: SessionEvent): void {
+    super.onSessionEvent(session, event)
+    this.driver.observe(session, event)
+  }
+
+  override mergeQueued(messageId: string, steer: (sessionId: string, message: UserMessage) => boolean): boolean {
+    return super.mergeQueued(messageId, (sessionId, message) => {
+      const accepted = steer(sessionId, message)
+      const session = this.attached.get(sessionId)
+      if (accepted && session !== undefined) this.driver.steered(session, message)
+      return accepted
+    })
+  }
+}
 
 function channel(): FeishuChannel & { updated: Array<{ messageId: string; card: object }> } {
   const updated: Array<{ messageId: string; card: object }> = []
@@ -65,7 +113,7 @@ describe('TurnStreamer', () => {
 
   it('publishes the first frame immediately, then throttles to refreshMs', async () => {
     const ch = channel()
-    const streamer = new TurnStreamer(ch, 500, hooks())
+    const streamer = new DrivenStreamer(ch, 500, hooks())
     const session = makeSession('sess-stream')
     streamer.attach(session, 'om_card', 'om_trigger', 'react-typing')
 
@@ -91,7 +139,7 @@ describe('TurnStreamer', () => {
 
   it('collects reasoning deltas into the fold panel and flips the title on first text', async () => {
     const ch = channel()
-    const streamer = new TurnStreamer(ch, 500, hooks())
+    const streamer = new DrivenStreamer(ch, 500, hooks())
     const session = makeSession('sess-reason')
     streamer.attach(session, 'om_card', 'om_trigger', undefined)
 
@@ -116,7 +164,7 @@ describe('TurnStreamer', () => {
   it('finalizes on turn/end: settled card, final patch, and Typing→DONE swap', async () => {
     const ch = channel()
     const hooksInstance = hooks()
-    const streamer = new TurnStreamer(ch, 500, hooksInstance)
+    const streamer = new DrivenStreamer(ch, 500, hooksInstance)
     const session = makeSession('sess-done')
     streamer.attach(session, 'om_card', 'om_trigger', 'react-typing')
 
@@ -157,7 +205,7 @@ describe('TurnStreamer', () => {
 
   it('skips removal when the Typing reaction was never added, still adds DONE', async () => {
     const ch = channel()
-    const streamer = new TurnStreamer(ch, 500, hooks())
+    const streamer = new DrivenStreamer(ch, 500, hooks())
     const session = makeSession('sess-noreact')
     streamer.attach(session, 'om_card', 'om_trigger', undefined)
     streamer.onSessionEvent(session, { type: 'turn/end', seq: 1, data: { turn: 1, reason: 'stop' } })
@@ -173,7 +221,7 @@ describe('TurnStreamer', () => {
   it('renders a structured turn failure, isolates prior-turn effort, and swaps Typing→No', async () => {
     const ch = channel()
     const hooksInstance = hooks()
-    const streamer = new TurnStreamer(ch, 500, hooksInstance)
+    const streamer = new DrivenStreamer(ch, 500, hooksInstance)
     const session = makeSession('sess-failed')
     // The preceding turn succeeded with high. The new turn fails before it can
     // emit request/header or usage, so none of these samples belong to it.
@@ -243,7 +291,7 @@ describe('TurnStreamer', () => {
 
   it('keeps session-cumulative token figures across turns', async () => {
     const ch = channel()
-    const streamer = new TurnStreamer(ch, 500, hooks())
+    const streamer = new DrivenStreamer(ch, 500, hooks())
     const session = makeSession('sess-cum')
     // Historical usage already in the log before attach.
     ;(sessionEvents(session) as SessionEvent[]).push(
@@ -266,7 +314,7 @@ describe('TurnStreamer', () => {
 
   it('reports the accumulated reasoning time on the settled footer', async () => {
     const ch = channel()
-    const streamer = new TurnStreamer(ch, 500, hooks())
+    const streamer = new DrivenStreamer(ch, 500, hooks())
     const session = makeSession('sess-reason-time')
     streamer.attach(session, 'om_card', 'om_trigger', undefined)
 
@@ -312,7 +360,7 @@ describe('TurnStreamer', () => {
   it('splits an oversized body into continuation segment cards, losing nothing', async () => {
     const ch = channel()
     const hooksInstance = hooks()
-    const streamer = new TurnStreamer(ch, 500, hooksInstance)
+    const streamer = new DrivenStreamer(ch, 500, hooksInstance)
     const session = makeSession('sess-seg')
     streamer.attach(session, 'om_card', 'om_trigger', undefined)
 
@@ -342,7 +390,7 @@ describe('TurnStreamer', () => {
 
   it('finalizes continuation cards without repeating the main card footer', async () => {
     const ch = channel()
-    const streamer = new TurnStreamer(ch, 500, hooks())
+    const streamer = new DrivenStreamer(ch, 500, hooks())
     const session = makeSession('sess-seg-done')
     streamer.attach(session, 'om_card', 'om_trigger', undefined)
 
@@ -367,7 +415,7 @@ describe('TurnStreamer', () => {
   it('splits a multi-table body into table-capped segments without losing content', async () => {
     const ch = channel()
     const hooksInstance = hooks()
-    const streamer = new TurnStreamer(ch, 500, hooksInstance)
+    const streamer = new DrivenStreamer(ch, 500, hooksInstance)
     const session = makeSession('sess-tables')
     streamer.attach(session, 'om_card', 'om_trigger', undefined)
 
@@ -403,7 +451,7 @@ describe('TurnStreamer', () => {
   it('reports segment deliveries to the hooks with the main card id', async () => {
     const ch = channel()
     const hooksInstance = hooks()
-    const streamer = new TurnStreamer(ch, 500, hooksInstance)
+    const streamer = new DrivenStreamer(ch, 500, hooksInstance)
     const session = makeSession('sess-segdelivery')
     streamer.attach(session, 'om_main', 'om_trigger', undefined)
 
@@ -421,7 +469,7 @@ describe('TurnStreamer', () => {
     const sendSegment = hooksInstance.sendSegmentCard as unknown as ReturnType<typeof vi.fn>
     sendSegment.mockResolvedValueOnce({ messageId: 'om_text', mode: 'text' })
 
-    const streamer = new TurnStreamer(ch, 500, hooksInstance)
+    const streamer = new DrivenStreamer(ch, 500, hooksInstance)
     const session = makeSession('sess-textmode')
     streamer.attach(session, 'om_card', 'om_trigger', undefined)
 
@@ -452,7 +500,7 @@ describe('TurnStreamer', () => {
       throw new Error('card rejected')
     })
     const hooksInstance = hooks()
-    const streamer = new TurnStreamer(ch, 500, hooksInstance)
+    const streamer = new DrivenStreamer(ch, 500, hooksInstance)
     const session = makeSession('sess-backoff')
     streamer.attach(session, 'om_card', 'om_trigger', undefined)
 
@@ -476,7 +524,7 @@ describe('TurnStreamer', () => {
     const sendSegment = hooksInstance.sendSegmentCard as unknown as ReturnType<typeof vi.fn>
     sendSegment.mockRejectedValue(new Error('both card and text failed'))
 
-    const streamer = new TurnStreamer(ch, 500, hooksInstance)
+    const streamer = new DrivenStreamer(ch, 500, hooksInstance)
     const session = makeSession('sess-sendfail')
     streamer.attach(session, 'om_card', 'om_trigger', undefined)
     streamer.onAssistantFrame(session, { type: 'start', attemptId: 'attempt-1', revision: 1, turn: 1, step: 1 })
@@ -513,7 +561,7 @@ describe('TurnStreamer activity status + keep-alive', () => {
 
   it('shows a tool call on the tool line and clears it on tool/result', async () => {
     const ch = channel()
-    const streamer = new TurnStreamer(ch, 500, hooks())
+    const streamer = new DrivenStreamer(ch, 500, hooks())
     const session = makeSession('sess-tool')
     streamer.attach(session, 'om_card', 'om_trigger', undefined)
 
@@ -538,7 +586,7 @@ describe('TurnStreamer activity status + keep-alive', () => {
 
   it('replaces the tool line with the approval wait while a card is undecided', async () => {
     const ch = channel()
-    const streamer = new TurnStreamer(ch, 500, hooks())
+    const streamer = new DrivenStreamer(ch, 500, hooks())
     const session = makeSession('sess-approval-wait')
     streamer.attach(session, 'om_card', 'om_trigger', undefined)
     streamer.onSessionEvent(session, {
@@ -558,7 +606,7 @@ describe('TurnStreamer activity status + keep-alive', () => {
 
   it('shows the activity lines only on the card that is still streaming', async () => {
     const ch = channel()
-    const streamer = new TurnStreamer(ch, 500, hooks())
+    const streamer = new DrivenStreamer(ch, 500, hooks())
     const session = makeSession('sess-active-card')
     streamer.attach(session, 'om_card', 'om_trigger', undefined)
 
@@ -583,7 +631,7 @@ describe('TurnStreamer activity status + keep-alive', () => {
 
   it('labels the subagent tool with its description argument', async () => {
     const ch = channel()
-    const streamer = new TurnStreamer(ch, 500, hooks())
+    const streamer = new DrivenStreamer(ch, 500, hooks())
     const session = makeSession('sess-subagent')
     streamer.attach(session, 'om_card', 'om_trigger', undefined)
 
@@ -608,7 +656,7 @@ describe('TurnStreamer activity status + keep-alive', () => {
 
   it('keeps the workflow end status while a later tool call runs (two independent lines)', async () => {
     const ch = channel()
-    const streamer = new TurnStreamer(ch, 500, hooks())
+    const streamer = new DrivenStreamer(ch, 500, hooks())
     const session = makeSession('sess-end-tool')
     streamer.attach(session, 'om_card', 'om_trigger', undefined)
 
@@ -664,7 +712,7 @@ describe('TurnStreamer activity status + keep-alive', () => {
 
   it('folds tool-workflow run events into a progress line with member counts', async () => {
     const ch = channel()
-    const streamer = new TurnStreamer(ch, 500, hooks())
+    const streamer = new DrivenStreamer(ch, 500, hooks())
     const session = makeSession('sess-workflow')
     streamer.attach(session, 'om_card', 'om_trigger', undefined)
 
@@ -708,7 +756,7 @@ describe('TurnStreamer activity status + keep-alive', () => {
 
   it('heartbeats a silent turn: elapsed counter appears and ticks every statusRefreshMs', async () => {
     const ch = channel()
-    const streamer = new TurnStreamer(ch, 500, hooks(), 5_000)
+    const streamer = new DrivenStreamer(ch, 500, hooks(), 5_000)
     const session = makeSession('sess-heartbeat')
     streamer.attach(session, 'om_card', 'om_trigger', undefined)
 
@@ -725,7 +773,7 @@ describe('TurnStreamer activity status + keep-alive', () => {
 
   it('drops the heartbeat line once text arrives and finalizes without activity', async () => {
     const ch = channel()
-    const streamer = new TurnStreamer(ch, 500, hooks(), 5_000)
+    const streamer = new DrivenStreamer(ch, 500, hooks(), 5_000)
     const session = makeSession('sess-heartbeat-done')
     streamer.attach(session, 'om_card', 'om_trigger', undefined)
 
@@ -787,7 +835,7 @@ describe('TurnStreamer subagent child folding', () => {
 
   it('folds a child subagent\'s descriptor and tool calls into the parent card (status only)', async () => {
     const ch = channel()
-    const streamer = new TurnStreamer(ch, 500, hooks())
+    const streamer = new DrivenStreamer(ch, 500, hooks())
     const session = makeSession('sess-parent')
     streamer.attach(session, 'om_card', 'om_trigger', undefined)
 
@@ -834,7 +882,7 @@ describe('TurnStreamer subagent child folding', () => {
 
   it('does not fold an ordinary fork that still carries parentSession into its source card', async () => {
     const ch = channel()
-    const streamer = new TurnStreamer(ch, 500, hooks())
+    const streamer = new DrivenStreamer(ch, 500, hooks())
     const session = makeSession('sess-source')
     streamer.attach(session, 'om_card', 'om_trigger', undefined)
 
@@ -852,7 +900,7 @@ describe('TurnStreamer subagent child folding', () => {
 
   it('summarizes finished subagents on the settled card (tool line disappears)', async () => {
     const ch = channel()
-    const streamer = new TurnStreamer(ch, 500, hooks())
+    const streamer = new DrivenStreamer(ch, 500, hooks())
     const session = makeSession('sess-settled-sub')
     streamer.attach(session, 'om_card', 'om_trigger', undefined)
 
@@ -887,7 +935,7 @@ describe('TurnStreamer subagent child folding', () => {
 
   it('counts parallel children and defaults the label to 子代理 before the descriptor', async () => {
     const ch = channel()
-    const streamer = new TurnStreamer(ch, 500, hooks())
+    const streamer = new DrivenStreamer(ch, 500, hooks())
     const session = makeSession('sess-multi')
     streamer.attach(session, 'om_card', 'om_trigger', undefined)
 
@@ -914,7 +962,7 @@ describe('TurnStreamer subagent child folding', () => {
 
   it('ignores workflow member children (the workflow line already aggregates them)', async () => {
     const ch = channel()
-    const streamer = new TurnStreamer(ch, 500, hooks())
+    const streamer = new DrivenStreamer(ch, 500, hooks())
     const session = makeSession('sess-wf-member')
     streamer.attach(session, 'om_card', 'om_trigger', undefined)
 
@@ -948,7 +996,7 @@ describe('TurnStreamer subagent child folding', () => {
 
   it('ignores child sessions whose parent has no active turn', async () => {
     const ch = channel()
-    const streamer = new TurnStreamer(ch, 500, hooks())
+    const streamer = new DrivenStreamer(ch, 500, hooks())
     const session = makeSession('sess-orphan-parent')
     streamer.attach(session, 'om_card', 'om_trigger', undefined)
 
@@ -980,7 +1028,7 @@ describe('TurnStreamer live assistant frames', () => {
 
   it('streams text and reasoning deltas from agent/assistant-stream frames', async () => {
     const ch = channel()
-    const streamer = new TurnStreamer(ch, 500, hooks())
+    const streamer = new DrivenStreamer(ch, 500, hooks())
     const session = makeSession('sess-live')
     streamer.attach(session, 'om_card', 'om_trigger', 'react-typing')
 
@@ -1006,7 +1054,7 @@ describe('TurnStreamer live assistant frames', () => {
 
   it('rolls back an abandoned attempt and keeps a committed one', async () => {
     const ch = channel()
-    const streamer = new TurnStreamer(ch, 500, hooks())
+    const streamer = new DrivenStreamer(ch, 500, hooks())
     const session = makeSession('sess-rollback')
     streamer.attach(session, 'om_card', 'om_trigger', undefined)
 
@@ -1051,7 +1099,7 @@ describe('TurnStreamer live assistant frames', () => {
   it('keeps the card live through a model-request retry and drops the failed attempt', async () => {
     const ch = channel()
     const hooksInstance = hooks()
-    const streamer = new TurnStreamer(ch, 500, hooksInstance, 1_000)
+    const streamer = new DrivenStreamer(ch, 500, hooksInstance, 1_000)
     const session = makeSession('sess-retry')
     streamer.attach(session, 'om_card', 'om_trigger', 'react-typing')
     const text = (): string => JSON.stringify(ch.updated.at(-1)!.card)
@@ -1115,7 +1163,7 @@ describe('TurnStreamer live assistant frames', () => {
   it('reopens a writable card after rolling back a failed attempt that spilled into a continuation', async () => {
     const ch = channel()
     const hooksInstance = hooks()
-    const streamer = new TurnStreamer(ch, 500, hooksInstance)
+    const streamer = new DrivenStreamer(ch, 500, hooksInstance)
     const session = makeSession('sess-retry-segment')
     streamer.attach(session, 'om_card', 'om_trigger', undefined)
 
@@ -1152,7 +1200,7 @@ describe('TurnStreamer live assistant frames', () => {
   it('streams the retry into the head card when the failed continuation was never sent', async () => {
     const ch = channel()
     const hooksInstance = hooks()
-    const streamer = new TurnStreamer(ch, 500, hooksInstance)
+    const streamer = new DrivenStreamer(ch, 500, hooksInstance)
     const session = makeSession('sess-retry-unsent')
     streamer.attach(session, 'om_card', 'om_trigger', undefined)
 
@@ -1181,7 +1229,7 @@ describe('TurnStreamer live assistant frames', () => {
 
   it('reports the retry count when retries run out and the turn fails', async () => {
     const ch = channel()
-    const streamer = new TurnStreamer(ch, 500, hooks())
+    const streamer = new DrivenStreamer(ch, 500, hooks())
     const session = makeSession('sess-retry-exhausted')
     streamer.attach(session, 'om_card', 'om_trigger', undefined)
 
@@ -1212,7 +1260,7 @@ describe('TurnStreamer live assistant frames', () => {
   it('prefers host projection figures for tokens, cache and window', async () => {
     const ch = channel()
     const hooksInstance = hooks()
-    const streamer = new TurnStreamer(ch, 500, {
+    const streamer = new DrivenStreamer(ch, 500, {
       ...hooksInstance,
       projectStats: () => ({ inputTokens: 111, outputTokens: 22, cacheHitPct: 0.5, contextWindow: 64_000 }),
     })
@@ -1260,7 +1308,7 @@ describe('TurnStreamer stop button', () => {
 
   it('shows the button on the streaming card, then drops it when the turn settles', async () => {
     const ch = channel()
-    const streamer = new TurnStreamer(ch, 500, hooks())
+    const streamer = new DrivenStreamer(ch, 500, hooks())
     const session = makeSession('sess-stop-live')
     streamer.attach(session, 'om_card', 'om_trigger', undefined)
     streamText(streamer, session, '进行中')
@@ -1277,7 +1325,7 @@ describe('TurnStreamer stop button', () => {
 
   it('moves the button to the newest segment card', async () => {
     const ch = channel()
-    const streamer = new TurnStreamer(ch, 500, hooks())
+    const streamer = new DrivenStreamer(ch, 500, hooks())
     const session = makeSession('sess-stop-seg')
     streamer.attach(session, 'om_card', 'om_trigger', undefined)
     streamText(streamer, session, 'x'.repeat(30_000))
@@ -1292,7 +1340,7 @@ describe('TurnStreamer stop button', () => {
 
   it('renders stopping and denied states, and settles an aborted turn as stopped', async () => {
     const ch = channel()
-    const streamer = new TurnStreamer(ch, 500, hooks())
+    const streamer = new DrivenStreamer(ch, 500, hooks())
     const session = makeSession('sess-stop-abort')
     streamer.attach(session, 'om_card', 'om_trigger', undefined)
     streamText(streamer, session, '进行中')
@@ -1324,7 +1372,7 @@ describe('TurnStreamer stop button', () => {
 
   it('offers the button only on the active turn, and moves it to the next queued turn', async () => {
     const ch = channel()
-    const streamer = new TurnStreamer(ch, 500, hooks())
+    const streamer = new DrivenStreamer(ch, 500, hooks())
     const session = makeSession('sess-stop-queue')
     streamer.attach(session, 'om_first', 'om_t1', undefined)
     streamer.attach(session, 'om_second', 'om_t2', undefined)
@@ -1342,7 +1390,7 @@ describe('TurnStreamer stop button', () => {
 
   it('settles a cancellation it did not request as a normal end', async () => {
     const ch = channel()
-    const streamer = new TurnStreamer(ch, 500, hooks())
+    const streamer = new DrivenStreamer(ch, 500, hooks())
     const session = makeSession('sess-stop-parent')
     streamer.attach(session, 'om_card', 'om_trigger', undefined)
     streamText(streamer, session, '进行中')
@@ -1364,27 +1412,21 @@ describe('TurnStreamer queued turns', () => {
     vi.useRealTimers()
   })
 
-  function prompt(id: string): UserMessage {
-    return { id: id as MessageId, role: 'user', content: [{ type: 'text', text: id }], source: { kind: 'user' } }
-  }
-
   function queued(ch: ReturnType<typeof channel>, sessionId: string) {
-    const streamer = new TurnStreamer(ch, 500, hooks())
+    const streamer = new DrivenStreamer(ch, 500, hooks())
     const session = makeSession(sessionId)
     streamer.attach(session, 'om_first', 'om_t1', 'react-1', { message: prompt('m1') })
     streamer.attach(session, 'om_second', 'om_t2', 'react-2', { message: prompt('m2') })
     return { streamer, session }
   }
 
-  it('resolves only queued cards that carry their prompt', () => {
+  it('resolves only queued cards as steer targets', () => {
     const ch = channel()
     const { streamer, session } = queued(ch, 'sess-q')
-    streamer.attach(session, 'om_bare', 'om_t3', undefined)
     expect(streamer.hasLiveTurn('sess-q')).toBe(true)
     expect(streamer.hasLiveTurn('sess-other')).toBe(false)
     expect(streamer.steerTargetOf('om_first')).toBeUndefined()
     expect(streamer.steerTargetOf('om_second')).toEqual({ sessionId: 'sess-q', message: prompt('m2') })
-    expect(streamer.steerTargetOf('om_bare')).toBeUndefined()
   })
 
   it('merges a queued turn into the running one and settles both reactions together', async () => {
@@ -1408,7 +1450,7 @@ describe('TurnStreamer queued turns', () => {
   it('retries the merged card patch after a transient failure', async () => {
     const ch = channel()
     const errors = hooks()
-    const streamer = new TurnStreamer(ch, 500, errors)
+    const streamer = new DrivenStreamer(ch, 500, errors)
     const session = makeSession('sess-merge-retry')
     streamer.attach(session, 'om_first', 'om_t1', undefined, { message: prompt('m1') })
     streamer.attach(session, 'om_second', 'om_t2', undefined, { message: prompt('m2') })
@@ -1463,3 +1505,112 @@ function mockCalls(fn: unknown): unknown[][] {
 function mockFn(fn: unknown): ReturnType<typeof vi.fn> {
   return fn as ReturnType<typeof vi.fn>
 }
+
+describe('TurnStreamer host turns', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  function frame(streamer: DrivenStreamer, session: Session, turn: number, text: string): void {
+    streamer.onAssistantFrame(session, { type: 'start', attemptId: `a-${turn}`, revision: 1, turn, step: 1 })
+    streamer.onAssistantFrame(session, { type: 'chunk', attemptId: `a-${turn}`, revision: 1, index: 0, time: 1, chunk: { type: 'text-delta', index: 0, text } })
+  }
+
+  it('opens its own card for a host turn and keeps a queued Feishu card for the next turn', async () => {
+    const ch = channel()
+    const hooksInstance = { ...hooks(), hostTurnOrigin: vi.fn(() => '🤖 子代理已结束，继续处理') }
+    const streamer = new DrivenStreamer(ch, 500, hooksInstance)
+    const session = makeSession('sess-host')
+
+    streamer.hostTurn(session, prompt('subagent-done', 'subagent-settled'))
+    expect(hooksInstance.hostTurnOrigin).toHaveBeenCalledWith('sess-host', prompt('subagent-done', 'subagent-settled'))
+    await vi.advanceTimersByTimeAsync(0)
+    expect(hooksInstance.sendSegmentCard).toHaveBeenCalledTimes(1)
+    expect(JSON.stringify(mockFn(hooksInstance.sendSegmentCard).mock.calls[0]![2])).toContain('子代理已结束')
+
+    // A Feishu message arriving meanwhile waits behind the host turn.
+    streamer.attach(session, 'om_user', 'om_trigger', 'react-typing', { message: prompt('m-user') })
+    expect(streamer.steerTargetOf('om_user')).toEqual({ sessionId: 'sess-host', message: prompt('m-user') })
+
+    frame(streamer, session, 1, '子代理的结论')
+    await vi.advanceTimersByTimeAsync(500)
+    expect(JSON.stringify(ch.updated.filter(update => update.messageId === 'om_seg_1'))).toContain('子代理的结论')
+    expect(JSON.stringify(ch.updated.filter(update => update.messageId === 'om_user'))).not.toContain('子代理的结论')
+
+    streamer.onSessionEvent(session, { type: 'turn/end', seq: 1, data: { turn: 1, reason: 'stop' } })
+    expect(hooksInstance.onTurnFinalized).toHaveBeenCalledWith('sess-host', 1, 'om_seg_1')
+    // No Feishu trigger: the host turn swaps no reaction.
+    expect(ch.addReaction).not.toHaveBeenCalled()
+
+    // The queued message now runs as turn 2 and streams into its own card.
+    expect(streamer.steerTargetOf('om_user')).toBeUndefined()
+    frame(streamer, session, 2, '用户问题的回答')
+    await vi.advanceTimersByTimeAsync(500)
+    expect(JSON.stringify(ch.updated.filter(update => update.messageId === 'om_user').at(-1))).toContain('用户问题的回答')
+    streamer.onSessionEvent(session, { type: 'turn/end', seq: 2, data: { turn: 2, reason: 'stop' } })
+    await vi.waitFor(() => expect(ch.addReaction).toHaveBeenCalledWith('om_trigger', 'DONE'))
+  })
+
+  it('keeps output that arrived while a host card fell back to text', async () => {
+    const ch = channel()
+    let deliver: (() => void) | undefined
+    const sendSegmentCard = vi.fn(async (_sessionId: string, segment: number, _card: object, fallbackText: string) => {
+      if (segment === 1 && deliver === undefined) {
+        await new Promise<void>(resolve => { deliver = resolve })
+        return { messageId: 'om_text_1', mode: 'text' as const }
+      }
+      return { messageId: `om_seg_${segment}_${fallbackText.length}`, mode: 'card' as const }
+    })
+    const hooksInstance = { ...hooks(), sendSegmentCard, hostTurnOrigin: vi.fn(() => 'origin') }
+    const streamer = new DrivenStreamer(ch, 500, hooksInstance)
+    const session = makeSession('sess-fallback')
+
+    streamer.hostTurn(session, prompt('job-done', 'tool-jobs'))
+    await vi.advanceTimersByTimeAsync(0)
+    frame(streamer, session, 1, '发送期间产生的回答')
+    deliver!()
+    await vi.advanceTimersByTimeAsync(500)
+
+    expect(sendSegmentCard).toHaveBeenCalledTimes(2)
+    expect(sendSegmentCard.mock.calls[0]![3]).toBe('')
+    expect(JSON.stringify(sendSegmentCard.mock.calls[1]![2])).toContain('发送期间产生的回答')
+  })
+
+  it('renders a host turn nowhere when no origin is returned', async () => {
+    const ch = channel()
+    const hooksInstance = { ...hooks(), hostTurnOrigin: vi.fn(() => undefined) }
+    const streamer = new DrivenStreamer(ch, 500, hooksInstance)
+    const session = makeSession('sess-hidden')
+
+    streamer.hostTurn(session, prompt('job-done', 'tool-jobs'))
+    streamer.attach(session, 'om_user', 'om_trigger', undefined, { message: prompt('m-user') })
+    expect(streamer.hasLiveTurn('sess-hidden')).toBe(true)
+    // Steering needs a turn that renders somewhere.
+    expect(streamer.mergeQueued('om_user', () => true)).toBe(false)
+
+    frame(streamer, session, 1, '后台输出')
+    await vi.advanceTimersByTimeAsync(500)
+    expect(hooksInstance.sendSegmentCard).not.toHaveBeenCalled()
+    expect(JSON.stringify(ch.updated)).not.toContain('后台输出')
+
+    streamer.onSessionEvent(session, { type: 'turn/end', seq: 1, data: { turn: 1, reason: 'stop' } })
+    frame(streamer, session, 2, '回答')
+    await vi.advanceTimersByTimeAsync(500)
+    expect(JSON.stringify(ch.updated.filter(update => update.messageId === 'om_user').at(-1))).toContain('回答')
+  })
+
+  it('ignores claims in subagent child sessions', () => {
+    const ch = channel()
+    const hooksInstance = { ...hooks(), hostTurnOrigin: vi.fn(() => 'origin') }
+    const streamer = new DrivenStreamer(ch, 500, hooksInstance)
+    const child = makeSession('sess-child')
+    ;(child.header as { origin?: string }).origin = 'subagent'
+    streamer.onInboxClaimed(child, prompt('task'), 1)
+    expect(hooksInstance.hostTurnOrigin).not.toHaveBeenCalled()
+    expect(streamer.hasLiveTurn('sess-child')).toBe(false)
+  })
+})

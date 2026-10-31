@@ -38,6 +38,7 @@ import type {
   SessionId,
   SessionProjections,
   TokenMeter,
+  UserMessage,
 } from './dsh-types.ts'
 import { buildPickerCard, parsePickAction, standaloneInfoCard, STEER_ACTION, STOP_ACTION } from './cards.ts'
 import type { PickerOption } from './cards.ts'
@@ -294,6 +295,23 @@ export class InstanceLockHeldError extends Error {
 export function describeLockHolder(holder: LockHolderInfo | undefined): string {
   if (holder === undefined) return '对方未响应身份查询'
   return `pid ${holder.pid} · DSH_HOME ${holder.home} · v${holder.version}`
+}
+
+/**
+ * Origin line of a host-started turn's card, by the claimed message's source.
+ * @param kind - `UserMessage.source.kind` of the message that opened the turn.
+ * @returns the line rendered at the top of the card.
+ */
+export function hostTurnOriginLine(kind: string): string {
+  switch (kind) {
+    case 'subagent-settled': return '🤖 子代理已结束，继续处理'
+    case 'agent-message': return '🤖 收到子代理的消息，继续处理'
+    case 'tool-jobs': return '⚙️ 后台任务已完成，继续处理'
+    case 'schedule': return '⏰ 定时跟进'
+    case 'user': return '💻 来自 dsh 客户端的消息'
+    // Other sources come from plugins this channel does not know.
+    default: return '⚙️ 会话被唤醒，继续处理'
+  }
 }
 
 function messageOf(error: unknown): string {
@@ -1071,6 +1089,15 @@ export class FeishuService {
     return this.started ? undefined : this.occupied
   }
 
+  /**
+   * Origin line for a turn no Feishu message started, or undefined when it
+   * gets no card (disabled, or the session has no Feishu route).
+   */
+  private hostTurnOrigin(sessionId: string, message: UserMessage): string | undefined {
+    if (!this.config.hostTurnCards || this.routes.findBySession(sessionId) === undefined) return undefined
+    return hostTurnOriginLine(message.source.kind)
+  }
+
   /** The `feishuTopics` service, provided by `apply()`. */
   topics(): TopicLauncher { return this.topicLauncher }
   isRunning(): boolean { return this.started }
@@ -1670,6 +1697,7 @@ export class FeishuService {
       },
       sendSegmentCard: (sessionId, segment, card, fallbackText) =>
         this.delivery.segmentCard(sessionId, segment, card, fallbackText),
+      hostTurnOrigin: (sessionId, message) => this.hostTurnOrigin(sessionId, message),
     }
     this.streamer = new TurnStreamer(
       channel,
@@ -1747,6 +1775,10 @@ export class FeishuService {
     // stream in the settlement); the live deltas arrive here instead.
     this.unlistenHost.push(this.ctx.on('agent/assistant-stream', ({ agent, frame }) => {
       this.streamer?.onAssistantFrame(agent.session, frame)
+    }))
+    // Binds each card to the turn its own prompt opens (see `TurnStreamer`).
+    this.unlistenHost.push(this.ctx.on('agent/inbox/claimed', ({ agent, message, turn }) => {
+      this.streamer?.onInboxClaimed(agent.session, message, turn)
     }))
     this.unlisten = channel.onMessage(message => {
       void this.inbound.handle(message).catch((error: unknown) => {

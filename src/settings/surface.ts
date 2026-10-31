@@ -155,6 +155,7 @@ const OPTIONAL_TEXT_KEYS = new Set<EditableKey>([
 const BOOLEAN_KEYS = new Set<EditableKey>([
   'requireMention',
   'welcomeOnboarding',
+  'hostTurnCards',
   'slashCommandPanel',
   'allowPermissionSwitch',
   'dmAllowWhitelist',
@@ -341,6 +342,12 @@ const FIELD_META: Record<EditableKey, FieldMeta> = {
   refreshMs: { label: '流式刷新间隔', group: 'cards', summary: '回复卡片多久更新一次', min: 200, max: 10_000, step: 100, unit: 'ms' },
   statusRefreshMs: { label: '状态行保活间隔', group: 'cards', summary: '没有文字输出时，计时多久刷新一次', min: 1_000, max: 60_000, step: 500, unit: 'ms' },
   welcomeOnboarding: { label: '首次私聊发引导卡', group: 'features', summary: '每个私聊只发一次' },
+  hostTurnCards: {
+    label: '后台继续时发新卡片',
+    group: 'features',
+    summary: '子代理、后台任务、定时跟进唤醒会话时，在话题里新发一张回复卡',
+    help: '这些回合不是飞书消息触发的。关闭后它们不在飞书显示，但仍会照常运行，在 dsh 客户端里可以看到。',
+  },
   slashCommandPanel: {
     label: '同步斜杠指令面板',
     group: 'features',

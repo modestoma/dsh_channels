@@ -1119,11 +1119,12 @@ export class InboundRouter {
       //    quoted-message excerpt are attached as text blocks. `routes.put` and
       //    `followup` stay synchronous with respect to other turns because
       //    later messages wait on the delivery gate.
-      this.streamer?.attach(handle.agent.session, sent.messageId, msg.messageId, typingId)
-      handle.agent.followup(await this.deliverTurnMessage(msg, record, content, {
+      const message = await this.deliverTurnMessage(msg, record, content, {
         firstTurn: true,
         excludeMessageIds: [msg.messageId, sent.messageId],
-      }))
+      })
+      this.streamer?.attach(handle.agent.session, sent.messageId, msg.messageId, typingId, { message })
+      handle.agent.followup(message)
     } finally {
       closeDeliveryGate()
     }
