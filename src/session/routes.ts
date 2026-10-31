@@ -87,11 +87,6 @@ export class RouteStore {
     return table === undefined ? [] : [...table.entries()].map(([, record]) => record)
   }
 
-  /** Active route records (cache view). */
-  records(): IterableIterator<RouteRecord> {
-    return this.active.values()
-  }
-
   /** Feishu origin of one Session any route ever named, retired routes included. */
   origin(sessionId: string): SessionOriginRecord | undefined {
     return this.deps.domain()?.sessionOrigins.get(sessionId)

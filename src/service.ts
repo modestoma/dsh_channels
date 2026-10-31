@@ -1453,7 +1453,7 @@ export class FeishuService {
    */
   private async browsableWorkspace(workspace: string): Promise<string> {
     const known = (): boolean => this.recordWorkspaces.has(workspace)
-      || [...this.routes.records()].some(record => record.workspacePath === workspace)
+      || this.routes.records().some(record => record.workspacePath === workspace)
     if (!known()) await this.sessionRecordFacts(this.routes.origins())
     if (!known()) throw new WorkspaceFileError(403, '该目录不是飞书会话的工作区')
     return workspace
