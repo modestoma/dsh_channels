@@ -327,10 +327,12 @@ export class TopicLauncher implements FeishuTopicService {
         this.assertStarted()
         await this.deps.routes.put(routeKey, record)
         published = true
+        const message = feishuUserMessage(spec.prompt)
         this.deps.streamer()?.attach(agent.session, streamCardId, rootId, undefined, {
           onSettled: outcome => { void showStatus({ kind: outcome }) },
+          message,
         })
-        agent.followup(feishuUserMessage(spec.prompt))
+        agent.followup(message)
       })
     } catch (error) {
       const reason = messageOf(error)

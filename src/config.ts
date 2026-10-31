@@ -383,6 +383,14 @@ export const configSchema = z.object({
    */
   welcomeOnboarding: z.boolean().default(true),
   /**
+   * Give a turn no Feishu message started its own streaming card in the
+   * route's topic: a subagent finishing or messaging the Agent, a background
+   * job completing, a schedule firing, or a prompt typed in a dsh client.
+   * When off such turns render nowhere (they never stream into a Feishu
+   * message's card either way).
+   */
+  hostTurnCards: z.boolean().default(true),
+  /**
    * Sync the command registry to Feishu's native `/` panel on every connect
    * (needs the `application:app_slash_command:read`/`write` scopes). Off by
    * default: some tenants forbid apps from adding slash commands. When off,

@@ -105,6 +105,17 @@ export interface AssistantStreamPayload {
   readonly frame: AssistantStreamFrame
 }
 
+/**
+ * One inbox message claimed by a turn (`agent/inbox/claimed`, DSH
+ * `packages/core/agent/src/runtime-types.ts`). Emitted when the turn opens
+ * (its next-turn message) and when a step claims steered messages.
+ */
+export interface InboxClaimedPayload {
+  readonly agent: Agent
+  readonly message: UserMessage
+  readonly turn: number
+}
+
 // ---- Session surface ----------------------------------------------------
 
 export interface SessionHeader {

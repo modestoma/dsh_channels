@@ -13,10 +13,10 @@ import type { AcquireOptions, InstanceLockProvider, LockHolderInfo } from '../sr
 import { FeishuService } from '../src/service.ts'
 import type {
   Agent, AgentContext, AgentHandle, AgentOptions, AgentRegistry, AgentRequestConfig, AgentRequestListener, ApprovalAnswererListener,
-  AssistantStreamPayload, AttachmentStore, CommandDefinition, CommandInvocation, CommandRuntime, EncodedImageAttachment,
+  AssistantStreamPayload, AttachmentStore, InboxClaimedPayload, CommandDefinition, CommandInvocation, CommandRuntime, EncodedImageAttachment,
   FileAttachmentRef, HostContext, ImageAttachmentLimits, ImageAttachmentRef, ImageMediaType, PermissionPresets, PromptSection,
   Session, SessionEvent, SessionId, SessionProjections, StorageDomainFacility, ToolDefinition, ToolRuntime,
-  UserQuestionAnswererListener, Workspace, WorkspaceRegistry,
+  UserMessage, UserQuestionAnswererListener, Workspace, WorkspaceRegistry,
 } from '../src/dsh-types.ts'
 import type {
   CreatedWorktree, WorkingDirectoryService, WorktreeService,
@@ -315,7 +315,72 @@ function mockCallsOf(fn: unknown): unknown[][] {
 }
 
 
-export function makeAgent(session: Session, options: AgentOptions = {}, ctx?: AgentContext): Agent {
+/**
+ * Emulates the Agent loop's inbox for tests: each `followup` runs as its own
+ * turn, claimed at once when the session is idle and otherwise after the
+ * running turn's `turn/end`; a steered message leaves the queue.
+ */
+export class FakeTurnDriver {
+  private readonly bySession = new Map<string, { session: Session; turn: number; busy: boolean; queue: UserMessage[] }>()
+
+  /** @param claim - receives every `agent/inbox/claimed` the fake loop emits. */
+  constructor(private readonly claim: (session: Session, message: UserMessage, turn: number) => void) {}
+
+  /**
+   * Queue a followup, claiming it now when nothing runs.
+   * @param session - the Agent's session.
+   * @param message - the followup message.
+   */
+  followup(session: Session, message: UserMessage): void {
+    const entry = this.of(session)
+    if (entry.busy) entry.queue.push(message)
+    else this.start(entry, message)
+  }
+
+  /**
+   * Drop a message moved into the running turn.
+   * @param session - the Agent's session.
+   * @param message - the steered message.
+   */
+  steered(session: Session, message: UserMessage): void {
+    const entry = this.of(session)
+    entry.queue = entry.queue.filter(queued => queued.id !== message.id)
+  }
+
+  /**
+   * Observe a session event; `turn/end` of the running turn claims the next followup.
+   * @param session - the event's session.
+   * @param event - the appended event.
+   */
+  observe(session: Session, event: SessionEvent): void {
+    if (event.type !== 'turn/end') return
+    const entry = this.of(session)
+    if (!entry.busy || entry.turn !== event.data.turn) return
+    entry.busy = false
+    const next = entry.queue.shift()
+    if (next !== undefined) this.start(entry, next)
+  }
+
+  private of(session: Session): { session: Session; turn: number; busy: boolean; queue: UserMessage[] } {
+    let entry = this.bySession.get(session.id)
+    if (entry === undefined) {
+      // Turns continue the numbering already in the session log.
+      const turn = Math.max(0, ...session.snapshotEvents().map(event =>
+        'turn' in event.data && typeof event.data.turn === 'number' ? event.data.turn : 0))
+      entry = { session, turn, busy: false, queue: [] }
+      this.bySession.set(session.id, entry)
+    }
+    return entry
+  }
+
+  private start(entry: { session: Session; turn: number; busy: boolean }, message: UserMessage): void {
+    entry.busy = true
+    entry.turn += 1
+    this.claim(entry.session, message, entry.turn)
+  }
+}
+
+export function makeAgent(session: Session, options: AgentOptions = {}, ctx?: AgentContext, driver?: FakeTurnDriver): Agent {
   return {
     id: session.id,
     options,
@@ -323,8 +388,8 @@ export function makeAgent(session: Session, options: AgentOptions = {}, ctx?: Ag
     status: 'idle',
     inbox: { nextTurn: [], nextStep: [], remove: vi.fn(() => true) },
     ctx: ctx ?? makeAgentContext(),
-    followup: vi.fn(),
-    steer: vi.fn(),
+    followup: vi.fn((message: UserMessage) => { driver?.followup(session, message) }),
+    steer: vi.fn((message: UserMessage) => { driver?.steered(session, message) }),
   }
 }
 
@@ -339,6 +404,8 @@ export interface FakeAgentsOptions {
   resumeSession?: Session
   /** Host services exposed inside every fake Agent scope (tools/attachments). */
   agentExtras?: FakeAgentServices
+  /** Fake inbox loop that turns followups into `agent/inbox/claimed`. */
+  driver?: FakeTurnDriver
 }
 
 export function makeAgentRegistry(fail: FakeAgentsOptions = {}): {
@@ -361,7 +428,7 @@ export function makeAgentRegistry(fail: FakeAgentsOptions = {}): {
       const setupCtx = makeAgentContext(undefined, fail.agentExtras ?? {})
       await options.setup?.(setupCtx)
       const session = makeSession(options.sessionId, options.meta?.cwd, options.meta?.agentPreset)
-      const agent = makeAgent(session, options.agentOptions, setupCtx)
+      const agent = makeAgent(session, options.agentOptions, setupCtx, fail.driver)
       const handle: AgentHandle = { agent, dispose: vi.fn(async () => { liveAgents.delete(options.sessionId) }) }
       liveAgents.set(options.sessionId, handle)
       created.push({ options, handle, setupCtx })
@@ -375,7 +442,7 @@ export function makeAgentRegistry(fail: FakeAgentsOptions = {}): {
       const setupCtx = makeAgentContext(undefined, fail.agentExtras ?? {})
       await options.setup?.(setupCtx)
       const session = fail.resumeSession ?? makeSession(options.resumeSessionId)
-      const agent = makeAgent(session, options.agentOptions, setupCtx)
+      const agent = makeAgent(session, options.agentOptions, setupCtx, fail.driver)
       const handle: AgentHandle = { agent, dispose: vi.fn(async () => { liveAgents.delete(options.resumeSessionId) }) }
       liveAgents.set(options.resumeSessionId, handle)
       resumed.push({ options, handle, setupCtx })
@@ -620,6 +687,13 @@ export function makeHostContext(
   permissions: PermissionPresets & { set: ReturnType<typeof vi.fn>; preset: string }
   sessionQuery: { readTitleSnapshots: ReturnType<typeof vi.fn> }
 } {
+  const inboxClaimedListeners: Array<(payload: InboxClaimedPayload) => void> = []
+  const driver = new FakeTurnDriver((session, message, turn) => {
+    const agent = agents.registry.get(session.id)
+    for (const listener of inboxClaimedListeners) listener({ agent: agent ?? makeAgent(session), message, turn })
+  })
+  // Mutated in place: tests adjust failure options after setup.
+  agentsOptions.driver = driver
   const agents = makeAgentRegistry(agentsOptions)
   const workspaces = makeWorkspaceRegistry()
   const domain = makeDomain()
@@ -712,8 +786,13 @@ export function makeHostContext(
     get: (name: string) => services[name],
     on: vi.fn((name: unknown, listener?: unknown, options?: unknown) => {
       if (name === 'session/event') {
-        const wrapped = listener as (session: Session, event: SessionEvent) => void
-        sessionListeners.push(wrapped)
+        const inner = listener as (session: Session, event: SessionEvent) => void
+        sessionListeners.push((session, event) => {
+          inner(session, event)
+          driver.observe(session, event)
+        })
+      } else if (name === 'agent/inbox/claimed') {
+        inboxClaimedListeners.push(listener as (payload: InboxClaimedPayload) => void)
       } else if (name === 'agent/assistant-stream') {
         assistantStreamListeners.push(listener as (payload: AssistantStreamPayload) => void)
       } else if (name === 'approval/request') {

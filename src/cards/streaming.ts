@@ -157,6 +157,11 @@ export interface CardState {
   queued?: boolean
   /** Add the owner-only notice under the steer button (a non-owner clicked it). */
   queuedDenied?: boolean
+  /**
+   * Why a turn no Feishu message started is running (e.g. a subagent woke the
+   * Agent), rendered as the first notation line of the main card.
+   */
+  origin?: string
   stats: CardStats
 }
 
@@ -450,6 +455,7 @@ function renderCard(
   const elements: object[] = []
 
   if (main) {
+    if (state.origin !== undefined && state.origin !== '') elements.push(note(state.origin))
     if (panelShown(state.phase, reasoning)) {
       elements.push(foldPanel(
         PANEL_TITLES[state.phase],
