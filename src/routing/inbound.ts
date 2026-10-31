@@ -50,7 +50,7 @@ export interface CommandPlanePort {
   /**
    * Whether a `/`-prefixed line names a channel command (including aliases).
    * Other slash lines are ordinary prompts, so DSH can expand user-invocable
-   * skills such as `/logalyze`.
+   * skills such as `/some-skill`.
    */
   owns(line: string): boolean
   /** Slash-command admission + dispatch for a line {@link owns} accepted. */
