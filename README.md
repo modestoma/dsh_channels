@@ -40,7 +40,7 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 
 `/new` 是 `/renew` 的别名。`/help` 由命令注册表按分组生成，新增命令只需在注册表里加一行。
 
-不在上面命令表中的 `/` 开头消息（如 `/guanxiang …`）不由插件处理，而是和普通消息一样经过准入后作为 prompt 交给 DSH，由 DSH 展开对应的用户可调用 skill；没有同名 skill 时按普通文本处理。
+不在上面命令表中的 `/` 开头消息（如 `/logalyze …`）不由插件处理，而是和普通消息一样经过准入后作为 prompt 交给 DSH，由 DSH 展开对应的用户可调用 skill；没有同名 skill 时按普通文本处理。
 
 **飞书原生斜杠指令面板**（可选，`slashCommandPanel: true` 开启，默认关闭；部分企业不允许应用添加斜杠指令）：开启后每次连上飞书，插件在后台调用 `application/v7/app_slash_commands` 把命令注册表同步到飞书原生面板，用户在聊天框输入 `/` 即可直接选择命令（飞书客户端有约 5 分钟缓存）。同步是全量对齐且幂等：缺的创建、描述变了的原地更新、注册表里已没有的或重复的删除（别名不单独列出），注册表不变时再次连接不产生任何写操作；超时（30 秒）或断开后不再发起新的写操作。需要可选权限 `application:app_slash_command:read`（读取现有命令）与 `application:app_slash_command:write`（增删改），两项只在开启时列入权限自检。关闭时插件不读写面板。同步失败只影响面板列表，直接输入命令照常可用；失败原因显示在 Web 设置「连接」页并打印一条 warn。
 
@@ -379,9 +379,9 @@ FEISHU_APP_SECRET: xxxxxxxx
 
 ## 群话题服务（feishuTopics）
 
-插件向其他 DSH 插件提供 Cordis 服务 `feishuTopics`：调用方给出目标群、发起人、根卡片内容、工作区和 prompt，插件在群里发一张根卡片，在卡片下开话题，把 prompt 原样交给一个新 Session（prompt 开头的斜杠命令由 DSH 展开成对应 skill），过程在话题内流式输出，和用户自己发起的会话一样。首轮结束后根卡片的状态标签随之更新。群里通过准入的成员都可以在该话题内追问。观象（[@modesto_ma/dsh-guanxiang](https://github.com/modestoma/dsh-guanxiang)）的日志平台分析接口 `POST /open-api/logalyze` 就建在这个服务上。
+插件向其他 DSH 插件提供 Cordis 服务 `feishuTopics`：调用方给出目标群、发起人、根卡片内容、工作区和 prompt，插件在群里发一张根卡片，在卡片下开话题，把 prompt 原样交给一个新 Session（prompt 开头的斜杠命令由 DSH 展开成对应 skill），过程在话题内流式输出，和用户自己发起的会话一样。首轮结束后根卡片的状态标签随之更新。群里通过准入的成员都可以在该话题内追问。观象（[dsh-logalyze](https://github.com/modestoma/dsh-logalyze)）的日志平台分析接口 `POST /open-api/logalyze` 就建在这个服务上。
 
-**日志平台分析接口已迁到观象**：接口的路径、请求体和响应都没有变，但开关和令牌改在观象面板「分析接口」中设置，令牌的凭据引用名改为 `GUANXIANG_ANALYZE_TOKEN`。本插件不再注册这个路由，也不再读取 `analyzeEnabled` / `analyzeToken`；`cordis.yml` 或 Web 覆盖文件里还留着这两项时，启动日志会提示一次。升级步骤：
+**日志平台分析接口已迁到观象**：接口的路径、请求体和响应都没有变，但开关和令牌改在观象面板「分析接口」中设置，令牌的凭据引用名改为 `LOGALYZE_ANALYZE_TOKEN`。本插件不再注册这个路由，也不再读取 `analyzeEnabled` / `analyzeToken`；`cordis.yml` 或 Web 覆盖文件里还留着这两项时，启动日志会提示一次。升级步骤：
 
 1. 把 dsh-channels 和观象一起升级（观象需要支持 `feishuTopics` 的版本）。只升级 dsh-channels 时没有插件提供这个接口，请求会得到 404。
 2. 在观象面板「分析接口」中打开开关，保存令牌。平台继续用原来的令牌值时，把同一个值存进去即可。

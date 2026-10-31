@@ -482,25 +482,25 @@ describe('FeishuService', () => {
 
   it('forwards a slash line that names no channel command to the Agent as a prompt', async () => {
     const h = await setup()
-    await h.onMessage(makeMessage({ chatType: 'p2p', senderId: 'u_alice', content: '/guanxiang 订单服务下单报 500' }))
+    await h.onMessage(makeMessage({ chatType: 'p2p', senderId: 'u_alice', content: '/logalyze 订单服务下单报 500' }))
     await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
     await waitUntil(() => expect(mock(agent.followup)).toHaveBeenCalledTimes(1))
 
     expect((mock(agent.followup).mock.calls[0]?.[0] as { content: Array<{ text: string }> }).content[0]?.text)
-      .toBe('/guanxiang 订单服务下单报 500')
+      .toBe('/logalyze 订单服务下单报 500')
     expect(mock(h.ctxState.ctx.commands.execute)).not.toHaveBeenCalled()
     expect(JSON.stringify(h.channel.sent)).not.toContain('未知命令')
   })
 
   it('forwards an @-mentioned slash prompt in a group chat', async () => {
     const h = await setup()
-    await h.onMessage(makeMessage({ chatType: 'group', chatId: 'oc_guanxiang', senderId: 'u_owner', mentionedBot: true, content: '/guanxiang 看下支付回调日志' }))
+    await h.onMessage(makeMessage({ chatType: 'group', chatId: 'oc_logalyze', senderId: 'u_owner', mentionedBot: true, content: '/logalyze 看下支付回调日志' }))
     await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
     await waitUntil(() => expect(mock(agent.followup)).toHaveBeenCalledTimes(1))
     expect((mock(agent.followup).mock.calls[0]?.[0] as { content: Array<{ text: string }> }).content[0]?.text)
-      .toBe('/guanxiang 看下支付回调日志')
+      .toBe('/logalyze 看下支付回调日志')
   })
 
   it('keeps answering a channel command alias on the command plane', async () => {

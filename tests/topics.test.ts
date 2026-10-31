@@ -24,7 +24,7 @@ import type { FeishuTopicService, TopicLaunchSpec } from '../src/topics/contract
 import { FEISHU_TOPICS_SERVICE, TopicLauncher } from '../src/topics/launcher.ts'
 import { followupMessagesOf, makeChannel, makeHostContext, makeMessage } from './helpers.ts'
 
-const PROMPT = '/guanxiang https://logs.example/a.zip 分析这些日志'
+const PROMPT = '/logalyze https://logs.example/a.zip 分析这些日志'
 
 function spec(partial: Partial<TopicLaunchSpec> = {}): TopicLaunchSpec {
   return {
