@@ -9,7 +9,7 @@
  * @module dsh-channels/client/panel/records-tab
  */
 
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { fillCopy, PANEL_COPY } from '../../settings/contract.ts'
 import type {
   SessionRecordGroupWire,
@@ -409,26 +409,35 @@ function WorkspaceFiles(props: { target: FilesTarget; onBack: () => void }): JSX
   const [preview, setPreview] = useState<PreviewState | null>(null)
   const [downloading, setDownloading] = useState(false)
   const [downloadError, setDownloadError] = useState<string | null>(null)
+  /** Latest navigation (workspace or directory change); older listing answers are dropped. */
+  const listingRequest = useRef(0)
+  /** Latest preview request; navigation also bumps it so a pending preview never reappears. */
+  const previewRequest = useRef(0)
 
   const openDir = useCallback(async (dir: string): Promise<void> => {
+    const request = ++listingRequest.current
+    previewRequest.current += 1
     setListing({ phase: 'loading', path: dir })
     setPreview(null)
     try {
-      setListing({ phase: 'ready', listing: await fetchWorkspaceFiles(workspace, dir) })
+      const result = await fetchWorkspaceFiles(workspace, dir)
+      if (request === listingRequest.current) setListing({ phase: 'ready', listing: result })
     } catch (error) {
-      setListing({ phase: 'error', path: dir, message: messageOf(error) })
+      if (request === listingRequest.current) setListing({ phase: 'error', path: dir, message: messageOf(error) })
     }
   }, [workspace])
 
   useEffect(() => { void openDir('') }, [openDir])
 
   const openFile = async (file: string): Promise<void> => {
+    const request = ++previewRequest.current
     setPreview({ phase: 'loading', path: file })
     setDownloadError(null)
     try {
-      setPreview({ phase: 'ready', preview: await fetchWorkspaceFilePreview(workspace, file) })
+      const result = await fetchWorkspaceFilePreview(workspace, file)
+      if (request === previewRequest.current) setPreview({ phase: 'ready', preview: result })
     } catch (error) {
-      setPreview({ phase: 'error', path: file, message: messageOf(error) })
+      if (request === previewRequest.current) setPreview({ phase: 'error', path: file, message: messageOf(error) })
     }
   }
 
