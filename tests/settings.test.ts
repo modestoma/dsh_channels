@@ -10,7 +10,8 @@ import { describe, expect, it, vi } from 'vitest'
 import { resolveConfig } from '../src/config.ts'
 import type { FeishuConfig } from '../src/config.ts'
 import type { AgentPreset, HostContext, LlmModelInfo, LlmService } from '../src/dsh-types.ts'
-import { FeishuService } from '../src/service.ts'
+import { makeInstanceLocks, TestFeishuService as FeishuService } from './helpers.ts'
+import type { LockHolderInfo } from '../src/instance-lock.ts'
 import { HEALTH_DEPENDENCY_NAMES } from '../src/health.ts'
 import type { HealthSnapshot } from '../src/health.ts'
 import type { FeishuChannel } from '../src/feishu-channel.ts'
@@ -35,6 +36,7 @@ import {
   PANEL_TABS,
   TAB_FIELD_GROUPS,
   RECONNECT_ROUTE,
+  TAKEOVER_ROUTE,
   REMOVE_ACCESS_GROUP_ROUTE,
   REMOVE_ACCESS_USER_ROUTE,
   REMOVE_WIKI_USER_ROUTE,
@@ -199,6 +201,21 @@ class FakeTarget implements SettingsTarget {
     this.restartCalls++
     if (this.failRestart !== undefined) throw new Error(this.failRestart)
     this.running = { ...this.config }
+  }
+
+  occupiedState: { holder: LockHolderInfo | undefined } | undefined
+  takeoverCalls = 0
+  failTakeover: string | undefined
+
+  occupiedBy(): { holder: LockHolderInfo | undefined } | undefined {
+    return this.runningFlag ? undefined : this.occupiedState
+  }
+
+  async takeover(): Promise<void> {
+    this.takeoverCalls++
+    if (this.failTakeover !== undefined) throw new Error(this.failTakeover)
+    this.occupiedState = undefined
+    await this.connect()
   }
 
   async connect(): Promise<void> {
@@ -1780,6 +1797,7 @@ describe('settings routes', () => {
       [SAVE_CREDENTIALS_ROUTE]: 'POST',
       [CLEAR_CREDENTIAL_ROUTE]: 'POST',
       [RECONNECT_ROUTE]: 'POST',
+      [TAKEOVER_ROUTE]: 'POST',
       [PICK_DIRECTORY_ROUTE]: 'POST',
       [ADD_ACCESS_GROUP_ROUTE]: 'POST',
       [REMOVE_ACCESS_GROUP_ROUTE]: 'POST',
@@ -2115,7 +2133,7 @@ describe('apply() web wiring', () => {
     })
 
     expect(injected).toContainEqual(['connection'])
-    expect(routes.size).toBe(19)
+    expect(routes.size).toBe(20)
 
     const panel = await call(routes, PANEL_ROUTE)
     expect(panel.status).toBe(200)
@@ -2129,7 +2147,7 @@ describe('apply() web wiring', () => {
 
     await vi.waitFor(async () => {
       const status = await call(routes, STATUS_ROUTE)
-      expect(JSON.parse(status.body).running).toBe(true)
+      expect(JSON.parse(status.body)).toMatchObject({ running: true, busy: false })
     })
 
     const saved = await call(routes, SAVE_CONFIG_ROUTE, post({ values: { requireMention: false } }))
@@ -2279,6 +2297,34 @@ describe('FeishuService settings integration', () => {
     expect(panel.status.running).toBe(false)
     expect(panel.status.phase).toBe('error')
     expect(panel.status.lastStartError).toContain('ws handshake failed')
+  })
+
+  it('shows the occupied phase with the owner and takes the connection over through the panel', async () => {
+    const h = harness()
+    const locks = makeInstanceLocks()
+    const owner = new FeishuService(h.ctx, h.config, () => makeChannel(), undefined, h.store, locks)
+    await owner.boot()
+    expect(owner.isRunning()).toBe(true)
+
+    const service = new FeishuService(h.ctx, h.config, () => makeChannel(), undefined, h.store, locks)
+    await service.boot()
+    expect(service.isRunning()).toBe(false)
+    const surface = new SettingsSurface(service, h.store)
+    const panel = await surface.panel()
+    expect(panel.status.phase).toBe('occupied')
+    expect(panel.status.occupiedBy).toEqual({
+      holder: { pid: process.pid, home: expect.any(String), version: expect.any(String) },
+    })
+
+    const taken = await surface.takeover()
+    expect(taken.ok).toBe(true)
+    if (taken.ok) {
+      expect(taken.panel.status.phase).toBe('connected')
+      expect(taken.panel.status.occupiedBy).toBeUndefined()
+    }
+    await vi.waitFor(() => expect(owner.isRunning()).toBe(false))
+    expect((await new SettingsSurface(owner, h.store).panel()).status.phase).toBe('occupied')
+    await service.shutdown()
   })
 
   it('stays loaded and unconnected while the credentials are incomplete', async () => {

@@ -101,7 +101,10 @@ import type {
 } from './settings/contract.ts'
 import { checkScopes } from './feishu/scopes.ts'
 import { desiredSlashCommands, syncSlashCommands } from './feishu/slash-commands.ts'
-import { mergeOverlay } from './settings/overlay.ts'
+import { mergeOverlay, resolveDshHome } from './settings/overlay.ts'
+import { SYSTEM_INSTANCE_LOCK } from './instance-lock.ts'
+import type { InstanceLock, InstanceLockProvider, LockHolderInfo } from './instance-lock.ts'
+import { DSH_CHANNELS_VERSION } from './session-export.ts'
 import type { OverlayPatch, OverlayStore } from './settings/overlay.ts'
 
 /** Periodic route-GC sweep cadence (a long-running instance also accumulates
@@ -269,6 +272,30 @@ function userWire(record: AccessUserRecord): AccessUserWire {
   }
 }
 
+/** How long a takeover waits for the previous owner to tear down and free the lock. */
+const TAKEOVER_WAIT_MS = 15_000
+
+/**
+ * The Feishu connection of this App ID is owned by another dsh process on this
+ * machine (see `instance-lock.ts`).
+ */
+export class InstanceLockHeldError extends Error {
+  constructor(readonly holder: LockHolderInfo | undefined) {
+    super(`飞书连接已被本机另一个 dsh 实例占用（${describeLockHolder(holder)}），可在设置面板「接管连接」`)
+    this.name = 'InstanceLockHeldError'
+  }
+}
+
+/**
+ * One-line description of a lock owner for logs and the panel.
+ * @param holder - the owner, or undefined when it did not identify itself.
+ * @returns e.g. `pid 1234 · DSH_HOME /Users/a/.dsh · v0.8.0`.
+ */
+export function describeLockHolder(holder: LockHolderInfo | undefined): string {
+  if (holder === undefined) return '对方未响应身份查询'
+  return `pid ${holder.pid} · DSH_HOME ${holder.home} · v${holder.version}`
+}
+
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
@@ -333,6 +360,15 @@ export class FeishuService {
   private readonly contextWindows = new Map<string, number>()
   private readonly windowRequests = new Set<string>()
   private started = false
+  /** Machine-wide lock for the connected App ID, held while the channel runs. */
+  private lock: InstanceLock | undefined
+  /**
+   * Set while the connection is unavailable because another process owns the
+   * lock: after a refused acquisition, or after yielding to a takeover.
+   */
+  private occupied: { holder: LockHolderInfo | undefined } | undefined
+  /** Acquisition deadline while a takeover waits for the previous owner. */
+  private takeoverDeadline: number | undefined
   /** Epoch ms when `start()` completed (uptime for `/status`). */
   private startedAt: number | undefined
   /** Last failed connection attempt, surfaced in the Web settings panel. */
@@ -392,6 +428,7 @@ export class FeishuService {
     channelFactory: ChannelFactory,
     sessionExportBuilder: SessionExportBuilder = createLogicalSessionExport,
     overlay?: OverlayStore,
+    private readonly instanceLock: InstanceLockProvider = SYSTEM_INSTANCE_LOCK,
   ) {
     this.ctx = ctx
     this.config = config
@@ -885,10 +922,16 @@ export class FeishuService {
       this.runningConfig = { ...this.config }
     } catch (error) {
       this.lastStartError = messageOf(error)
-      this.ctx.logger?.error?.('dsh-channels: 飞书连接失败：%s', String(error))
-      // Headless profiles have no settings panel; keep the failure visible on
-      // the console, symmetric with the success line at the end of `start()`.
-      console.error('[dsh-channels] feishu connection failed:', error)
+      if (error instanceof InstanceLockHeldError) {
+        // Expected when another profile runs the same bot: not a failure.
+        this.ctx.logger?.info?.('dsh-channels: %s', error.message)
+        console.warn('[dsh-channels]', error.message)
+      } else {
+        this.ctx.logger?.error?.('dsh-channels: 飞书连接失败：%s', String(error))
+        // Headless profiles have no settings panel; keep the failure visible on
+        // the console, symmetric with the success line at the end of `start()`.
+        console.error('[dsh-channels] feishu connection failed:', error)
+      }
       try {
         await this.shutdown()
       } catch {
@@ -971,6 +1014,61 @@ export class FeishuService {
     } finally {
       this.restarting = false
     }
+  }
+
+  /** This process's identity as answered to lock queries. */
+  private lockIdentity(): LockHolderInfo {
+    return { pid: process.pid, home: resolveDshHome(), version: DSH_CHANNELS_VERSION, startedAt: Date.now() }
+  }
+
+  /**
+   * Hand the connection to another process that asked to take over. The lock
+   * already answered the request; tearing down releases it.
+   */
+  private async yieldConnection(from: LockHolderInfo): Promise<void> {
+    this.restarting = true
+    try {
+      await this.shutdown()
+    } catch (error) {
+      this.ctx.logger?.warn?.('dsh-channels: shutdown during takeover failed: %s', String(error))
+    } finally {
+      this.restarting = false
+    }
+    this.occupied = { holder: from }
+    this.lastStartError = `飞书连接已被本机另一个 dsh 实例接管（${describeLockHolder(from)}）`
+    this.ctx.logger?.info?.('dsh-channels: yielded the feishu connection to %s', describeLockHolder(from))
+  }
+
+  /**
+   * Panel action: ask the process owning this App ID to yield, then connect.
+   * Interrupts the replies in flight over there; those cards are repaired when
+   * that process starts its channel again.
+   */
+  async takeover(): Promise<void> {
+    if (this.started) return
+    if (this.connecting || this.restarting) throw new Error('飞书连接正在连接或重启，请稍候再试')
+    await this.refreshReadiness()
+    if (!this.configured) {
+      throw new Error(`飞书应用凭据尚未配置完整：缺少 ${this.missingConfigItems.join('、')}`)
+    }
+    const appId = await resolveCredentialRef(this.ctx, this.config.appId)
+    const outcome = await this.instanceLock.requestYield(this.instanceLock.address(appId), this.lockIdentity())
+    if (outcome === 'busy') throw new Error('另一个 dsh 实例正在连接或重启，请稍候再试')
+    this.takeoverDeadline = Date.now() + TAKEOVER_WAIT_MS
+    try {
+      await this.connect()
+    } finally {
+      this.takeoverDeadline = undefined
+    }
+  }
+
+  /**
+   * The process owning this App ID's connection, while it keeps this one from
+   * connecting; `undefined` otherwise. `holder` is undefined when the owner did
+   * not identify itself.
+   */
+  occupiedBy(): { holder: LockHolderInfo | undefined } | undefined {
+    return this.started ? undefined : this.occupied
   }
 
   /** The `feishuTopics` service, provided by `apply()`. */
@@ -1529,7 +1627,23 @@ export class FeishuService {
     const appId = await resolveCredentialRef(this.ctx, this.config.appId)
     const appSecret = await resolveCredentialRef(this.ctx, this.config.appSecret)
 
-    // 2. Build the channel with the resolved secrets.
+    // 2. Own the App ID on this machine before connecting: Feishu splits the
+    //    events of one app across all its long connections.
+    const acquired = await this.instanceLock.acquire({
+      address: this.instanceLock.address(appId),
+      self: this.lockIdentity(),
+      canYield: () => this.started && !this.connecting && !this.restarting,
+      onYield: (from) => { void this.yieldConnection(from) },
+      ...(this.takeoverDeadline === undefined ? {} : { waitUntil: this.takeoverDeadline }),
+    })
+    if (!acquired.ok) {
+      this.occupied = { holder: acquired.holder }
+      throw new InstanceLockHeldError(acquired.holder)
+    }
+    this.lock = acquired.lock
+    this.occupied = undefined
+
+    // 3. Build the channel with the resolved secrets.
     const channel = this.channelFactory({
       appId,
       appSecret,
@@ -1767,6 +1881,9 @@ export class FeishuService {
     this.streamer = undefined
     await this.domain?.close()
     this.domain = undefined
+    // Last: the lock may only pass on once this process holds no connection.
+    await this.lock?.release()
+    this.lock = undefined
     this.runningConfig = undefined
     this.appOwner = undefined
     this.scopeCheckState = undefined

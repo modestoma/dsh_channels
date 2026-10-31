@@ -9,7 +9,7 @@ import path from 'node:path'
 import { promisify } from 'node:util'
 import { gunzip } from 'node:zlib'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { FeishuService } from '../src/service.ts'
+import { TestFeishuService as FeishuService } from './helpers.ts'
 import { FeishuApiError } from '../src/feishu-channel.ts'
 import type { FeishuConfig } from '../src/config.ts'
 import type {

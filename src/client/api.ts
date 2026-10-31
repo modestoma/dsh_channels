@@ -18,6 +18,7 @@ import {
   PROFILES_MAX_IDS,
   PROFILES_ROUTE,
   RECONNECT_ROUTE,
+  TAKEOVER_ROUTE,
   REMOVE_ACCESS_GROUP_ROUTE,
   REMOVE_ACCESS_USER_ROUTE,
   REMOVE_WIKI_USER_ROUTE,
@@ -179,6 +180,20 @@ export async function clearConfig(): Promise<ClearConfigResponse> {
 /** Reopen the Feishu long connection (interrupts in-flight replies). */
 export async function reconnect(): Promise<ReconnectResponse> {
   const response = await request(RECONNECT_ROUTE, { method: 'POST' })
+  const text = await response.text()
+  if (!response.ok) {
+    try {
+      return JSON.parse(text) as ReconnectResponse
+    } catch {
+      return { ok: false, error: errorFromBody(response.status, text) }
+    }
+  }
+  return JSON.parse(text) as ReconnectResponse
+}
+
+/** Take this bot's connection over from another dsh process on this machine. */
+export async function takeover(): Promise<ReconnectResponse> {
+  const response = await request(TAKEOVER_ROUTE, { method: 'POST' })
   const text = await response.text()
   if (!response.ok) {
     try {

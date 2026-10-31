@@ -16,6 +16,7 @@ import { MAX_TIMER_DELAY_MS } from '../config.ts'
 import { FEISHU_USER_ID_PATTERN } from '../domain.ts'
 import { parseWikiRootLink, WIKI_ROOT_LINK_ERRORS } from '../feishu/wiki/links.ts'
 import type { HealthSnapshot } from '../health.ts'
+import type { LockHolderInfo } from '../instance-lock.ts'
 import { prepareWorkspaceBaseDir } from '../workspaces.ts'
 import {
   BYTES_UNIT,
@@ -95,6 +96,10 @@ export interface SettingsTarget {
   refreshReadiness(): Promise<void>
   /** Connect with the current config; throws when credentials are incomplete or the handshake fails. */
   connect(): Promise<void>
+  /** Ask the process owning this bot's connection to yield, then connect; throws like `connect()`. */
+  takeover(): Promise<void>
+  /** The process keeping this one from connecting, or undefined. */
+  occupiedBy(): { holder: LockHolderInfo | undefined } | undefined
   configSnapshot(): FeishuConfig
   baseConfigSnapshot(): FeishuConfig
   runningConfigSnapshot(): FeishuConfig | undefined
@@ -636,6 +641,7 @@ function phaseOf(target: SettingsTarget): ChannelPhaseWire {
   if (target.isConnecting()) return target.isConfigured() ? 'connecting' : 'unconfigured'
   if (target.isRunning()) return 'connected'
   if (!target.isConfigured()) return 'unconfigured'
+  if (target.occupiedBy() !== undefined) return 'occupied'
   if (target.startError() !== undefined) return 'error'
   return 'idle'
 }
@@ -646,6 +652,7 @@ function buildStatus(target: SettingsTarget, overlayPath: string): ChannelStatus
   const connection = health.connection
   const scopeCheck = target.isRunning() ? target.scopeCheck() : undefined
   const slashCommandSync = target.isRunning() ? target.slashCommandSync() : undefined
+  const occupied = target.occupiedBy()
   return {
     running: target.isRunning(),
     configured: target.isConfigured(),
@@ -667,6 +674,11 @@ function buildStatus(target: SettingsTarget, overlayPath: string): ChannelStatus
     liveAgentCount: health.liveAgentCount,
     inflightTurnCount: health.inflightTurnCount,
     ...(target.startError() === undefined ? {} : { lastStartError: target.startError() }),
+    ...(occupied === undefined ? {} : {
+      occupiedBy: occupied.holder === undefined ? {} : {
+        holder: { pid: occupied.holder.pid, home: occupied.holder.home, version: occupied.holder.version },
+      },
+    }),
     reasons: health.reasons,
     version: DSH_CHANNELS_VERSION,
     overlayPath,
@@ -927,6 +939,30 @@ export class SettingsSurface {
       return { ok: false, error: `清除覆盖配置失败：${messageOf(error)}` }
     }
     this.target.applyOverlay({})
+    return { ok: true, panel: await this.panel() }
+  }
+
+  /**
+   * Panel action: take this bot's connection over from the other dsh process
+   * on this machine that owns it.
+   */
+  async takeover(): Promise<ReconnectResponse> {
+    await this.syncReadiness()
+    if (!this.target.isConfigured()) {
+      return {
+        ok: false,
+        error: '飞书应用凭据尚未配置完整，请先填写 App ID 与 App Secret 并保存',
+        unconfigured: true,
+      }
+    }
+    try {
+      await this.target.takeover()
+    } catch (error) {
+      return { ok: false, error: `接管失败：${messageOf(error)}` }
+    }
+    if (!this.target.isRunning()) {
+      return { ok: false, error: this.target.startError() ?? '飞书连接未建立' }
+    }
     return { ok: true, panel: await this.panel() }
   }
 

@@ -28,6 +28,8 @@ export const CLEAR_CREDENTIAL_ROUTE = '/api/dsh-channels.clearCredential'
  * one "connect / reconnect" button. Credentials are resolved again either way.
  */
 export const RECONNECT_ROUTE = '/api/dsh-channels.reconnect'
+/** `POST`: ask the dsh process owning this bot's connection to yield, then connect. Answers {@link ReconnectResponse}. */
+export const TAKEOVER_ROUTE = '/api/dsh-channels.takeover'
 /** 模型/推理档位/预设选择器的宿主目录（provider → model → effort 级联刷新）。 */
 export const CATALOG_ROUTE = '/api/dsh-channels.catalog'
 /** 访问与授权只读快照（GET）：准入模式、管理员、群/用户/知识库白名单、待处理申请。 */
@@ -380,6 +382,17 @@ export type ChannelPhaseWire =
   | 'connected'
   /** The last connection attempt failed; the reason is in `lastStartError`. */
   | 'error'
+  /** Another dsh process on this machine owns this bot's connection; `occupiedBy` names it. */
+  | 'occupied'
+
+/** The dsh process owning this bot's Feishu connection on this machine. */
+export interface LockHolderWire {
+  pid: number
+  /** That process's `$DSH_HOME`. */
+  home: string
+  /** Its dsh-channels version. */
+  version: string
+}
 
 /** Runtime connection/liveness facts. */
 export interface ChannelStatusWire {
@@ -403,6 +416,10 @@ export interface ChannelStatusWire {
   inflightTurnCount: number
   /** 最近一次连接失败的原因（成功后清空）。 */
   lastStartError?: string
+  /**
+   * 本机另一个 dsh 实例占用了同一个机器人的连接时给出；`holder` 缺省表示对方未响应身份查询。
+   */
+  occupiedBy?: { holder?: LockHolderWire }
   /** 健康判定的原因说明（空数组 = 健康）；由 Host 的 health 折叠给出。 */
   reasons: string[]
   /** 面板显示的所有键值对来源版本。 */
@@ -690,11 +707,19 @@ export const PANEL_COPY = {
   phaseConnecting: '连接中',
   phaseConnected: '已连接',
   phaseError: '连接失败',
+  phaseOccupied: '已被占用',
   statusSummaryConnected: '机器人在线，可以收发消息',
   statusSummaryUnconfigured: '还没有填写飞书应用凭据，插件不会连接飞书',
   statusSummaryIdle: '凭据已就绪，还没有建立连接',
   statusSummaryConnecting: '正在连接飞书…',
   statusSummaryError: '连接飞书失败，请检查凭据与网络后重试',
+  statusSummaryOccupied: '本机另一个 dsh 实例正在使用这个机器人，同一个机器人只能由一个实例连接',
+  occupiedHolder: '占用方',
+  occupiedHolderUnknown: '对方未响应身份查询',
+  takeover: '接管连接',
+  takingOver: '接管中…',
+  takeoverWarning: '接管会断开另一个实例的飞书连接，并中断它正在进行的回复。确定接管？',
+  takeoverDone: '已接管飞书连接',
   uptimePrefix: '运行',
   lastError: '最近一次连接失败',
   checksTitle: '自检',
