@@ -3,7 +3,7 @@
  * routes, and FeishuService config hot-apply / reconnect integration.
  */
 
-import { mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
@@ -33,6 +33,10 @@ import {
   PROFILES_MAX_IDS,
   PROFILES_ROUTE,
   SESSION_ORIGIN_ROUTE,
+  SESSION_RECORDS_ROUTE,
+  WORKSPACE_FILE_DOWNLOAD_ROUTE,
+  WORKSPACE_FILE_PREVIEW_ROUTE,
+  WORKSPACE_FILES_ROUTE,
   PANEL_TABS,
   TAB_FIELD_GROUPS,
   RECONNECT_ROUTE,
@@ -55,7 +59,10 @@ import type {
   ScopeCheckWire,
   FeishuProfilesWire,
   SessionOriginWire,
+  SessionRecordsWire,
   SlashCommandSyncWire,
+  WorkspaceListingWire,
+  WorkspacePreviewWire,
 } from '../src/settings/contract.ts'
 import {
   OverlayStore,
@@ -85,6 +92,8 @@ import type { SettingsDirectoryPicker } from '../src/settings/directory-picker.t
 import { mountSettingsRoutes, registerSettingsRoutes } from '../src/settings/routes.ts'
 import type { HostConnection, HostFetchRoute } from '../src/settings/routes.ts'
 import { normalizeWorkspaceBaseDir, prepareWorkspaceBaseDir } from '../src/workspaces.ts'
+import { listWorkspaceDirectory, previewWorkspaceFile, readWorkspaceFile, WorkspaceFileError } from '../src/workspace-files.ts'
+import type { WorkspaceDownload } from '../src/workspace-files.ts'
 import { makeChannel, makeHostContext } from './helpers.ts'
 
 function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
@@ -317,6 +326,31 @@ class FakeTarget implements SettingsTarget {
   async sessionOrigin(sessionId: string): Promise<SessionOriginWire | null> {
     this.originCalls.push(sessionId)
     return this.origins.get(sessionId) ?? null
+  }
+
+  records: SessionRecordsWire = { groups: [], directs: [] }
+  /** The only root the fake file routes serve. */
+  workspaceRoot: string | undefined
+
+  async sessionRecords(): Promise<SessionRecordsWire> {
+    return this.records
+  }
+
+  private allowed(workspace: string): string {
+    if (workspace !== this.workspaceRoot) throw new WorkspaceFileError(403, '该目录不是飞书会话的工作区')
+    return workspace
+  }
+
+  async workspaceFiles(workspace: string, path: string | undefined): Promise<WorkspaceListingWire> {
+    return listWorkspaceDirectory(this.allowed(workspace), path)
+  }
+
+  async workspaceFilePreview(workspace: string, path: string | undefined): Promise<WorkspacePreviewWire> {
+    return previewWorkspaceFile(this.allowed(workspace), path)
+  }
+
+  async workspaceFileDownload(workspace: string, path: string | undefined): Promise<WorkspaceDownload> {
+    return readWorkspaceFile(this.allowed(workspace), path)
   }
 
   async feishuProfiles(userIds: readonly string[], chatIds: readonly string[]): Promise<FeishuProfilesWire> {
@@ -1792,6 +1826,10 @@ describe('settings routes', () => {
       [SESSION_ORIGIN_ROUTE]: 'GET',
       [PROFILES_ROUTE]: 'GET',
       [ACCESS_ROUTE]: 'GET',
+      [SESSION_RECORDS_ROUTE]: 'GET',
+      [WORKSPACE_FILES_ROUTE]: 'GET',
+      [WORKSPACE_FILE_PREVIEW_ROUTE]: 'GET',
+      [WORKSPACE_FILE_DOWNLOAD_ROUTE]: 'GET',
       [SAVE_CONFIG_ROUTE]: 'POST',
       [CLEAR_CONFIG_ROUTE]: 'POST',
       [SAVE_CREDENTIALS_ROUTE]: 'POST',
@@ -1858,6 +1896,56 @@ describe('settings routes', () => {
     const missing = await call(routes, SESSION_ORIGIN_ROUTE, { query: 'sessionId=%20' })
     expect(missing.status).toBe(400)
     expect(target.originCalls).toEqual(['s_feishu', 's_web'])
+  })
+
+  it('serves the Session records over GET', async () => {
+    const { surface, target } = makeSurface()
+    target.records = {
+      groups: [{ chatId: 'oc_1', chatName: '研发群', users: [{ userId: 'u_1', name: '张三', workspaces: ['/ws'], sessions: [] }] }],
+      directs: [],
+    }
+    const { connection, routes } = makeConnection()
+    registerSettingsRoutes(connection, surface)
+    const response = await call(routes, SESSION_RECORDS_ROUTE)
+    expect(response.status).toBe(200)
+    expect(JSON.parse(response.body)).toEqual(target.records)
+  })
+
+  it('serves workspace listings, previews and downloads, mapping refusals to their HTTP status', async () => {
+    const { surface, target } = makeSurface()
+    const root = mkdtempSync(path.join(tmpdir(), 'dsh-channels-files-'))
+    mkdirSync(path.join(root, 'topics', 't1'), { recursive: true })
+    writeFileSync(path.join(root, 'topics', 't1', '报告.md'), '# 标题\n')
+    target.workspaceRoot = root
+    const { connection, routes } = makeConnection()
+    registerSettingsRoutes(connection, surface)
+    const query = (workspace: string, file?: string): string => new URLSearchParams({
+      workspace, ...(file === undefined ? {} : { path: file }),
+    }).toString()
+
+    const listing = await call(routes, WORKSPACE_FILES_ROUTE, { query: query(root, 'topics') })
+    expect(listing.status).toBe(200)
+    expect(JSON.parse(listing.body)).toEqual({ path: 'topics', entries: [{ name: 't1', kind: 'dir' }], truncated: false })
+
+    const preview = await call(routes, WORKSPACE_FILE_PREVIEW_ROUTE, { query: query(root, 'topics/t1/报告.md') })
+    expect(JSON.parse(preview.body)).toMatchObject({ kind: 'text', path: 'topics/t1/报告.md', content: '# 标题\n', truncated: false })
+
+    const download = await routes.get(WORKSPACE_FILE_DOWNLOAD_ROUTE)!.fetch(
+      new Request(`http://127.0.0.1:3080${WORKSPACE_FILE_DOWNLOAD_ROUTE}?${query(root, 'topics/t1/报告.md')}`),
+    )
+    expect(download.status).toBe(200)
+    expect(download.headers.get('content-type')).toBe('application/octet-stream')
+    expect(download.headers.get('content-disposition')).toBe(`attachment; filename="__.md"; filename*=UTF-8''${encodeURIComponent('报告.md')}`)
+    expect(await download.text()).toBe('# 标题\n')
+
+    const escape = await call(routes, WORKSPACE_FILES_ROUTE, { query: query(root, '../') })
+    expect(escape.status).toBe(400)
+    const foreign = await call(routes, WORKSPACE_FILES_ROUTE, { query: query('/etc') })
+    expect(foreign.status).toBe(403)
+    const missingWorkspace = await call(routes, WORKSPACE_FILES_ROUTE, { query: 'path=topics' })
+    expect(JSON.parse(missingWorkspace.body)).toEqual({ ok: false, error: '缺少 workspace 参数' })
+    const missingFile = await call(routes, WORKSPACE_FILE_PREVIEW_ROUTE, { query: query(root, 'nope.txt') })
+    expect(missingFile.status).toBe(404)
   })
 
   it('serves Feishu profiles for comma-separated ids over GET and bounds the id count', async () => {
@@ -2130,7 +2218,7 @@ describe('apply() web wiring', () => {
     })
 
     expect(injected).toContainEqual(['connection'])
-    expect(routes.size).toBe(20)
+    expect(routes.size).toBe(24)
 
     const panel = await call(routes, PANEL_ROUTE)
     expect(panel.status).toBe(200)

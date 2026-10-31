@@ -1059,6 +1059,65 @@ describe('FeishuService', () => {
     }
   })
 
+  it('groups Feishu Sessions by group chat → user and private user with live names, titles and workspace roots', async () => {
+    const h = await setup({}, {
+      chatProfile: async () => ({ name: '研发群', avatarUrl: 'https://cdn.example/chat.png' }),
+      userProfiles: async ids => new Map(ids.filter(id => id !== 'u_member').map(id => [id, { name: `名-${id}` }])),
+      memberName: async (userId, chatId) => (userId === 'u_member' && chatId === 'oc_rec' ? '李四' : undefined),
+    })
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_rec', senderId: 'u_owner', messageId: 'om_rec_1', content: '开始',
+    }))
+    await waitForEstablishedSession(h)
+    const owner = h.ctxState.agents.created[0]!
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_rec', senderId: 'u_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_rec_renew', content: '/renew',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
+    const renewed = h.ctxState.agents.created[1]!
+    await waitForRenewedRoute(h, 'omt_1', renewed.options.sessionId)
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_rec', senderId: 'u_member', messageId: 'om_rec_2', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(3))
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_dm', senderId: 'u_dm', messageId: 'om_rec_3', content: '开始',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(4))
+    await waitUntil(() => expect(h.ctxState.domain.raw.table('routes').get('omt_3')).toBeDefined())
+    const retiredRoot = path.join(h.config.baseDir, 'retired-root')
+    h.ctxState.sessionQuery.readTitleSnapshots.mockImplementation(async (ids: readonly string[]) => ids.map(sessionId => ({
+      sessionId,
+      status: 'fulfilled' as const,
+      value: sessionId === owner.options.sessionId
+        ? { title: { title: '旧会话', updatedAt: 1 }, session: { cwd: retiredRoot } }
+        : { title: { title: `标题-${sessionId.slice(0, 4)}`, updatedAt: 1 } },
+    })))
+
+    const records = await h.service.sessionRecords()
+    expect(records.groups).toHaveLength(1)
+    const group = records.groups[0]!
+    expect(group).toMatchObject({ chatId: 'oc_rec', chatName: '研发群', chatAvatarUrl: 'https://cdn.example/chat.png' })
+    const users = Object.fromEntries(group.users.map(user => [user.userId, user]))
+    expect(users.u_owner).toMatchObject({ name: '名-u_owner' })
+    expect(users.u_member).toMatchObject({ name: '李四' })
+    const ownerSessions = Object.fromEntries(users.u_owner!.sessions.map(record => [record.sessionId, record]))
+    expect(ownerSessions[owner.options.sessionId]).toMatchObject({ title: '旧会话', bound: false, workspace: retiredRoot })
+    expect(ownerSessions[renewed.options.sessionId]).toMatchObject({ kind: 'thread', bound: true, live: true })
+    const workspace = (h.ctxState.domain.raw.table('routes').get('omt_1') as RouteRecord).workspacePath
+    expect(ownerSessions[renewed.options.sessionId]!.workspace).toBe(workspace)
+    expect(users.u_owner!.workspaces).toEqual(expect.arrayContaining([retiredRoot, workspace]))
+    expect(records.directs.map(user => user.userId)).toEqual(['u_dm'])
+    expect(records.directs[0]!.sessions[0]!.workspace).toContain(path.join('p2p', 'u_dm'))
+
+    const listing = await h.service.workspaceFiles(workspace, '')
+    expect(listing.entries.map(entry => entry.name)).toContain('topics')
+    await expect(h.service.workspaceFiles(h.config.baseDir, '')).rejects.toMatchObject({ status: 403 })
+    // The retired root is browsable once the records named it; it does not exist on disk.
+    await expect(h.service.workspaceFiles(retiredRoot, '')).rejects.toMatchObject({ status: 404 })
+  })
+
   it('backfills origins for routes written before origins existed', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({

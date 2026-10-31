@@ -67,6 +67,9 @@ import type {
   LoadState,
   Notice,
 } from './shared.tsx'
+import { FeishuChannelsIcon } from '../icon.tsx'
+import { RefreshIcon } from './records-icons.tsx'
+import { RecordsTab } from './records-tab.tsx'
 import { WikiTab } from './wiki-tab.tsx'
 
 /**
@@ -737,6 +740,7 @@ function FeishuChannelsPanel(): JSX.Element | null {
             )
           : null}
         {activeTab === 'sessions' ? <FieldsTab form={form} tab="sessions" /> : null}
+        {activeTab === 'records' ? <RecordsTab /> : null}
         {activeTab === 'model'
           ? <FieldsTab form={form} tab="model" note={catalogBusy ? PANEL_COPY.catalogLoading : undefined} />
           : null}
@@ -797,6 +801,7 @@ function PanelHeader(props: {
   return (
     <header className="dsh-channels-cfg__panelHead">
       <div className="dsh-channels-cfg__headRow">
+        <span className="dsh-channels-cfg__logo"><FeishuChannelsIcon size={18} active={false} /></span>
         <h1 className="dsh-channels-cfg__title">{PANEL_COPY.title}</h1>
         <Pill tone={badge.tone} dot>{badge.text}</Pill>
         <span className="dsh-channels-cfg__meta dsh-channels-cfg__mono">v{status.version}</span>
@@ -810,6 +815,7 @@ function PanelHeader(props: {
           onClick={onRefresh}
           disabled={busy !== null || locked}
         >
+          <RefreshIcon />
           {PANEL_COPY.refresh}
         </button>
       </div>

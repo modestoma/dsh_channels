@@ -604,6 +604,7 @@ export interface TopicLaunchesTable {
 export interface SessionOriginsTable {
   get(key: string): SessionOriginRecord | undefined
   put(key: string, value: SessionOriginRecord): Promise<unknown> | void
+  entries(): IterableIterator<[string, SessionOriginRecord]>
 }
 
 /** Normalized domain handle. */

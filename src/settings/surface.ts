@@ -52,9 +52,13 @@ import type {
   ScopeCheckWire,
   SessionOriginResponse,
   SessionOriginWire,
+  SessionRecordsWire,
   SlashCommandSyncWire,
   StringListItemFormat,
+  WorkspaceListingWire,
+  WorkspacePreviewWire,
 } from './contract.ts'
+import type { WorkspaceDownload } from '../workspace-files.ts'
 import {
   configValueOf,
   deleteOverlayKey,
@@ -128,6 +132,15 @@ export interface SettingsTarget {
   sessionOrigin(sessionId: string): Promise<SessionOriginWire | null>
   /** Live Feishu names and avatars of the given users and chats. */
   feishuProfiles(userIds: readonly string[], chatIds: readonly string[]): Promise<FeishuProfilesWire>
+  /** Every Feishu-routed Session grouped by group chat → user and private-chat user. */
+  sessionRecords(): Promise<SessionRecordsWire>
+  /**
+   * File routes: `workspace` must be the root of a Feishu-routed Session and
+   * `path` is relative to it; refusals throw `WorkspaceFileError`.
+   */
+  workspaceFiles(workspace: string, path: string | undefined): Promise<WorkspaceListingWire>
+  workspaceFilePreview(workspace: string, path: string | undefined): Promise<WorkspacePreviewWire>
+  workspaceFileDownload(workspace: string, path: string | undefined): Promise<WorkspaceDownload>
 }
 
 /** Presence/source/writability facts returned by the credentials seam. */
@@ -758,6 +771,26 @@ export class SettingsSurface {
    */
   async feishuProfiles(userIds: readonly string[], chatIds: readonly string[]): Promise<FeishuProfilesWire> {
     return this.target.feishuProfiles(userIds, chatIds)
+  }
+
+  /** Feishu-routed Sessions for the 「会话记录」 tab. */
+  async sessionRecords(): Promise<SessionRecordsWire> {
+    return this.target.sessionRecords()
+  }
+
+  /** One directory listing of a Feishu workspace. */
+  async workspaceFiles(workspace: string, path: string | undefined): Promise<WorkspaceListingWire> {
+    return this.target.workspaceFiles(workspace, path)
+  }
+
+  /** One file preview of a Feishu workspace. */
+  async workspaceFilePreview(workspace: string, path: string | undefined): Promise<WorkspacePreviewWire> {
+    return this.target.workspaceFilePreview(workspace, path)
+  }
+
+  /** One file of a Feishu workspace for download. */
+  async workspaceFileDownload(workspace: string, path: string | undefined): Promise<WorkspaceDownload> {
+    return this.target.workspaceFileDownload(workspace, path)
   }
 
   async catalogFor(provider?: string, model?: string): Promise<CatalogWire> {

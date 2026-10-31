@@ -35,7 +35,11 @@ import {
   SAVE_CONFIG_ROUTE,
   SAVE_CREDENTIALS_ROUTE,
   SESSION_ORIGIN_ROUTE,
+  SESSION_RECORDS_ROUTE,
   STATUS_ROUTE,
+  WORKSPACE_FILE_DOWNLOAD_ROUTE,
+  WORKSPACE_FILE_PREVIEW_ROUTE,
+  WORKSPACE_FILES_ROUTE,
 } from './contract.ts'
 import type {
   CredentialField,
@@ -44,6 +48,7 @@ import type {
   SaveCredentialsRequest,
 } from './contract.ts'
 import type { SettingsSurface } from './surface.ts'
+import { WorkspaceFileError } from '../workspace-files.ts'
 
 /** One exact route on DSH's authenticated `/api` channel. */
 export interface HostFetchRoute {
@@ -112,6 +117,19 @@ function idList(raw: string | null): string[] {
   return [...new Set(raw.split(',').map(id => id.trim()).filter(id => id !== ''))]
 }
 
+/** The required absolute `workspace` query parameter of the file routes. */
+function workspaceParam(url: URL): string {
+  const workspace = url.searchParams.get('workspace')
+  if (workspace === null || workspace === '') throw new HttpError(400, '缺少 workspace 参数')
+  return workspace
+}
+
+/** `Content-Disposition` for one download name (RFC 6266 with an RFC 5987 UTF-8 name). */
+function attachmentDisposition(name: string): string {
+  const fallback = name.replace(/[^\x20-\x7e]|["\\]/g, '_')
+  return `attachment; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(name)}`
+}
+
 /** A write's answer: 200 on success, 400 for a refusal the body explains. */
 function result(outcome: { ok: boolean }): Response {
   return json(outcome.ok ? 200 : 400, outcome)
@@ -123,7 +141,9 @@ function answered(handler: (request: Request) => Promise<Response>): (request: R
     try {
       return await handler(request)
     } catch (error) {
-      if (error instanceof HttpError) return json(error.status, { ok: false, error: error.message })
+      if (error instanceof HttpError || error instanceof WorkspaceFileError) {
+        return json(error.status, { ok: false, error: error.message })
+      }
       return json(500, { ok: false, error: `内部错误：${messageOf(error)}` })
     }
   }
@@ -163,6 +183,26 @@ export function registerSettingsRoutes(connection: HostConnection, surface: Sett
       return json(200, await surface.feishuProfiles(userIds, chatIds))
     }),
     get(ACCESS_ROUTE, async () => json(200, await surface.access())),
+    get(SESSION_RECORDS_ROUTE, async () => json(200, await surface.sessionRecords())),
+    get(WORKSPACE_FILES_ROUTE, async url => json(200, await surface.workspaceFiles(
+      workspaceParam(url), url.searchParams.get('path') ?? undefined,
+    ))),
+    get(WORKSPACE_FILE_PREVIEW_ROUTE, async url => json(200, await surface.workspaceFilePreview(
+      workspaceParam(url), url.searchParams.get('path') ?? undefined,
+    ))),
+    get(WORKSPACE_FILE_DOWNLOAD_ROUTE, async (url) => {
+      const file = await surface.workspaceFileDownload(workspaceParam(url), url.searchParams.get('path') ?? undefined)
+      return new Response(file.bytes, {
+        status: 200,
+        headers: {
+          'content-type': 'application/octet-stream',
+          'content-length': String(file.size),
+          'content-disposition': attachmentDisposition(file.name),
+          'cache-control': 'no-store',
+          'x-content-type-options': 'nosniff',
+        },
+      })
+    }),
     post(SAVE_CONFIG_ROUTE, async (request) => {
       const values = (await readJsonObject(request)).values
       if (typeof values !== 'object' || values === null || Array.isArray(values)) {

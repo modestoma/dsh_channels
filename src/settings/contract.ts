@@ -122,6 +122,94 @@ export interface SessionOriginResponse {
   origin: SessionOriginWire | null
 }
 
+/** 飞书会话记录（GET，无参数）：「会话记录」标签页按群聊/私聊、用户分组展示。 */
+export const SESSION_RECORDS_ROUTE = '/api/dsh-channels.sessionRecords'
+/** 工作区目录列表（GET，`?workspace=<根目录>&path=<相对路径>`）。 */
+export const WORKSPACE_FILES_ROUTE = '/api/dsh-channels.workspaceFiles'
+/** 工作区文件预览（GET，`?workspace=&path=`）。 */
+export const WORKSPACE_FILE_PREVIEW_ROUTE = '/api/dsh-channels.workspaceFilePreview'
+/** 工作区文件下载（GET，`?workspace=&path=`），成功时响应体是文件原始字节。 */
+export const WORKSPACE_FILE_DOWNLOAD_ROUTE = '/api/dsh-channels.workspaceFileDownload'
+
+/** One Feishu-routed Session in the records view. */
+export interface SessionRecordWire {
+  sessionId: string
+  /** Latest log-backed title; absent when the Session has none or the host cannot read it. */
+  title?: string
+  /** `thread` = 话题内会话，`chat` = 整个聊天一个会话。 */
+  kind: 'thread' | 'chat'
+  /** 群共享话题（经 `feishuTopics` 发起）。 */
+  shared: boolean
+  /** Epoch ms when the Session was bound to its Feishu route. */
+  createdAt: number
+  /** Whether the Feishu route still points at this Session. */
+  bound: boolean
+  /** Epoch ms of the route's last activity, while bound. */
+  lastActivityAt?: number
+  /** Whether the Session currently has a live Agent. */
+  live: boolean
+  /** Workspace root (Session header cwd); absent when unknown. */
+  workspace?: string
+}
+
+/** One user's Sessions inside a group, or in their private chat. */
+export interface SessionRecordUserWire {
+  userId: string
+  /** 用户姓名（通讯录或群成员列表能查到时）。 */
+  name?: string
+  avatarUrl?: string
+  /** Distinct workspace roots of the Sessions, most recently active first. */
+  workspaces: string[]
+  /** Sessions, most recently active first. */
+  sessions: SessionRecordWire[]
+}
+
+/** One group chat with its users. */
+export interface SessionRecordGroupWire {
+  chatId: string
+  /** 群名（能读取群信息时）。 */
+  chatName?: string
+  chatAvatarUrl?: string
+  /** Users, most recently active first. */
+  users: SessionRecordUserWire[]
+}
+
+/** `GET SESSION_RECORDS_ROUTE` response. */
+export interface SessionRecordsWire {
+  /** Group chats, most recently active first. */
+  groups: SessionRecordGroupWire[]
+  /** Private-chat users, most recently active first. */
+  directs: SessionRecordUserWire[]
+  /** Name lookup failures (typically a missing scope); ids are shown instead. */
+  warning?: string
+}
+
+/** One workspace directory entry; `symlink` entries are not followed. */
+export interface WorkspaceEntryWire {
+  name: string
+  kind: 'dir' | 'file' | 'symlink' | 'other'
+  /** Bytes, for regular files. */
+  size?: number
+  /** Last modification, epoch ms. */
+  mtimeMs?: number
+}
+
+/** `GET WORKSPACE_FILES_ROUTE` response; directories sort first. */
+export interface WorkspaceListingWire {
+  /** Normalized relative path of the listed directory (`''` = workspace root). */
+  path: string
+  entries: WorkspaceEntryWire[]
+  /** Whether the directory held more entries than one listing returns. */
+  truncated: boolean
+}
+
+/** `GET WORKSPACE_FILE_PREVIEW_ROUTE` response. */
+export type WorkspacePreviewWire =
+  | { kind: 'text'; path: string; size: number; mtimeMs: number; content: string; truncated: boolean }
+  | { kind: 'image'; path: string; size: number; mtimeMs: number; mime: string; dataBase64: string }
+  /** Binary content or an oversized image: download only. */
+  | { kind: 'binary'; path: string; size: number; mtimeMs: number }
+
 /**
  * 可由 Web 面板覆盖的配置项。顶层键对应 `src/config.ts` 的字段；`feishuTools.*`
  * 是嵌套字段（覆盖层里仍写成 `{ "feishuTools": { ... } }` 对象）。覆盖值写进
@@ -658,6 +746,7 @@ export type ClearCredentialResponse =
 export const PANEL_TABS = [
   { id: 'connection', label: '连接' },
   { id: 'sessions', label: '会话' },
+  { id: 'records', label: '会话记录' },
   { id: 'model', label: '模型' },
   { id: 'attachments', label: '附件与工具' },
   { id: 'access', label: '访问授权' },
@@ -671,6 +760,7 @@ export type PanelTabId = (typeof PANEL_TABS)[number]['id']
 export const TAB_FIELD_GROUPS: Readonly<Record<PanelTabId, readonly FieldGroup[]>> = {
   connection: [],
   sessions: ['trigger', 'workspace', 'cards', 'features'],
+  records: [],
   model: ['model'],
   attachments: ['attachments', 'tools', 'limits'],
   access: ['access'],
