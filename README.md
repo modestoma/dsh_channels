@@ -141,14 +141,14 @@ Web 里直接新建的会话不显示按钮。来源在 Host 侧按会话 id 持
 
 ## 发布
 
-版本号由 semantic-release 按 Conventional Commits 计算。1.0 之前，破坏性变更（`BREAKING CHANGE`）只升次版本号（如 0.7 → 0.8）。推送（含合并 PR）到 `main` 在检查通过后**自动发布**正式版；推送到 `dev` 只跑检查，beta 版**只在手动触发时发布**，可以先累积多笔提交。
+版本号由 semantic-release 按 Conventional Commits 计算。版本号始终保持 0.x：破坏性变更（`BREAKING CHANGE`）只升次版本号（如 0.7 → 0.8），不会升到 1.0.0。推送（含合并 PR）到 `dev` 在检查通过后**自动发布** beta 版；正式版**只在手动触发时发布**，推送到 `main` 只跑检查。
 
-| 分支 | 版本 | npm dist-tag |
-| --- | --- | --- |
-| `main` | 正式版，如 `0.5.0` | `latest` |
-| `dev` | 预发布版，如 `0.5.0-beta.1` | `beta` |
+| 分支 | 触发 | 版本 | npm dist-tag |
+| --- | --- | --- | --- |
+| `main` | 手动 | 正式版，如 `0.5.0` | `latest` |
+| `dev` | 推送自动 | 预发布版，如 `0.5.0-beta.1` | `beta` |
 
-手动发布：在 GitHub Actions 的 `pipeline` workflow 点击 **Run workflow**，选择 `dev`（或需要补发时选 `main`）：`dry_run` 默认勾选，只预览下一个版本号；取消勾选才真正发布 npm 包、打 tag 并创建 GitHub Release。安装 beta 版用 `@modesto_ma/dsh-channels@beta`。
+发布正式版：在 GitHub Actions 的 `pipeline` workflow 点击 **Run workflow** 并选择 `main`。`dry_run` 默认勾选，只预览下一个版本号；取消勾选才真正发布 npm 包、打 tag 并创建 GitHub Release。在 `dev` 上手动触发同样可用，用来预览或补发 beta。安装 beta 版用 `@modesto_ma/dsh-channels@beta`。
 
 ## 目录结构
 
