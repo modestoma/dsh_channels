@@ -474,8 +474,9 @@ export class FeishuService {
       recovery: {
         policy: () => this.config.replay,
         liveAgent: snapshot => this.recoveryAgent(snapshot),
-        replay: (agent, snapshot, message) => {
-          this.runIntoCard(agent, snapshot.cards[0]!.messageId, snapshot.triggerMessageId, snapshot.reactionId, message)
+        replay: (agent, snapshot, message, submit) => {
+          this.streamer?.attach(agent.session, snapshot.cards[0]!.messageId, snapshot.triggerMessageId, snapshot.reactionId, { message })
+          if (submit) agent.followup(message)
         },
       },
     })

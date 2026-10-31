@@ -113,10 +113,11 @@ export interface InflightRecovery {
    */
   liveAgent(snapshot: InflightSnapshot): Promise<Agent | undefined>
   /**
-   * Run `message` again as a new turn streaming into the snapshot's main card.
+   * Stream the turn running `message` into the snapshot's main card: submit it
+   * again (`submit`), or only reattach the card when the Agent still holds it.
    * The snapshot stays and is retired when that turn settles.
    */
-  replay(agent: Agent, snapshot: InflightSnapshot, message: UserMessage): void
+  replay(agent: Agent, snapshot: InflightSnapshot, message: UserMessage, submit: boolean): void
 }
 
 export interface InflightRepairDeps {
@@ -238,7 +239,8 @@ export class InflightRepair {
     for (const [key, snapshot] of due) {
       try {
         const outcome = await this.recover(snapshot)
-        if (outcome !== 'replayed') await table.delete(key)
+        // A continue click during recovery replaces the snapshot with its own.
+        if (outcome !== 'replayed' && sameTurn(table.get(key), snapshot)) await table.delete(key)
         this.deps.info('dsh-channels: turn card %s recovered (%s)', key, outcome)
       } catch (error) {
         this.deps.warn('dsh-channels: repair of turn card %s failed: %s', key, String(error))
@@ -268,16 +270,30 @@ export class InflightRepair {
     const state = snapshot.message === undefined
       ? { kind: 'interrupted' as const }
       : classifyTurn(agent.session.snapshotEvents(), snapshot.message.id)
-    // A replay streams into the main card, so that card must still be patchable.
-    if (state.kind === 'pending' && snapshot.message !== undefined && policy.pending
-      && (snapshot.replays ?? 0) < 1 && snapshot.cards[0]?.mode === 'card') {
-      await this.deps.domain()?.inflight.put(snapshot.key, { ...snapshot, replays: (snapshot.replays ?? 0) + 1, attempts: 0 })
-      recovery.replay(agent, snapshot, userMessageOf(snapshot.message))
-      return 'replayed'
-    }
     if (state.kind === 'completed') {
       await this.settleCompleted(snapshot, state.text)
       return 'completed'
+    }
+    // A borrowed Agent outlives a channel restart, inbox included: a prompt
+    // still queued there runs on its own and only needs its card back.
+    const message = snapshot.message
+    if (state.kind === 'pending' && message !== undefined && snapshot.cards[0]?.mode === 'card'
+      && [...agent.inbox.nextTurn, ...agent.inbox.nextStep].some(queued => queuedId(queued) === message.id)) {
+      recovery.replay(agent, snapshot, userMessageOf(message), false)
+      return 'replayed'
+    }
+    // A running Agent may still be working on this turn (or about to log the
+    // prompt), so neither a replay nor a continue button is safe.
+    if (agent.status === 'running') {
+      await this.settleInterrupted(snapshot, false)
+      return 'interrupted'
+    }
+    // A replay streams into the main card, so that card must still be patchable.
+    if (state.kind === 'pending' && message !== undefined && policy.pending
+      && (snapshot.replays ?? 0) < 1 && snapshot.cards[0]?.mode === 'card') {
+      await this.deps.domain()?.inflight.put(snapshot.key, { ...snapshot, replays: (snapshot.replays ?? 0) + 1, attempts: 0 })
+      recovery.replay(agent, snapshot, userMessageOf(message), true)
+      return 'replayed'
     }
     await this.settleInterrupted(snapshot, policy.interrupted === 'ask')
     return 'interrupted'
@@ -324,6 +340,19 @@ export class InflightRepair {
     }
     await channel.addReaction(trigger, 'DONE').catch(() => {})
   }
+}
+
+/** Id of a message in an Agent inbox. */
+function queuedId(message: unknown): string | undefined {
+  if (typeof message !== 'object' || message === null) return undefined
+  const id = (message as { id?: unknown }).id
+  return typeof id === 'string' ? id : undefined
+}
+
+/** Whether the stored snapshot still describes the recovered turn. */
+function sameTurn(current: InflightSnapshot | undefined, recovered: InflightSnapshot): boolean {
+  return current !== undefined && current.startedAt === recovered.startedAt
+    && current.message?.id === recovered.message?.id
 }
 
 /** Rebuild the prompt stored in a snapshot. */
