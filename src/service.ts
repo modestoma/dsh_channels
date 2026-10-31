@@ -51,7 +51,7 @@ import type { EffortCommandAction, ParsedSlashCommand } from './commands.ts'
 import { commandSpec } from './commands/registry.ts'
 import type { ChannelCommandSpec } from './commands/registry.ts'
 import type { PermissionPresets, SessionQuery } from './dsh-types.ts'
-import { FEISHU_USER_ID_PATTERN, feishuDomain, sessionDirOf } from './domain.ts'
+import { FEISHU_USER_ID_PATTERN, feishuDomain, PROCESSED_RETENTION_MS, sessionDirOf } from './domain.ts'
 import type {
   AccessGroupRecord, AccessRequestRecord, AccessUserRecord,
   ExpiredRouteRecord, FeishuDomainGlobal, FeishuDomainHandle, InflightSnapshot,
@@ -78,6 +78,7 @@ import {
 import type { MessageReadRoute, RawMessageItem } from './feishu/message-read.ts'
 import type { AttachmentStore } from './host/attachments.ts'
 import { feishuUserMessage, InboundRouter } from './routing/inbound.ts'
+import { MissedMessages } from './routing/missed.ts'
 import type { RequestPolicyController } from './session/request-policy.ts'
 import type { CardActionEvent, ChannelFactory, FeishuChannel, NormalizedMessage } from './feishu-channel.ts'
 import { AppOwnerLookupError, FeishuApiError } from './feishu-channel.ts'
@@ -113,9 +114,6 @@ import type { OverlayPatch, OverlayStore } from './settings/overlay.ts'
  *  dead records; TTL semantics make 6 h granularity more than sufficient). */
 const GC_SWEEP_INTERVAL_MS = 6 * 60 * 60 * 1000
 
-/** Dedup-record retention: Feishu redelivery windows are minutes-scale, so a
- *  day is 100×+ headroom while keeping the table bounded. */
-const PROCESSED_RETENTION_MS = 24 * 60 * 60 * 1000
 /** Upper bound on the boot-time app-owner lookup before the connection opens. */
 const APP_OWNER_LOOKUP_TIMEOUT_MS = 10_000
 /** Upper bound on the post-connect scope grant query. */
@@ -339,6 +337,7 @@ export class FeishuService {
   private readonly routes: RouteStore
   /** In-flight turn snapshots + startup repair. */
   private readonly repair: InflightRepair
+  private readonly missed: MissedMessages
   /** Outbound card delivery + reaction lifecycle. */
   private readonly delivery: CardDelivery
   /** Inbound attachment archival (Feishu resources → workspace files). */
@@ -432,6 +431,7 @@ export class FeishuService {
   /** Administrator DM authorization cards + bot-added group info cards. */
   private accessRequests: AccessRequests | undefined
   private unlistenBotAdded: (() => void) | undefined
+  private unlistenConnection: (() => void) | undefined
   /**
    * App owner resolved at `start()`; the administrator whenever `adminUserId`
    * is unset. Cleared on shutdown so a reconnect looks it up again.
@@ -479,6 +479,20 @@ export class FeishuService {
           if (submit) agent.followup(message)
         },
       },
+    })
+    this.missed = new MissedMessages({
+      config: () => this.config.missed,
+      domain: () => this.domain,
+      channel: () => this.channel,
+      routes: () => this.routes.records(),
+      groupChats: () => this.accessStore.groupRecords().map(group => group.chatId),
+      handle: async message => {
+        const channel = this.channel
+        if (channel !== undefined) await this.dispatchInbound(channel, message)
+      },
+      isAdmin: userId => this.accessController.isAdmin(userId),
+      info: (message, ...args) => this.ctx.logger?.info?.(message, ...args),
+      warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
     })
     this.sessions = new SessionManager({
       ctx: this.ctx,
@@ -1796,6 +1810,7 @@ export class FeishuService {
       answerer.onCardAction(event)
       questions.onCardAction(event)
       this.wikiConsent.onCardAction(event)
+      this.missed.onCardAction(event)
       this.onStopAction(event)
       this.onSteerAction(event)
       void this.onResumeAction(event).catch((error: unknown) => {
@@ -1820,13 +1835,11 @@ export class FeishuService {
       this.streamer?.onInboxClaimed(agent.session, message, turn)
     }))
     this.unlisten = channel.onMessage(message => {
-      void this.inbound.handle(message).catch((error: unknown) => {
-        this.ctx.logger?.warn?.('dsh-channels inbound error: %s', String(error))
-        // User-facing safety net: never leave the user without a reply.
-        void channel
-          .send(message.chatId, { text: `dsh-channels 处理失败：${String(error)}` }, { replyTo: message.messageId })
-          .catch(() => {})
-      })
+      void this.dispatchInbound(channel, message)
+    })
+    this.unlistenConnection = channel.onConnectionChange?.(change => {
+      if (change === 'reconnecting') this.missed.onReconnecting()
+      else this.missed.onReconnected()
     })
     // Without a configured administrator, resolve the owner before the
     // handshake so the first inbound message already sees the fallback; with
@@ -1840,6 +1853,8 @@ export class FeishuService {
     // Before admission opens, so every `running` record left is a previous instance's.
     await this.topicLauncher.markInterrupted()
     this.topicLauncher.open()
+    // Read back what arrived while no instance was connected (background).
+    this.missed.start()
     // Repair cards a previous instance left mid-flight (best-effort, background).
     void this.repair.repairAll().catch((error: unknown) => {
       this.ctx.logger?.warn?.('dsh-channels: inflight repair failed: %s', String(error))
@@ -1897,8 +1912,23 @@ export class FeishuService {
     )
   }
 
+  /** Run one inbound message; a failure is logged and answered in the chat. */
+  private async dispatchInbound(channel: FeishuChannel, message: NormalizedMessage): Promise<void> {
+    try {
+      await this.inbound.handle(message)
+    } catch (error) {
+      this.ctx.logger?.warn?.('dsh-channels inbound error: %s', String(error))
+      // User-facing safety net: never leave the user without a reply.
+      await channel
+        .send(message.chatId, { text: `dsh-channels 处理失败：${String(error)}` }, { replyTo: message.messageId })
+        .catch(() => {})
+    }
+  }
+
   /** Tear down: close the connection and dispose all live agents. */
   async shutdown(): Promise<void> {
+    // While admission is still open, so a running catch-up finishes its messages.
+    await this.missed.stop()
     // Close admission first. In-flight Host commands receive cancellation
     // before their Agent/channel/storage dependencies are disposed, while
     // already queued route operations observe `started === false` and retire.
@@ -1915,6 +1945,8 @@ export class FeishuService {
     this.unlistenCardAction = undefined
     this.unlistenBotAdded?.()
     this.unlistenBotAdded = undefined
+    this.unlistenConnection?.()
+    this.unlistenConnection = undefined
     this.accessRequests?.clear()
     this.accessRequests = undefined
     this.accessController.clear()

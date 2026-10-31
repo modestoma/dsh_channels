@@ -8,7 +8,9 @@
  * @module dsh-channels/feishu-channel
  */
 
-import { createLarkChannel, LoggerLevel } from '@larksuiteoapi/node-sdk'
+import { createLarkChannel, LoggerLevel, normalize } from '@larksuiteoapi/node-sdk'
+import { historyMessages, listHistoryIds } from './feishu/history-events.ts'
+import type { HistoryContainer, HistoryEventOps, HistoryReadError } from './feishu/history-events.ts'
 import { SCOPE_GRANTED_STATUS } from './feishu/scopes.ts'
 import type { ScopeGrant } from './feishu/scopes.ts'
 import type { RemoteSlashCommand, SlashCommandApi, SlashCommandEntry } from './feishu/slash-commands.ts'
@@ -172,6 +174,27 @@ export interface FeishuChannel {
   messageMget?(messageIds: readonly string[]): Promise<unknown>
   /** P0 probe surface: raw `im.v1.message.list` (thread / chat history). */
   messageList?(params: RawMessageListParams): Promise<unknown>
+  /**
+   * Ids of the user messages created at or after `sinceMs` in one chat or
+   * topic, oldest first, at most `limit` (`truncated`: more were left).
+   * Rejects with a {@link HistoryReadError} when Feishu refuses the read.
+   * Optional so stubs can omit it; absence disables missed-message catch-up.
+   */
+  historyIds?(container: HistoryContainer, sinceMs: number, limit: number): Promise<{
+    ids: Array<{ messageId: string; createTime: number }>
+    truncated: boolean
+  }>
+  /**
+   * The given messages as the normalized events live delivery hands to
+   * `onMessage` handlers, in the given order; messages live delivery would
+   * drop are left out. Rejects like {@link historyIds}.
+   */
+  historyMessages?(messageIds: readonly string[], chatType: 'p2p' | 'group'): Promise<NormalizedMessage[]>
+  /**
+   * Bound handler for long-connection loss (`reconnecting`) and recovery
+   * (`reconnected`). Optional so stubs can omit it.
+   */
+  onConnectionChange?(handler: (change: 'reconnecting' | 'reconnected') => void): () => void
 }
 
 /** Query for the raw `im.v1.message.list` endpoint. */
@@ -638,7 +661,52 @@ class LarkChannelAdapter implements FeishuChannel {
     return await message.get({ path: { message_id: messageId }, params: { user_id_type: 'user_id' } })
   }
 
+  async historyIds(container: HistoryContainer, sinceMs: number, limit: number): Promise<{
+    ids: Array<{ messageId: string; createTime: number }>
+    truncated: boolean
+  }> {
+    return await listHistoryIds(this.historyOps(), container, sinceMs, limit)
+  }
+
+  async historyMessages(messageIds: readonly string[], chatType: 'p2p' | 'group'): Promise<NormalizedMessage[]> {
+    return await historyMessages(this.historyOps(), messageIds, chatType)
+  }
+
+  onConnectionChange(handler: (change: 'reconnecting' | 'reconnected') => void): () => void {
+    const offLost = this.channel.on('reconnecting', () => { handler('reconnecting') })
+    const offBack = this.channel.on('reconnected', () => { handler('reconnected') })
+    return () => {
+      offLost()
+      offBack()
+    }
+  }
+
+  private historyOps(): HistoryEventOps {
+    const client = this.channel.rawClient
+    const botIdentity = this.channel.botIdentity
+    if (botIdentity === undefined) throw new Error('dsh-channels: history read before connect')
+    return {
+      list: async params => await client.im.v1.message.list({ params }),
+      mget: async (messageIds, idType) => await this.rawMget(messageIds, idType),
+      // Same options as the SDK's live pipeline.
+      normalize: async event => await normalize(event, {
+        botIdentity,
+        stripBotMentions: true,
+        includeRaw: true,
+        fetchSubMessages: async messageId => {
+          const response = await client.im.v1.message.get({ path: { message_id: messageId } })
+          // The SDK types child mentions as event mentions; the converter reads none of them.
+          return (response.data?.items ?? []).map(({ mentions: _mentions, ...item }) => item)
+        },
+      }),
+    }
+  }
+
   async messageMget(messageIds: readonly string[]): Promise<unknown> {
+    return await this.rawMget(messageIds, 'user_id')
+  }
+
+  private async rawMget(messageIds: readonly string[], idType: 'open_id' | 'user_id'): Promise<unknown> {
     // SDK 1.76 has no typed `im.v1.message.mget`; the endpoint is
     // `GET /open-apis/im/v1/messages/mget` with *repeated* `message_ids`
     // query params (comma-separated ids are rejected by Feishu with 99992354).
@@ -655,7 +723,7 @@ class LarkChannelAdapter implements FeishuChannel {
     }
     return await client.request({
       method: 'GET',
-      url: `/open-apis/im/v1/messages/mget?${query}&card_msg_content_type=raw_card_content&user_id_type=user_id`,
+      url: `/open-apis/im/v1/messages/mget?${query}&card_msg_content_type=raw_card_content&user_id_type=${idType}`,
     })
   }
 
