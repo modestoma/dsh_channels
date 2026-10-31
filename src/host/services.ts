@@ -187,6 +187,8 @@ export interface SessionTitleSnapshot {
 export interface SessionTitleObservation {
   /** Absent when the observed log has no title event. */
   title?: SessionTitleSnapshot
+  /** Header of the observed Session; `cwd` is its workspace root. */
+  session?: { cwd?: string }
 }
 
 /** One ordered result from a batch title observation. */

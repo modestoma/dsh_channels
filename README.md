@@ -81,6 +81,7 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 | --- | --- |
 | 连接 | 状态块（当前阶段唯一的操作按钮：连接 / 重试 / 重启连接，连接后显示话题路由 / 活动会话 / 在途回复 / Bot open_id 尾号）、自检（权限缺口可展开逐项开通、斜杠指令面板同步结果）、飞书应用凭据（更换 / 移除）；未配置时显示三步引导，有需重连才生效的已保存项时顶部显示「重启连接」横幅 |
 | 会话 | 「触发」：私聊、普通群需要 @、话题被拒时降级为会话级（均为开关）；「工作区」：工作区根目录、话题工作目录隔离方式（`topicIsolation`）；「话题与卡片」：话题过期（`routeTtlMs`，按天）、审批 / 提问卡片等待（`approvalTimeoutMs` / `questionTimeoutMs`，按秒）、流式刷新与状态行保活间隔；「飞书侧功能」：首次私聊引导、斜杠指令面板同步、权限切换 |
+| 会话记录 | 飞书发起的全部会话：群聊按「群 → 用户 → 会话」、私聊按「用户 → 会话」分组，显示飞书群名、姓名和头像；会话行显示标题、开始 / 最近活跃时间，「打开」在主区进入该对话；用户行的「工作区文件」只读浏览该用户的工作区（见下文「会话记录」） |
 | 模型 | 服务商、模型、推理档位、单次输出上限（`maxTokens`，留空使用模型默认）、Agent 预设 |
 | 附件与工具 | 「入站附件」：接收图片和文件、使用 DSH 原生附件库（开关，关闭则存到话题目录 `attachments/`）、图片预取、首轮话题历史；「工具」：`feishu_attachment_fetch` / `feishu_topic_messages` / `feishu_send_file` 开关；「限额与超时」：预取上限、读取附件上限与超时、读取话题消息超时、引用摘录与历史超时（共 8 项，默认收起，有改动或错误时自动展开） |
 | 访问授权 | 待处理申请（置顶，一键授权 / 忽略）、调试模式（`accessMode`，开关）、白名单用户可私聊（`dmAllowWhitelist`，开关）、管理员 user_id、申请有效期；已授权群 / 用户白名单（添加表单默认收起） |
@@ -113,11 +114,13 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 
 **访问授权**：「访问授权」标签页集中管理准入：管理员 user_id（私聊 `/userid` 获取）、调试模式、白名单用户可私聊、授权申请有效期；「已授权群」「已授权用户」列表支持增删（群 ID 可从入群群信息卡或 `/groupid` 获得，用户 user_id 可用 `/userid` 查看）；「待处理申请」可一键授权/忽略。白名单只约束非管理员：管理员在任何私聊/群聊都直接放行。管理员留空时自动使用飞书应用所有者（连接时通过「获取应用信息」接口查询），管理员设置下方的「当前管理员」一行会注明“应用所有者”；`guarded` 且既未配置管理员、也查不到应用所有者时，标签页顶部会红字提示“当前会拒绝所有对话”并附上查询失败原因。管理员、群和用户白名单、待处理申请、知识库白名单在每次进入页面时实时读取飞书头像和名字（`GET /api/dsh-channels.profiles?users=…&chats=…`，每类最多 200 个，Host 侧缓存 30 秒）：用户需要 `contact:user.base:readonly` 且在应用的通讯录权限范围内，群需要 `im:chat:readonly`；读不到时显示授权时记下的名字或 ID，并在标签页顶部注明失败原因。授权白名单与申请记录保存在插件 `storageDomain`（`channels_routes_v2` 域），重启后保留；未建立飞书连接时白名单尚未加载，标签页会提示「连接建立后加载授权列表」并禁用写操作。
 
+**会话记录**：「会话记录」标签页列出插件记录过来源的全部会话（存储表 `session_origins`，包括已 `/renew` 或过期的旧会话），群聊下再按发起用户分组，每一层按最近活跃排序。群名、姓名与头像和「飞书来源」使用同一套实时查询与 30 秒缓存，读不到时显示 ID 并在顶部注明原因。会话标题与工作区根目录来自宿主 `sessionQuery`（会话日志的标题和 header cwd），宿主没有该服务时标题留空、工作区退回到当前路由记录的目录。「当前」标记表示飞书里的这个话题仍然接着该会话。「打开」通过 Web 壳的 `uiWorkspace.openSession` 在主区打开对话，壳不提供该服务时按钮禁用。「工作区文件」进入只读文件浏览：面包屑导航、目录优先排序（单个目录最多列 2000 项），点文件在下方预览（UTF-8 文本最多 512 KB，png/jpg/gif/webp/bmp/svg 图片最多 5 MB 内联显示，其余只提供下载），下载单个文件上限 100 MB。文件路由只服务飞书会话的工作区根目录，路径必须是根目录内的相对路径，跟随符号链接后仍要落在根目录内，否则返回 403；接口为 `GET /api/dsh-channels.sessionRecords`、`/api/dsh-channels.workspaceFiles`、`/api/dsh-channels.workspaceFilePreview`、`/api/dsh-channels.workspaceFileDownload`（`?workspace=<根目录>&path=<相对路径>`），与其它面板路由一样需要 DSH 登录。
+
 **配置层级**：`configSchema` 默认值 < profile `cordis.patch.yml` 的 `config` < Web 面板覆盖。面板只把可编辑字段写入 `$DSH_HOME/dsh-channels/settings.json`；「高级 → 恢复 profile 配置」确认后删除该文件并回落到 profile 配置。`baseDir` 与 `topicIsolation` 在「会话 → 工作区」编辑（只影响之后新建的话题）；话题过期、审批 / 提问卡片等待与 `maxTokens` 保存后立即生效，不需要重连。凭据**值**在「连接 → 飞书应用凭据」编辑，凭据**引用名**（`appId` / `appSecret` 配置项）仍由 profile 配置决定。已移除的目录清理配置 `workspaceRetention` / `workspaceRetentionAuto` 与覆盖文件路径配置 `settingsFile` 若仍留在 profile 或覆盖文件中会被静默忽略，面板下次保存时从覆盖文件中去掉。
 
 **为什么落在插件自己的文件而不是 profile 的 `cordis.patch.yml`？** DSH 提供官方 `ctx.configEditor.edit()`，可以安全写 profile patch（完整 Config 校验、保留注释与 `!!js`、原子替换、失败回滚、与 HMR 串行）；但它是「完整配置编辑」通道——本插件的 Config 是 zod，没有 schemastery `.volatile()` 标记，普通字段写入会触发 Loader 重载插件，等于每次保存都断开并重连飞书；而且该服务只在有 `profileContext` 的启动器（桌面端 / `dsh web`）存在。`$DSH_HOME/<plugin>/` 是 DSH 插件保存运行时数据的惯例（如 dsh-pet 的 `$DSH_HOME/dsh-pet/`），因此面板偏好写入 `$DSH_HOME/dsh-channels/settings.json`：保存即生效（需重连字段除外）、可一键清除回退、不依赖 `profileContext`；profile 的 `cordis.patch.yml` 继续作为部署级基础配置层。若将来要求「所有配置统一进 profile」，迁移路径是改用 `ctx.configEditor.edit()` 并接受保存触发插件重载。
 
-**安全边界**：面板路由都通过宿主 `connection.fetch` 注册为 DSH `/api` 下的精确路由 `/api/dsh-channels.<方法>`（读用 GET，写一律 POST），由 DSH 的 `/api` 统一做 Host/Origin 校验和登录 cookie 鉴权：未登录返回 401，Host/Origin 不受信任返回 403，只有通过的请求才会到达插件；宿主没有 `connection` 服务时面板路由不挂载。浏览器按相对路径请求（DSH 页面带 `<base href="./">`），DSH 挂在反向代理前缀下（如 `/dsh/`）时请求自动带上前缀。**授权白名单与待处理申请同样面板可写，因此“已登录 DSH Web = 可授权”**；非回环绑定时登录 cookie 走明文 HTTP，建议给 DSH Web 服务配置 TLS。凭据值只走写路径、响应永不回显，也不会写进 Web 覆盖文件。`baseDir` 可写意味着同源页面能改变模型文件的落点（面板已拒绝文件系统根目录）。
+**安全边界**：面板路由都通过宿主 `connection.fetch` 注册为 DSH `/api` 下的精确路由 `/api/dsh-channels.<方法>`（读用 GET，写一律 POST），由 DSH 的 `/api` 统一做 Host/Origin 校验和登录 cookie 鉴权：未登录返回 401，Host/Origin 不受信任返回 403，只有通过的请求才会到达插件；宿主没有 `connection` 服务时面板路由不挂载。浏览器按相对路径请求（DSH 页面带 `<base href="./">`），DSH 挂在反向代理前缀下（如 `/dsh/`）时请求自动带上前缀。**授权白名单与待处理申请同样面板可写，因此“已登录 DSH Web = 可授权”**；非回环绑定时登录 cookie 走明文 HTTP，建议给 DSH Web 服务配置 TLS。凭据值只走写路径、响应永不回显，也不会写进 Web 覆盖文件。`baseDir` 可写意味着同源页面能改变模型文件的落点（面板已拒绝文件系统根目录）。「会话记录」的文件路由只读，同样意味着“已登录 DSH Web = 可读取飞书会话工作区里的文件”。
 
 **构建**：DSH 只加载已构建的浏览器 bundle，改了 `src/client/` 或 `src/settings/contract.ts` 后需要重新构建并重启应用：
 
@@ -209,15 +212,17 @@ src/
 ├── session-export.ts      # 逻辑日志导出
 ├── feishu-channel.ts      # 官方 SDK Channel 适配（可注入 stub）
 ├── client/                # 浏览器半区：左侧栏「飞书渠道」主区页面（构建到 lib/client.js）
-│   ├── index.ts           #   client 插件入口：sidebar.panellist + main 注册、飞书来源（右侧栏标签 + 会话头部入口）+ 样式
+│   ├── index.ts           #   client 插件入口：sidebar.panellist + main 注册、飞书来源（右侧栏标签 + 会话头部入口）、会话导航 + 样式
 │   ├── origin.tsx         #   对话里的飞书来源：会话头部按钮与右侧栏标签页
 │   ├── origin-cache.ts    #   按会话缓存的来源查询
-│   ├── panel/             #   页面外壳 + 七个标签页
+│   ├── navigation.ts      #   保存壳的 uiWorkspace 服务，供「会话记录」打开会话
+│   ├── panel/             #   页面外壳 + 八个标签页
 │   │   ├── index.tsx      #     加载 / 5s 状态轮询 / 全局草稿 / catalog 级联 / 顶部状态头 / Tab
 │   │   ├── shared.tsx     #     行 / 开关 / 分组 / 保存栏等渲染原语、阶段徽标、草稿校验
 │   │   ├── connection-tab.tsx #   连接：三步引导 / 状态块 / 自检 / 待生效提醒 / 凭据
 │   │   ├── credentials-card.tsx  #  凭据行：更换 / 移除（不回显）
 │   │   ├── fields-tab.tsx #     会话 / 模型 / 附件与工具：纯字段分组页
+│   │   ├── records-tab.tsx #    会话记录：群 → 用户 → 会话分组、工作区文件浏览与预览
 │   │   ├── access-tab.tsx / wiki-tab.tsx / advanced-tab.tsx
 │   │   └── whitelist.tsx  #     白名单与待处理申请列表
 │   ├── number-field.ts    #   数值字段显示单位换算、上下界校验、字节读数
@@ -231,6 +236,7 @@ src/
 │   ├── directory-picker.ts #  系统目录选择框适配（ctx.directoryPicker native 后端）
 │   ├── surface.ts         #   状态 / 面板视图模型 + 保存 / 清除 / 重连 / 选目录
 │   └── routes.ts          #   HTTP 路由 + DSH 登录鉴权 + 同源写保护
+├── workspace-files.ts     # 「会话记录」的只读工作区文件访问：路径约束、目录列表、预览、下载
 └── workspaces.ts          # 用户工作区 / 话题目录 / 旧版 _staging 路径解析
 ```
 

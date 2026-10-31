@@ -26,7 +26,11 @@ import {
   SAVE_CONFIG_ROUTE,
   SAVE_CREDENTIALS_ROUTE,
   SESSION_ORIGIN_ROUTE,
+  SESSION_RECORDS_ROUTE,
   STATUS_ROUTE,
+  WORKSPACE_FILE_DOWNLOAD_ROUTE,
+  WORKSPACE_FILE_PREVIEW_ROUTE,
+  WORKSPACE_FILES_ROUTE,
 } from '../settings/contract.ts'
 import type {
   AccessMutationResponse,
@@ -45,6 +49,9 @@ import type {
   SaveCredentialsRequest,
   SaveCredentialsResponse,
   SessionOriginResponse,
+  SessionRecordsWire,
+  WorkspaceListingWire,
+  WorkspacePreviewWire,
 } from '../settings/contract.ts'
 
 function messageOf(error: unknown): string {
@@ -101,6 +108,49 @@ export async function fetchStatus(): Promise<ChannelStatusWire> {
 export async function fetchSessionOrigin(sessionId: string): Promise<SessionOriginResponse> {
   const query = new URLSearchParams({ sessionId }).toString()
   return readJson<SessionOriginResponse>(await request(`${SESSION_ORIGIN_ROUTE}?${query}`))
+}
+
+/** Every Feishu-routed Session, grouped by group chat → user and private-chat user. */
+export async function fetchSessionRecords(): Promise<SessionRecordsWire> {
+  return readJson<SessionRecordsWire>(await request(SESSION_RECORDS_ROUTE))
+}
+
+function workspaceQuery(workspace: string, path: string): string {
+  return new URLSearchParams({ workspace, path }).toString()
+}
+
+/**
+ * One directory of a Feishu workspace.
+ * @param workspace - workspace root as the records listed it.
+ * @param path - directory relative to the root (`''` = root).
+ * @returns the listing, directories first.
+ */
+export async function fetchWorkspaceFiles(workspace: string, path: string): Promise<WorkspaceListingWire> {
+  return readJson<WorkspaceListingWire>(await request(`${WORKSPACE_FILES_ROUTE}?${workspaceQuery(workspace, path)}`))
+}
+
+/**
+ * Preview of one workspace file: text excerpt, inline image, or binary facts.
+ * @param workspace - workspace root as the records listed it.
+ * @param path - file relative to the root.
+ * @returns the preview.
+ */
+export async function fetchWorkspaceFilePreview(workspace: string, path: string): Promise<WorkspacePreviewWire> {
+  return readJson<WorkspacePreviewWire>(await request(`${WORKSPACE_FILE_PREVIEW_ROUTE}?${workspaceQuery(workspace, path)}`))
+}
+
+/**
+ * Bytes of one workspace file, read through the authenticated route.
+ * @param workspace - workspace root as the records listed it.
+ * @param path - file relative to the root.
+ * @returns the file contents.
+ */
+export async function fetchWorkspaceFileBlob(workspace: string, path: string): Promise<Blob> {
+  const response = await request(`${WORKSPACE_FILE_DOWNLOAD_ROUTE}?${workspaceQuery(workspace, path)}`, {
+    headers: { accept: 'application/octet-stream' },
+  })
+  if (!response.ok) throw new Error(errorFromBody(response.status, await response.text()))
+  return response.blob()
 }
 
 /**

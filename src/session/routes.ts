@@ -81,6 +81,17 @@ export class RouteStore {
     await this.recordOrigins(normalized)
   }
 
+  /** Every recorded Session origin, retired routes included. */
+  origins(): SessionOriginRecord[] {
+    const table = this.deps.domain()?.sessionOrigins
+    return table === undefined ? [] : [...table.entries()].map(([, record]) => record)
+  }
+
+  /** Active route records (cache view). */
+  records(): IterableIterator<RouteRecord> {
+    return this.active.values()
+  }
+
   /** Feishu origin of one Session any route ever named, retired routes included. */
   origin(sessionId: string): SessionOriginRecord | undefined {
     return this.deps.domain()?.sessionOrigins.get(sessionId)

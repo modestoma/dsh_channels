@@ -13,6 +13,8 @@
 import { PANEL_COPY } from '../settings/contract.ts'
 import { FeishuChannelsIcon } from './icon.tsx'
 import { ORIGIN_TAB_ID, ORIGIN_TAB_KIND, ORIGIN_TAB_TITLE, OriginHeaderAction, OriginTab } from './origin.tsx'
+import { setSessionNavigator } from './navigation.ts'
+import type { SessionNavigator } from './navigation.ts'
 import { FeishuChannelsPage } from './panel/index.tsx'
 import { installStyles } from './styles.ts'
 
@@ -42,11 +44,16 @@ export interface SidebarRightScope extends ClientContext {
   sidebarRight: { openTab(kind: string): void }
 }
 
+/** Shell Session navigation the records tab opens Sessions through. */
+export interface WorkspaceNavigationScope extends ClientContext {
+  uiWorkspace: SessionNavigator
+}
+
 export interface ClientContext {
   slots: ClientSlots
   effect?(callback: () => void | (() => void), label?: string): void
   /** Run `callback` in a child scope while every named service is available. */
-  inject?(deps: string[], callback: (scope: SidebarRightScope) => void): void
+  inject?(deps: string[], callback: (scope: SidebarRightScope & WorkspaceNavigationScope) => void): void
 }
 
 /** Cordis client plugin name. */
@@ -87,6 +94,22 @@ export function apply(ctx: ClientContext): void {
     label: () => PANEL_COPY.title,
   }, FeishuChannelsIcon))
   ctx.inject?.(['sidebarRightTabs', 'sidebarRight'], mountOrigin)
+  ctx.inject?.(['uiWorkspace'], mountNavigation)
+}
+
+/**
+ * Expose the shell's Session navigation to the records tab while the
+ * `uiWorkspace` service lives.
+ * @param scope - child context holding `uiWorkspace`.
+ */
+export function mountNavigation(scope: WorkspaceNavigationScope): void {
+  const navigator = scope.uiWorkspace
+  const publish = (): (() => void) => {
+    setSessionNavigator({ openSession: sessionId => navigator.openSession(sessionId) })
+    return () => { setSessionNavigator(undefined) }
+  }
+  if (typeof scope.effect === 'function') scope.effect(publish, 'dsh-channels: session navigation')
+  else publish()
 }
 
 /**

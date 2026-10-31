@@ -67,6 +67,7 @@ import type {
   LoadState,
   Notice,
 } from './shared.tsx'
+import { RecordsTab } from './records-tab.tsx'
 import { WikiTab } from './wiki-tab.tsx'
 
 /**
@@ -737,6 +738,7 @@ function FeishuChannelsPanel(): JSX.Element | null {
             )
           : null}
         {activeTab === 'sessions' ? <FieldsTab form={form} tab="sessions" /> : null}
+        {activeTab === 'records' ? <RecordsTab /> : null}
         {activeTab === 'model'
           ? <FieldsTab form={form} tab="model" note={catalogBusy ? PANEL_COPY.catalogLoading : undefined} />
           : null}

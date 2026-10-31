@@ -56,6 +56,7 @@ const effects = []
 const tabTypes = []
 const opened = []
 const scopeDeps = []
+const openedSessions = []
 const fakeSlots = {
   inject: (slot, contribution) => { contribution() },
   register: (declaration, component) => {
@@ -73,6 +74,7 @@ plugin.apply({
       slots: fakeSlots,
       sidebarRightTabs: { register: definition => { tabTypes.push(definition); return () => {} } },
       sidebarRight: { openTab: kind => { opened.push(kind) } },
+      uiWorkspace: { openSession: sessionId => { openedSessions.push(sessionId) } },
     })
   },
 })
@@ -89,11 +91,13 @@ assert.equal(entry.declaration.id, 'feishu-channels', 'sidebar row id must addre
 assert.equal(entry.declaration.label(), '飞书渠道')
 for (const { component } of registrations) assert.equal(typeof component, 'function')
 
-assert.deepEqual(scopeDeps, [['sidebarRightTabs', 'sidebarRight']])
+assert.deepEqual(scopeDeps, [['sidebarRightTabs', 'sidebarRight'], ['uiWorkspace']])
 assert.equal(tabTypes.length, 1, 'origin tab type was not registered')
 assert.equal(originTab.declaration.key, tabTypes[0].id, 'tab body must be keyed by the tab type id')
 assert.equal(tabTypes[0].title(''), '飞书来源')
 originAction.declaration.inject('s_1').openOrigin()
 assert.deepEqual(opened, [tabTypes[0].kind], 'header entry must open the origin tab kind')
 
-console.log('OK: lib/client.js loads through the module-loader shim and registers the 飞书渠道 sidebar entry, page, and origin tab')
+assert.ok(effects.some(dispose => typeof dispose === 'function'), 'session navigation must be published as a disposable effect')
+
+console.log('OK: lib/client.js loads through the module-loader shim and registers the 飞书渠道 sidebar entry, page, origin tab, and session navigation')

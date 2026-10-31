@@ -98,9 +98,11 @@ import type { ProjectedStats, StreamerHooks } from './streamer.ts'
 import type { FeishuConfig } from './config.ts'
 import type {
   AccessMutationResponse, AccessRequestWire, AccessUserWire, AccessWire, CredentialField, FeishuProfilesWire, FeishuProfileWire,
-  ScopeCheckWire, SessionOriginWire,
-  SlashCommandSyncWire,
+  ScopeCheckWire, SessionOriginWire, SessionRecordGroupWire, SessionRecordsWire, SessionRecordUserWire, SessionRecordWire,
+  SlashCommandSyncWire, WorkspaceListingWire, WorkspacePreviewWire,
 } from './settings/contract.ts'
+import { listWorkspaceDirectory, previewWorkspaceFile, readWorkspaceFile, WorkspaceFileError } from './workspace-files.ts'
+import type { WorkspaceDownload } from './workspace-files.ts'
 import { checkScopes } from './feishu/scopes.ts'
 import { desiredSlashCommands, syncSlashCommands } from './feishu/slash-commands.ts'
 import { mergeOverlay, resolveDshHome } from './settings/overlay.ts'
@@ -231,6 +233,7 @@ async function openFeishuDomain(ctx: HostContext): Promise<FeishuDomainHandle> {
     sessionOrigins: {
       get: key => sessionOriginsRaw.get(key) as SessionOriginRecord | undefined,
       put: (key, value) => sessionOriginsRaw.put(key, value),
+      entries: () => sessionOriginsRaw.entries() as IterableIterator<[string, SessionOriginRecord]>,
     },
     getGlobal: () => (domain.global.get() ?? {}) as FeishuDomainGlobal,
     setGlobal: value => domain.global.set(value),
@@ -418,6 +421,8 @@ export class FeishuService {
   private approvalAnswerer: ApprovalAnswerer | undefined
   /** Interrupted cards whose continue button already started a turn. */
   private readonly resumedCards = new Set<string>()
+  /** Workspace roots of Feishu-routed Sessions seen by the last records read; file routes serve only these and active routes' roots. */
+  private recordWorkspaces = new Set<string>()
   /** HITL structured-question answerer (`ask_user_question`). */
   private questionAnswerer: QuestionAnswerer | undefined
   /** Disposers for the host approval waterfall listener + card actions. */
@@ -1315,6 +1320,144 @@ export class FeishuService {
       ...(bound ? { lastActivityAt: route.lastActivityAt } : {}),
       chatLink: `https://applink.feishu.cn/client/chat/open?openChatId=${encodeURIComponent(origin.chatId)}`,
     }
+  }
+
+  /**
+   * Panel: every Feishu-routed Session, grouped by group chat → user and by
+   * private-chat user, with live names, log-backed titles and workspace roots.
+   * Titles and roots come from `sessionQuery`; without it, roots fall back to
+   * the active route's workspace and titles are absent.
+   * @returns the grouped records, most recently active first at every level.
+   */
+  async sessionRecords(): Promise<SessionRecordsWire> {
+    const origins = this.routes.origins()
+    const sessions = await this.sessionRecordFacts(origins)
+    const userIds = new Set<string>()
+    const chatIds = new Set<string>()
+    for (const origin of origins) {
+      userIds.add(origin.senderUserId)
+      if (origin.chatType === 'group') chatIds.add(origin.chatId)
+    }
+    const profiles = await this.feishuProfiles([...userIds], [...chatIds])
+    const activity = (record: SessionRecordWire): number => record.lastActivityAt ?? record.createdAt
+    const byActivity = (a: SessionRecordWire, b: SessionRecordWire): number => activity(b) - activity(a)
+    const latest = (user: SessionRecordUserWire): number => activity(user.sessions[0]!)
+    const groupMembers = new Map<string, Map<string, SessionRecordWire[]>>()
+    const directMembers = new Map<string, SessionRecordWire[]>()
+    origins.forEach((origin, index) => {
+      const record = sessions[index]!
+      if (origin.chatType === 'group') {
+        const members = groupMembers.get(origin.chatId) ?? new Map<string, SessionRecordWire[]>()
+        groupMembers.set(origin.chatId, members)
+        members.set(origin.senderUserId, [...(members.get(origin.senderUserId) ?? []), record])
+      } else {
+        directMembers.set(origin.senderUserId, [...(directMembers.get(origin.senderUserId) ?? []), record])
+      }
+    })
+    const userEntry = async (userId: string, records: SessionRecordWire[], chatId?: string): Promise<SessionRecordUserWire> => {
+      records.sort(byActivity)
+      const profile = profiles.users[userId] ?? {}
+      const name = profile.name ?? (chatId === undefined ? undefined : await this.memberName(userId, chatId))
+      const workspaces = [...new Set(records.flatMap(record => (record.workspace === undefined ? [] : [record.workspace])))]
+      return {
+        userId,
+        ...(name === undefined ? {} : { name }),
+        ...(profile.avatarUrl === undefined ? {} : { avatarUrl: profile.avatarUrl }),
+        workspaces,
+        sessions: records,
+      }
+    }
+    const groups = await Promise.all([...groupMembers].map(async ([chatId, members]): Promise<SessionRecordGroupWire> => {
+      const users = await Promise.all([...members].map(([userId, records]) => userEntry(userId, records, chatId)))
+      users.sort((a, b) => latest(b) - latest(a))
+      const chat = profiles.chats[chatId] ?? {}
+      return {
+        chatId,
+        ...(chat.name === undefined ? {} : { chatName: chat.name }),
+        ...(chat.avatarUrl === undefined ? {} : { chatAvatarUrl: chat.avatarUrl }),
+        users,
+      }
+    }))
+    groups.sort((a, b) => latest(b.users[0]!) - latest(a.users[0]!))
+    const directs = await Promise.all([...directMembers].map(([userId, records]) => userEntry(userId, records)))
+    directs.sort((a, b) => latest(b) - latest(a))
+    return {
+      groups,
+      directs,
+      ...(profiles.warning === undefined ? {} : { warning: profiles.warning }),
+    }
+  }
+
+  /**
+   * One records-view entry per origin (same order), and refresh the set of
+   * browsable workspace roots from them.
+   */
+  private async sessionRecordFacts(origins: readonly SessionOriginRecord[]): Promise<SessionRecordWire[]> {
+    const bound = new Map<string, RouteRecord>()
+    for (const record of this.routes.records()) bound.set(record.sessionId, record)
+    const titles = new Map<string, string>()
+    const roots = new Map<string, string>()
+    const query = this.ctx.get?.('sessionQuery') as SessionQuery | undefined
+    if (query !== undefined && origins.length > 0) {
+      try {
+        for (const item of await query.readTitleSnapshots(origins.map(origin => origin.key as SessionId))) {
+          if (item.status !== 'fulfilled') continue
+          if (item.value.title !== undefined) titles.set(item.sessionId, item.value.title.title)
+          const cwd = item.value.session?.cwd
+          if (cwd !== undefined && cwd !== '') roots.set(item.sessionId, cwd)
+        }
+      } catch (error) {
+        this.ctx.logger?.warn?.('dsh-channels: session records lookup failed: %s', String(error))
+      }
+    }
+    const records = origins.map((origin): SessionRecordWire => {
+      const id = origin.key
+      const route = bound.get(id)
+      const title = titles.get(id)
+      const workspace = roots.get(id) ?? route?.workspacePath
+      return {
+        sessionId: id,
+        ...(title === undefined ? {} : { title }),
+        kind: origin.kind,
+        shared: origin.shared === true,
+        createdAt: origin.createdAt,
+        bound: route !== undefined,
+        ...(route === undefined ? {} : { lastActivityAt: route.lastActivityAt }),
+        live: this.sessions.get(id) !== undefined || this.ctx.agents.get(id as SessionId) !== undefined,
+        ...(workspace === undefined ? {} : { workspace }),
+      }
+    })
+    this.recordWorkspaces = new Set(records.flatMap(record => (record.workspace === undefined ? [] : [record.workspace])))
+    return records
+  }
+
+  /**
+   * A workspace root the file routes may serve: a root of some Feishu-routed
+   * Session. An unknown root re-reads the records once (the page may outlive
+   * a restart) before it is refused.
+   * @throws {WorkspaceFileError} 403 for any other directory.
+   */
+  private async browsableWorkspace(workspace: string): Promise<string> {
+    const known = (): boolean => this.recordWorkspaces.has(workspace)
+      || [...this.routes.records()].some(record => record.workspacePath === workspace)
+    if (!known()) await this.sessionRecordFacts(this.routes.origins())
+    if (!known()) throw new WorkspaceFileError(403, '该目录不是飞书会话的工作区')
+    return workspace
+  }
+
+  /** Panel: list one directory of a Feishu workspace. */
+  async workspaceFiles(workspace: string, path: string | undefined): Promise<WorkspaceListingWire> {
+    return listWorkspaceDirectory(await this.browsableWorkspace(workspace), path)
+  }
+
+  /** Panel: preview one file of a Feishu workspace. */
+  async workspaceFilePreview(workspace: string, path: string | undefined): Promise<WorkspacePreviewWire> {
+    return previewWorkspaceFile(await this.browsableWorkspace(workspace), path)
+  }
+
+  /** Panel: read one file of a Feishu workspace for download. */
+  async workspaceFileDownload(workspace: string, path: string | undefined): Promise<WorkspaceDownload> {
+    return readWorkspaceFile(await this.browsableWorkspace(workspace), path)
   }
 
   /**
