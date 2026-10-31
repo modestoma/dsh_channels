@@ -13,7 +13,7 @@ import { AppOwnerLookupError } from '../src/feishu-channel.ts'
 import type { ChannelFactory, NormalizedMessage } from '../src/feishu-channel.ts'
 import type { RouteRecord } from '../src/domain.ts'
 import { ATTACHMENTS_DIR } from '../src/feishu/inbound-attachments.ts'
-import { FeishuService } from '../src/service.ts'
+import { TestFeishuService as FeishuService } from './helpers.ts'
 import { makeAccessConfig } from './access-fixtures.ts'
 import { makeChannel, makeHostContext, makeMessage, makeTempBaseDir } from './helpers.ts'
 

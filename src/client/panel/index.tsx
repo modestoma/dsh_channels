@@ -36,6 +36,7 @@ import {
   fetchStatus,
   pickDirectory as requestDirectoryPicker,
   reconnect,
+  takeover,
   removeAccessGroup,
   removeAccessUser,
   removeWikiUser,
@@ -414,6 +415,33 @@ function FeishuChannelsPanel(): JSX.Element | null {
     }
   }, [refreshStatus, running])
 
+  /** Take the connection over from the other dsh process; it interrupts that process's replies. */
+  const onTakeover = useCallback(async (): Promise<void> => {
+    const confirmed = typeof window.confirm === 'function'
+      ? window.confirm(PANEL_COPY.takeoverWarning)
+      : true
+    if (!confirmed) return
+    setBusy('takeover')
+    setNotice(null)
+    try {
+      const result = await takeover()
+      if (!result.ok) {
+        setNotice({ kind: 'error', text: result.error })
+        if (result.unconfigured === true) setActiveTab('connection')
+        await refreshStatus()
+        return
+      }
+      setLoad({ phase: 'ready', panel: result.panel })
+      setStatus(result.panel.status)
+      setNotice({ kind: 'ok', text: PANEL_COPY.takeoverDone })
+    } catch (error) {
+      setNotice({ kind: 'error', text: messageOf(error) })
+      await refreshStatus()
+    } finally {
+      setBusy(null)
+    }
+  }, [refreshStatus])
+
   /** Replace the embedded access snapshot after a whitelist mutation. */
   const applyAccess = useCallback((access: AccessWire): void => {
     setLoad(previous => previous.phase === 'ready'
@@ -704,6 +732,7 @@ function FeishuChannelsPanel(): JSX.Element | null {
                 busy={busy}
                 credentials={credentials}
                 onReconnect={() => { void onReconnect() }}
+                onTakeover={() => { void onTakeover() }}
               />
             )
           : null}

@@ -9,6 +9,8 @@ import { mkdirSync, mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { vi } from 'vitest'
+import type { AcquireOptions, InstanceLockProvider, LockHolderInfo } from '../src/instance-lock.ts'
+import { FeishuService } from '../src/service.ts'
 import type {
   Agent, AgentContext, AgentHandle, AgentOptions, AgentRegistry, AgentRequestConfig, AgentRequestListener, ApprovalAnswererListener,
   AssistantStreamPayload, AttachmentStore, CommandDefinition, CommandInvocation, CommandRuntime, EncodedImageAttachment,
@@ -968,4 +970,61 @@ export function makeMessage(partial: Partial<Omit<NormalizedMessage, 'content'>>
 
 export function makeTempBaseDir(): string {
   return mkdtempSync(path.join(tmpdir(), 'dsh-channels-test-'))
+}
+
+/**
+ * In-memory {@link InstanceLockProvider}: one shared table of owners per
+ * provider, so several services built with the same provider contend like
+ * processes on one machine.
+ */
+export function makeInstanceLocks(): InstanceLockProvider & {
+  owners: Map<string, { self: LockHolderInfo; options: AcquireOptions }>
+} {
+  const owners = new Map<string, { self: LockHolderInfo; options: AcquireOptions }>()
+  return {
+    owners,
+    address: appId => `memory:${appId}`,
+    async acquire(options) {
+      for (;;) {
+        const owner = owners.get(options.address)
+        if (owner === undefined) {
+          const entry = { self: options.self, options }
+          owners.set(options.address, entry)
+          return {
+            ok: true,
+            lock: {
+              async release() {
+                if (owners.get(options.address) === entry) owners.delete(options.address)
+              },
+            },
+          }
+        }
+        if (options.waitUntil === undefined || Date.now() >= options.waitUntil) {
+          return { ok: false, holder: owner.self }
+        }
+        await new Promise(resolve => setTimeout(resolve, 10))
+      }
+    },
+    async requestYield(address, self) {
+      const owner = owners.get(address)
+      if (owner === undefined) return 'absent'
+      if (!owner.options.canYield()) return 'busy'
+      owner.options.onYield(self)
+      return 'yielding'
+    },
+  }
+}
+
+/** {@link FeishuService} with an uncontended in-memory instance lock (tests never touch real IPC endpoints). */
+export class TestFeishuService extends FeishuService {
+  constructor(
+    ctx: ConstructorParameters<typeof FeishuService>[0],
+    config: ConstructorParameters<typeof FeishuService>[1],
+    channelFactory: ConstructorParameters<typeof FeishuService>[2],
+    sessionExportBuilder?: ConstructorParameters<typeof FeishuService>[3],
+    overlay?: ConstructorParameters<typeof FeishuService>[4],
+    instanceLock: InstanceLockProvider = makeInstanceLocks(),
+  ) {
+    super(ctx, config, channelFactory, sessionExportBuilder, overlay, instanceLock)
+  }
 }

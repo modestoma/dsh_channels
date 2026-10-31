@@ -1,0 +1,180 @@
+/**
+ * Machine-wide instance lock: the real IPC endpoint (acquire, refusal with the
+ * owner's identity, release, stale socket recovery, yield) and the service
+ * using it (refused connect, takeover).
+ */
+
+import { spawn } from 'node:child_process'
+import { existsSync, mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import type { FeishuConfig } from '../src/config.ts'
+import { createInstanceLockProvider, lockAddress } from '../src/instance-lock.ts'
+import type { AcquireOptions, InstanceLock, LockHolderInfo } from '../src/instance-lock.ts'
+import { InstanceLockHeldError } from '../src/service.ts'
+import { makeAccessConfig } from './access-fixtures.ts'
+import {
+  makeChannel, makeHostContext, makeInstanceLocks, makeTempBaseDir, TestFeishuService,
+} from './helpers.ts'
+
+const describeUnix = process.platform === 'win32' ? describe.skip : describe
+
+function identity(pid: number, home = '/home/a/.dsh'): LockHolderInfo {
+  return { pid, home, version: '0.0.0-test', startedAt: 1 }
+}
+
+function options(address: string, self: LockHolderInfo, overrides: Partial<AcquireOptions> = {}): AcquireOptions {
+  return { address, self, onYield: () => {}, canYield: () => true, ...overrides }
+}
+
+const held: InstanceLock[] = []
+afterEach(async () => {
+  for (const lock of held.splice(0)) await lock.release()
+})
+
+describe('lockAddress', () => {
+  it('derives a short, App-ID-free address per platform', () => {
+    const unix = lockAddress('cli_secret_app', 'linux', '/tmp')
+    expect(unix).toMatch(/^\/tmp\/dsh-channels-[0-9a-f]{16}\.sock$/)
+    expect(unix).not.toContain('cli_secret_app')
+    expect(lockAddress('cli_secret_app', 'win32')).toMatch(/^\\\\\.\\pipe\\dsh-channels-[0-9a-f]{16}$/)
+    expect(lockAddress('cli_other', 'linux', '/tmp')).not.toBe(unix)
+  })
+})
+
+describeUnix('createInstanceLockProvider', () => {
+  const provider = () => createInstanceLockProvider({ dir: mkdtempSync(path.join(tmpdir(), 'dsh-lock-')), sameProcessWaitMs: 0 })
+
+  it('grants the first owner and refuses the next with the owner identity', async () => {
+    const locks = provider()
+    const address = locks.address('cli_a')
+    const first = await locks.acquire(options(address, identity(process.pid)))
+    expect(first.ok).toBe(true)
+    if (first.ok) held.push(first.lock)
+
+    const second = await locks.acquire(options(address, identity(process.pid, '/home/b/.dsh')))
+    expect(second).toEqual({ ok: false, holder: identity(process.pid) })
+  })
+
+  it('frees the address on release', async () => {
+    const locks = provider()
+    const address = locks.address('cli_a')
+    const first = await locks.acquire(options(address, identity(process.pid)))
+    if (!first.ok) throw new Error('first acquisition refused')
+    await first.lock.release()
+    await first.lock.release()
+    expect(existsSync(address)).toBe(false)
+
+    const again = await locks.acquire(options(address, identity(process.pid)))
+    expect(again.ok).toBe(true)
+    if (again.ok) held.push(again.lock)
+  })
+
+  it('waits for a holder in this same process to release', async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'dsh-lock-'))
+    const locks = createInstanceLockProvider({ dir, sameProcessWaitMs: 2_000 })
+    const address = locks.address('cli_a')
+    const first = await locks.acquire(options(address, identity(process.pid)))
+    if (!first.ok) throw new Error('first acquisition refused')
+    setTimeout(() => { void first.lock.release() }, 300)
+
+    const second = await locks.acquire(options(address, identity(process.pid)))
+    expect(second.ok).toBe(true)
+    if (second.ok) held.push(second.lock)
+  })
+
+  it('reports an unidentified owner and recovers the address once that process is killed', async () => {
+    const locks = provider()
+    const address = locks.address('cli_a')
+    // A foreign process listening on the address without speaking the protocol.
+    const child = spawn(process.execPath, ['-e', `require('node:net').createServer().listen(${JSON.stringify(address)}, () => console.log('ready'))`])
+    await new Promise<void>((resolve, reject) => {
+      child.stdout.once('data', () => resolve())
+      child.once('error', reject)
+    })
+
+    const refused = await locks.acquire(options(address, identity(process.pid)))
+    expect(refused).toEqual({ ok: false, holder: undefined })
+
+    // SIGKILL leaves the socket file behind; it refuses connections.
+    child.kill('SIGKILL')
+    await new Promise(resolve => child.once('exit', resolve))
+    expect(existsSync(address)).toBe(true)
+
+    const recovered = await locks.acquire(options(address, identity(process.pid)))
+    expect(recovered.ok).toBe(true)
+    if (recovered.ok) held.push(recovered.lock)
+  })
+
+  it('answers a yield request, then lets the requester acquire once the owner released', async () => {
+    const locks = provider()
+    const address = locks.address('cli_a')
+    const yieldedTo: LockHolderInfo[] = []
+    let owner: InstanceLock | undefined
+    const first = await locks.acquire(options(address, identity(process.pid), {
+      onYield: (from) => {
+        yieldedTo.push(from)
+        setTimeout(() => { void owner?.release() }, 100)
+      },
+    }))
+    if (!first.ok) throw new Error('first acquisition refused')
+    owner = first.lock
+
+    const requester = identity(process.pid, '/home/b/.dsh')
+    await expect(locks.requestYield(address, requester)).resolves.toBe('yielding')
+    expect(yieldedTo).toEqual([requester])
+
+    const taken = await locks.acquire(options(address, requester, { waitUntil: Date.now() + 3_000 }))
+    expect(taken.ok).toBe(true)
+    if (taken.ok) held.push(taken.lock)
+  })
+
+  it('refuses a yield while the owner is busy and reports an absent owner', async () => {
+    const locks = provider()
+    const address = locks.address('cli_a')
+    await expect(locks.requestYield(address, identity(1))).resolves.toBe('absent')
+
+    let yielded = false
+    const first = await locks.acquire(options(address, identity(process.pid), {
+      canYield: () => false,
+      onYield: () => { yielded = true },
+    }))
+    if (!first.ok) throw new Error('first acquisition refused')
+    held.push(first.lock)
+    await expect(locks.requestYield(address, identity(1))).resolves.toBe('busy')
+    expect(yielded).toBe(false)
+  })
+})
+
+describe('FeishuService instance lock', () => {
+  function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
+    return makeAccessConfig({ baseDir: makeTempBaseDir(), statusRefreshMs: 60_000, routeTtlMs: 0, welcomeOnboarding: false, ...partial })
+  }
+
+  it('stays disconnected while another instance owns the bot, then takes the connection over', async () => {
+    const locks = makeInstanceLocks()
+    const first = new TestFeishuService(makeHostContext().ctx, makeConfig(), () => makeChannel(), undefined, undefined, locks)
+    await first.connect()
+    expect(first.isRunning()).toBe(true)
+
+    const secondChannel = makeChannel()
+    const second = new TestFeishuService(makeHostContext().ctx, makeConfig(), () => secondChannel, undefined, undefined, locks)
+    const refused = second.connect()
+    await expect(refused).rejects.toBeInstanceOf(InstanceLockHeldError)
+    await expect(refused).rejects.toThrow(/本机另一个 dsh 实例占用/)
+    expect(second.isRunning()).toBe(false)
+    expect(second.occupiedBy()?.holder?.pid).toBe(process.pid)
+    expect(secondChannel.connect).not.toHaveBeenCalled()
+
+    await second.takeover()
+    expect(second.isRunning()).toBe(true)
+    expect(second.occupiedBy()).toBeUndefined()
+    await vi.waitFor(() => expect(first.isRunning()).toBe(false))
+    expect(first.occupiedBy()?.holder).toBeDefined()
+    expect(first.startError()).toMatch(/已被本机另一个 dsh 实例接管/)
+
+    await second.shutdown()
+    expect(locks.owners.size).toBe(0)
+  })
+})

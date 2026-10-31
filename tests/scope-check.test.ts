@@ -8,7 +8,7 @@ import type { FeishuConfig } from '../src/config.ts'
 import { AppOwnerLookupError, FeishuApiError } from '../src/feishu-channel.ts'
 import { checkScopes, scopeConsoleUrl, scopeRequirements } from '../src/feishu/scopes.ts'
 import type { ScopeGrant } from '../src/feishu/scopes.ts'
-import { FeishuService } from '../src/service.ts'
+import { TestFeishuService as FeishuService } from './helpers.ts'
 import { makeAccessConfig } from './access-fixtures.ts'
 import { makeChannel, makeHostContext, makeTempBaseDir } from './helpers.ts'
 

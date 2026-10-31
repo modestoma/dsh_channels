@@ -58,6 +58,7 @@ export type BusyAction =
   | 'save'
   | 'clear'
   | 'reconnect'
+  | 'takeover'
   | 'credentials'
   | 'credentials-clear'
   | 'access'
@@ -132,6 +133,7 @@ export function phaseBadge(phase: ChannelPhaseWire): { text: string; tone: Badge
     case 'connected': return { text: PANEL_COPY.phaseConnected, tone: 'ok' }
     case 'connecting': return { text: PANEL_COPY.phaseConnecting, tone: 'warn' }
     case 'error': return { text: PANEL_COPY.phaseError, tone: 'bad' }
+    case 'occupied': return { text: PANEL_COPY.phaseOccupied, tone: 'warn' }
     case 'idle': return { text: PANEL_COPY.phaseIdle, tone: 'muted' }
     default: return { text: PANEL_COPY.phaseUnconfigured, tone: 'muted' }
   }
@@ -143,6 +145,7 @@ export function phaseSummary(phase: ChannelPhaseWire): string {
     case 'connected': return PANEL_COPY.statusSummaryConnected
     case 'connecting': return PANEL_COPY.statusSummaryConnecting
     case 'error': return PANEL_COPY.statusSummaryError
+    case 'occupied': return PANEL_COPY.statusSummaryOccupied
     case 'idle': return PANEL_COPY.statusSummaryIdle
     default: return PANEL_COPY.statusSummaryUnconfigured
   }

@@ -27,6 +27,7 @@ import {
   PROFILES_MAX_IDS,
   PROFILES_ROUTE,
   RECONNECT_ROUTE,
+  TAKEOVER_ROUTE,
   REMOVE_ACCESS_GROUP_ROUTE,
   REMOVE_ACCESS_USER_ROUTE,
   REMOVE_WIKI_USER_ROUTE,
@@ -188,6 +189,10 @@ export function registerSettingsRoutes(connection: HostConnection, surface: Sett
       const outcome = await surface.reconnect()
       // An incomplete configuration is a client-side state (the panel routes
       // the user to the credentials form), not a server failure.
+      return json(outcome.ok ? 200 : (outcome.unconfigured === true ? 400 : 500), outcome)
+    }),
+    post(TAKEOVER_ROUTE, async () => {
+      const outcome = await surface.takeover()
       return json(outcome.ok ? 200 : (outcome.unconfigured === true ? 400 : 500), outcome)
     }),
     post(PICK_DIRECTORY_ROUTE, async (request) => {
