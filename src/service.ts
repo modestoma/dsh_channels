@@ -342,6 +342,7 @@ export function hostTurnOriginLine(kind: string): string {
     case 'agent-message': return '🤖 收到子代理的消息，继续处理'
     case 'tool-jobs': return '⚙️ 后台任务已完成，继续处理'
     case 'schedule': return '⏰ 定时跟进'
+    case 'repo-activity': return '🔔 PR/MR 有新动态，继续处理'
     case 'user': return '💻 来自 dsh 客户端的消息'
     // Other sources come from plugins this channel does not know.
     default: return '⚙️ 会话被唤醒，继续处理'
@@ -2098,6 +2099,13 @@ export class FeishuService {
       const gitEmail = this.accessStore.getUser(userId)?.gitEmail
       if (gitEmail !== undefined) event.setAuthor?.(name ?? userId, gitEmail)
     }))
+    // A cold Feishu Session resumed by the host's generic controller would
+    // lack this channel's tools and guidance; resume it here instead.
+    this.unlistenHost.push(this.ctx.on('repo/resolve-agent', async (sessionId, next) => {
+      const route = this.routes.findBySession(sessionId)
+      if (route === undefined) return await next()
+      return (await this.sessions.ensureLive(route)).agent
+    }, { prepend: true }))
     this.unlisten = channel.onMessage(message => {
       void this.dispatchInbound(channel, message)
     })

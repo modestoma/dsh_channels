@@ -1700,6 +1700,7 @@ describe('FeishuService', () => {
     expect(hostTurnOriginLine('agent-message')).toContain('子代理的消息')
     expect(hostTurnOriginLine('tool-jobs')).toContain('后台任务')
     expect(hostTurnOriginLine('schedule')).toContain('定时')
+    expect(hostTurnOriginLine('repo-activity')).toContain('PR/MR')
     expect(hostTurnOriginLine('user')).toContain('dsh 客户端')
     expect(hostTurnOriginLine('plugin-x')).toContain('会话被唤醒')
   })
