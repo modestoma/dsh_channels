@@ -14,6 +14,7 @@ import type { KeyboardEvent } from 'react'
 import { PANEL_COPY, PANEL_TABS, TAB_FIELD_GROUPS } from '../../settings/contract.ts'
 import type {
   AccessMutationResponse,
+  AccessPermissionWire,
   AccessWire,
   CatalogWire,
   ChannelStatusWire,
@@ -26,9 +27,7 @@ import type {
   PanelWire,
 } from '../../settings/contract.ts'
 import {
-  addAccessGroup,
   addAccessUser,
-  addWikiUser,
   clearConfig,
   clearCredential,
   fetchCatalog,
@@ -37,10 +36,9 @@ import {
   pickDirectory as requestDirectoryPicker,
   reconnect,
   takeover,
-  removeAccessGroup,
   removeAccessUser,
-  removeWikiUser,
   resolveAccessRequest,
+  setAccessPermission,
   saveConfig,
   saveCredentials,
 } from '../api.ts'
@@ -445,46 +443,29 @@ function FeishuChannelsPanel(): JSX.Element | null {
     }
   }, [refreshStatus])
 
-  /** Replace the embedded access snapshot after a whitelist mutation. */
+  /** Replace the embedded access snapshot after a user-table mutation. */
   const applyAccess = useCallback((access: AccessWire): void => {
     setLoad(previous => previous.phase === 'ready'
       ? { phase: 'ready', panel: { ...previous.panel, access } }
       : previous)
   }, [])
 
-  const onAddAccessGroup = useCallback(async (chatId: string, name: string): Promise<boolean> => {
+  const onTogglePermission = useCallback(async (
+    userId: string,
+    permission: AccessPermissionWire,
+    enabled: boolean,
+  ): Promise<void> => {
     setBusy('access')
     setAccessError(null)
     setAccessNotice(null)
     try {
-      const result = await addAccessGroup(chatId, name)
-      if (!result.ok) {
-        setAccessError(result.error)
-        return false
-      }
-      applyAccess(result.access)
-      setAccessNotice(PANEL_COPY.accessGroupAdded)
-      return true
-    } catch (error) {
-      setAccessError(messageOf(error))
-      return false
-    } finally {
-      setBusy(null)
-    }
-  }, [applyAccess])
-
-  const onRemoveAccessGroup = useCallback(async (chatId: string): Promise<void> => {
-    setBusy('access')
-    setAccessError(null)
-    setAccessNotice(null)
-    try {
-      const result = await removeAccessGroup(chatId)
+      const result = await setAccessPermission(userId, permission, enabled)
       if (!result.ok) {
         setAccessError(result.error)
         return
       }
       applyAccess(result.access)
-      setAccessNotice(PANEL_COPY.accessGroupRemoved)
+      setAccessNotice(PANEL_COPY.accessPermissionChanged)
     } catch (error) {
       setAccessError(messageOf(error))
     } finally {
@@ -492,7 +473,7 @@ function FeishuChannelsPanel(): JSX.Element | null {
     }
   }, [applyAccess])
 
-  /** Add one user to a whitelist; resolves true when the input should clear. */
+  /** Add one user to the user table; resolves true when the input should clear. */
   const addUser = useCallback(async (
     add: (userId: string, name: string) => Promise<AccessMutationResponse>,
     userId: string,
@@ -752,24 +733,16 @@ function FeishuChannelsPanel(): JSX.Element | null {
                 profiles={profiles}
                 accessNotice={accessNotice}
                 accessError={accessError}
-                onAddGroup={onAddAccessGroup}
-                onRemoveGroup={chatId => { void onRemoveAccessGroup(chatId) }}
                 onAddUser={(userId, name) => addUser(addAccessUser, userId, name, PANEL_COPY.accessUserAdded)}
                 onRemoveUser={userId => { void removeUser(removeAccessUser, userId, PANEL_COPY.accessUserRemoved) }}
+                onTogglePermission={(userId, permission, enabled) => { void onTogglePermission(userId, permission, enabled) }}
                 onResolveRequest={(token, decision) => { void onResolveAccessRequest(token, decision) }}
               />
             )
           : null}
         {activeTab === 'wiki'
           ? (
-              <WikiTab
-                form={form}
-                profiles={profiles}
-                accessNotice={accessNotice}
-                accessError={accessError}
-                onAddUser={(userId, name) => addUser(addWikiUser, userId, name, PANEL_COPY.wikiUserAdded)}
-                onRemoveUser={userId => { void removeUser(removeWikiUser, userId, PANEL_COPY.wikiUserRemoved) }}
-              />
+              <WikiTab form={form} profiles={profiles} />
             )
           : null}
         {activeTab === 'advanced'

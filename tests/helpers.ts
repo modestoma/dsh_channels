@@ -14,7 +14,8 @@ import { FeishuService } from '../src/service.ts'
 import type {
   Agent, AgentContext, AgentHandle, AgentOptions, AgentRegistry, AgentRequestConfig, AgentRequestListener, ApprovalAnswererListener,
   AssistantStreamPayload, AttachmentStore, InboxClaimedPayload, CommandDefinition, CommandInvocation, CommandRuntime, EncodedImageAttachment,
-  FileAttachmentRef, HostContext, ImageAttachmentLimits, ImageAttachmentRef, ImageMediaType, PermissionPresets, PromptSection,
+  FileAttachmentRef, HostContext, ImageAttachmentLimits, ImageAttachmentRef, ImageMediaType, PermissionPresets, PreToolDecision,
+  PreToolExecution, PromptSection,
   Session, SessionEvent, SessionId, SessionProjections, StorageDomainFacility, ToolDefinition, ToolRuntime,
   UserMessage, UserQuestionAnswererListener, Workspace, WorkspaceRegistry,
 } from '../src/dsh-types.ts'
@@ -679,6 +680,9 @@ export function makeWorktrees(workingDirectory: FakeWorkingDirectory): FakeWorkt
   return fake
 }
 
+/** One `tools/pre-execute` waterfall listener. */
+export type PreExecuteListener = (exec: PreToolExecution, next: () => Promise<PreToolDecision>) => Promise<PreToolDecision>
+
 export function makeHostContext(
   credentialValues?: Record<string, string>,
   agentPresets?: FakeAgentPresets,
@@ -705,6 +709,8 @@ export function makeHostContext(
   driver: FakeTurnDriver
   approvalListeners: Array<{ listener: ApprovalAnswererListener; options: { prepend?: boolean } | undefined }>
   questionListeners: Array<{ listener: UserQuestionAnswererListener; options: { prepend?: boolean } | undefined }>
+  /** Every `tools/pre-execute` listener the service registered. */
+  preExecuteListeners: PreExecuteListener[]
   permissions: PermissionPresets & { set: ReturnType<typeof vi.fn>; preset: string }
   sessionQuery: { readTitleSnapshots: ReturnType<typeof vi.fn> }
 } {
@@ -724,6 +730,7 @@ export function makeHostContext(
   const assistantStreamListeners: Array<(payload: AssistantStreamPayload) => void> = []
   const approvalListeners: Array<{ listener: ApprovalAnswererListener; options: { prepend?: boolean } | undefined }> = []
   const questionListeners: Array<{ listener: UserQuestionAnswererListener; options: { prepend?: boolean } | undefined }> = []
+  const preExecuteListeners: PreExecuteListener[] = []
   const tokenMeter = { measure: () => ({ totalTokens: 1234 }) }
   const permissions = {
     preset: 'standard',
@@ -821,6 +828,8 @@ export function makeHostContext(
           listener: listener as ApprovalAnswererListener,
           options: options as { prepend?: boolean } | undefined,
         })
+      } else if (name === 'tools/pre-execute') {
+        preExecuteListeners.push(listener as PreExecuteListener)
       } else if (name === 'user-questions/request') {
         questionListeners.push({
           listener: listener as UserQuestionAnswererListener,
@@ -833,7 +842,7 @@ export function makeHostContext(
   }
   return {
     ctx, agents, workspaces, domain, credentials, sessionListeners, driver,
-    assistantStreamListeners, approvalListeners, questionListeners, permissions, sessionQuery,
+    assistantStreamListeners, approvalListeners, questionListeners, preExecuteListeners, permissions, sessionQuery,
     workingDirectory, worktrees,
   }
 }

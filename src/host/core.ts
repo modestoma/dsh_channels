@@ -116,6 +116,27 @@ export interface InboxClaimedPayload {
   readonly turn: number
 }
 
+/**
+ * The pending tool call a `tools/pre-execute` listener sees (subset of DSH
+ * `ToolExecution`, `packages/core/tools/src/contracts.ts`).
+ */
+export interface PreToolExecution {
+  readonly name: string
+  /** The agent the call runs for; absent for calls outside an agent loop. */
+  readonly agent?: Agent
+}
+
+/**
+ * Decision of a `tools/pre-execute` listener (subset of DSH
+ * `PreToolDecision`): `deny` turns the call into an error result whose text
+ * is `reason`.
+ */
+export type PreToolDecision =
+  | { readonly kind: 'allow' }
+  | { readonly kind: 'deny'; readonly reason: string }
+  | { readonly kind: 'cancel' }
+  | { readonly kind: 'ask'; readonly reason?: string }
+
 // ---- Session surface ----------------------------------------------------
 
 export interface SessionHeader {

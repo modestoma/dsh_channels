@@ -132,6 +132,7 @@ interface Harness {
   bases: ReturnType<typeof fakeBases>
   consent: WikiConsent
   definitions: Map<string, ToolDefinition>
+  runtime: WikiToolRuntime
   run(tool: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<Record<string, unknown>>
   /** Wait for the newest consent card and click it. */
   click(decision: 'allow' | 'deny', userId?: string): Promise<void>
@@ -142,6 +143,8 @@ async function setup(options: {
   read?: boolean
   write?: boolean
   allowed?: boolean
+  /** Switches the topic owner holds; overrides `allowed`. */
+  granted?: ReadonlyArray<'read' | 'write'>
 } = {}): Promise<Harness> {
   const config = resolveConfig({
     wikiRoots: options.roots ?? [NODE_LINK],
@@ -157,7 +160,7 @@ async function setup(options: {
     config: () => config,
     channel: () => channel,
     routeOfSession: id => (id === 's1' ? { chatId: 'oc_1', cardMessageId: 'om_card', inThread: true, senderUserId: 'u_owner' } : undefined),
-    mayUseWiki: () => options.allowed ?? true,
+    mayUseWiki: (_userId, access) => options.granted?.includes(access) ?? options.allowed ?? true,
     consent,
     warn: vi.fn(),
   })
@@ -166,7 +169,7 @@ async function setup(options: {
   ctx.tools = { register: (definition: ToolDefinition) => { definitions.set(definition.name, definition) } } as unknown as ToolRuntime
   await runtime.mount(ctx, 's1')
   return {
-    channel, api, sheets, bases, consent, definitions,
+    channel, api, sheets, bases, consent, definitions, runtime,
     async run(tool, args, signal) {
       const definition = definitions.get(tool)
       if (definition === undefined) throw new Error(`${tool} not mounted`)
@@ -213,9 +216,24 @@ describe('wiki tool mounting and gates', () => {
       .toEqual([WIKI_CREATE_TOOL_NAME, WIKI_EDIT_TOOL_NAME, 'feishu_wiki_sheet_edit', 'feishu_wiki_base_edit'])
   })
 
-  it('refuses topic owners outside the wiki whitelist', async () => {
+  it('refuses topic owners without the wiki-read switch', async () => {
     const h = await setup({ allowed: false })
     expect(await h.run(WIKI_LIST_TOOL_NAME, {})).toMatchObject({ ok: false, code: 'NOT_AUTHORIZED' })
+  })
+
+  it('gates read tools on wiki-read and create/edit tools on wiki-write, independently', async () => {
+    const readTools = [WIKI_LIST_TOOL_NAME, WIKI_READ_TOOL_NAME, 'feishu_wiki_sheet_read', 'feishu_wiki_base_read']
+    const writeTools = [WIKI_CREATE_TOOL_NAME, WIKI_EDIT_TOOL_NAME, 'feishu_wiki_sheet_edit', 'feishu_wiki_base_edit']
+    const code = async (h: Harness, tool: string) => {
+      const gate = h.runtime.gate('s1', tool)
+      return gate.ok ? 'ok' : gate.code
+    }
+    const reader = await setup({ granted: ['read'] })
+    for (const tool of readTools) expect(await code(reader, tool), tool).not.toBe('NOT_AUTHORIZED')
+    for (const tool of writeTools) expect(await code(reader, tool), tool).toBe('NOT_AUTHORIZED')
+    const writer = await setup({ granted: ['write'] })
+    for (const tool of readTools) expect(await code(writer, tool), tool).toBe('NOT_AUTHORIZED')
+    for (const tool of writeTools) expect(await code(writer, tool), tool).not.toBe('NOT_AUTHORIZED')
   })
 
   it('lists roots and children without a card, and rejects nodes outside the roots', async () => {

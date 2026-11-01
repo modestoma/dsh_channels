@@ -165,7 +165,7 @@ describe('topic launch flow', () => {
 
   it('posts the root card, opens a shared topic with a streaming card, and forwards the prompt verbatim', async () => {
     const h = await setup()
-    await h.service.addAccessGroup('oc_group')
+    await h.service.addAccessUser('u_alice')
     const response = await h.launcher.launch(spec())
 
     expect(response).toEqual({ ok: true, replayed: false, chatId: 'oc_group', messageId: 'om_1' })
@@ -191,7 +191,7 @@ describe('topic launch flow', () => {
 
   it('streams the first turn in the topic and marks the root card when it settles', async () => {
     const h = await setup()
-    await h.service.addAccessGroup('oc_group')
+    await h.service.addAccessUser('u_alice')
     await h.launcher.launch(spec())
     await waitUntil(() => expect(h.routes()).toHaveLength(1))
     const agent = h.ctxState.agents.created[0]!.handle.agent
@@ -208,7 +208,7 @@ describe('topic launch flow', () => {
 
   it('marks the root card failed when the first turn fails', async () => {
     const h = await setup()
-    await h.service.addAccessGroup('oc_group')
+    await h.service.addAccessUser('u_alice')
     await h.launcher.launch(spec())
     await waitUntil(() => expect(h.routes()).toHaveLength(1))
     const agent = h.ctxState.agents.created[0]!.handle.agent
@@ -222,7 +222,7 @@ describe('topic launch flow', () => {
 
   it('marks analyses a previous instance never finished as interrupted at start', async () => {
     const h = await setup()
-    await h.service.addAccessGroup('oc_group')
+    await h.service.addAccessUser('u_alice')
     await h.launcher.launch(spec({ key: 'key-done' }))
     await waitUntil(() => expect(h.routes()).toHaveLength(1))
     const first = h.ctxState.agents.created[0]!.handle.agent
@@ -244,7 +244,7 @@ describe('topic launch flow', () => {
 
   it('replays a retried key and refuses a reused one', async () => {
     const h = await setup()
-    await h.service.addAccessGroup('oc_group')
+    await h.service.addAccessUser('u_alice')
     const [first, concurrent] = await Promise.all([h.launcher.launch(spec()), h.launcher.launch(spec())])
     const replay = await h.launcher.launch(spec())
     expect(first).toMatchObject({ ok: true, replayed: false })
@@ -254,9 +254,12 @@ describe('topic launch flow', () => {
     expect(await h.launcher.launch(spec({ fingerprint: 'fp-other', prompt: 'other' }))).toMatchObject({ ok: false, code: 'key-conflict' })
   })
 
-  it('refuses groups that are not authorized', async () => {
+  it('refuses requesters without chat permission', async () => {
     const h = await setup()
     expect(await h.launcher.launch(spec())).toMatchObject({ ok: false, code: 'forbidden-chat' })
+    await h.service.addAccessUser('u_alice')
+    await h.service.setAccessPermission('u_alice', 'chat', false)
+    expect(await h.launcher.launch(spec())).toMatchObject({ ok: false, code: 'forbidden-chat', message: expect.stringContaining('没有对话权限') })
     expect(h.channel.sent).toHaveLength(0)
   })
 
@@ -268,7 +271,7 @@ describe('topic launch flow', () => {
 
   it('waits for an acceptance still sending its root card before shutdown finishes', async () => {
     const h = await setup()
-    await h.service.addAccessGroup('oc_group')
+    await h.service.addAccessUser('u_alice')
     const sendMock = vi.mocked(h.channel.send)
     const send = sendMock.getMockImplementation()!
     let release!: () => void
@@ -297,7 +300,7 @@ describe('topic launch flow', () => {
 
   it('refuses invalid specs before posting anything', async () => {
     const h = await setup()
-    await h.service.addAccessGroup('oc_group')
+    await h.service.addAccessUser('u_alice')
     const invalid: Array<[string, TopicLaunchSpec]> = [
       ['workspace.segments', spec({ workspace: { segments: ['..'], title: 't' } })],
       ['workspace.segments', spec({ workspace: { segments: ['p2p', 'u_alice'], title: 't' } })],
@@ -318,7 +321,7 @@ describe('topic launch flow', () => {
 
   it('reports a root card Feishu refuses as send-failed', async () => {
     const h = await setup()
-    await h.service.addAccessGroup('oc_group')
+    await h.service.addAccessUser('u_alice')
     vi.mocked(h.channel.send).mockRejectedValueOnce(new Error('bot not in chat'))
     expect(await h.launcher.launch(spec())).toMatchObject({ ok: false, code: 'send-failed', message: expect.stringContaining('bot not in chat') })
     expect(h.record('key-1')).toBeUndefined()
@@ -344,7 +347,7 @@ describe('topic launch flow', () => {
 
   it('ends on a failure card without a route when setup fails', async () => {
     const h = await setup()
-    await h.service.addAccessGroup('oc_group')
+    await h.service.addAccessUser('u_alice')
     sessionsOf(h.launcher).mountGuidance = async () => { throw new Error('mount failed') }
     await h.launcher.launch(spec())
     await waitUntil(() => expect(h.record('key-1')?.status).toBe('failed'))
@@ -357,7 +360,7 @@ describe('topic launch flow', () => {
 
   it('holds topic replies posted during setup until the analysis prompt is delivered', async () => {
     const h = await setup()
-    await h.service.addAccessGroup('oc_group')
+    await h.service.addAccessUser('u_alice')
     await h.service.addAccessUser('u_bob')
     const held = holdSetup(h.launcher)
     await h.launcher.launch(spec())
@@ -378,7 +381,7 @@ describe('topic launch flow', () => {
 
   it('removes the published route when the first prompt cannot be delivered', async () => {
     const h = await setup()
-    await h.service.addAccessGroup('oc_group')
+    await h.service.addAccessUser('u_alice')
     const held = holdSetup(h.launcher)
     await h.launcher.launch(spec())
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
@@ -393,7 +396,7 @@ describe('topic launch flow', () => {
 
   it('ends an analysis still starting at shutdown on the failure card', async () => {
     const h = await setup()
-    await h.service.addAccessGroup('oc_group')
+    await h.service.addAccessUser('u_alice')
     const held = holdSetup(h.launcher)
     await h.launcher.launch(spec())
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
@@ -407,7 +410,7 @@ describe('topic launch flow', () => {
 
   it('lets admitted group members, and nobody else, follow up and stop the shared topic', async () => {
     const h = await setup()
-    await h.service.addAccessGroup('oc_group')
+    await h.service.addAccessUser('u_alice')
     await h.service.addAccessUser('u_bob')
     await h.launcher.launch(spec())
     await waitUntil(() => expect(h.routes()).toHaveLength(1))

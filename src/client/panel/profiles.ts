@@ -28,11 +28,8 @@ export function profileIds(access: AccessWire): { users: string[]; chats: string
   const chats = new Set<string>()
   if (access.admin.userId !== undefined) users.add(access.admin.userId)
   for (const user of access.users) users.add(user.userId)
-  for (const user of access.wikiUsers) users.add(user.userId)
-  for (const group of access.groups) chats.add(group.chatId)
   for (const request of access.requests) {
-    if (request.kind === 'user') users.add(request.targetId)
-    else chats.add(request.targetId)
+    users.add(request.targetId)
     if (request.chatId !== undefined) chats.add(request.chatId)
   }
   return { users: [...users].sort(), chats: [...chats].sort() }

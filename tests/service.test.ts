@@ -57,7 +57,7 @@ function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
     allowPermissionSwitch: false,
     // Tests exercise routing/hitl behavior; access control has its own tests.
     accessMode: 'open',
-    dmAllowWhitelist: false,
+    codeWriteTools: [],
     authRequestTtlDays: 7,
     // Onboarding is opt-in per test: it adds a card that would shift send counts.
     welcomeOnboarding: false,
@@ -5369,7 +5369,7 @@ describe('quote excerpts and first-turn topic history', () => {
     await h.service.shutdown()
   })
 
-  it('mounts the wiki tools, gates them on the wiki whitelist, and routes consent clicks', async () => {
+  it('mounts the wiki tools, gates them on the owner\'s wiki-read switch, and routes consent clicks', async () => {
     const node = {
       spaceId: '1', nodeToken: 'wikcnServiceDoc01', objToken: 'doc_1', objType: 'docx' as const,
       nodeType: 'origin' as const, title: '服务测试', hasChild: false,
@@ -5399,11 +5399,18 @@ describe('quote excerpts and first-turn topic history', () => {
     expect(await readTool!.execute({ doc: 'wikcnServiceDoc01' }, { signal: new AbortController().signal }))
       .toMatchObject({ ok: false, code: 'NOT_AUTHORIZED' })
 
-    await h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_admin', senderId: 'u_admin', mentionedBot: false,
-      messageId: 'om_wiki_grant', content: '/auth wiki add u_owner',
+    const admin = (messageId: string, content: string) => h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_admin', senderId: 'u_admin', mentionedBot: false, messageId, content,
     }))
-    await waitUntil(() => expect(JSON.stringify(h.channel.sent)).toContain('加入知识库白名单'))
+    await admin('om_wiki_early', '/auth set wiki-read on u_owner')
+    await waitUntil(() => expect(JSON.stringify(h.channel.sent)).toContain('不在用户表中，请先 /auth add'))
+    await admin('om_wiki_add', '/auth add u_owner')
+    await waitUntil(() => expect(JSON.stringify(h.channel.sent)).toContain('加入用户表并打开对话准入'))
+    // Chat alone grants no knowledge-base access.
+    expect(await readTool!.execute({ doc: 'wikcnServiceDoc01' }, { signal: new AbortController().signal }))
+      .toMatchObject({ ok: false, code: 'NOT_AUTHORIZED' })
+    await admin('om_wiki_grant', '/auth set wiki-read on u_owner')
+    await waitUntil(() => expect(JSON.stringify(h.channel.sent)).toContain('当前：对话准入 · 知识库读取'))
     const before = h.channel.sent.length
     const pending = readTool!.execute({ doc: 'wikcnServiceDoc01' }, { signal: new AbortController().signal })
     await waitUntil(() => expect(h.channel.sent).toHaveLength(before + 1))

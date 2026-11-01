@@ -7,7 +7,7 @@
  * cookie 鉴权，只有通过的 owner 请求才会到达这里，未通过时由 DSH 直接返回
  * 401 / 403。凭据值只走写路径，响应永远不包含它们。`catalog` 只读宿主
  * LLM / preset roster 的枚举结果，用于面板的 provider → model → 推理档位
- * 级联选择。`access` 提供准入快照与白名单/授权申请的写入口（与飞书卡片共用
+ * 级联选择。`access` 提供准入快照与用户表/授权申请的写入口（与飞书卡片共用
  * 同一结算函数）。
  *
  * @module dsh-channels/settings/routes
@@ -16,9 +16,7 @@
 import type { HostContext } from '../dsh-types.ts'
 import {
   ACCESS_ROUTE,
-  ADD_ACCESS_GROUP_ROUTE,
   ADD_ACCESS_USER_ROUTE,
-  ADD_WIKI_USER_ROUTE,
   CATALOG_ROUTE,
   CLEAR_CONFIG_ROUTE,
   CLEAR_CREDENTIAL_ROUTE,
@@ -28,10 +26,9 @@ import {
   PROFILES_ROUTE,
   RECONNECT_ROUTE,
   TAKEOVER_ROUTE,
-  REMOVE_ACCESS_GROUP_ROUTE,
   REMOVE_ACCESS_USER_ROUTE,
-  REMOVE_WIKI_USER_ROUTE,
   RESOLVE_ACCESS_REQUEST_ROUTE,
+  SET_ACCESS_PERMISSION_ROUTE,
   SAVE_CONFIG_ROUTE,
   SAVE_CREDENTIALS_ROUTE,
   SESSION_ORIGIN_ROUTE,
@@ -243,21 +240,15 @@ export function registerSettingsRoutes(connection: HostConnection, surface: Sett
       const payload: PickDirectoryResponse = path === null ? { ok: true, canceled: true } : { ok: true, path }
       return json(200, payload)
     }),
-    post(ADD_ACCESS_GROUP_ROUTE, async (request) => {
-      const payload = await readJsonObject(request)
-      return result(await surface.saveAccessGroup(payload.chatId, payload.name))
-    }),
-    post(REMOVE_ACCESS_GROUP_ROUTE, async request => result(await surface.removeAccessGroup((await readJsonObject(request)).chatId))),
     post(ADD_ACCESS_USER_ROUTE, async (request) => {
       const payload = await readJsonObject(request)
       return result(await surface.saveAccessUser(payload.userId, payload.name))
     }),
     post(REMOVE_ACCESS_USER_ROUTE, async request => result(await surface.removeAccessUser((await readJsonObject(request)).userId))),
-    post(ADD_WIKI_USER_ROUTE, async (request) => {
+    post(SET_ACCESS_PERMISSION_ROUTE, async (request) => {
       const payload = await readJsonObject(request)
-      return result(await surface.saveWikiUser(payload.userId, payload.name))
+      return result(await surface.setAccessPermission(payload.userId, payload.permission, payload.enabled))
     }),
-    post(REMOVE_WIKI_USER_ROUTE, async request => result(await surface.removeWikiUser((await readJsonObject(request)).userId))),
     post(RESOLVE_ACCESS_REQUEST_ROUTE, async (request) => {
       const payload = await readJsonObject(request)
       return result(await surface.resolveAccessRequest(payload.token, payload.decision))

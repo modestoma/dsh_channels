@@ -1,13 +1,13 @@
 /**
- * 白名单列表：群白名单、用户白名单与知识库白名单共用的条目行、添加表单
- * （点「＋ 添加」才展开）与待处理申请行。
+ * 用户表：每个用户一行（头像、名字、user_id、四个权限开关、移除），添加
+ * 表单点「＋ 添加用户」才展开；以及待处理申请行。
  *
  * @module dsh-channels/client/panel/whitelist
  */
 
 import { useState } from 'react'
 import { fillCopy, PANEL_COPY } from '../../settings/contract.ts'
-import type { AccessGroupWire, AccessRequestWire } from '../../settings/contract.ts'
+import type { AccessPermissionWire, AccessRequestWire, AccessUserWire } from '../../settings/contract.ts'
 import { Avatar } from '../avatar.tsx'
 import type { ProfileView } from './profiles.ts'
 import { EmptyRow, Row, Section } from './shared.tsx'
@@ -21,7 +21,7 @@ export function formatAccessDate(ms: number): string {
 }
 
 /** Which authorization entry produced one grant. */
-function sourceLabel(source: AccessGroupWire['source']): string {
+function sourceLabel(source: AccessUserWire['source']): string {
   switch (source) {
     case 'command': return PANEL_COPY.accessSourceCommand
     case 'card': return PANEL_COPY.accessSourceCard
@@ -29,39 +29,39 @@ function sourceLabel(source: AccessGroupWire['source']): string {
   }
 }
 
-/** One whitelist entry: a group `chat_id` or a user `user_id`. */
-export interface WhitelistEntry {
-  id: string
+/** The four switches in display order with their chip labels. */
+const PERMISSION_CHIPS: ReadonlyArray<{ permission: AccessPermissionWire; label: string }> = [
+  { permission: 'chat', label: PANEL_COPY.accessPermChat },
+  { permission: 'wikiRead', label: PANEL_COPY.accessPermWikiRead },
+  { permission: 'wikiWrite', label: PANEL_COPY.accessPermWikiWrite },
+  { permission: 'codeWrite', label: PANEL_COPY.accessPermCodeWrite },
+]
+
+/** One user row as the table renders it. */
+export interface UserTableEntry {
+  user: AccessUserWire
   /** Live Feishu name, else the name captured at authorization time. */
   name?: string
   /** Live Feishu avatar. */
   avatarUrl?: string
-  source: AccessGroupWire['source']
 }
 
 /**
- * One titled whitelist with remove buttons and a collapsed add form.
- * `onAdd` resolves true when the entry was added (the form then closes).
+ * The flat user table: one dense row per user with four toggle chips (a
+ * suspended user's other chips are dimmed), remove buttons, and a collapsed
+ * add form. `onAdd` resolves true when the user was added (the form then
+ * closes).
  */
-export function Whitelist(props: {
-  title: string
-  /** Shown after the title once loaded; defaults to the entry count. */
-  countLabel?: string
-  entries: readonly WhitelistEntry[]
-  /** Fallback avatar text for entries without an image; defaults to the entry name. */
-  avatar?: string
-  empty: string
+export function UserTable(props: {
+  entries: readonly UserTableEntry[]
   loaded: boolean
-  addLabel: string
-  idPlaceholder: string
-  namePlaceholder: string
-  footnote?: string
   disabled: boolean
   working: boolean
   onAdd: (id: string, name: string) => Promise<boolean>
   onRemove: (id: string) => void
+  onToggle: (id: string, permission: AccessPermissionWire, enabled: boolean) => void
 }): JSX.Element {
-  const { title, countLabel, entries, avatar, empty, loaded, addLabel, idPlaceholder, namePlaceholder, footnote, disabled, working, onAdd, onRemove } = props
+  const { entries, loaded, disabled, working, onAdd, onRemove, onToggle } = props
   const [adding, setAdding] = useState(false)
   const [id, setId] = useState('')
   const [name, setName] = useState('')
@@ -76,24 +76,38 @@ export function Whitelist(props: {
   }
 
   return (
-    <Section title={loaded ? `${title} · ${countLabel ?? entries.length}` : title} footnote={footnote}>
+    <Section title={loaded ? `${PANEL_COPY.accessUsersTitle} · ${entries.length}` : PANEL_COPY.accessUsersTitle} footnote={PANEL_COPY.accessUsersHint}>
       {!loaded ? <EmptyRow text={PANEL_COPY.accessNotLoaded} /> : null}
-      {loaded && entries.length === 0 ? <EmptyRow text={empty} /> : null}
-      {entries.map(entry => (
+      {loaded && entries.length === 0 ? <EmptyRow text={PANEL_COPY.accessUsersEmpty} /> : null}
+      {entries.map(({ user, name: display, avatarUrl }) => (
         <Row
-          key={entry.id}
-          leading={<Avatar text={avatar ?? entry.name ?? entry.id} url={entry.avatarUrl} />}
-          label={entry.name ?? entry.id}
-          summary={<><span className="dsh-channels-cfg__mono">{entry.id}</span> · {sourceLabel(entry.source)}</>}
+          key={user.userId}
+          leading={<Avatar text={display ?? user.userId} url={avatarUrl} />}
+          label={display ?? user.userId}
+          summary={<><span className="dsh-channels-cfg__mono">{user.userId}</span> · {sourceLabel(user.source)}</>}
           control={(
-            <button
-              type="button"
-              className="dsh-channels-cfg__btn dsh-channels-cfg__btn--remove"
-              disabled={disabled}
-              onClick={() => onRemove(entry.id)}
-            >
-              {working ? PANEL_COPY.accessWorking : PANEL_COPY.accessRemove}
-            </button>
+            <div className="dsh-channels-cfg__inputRow">
+              {PERMISSION_CHIPS.map(({ permission, label }) => (
+                <button
+                  key={permission}
+                  type="button"
+                  className={`dsh-channels-cfg__perm${permission !== 'chat' && !user.chat ? ' dsh-channels-cfg__perm--muted' : ''}`}
+                  aria-pressed={user[permission]}
+                  disabled={disabled}
+                  onClick={() => onToggle(user.userId, permission, !user[permission])}
+                >
+                  {label}
+                </button>
+              ))}
+              <button
+                type="button"
+                className="dsh-channels-cfg__btn dsh-channels-cfg__btn--remove"
+                disabled={disabled}
+                onClick={() => onRemove(user.userId)}
+              >
+                {working ? PANEL_COPY.accessWorking : PANEL_COPY.accessRemove}
+              </button>
+            </div>
           )}
         />
       ))}
@@ -106,8 +120,8 @@ export function Whitelist(props: {
                   type="text"
                   className="dsh-channels-cfg__input"
                   value={id}
-                  placeholder={idPlaceholder}
-                  aria-label={idPlaceholder}
+                  placeholder={PANEL_COPY.accessUserIdPlaceholder}
+                  aria-label={PANEL_COPY.accessUserIdPlaceholder}
                   disabled={disabled}
                   onChange={event => setId(event.target.value)}
                 />
@@ -115,8 +129,8 @@ export function Whitelist(props: {
                   type="text"
                   className="dsh-channels-cfg__input"
                   value={name}
-                  placeholder={namePlaceholder}
-                  aria-label={namePlaceholder}
+                  placeholder={PANEL_COPY.accessUserNamePlaceholder}
+                  aria-label={PANEL_COPY.accessUserNamePlaceholder}
                   disabled={disabled}
                   onChange={event => setName(event.target.value)}
                 />
@@ -136,7 +150,7 @@ export function Whitelist(props: {
           : (
               <div className="dsh-channels-cfg__addRow">
                 <button type="button" className="dsh-channels-cfg__link" disabled={disabled} onClick={() => setAdding(true)}>
-                  ＋ {addLabel}
+                  ＋ {PANEL_COPY.accessAddUser}
                 </button>
               </div>
             )}
@@ -156,19 +170,17 @@ export function RequestList(props: {
   return (
     <Section title={`${PANEL_COPY.accessRequestsTitle} · ${requests.length}`} tone="warn">
       {requests.map((request) => {
-        const profile = request.kind === 'user' ? profiles.user(request.targetId) : profiles.chat(request.targetId)
+        const profile = profiles.user(request.targetId)
         const target = profile?.name ?? request.name ?? request.targetId
         const group = request.chatId === undefined
           ? request.groupName
           : profiles.chat(request.chatId)?.name ?? request.groupName ?? request.chatId
-        const where = request.kind === 'user' && group !== undefined
-          ? fillCopy(PANEL_COPY.accessRequestIn, { group })
-          : ''
+        const where = group === undefined ? '' : fillCopy(PANEL_COPY.accessRequestIn, { group })
         return (
           <Row
             key={request.token}
             leading={<Avatar text={target} url={profile?.avatarUrl} />}
-            label={`${target} ${where}${request.kind === 'group' ? PANEL_COPY.accessRequestGroup : PANEL_COPY.accessRequestUser}`}
+            label={`${target} ${where}${PANEL_COPY.accessRequestUser}`}
             summary={(
               <>
                 <span className="dsh-channels-cfg__mono">{request.targetId}</span>

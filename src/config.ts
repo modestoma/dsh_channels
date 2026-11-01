@@ -312,8 +312,10 @@ export const configSchema = z.object({
    *   plus the read scopes above.
    *
    * The wiki tools act with the app identity and are mounted only while
-   * `wikiRoots` is non-empty. Each call is limited to topics whose owner is
-   * the administrator or on the wiki whitelist (`/auth wiki add`); opening a
+   * `wikiRoots` is non-empty. Each read call is limited to topics whose owner
+   * is the administrator or has the user table's `wikiRead` switch on, and
+   * each create or edit call to owners with `wikiWrite` on
+   * (`/auth set wiki-read|wiki-write on`); opening a
    * document, creating one, and editing one each need the topic owner's
    * consent on an authorization card (a read consent lasts for the topic).
    *
@@ -411,21 +413,32 @@ export const configSchema = z.object({
   /**
    * Admission policy for inbound Feishu traffic.
    *
-   * - `guarded` (default): only the configured administrator can talk in
-   *   private chats (plus whitelisted users when `dmAllowWhitelist` is on),
-   *   and a group conversation additionally requires the group to be
-   *   authorized and the sender to be the administrator or an explicitly
-   *   authorized user.
-   * - `open`: legacy behavior — any user inside the app's availability scope
-   *   can start a conversation. Debug/compatibility only; unsafe.
+   * - `guarded` (default): the administrator, and users of the access table
+   *   whose `chat` switch is on, may talk in private chats and in any group;
+   *   everyone else is refused.
+   * - `open`: any user inside the app's availability scope can start a
+   *   conversation. Debug only; unsafe. The knowledge-base and code-write
+   *   switches still apply.
    */
   accessMode: z.enum(['open', 'guarded']).default('guarded'),
   /**
-   * In `guarded` mode, also admit users on the global user whitelist
-   * (`/auth user`) in private chats. Off by default: private chats stay
-   * administrator-only. Each private-chat user already has an own workspace.
+   * Tools that write to a remote repository (push, merge requests, issues).
+   * In a Feishu Session a call is refused unless the user who drives the
+   * current turn is the administrator or holds the `codeWrite` switch. Names
+   * are matched exactly; an empty list turns the check off.
    */
-  dmAllowWhitelist: z.boolean().default(false),
+  codeWriteTools: z.array(z.string().trim().min(1)).default([
+    'repo_workspace_push',
+    'repo_mr_create',
+    'repo_mr_update',
+    'repo_mr_comment',
+    'repo_mr_merge',
+    'repo_issue_create',
+    'repo_issue_update',
+    'repo_issue_comment',
+    'logalyze_improve_skill',
+    'logalyze_submit_init',
+  ]),
   /**
    * The unique administrator's Feishu `user_id`. Set it in the Web
    * settings panel (or the profile config). Get it by sending `/userid` to the
@@ -441,7 +454,7 @@ export const configSchema = z.object({
   ).optional(),
   /**
    * Lifetime of one pending authorization request and of the DM card that asks
-   * the administrator to approve a group or a user. Expired requests stay in
+   * the administrator to add a user to the access table. Expired requests stay in
    * the store as an audit trail but can no longer be decided.
    */
   authRequestTtlDays: z.number().int().min(1).max(30).default(7),

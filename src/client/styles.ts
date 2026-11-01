@@ -60,6 +60,10 @@ const CSS = `
 .dsh-channels-cfg__switch[aria-checked="true"]{background:var(--dc-accent)}
 .dsh-channels-cfg__switch[aria-checked="true"]::after{transform:translateX(14px)}
 .dsh-channels-cfg__switch:disabled{opacity:.5;cursor:default}
+.dsh-channels-cfg__perm{flex:none;min-width:58px;height:24px;padding:0 8px;border:1px solid var(--dc-line);border-radius:6px;background:transparent;color:var(--dc-fg2);font:inherit;font-size:12px;line-height:22px;text-align:center;cursor:pointer;white-space:nowrap}
+.dsh-channels-cfg__perm[aria-pressed="true"]{border-color:var(--dc-accent);background:color-mix(in srgb,var(--dc-accent) 12%,transparent);color:var(--dc-accent)}
+.dsh-channels-cfg__perm--muted{opacity:.45}
+.dsh-channels-cfg__perm:disabled{cursor:default}
 .dsh-channels-cfg__input{box-sizing:border-box;width:100%;min-width:0;height:32px;padding:0 10px;border:1px solid var(--dc-line);border-radius:8px;transition:border-color .15s,box-shadow .15s;background:var(--dsw-alias-bg-layer-1,transparent);color:inherit;font:inherit;font-size:13px;outline:none}
 .dsh-channels-cfg__input:focus{border-color:var(--dc-accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--dc-accent) 14%,transparent)}
 .dsh-channels-cfg__input--invalid{border-color:var(--dc-bad)}

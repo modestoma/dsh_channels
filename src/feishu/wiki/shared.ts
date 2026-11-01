@@ -43,7 +43,7 @@ export interface WikiConsentFields {
 /** The gates and consent steps every wiki tool family runs through (implemented by the wiki tool runtime). */
 export interface WikiToolKit {
   /**
-   * Switch, route, whitelist, and channel gates of one call.
+   * Switch, route, permission, and channel gates of one call.
    * @param sessionId The calling Session.
    * @param tool Tool name (its switch decides).
    * @returns The call context, or the failure.
@@ -160,7 +160,7 @@ export type WikiFailureCode =
 export const FAILURE_REASONS: Readonly<Record<WikiFailureCode, string>> = {
   TOOL_DISABLED: '知识库工具已在插件配置中关闭',
   ROUTE_NOT_FOUND: '当前会话没有绑定飞书话题，无法确定授权人',
-  NOT_AUTHORIZED: '当前话题的发起人不在知识库白名单中；请管理员发送 /auth wiki add @该用户 后重试',
+  NOT_AUTHORIZED: '当前话题的发起人没有这个知识库权限；读取需要管理员发送 /auth set wiki-read on @该用户，新建或修改需要 /auth set wiki-write on @该用户',
   CHANNEL_UNAVAILABLE: '飞书连接当前不可用，请稍后重试',
   INVALID_REFERENCE: '无法识别的知识库引用：请传知识库节点链接 https://<租户>.feishu.cn/wiki/<node_token>、node_token，或知识空间链接 https://<租户>.feishu.cn/wiki/space/<space_id>',
   INVALID_OPERATION: '操作参数不正确',

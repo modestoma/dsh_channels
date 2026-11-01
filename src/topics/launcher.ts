@@ -3,7 +3,7 @@
  * `./contract.ts`).
  *
  * Synchronously (before {@link TopicLauncher.launch} settles): spec
- * validation, service state, target-group permission, idempotency replay, and
+ * validation, service state, requester permission, idempotency replay, and
  * the root card (进行中). In the background: the topic (opened by the first
  * streaming card, replied in thread below the root card), the launch workspace
  * and its per-topic directory, the Session, the group-shared route, and the
@@ -109,8 +109,8 @@ export interface TopicLauncherDeps {
    * The returned closer is called exactly once.
    */
   reserveTopic(threadId: string): () => void
-  /** Whether a launch may post into the group. */
-  mayLaunchIn(chatId: string): boolean
+  /** Whether a launch may start a topic for this requester (`user_id`). */
+  mayLaunchFor(requesterUserId: string): boolean
 }
 
 /** One accepted launch still posting its root card. */
@@ -219,8 +219,8 @@ export class TopicLauncher implements FeishuTopicService {
       if (stored.bodyHash !== spec.fingerprint) return reusedKey()
       return { ok: true, replayed: true, chatId: stored.chatId, messageId: stored.messageId }
     }
-    if (!this.deps.mayLaunchIn(spec.chatId)) {
-      return refused('forbidden-chat', '目标群未授权：请管理员在该群发送 /auth group add，或在设置面板「访问与授权」中添加')
+    if (!this.deps.mayLaunchFor(spec.requesterUserId)) {
+      return refused('forbidden-chat', '发起人没有对话权限：请管理员发送 /auth add @发起人，或在设置面板「访问授权」中添加')
     }
     const card = copyCard(spec.card)
     let rootId: string

@@ -8,7 +8,7 @@
 
 import type { AgentRegistry } from './agent.ts'
 import type { CommandRuntime } from './commands.ts'
-import type { AssistantStreamPayload, InboxClaimedPayload, Session, SessionEvent, SessionId } from './core.ts'
+import type { AssistantStreamPayload, InboxClaimedPayload, PreToolDecision, PreToolExecution, Session, SessionEvent, SessionId } from './core.ts'
 import type { ApprovalAnswererListener, UserQuestionAnswererListener } from './interaction.ts'
 
 // ---- Workspace surface --------------------------------------------------
@@ -324,6 +324,15 @@ export interface HostContext {
     name: 'approval/request',
     listener: ApprovalAnswererListener,
     options?: { prepend?: boolean },
+  ): () => boolean
+  /**
+   * The host's pre-dispatch tool policy waterfall. Untagged plugin contexts
+   * receive every agent's calls; a listener returns a decision or delegates
+   * with `next()`.
+   */
+  on(
+    name: 'tools/pre-execute',
+    listener: (exec: PreToolExecution, next: () => Promise<PreToolDecision>) => Promise<PreToolDecision>,
   ): () => boolean
   effect(callback: () => (() => void | Promise<void>) | void, label?: string): void
 }

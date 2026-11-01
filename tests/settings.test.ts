@@ -17,9 +17,7 @@ import type { HealthSnapshot } from '../src/health.ts'
 import type { FeishuChannel } from '../src/feishu-channel.ts'
 import {
   ACCESS_ROUTE,
-  ADD_ACCESS_GROUP_ROUTE,
   ADD_ACCESS_USER_ROUTE,
-  ADD_WIKI_USER_ROUTE,
   BYTES_UNIT,
   CATALOG_ROUTE,
   CLEAR_CONFIG_ROUTE,
@@ -41,10 +39,9 @@ import {
   TAB_FIELD_GROUPS,
   RECONNECT_ROUTE,
   TAKEOVER_ROUTE,
-  REMOVE_ACCESS_GROUP_ROUTE,
   REMOVE_ACCESS_USER_ROUTE,
-  REMOVE_WIKI_USER_ROUTE,
   RESOLVE_ACCESS_REQUEST_ROUTE,
+  SET_ACCESS_PERMISSION_ROUTE,
   RESTART_KEYS,
   SAVE_CONFIG_ROUTE,
   SAVE_CREDENTIALS_ROUTE,
@@ -52,6 +49,7 @@ import {
 } from '../src/settings/contract.ts'
 import type {
   AccessMutationResponse,
+  AccessPermissionWire,
   AccessWire,
   CatalogWire,
   CredentialField,
@@ -156,12 +154,10 @@ class FakeTarget implements SettingsTarget {
     mode: 'guarded',
     admin: { configured: false },
     loaded: true,
-    groups: [],
     users: [],
-    wikiUsers: [],
     requests: [],
   }
-  /** Every whitelist mutation the surface forwarded (asserted by the tests). */
+  /** Every user-table mutation the surface forwarded (asserted by the tests). */
   accessCalls: Array<Record<string, unknown>> = []
   /** Return one failed wire result instead of mutating (storage error path). */
   failAccess: string | undefined
@@ -254,29 +250,6 @@ class FakeTarget implements SettingsTarget {
     return structuredClone(this.accessState)
   }
 
-  async addAccessGroup(chatId: string, name?: string): Promise<AccessMutationResponse> {
-    this.accessCalls.push({ op: 'add-group', chatId, name })
-    const failed = this.accessFailure()
-    if (failed !== undefined) return failed
-    if (!this.accessState.groups.some(group => group.chatId === chatId)) {
-      this.accessState.groups.push({
-        chatId,
-        ...(name === undefined ? {} : { name }),
-        source: 'panel',
-        addedAt: 1_700_000_000_000,
-      })
-    }
-    return { ok: true, access: this.accessSnapshot() }
-  }
-
-  async removeAccessGroup(chatId: string): Promise<AccessMutationResponse> {
-    this.accessCalls.push({ op: 'remove-group', chatId })
-    const failed = this.accessFailure()
-    if (failed !== undefined) return failed
-    this.accessState.groups = this.accessState.groups.filter(group => group.chatId !== chatId)
-    return { ok: true, access: this.accessSnapshot() }
-  }
-
   async addAccessUser(userId: string, name?: string): Promise<AccessMutationResponse> {
     this.accessCalls.push({ op: 'add-user', userId, name })
     const failed = this.accessFailure()
@@ -287,6 +260,10 @@ class FakeTarget implements SettingsTarget {
         ...(name === undefined ? {} : { name }),
         source: 'panel',
         addedAt: 1_700_000_000_000,
+        chat: true,
+        wikiRead: false,
+        wikiWrite: false,
+        codeWrite: false,
       })
     }
     return { ok: true, access: this.accessSnapshot() }
@@ -300,26 +277,13 @@ class FakeTarget implements SettingsTarget {
     return { ok: true, access: this.accessSnapshot() }
   }
 
-  async addWikiUser(userId: string, name?: string): Promise<AccessMutationResponse> {
-    this.accessCalls.push({ op: 'add-wiki-user', userId, name })
+  async setAccessPermission(userId: string, permission: AccessPermissionWire, enabled: boolean): Promise<AccessMutationResponse> {
+    this.accessCalls.push({ op: 'set', userId, permission, enabled })
     const failed = this.accessFailure()
     if (failed !== undefined) return failed
-    if (!this.accessState.wikiUsers.some(user => user.userId === userId)) {
-      this.accessState.wikiUsers.push({
-        userId,
-        ...(name === undefined ? {} : { name }),
-        source: 'panel',
-        addedAt: 1_700_000_000_000,
-      })
-    }
-    return { ok: true, access: this.accessSnapshot() }
-  }
-
-  async removeWikiUser(userId: string): Promise<AccessMutationResponse> {
-    this.accessCalls.push({ op: 'remove-wiki-user', userId })
-    const failed = this.accessFailure()
-    if (failed !== undefined) return failed
-    this.accessState.wikiUsers = this.accessState.wikiUsers.filter(user => user.userId !== userId)
+    const user = this.accessState.users.find(item => item.userId === userId)
+    if (user === undefined) return { ok: false, error: '用户不在用户表里' }
+    user[permission] = enabled
     return { ok: true, access: this.accessSnapshot() }
   }
 
@@ -369,21 +333,16 @@ class FakeTarget implements SettingsTarget {
     if (request === undefined) return { ok: false, error: '申请不存在或已结算' }
     this.accessState.requests = this.accessState.requests.filter(item => item.token !== token)
     if (decision === 'allow') {
-      if (request.kind === 'group') {
-        this.accessState.groups.push({
-          chatId: request.targetId,
-          ...(request.name === undefined ? {} : { name: request.name }),
-          source: 'card',
-          addedAt: 1_700_000_000_000,
-        })
-      } else {
-        this.accessState.users.push({
-          userId: request.targetId,
-          ...(request.name === undefined ? {} : { name: request.name }),
-          source: 'card',
-          addedAt: 1_700_000_000_000,
-        })
-      }
+      this.accessState.users.push({
+        userId: request.targetId,
+        ...(request.name === undefined ? {} : { name: request.name }),
+        source: 'card',
+        addedAt: 1_700_000_000_000,
+        chat: true,
+        wikiRead: false,
+        wikiWrite: false,
+        codeWrite: false,
+      })
     }
     return { ok: true, access: this.accessSnapshot() }
   }
@@ -621,7 +580,8 @@ describe('field descriptors', () => {
       expect(byKey.get(key)).toMatchObject({ kind: 'boolean', group: 'wiki', restartRequired: false })
     }
     expect(byKey.get('feishuTools.wikiRead')?.help).toContain('feishu_wiki_read')
-    expect(byKey.get('feishuTools.wikiRead')?.help).toContain('/auth wiki add')
+    expect(byKey.get('feishuTools.wikiRead')?.help).toContain('/auth set wiki-read on')
+    expect(byKey.get('feishuTools.wikiWrite')?.help).toContain('/auth set wiki-write on')
     expect(byKey.get('feishuTools.wikiWrite')?.help).toContain('feishu_wiki_edit')
     const roots = byKey.get('wikiRoots')
     expect(roots).toMatchObject({
@@ -707,7 +667,7 @@ describe('field descriptors', () => {
 
   it('describes the access-control fields without restarting the channel', () => {
     const byKey = new Map(FIELD_DESCRIPTORS.map(field => [field.key, field]))
-    for (const key of ['adminUserId', 'accessMode', 'dmAllowWhitelist', 'authRequestTtlDays'] as const) {
+    for (const key of ['adminUserId', 'accessMode', 'authRequestTtlDays'] as const) {
       expect(EDITABLE_KEYS).toContain(key)
       expect(byKey.get(key)).toMatchObject({ group: 'access', restartRequired: false })
     }
@@ -724,7 +684,7 @@ describe('field descriptors', () => {
     expect(mode?.options?.map(option => option.value)).toEqual(['guarded', 'open'])
     expect(mode?.summary).toContain('不安全')
 
-    expect(byKey.get('dmAllowWhitelist')).toMatchObject({ kind: 'boolean', label: '白名单用户可私聊' })
+    expect(byKey.has('dmAllowWhitelist' as never)).toBe(false)
 
     const ttl = byKey.get('authRequestTtlDays')
     expect(ttl).toMatchObject({ kind: 'number', min: 1, max: 30, step: 1 })
@@ -1545,15 +1505,22 @@ describe('SettingsSurface access control', () => {
     mode: 'guarded',
     admin: { userId: 'u_admin', configured: true },
     loaded: true,
-    groups: [{ chatId: 'oc_team', name: '研发群', source: 'card', addedAt: 1_700_000_000_000 }],
-    users: [{ userId: 'u_alice', name: 'Alice', source: 'command', addedAt: 1_700_000_100_000 }],
-    wikiUsers: [{ userId: 'u_wiki', source: 'command', addedAt: 1_700_000_000_000 }],
+    users: [{
+      userId: 'u_alice',
+      name: 'Alice',
+      source: 'command',
+      addedAt: 1_700_000_100_000,
+      chat: true,
+      wikiRead: true,
+      wikiWrite: false,
+      codeWrite: false,
+    }],
     requests: [{
       token: 'tok_1',
-      kind: 'group',
-      targetId: 'oc_new',
-      name: '新群',
-      chatId: 'oc_new',
+      targetId: 'u_bob',
+      name: 'Bob',
+      chatId: 'oc_team',
+      groupName: '研发群',
       createdAt: 1_700_000_200_000,
       expiresAt: 1_700_000_800_000,
     }],
@@ -1575,26 +1542,14 @@ describe('SettingsSurface access control', () => {
       mode: 'open',
       admin: { configured: false },
       loaded: false,
-      groups: [],
       users: [],
-      wikiUsers: [],
       requests: [],
     })
     await expect(surface.access()).rejects.toThrow('access store down')
   })
 
-  it('validates and saves group and user authorizations', async () => {
+  it('validates and saves users, then flips their permission switches', async () => {
     const { surface, target } = makeSurface()
-    const group = await surface.saveAccessGroup(' oc_team ', ' 研发群 ')
-    expect(group.ok).toBe(true)
-    if (!group.ok) return
-    expect(group.access.groups).toEqual([{
-      chatId: 'oc_team',
-      name: '研发群',
-      source: 'panel',
-      addedAt: 1_700_000_000_000,
-    }])
-
     const user = await surface.saveAccessUser(' u_alice ', ' Alice ')
     expect(user.ok).toBe(true)
     if (!user.ok) return
@@ -1603,19 +1558,29 @@ describe('SettingsSurface access control', () => {
       name: 'Alice',
       source: 'panel',
       addedAt: 1_700_000_000_000,
+      chat: true,
+      wikiRead: false,
+      wikiWrite: false,
+      codeWrite: false,
     }])
+
+    const code = await surface.setAccessPermission(' u_alice ', 'codeWrite', true)
+    expect(code.ok).toBe(true)
+    if (!code.ok) return
+    expect(code.access.users[0]).toMatchObject({ chat: true, codeWrite: true })
+    const suspended = await surface.setAccessPermission('u_alice', 'chat', false)
+    expect(suspended.ok).toBe(true)
+    if (!suspended.ok) return
+    expect(suspended.access.users[0]).toMatchObject({ chat: false, codeWrite: true })
     expect(target.accessCalls).toEqual([
-      { op: 'add-group', chatId: 'oc_team', name: '研发群' },
       { op: 'add-user', userId: 'u_alice', name: 'Alice' },
+      { op: 'set', userId: 'u_alice', permission: 'codeWrite', enabled: true },
+      { op: 'set', userId: 'u_alice', permission: 'chat', enabled: false },
     ])
   })
 
-  it('rejects invalid identifiers before writing anything', async () => {
+  it('rejects invalid identifiers, switches, and values before writing anything', async () => {
     const { surface, target } = makeSurface()
-    for (const chatId of ['', '   ', 'x'.repeat(129), 'oc_\u0001bad', 42]) {
-      const result = await surface.saveAccessGroup(chatId)
-      expect(result.ok).toBe(false)
-    }
     for (const userId of ['ou_alice', 'on_alice', 'user@example.com', 'bad id']) {
       const result = await surface.saveAccessUser(userId)
       expect(result.ok).toBe(false)
@@ -1624,33 +1589,32 @@ describe('SettingsSurface access control', () => {
     }
     const badName = await surface.saveAccessUser('u_bob', 'x'.repeat(129))
     expect(badName.ok).toBe(false)
-    expect((await surface.saveWikiUser('ou_bob')).ok).toBe(false)
-    expect((await surface.saveWikiUser('u_bob', 'x'.repeat(129))).ok).toBe(false)
-    expect((await surface.removeWikiUser('bad id')).ok).toBe(false)
+    expect((await surface.removeAccessUser('bad id')).ok).toBe(false)
+    expect((await surface.setAccessPermission('ou_bob', 'chat', true)).ok).toBe(false)
+    const badSwitch = await surface.setAccessPermission('u_bob', 'admin', true)
+    expect(badSwitch).toEqual({ ok: false, error: '权限开关只能是 chat、wikiRead、wikiWrite 或 codeWrite' })
+    const badValue = await surface.setAccessPermission('u_bob', 'chat', 'yes')
+    expect(badValue).toEqual({ ok: false, error: 'enabled 必须是 true 或 false' })
     expect(target.accessCalls).toEqual([])
   })
 
-  it('removes authorizations and resolves pending requests', async () => {
+  it('removes users and resolves pending requests into a chat-only user', async () => {
     const { surface, target } = makeSurface()
     target.accessState = structuredClone(SAMPLE_ACCESS)
 
-    const removedGroup = await surface.removeAccessGroup('oc_team')
-    expect(removedGroup.ok).toBe(true)
     const removedUser = await surface.removeAccessUser('u_alice')
     expect(removedUser.ok).toBe(true)
-    const removedWiki = await surface.removeWikiUser('u_wiki')
-    expect(removedWiki.ok).toBe(true)
-    if (!removedWiki.ok) return
-    expect(removedWiki.access.wikiUsers).toEqual([])
+    if (!removedUser.ok) return
+    expect(removedUser.access.users).toEqual([])
     const allowed = await surface.resolveAccessRequest('tok_1', 'allow')
     expect(allowed.ok).toBe(true)
     if (!allowed.ok) return
     expect(allowed.access.requests).toEqual([])
-    expect(allowed.access.groups.map(group => group.chatId)).toEqual(['oc_new'])
+    expect(allowed.access.users).toEqual([expect.objectContaining({
+      userId: 'u_bob', chat: true, wikiRead: false, wikiWrite: false, codeWrite: false,
+    })])
     expect(target.accessCalls).toEqual([
-      { op: 'remove-group', chatId: 'oc_team' },
       { op: 'remove-user', userId: 'u_alice' },
-      { op: 'remove-wiki-user', userId: 'u_wiki' },
       { op: 'resolve', token: 'tok_1', decision: 'allow' },
     ])
   })
@@ -1658,7 +1622,8 @@ describe('SettingsSurface access control', () => {
   it('folds target failures, thrown errors, and invalid decisions into the wire', async () => {
     const { surface, target } = makeSurface()
     target.failAccess = 'store unavailable'
-    await expect(surface.saveAccessGroup('oc_x')).resolves.toEqual({ ok: false, error: 'store unavailable' })
+    await expect(surface.saveAccessUser('u_x')).resolves.toEqual({ ok: false, error: 'store unavailable' })
+    await expect(surface.setAccessPermission('u_x', 'wikiWrite', true)).resolves.toEqual({ ok: false, error: 'store unavailable' })
 
     target.failAccess = undefined
     target.throwAccess = 'domain not open'
@@ -1837,12 +1802,9 @@ describe('settings routes', () => {
       [RECONNECT_ROUTE]: 'POST',
       [TAKEOVER_ROUTE]: 'POST',
       [PICK_DIRECTORY_ROUTE]: 'POST',
-      [ADD_ACCESS_GROUP_ROUTE]: 'POST',
-      [REMOVE_ACCESS_GROUP_ROUTE]: 'POST',
       [ADD_ACCESS_USER_ROUTE]: 'POST',
       [REMOVE_ACCESS_USER_ROUTE]: 'POST',
-      [ADD_WIKI_USER_ROUTE]: 'POST',
-      [REMOVE_WIKI_USER_ROUTE]: 'POST',
+      [SET_ACCESS_PERMISSION_ROUTE]: 'POST',
       [RESOLVE_ACCESS_REQUEST_ROUTE]: 'POST',
     })
     for (const route of routes.values()) {
@@ -2093,20 +2055,17 @@ describe('settings routes', () => {
     expect(JSON.parse(unavailable.body).error).toContain(PANEL_COPY.directoryPickFailed)
   })
 
-  it('serves the access snapshot and every whitelist write', async () => {
+  it('serves the access snapshot and every user-table write', async () => {
     const { surface, target } = makeSurface()
     target.accessState = {
       mode: 'guarded',
       admin: { userId: 'u_admin', configured: true },
       loaded: true,
-      groups: [{ chatId: 'oc_team', name: '研发群', source: 'card', addedAt: 1_700_000_000_000 }],
       users: [],
-      wikiUsers: [],
       requests: [{
         token: 'tok_1',
-        kind: 'group',
-        targetId: 'oc_new',
-        chatId: 'oc_new',
+        targetId: 'u_bob',
+        chatId: 'oc_team',
         createdAt: 1_700_000_200_000,
         expiresAt: 1_700_000_800_000,
       }],
@@ -2118,42 +2077,35 @@ describe('settings routes', () => {
     expect(read.status).toBe(200)
     const snapshot = JSON.parse(read.body) as AccessWire
     expect(snapshot.admin).toEqual({ userId: 'u_admin', configured: true })
-    expect(snapshot.groups).toEqual(target.accessState.groups)
-
-    const addedGroup = await call(routes, ADD_ACCESS_GROUP_ROUTE, post({ chatId: 'oc_team', name: '研发群' }))
-    expect(addedGroup.status).toBe(200)
-    expect(JSON.parse(addedGroup.body).ok).toBe(true)
-    expect(JSON.parse(addedGroup.body).access.groups.map((group: { chatId: string }) => group.chatId))
-      .toContain('oc_team')
+    expect(snapshot.requests).toEqual(target.accessState.requests)
 
     const invalidUser = await call(routes, ADD_ACCESS_USER_ROUTE, post({ userId: 'ou_alice' }))
     expect(invalidUser.status).toBe(400)
     expect(JSON.parse(invalidUser.body).error).toContain('ou_')
 
-    const addedUser = await call(routes, ADD_ACCESS_USER_ROUTE, post({ userId: 'u_alice' }))
+    const addedUser = await call(routes, ADD_ACCESS_USER_ROUTE, post({ userId: 'u_alice', name: 'Alice' }))
+    expect(addedUser.status).toBe(200)
     expect(JSON.parse(addedUser.body).access.users.map((user: { userId: string }) => user.userId)).toEqual(['u_alice'])
+
+    const wiki = await call(routes, SET_ACCESS_PERMISSION_ROUTE, post({ userId: 'u_alice', permission: 'wikiWrite', enabled: true }))
+    expect(wiki.status).toBe(200)
+    expect(JSON.parse(wiki.body).access.users[0]).toMatchObject({ userId: 'u_alice', wikiWrite: true })
+    const badSwitch = await call(routes, SET_ACCESS_PERMISSION_ROUTE, post({ userId: 'u_alice', permission: 'root', enabled: true }))
+    expect(badSwitch.status).toBe(400)
+    const badValue = await call(routes, SET_ACCESS_PERMISSION_ROUTE, post({ userId: 'u_alice', permission: 'chat' }))
+    expect(badValue.status).toBe(400)
+
     const removedUser = await call(routes, REMOVE_ACCESS_USER_ROUTE, post({ userId: 'u_alice' }))
     expect(JSON.parse(removedUser.body).access.users).toEqual([])
-
-    const removed = await call(routes, REMOVE_ACCESS_GROUP_ROUTE, post({ chatId: 'oc_team' }))
-    expect(removed.status).toBe(200)
-
-    const addedWiki = await call(routes, ADD_WIKI_USER_ROUTE, post({ userId: 'u_wiki', name: 'Wiki' }))
-    expect(addedWiki.status).toBe(200)
-    expect(JSON.parse(addedWiki.body).access.wikiUsers.map((user: { userId: string }) => user.userId)).toEqual(['u_wiki'])
-    const removedWiki = await call(routes, REMOVE_WIKI_USER_ROUTE, post({ userId: 'u_wiki' }))
-    expect(JSON.parse(removedWiki.body).access.wikiUsers).toEqual([])
-    const invalidWiki = await call(routes, ADD_WIKI_USER_ROUTE, post({ userId: 'ou_wiki' }))
-    expect(invalidWiki.status).toBe(400)
 
     const resolved = await call(routes, RESOLVE_ACCESS_REQUEST_ROUTE, post({ token: 'tok_1', decision: 'allow' }))
     expect(resolved.status).toBe(200)
     expect(JSON.parse(resolved.body).access.requests).toEqual([])
 
-    const missing = await call(routes, ADD_ACCESS_GROUP_ROUTE, post({}))
+    const missing = await call(routes, ADD_ACCESS_USER_ROUTE, post({}))
     expect(missing.status).toBe(400)
 
-    expect((await call(routes, ADD_ACCESS_GROUP_ROUTE)).status).toBe(404)
+    expect((await call(routes, SET_ACCESS_PERMISSION_ROUTE)).status).toBe(404)
   })
 
   it('writes and removes credentials over POST', async () => {
@@ -2218,7 +2170,7 @@ describe('apply() web wiring', () => {
     })
 
     expect(injected).toContainEqual(['connection'])
-    expect(routes.size).toBe(24)
+    expect(routes.size).toBe(21)
 
     const panel = await call(routes, PANEL_ROUTE)
     expect(panel.status).toBe(200)

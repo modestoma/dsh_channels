@@ -26,6 +26,7 @@ import {
 } from './contract.ts'
 import type {
   AccessMutationResponse,
+  AccessPermissionWire,
   AccessWire,
   CatalogWire,
   ChannelPhaseWire,
@@ -112,20 +113,14 @@ export interface SettingsTarget {
   credentialStates(): Promise<Record<CredentialField, CredentialInfo>>
   setCredential(field: CredentialField, value: string): Promise<void>
   clearCredential(field: CredentialField): Promise<void>
-  /** Current admission snapshot: mode, administrator, whitelists, pending requests. */
+  /** Current admission snapshot: mode, administrator, user table, pending requests. */
   accessSnapshot(): AccessWire
-  /** Authorize one group (panel entry); resolves with the refreshed snapshot. */
-  addAccessGroup(chatId: string, name?: string): Promise<AccessMutationResponse>
-  /** Revoke one group authorization (takes effect on the next message). */
-  removeAccessGroup(chatId: string): Promise<AccessMutationResponse>
-  /** Authorize one user `user_id` (global across authorized groups). */
+  /** Add one user `user_id` with only `chat` on (or turn `chat` back on). */
   addAccessUser(userId: string, name?: string): Promise<AccessMutationResponse>
-  /** Revoke one user authorization (takes effect on the next message). */
+  /** Remove one user from the table (takes effect on the next message). */
   removeAccessUser(userId: string): Promise<AccessMutationResponse>
-  /** Add one user `user_id` to the wiki whitelist. */
-  addWikiUser(userId: string, name?: string): Promise<AccessMutationResponse>
-  /** Remove one user from the wiki whitelist (takes effect on the next wiki tool call). */
-  removeWikiUser(userId: string): Promise<AccessMutationResponse>
+  /** Set one permission switch of a user already in the table (takes effect on the next check). */
+  setAccessPermission(userId: string, permission: AccessPermissionWire, enabled: boolean): Promise<AccessMutationResponse>
   /** Settle one pending request (panel shares this path with the Feishu DM card). */
   resolveAccessRequest(token: string, decision: 'allow' | 'deny'): Promise<AccessMutationResponse>
   /** Feishu origin of one Session, or null when Feishu never routed it. */
@@ -171,7 +166,6 @@ const BOOLEAN_KEYS = new Set<EditableKey>([
   'hostTurnCards',
   'slashCommandPanel',
   'allowPermissionSwitch',
-  'dmAllowWhitelist',
   'acceptAttachments',
   'prefetchImages',
   'feishuTools.attachmentFetch',
@@ -426,19 +420,13 @@ const FIELD_META: Record<EditableKey, FieldMeta> = {
     label: '调试模式',
     group: 'access',
     summary: '打开后所有人都能聊，不安全，只在调试时用',
-    help: '关闭时（默认）：管理员随时可用；非管理员私聊会被拒绝（打开「白名单用户可私聊」后白名单用户也可以）；群聊要同时满足群已授权、发言人在用户白名单里。授权入口有三个：群里 /auth 命令、授权卡、本页。撤销立即生效。',
-  },
-  dmAllowWhitelist: {
-    label: '白名单用户可私聊',
-    group: 'access',
-    summary: '关闭时私聊仅管理员可用',
-    help: '打开后「已授权用户」里的人也可以私聊机器人，各自使用独立的私聊工作区，能力与群聊相同；不在白名单的人仍收到固定提示。撤销用户立即生效。',
+    help: '关闭时（默认）：管理员随时可用；其他人要在用户表里并打开「对话准入」，才能私聊或在任何群里 @ 机器人。授权入口有三个：飞书 /auth 命令、授权卡、本页。撤销立即生效。打开后知识库与代码改动开关仍然生效。',
   },
   adminUserId: {
     label: '管理员 user_id',
     group: 'access',
     summary: '私聊机器人发送 /userid 获取；留空使用应用所有者',
-    help: '不是 ou_ 开头的 open_id，也不是邮箱。私聊关闭时 /userid 不可用，可以在飞书管理后台的成员详情里查看。自动使用应用所有者需要可选的「获取应用信息」权限。',
+    help: '不是 ou_ 开头的 open_id，也不是邮箱。也可以在飞书管理后台的成员详情里查看。自动使用应用所有者需要可选的「获取应用信息」权限。',
     placeholder: 'user_id',
   },
   authRequestTtlDays: { label: '申请有效期', group: 'access', summary: '授权申请卡多久内可以处理', min: 1, max: 30, step: 1, unit: '天' },
@@ -446,13 +434,13 @@ const FIELD_META: Record<EditableKey, FieldMeta> = {
     label: '读取知识库',
     group: 'wiki',
     summary: '浏览节点，读取文档、电子表格、多维表格',
-    help: '以应用身份访问，工具 feishu_wiki_list / feishu_wiki_read / feishu_wiki_sheet_read / feishu_wiki_base_read。打开文档前在授权卡上征得话题发起人同意，每个话题一次。只有管理员或下方「可使用的人」发起的话题能用（/auth wiki add @成员）。需要权限 wiki:wiki、docx:document（或只读）、sheets:spreadsheet:read、base:table:read、base:field:read、base:record:read；旧版 sheets:spreadsheet、bitable:app 不生效。对新会话生效。',
+    help: '以应用身份访问，工具 feishu_wiki_list / feishu_wiki_read / feishu_wiki_sheet_read / feishu_wiki_base_read。打开文档前在授权卡上征得话题发起人同意，每个话题一次。只有管理员或用户表里打开「读知识库」的人发起的话题能用（/auth set wiki-read on @成员）。需要权限 wiki:wiki、docx:document（或只读）、sheets:spreadsheet:read、base:table:read、base:field:read、base:record:read；旧版 sheets:spreadsheet、bitable:app 不生效。对新会话生效。',
   },
   'feishuTools.wikiWrite': {
     label: '编辑知识库',
     group: 'wiki',
     summary: '新建和修改文档、表格，每次都需审批',
-    help: '工具 feishu_wiki_create / feishu_wiki_edit / feishu_wiki_sheet_edit / feishu_wiki_base_edit。只能编辑本应用拥有的文档和表格；其他多维表格只能新增记录。需要读取工具的权限，以及 sheets:spreadsheet:write_only、base:record:create、base:record:update、base:record:delete。对新会话生效。',
+    help: '工具 feishu_wiki_create / feishu_wiki_edit / feishu_wiki_sheet_edit / feishu_wiki_base_edit。只有管理员或打开「写知识库」的人发起的话题能用（/auth set wiki-write on @成员）。只能编辑本应用拥有的文档和表格；其他多维表格只能新增记录。需要读取工具的权限，以及 sheets:spreadsheet:write_only、base:record:create、base:record:update、base:record:delete。对新会话生效。',
   },
   wikiRoots: {
     label: '可访问范围',
@@ -607,7 +595,7 @@ export function normalizeCredentialValue(raw: unknown): { ok: true; value: strin
 const MAX_ACCESS_VALUE_LENGTH = 128
 
 
-/** Format reason for a rejected user `user_id` (shared by the user and wiki whitelists). */
+/** Format reason for a rejected user `user_id`. */
 const USER_ID_FORMAT = '用户 user_id 只能包含字母、数字、_ 和 -（不是 ou_ 开头的 open_id，也不是邮箱）'
 
 /** Trim one whitelist identifier, rejecting empty, oversized, or hostile input. */
@@ -859,9 +847,7 @@ export class SettingsSurface {
         mode: effective.accessMode,
         admin: { configured: false },
         loaded: false,
-        groups: [],
         users: [],
-        wikiUsers: [],
         requests: [],
       }
     }
@@ -1114,45 +1100,36 @@ export class SettingsSurface {
     return { ok: true, panel: await this.panel() }
   }
 
-  /** Read the current admission snapshot (mode, administrator, whitelists, requests). */
+  /** Read the current admission snapshot (mode, administrator, user table, requests). */
   async access(): Promise<AccessWire> {
     return this.target.accessSnapshot()
   }
 
-  /** Authorize one group from the panel. Validation happens before the write. */
-  async saveAccessGroup(chatId: unknown, name?: unknown): Promise<AccessMutationResponse> {
-    const id = normalizeAccessId(chatId, '群 chat_id')
-    if (!id.ok) return { ok: false, error: id.message }
-    const label = normalizeAccessName(name)
-    if (!label.ok) return { ok: false, error: label.message }
-    return this.mutateAccess(() => this.target.addAccessGroup(id.value, label.value))
-  }
-
-  /** Revoke one group authorization (immediate: the next message re-evaluates). */
-  async removeAccessGroup(chatId: unknown): Promise<AccessMutationResponse> {
-    const id = normalizeAccessId(chatId, '群 chat_id')
-    if (!id.ok) return { ok: false, error: id.message }
-    return this.mutateAccess(() => this.target.removeAccessGroup(id.value))
-  }
-
-  /** Authorize one user `user_id` (not an open_id or email). */
+  /** Add one user `user_id` (not an open_id or email) with only `chat` on. */
   async saveAccessUser(userId: unknown, name?: unknown): Promise<AccessMutationResponse> {
     return this.saveUser(userId, name, (id, label) => this.target.addAccessUser(id, label))
   }
 
-  /** Revoke one user authorization (immediate: the next message re-evaluates). */
+  /** Remove one user from the table (immediate: the next message re-evaluates). */
   async removeAccessUser(userId: unknown): Promise<AccessMutationResponse> {
     return this.removeUser(userId, id => this.target.removeAccessUser(id))
   }
 
-  /** Add one user `user_id` to the wiki whitelist. */
-  async saveWikiUser(userId: unknown, name?: unknown): Promise<AccessMutationResponse> {
-    return this.saveUser(userId, name, (id, label) => this.target.addWikiUser(id, label))
-  }
-
-  /** Remove one user from the wiki whitelist (immediate: the next wiki tool call re-evaluates). */
-  async removeWikiUser(userId: unknown): Promise<AccessMutationResponse> {
-    return this.removeUser(userId, id => this.target.removeWikiUser(id))
+  /**
+   * Set one permission switch from the panel. Validation happens before the write.
+   * @param userId - raw `user_id` from the request body.
+   * @param permission - raw switch name.
+   * @param enabled - raw new value.
+   * @returns the refreshed snapshot, or the validation/write failure.
+   */
+  async setAccessPermission(userId: unknown, permission: unknown, enabled: unknown): Promise<AccessMutationResponse> {
+    const id = normalizeAccessId(userId, '用户 user_id', USER_ID_FORMAT)
+    if (!id.ok) return { ok: false, error: id.message }
+    if (permission !== 'chat' && permission !== 'wikiRead' && permission !== 'wikiWrite' && permission !== 'codeWrite') {
+      return { ok: false, error: '权限开关只能是 chat、wikiRead、wikiWrite 或 codeWrite' }
+    }
+    if (typeof enabled !== 'boolean') return { ok: false, error: 'enabled 必须是 true 或 false' }
+    return this.mutateAccess(() => this.target.setAccessPermission(id.value, permission, enabled))
   }
 
   private async saveUser(
@@ -1189,7 +1166,7 @@ export class SettingsSurface {
     return this.mutateAccess(() => this.target.resolveAccessRequest(normalized.value, decision))
   }
 
-  /** Run one whitelist mutation, folding thrown seam errors into the wire type. */
+  /** Run one access mutation, folding thrown seam errors into the wire type. */
   private async mutateAccess(
     mutation: () => Promise<AccessMutationResponse>,
   ): Promise<AccessMutationResponse> {

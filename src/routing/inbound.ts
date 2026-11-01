@@ -137,6 +137,11 @@ export interface InboundDeps {
     source?: KnownAttachmentSource,
   ): void
   /**
+   * Record the Feishu sender of the prompt one DSH user message carries
+   * (feeds the code-write gate's turn driver).
+   */
+  noteTurnSender(messageId: string, userId: string): void
+  /**
    * Read-only message access: quoted-message excerpt, first-turn topic
    * history, and recent attachment messages. Failures degrade silently to an
    * absent value (never a throw into the turn).
@@ -144,7 +149,7 @@ export interface InboundDeps {
   messageRead: InboundMessageReadPort
   /** Live image-prefetch policy for triggering messages. */
   prefetchImages(): AttachmentPrefetchPolicy
-  /** Channel-plane access control (administrator + whitelist gates). */
+  /** Channel-plane access control (administrator + user table). */
   access: InboundAccessPort
   /** Shared per-route FIFO admission (commands and turns must not interleave). */
   queue: RouteOperationQueue
@@ -402,8 +407,8 @@ export class InboundRouter {
       return
     }
 
-    // Channel-plane admission (administrator / group whitelist / user
-    // whitelist). Nothing below this point may run for a denied sender: no
+    // Channel-plane admission (administrator / user table `chat` switch).
+    // Nothing below this point may run for a denied sender: no
     // TTL tombstone, attachment archive, workspace, Session, or model call.
     if (!(await this.access.admit(msg))) return
 
@@ -760,6 +765,18 @@ export class InboundRouter {
     record: RouteRecord,
     content: string,
     options: TurnDeliveryOptions = {},
+  ): Promise<UserMessage> {
+    const message = await this.assembleTurnMessage(msg, record, content, options)
+    this.deps.noteTurnSender(message.id, msg.senderId)
+    return message
+  }
+
+  /** Build the prompt of one turn; see {@link deliverTurnMessage}. */
+  private async assembleTurnMessage(
+    msg: NormalizedMessage,
+    record: RouteRecord,
+    content: string,
+    options: TurnDeliveryOptions,
   ): Promise<UserMessage> {
     try {
       if (this.attachmentBackend() !== 'native') {

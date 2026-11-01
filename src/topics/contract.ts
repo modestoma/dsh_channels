@@ -2,7 +2,7 @@
  * Types of the `feishuTopics` service: another DSH plugin starts a
  * group-shared Feishu topic Session from an external trigger.
  *
- * One launch posts a root card into an authorized group, opens a topic below
+ * One launch posts a root card into a group the bot is in, opens a topic below
  * it, creates the Session in a workspace below the channel's `baseDir`, and
  * streams the first turn (the prompt, verbatim) in that topic. The root card's
  * status tag follows the first turn (进行中 → 已完成 / 已停止 / 失败) and turns
@@ -79,9 +79,14 @@ export interface TopicLaunchSpec {
    * replay: the same key with another fingerprint is refused (`key-conflict`).
    */
   readonly fingerprint: string
-  /** Target group chat (`oc_…`). It must be an authorized group, or the channel must run in `open` access mode. */
+  /** Target group chat (`oc_…`); the bot must be a member. */
   readonly chatId: string
-  /** Feishu `user_id` of the person the launch is for: @-mentioned on the root card and recorded as the route's requester. */
+  /**
+   * Feishu `user_id` of the person the launch is for: @-mentioned on the root
+   * card and recorded as the route's requester. It must be the administrator
+   * or a user whose `chat` switch is on, unless the channel runs in `open`
+   * access mode.
+   */
   readonly requesterUserId: string
   readonly card: TopicRootCard
   /**
@@ -109,7 +114,11 @@ export type TopicLaunchFailureCode =
   | 'invalid'
   /** The Feishu connection is not established, or the channel is shutting down. */
   | 'not-connected'
-  /** The target group is not authorized. */
+  /**
+   * The requester may not talk to the bot (not the administrator and no
+   * `chat` switch). The code name predates the user table and is kept for
+   * existing callers.
+   */
   | 'forbidden-chat'
   /** The key was accepted before with another fingerprint. */
   | 'key-conflict'
