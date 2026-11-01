@@ -343,7 +343,7 @@ describe('ApprovalAnswerer usability', () => {
     const b = answerer.onRequest(makeRequest('sess-approval', { toolName: 'edit', callId: 'call-2' }), nextOf('unavailable'))
     await vi.waitFor(() => expect(channel.sent).toHaveLength(2))
     expect(sentCard(channel, 0)).toContain('{not json')
-    expect(sentCard(channel, 1)).toContain('a.txt')
+    expect(sentCard(channel, 1)).toContain('path: a.txt')
     answerer.dispose()
     await Promise.all([a, b])
   })

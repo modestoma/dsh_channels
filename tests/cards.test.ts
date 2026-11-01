@@ -531,7 +531,7 @@ describe('approval decision cards', () => {
   }
 
   function buttonsOf(card: object): Array<Record<string, any>> {
-    const row = approvalElements(card).find(element => element.tag === 'column_set')
+    const row = approvalElements(card).find(element => element.tag === 'column_set' && element.flex_mode === 'bisect')
     return row?.columns.flatMap((column: Record<string, any>) =>
       column.elements.filter((element: Record<string, any>) => element.tag === 'button')) ?? []
   }
@@ -547,22 +547,21 @@ describe('approval decision cards', () => {
     expect(card.schema).toBe('2.0')
     expect(card.config.width_mode).toBe('fill')
     expect(approvalElements(card).map(element => element.tag)).toEqual([
-      'markdown', 'markdown', 'markdown', 'hr', 'markdown', 'markdown', 'markdown', 'column_set', 'button', 'markdown',
+      'markdown', 'div', 'hr', 'markdown', 'markdown', 'markdown', 'column_set', 'button', 'markdown',
     ])
 
     const markdowns = markdownsOf(card)
-    expect(markdowns[0]).toContain('需要你的审批')
-    expect(markdowns[1]).toContain('bash')
-    // The reason renders as its own blockquote markdown line.
-    expect(markdowns[2]).toBe('> 需要写入工作区外的文件')
-    expect(markdowns[3]).toContain('5 分钟')
-    expect(markdowns[3]).toContain('超时自动拒绝')
-    expect(markdowns[4]).toContain('回复其他内容视为拒绝')
-    expect(markdowns[5]).toContain('sess-1')
-    expect(markdowns[6]).toContain('本话题内 `bash` 都自动允许')
-    expect(markdowns[6]).toContain('/renew')
+    expect(markdowns[0]).toBe('**⚠️ 需要你的审批 · `bash`**')
+    // The reason is plain text, never read as markdown.
+    expect(approvalElements(card)[1]).toEqual({ tag: 'div', text: { tag: 'plain_text', content: '需要写入工作区外的文件' } })
+    expect(markdowns[1]).toContain('5 分钟')
+    expect(markdowns[1]).toContain('超时自动拒绝')
+    expect(markdowns[2]).toContain('回复其他内容视为拒绝')
+    expect(markdowns[3]).toContain('sess-1')
+    expect(markdowns[4]).toContain('本话题内 `bash` 都自动允许')
+    expect(markdowns[4]).toContain('/renew')
 
-    const actionRow = approvalElements(card).find(element => element.tag === 'column_set')!
+    const actionRow = approvalElements(card).find(element => element.tag === 'column_set' && element.flex_mode === 'bisect')!
     expect(actionRow.flex_mode).toBe('bisect')
     expect(actionRow.horizontal_spacing).toBe('medium')
     expect(actionRow.columns).toHaveLength(2)
@@ -585,7 +584,7 @@ describe('approval decision cards', () => {
     expect(always.type).toBe('default')
     expect(always.behaviors).toEqual([{ type: 'callback', value: { decision: 'always', token: 'tok-1' } }])
 
-    expect(notationMarkdownsOf(card)).toContain(markdowns[3]!)
+    expect(notationMarkdownsOf(card)).toContain(markdowns[1]!)
   })
 
   it('shows the command, the escalation target, and a danger grant for full access', () => {
@@ -607,9 +606,54 @@ describe('approval decision cards', () => {
   it('clips a long command and says how much was hidden', () => {
     const card = buildApprovalCard({ ...question, command: 'a'.repeat(700) })
     const markdowns = markdownsOf(card)
-    expect(markdowns[2]).toContain('a'.repeat(600))
-    expect(markdowns[2]).not.toContain('a'.repeat(601))
-    expect(markdowns[3]).toContain('已截断 100 个字符')
+    expect(markdowns[1]).toContain('a'.repeat(600))
+    expect(markdowns[1]).not.toContain('a'.repeat(601))
+    expect(markdowns[2]).toContain('已截断 100 个字符')
+  })
+
+  function textsOf(element: Record<string, any>): string[] {
+    if (element.tag === 'div') return [element.text.content as string]
+    return (element.columns ?? []).flatMap((column: Record<string, any>) => column.elements.flatMap(textsOf))
+  }
+
+  it('renders a structured reason as label rows and a list, with the arguments folded away', () => {
+    const card = buildApprovalCard({
+      token: 'tok-1',
+      toolName: 'repo_workspace_push',
+      reason: '推送工作区改动到新分支 fix/a_b\n仓库：https://git.example.com/a/b.git\n提交说明：fix: a*b\n  修改 src/a_b.ts  +3 −1\n  新增 logo.png（二进制）',
+      arguments: 'branch: fix/a_b\nmessage: fix: a*b',
+      timeoutMs: 300_000,
+    })
+    const elements = approvalElements(card)
+    expect(markdownsOf(card)[0]).toBe('**⚠️ 需要你的审批 · `repo_workspace_push`**')
+    // No generic "tool asks" sentence when the asker described the call.
+    expect(markdownsOf(card).join('\n')).not.toContain('请求执行一个需要授权的操作')
+    expect(elements.slice(1, 6).map(element => element.tag)).toEqual(['div', 'column_set', 'column_set', 'div', 'collapsible_panel'])
+    expect(textsOf(elements[1]!)).toEqual(['推送工作区改动到新分支 fix/a_b'])
+    expect(textsOf(elements[2]!)).toEqual(['仓库', 'https://git.example.com/a/b.git'])
+    expect(textsOf(elements[3]!)).toEqual(['提交说明', 'fix: a*b'])
+    expect(textsOf(elements[4]!)).toEqual(['· 修改 src/a_b.ts  +3 −1\n· 新增 logo.png（二进制）'])
+    const panel = elements[5]!
+    expect(panel.expanded).toBe(false)
+    expect(panel.header.title.content).toBe('调用参数')
+    expect(panel.elements[0].text.content).toBe('branch: fix/a_b\nmessage: fix: a*b')
+  })
+
+  it('shows the arguments unfolded when nothing else describes the call', () => {
+    const card = buildApprovalCard({ token: 'tok-1', toolName: 'edit', arguments: 'path: a.txt', timeoutMs: 60_000 })
+    const elements = approvalElements(card)
+    expect(markdownsOf(card)[1]).toContain('请求执行一个需要授权的操作')
+    expect(markdownsOf(card)[2]).toBe('**调用参数**')
+    expect(elements.some(element => element.tag === 'collapsible_panel')).toBe(false)
+    expect(JSON.stringify(card)).toContain('path: a.txt')
+  })
+
+  it('says how many reason lines were left out', () => {
+    const reason = Array.from({ length: 35 }, (_, index) => `line ${index}`).join('\n')
+    const card = buildApprovalCard({ ...question, reason })
+    expect(JSON.stringify(card)).toContain('line 29')
+    expect(JSON.stringify(card)).not.toContain('line 30')
+    expect(notationMarkdownsOf(card)).toContain('另有 5 行未显示')
   })
 
   it('omits the reason blockquote and session line when absent', () => {
@@ -639,7 +683,7 @@ describe('approval decision cards', () => {
       timeoutMs: 300_000,
     })
     expect(cardJsonBytes(huge)).toBeLessThanOrEqual(CARD_MAX_BYTES)
-    expect(cardJsonBytes(huge)).toBeLessThan(5_000)
+    expect(cardJsonBytes(huge)).toBeLessThan(8_000)
   })
 
   it.each([
