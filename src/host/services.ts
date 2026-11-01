@@ -111,56 +111,12 @@ export interface LlmModelInfo {
   reasoning?: LlmModelReasoningInfo
 }
 
-/** One model an endpoint reported during model discovery. */
-export interface LlmDiscoveredModel {
-  id: string
-  name?: string
-  contextWindow?: number
-  maxTokens?: number
-}
-
-/** Draft endpoint facts sent to a namespace's model discovery. */
-export interface LlmModelDiscoveryRequest {
-  provider?: string
-  baseURL?: string
-  api?: string
-  apiKey?: string
-}
-
 export interface LlmService {
   resolveModelInfo(provider: string, model: string): Promise<LlmModelInfo>
   /** Registered provider routes, when the deployment exposes them. */
   listProviders?(): readonly LlmProviderInfo[]
   /** Models advertised for one provider route. */
   listModels?(provider: string): Promise<readonly LlmModelInfo[]>
-  /**
-   * Interrogate a draft endpoint through the discovery a settings namespace
-   * registered (`llm-pi-ai` registers one for hand-declared routes).
-   * @param settingsNs - namespace owning the discovery.
-   * @param request - endpoint facts, including the API key to try.
-   * @param signal - aborts the endpoint request.
-   * @returns the models the endpoint reported.
-   */
-  discoverModels?(settingsNs: string, request: LlmModelDiscoveryRequest, signal?: AbortSignal): Promise<readonly LlmDiscoveredModel[]>
-}
-
-/** One ordered edit of a settings namespace (`@deepseek-ai/dsh-settings`). */
-export type SettingsPathOp =
-  | { op: 'set'; path: readonly string[]; value: unknown }
-  | { op: 'unset'; path: readonly string[] }
-
-/**
- * The host's schema-derived plugin configuration forms (`ctx.settings`). Only
- * the write used to register personal provider routes is declared.
- */
-export interface SettingsService {
-  /**
-   * Apply field edits to one profile entry's live configuration.
-   * @param ns - profile entry id (e.g. `llm-pi-ai`).
-   * @param ops - ordered edits; each path must address a volatile field.
-   * @param expectedRevision - optional optimistic-concurrency revision.
-   */
-  mutate(ns: string, ops: readonly SettingsPathOp[], expectedRevision?: number): Promise<void>
 }
 
 /**

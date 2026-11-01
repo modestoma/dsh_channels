@@ -816,9 +816,9 @@ describe('streaming card stop button', () => {
 
 describe('command picker cards', () => {
   const input = {
-    title: '🧠 模型',
-    command: 'model' as const,
-    text: '**当前模型**：`a`',
+    title: '💭 推理强度',
+    command: 'effort' as const,
+    text: '**当前推理强度**：`a`',
     sessionId: 'sess-pick',
     options: [{ label: 'a', arg: 'a' }, { label: 'b', arg: 'b' }, { label: 'c', arg: 'c' }],
     current: 'a',
@@ -831,7 +831,7 @@ describe('command picker cards', () => {
     expect(buttons.every(button => button.width === 'fill')).toBe(true)
     expect(buttons.map(buttonLabel)).toEqual(['✅ a', 'b', 'c'])
     expect(buttons[0]!.type).toBe('primary')
-    expect(buttonValue(buttons[1]!)).toEqual({ decision: PICK_ACTION, command: 'model', arg: 'b', sessionId: 'sess-pick' })
+    expect(buttonValue(buttons[1]!)).toEqual({ decision: PICK_ACTION, command: 'effort', arg: 'b', sessionId: 'sess-pick' })
     expect(JSON.stringify(card)).toContain('仅发起该会话的用户可操作')
   })
 

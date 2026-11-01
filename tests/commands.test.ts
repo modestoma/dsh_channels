@@ -30,7 +30,7 @@ describe('slash command primitives', () => {
       expect(help).toContain(`**${group}**`)
     }
     // The usage hint comes from the registry, not a second hand-written copy.
-    expect(help).toContain('**/effort** [id|default|reset] — 查看或切换当前 Session 推理强度')
+    expect(help).toContain('**/effort** [id|reset] — 查看或切换当前 Session 推理强度')
   })
 
   it('accepts the /new alias and resolves it to /renew', () => {
@@ -44,7 +44,7 @@ describe('slash command primitives', () => {
     const commands = makeCommandRuntime()
     registerChannelCommands(commands)
     expect([...commands.definitions.keys()].sort()).toEqual([
-      'effort', 'export', 'health', 'help', 'history', 'model', 'renew', 'status', 'workspace',
+      'effort', 'export', 'health', 'help', 'history', 'renew', 'status', 'workspace',
     ])
     expect(commands.definitions.has('compact')).toBe(false)
 
@@ -124,7 +124,7 @@ describe('slash command primitives', () => {
 
     await mountChannelCommands(bareAgentCtx as unknown as AgentContext)
     expect([...commands.definitions.keys()].sort()).toEqual([
-      'effort', 'export', 'health', 'help', 'history', 'model', 'renew', 'status', 'workspace',
+      'effort', 'export', 'health', 'help', 'history', 'renew', 'status', 'workspace',
     ])
 
     await ctx.fiber.dispose()

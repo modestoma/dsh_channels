@@ -1,5 +1,5 @@
 /**
- * Command picker cards: `/model`, `/effort` and `/permissions` without
+ * Command picker cards: `/effort` and `/permissions` without
  * arguments answer with clickable choices instead of ids to retype.
  *
  * A click carries the command and its argument back to the service, which
@@ -16,7 +16,7 @@ import { divider, markdown, note, standaloneCard, textButton } from './primitive
 export const PICK_ACTION = 'command-pick'
 
 /** Commands that answer their bare form with a picker card. */
-export const PICKER_COMMANDS = ['model', 'effort', 'permissions'] as const
+export const PICKER_COMMANDS = ['effort', 'permissions'] as const
 export type PickerCommand = typeof PICKER_COMMANDS[number]
 
 /** Cap on rendered choices so one picker cannot approach the card budget. */
@@ -26,7 +26,7 @@ export const MAX_PICKER_OPTIONS = 12
 export interface PickAction {
   decision: typeof PICK_ACTION
   command: PickerCommand
-  /** Argument appended to the command line (`/model <arg>`). */
+  /** Argument appended to the command line (`/effort <arg>`). */
   arg: string
   /** Session the picker was rendered for; a rebound topic makes it stale. */
   sessionId: string

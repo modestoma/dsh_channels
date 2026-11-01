@@ -26,13 +26,12 @@ import type {
 import type { FeishuConfig } from '../config.ts'
 import { mountChannelCommands } from '../commands.ts'
 import { appendSessionHistory, sessionDirOf } from '../domain.ts'
-import type { RouteRecord, SessionLlm } from '../domain.ts'
+import type { RouteRecord } from '../domain.ts'
 import { mountChannelGuidance } from '../feishu/agent-context.ts'
 import { attachmentsDir } from '../feishu/inbound-attachments.ts'
 import { effectiveAttachmentMode, resolveAttachmentService } from '../feishu/native-attachments.ts'
-import { policyConfigFor } from '../llm/selection.ts'
 import { installRequestPolicy } from './request-policy.ts'
-import type { RequestPolicyConfig, RequestPolicyController } from './request-policy.ts'
+import type { RequestPolicyController } from './request-policy.ts'
 import { placementServices, restoreTopicDir } from './isolation.ts'
 import type { PlacementServices, TopicPlacement } from './isolation.ts'
 import { workspaceTitleFor } from '../workspaces.ts'
@@ -75,12 +74,6 @@ export interface SessionManagerDeps {
    * compose model tools omit it.
    */
   mountTools?(agentCtx: AgentContext, sessionId: string): Promise<void> | void
-  /**
-   * Starting model choice for a Session the user creates (their `/model`
-   * preference); undefined follows the deployment default. Optional: tests
-   * without per-user models omit it.
-   */
-  sessionLlmFor?(userId: string): SessionLlm | undefined
   warn(message: string, ...args: unknown[]): void
 }
 
@@ -113,15 +106,10 @@ export class SessionManager {
     return this.live.size
   }
 
-  /**
-   * Provider/model/token caps of one Session this plugin creates or resumes.
-   * @param llm - the Session's recorded model choice; absent = deployment default.
-   * @returns the agent options.
-   */
-  agentOptions(llm?: SessionLlm): Record<string, unknown> {
+  /** Provider/model/token caps sessions this plugin creates. */
+  agentOptions(): Record<string, unknown> {
     const options: Record<string, unknown> = {}
-    const { provider, model } = this.policyConfig(llm)
-    const { maxTokens } = this.deps.config
+    const { provider, model, maxTokens } = this.deps.config
     if (provider !== undefined) options.provider = provider
     if (model !== undefined) options.model = model
     if (maxTokens !== undefined) options.maxTokens = maxTokens
@@ -129,49 +117,17 @@ export class SessionManager {
   }
 
   /**
-   * Starting model choice of a Session `userId` creates now.
-   * @param userId - the Session owner's Feishu user_id.
-   * @returns the choice to record on the route; undefined follows the deployment default.
-   */
-  sessionLlmFor(userId: string): SessionLlm | undefined {
-    return this.deps.sessionLlmFor?.(userId)
-  }
-
-  /**
-   * Request-policy configuration of a Session with this recorded choice. A
-   * pinned route the host no longer lists (a personal endpoint that was
-   * unbound) falls back to the deployment default instead of failing every
-   * request of the Session.
-   */
-  private policyConfig(recorded: SessionLlm | undefined): RequestPolicyConfig {
-    const llm = recorded?.provider !== undefined && !this.providerListed(recorded.provider) ? undefined : recorded
-    return policyConfigFor(llm, {
-      effort: this.deps.config.reasoningEffort,
-      provider: this.deps.config.provider,
-      model: this.deps.config.model,
-    })
-  }
-
-  /** Whether the host lists a provider route; true when the host offers no listing. */
-  private providerListed(provider: string): boolean {
-    const providers = this.deps.ctx.llm?.listProviders?.()
-    return providers === undefined || providers.some(entry => entry.id === provider)
-  }
-
-  /**
    * Create the root agent for one freshly routed session and register it live.
    * `cwd` is the Session header cwd (the user workspace when the deployment can
-   * switch directories); `llm` is the owner's starting model choice, which the
-   * caller records on the route. The caller owns placement, the workspace
-   * attachment, the attachment guidance, and the failure card.
+   * switch directories). The caller owns placement, the workspace attachment,
+   * the attachment guidance, and the failure card.
    */
   async createSession(
     sessionId: SessionId,
     cwd: string,
-    llm?: SessionLlm,
+    agentOptions: Record<string, unknown> = this.agentOptions(),
   ): Promise<AgentHandle> {
-    const agentOptions = this.agentOptions(llm)
-    const composition = await this.presetComposition(undefined, true, sessionId, llm)
+    const composition = await this.presetComposition(undefined, true, sessionId)
     const handle = await this.deps.ctx.agents.create({
       sessionId,
       meta: {
@@ -237,7 +193,7 @@ export class SessionManager {
     if (own !== undefined) return own
 
     const foreign = this.deps.ctx.agents.get(sessionId as SessionId)
-    if (foreign !== undefined) return await this.borrow(sessionId, foreign, record.llm)
+    if (foreign !== undefined) return await this.borrow(sessionId, foreign)
 
     let pending = this.pendingResume.get(sessionId)
     if (pending === undefined) {
@@ -250,8 +206,8 @@ export class SessionManager {
   }
 
   /** Borrow one foreign live agent and mount this channel's scoped policy. */
-  private async borrow(sessionId: string, agent: Agent, llm: SessionLlm | undefined): Promise<LiveAgent> {
-    const borrowed = borrowLiveAgent(agent, this.mountRequestPolicy(agent.ctx, agent, llm))
+  private async borrow(sessionId: string, agent: Agent): Promise<LiveAgent> {
+    const borrowed = borrowLiveAgent(agent, this.mountRequestPolicy(agent.ctx, agent))
     this.live.set(sessionId, borrowed)
     // Best-effort tool backfill (D7): the foreign owner may have composed the
     // session without this plugin's setup (web UI resolver, previous plugin
@@ -269,10 +225,10 @@ export class SessionManager {
       // (config override or roster default). A session persisted before the
       // preset fix has no preset recorded on its header; re-resolving here is
       // what repairs it on the first resume after a restart.
-      const composition = await this.presetComposition(undefined, true, sessionId, record.llm)
+      const composition = await this.presetComposition(undefined, true, sessionId)
       const handle = await this.deps.ctx.agents.resume({
         resumeSessionId: sessionId,
-        agentOptions: this.agentOptions(record.llm),
+        agentOptions: this.agentOptions(),
         setup: composition.setup,
       })
       if (!this.deps.started()) {
@@ -291,21 +247,17 @@ export class SessionManager {
       // Lost a cold-resume race: another owner published the session while our
       // resume was in flight. Borrow the winner instead of failing the turn.
       const winner = this.deps.ctx.agents.get(sessionId)
-      if (winner !== undefined) return await this.borrow(sessionId, winner, record.llm)
+      if (winner !== undefined) return await this.borrow(sessionId, winner)
       throw error
     }
   }
 
-  /**
-   * Mount one mutable Session-aware request policy outside every other wrapper.
-   * @param agentCtx - the Agent scope.
-   * @param agent - the live Agent, when it already exists (borrow).
-   * @param llm - the Session's recorded model choice; absent = deployment default.
-   * @returns the disposer of this policy.
-   */
-  mountRequestPolicy(agentCtx: AgentContext, agent?: Agent, llm?: SessionLlm): () => void {
-    const controller = installRequestPolicy(agentCtx, this.policyConfig(llm), {
-      providerAvailable: provider => this.providerListed(provider),
+  /** Mount one mutable Session-aware request policy outside every other wrapper. */
+  mountRequestPolicy(agentCtx: AgentContext, agent?: Agent): () => void {
+    const controller = installRequestPolicy(agentCtx, {
+      effort: this.deps.config.reasoningEffort,
+      provider: this.deps.config.provider,
+      model: this.deps.config.model,
     })
     if (agent !== undefined) controller.sync(agent.session.snapshotEvents(), agent)
     this.policies.set(agentCtx, controller)
@@ -326,30 +278,16 @@ export class SessionManager {
   }
 
   /**
-   * Agent options of the Session `/renew` creates. A recorded choice replaces
-   * the old provider/model; returning to the deployment default drops the
-   * route the old Session was pinned to; otherwise the old options carry over.
-   */
-  private renewedAgentOptions(record: RouteRecord, oldLive: LiveAgent, llm: SessionLlm | undefined): Record<string, unknown> {
-    if (llm !== undefined) return { ...oldLive.agent.options, ...this.agentOptions(llm) }
-    if (record.llm?.provider === undefined) return { ...oldLive.agent.options }
-    const { provider: _pinnedProvider, model: _pinnedModel, ...rest } = oldLive.agent.options as Record<string, unknown>
-    return { ...rest, ...this.agentOptions() }
-  }
-
-  /**
    * Create, place, workspace-attach, and atomically publish one renewed route.
    *
    * A renewal keeps the topic's working directory: the new Session is created
    * with the user workspace as its header cwd (so it stays grouped under the
    * project) and then re-entered into the same topic directory or worktree.
-   * The new Session starts from the owner's current model preference.
    */
   async renew(record: RouteRecord, oldLive: LiveAgent): Promise<RenewCommit> {
     const sessionId = randomUUID() as SessionId
     const preset = this.effectivePreset(oldLive.agent.session)
-    const llm = this.sessionLlmFor(record.senderUserId)
-    const composition = await this.presetComposition(preset, false, sessionId, llm)
+    const composition = await this.presetComposition(preset, false, sessionId)
     const services: PlacementServices = placementServices(this.deps.ctx)
     const switchable = services.workingDirectory !== undefined
     const workspacePath = record.workspacePath
@@ -369,7 +307,7 @@ export class SessionManager {
           cwd: switchable ? workspacePath : sessionDirOf(record),
           ...(composition.agentPreset === undefined ? {} : { agentPreset: composition.agentPreset }),
         },
-        agentOptions: this.renewedAgentOptions(record, oldLive, llm),
+        agentOptions: { ...oldLive.agent.options },
         setup: composition.setup,
       })
       this.requestPolicy(newHandle.agent)
@@ -393,8 +331,6 @@ export class SessionManager {
         sessionDir: placement.sessionDir,
       }
       delete base.worktreeBranch
-      delete base.llm
-      if (llm !== undefined) base.llm = llm
       const current: RouteRecord = placement.worktreeBranch === undefined
         ? base
         : { ...base, worktreeBranch: placement.worktreeBranch }
@@ -455,7 +391,6 @@ export class SessionManager {
     requestedPreset: string | undefined = this.deps.config.agentPreset,
     useRosterDefault = true,
     sessionId?: string,
-    llm?: SessionLlm,
   ): Promise<PresetComposition> {
     // Read through ctx.get (safe lookup): only the web profile ships a roster,
     // and direct property access on a cordis context throws for services the
@@ -465,7 +400,7 @@ export class SessionManager {
       // `prepend` is essential: standing preset listeners may have been
       // mounted before this Agent existed, so setup registration order alone
       // cannot guarantee that the explicit channel value wins.
-      this.mountRequestPolicy(agentCtx, undefined, llm)
+      this.mountRequestPolicy(agentCtx)
       await mountChannelCommands(agentCtx)
       if (sessionId !== undefined) await this.mountToolsFor(agentCtx, sessionId)
     }
@@ -476,7 +411,7 @@ export class SessionManager {
     return {
       agentPreset: resolved.id,
       setup: async (agentCtx) => {
-        this.mountRequestPolicy(agentCtx, undefined, llm)
+        this.mountRequestPolicy(agentCtx)
         await presets.mount(agentCtx, resolved.id)
         await mountChannelCommands(agentCtx)
         if (sessionId !== undefined) await this.mountToolsFor(agentCtx, sessionId)

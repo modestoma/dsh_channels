@@ -28,9 +28,7 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 - `/health`：显示 Harness 与飞书通道健康状态，无需绑定 Session；回复方式同 `/help`（直接回复，话题内回在话题中）
 - `/status`：显示当前 Session 状态与性能指标
 - `/workspace`：显示当前 Session 工作目录
-- `/effort`：查看当前 Session 推理强度；当前模型声明了可选档位时，回复卡附档位按钮，点一下即切换；`/effort <档位-id>` 切换，`/effort default` 改用模型自身默认（忽略配置值），`/effort reset` 恢复配置默认
-- `/model`：不带参数时回复一张**个人模型选择卡**，有没有 Session 都能用（发起会话前 @ 机器人发 `/model` 即可）：上半部分是管理员配置的缺省 API 的模型（缺省模型排第一并标「缺省」，选它就是跟随管理员的缺省模型和推理强度），中间是「我的 API」上的模型，下半部分是当前所选模型声明的推理强度；模型超过 8 个时改成下拉框。点选保存为**你之后新发起会话的模型**；在你自己发起的会话里点选，还会立即切换当前会话（群里共用话题只有发起人能切换当前会话），会话实际在用的模型和你保存的不一样时，卡上会标出来。带参数时只切换当前 Session：`/model <模型-id>`（沿用当前 provider）、`/model <provider>/<model>`，`/model reset` 恢复本会话创建时的模型；非管理员只能切到缺省 API 或自己绑定的 API
-- `/llm`：绑定**自己的模型 API**。表单卡总在私聊里出现（群里发 `/llm` 或在 `/model` 卡上点「绑定我的 API」，机器人都会私聊你发表单），填写接口协议、API 地址和 API key（密码框）；提交时先用这个 key 拉取模型列表验证（卡上显示验证中），通过后 key 存入本机 DSH 凭据库，并在宿主 `llm-pi-ai` 里登记一条只属于你的 provider 路由，表单随即变成模型选择卡，之后你新发起的会话改用你的 API。验证失败时表单保留已填的协议和地址，只需重填 key。再次发送可修改（key 留空保留原 key）或解绑（会先弹窗确认）
+- `/effort`：查看当前 Session 推理强度；当前模型声明了可选档位时，回复卡附档位按钮，点一下即切换；`/effort <档位-id>` 切换，`/effort reset` 恢复配置默认
 - `/compact`：调用 Harness 原生命令压缩当前 Session 上下文
 - `/renew`：在当前话题创建并绑定新 Session
 - `/stop`：中断当前正在运行的回合（不冷恢复 Session；排队中的后续消息保留并接着运行；没有运行中的回合时明确提示）。流式卡片上的「⏹ 停止」按钮效果相同
@@ -39,7 +37,7 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 - `/history`：显示当前话题的 Session 历史（含 `ctx.sessionQuery` 折叠出的会话标题与 live 标记）
 - `/export`：导出当前 Session 的逻辑日志
 
-下面说的「选择卡」指 `/effort` 和 `/permissions`（`/model` 是上面的个人模型选择卡）。选择卡的选项单列排列；按钮等同于在该卡下输入对应命令（如点「deepseek-v4-pro」= `/model deepseek-v4-pro`），走同样的准入、归属与校验，执行结果原地替换该选择卡（更新失败时才另发一张结果卡）；只有话题发起人点击、且卡片仍在原聊天里时才生效，话题换绑 Session 后旧卡上的按钮失效。按钮最多显示 12 个，其余可直接输入命令。
+选择卡的选项单列排列；按钮等同于在该卡下输入对应命令（如点「high」= `/effort high`），走同样的准入、归属与校验，执行结果原地替换该选择卡（更新失败时才另发一张结果卡）；只有话题发起人点击、且卡片仍在原聊天里时才生效，话题换绑 Session 后旧卡上的按钮失效。按钮最多显示 12 个，其余可直接输入命令。
 
 `/new` 是 `/renew` 的别名。`/help` 由命令注册表按分组生成，新增命令只需在注册表里加一行。
 
@@ -196,8 +194,7 @@ src/
 │   ├── repair.ts          #   inflight 快照 + 重启恢复（重放 / 补画 / 继续）
 │   ├── manager.ts         #   live Agent、冷恢复、preset、/renew 事务
 │   ├── isolation.ts       #   话题工作目录编排：workingDirectory 切换 / Git worktree + 降级
-│   └── request-policy.ts  #   会话级 provider/model/reasoningEffort 覆盖（/model、/effort）
-├── llm/                   # 个人模型：user_llm 偏好、个人 API 路由登记、/model 选择卡、/llm 绑定表单
+│   └── request-policy.ts  #   会话请求策略：配置的 provider/model 与推理强度（含 /effort 覆盖）
 ├── feishu/
 │   ├── delivery.ts        # 出站投递：首帧话题卡、结果卡、分段降级、表情生命周期
 │   ├── native-attachments.ts  # 原生附件存储/降级：saveImage/saveFileStream、生效后端选择
@@ -288,7 +285,6 @@ npm 发行包已包含构建产物：Host 入口是 `lib/index.js`（profile 直
     provider: 'deepseek-official'       # 可选：省略则用部署默认
     model: 'deepseek-v4-flash'          # 可选
     reasoningEffort: 'high'             # 可选：模型声明的精确档位 id；省略则用适配器/provider 默认
-    personalLlmNamespace: 'llm-pi-ai'   # /llm 个人 API 登记到的 llm-pi-ai 插件条目 id；留空关闭 /llm
     agentPreset: 'standard'             # 可选：省略则挂 roster 默认 preset（web profile 下工具只在 preset 里）
     refreshMs: 500                      # 卡片刷新频率
     statusRefreshMs: 5000               # 活动状态行保活间隔（工具/子代理/工作流等待期的计时刷新）
@@ -349,7 +345,7 @@ npm 发行包已包含构建产物：Host 入口是 `lib/index.js`（profile 直
     loggerLevel: 'info'
 ```
 
-`reasoningEffort` 是每个 Session 的初始/重置默认值。DSH 0.2.2 起模型选择归 Agent 所有（`agent.model`），插件在新建、恢复、借用 Agent 以及 `/model`、`/effort` 成功后用 `agent.model.select()` 记录生效的 provider/model/推理强度（`/model reset` 回到 Agent 的部署默认路由）；DSH 0.2.1 没有 `agent.model`，插件改为在该 Agent 作用域内以 `prepend` 外层覆盖 `agent/request`，因此胜过已存在的模型选择与 provider 默认。两种宿主自动识别，无需配置；借用外部 Agent 时，插件关闭只移除这条频道策略，不销毁外部 Agent。话题所有者可用 `/effort <档位-id>` 覆盖当前 Session，`/effort` 查看生效来源，`/effort reset` 恢复该配置值（未配置时恢复模型适配器/provider 默认），`/effort default` 则忽略配置值、改用模型适配器/provider 默认。成功选择由 Session 自带的 `command/run` / `command/done` 日志恢复，重启后仍生效；新建 Session 不继承旧 Session 的覆盖。
+飞书里不提供切换模型的命令：模型只在设置面板「模型」标签页（即上面的 `provider` / `model`）配置，对插件创建的所有会话统一生效；留空时使用 DSH 部署默认模型。`reasoningEffort` 是每个 Session 的初始/重置默认值。DSH 0.2.2 起模型选择归 Agent 所有（`agent.model`），插件在新建、恢复、借用 Agent 以及 `/effort` 成功后用 `agent.model.select()` 记录生效的 provider/model/推理强度；DSH 0.2.1 没有 `agent.model`，插件改为在该 Agent 作用域内以 `prepend` 外层覆盖 `agent/request`，因此胜过已存在的模型选择与 provider 默认。两种宿主自动识别，无需配置；借用外部 Agent 时，插件关闭只移除这条频道策略，不销毁外部 Agent。话题所有者可用 `/effort <档位-id>` 覆盖当前 Session，`/effort` 查看生效来源，`/effort reset` 恢复该配置值（未配置时恢复模型适配器/provider 默认）。成功选择由 Session 自带的 `command/run` / `command/done` 日志恢复，重启后仍生效；新建 Session 不继承旧 Session 的覆盖。
 
 推理档位是适配器拥有的不透明 id（常见如 `off`、`low`、`high`、`max`），命令不会猜测或预校验 provider 的能力；不受支持的值会在下一次模型请求前被 Harness 拒绝，并按失败终态显示错误。
 
@@ -387,7 +383,7 @@ FEISHU_APP_SECRET: xxxxxxxx
    - 事件：**机器人进群 im.chat.member.bot.added_v1**（入群后私聊管理员发群信息卡）；对应的群信息读取权限（如 `im:chat:readonly`，以控制台要求为准）
    - 私聊需要能主动给管理员发消息（`im:message` 已覆盖；管理员需在应用可用范围内）
    - 「获取应用信息」权限（**可选**，如 `admin:app.info:readonly` / `application:application:self_manage`，以控制台要求为准）：未配置 `adminUserId` 时，插件在每次连接时调用 `application/v6/applications/:app_id` 查询应用所有者并让其成为管理员；调不通（企业内不便申请该权限等）时日志与面板会给出飞书返回的错误码，并提示在「访问授权」手动填写管理员 user_id，填写后不再依赖它
-   - 回调：**卡片回传交互 card.action.trigger**（流式卡停止按钮、`/model` 等选择卡、HITL 审批 / `ask_user_question` 问答按钮的回传事件，同样走长连接）
+   - 回调：**卡片回传交互 card.action.trigger**（流式卡停止按钮、`/effort` 等选择卡、HITL 审批 / `ask_user_question` 问答按钮的回传事件，同样走长连接）
    - `im:resource`（获取与上传图片或文件资源，**可选**；`im:resource:upload` 亦可）：`feishu_send_file` 上传图片/文件后发给用户。未开通时该工具返回可读的 `PERMISSION_DENIED`；关闭 `feishuTools.sendFile` 后自检不再检查此项
    - `wiki:wiki`、`docx:document`（**可选**，仅开启知识库工具时需要；只读可用 `wiki:wiki:readonly` / `docx:document:readonly`）：浏览知识库节点，读取/新建/修改飞书文档。电子表格和多维表格走飞书新版接口，只认细分权限，旧版 `sheets:spreadsheet` / `bitable:app` 不算：电子表格读 `sheets:spreadsheet:read`、写 `sheets:spreadsheet:write_only`；多维表格读 `base:table:read` + `base:field:read` + `base:record:read`，写 `base:record:create` / `base:record:update` / `base:record:delete`。应用还必须是目标知识空间的成员，否则调用返回 `NO_ACCESS`
    - `im:message.reactions:write_only`（发送、删除消息表情回复）

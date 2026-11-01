@@ -31,22 +31,6 @@ export const sessionHistoryEntrySchema = z.object({
 
 export type SessionHistoryEntry = z.infer<typeof sessionHistoryEntrySchema>
 
-/**
- * Model choice a Session starts from. `provider` + `model` pin a route; an
- * `effort` alone keeps the deployment default model and only changes its
- * reasoning effort.
- */
-export const sessionLlmSchema = z.object({
-  /** Provider route (the deployment default route, or the user's personal route). */
-  provider: z.string().min(1).optional(),
-  /** Model id on `provider`. */
-  model: z.string().min(1).optional(),
-  /** Reasoning-effort id advertised by the model; absent = the model default. */
-  effort: z.string().min(1).optional(),
-})
-
-export type SessionLlm = z.infer<typeof sessionLlmSchema>
-
 export const routeRecordSchema = z.object({
   /** Route key the record is stored under (thread_id or chat:<chatId>). */
   key: z.string().min(1),
@@ -84,12 +68,6 @@ export const routeRecordSchema = z.object({
    * `senderUserId` (who then names the requester). Absent = owner-only.
    */
   shared: z.literal(true).optional(),
-  /**
-   * Model choice captured from the owner's personal preference when the
-   * Session was created. Absent = the deployment default (`provider` /
-   * `model` / `reasoningEffort` config), followed live.
-   */
-  llm: sessionLlmSchema.optional(),
 })
 
 export type RouteRecord = z.infer<typeof routeRecordSchema>
@@ -297,55 +275,6 @@ export type AccessPermission = 'chat' | 'wikiRead' | 'wikiWrite' | 'codeWrite'
 export const ACCESS_PERMISSIONS: readonly AccessPermission[] = ['chat', 'wikiRead', 'wikiWrite', 'codeWrite']
 
 export type AccessUserRecord = z.infer<typeof accessUserRecordSchema>
-
-/** Wire protocols a personal endpoint may speak (the `llm-pi-ai` route `api`). */
-export const PERSONAL_LLM_APIS = ['openai-completions', 'openai-responses', 'anthropic-messages'] as const
-
-export type PersonalLlmApi = typeof PERSONAL_LLM_APIS[number]
-
-/**
- * One user's personal model endpoint. The API key never appears here: it is
- * stored in the DSH credential store under `credentialRef`, which the
- * `llm-pi-ai` route registered as `route` names as its `apiKeyEnv`.
- */
-export const personalLlmSchema = z.object({
-  /** Provider route id registered for this user (`feishu-<hash>`). */
-  route: z.string().min(1),
-  /** Credential reference holding the API key. */
-  credentialRef: z.string().min(1),
-  /** Wire protocol of the endpoint. */
-  api: z.enum(PERSONAL_LLM_APIS),
-  /** Endpoint base URL. */
-  baseURL: z.string().min(1),
-  /** Model ids discovered from the endpoint when it was bound. */
-  models: z.array(z.string().min(1)),
-  /** Epoch ms of the last successful bind. */
-  boundAt: z.number().int().nonnegative(),
-})
-
-export type PersonalLlm = z.infer<typeof personalLlmSchema>
-
-/**
- * One user's model preference for the Sessions they start (`user_llm`,
- * key = `user_id`). `source: 'default'` uses the administrator's default
- * endpoint; `'own'` uses `own`, falling back to the default while unbound.
- */
-export const userLlmRecordSchema = z.object({
-  /** Feishu `user_id` — also the table key. */
-  userId: z.string().min(1),
-  /** Which endpoint new Sessions use. */
-  source: z.enum(['default', 'own']),
-  /** Model on that endpoint; absent = the endpoint's default model. */
-  model: z.string().min(1).optional(),
-  /** Reasoning-effort id; absent = the model default. */
-  effort: z.string().min(1).optional(),
-  /** The user's personal endpoint, once bound. */
-  own: personalLlmSchema.optional(),
-  /** Epoch ms of the last change. */
-  updatedAt: z.number().int().nonnegative(),
-})
-
-export type UserLlmRecord = z.infer<typeof userLlmRecordSchema>
 
 /**
  * One authorization request the administrator has been (or should be) asked
@@ -572,10 +501,6 @@ export interface FeishuDomainSpecShape {
       valueSchema: typeof sessionOriginRecordSchema
       __key?: string
     }
-    user_llm: {
-      valueSchema: typeof userLlmRecordSchema
-      __key?: string
-    }
   }
 }
 
@@ -624,8 +549,6 @@ export const feishuDomain: FeishuDomainSpecShape = {
     analyze_requests: { valueSchema: topicLaunchRecordSchema },
     // Session id → Feishu origin; a missing table loads empty.
     session_origins: { valueSchema: sessionOriginRecordSchema },
-    // Per-user model preference and personal endpoint; a missing table loads empty.
-    user_llm: { valueSchema: userLlmRecordSchema },
   },
 }
 
@@ -698,14 +621,6 @@ export interface SessionOriginsTable {
   entries(): IterableIterator<[string, SessionOriginRecord]>
 }
 
-/** Normalized table handle for per-user model preferences (key = `user_id`). */
-export interface UserLlmTable {
-  get(key: string): UserLlmRecord | undefined
-  put(key: string, value: UserLlmRecord): Promise<unknown> | void
-  delete(key: string): Promise<unknown> | void
-  entries(): IterableIterator<[string, UserLlmRecord]>
-}
-
 /** Normalized domain handle. */
 export interface FeishuDomainHandle {
   routes: RoutesTable
@@ -718,8 +633,6 @@ export interface FeishuDomainHandle {
   topicLaunches: TopicLaunchesTable
   /** Feishu origin of every Session a route ever named. */
   sessionOrigins: SessionOriginsTable
-  /** Per-user model preferences and personal endpoints. */
-  userLlm: UserLlmTable
   getGlobal(): FeishuDomainGlobal
   setGlobal(value: FeishuDomainGlobal): Promise<unknown> | void
   close(): Promise<void>
