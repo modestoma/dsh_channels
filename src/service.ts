@@ -51,12 +51,13 @@ import {
 import type { EffortCommandAction, ParsedSlashCommand } from './commands.ts'
 import { commandSpec } from './commands/registry.ts'
 import type { ChannelCommandSpec } from './commands/registry.ts'
-import type { PermissionPresets, SessionQuery } from './dsh-types.ts'
+import type { AgentDefaultModel, PermissionPresets, SessionQuery, SettingsService } from './dsh-types.ts'
+import { PersonalRoutes, UserLlmStore, UserModels } from './llm/index.ts'
 import { ACCESS_PERMISSIONS, FEISHU_USER_ID_PATTERN, feishuDomain, PROCESSED_RETENTION_MS, sessionDirOf } from './domain.ts'
 import type {
   AccessPermission, AccessRequestRecord, AccessUserRecord,
   ExpiredRouteRecord, FeishuDomainGlobal, FeishuDomainHandle, InflightSnapshot,
-  ProcessedRecord, RawDomainHandle, RouteRecord, SessionOriginRecord, TopicLaunchRecord,
+  ProcessedRecord, RawDomainHandle, RouteRecord, SessionOriginRecord, TopicLaunchRecord, UserLlmRecord,
 } from './domain.ts'
 import { RouteStore } from './session/routes.ts'
 import { TopicLauncher } from './topics/launcher.ts'
@@ -145,6 +146,8 @@ interface EffortAdmission {
 interface ModelAdmission {
   live: LiveAgent
   controller: RequestPolicyController
+  /** Owner of the Session's route: the provider routes they may switch to bound `/model`. */
+  ownerUserId: string
 }
 
 /**
@@ -173,6 +176,7 @@ async function openFeishuDomain(ctx: HostContext): Promise<FeishuDomainHandle> {
   const accessRequestsRaw = domain.table('access_requests')
   const topicLaunchesRaw = domain.table('analyze_requests')
   const sessionOriginsRaw = domain.table('session_origins')
+  const userLlmRaw = domain.table('user_llm')
   return {
     routes: {
       get: key => table.get(key) as RouteRecord | undefined,
@@ -219,6 +223,12 @@ async function openFeishuDomain(ctx: HostContext): Promise<FeishuDomainHandle> {
       get: key => sessionOriginsRaw.get(key) as SessionOriginRecord | undefined,
       put: (key, value) => sessionOriginsRaw.put(key, value),
       entries: () => sessionOriginsRaw.entries() as IterableIterator<[string, SessionOriginRecord]>,
+    },
+    userLlm: {
+      get: key => userLlmRaw.get(key) as UserLlmRecord | undefined,
+      put: (key, value) => userLlmRaw.put(key, value),
+      delete: key => userLlmRaw.delete(key),
+      entries: () => userLlmRaw.entries() as IterableIterator<[string, UserLlmRecord]>,
     },
     getGlobal: () => (domain.global.get() ?? {}) as FeishuDomainGlobal,
     setGlobal: value => domain.global.set(value),
@@ -446,6 +456,10 @@ export class FeishuService {
   private readonly codeWriteGate: CodeWriteGate
   /** Durable access-control user table and authorization requests. */
   private readonly accessStore: AccessStore
+  /** Per-user model preferences and personal endpoints (`user_llm`). */
+  private readonly userLlm: UserLlmStore
+  /** `/model` selector, `/llm` bind form, and each user's starting model. */
+  private readonly userModels: UserModels
   /** Channel-plane admission gate (administrator / group / user). */
   private readonly accessController: AccessController
   /** Administrator DM authorization cards + bot-added group info cards. */
@@ -542,6 +556,7 @@ export class FeishuService {
         mounts.push(this.wikiTools.mount(agentCtx, sessionId))
         return Promise.all(mounts).then(() => undefined)
       },
+      sessionLlmFor: userId => this.userModels.sessionLlmFor(userId),
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
     })
     this.attachments = new AttachmentIntake({
@@ -638,6 +653,29 @@ export class FeishuService {
     })
     this.accessStore = new AccessStore({
       domain: () => this.domain,
+      warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
+    })
+    this.userLlm = new UserLlmStore({
+      domain: () => this.domain,
+      warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
+    })
+    this.userModels = new UserModels({
+      store: this.userLlm,
+      routes: new PersonalRoutes({
+        settings: () => this.ctx.get?.('settings') as SettingsService | undefined,
+        llm: () => this.ctx.get?.('llm') as LlmService | undefined,
+        credentials: this.ctx.credentials,
+        namespace: () => this.config.personalLlmNamespace,
+        warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
+      }),
+      config: () => this.config,
+      llm: () => this.ctx.get?.('llm') as LlmService | undefined,
+      defaultModel: () => this.ctx.get?.('agentDefaultModel') as AgentDefaultModel | undefined,
+      channel: () => this.channel,
+      mayChat: userId => this.config.accessMode === 'open' || this.accessController.mayUse(userId, 'chat'),
+      displayName: userId => this.accessStore.getUser(userId)?.name,
+      routeOf: sessionId => this.routes.findBySession(sessionId),
+      switchSession: (route, lines) => this.switchSessionModel(route, lines),
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
     })
     this.codeWriteGate = new CodeWriteGate({
@@ -1209,7 +1247,10 @@ export class FeishuService {
         configured: admin !== undefined,
         ...(owner !== undefined && 'error' in owner ? { ownerLookupError: owner.error } : {}),
       },
-      users: this.accessStore.userRecords().map(userWire),
+      users: this.accessStore.userRecords().map((record) => {
+        const llm = this.userModels.summary(record.userId)
+        return llm === undefined ? userWire(record) : { ...userWire(record), llm }
+      }),
       requests: this.accessStore.pendingRequests().map(record => {
         const wire: AccessRequestWire = {
           token: record.token,
@@ -1255,6 +1296,7 @@ export class FeishuService {
     if (id === undefined) return { ok: false, error: 'user_id 不合法' }
     try {
       await this.accessStore.removeUser(id)
+      await this.forgetUserModel(id)
       return { ok: true, access: this.accessSnapshot() }
     } catch (error) {
       return { ok: false, error: `撤销授权失败：${messageOf(error)}` }
@@ -1921,6 +1963,7 @@ export class FeishuService {
     this.domain = await openFeishuDomain(this.ctx)
     this.routes.load()
     this.accessStore.load()
+    this.userLlm.load()
 
     // HITL: answer the host's approval/request waterfall for sessions this
     // channel routes. `prepend` claims such requests BEFORE the web gateway's
@@ -1978,6 +2021,9 @@ export class FeishuService {
       this.onSteerAction(event)
       void this.onResumeAction(event).catch((error: unknown) => {
         this.ctx.logger?.warn?.('dsh-channels: continue action failed: %s', String(error))
+      })
+      void this.userModels.onCardAction(event).catch((error: unknown) => {
+        this.ctx.logger?.warn?.('dsh-channels: model selector action failed: %s', String(error))
       })
       void this.onPickAction(event).catch((error: unknown) => {
         this.ctx.logger?.warn?.('dsh-channels: picker card action failed: %s', String(error))
@@ -2144,6 +2190,7 @@ export class FeishuService {
     this.inbound.clear()
     this.routes.clear()
     this.accessStore.clear()
+    this.userLlm.clear()
     try {
       await this.channel?.disconnect()
     } catch {
@@ -2202,6 +2249,17 @@ export class FeishuService {
     // the conversation" entry point).
     if (spec.name === 'auth') {
       await this.runAuthCommand(msg, parsed)
+      return
+    }
+
+    // `/llm` (private chat only) opens the personal endpoint form.
+    if (spec.name === 'llm') {
+      await this.runLlmCommand(msg, parsed)
+      return
+    }
+    // A bare `/model` opens the per-user selector, with or without a Session.
+    if (spec.name === 'model' && parsed.rawInput.trim() === '') {
+      await this.runModelSelector(msg)
       return
     }
 
@@ -2324,6 +2382,7 @@ export class FeishuService {
       }
       if (action === 'remove') {
         const removed = await this.accessStore.removeUser(userId)
+        if (removed) await this.forgetUserModel(userId)
         await reply(removed ? 'success' : 'unavailable', removed ? `已把 ${label} 移出用户表，立即生效。` : `用户 ${label} 不在用户表中。`)
         return
       }
@@ -2705,7 +2764,8 @@ export class FeishuService {
     msg: NormalizedMessage,
     parsed: ParsedSlashCommand,
     current: RouteRecord,
-  ): Promise<void> {
+    options: { quiet?: boolean } = {},
+  ): Promise<CommandResult | undefined> {
     // An alias (`/new`) resolves to this canonical spec; execute the canonical
     // line so the agent command plane finds the registered definition.
     const line = `/${spec.name}${parsed.rawInput}`
@@ -2726,6 +2786,7 @@ export class FeishuService {
     }
     if (definition === undefined) {
       unregisterBorrowedCommand?.()
+      if (options.quiet === true) return undefined
       const text = spec.name === 'compact'
         ? '当前部署未挂载 Harness 原生 /compact 命令。'
         : `当前 Session 未挂载 /${spec.name} 命令。`
@@ -2746,7 +2807,7 @@ export class FeishuService {
       ? { live, controller: this.sessions.requestPolicy(live.agent) }
       : undefined
     const modelAdmission: ModelAdmission | undefined = spec.name === 'model'
-      ? { live, controller: this.sessions.requestPolicy(live.agent) }
+      ? { live, controller: this.sessions.requestPolicy(live.agent), ownerUserId: current.senderUserId }
       : undefined
     const disarmRenew = renewAdmission === undefined
       ? undefined
@@ -2776,13 +2837,22 @@ export class FeishuService {
         await this.sessions.releaseRenewed(renewAdmission.commit)
       }
     }
-    if (controller.signal.aborted || !this.started) return
+    if (controller.signal.aborted || !this.started) return undefined
+    if (options.quiet === true) {
+      // A quiet switch (model selector click) records the settled selection
+      // exactly like a typed one, without rendering a result card.
+      if (execution?.result.kind === 'success' && parsed.rawInput.trim() !== '') {
+        effortAdmission?.controller.sync(live.agent.session.snapshotEvents(), live.agent, 'effort')
+        modelAdmission?.controller.sync(live.agent.session.snapshotEvents(), live.agent, 'model')
+      }
+      return execution?.result
+    }
     if (execution === undefined) {
       await this.delivery.commandCard(msg, {
         kind: 'unavailable', command: spec.name,
         text: `当前 Session 无法执行 /${spec.name}。`, sessionId: current.sessionId,
       })
-      return
+      return undefined
     }
     await this.renderCommandResult({
       spec, msg, current, live,
@@ -2793,6 +2863,95 @@ export class FeishuService {
       effortAdmission,
       modelAdmission,
     })
+    return execution.result
+  }
+
+  /**
+   * Run `/model …` / `/effort …` lines against a route's live Session inside
+   * the route's admission queue, without result cards (model selector clicks).
+   * @param route - the route whose Session switches.
+   * @param lines - command lines, run in order until one fails.
+   * @returns an error text, or undefined when every line succeeded.
+   */
+  private async switchSessionModel(route: RouteRecord, lines: readonly string[]): Promise<string | undefined> {
+    return await this.routeOperations.run(route.key, async () => {
+      if (!this.started) return '通道已停止'
+      const current = this.routes.get(route.key)
+      if (current === undefined || current.sessionId !== route.sessionId) return '话题绑定已变化'
+      const msg: NormalizedMessage = {
+        messageId: `model-selector:${current.sessionId}`,
+        chatId: current.chatId,
+        chatType: current.chatType,
+        senderId: current.senderUserId,
+        content: '',
+        rawContentType: 'text',
+        resources: [],
+        mentions: [],
+        mentionAll: false,
+        mentionedBot: true,
+        ...(current.kind === 'thread' ? { threadId: current.key } : {}),
+        createTime: Date.now(),
+      }
+      for (const line of lines) {
+        const parsed = parseSlashCommand(line)
+        const spec = parsed === undefined ? undefined : commandSpec(parsed.name)
+        if (parsed === undefined || spec === undefined) return `无法解析 ${line}`
+        const result = await this.runAgentCommand(spec, { ...msg, content: line }, parsed, current, { quiet: true })
+        if (result === undefined) return `当前会话无法执行 /${spec.name}`
+        if (result.kind !== 'success') return result.text ?? `/${spec.name} 执行失败`
+      }
+      return undefined
+    })
+  }
+
+  /** Bare `/model`: the per-user selector, bound to the sender's own Session when there is one. */
+  private async runModelSelector(msg: NormalizedMessage): Promise<void> {
+    if (msg.chatType === 'group' && msg.threadId === undefined && this.config.requireMention && !msg.mentionedBot) return
+    const expired = msg.threadId === undefined ? undefined : this.routes.expiredRoute(msg.threadId)
+    const route = expired === undefined ? await this.inbound.resolveRoute(msg) : undefined
+    const sessionId = route !== undefined && this.accessController.ownsRoute(msg, route) ? route.sessionId : undefined
+    await this.delivery.withCommandReaction(msg, async () => {
+      await this.delivery.standaloneReply(
+        msg, await this.userModels.selectorCard(msg.senderId, sessionId), { createThread: false },
+      )
+    })
+  }
+
+  /** `/llm`: the personal endpoint form, private chat only. */
+  private async runLlmCommand(msg: NormalizedMessage, parsed: ParsedSlashCommand): Promise<void> {
+    const direct = { createThread: false }
+    if (msg.chatType !== 'p2p') {
+      await this.delivery.commandCard(msg, {
+        kind: 'context-error', command: 'llm',
+        text: '命令 /llm 仅支持在私聊中使用，请不要把 API key 发到群里。也可以发送 /model，点「绑定我的 API」，我会私聊你发表单。',
+      }, direct)
+      return
+    }
+    if (parsed.rawInput.trim() !== '') {
+      await this.delivery.commandCard(msg, {
+        kind: 'input-error', command: 'llm', text: '用法错误：/llm 不接受参数，请在卡片表单里填写 API 地址和 key。',
+      }, direct)
+      return
+    }
+    if (!this.userModels.bindable()) {
+      await this.delivery.commandCard(msg, {
+        kind: 'unavailable', command: 'llm',
+        text: '当前部署无法绑定个人 API：需要宿主提供 settings、模型发现和凭据服务，并启用 llm-pi-ai。',
+      }, direct)
+      return
+    }
+    await this.delivery.withCommandReaction(msg, async () => {
+      await this.delivery.standaloneReply(msg, this.userModels.bindCard(msg.senderId), direct)
+    })
+  }
+
+  /** Drop a removed user's model preference and personal endpoint; failures only warn. */
+  private async forgetUserModel(userId: string): Promise<void> {
+    try {
+      await this.userModels.forget(userId)
+    } catch (error) {
+      this.ctx.logger?.warn?.('dsh-channels: removing model preference of %s failed: %s', userId, String(error))
+    }
   }
 
   /** Render one settled agent-plane command result. */
@@ -2820,11 +2979,10 @@ export class FeishuService {
       modelAdmission?.controller.sync(live.agent.session.snapshotEvents(), live.agent, reconcile === 'model' ? 'model' : undefined)
     }
     if (input.bare && result.kind === 'success') {
-      const picker = spec.name === 'model' && modelAdmission !== undefined
-        ? await this.modelPicker(current, live, modelAdmission)
-        : spec.name === 'effort' && effortAdmission !== undefined
-          ? await this.effortPicker(current, live, effortAdmission, result.text ?? '')
-          : undefined
+      // A bare `/model` never reaches here: it opens the per-user selector.
+      const picker = spec.name === 'effort' && effortAdmission !== undefined
+        ? await this.effortPicker(current, live, effortAdmission, result.text ?? '')
+        : undefined
       if (picker !== undefined) {
         await this.delivery.standaloneReply(msg, picker)
         return
@@ -3206,7 +3364,7 @@ export class FeishuService {
     }
 
     if (rawInput === 'reset') {
-      return { kind: 'success', text: '已恢复部署默认模型（下一条消息生效）。' }
+      return { kind: 'success', text: '已恢复本会话创建时的模型（下一条消息生效）。' }
     }
 
     const slash = rawInput.indexOf('/')
@@ -3214,6 +3372,13 @@ export class FeishuService {
     const model = slash === -1 ? rawInput : rawInput.slice(slash + 1)
     if (model === '' || (slash !== -1 && (provider === undefined || provider === ''))) {
       return { kind: 'error', text: '用法错误：/model [模型-id|provider/model|reset]。' }
+    }
+    // Feishu users switch between the default endpoint and their own; only the
+    // administrator may name any other registered route.
+    if (provider !== undefined && provider !== currentProvider
+      && !this.accessController.isAdmin(admission.ownerUserId)
+      && !this.userModels.allowedProviders(admission.ownerUserId).has(provider)) {
+      return { kind: 'error', text: `不能切换到 provider \`${provider}\`：只能选择缺省 API 或你自己绑定的 API 上的模型。` }
     }
     // Validate against the advertised catalog when the deployment exposes one;
     // an unsupported value would otherwise only fail at the next request.
@@ -3228,26 +3393,6 @@ export class FeishuService {
     }
     const label = provider === undefined ? model : `${provider}/${model}`
     return { kind: 'success', text: `当前 Session 模型已切换为 \`${label}\`（下一条消息生效）。` }
-  }
-
-  /** `/model` picker: the provider's advertised models, or undefined when none are listed. */
-  private async modelPicker(
-    current: RouteRecord,
-    live: LiveAgent,
-    admission: ModelAdmission,
-  ): Promise<object | undefined> {
-    const route = currentModelRoute(live, admission.controller)
-    const models = await this.listModels(route.provider)
-    if (models.length === 0) return undefined
-    return buildPickerCard({
-      title: '🧠 模型',
-      command: 'model',
-      text: `${currentModelLine(live, admission.controller)}\n切换在下一条消息生效。`,
-      sessionId: current.sessionId,
-      options: models.map(id => ({ label: id, arg: id })),
-      ...(route.model === undefined ? {} : { current: route.model }),
-      reset: true,
-    })
   }
 
   /**

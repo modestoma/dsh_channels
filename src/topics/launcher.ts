@@ -281,7 +281,8 @@ export class TopicLauncher implements FeishuTopicService {
       const topicToken = topicTokenFor(threadId, 'thread', sessionId)
       const plan = await planTopic(services, this.deps.config, workspace.path, topicToken, warn)
       this.assertStarted()
-      handle = await this.deps.sessions.createSession(sessionId, plan.cwd)
+      const llm = this.deps.sessions.sessionLlmFor(spec.requesterUserId)
+      handle = await this.deps.sessions.createSession(sessionId, plan.cwd, llm)
       const placement: TopicPlacement = await enterTopic(
         services, handle.agent, plan, workspace.path, topicToken, warn,
       )
@@ -309,6 +310,7 @@ export class TopicLauncher implements FeishuTopicService {
         lastActivityAt: createdAt,
         sessionHistory: [{ sessionId, createdAt }],
         shared: true,
+        ...(llm === undefined ? {} : { llm }),
       }
       const message = feishuUserMessage(spec.prompt)
       const stored = storableMessage(message)

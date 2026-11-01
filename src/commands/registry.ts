@@ -91,8 +91,12 @@ export const CHANNEL_COMMANDS = [
     usage: '[id|reset]',
   },
   {
-    name: 'model', group: '模型与上下文', description: '查看或切换当前 Session 模型',
+    name: 'model', group: '模型与上下文', description: '选择对话使用的模型和推理强度（发起会话前也可用）',
     usage: '[id|provider/model|reset]',
+  },
+  {
+    name: 'llm', group: '模型与上下文', description: '绑定或修改自己的模型 API 地址和 key（仅私聊）',
+    routeFree: true, chatType: 'p2p', directReply: true, agentScoped: false,
   },
   {
     name: 'compact', group: '模型与上下文', description: '压缩当前 Session 上下文', agentScoped: false,

@@ -110,6 +110,12 @@ export const configSchema = z.object({
   /** Output-token cap per model request (optional → adapter default). */
   maxTokens: z.number().int().positive().optional(),
   /**
+   * Settings namespace (profile entry id) of the `@deepseek-ai/dsh-llm-pi-ai`
+   * plugin that personal endpoints bound with `/llm` are registered in, as
+   * `providers.feishu-<hash>` routes. Empty turns `/llm` off.
+   */
+  personalLlmNamespace: z.string().trim().default('llm-pi-ai'),
+  /**
    * Agent preset id sessions this plugin creates are composed from
    * (optional → the roster default, e.g. `standard`). In web-profile
    * deployments the model-facing tools exist only inside agent presets, so
