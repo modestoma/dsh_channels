@@ -5737,6 +5737,29 @@ describe('per-user models', () => {
     await h.service.shutdown()
   })
 
+  it('lets a pending bind store the user\'s binding before shutdown closes storage', async () => {
+    const { h, settings, llm } = await setupWithEndpoints()
+    let release!: () => void
+    const discovered = new Promise<void>(resolve => { release = resolve })
+    llm.discoverModels!.mockImplementationOnce(async () => {
+      await discovered
+      return [{ id: 'my-model' }]
+    })
+    await h.channel.fireCardAction(bindEvent('om_1', { api: 'openai-completions', baseURL: 'https://api.example.com/v1', apiKey: 'sk-secret' }))
+    await waitUntil(() => expect(updatesOf(h, 'om_1')).toHaveLength(1))
+
+    let closed = false
+    const shutdown = h.service.shutdown().then(() => { closed = true })
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(closed).toBe(false)
+    release()
+    await shutdown
+
+    const [route] = [...settings.providers.keys()]
+    expect(route).toMatch(/^feishu-[0-9a-f]{10}$/u)
+    expect(h.ctxState.domain.raw.table('user_llm').get('u_a')).toMatchObject({ source: 'own', own: { route } })
+  })
+
   it('binds a personal endpoint from the private-chat form and starts new Sessions on it', async () => {
     const { h, settings, llm } = await setupWithEndpoints()
     await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_dm_a', senderId: 'u_a', content: '/llm' }))

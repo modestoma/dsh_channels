@@ -271,6 +271,15 @@ export class UserModels {
   }
 
   /**
+   * Wait until every queued endpoint and preference change has settled,
+   * including changes queued while waiting. The caller stops delivering card
+   * actions first; storage and the channel must stay open until this resolves.
+   */
+  async drain(): Promise<void> {
+    while (this.userQueues.size > 0) await Promise.all(this.userQueues.values())
+  }
+
+  /**
    * Run one user's endpoint or preference change after that user's previous
    * one settles. Two open forms share one route and credential reference, so
    * a bind, its rollback and the stored record must not interleave with

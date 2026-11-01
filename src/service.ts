@@ -2160,6 +2160,9 @@ export class FeishuService {
     this.unlisten = undefined
     this.unlistenCardAction?.()
     this.unlistenCardAction = undefined
+    // A pending bind writes the route, the credential and then the user's
+    // record; storage must outlive it so the three stay consistent.
+    await this.userModels.drain()
     this.unlistenBotAdded?.()
     this.unlistenBotAdded = undefined
     this.unlistenConnection?.()
