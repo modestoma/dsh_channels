@@ -13,6 +13,10 @@
  *   previous driver; before any claimed message the route owner drives. A
  *   prompt replayed after a restart carries the sender stored with it; when
  *   none was stored, every gated call of that turn is denied.
+ * - Remembered senders are bounded. When a pending message's sender is
+ *   dropped, its Session fails closed: a turn there that claims a message
+ *   without a remembered sender denies every gated call, until a message
+ *   with a remembered sender is claimed in that Session.
  * - The check runs in `tools/pre-execute`, before the tool's own approval, so
  *   it holds whatever approval mode the tool's plugin uses.
  *
@@ -31,7 +35,7 @@ import type { PreToolDecision, PreToolExecution } from '../dsh-types.ts'
 /** Remembered message senders (bounded; oldest dropped first). */
 const MAX_NOTED_MESSAGES = 2_000
 
-/** Driver of a turn whose Feishu sender cannot be established (a replayed prompt of an older snapshot). */
+/** Driver of a turn whose Feishu sender cannot be established (an older replayed snapshot, or a dropped sender). */
 const UNKNOWN_SENDER = Symbol('unknown sender')
 type Driver = string | typeof UNKNOWN_SENDER
 
@@ -44,9 +48,17 @@ export interface CodeWriteGateDeps {
   mayUse(userId: string, permission: AccessPermission): boolean
 }
 
+/** One remembered sender of a message not yet claimed. */
+interface NotedSender {
+  readonly sessionId: string
+  readonly driver: Driver
+}
+
 export class CodeWriteGate {
-  /** DSH `UserMessage.id` → Feishu sender user_id. */
-  private readonly senders = new Map<string, Driver>()
+  /** DSH `UserMessage.id` → its Session and Feishu sender, until claimed. */
+  private readonly senders = new Map<string, NotedSender>()
+  /** Sessions with a pending message whose sender was dropped. */
+  private readonly droppedSenders = new Set<string>()
   /** Routed Session id → user_id that drives its current turn. */
   private readonly drivers = new Map<string, Driver>()
   /** Descendant Session id → routed ancestor Session id. */
@@ -56,27 +68,38 @@ export class CodeWriteGate {
 
   /**
    * Record who sent the prompt carried by one DSH user message.
+   * @param sessionId - the routed Session the message is submitted to.
    * @param messageId - the `UserMessage.id` submitted to the Agent.
    * @param userId - Feishu user_id of the sender; undefined when it cannot be
    *   established, which denies every gated call of the turn it starts.
    */
-  noteMessage(messageId: string, userId: string | undefined): void {
-    this.senders.set(messageId, userId ?? UNKNOWN_SENDER)
+  noteMessage(sessionId: string, messageId: string, userId: string | undefined): void {
+    this.senders.set(messageId, { sessionId, driver: userId ?? UNKNOWN_SENDER })
     if (this.senders.size <= MAX_NOTED_MESSAGES) return
-    const oldest = this.senders.keys().next().value
-    if (oldest !== undefined) this.senders.delete(oldest)
+    const [oldest] = this.senders
+    if (oldest === undefined) return
+    this.senders.delete(oldest[0])
+    this.droppedSenders.add(oldest[1].sessionId)
   }
 
   /**
    * A turn claimed an inbox message: its sender, when known, drives the turn.
+   * A message without a remembered sender keeps the previous driver, unless
+   * the Session has a dropped sender pending; then the driver is unknown.
    * @param sessionId - the claiming Session.
    * @param messageId - the claimed `UserMessage.id`.
    */
   onClaimed(sessionId: string, messageId: string): void {
     const sender = this.senders.get(messageId)
-    if (sender === undefined) return
+    if (sender === undefined) {
+      if (this.droppedSenders.has(sessionId)) this.drivers.set(sessionId, UNKNOWN_SENDER)
+      return
+    }
     this.senders.delete(messageId)
-    this.drivers.set(sessionId, sender)
+    // Inbox messages are claimed in submission order, so the dropped ones
+    // were claimed before this later-noted message.
+    this.droppedSenders.delete(sessionId)
+    this.drivers.set(sessionId, sender.driver)
   }
 
   /**
@@ -96,7 +119,7 @@ export class CodeWriteGate {
     if (driver === UNKNOWN_SENDER) {
       return {
         kind: 'deny',
-        reason: `无法确认这一轮的飞书发言人（重启后恢复的消息），不能调用 ${exec.name}。请告诉用户：重新发送一条消息后再试。`,
+        reason: `无法确认这一轮的飞书发言人（重启后恢复的消息，或排队的消息过多），不能调用 ${exec.name}。请告诉用户：重新发送一条消息后再试。`,
       }
     }
     if (this.deps.mayUse(driver, 'codeWrite')) return undefined
@@ -127,6 +150,7 @@ export class CodeWriteGate {
   /** Drop every remembered sender, driver, and descendant (shutdown). */
   clear(): void {
     this.senders.clear()
+    this.droppedSenders.clear()
     this.drivers.clear()
     this.roots.clear()
   }

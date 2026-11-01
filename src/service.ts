@@ -497,7 +497,7 @@ export class FeishuService {
         replay: (agent, snapshot, message, submit) => {
           this.streamer?.attach(agent.session, snapshot.cards[0]!.messageId, snapshot.triggerMessageId, snapshot.reactionId, { message })
           if (!submit) return
-          this.codeWriteGate.noteMessage(message.id, snapshot.senderUserId)
+          this.codeWriteGate.noteMessage(snapshot.sessionId, message.id, snapshot.senderUserId)
           agent.followup(message)
         },
       },
@@ -671,7 +671,7 @@ export class FeishuService {
       noteKnownAttachments: (record, message, source) => {
         this.noteKnownAttachmentMessage(record, message, source ?? 'trigger')
       },
-      noteTurnSender: (messageId, userId) => this.codeWriteGate.noteMessage(messageId, userId),
+      noteTurnSender: (sessionId, messageId, userId) => this.codeWriteGate.noteMessage(sessionId, messageId, userId),
       messageRead: {
         quote: input => this.readQuoteContext(input),
         history: input => this.readHistoryContext(input),
@@ -2565,7 +2565,7 @@ export class FeishuService {
       const live = await this.sessions.ensureLive(route)
       const message = feishuUserMessage(RESUME_PROMPT)
       const operator = event.operator.userId
-      if (operator !== undefined) this.codeWriteGate.noteMessage(message.id, operator)
+      if (operator !== undefined) this.codeWriteGate.noteMessage(route.sessionId, message.id, operator)
       const stored = storableMessage(message)
       await this.repair.write({
         key: event.messageId,

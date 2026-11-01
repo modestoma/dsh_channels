@@ -140,7 +140,7 @@ export interface InboundDeps {
    * Record the Feishu sender of the prompt one DSH user message carries
    * (feeds the code-write gate's turn driver).
    */
-  noteTurnSender(messageId: string, userId: string): void
+  noteTurnSender(sessionId: string, messageId: string, userId: string): void
   /**
    * Read-only message access: quoted-message excerpt, first-turn topic
    * history, and recent attachment messages. Failures degrade silently to an
@@ -767,7 +767,7 @@ export class InboundRouter {
     options: TurnDeliveryOptions = {},
   ): Promise<UserMessage> {
     const message = await this.assembleTurnMessage(msg, record, content, options)
-    this.deps.noteTurnSender(message.id, msg.senderId)
+    this.deps.noteTurnSender(record.sessionId, message.id, msg.senderId)
     return message
   }
 
