@@ -16,7 +16,7 @@
 2. **会话本体与事件日志**：宿主代持。插件消费的 `assistant/chunk`、`tool/call`、`tool-workflow/run-*`、`subagent/descriptor` 等全部在持久化日志里，因此 `src/stats.ts` 的 token/缓存统计不单独存，`foldAll()` 重放日志，重启后继续累计。`meta.cwd`、`agentPreset` 随 header 落盘。
 3. **工作区与话题目录**：工作区目录确定性生成、幂等 mkdir，宿主 `workspace.json` 持久化 path/title/sessionIds；话题目录路径记录在路由的 `sessionDir`，实际工作目录同时由 Session 的 `working-directory/change` 事件持久化。
 4. **凭据**：密钥存宿主 `$DSH_HOME/.credentials.yaml`，插件只持引用名。
-5. **准入授权**（`src/domain.ts` 域 `channels_routes_v2`，同样保持 `version: 1` 加法新增）：`access_users` 表以 `user_id` 保存用户表，每条记录带四个开关 `chat` / `wikiRead` / `wikiWrite` / `codeWrite`（旧记录缺开关时读作只有 `chat`）；`access_requests` 表以不透明 token 保存用户授权申请（含 `messageId`，重启后旧授权卡仍可点击结算；过期状态在同一表落审计；旧的群申请记录保留但加载时跳过）。`user_llm` 表以 `user_id` 保存个人模型偏好：用缺省 API 还是自己的 API（`source`）、选中的 `model` / `effort`，以及绑定后的个人端点 `own`（provider 路由 id、凭据引用名、协议、地址、模型列表；API key 只在 DSH 凭据库，不进表）。新建 Session 时按发起人的偏好算出起始模型，记在 `RouteRecord.llm`（`provider` / `model` / `effort`，缺省 = 跟随部署配置），恢复、借用时据此重建请求策略；`/renew` 按发起人当时的偏好重新算。已退役的 `access_groups`（群白名单）与 `access_wiki_users`（知识库白名单）仍在域里声明，以免 JSON 后端写入时丢掉旧数据，但不再读取。域全局值的 `knownGroups` 记录机器人被拉进过的群（最多 500 个），供断连补偿使用。管理员 user_id 与准入模式属于配置层（profile + Web 覆盖），不在这些表里。
+5. **准入授权**（`src/domain.ts` 域 `channels_routes_v2`，同样保持 `version: 1` 加法新增）：`access_users` 表以 `user_id` 保存用户表，每条记录带四个开关 `chat` / `wikiRead` / `wikiWrite` / `codeWrite`（旧记录缺开关时读作只有 `chat`）；`access_requests` 表以不透明 token 保存用户授权申请（含 `messageId`，重启后旧授权卡仍可点击结算；过期状态在同一表落审计；旧的群申请记录保留但加载时跳过）。已退役的 `access_groups`（群白名单）与 `access_wiki_users`（知识库白名单）仍在域里声明，以免 JSON 后端写入时丢掉旧数据，但不再读取。域全局值的 `knownGroups` 记录机器人被拉进过的群（最多 500 个），供断连补偿使用。管理员 user_id 与准入模式属于配置层（profile + Web 覆盖），不在这些表里。
 
 ## 二、内存态（有意不持久化）
 

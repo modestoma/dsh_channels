@@ -1,5 +1,5 @@
 /**
- * 用户表：每个用户一行（头像、名字、user_id、个人模型偏好、四个权限开关、移除），添加
+ * 用户表：每个用户一行（头像、名字、user_id、四个权限开关、移除），添加
  * 表单点「＋ 添加用户」才展开；以及待处理申请行。
  *
  * @module dsh-channels/client/panel/whitelist
@@ -84,12 +84,7 @@ export function UserTable(props: {
           key={user.userId}
           leading={<Avatar text={display ?? user.userId} url={avatarUrl} />}
           label={display ?? user.userId}
-          summary={(
-            <>
-              <span className="dsh-channels-cfg__mono">{user.userId}</span> · {sourceLabel(user.source)}
-              {user.llm === undefined ? null : ` · ${PANEL_COPY.accessUserModel}：${user.llm}`}
-            </>
-          )}
+          summary={<><span className="dsh-channels-cfg__mono">{user.userId}</span> · {sourceLabel(user.source)}</>}
           control={(
             <div className="dsh-channels-cfg__inputRow">
               {PERMISSION_CHIPS.map(({ permission, label }) => (

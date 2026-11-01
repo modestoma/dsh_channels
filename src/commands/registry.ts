@@ -18,7 +18,7 @@ export interface ChannelCommandSpec {
   readonly name: string
   readonly group: CommandGroup
   readonly description: string
-  /** Argument hint shown in help, e.g. `[id|default|reset]`. */
+  /** Argument hint shown in help, e.g. `[id|reset]`. */
   readonly usage?: string
   /** Answerable without any Session work (and inside a retired topic). */
   readonly routeFree?: boolean
@@ -88,15 +88,11 @@ export const CHANNEL_COMMANDS = [
   },
   {
     name: 'effort', group: '模型与上下文', description: '查看或切换当前 Session 推理强度',
-    usage: '[id|default|reset]',
+    usage: '[id|reset]',
   },
   {
-    name: 'model', group: '模型与上下文', description: '选择对话使用的模型和推理强度（发起会话前也可用）',
+    name: 'model', group: '模型与上下文', description: '查看或切换当前 Session 模型',
     usage: '[id|provider/model|reset]',
-  },
-  {
-    name: 'llm', group: '模型与上下文', description: '绑定或修改自己的模型 API 地址和 key（表单私聊发送）',
-    routeFree: true, directReply: true, agentScoped: false,
   },
   {
     name: 'compact', group: '模型与上下文', description: '压缩当前 Session 上下文', agentScoped: false,
@@ -139,7 +135,7 @@ export function supportedCommandNames(): readonly SupportedCommandName[] {
   return [...commandNames(), ...Object.keys(COMMAND_ALIASES)] as SupportedCommandName[]
 }
 
-/** `用法：/effort [id|default|reset]` line, or undefined without a usage hint. */
+/** `用法：/effort [id|reset]` line, or undefined without a usage hint. */
 export function commandUsage(spec: ChannelCommandSpec): string | undefined {
   if (spec.usage === undefined) return undefined
   return `/${spec.name} ${spec.usage}`
