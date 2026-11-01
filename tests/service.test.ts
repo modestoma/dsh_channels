@@ -1091,6 +1091,8 @@ describe('FeishuService', () => {
     }))
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(4))
     await waitUntil(() => expect(h.ctxState.domain.raw.table('routes').get('omt_3')).toBeDefined())
+    // Origin rows are written after route rows, and the listing reads origins: wait for all four Sessions.
+    await waitUntil(() => expect([...h.ctxState.domain.raw.table('session_origins').entries()]).toHaveLength(4))
     const retiredRoot = path.join(h.config.baseDir, 'retired-root')
     h.ctxState.sessionQuery.readTitleSnapshots.mockImplementation(async (ids: readonly string[]) => ids.map(sessionId => ({
       sessionId,
