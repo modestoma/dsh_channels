@@ -187,6 +187,8 @@ describe('topic launch flow', () => {
     })
     const agent = h.ctxState.agents.created[0]!.handle.agent
     expect(followupMessagesOf(agent).map(message => message.content[0]!.text)).toEqual([PROMPT])
+    // Restart recovery replays the first prompt on behalf of the requester.
+    expect(h.ctxState.domain.raw.table('inflight').get('om_2')).toMatchObject({ senderUserId: 'u_alice' })
   })
 
   it('streams the first turn in the topic and marks the root card when it settles', async () => {

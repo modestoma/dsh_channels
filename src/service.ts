@@ -1153,6 +1153,8 @@ export class FeishuService {
     const route = this.routes.findBySession(sessionId)
     if (route === undefined) return
     const stored = storableMessage(message)
+    // A host turn acts for the Session's current driver; replay restores it.
+    const driver = this.codeWriteGate.driverOf(sessionId)
     try {
       await this.repair.write({
         key: messageId,
@@ -1160,6 +1162,7 @@ export class FeishuService {
         chatId: route.chatId,
         routeKey: route.key,
         ...(stored === undefined ? {} : { message: stored }),
+        ...(driver === undefined ? {} : { senderUserId: driver }),
         cards: [{ messageId, mode }],
         startedAt: Date.now(),
         attempts: 0,
@@ -2561,7 +2564,8 @@ export class FeishuService {
     try {
       const live = await this.sessions.ensureLive(route)
       const message = feishuUserMessage(RESUME_PROMPT)
-      if (event.operator.userId !== undefined) this.codeWriteGate.noteMessage(message.id, event.operator.userId)
+      const operator = event.operator.userId
+      if (operator !== undefined) this.codeWriteGate.noteMessage(message.id, operator)
       const stored = storableMessage(message)
       await this.repair.write({
         key: event.messageId,
@@ -2570,6 +2574,7 @@ export class FeishuService {
         ...(target.triggerMessageId === undefined ? {} : { triggerMessageId: target.triggerMessageId }),
         routeKey: route.key,
         ...(stored === undefined ? {} : { message: stored }),
+        ...(operator === undefined ? {} : { senderUserId: operator }),
         cards: [{ messageId: event.messageId, mode: 'card' }],
         startedAt: Date.now(),
         attempts: 0,

@@ -319,6 +319,7 @@ export class TopicLauncher implements FeishuTopicService {
         triggerMessageId: rootId,
         routeKey: threadId,
         ...(stored === undefined ? {} : { message: stored }),
+        senderUserId: spec.requesterUserId,
         cards: [{ messageId: cardId, mode: 'card' }],
         startedAt: Date.now(),
         attempts: 0,

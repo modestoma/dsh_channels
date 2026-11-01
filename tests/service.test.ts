@@ -2530,7 +2530,7 @@ describe('FeishuService', () => {
     await channel2.fireCardAction({ messageId: 'om_1', chatId: 'oc_p2p', operator: { openId: 'ou_a', userId: 'u_alice' }, action: { value, tag: 'button' } })
     await waitUntil(() => expect(mock(resumed.followup)).toHaveBeenCalledTimes(1))
     expect(JSON.stringify(mock(resumed.followup).mock.calls[0]![0])).toContain('从中断处继续')
-    expect(inflightEntries(h)).toEqual([['om_1', expect.objectContaining({ triggerMessageId: 'om_msg_1', routeKey: expect.any(String) })]])
+    expect(inflightEntries(h)).toEqual([['om_1', expect.objectContaining({ triggerMessageId: 'om_msg_1', routeKey: expect.any(String), senderUserId: 'u_alice' })]])
     await waitUntil(() => expect(JSON.stringify(channel2.updated.at(-1))).toContain('turn-stop'))
 
     // A second click does not start another turn.
@@ -2661,7 +2661,8 @@ describe('FeishuService', () => {
     const [key, snapshot] = inflightEntries(h)[0]!
     expect(key).toBe('om_2')
     expect(snapshot).not.toHaveProperty('triggerMessageId')
-    expect(snapshot).toMatchObject({ message: { id: 'msg_job' }, cards: [{ messageId: 'om_2', mode: 'card' }] })
+    // The host turn acts for the Session's current driver.
+    expect(snapshot).toMatchObject({ message: { id: 'msg_job' }, senderUserId: 'u_alice', cards: [{ messageId: 'om_2', mode: 'card' }] })
 
     h.ctxState.sessionListeners[0]!(agent.session, { type: 'turn/end', seq: 2, data: { turn: 2, reason: 'stop' } })
     await waitUntil(() => expect(inflightEntries(h)).toHaveLength(0))
