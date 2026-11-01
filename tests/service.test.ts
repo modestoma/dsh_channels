@@ -2095,6 +2095,11 @@ describe('FeishuService', () => {
       provider: 'deepseek-official', model: 'deepseek-v4-flash',
     })).resolves.toMatchObject({ reasoningEffort: 'tiny' })
 
+    // The foreign composition gets this channel's prompt sections once.
+    await handler(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'u_alice', content: '再问一句', threadId: 'omt_1' }))
+    await waitUntil(() => expect(mock(foreignAgent.followup)).toHaveBeenCalledTimes(2))
+    expect(promptSectionsOf(foreignAgent.ctx).filter(section => section.name === 'dsh-channels:feishu-replies')).toHaveLength(1)
+
     // The reply card still lands in the topic as usual.
     const sends = channel2.sent as Array<{ options?: { replyInThread?: boolean } }>
     expect(sends[0]?.options?.replyInThread).toBe(true)
@@ -2137,6 +2142,7 @@ describe('FeishuService', () => {
 
     // The race must not surface to the user as a 处理失败 message.
     expect(JSON.stringify(channel2.sent)).not.toContain('处理失败')
+    expect(promptSectionsOf(winner!.agent.ctx).map(section => section.name)).toContain('dsh-channels:feishu-replies')
     await service2.shutdown()
   })
 
