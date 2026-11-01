@@ -3829,74 +3829,21 @@ describe('first-contact onboarding', () => {
 })
 
 describe('/model', () => {
-  it('shows the current model and the advertised catalog', async () => {
+  it('is not a channel command: the line reaches the Agent as a prompt', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_model_view', senderId: 'u_owner', content: '开始',
+      chatType: 'group', chatId: 'oc_model_gone', senderId: 'u_owner', content: '开始',
     }))
     await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
-    ;(sessionEvents(agent.session) as unknown as Array<Record<string, unknown>>).push({
-      type: 'request/header', seq: 1, time: 1,
-      data: { header: { config: { provider: 'deepseek-official', model: 'deepseek-v4-flash' } } },
-    })
-
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_model_view', senderId: 'u_owner', threadId: 'omt_1',
-      mentionedBot: false, messageId: 'om_model_view', content: '/model',
+      chatType: 'group', chatId: 'oc_model_gone', senderId: 'u_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_model_gone', content: '/model deepseek-v4-pro',
     }))
-    await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
-    const json = JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)
-    expect(json).toContain('当前模型')
-    expect(json).toContain('deepseek-v4-flash')
-    expect(json).toContain('deepseek-v4-pro')
-    await h.service.shutdown()
-  })
-
-  it('switches the model for subsequent requests', async () => {
-    const h = await setup()
-    await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_model_set', senderId: 'u_owner', content: '开始',
-    }))
-    await waitForEstablishedSession(h)
-    const created = h.ctxState.agents.created[0]!
-    const agent = created.handle.agent
-
-    await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_model_set', senderId: 'u_owner', threadId: 'omt_1',
-      mentionedBot: false, messageId: 'om_model_set', content: '/model deepseek-v4-pro',
-    }))
-    await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
-    expect(JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)).toContain('已切换为')
-    expect(sessionEvents(agent.session).slice(-2).map(event => event.type))
-      .toEqual(['command/run', 'command/done'])
-
-    // The persisted policy reaches the next model request.
-    await expect(dispatchAgentRequest(created.setupCtx, { provider: 'deepseek-official', model: 'deepseek-v4-flash' }))
-      .resolves.toMatchObject({ model: 'deepseek-v4-pro' })
-    await h.service.shutdown()
-  })
-
-  it('rejects a model the provider does not advertise', async () => {
-    const h = await setup()
-    await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_model_bad', senderId: 'u_owner', content: '开始',
-    }))
-    await waitForEstablishedSession(h)
-    const agent = h.ctxState.agents.created[0]!.handle.agent
-    ;(sessionEvents(agent.session) as unknown as Array<Record<string, unknown>>).push({
-      type: 'request/header', seq: 1, time: 1,
-      data: { header: { config: { provider: 'deepseek-official', model: 'deepseek-v4-flash' } } },
-    })
-
-    await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_model_bad', senderId: 'u_owner', threadId: 'omt_1',
-      mentionedBot: false, messageId: 'om_model_bad', content: '/model nope-model',
-    }))
-    await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
-    const json = JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)
-    expect(json).toContain('未提供模型')
-    expect(json).toContain('deepseek-v4-pro')
+    await waitUntil(() => expect(mock(agent.followup)).toHaveBeenCalledTimes(2))
+    expect((mock(agent.followup).mock.calls[1]?.[0] as { content: Array<{ text: string }> }).content[0]?.text)
+      .toBe('/model deepseek-v4-pro')
+    expect(mock(h.ctxState.ctx.commands.execute)).not.toHaveBeenCalled()
     await h.service.shutdown()
   })
 })
@@ -3937,50 +3884,6 @@ describe('command picker cards', () => {
     return created
   }
 
-  it('answers bare /model with model buttons and switches on an owner click', async () => {
-    const h = await setup()
-    const created = await establishWithModel(h, 'oc_pick_model')
-    await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_pick_model', senderId: 'u_owner', threadId: 'omt_1',
-      mentionedBot: false, messageId: 'om_pick_model', content: '/model',
-    }))
-    await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
-    const buttons = buttonValues(lastCard(h))
-    expect(buttons.map(button => button.label)).toEqual(['✅ deepseek-v4-flash', 'deepseek-v4-pro', '恢复默认'])
-    const pro = buttons[1]!.value
-    expect(pro).toEqual({
-      decision: 'command-pick', command: 'model', arg: 'deepseek-v4-pro', sessionId: created.handle.agent.session.id,
-    })
-
-    // Strangers and forwarded copies are ignored without a reply.
-    await h.channel.fireCardAction({
-      messageId: 'om_2', chatId: 'oc_pick_model',
-      operator: { openId: 'ou_x', userId: 'u_stranger' }, action: { value: pro, tag: 'button' },
-    })
-    await h.channel.fireCardAction({
-      messageId: 'om_2', chatId: 'oc_other',
-      operator: { openId: 'ou_o', userId: 'u_owner' }, action: { value: pro, tag: 'button' },
-    })
-    await h.channel.fireCardAction({
-      messageId: 'om_2', chatId: 'oc_pick_model',
-      operator: { openId: 'ou_o', userId: 'u_owner' },
-      action: { value: { ...pro, sessionId: 'sess-stale' }, tag: 'button' },
-    })
-    await flush()
-    expect(h.channel.sent).toHaveLength(2)
-
-    await h.channel.fireCardAction({
-      messageId: 'om_2', chatId: 'oc_pick_model',
-      operator: { openId: 'ou_o', userId: 'u_owner' }, action: { value: pro, tag: 'button' },
-    })
-    await waitUntil(() => expect(pickerUpdates(h, 'om_2')).toHaveLength(1))
-    expect(JSON.stringify(pickerUpdates(h, 'om_2')[0])).toContain('已切换为')
-    expect(h.channel.sent).toHaveLength(2)
-    await expect(dispatchAgentRequest(created.setupCtx, { provider: 'deepseek-official', model: 'deepseek-v4-flash' }))
-      .resolves.toMatchObject({ model: 'deepseek-v4-pro' })
-    await h.service.shutdown()
-  })
-
   it('answers bare /effort with the efforts the model advertises', async () => {
     const h = await setup({ reasoningEffort: 'high' })
     mock(h.ctxState.ctx.llm!.resolveModelInfo).mockResolvedValue({
@@ -3995,10 +3898,32 @@ describe('command picker cards', () => {
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
     const buttons = buttonValues(lastCard(h))
     expect(buttons.map(button => button.label)).toEqual(['低', '✅ 高', '恢复默认'])
+    const low = buttons[0]!.value
+    expect(low).toEqual({
+      decision: 'command-pick', command: 'effort', arg: 'low', sessionId: created.handle.agent.session.id,
+    })
+
+    // Strangers, forwarded copies, and stale cards are ignored without a reply.
+    await h.channel.fireCardAction({
+      messageId: 'om_2', chatId: 'oc_pick_effort',
+      operator: { openId: 'ou_x', userId: 'u_stranger' }, action: { value: low, tag: 'button' },
+    })
+    await h.channel.fireCardAction({
+      messageId: 'om_2', chatId: 'oc_other',
+      operator: { openId: 'ou_o', userId: 'u_owner' }, action: { value: low, tag: 'button' },
+    })
+    await h.channel.fireCardAction({
+      messageId: 'om_2', chatId: 'oc_pick_effort',
+      operator: { openId: 'ou_o', userId: 'u_owner' },
+      action: { value: { ...low, sessionId: 'sess-stale' }, tag: 'button' },
+    })
+    await flush()
+    expect(h.channel.sent).toHaveLength(2)
+    expect(pickerUpdates(h, 'om_2')).toHaveLength(0)
 
     await h.channel.fireCardAction({
       messageId: 'om_2', chatId: 'oc_pick_effort',
-      operator: { openId: 'ou_o', userId: 'u_owner' }, action: { value: buttons[0]!.value, tag: 'button' },
+      operator: { openId: 'ou_o', userId: 'u_owner' }, action: { value: low, tag: 'button' },
     })
     await waitUntil(() => expect(pickerUpdates(h, 'om_2')).toHaveLength(1))
     const settled = JSON.stringify(pickerUpdates(h, 'om_2')[0])

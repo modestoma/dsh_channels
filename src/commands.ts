@@ -104,16 +104,9 @@ type EffortOperation = (
   action: EffortCommandAction,
 ) => ReturnType<CommandDefinition['handler']>
 
-/** One armed `/model` execution: lists, validates, and switches models. */
-export type ModelOperation = (
-  invocation: Parameters<CommandDefinition['handler']>[0],
-  rawInput: string,
-) => ReturnType<CommandDefinition['handler']>
-
 /** Per-execution authority: handlers stay instance-neutral when an Agent is borrowed. */
 const RENEW_OPERATIONS = new WeakMap<AbortSignal, RenewOperation>()
 const EFFORT_OPERATIONS = new WeakMap<AbortSignal, EffortOperation>()
-const MODEL_OPERATIONS = new WeakMap<AbortSignal, ModelOperation>()
 
 function parseEffortAction(rawInput: string): EffortCommandAction | undefined {
   const value = rawInput.trim()
@@ -141,23 +134,6 @@ const effortHandler: CommandDefinition['handler'] = invocation => {
   return operation(invocation, action)
 }
 
-const modelHandler: CommandDefinition['handler'] = invocation => {
-  const rawInput = invocation.rawInput.trim()
-  if (/\s/u.test(rawInput)) {
-    return { kind: 'error', text: '用法错误：/model [模型-id|provider/model|reset]。' }
-  }
-  if (invocation.agent.status !== 'idle'
-    || invocation.agent.inbox.nextTurn.length > 0
-    || invocation.agent.inbox.nextStep.length > 0) {
-    return { kind: 'error', text: '当前 Session 正忙或仍有排队消息，暂时不能切换模型。' }
-  }
-  const operation = MODEL_OPERATIONS.get(invocation.signal)
-  if (operation === undefined) {
-    return { kind: 'error', text: '/model 只能通过已授权的飞书话题执行。' }
-  }
-  return operation(invocation, rawInput)
-}
-
 const renewHandler: CommandDefinition['handler'] = invocation => {
   if (invocation.rawInput.trim() !== '') {
     return { kind: 'error', text: '用法错误：/renew 不接受参数。' }
@@ -180,7 +156,6 @@ const READY_HANDLERS: Readonly<Record<string, CommandDefinition['handler']>> = {
   status: readyHandler('status', 'Session 状态已读取。'),
   workspace: readyHandler('workspace', '工作目录已读取。'),
   effort: effortHandler,
-  model: modelHandler,
   renew: renewHandler,
   history: readyHandler('history', 'Session 历史已读取。'),
   export: readyHandler('export', '导出已请求。'),
@@ -196,18 +171,6 @@ export function armRenewCommand(signal: AbortSignal, operation: RenewOperation):
 export function armEffortCommand(signal: AbortSignal, operation: EffortOperation): () => void {
   EFFORT_OPERATIONS.set(signal, operation)
   return () => { EFFORT_OPERATIONS.delete(signal) }
-}
-
-/** Arm exactly one Feishu-issued `/model` execution, then return its disarmer. */
-export function armModelCommand(signal: AbortSignal, operation: ModelOperation): () => void {
-  MODEL_OPERATIONS.set(signal, operation)
-  return () => { MODEL_OPERATIONS.delete(signal) }
-}
-
-/** Install only `/model` into a borrowed Agent scope that lacks channel commands. */
-export function registerModelCommand(commands: CommandRuntime): () => void {
-  const descriptor = DESCRIPTORS.find(entry => entry.name === 'model')!
-  return commands.register({ ...descriptor, handler: modelHandler })
 }
 
 /** Install only `/renew` into a borrowed Agent scope that lacks channel commands. */

@@ -44,7 +44,7 @@ describe('slash command primitives', () => {
     const commands = makeCommandRuntime()
     registerChannelCommands(commands)
     expect([...commands.definitions.keys()].sort()).toEqual([
-      'effort', 'export', 'health', 'help', 'history', 'model', 'renew', 'status', 'workspace',
+      'effort', 'export', 'health', 'help', 'history', 'renew', 'status', 'workspace',
     ])
     expect(commands.definitions.has('compact')).toBe(false)
 
@@ -124,7 +124,7 @@ describe('slash command primitives', () => {
 
     await mountChannelCommands(bareAgentCtx as unknown as AgentContext)
     expect([...commands.definitions.keys()].sort()).toEqual([
-      'effort', 'export', 'health', 'help', 'history', 'model', 'renew', 'status', 'workspace',
+      'effort', 'export', 'health', 'help', 'history', 'renew', 'status', 'workspace',
     ])
 
     await ctx.fiber.dispose()

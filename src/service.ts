@@ -45,7 +45,7 @@ import type {
 import { buildPickerCard, parsePickAction, parseResumeAction, standaloneInfoCard, STEER_ACTION, STOP_ACTION } from './cards.ts'
 import type { PickerOption } from './cards.ts'
 import {
-  armEffortCommand, armModelCommand, armRenewCommand, registerModelCommand, commandResultCardKind, parseSlashCommand,
+  armEffortCommand, armRenewCommand, commandResultCardKind, parseSlashCommand,
   registerEffortCommand, registerRenewCommand, RouteOperationQueue, supportedCommandHelp, supportedCommandList,
 } from './commands.ts'
 import type { EffortCommandAction, ParsedSlashCommand } from './commands.ts'
@@ -138,11 +138,6 @@ interface RenewAdmission {
 }
 
 interface EffortAdmission {
-  live: LiveAgent
-  controller: RequestPolicyController
-}
-
-interface ModelAdmission {
   live: LiveAgent
   controller: RequestPolicyController
 }
@@ -2785,10 +2780,6 @@ export class FeishuService {
       unregisterBorrowedCommand = registerEffortCommand(live.agent.ctx.commands)
       definition = this.ctx.commands.find(live.agent, spec.name)
     }
-    if (definition === undefined && spec.name === 'model') {
-      unregisterBorrowedCommand = registerModelCommand(live.agent.ctx.commands)
-      definition = this.ctx.commands.find(live.agent, spec.name)
-    }
     if (definition === undefined) {
       unregisterBorrowedCommand?.()
       const text = spec.name === 'compact'
@@ -2810,9 +2801,6 @@ export class FeishuService {
     const effortAdmission: EffortAdmission | undefined = spec.name === 'effort'
       ? { live, controller: this.sessions.requestPolicy(live.agent) }
       : undefined
-    const modelAdmission: ModelAdmission | undefined = spec.name === 'model'
-      ? { live, controller: this.sessions.requestPolicy(live.agent) }
-      : undefined
     const disarmRenew = renewAdmission === undefined
       ? undefined
       : armRenewCommand(controller.signal, invocation => this.runRenewCommand(invocation, renewAdmission))
@@ -2822,12 +2810,6 @@ export class FeishuService {
           controller.signal,
           (invocation, action) => this.runEffortCommand(invocation, action, effortAdmission),
         )
-    const disarmModel = modelAdmission === undefined
-      ? undefined
-      : armModelCommand(
-          controller.signal,
-          (invocation, rawInput) => this.runModelCommand(invocation, rawInput, modelAdmission),
-        )
     let execution
     try {
       execution = await this.ctx.commands.execute(live.agent, line, [], controller.signal)
@@ -2835,7 +2817,6 @@ export class FeishuService {
       this.commandControllers.delete(controller)
       disarmRenew?.()
       disarmEffort?.()
-      disarmModel?.()
       unregisterBorrowedCommand?.()
       if (renewAdmission?.commit !== undefined) {
         await this.sessions.releaseRenewed(renewAdmission.commit)
@@ -2856,7 +2837,6 @@ export class FeishuService {
       compactBefore,
       renewAdmission,
       effortAdmission,
-      modelAdmission,
     })
   }
 
@@ -2872,24 +2852,15 @@ export class FeishuService {
     compactBefore: ContextMeasurement | undefined
     renewAdmission: RenewAdmission | undefined
     effortAdmission: EffortAdmission | undefined
-    modelAdmission: ModelAdmission | undefined
   }): Promise<void> {
-    const { spec, msg, current, live, result, compactBefore, renewAdmission, effortAdmission, modelAdmission } = input
+    const { spec, msg, current, live, result, compactBefore, renewAdmission, effortAdmission } = input
     // A settled switch (not a bare view) reconciles the Agent's selection even
     // when the folded policy looks unchanged, e.g. a reset after restart.
-    const reconcile = !input.bare && result.kind === 'success' ? spec.name : undefined
-    if (spec.name === 'effort') {
-      effortAdmission?.controller.sync(live.agent.session.snapshotEvents(), live.agent, reconcile === 'effort' ? 'effort' : undefined)
-    }
-    if (spec.name === 'model') {
-      modelAdmission?.controller.sync(live.agent.session.snapshotEvents(), live.agent, reconcile === 'model' ? 'model' : undefined)
-    }
-    if (input.bare && result.kind === 'success') {
-      const picker = spec.name === 'model' && modelAdmission !== undefined
-        ? await this.modelPicker(current, live, modelAdmission)
-        : spec.name === 'effort' && effortAdmission !== undefined
-          ? await this.effortPicker(current, live, effortAdmission, result.text ?? '')
-          : undefined
+    effortAdmission?.controller.sync(
+      live.agent.session.snapshotEvents(), live.agent, !input.bare && result.kind === 'success',
+    )
+    if (input.bare && result.kind === 'success' && effortAdmission !== undefined) {
+      const picker = await this.effortPicker(current, live, effortAdmission, result.text ?? '')
       if (picker !== undefined) {
         await this.delivery.standaloneReply(msg, picker)
         return
@@ -3246,75 +3217,6 @@ export class FeishuService {
    * segment is re-delivered as a plain-text message so the content is never
    * lost — text messages carry no card constraints.
    */
-  /** Authorized Session-level `/model` view/switch operation. */
-  private async runModelCommand(
-    invocation: CommandInvocation,
-    rawInput: string,
-    admission: ModelAdmission,
-  ): Promise<CommandResult> {
-    if (admission.live.agent !== invocation.agent) {
-      return { kind: 'error', text: '/model 只能通过已授权的飞书话题执行。' }
-    }
-    const { provider: currentProvider, model: currentModel } = currentModelRoute(admission.live, admission.controller)
-
-    if (rawInput === '') {
-      const lines = [currentModelLine(admission.live, admission.controller)]
-      const models = await this.listModels(currentProvider)
-      if (models.length > 0) {
-        lines.push(`**可选模型（${models.length}）**：${models.slice(0, 20).map(id => `\`${id}\``).join('、')}`
-          + (models.length > 20 ? ' …' : ''))
-      } else if (currentProvider === undefined) {
-        lines.push('当前还没有模型请求记录；可先用 `/model <provider>/<model>` 指定，或先发一条普通消息。')
-      }
-      lines.push('用法：`/model <模型-id>`（沿用当前 provider）· `/model <provider>/<model>` · `/model reset`')
-      return { kind: 'success', text: lines.join('\n') }
-    }
-
-    if (rawInput === 'reset') {
-      return { kind: 'success', text: '已恢复部署默认模型（下一条消息生效）。' }
-    }
-
-    const slash = rawInput.indexOf('/')
-    const provider = slash === -1 ? currentProvider : rawInput.slice(0, slash)
-    const model = slash === -1 ? rawInput : rawInput.slice(slash + 1)
-    if (model === '' || (slash !== -1 && (provider === undefined || provider === ''))) {
-      return { kind: 'error', text: '用法错误：/model [模型-id|provider/model|reset]。' }
-    }
-    // Validate against the advertised catalog when the deployment exposes one;
-    // an unsupported value would otherwise only fail at the next request.
-    if (provider !== undefined) {
-      const models = await this.listModels(provider)
-      if (models.length > 0 && !models.includes(model)) {
-        return {
-          kind: 'error',
-          text: `provider \`${provider}\` 未提供模型 \`${model}\`。可选：${models.slice(0, 20).map(id => `\`${id}\``).join('、')}`,
-        }
-      }
-    }
-    const label = provider === undefined ? model : `${provider}/${model}`
-    return { kind: 'success', text: `当前 Session 模型已切换为 \`${label}\`（下一条消息生效）。` }
-  }
-
-  /** `/model` picker: the provider's advertised models, or undefined when none are listed. */
-  private async modelPicker(
-    current: RouteRecord,
-    live: LiveAgent,
-    admission: ModelAdmission,
-  ): Promise<object | undefined> {
-    const route = currentModelRoute(live, admission.controller)
-    const models = await this.listModels(route.provider)
-    if (models.length === 0) return undefined
-    return buildPickerCard({
-      title: '🧠 模型',
-      command: 'model',
-      text: `${currentModelLine(live, admission.controller)}\n切换在下一条消息生效。`,
-      sessionId: current.sessionId,
-      options: models.map(id => ({ label: id, arg: id })),
-      ...(route.model === undefined ? {} : { current: route.model }),
-      reset: true,
-    })
-  }
-
   /**
    * `/effort` picker: the efforts the current model route advertises, or
    * undefined when the route is unknown or advertises none.
@@ -3346,18 +3248,6 @@ export class FeishuService {
       ...(active === undefined ? {} : { current: active }),
       reset: true,
     })
-  }
-
-  /** Model ids advertised for one provider route (empty when unavailable). */
-  private async listModels(provider: string | undefined): Promise<string[]> {
-    if (provider === undefined) return []
-    try {
-      const llm = this.ctx.get?.('llm') as LlmService | undefined
-      const models = await llm?.listModels?.(provider)
-      return (models ?? []).map(entry => entry.id ?? entry.name ?? '').filter(id => id !== '')
-    } catch {
-      return []
-    }
   }
 
   /**
@@ -3498,19 +3388,9 @@ function currentModelRoute(
   const selected = live.agent.model?.current()
   const header = live.agent.session.requestHeader?.()?.config
   return {
-    provider: state.effectiveModel?.provider ?? selected?.provider
+    provider: state.configuredModel?.provider ?? selected?.provider
       ?? (typeof header?.provider === 'string' && header.provider !== '' ? header.provider : undefined),
-    model: state.effectiveModel?.model ?? selected?.model
+    model: state.configuredModel?.model ?? selected?.model
       ?? (typeof header?.model === 'string' && header.model !== '' ? header.model : undefined),
   }
-}
-
-/** `**当前模型**：…` line shared by the `/model` text answer and its picker. */
-function currentModelLine(live: LiveAgent, controller: RequestPolicyController): string {
-  const { provider, model } = currentModelRoute(live, controller)
-  const source = controller.state.modelSource === 'session'
-    ? 'Session 覆盖'
-    : controller.state.modelSource === 'config' ? '配置默认' : '部署默认'
-  return `**当前模型**：${model === undefined ? '尚无模型请求记录' : `\`${model}\``}`
-    + `${provider === undefined ? '' : `（provider \`${provider}\`）`} · ${source}`
 }
