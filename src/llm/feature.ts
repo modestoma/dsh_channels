@@ -322,12 +322,17 @@ export class UserModels {
     const route = this.deps.routeOf(sessionId)
     if (route === undefined) return `${saved}当前会话已不在这个话题里，没有切换。`
     if (route.senderUserId !== userId) return `${saved}当前会话由发起人决定，没有切换。`
+    const target = this.routeOfChoice(stored)
+    if (target === undefined) return `${saved}缺省模型未知，当前会话没有切换。`
     const lines: string[] = []
     if (action.kind === 'effort') {
+      // Efforts belong to the saved model, so a Session on another model switches to it first.
+      const current = this.deps.sessionChoice(sessionId)
+      if (current?.provider !== target.provider || current.model !== target.model) {
+        lines.push(`/model ${target.provider}/${target.model}`)
+      }
       lines.push(stored.effort === undefined ? this.defaultEffortLine(stored) : `/effort ${stored.effort}`)
     } else {
-      const target = this.routeOfChoice(stored)
-      if (target === undefined) return `${saved}缺省模型未知，当前会话没有切换。`
       lines.push(`/model ${target.provider}/${target.model}`, this.defaultEffortLine(stored))
     }
     const error = await this.deps.switchSession(route, lines)

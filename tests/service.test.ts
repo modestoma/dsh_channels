@@ -3959,6 +3959,29 @@ describe('command picker cards', () => {
     await h.service.shutdown()
   })
 
+  it('switches the Session to the saved model before applying an effort picked for it', async () => {
+    const h = await setup()
+    const created = await establishWithModel(h, 'oc_pick_effort_model')
+    const topic = (messageId: string, content: string) => makeMessage({
+      chatType: 'group', chatId: 'oc_pick_effort_model', senderId: 'u_owner', threadId: 'omt_1', mentionedBot: false, messageId, content,
+    })
+    await h.onMessage(topic('om_em_typed', '/model deepseek-v4-pro'))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
+    await h.onMessage(topic('om_em_pick', '/model'))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(3))
+    await h.channel.fireCardAction({
+      messageId: 'om_3', chatId: 'oc_pick_effort_model', operator: { openId: 'ou_o', userId: 'u_owner' },
+      action: {
+        value: { decision: 'llm-pref', kind: 'effort', owner: 'u_owner', effort: 'high', sessionId: created.handle.agent.session.id },
+        tag: 'button',
+      },
+    })
+    await waitUntil(() => expect(pickerUpdates(h, 'om_3')).toHaveLength(1))
+    await expect(dispatchAgentRequest(created.setupCtx, { provider: 'deepseek-official', model: 'deepseek-v4-pro' }))
+      .resolves.toMatchObject({ model: 'deepseek-v4-flash', reasoningEffort: 'high' })
+    await h.service.shutdown()
+  })
+
   it('answers bare /effort with the efforts the model advertises', async () => {
     const h = await setup({ reasoningEffort: 'high' })
     mock(h.ctxState.ctx.llm!.resolveModelInfo).mockResolvedValue({
