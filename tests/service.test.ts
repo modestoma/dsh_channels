@@ -11,7 +11,7 @@ import { gunzip } from 'node:zlib'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { TestFeishuService as FeishuService } from './helpers.ts'
 import { MISSED_RUN_ACTION } from '../src/cards/missed.ts'
-import { hostTurnOriginLine } from '../src/service.ts'
+import { hostTurnOriginLine, StartSupersededError } from '../src/service.ts'
 import { FeishuApiError } from '../src/feishu-channel.ts'
 import type { FeishuConfig } from '../src/config.ts'
 import type {
@@ -29,8 +29,9 @@ import type { SessionExportBuilder } from '../src/session-export.ts'
 import {
   dispatchAgentRequest, makeHostContext, makeChannel, makeMessage, makeAgentPresets, makeSession, makeAgent,
   makeMessageGetResponse, makeMessageListResponse, makeRawMessage, promptSectionsOf, sessionEvents,
-  followupMessagesOf, makeAttachmentStore, makeToolsRuntime,
+  followupMessagesOf, makeAttachmentStore, makeInstanceLocks, makeToolsRuntime,
 } from './helpers.ts'
+import { MissedMessages } from '../src/routing/missed.ts'
 import type { FakeAgentPresets, FakeAgentPresetsOptions, FakeAgentsOptions } from './helpers.ts'
 
 function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
@@ -195,6 +196,74 @@ describe('FeishuService', () => {
     expect(mock(h.channel.connect)).toHaveBeenCalled()
     await h.service.shutdown()
     expect(mock(h.channel.disconnect)).toHaveBeenCalled()
+  })
+
+  it('stops taking Feishu messages and card actions before teardown awaits anything', async () => {
+    const h = await setup()
+    const offMessage = vi.fn()
+    const offCardAction = vi.fn()
+    await h.service.shutdown()
+    mock(h.channel.onMessage).mockReturnValue(offMessage)
+    mock(h.channel.onCardAction).mockReturnValue(offCardAction)
+    await h.service.start()
+
+    const stopping = h.service.shutdown()
+    // Synchronous part of shutdown: a plugin reload has already removed the
+    // host listeners, so no new message may start a turn from here on.
+    expect(offMessage).toHaveBeenCalledTimes(1)
+    expect(offCardAction).toHaveBeenCalledTimes(1)
+    await stopping
+  })
+
+  it('leaves no Feishu connection when shut down while the connection is opening', async () => {
+    const channel = makeChannel()
+    let connected!: () => void
+    const connecting = new Promise<void>(resolve => { connected = resolve })
+    mock(channel.connect).mockImplementation(async () => { await connecting })
+    const locks = makeInstanceLocks()
+    const ctxState = makeHostContext()
+    const service = new FeishuService(ctxState.ctx, makeConfig(), () => channel, undefined, undefined, locks)
+    const starting = service.start().then(() => undefined, (error: unknown) => error)
+    await waitUntil(() => expect(mock(channel.connect)).toHaveBeenCalled())
+
+    await service.shutdown()
+    connected()
+
+    expect(await starting).toBeInstanceOf(StartSupersededError)
+    expect(mock(channel.disconnect)).toHaveBeenCalledTimes(2)
+    expect(service.isRunning()).toBe(false)
+    expect(locks.owners.size).toBe(0)
+  })
+
+  it('does not take the instance lock when shut down while resolving credentials', async () => {
+    const locks = makeInstanceLocks()
+    const ctxState = makeHostContext()
+    let resolved!: () => void
+    const resolving = new Promise<void>(resolve => { resolved = resolve })
+    const values = ctxState.credentials.values
+    ctxState.credentials.resolve.mockImplementation(async (ref: string) => {
+      await resolving
+      const value = values[ref]
+      return value === undefined ? undefined : { value, source: 'file' }
+    })
+    const channel = makeChannel()
+    const service = new FeishuService(ctxState.ctx, makeConfig(), () => channel, undefined, undefined, locks)
+    const starting = service.start().then(() => undefined, (error: unknown) => error)
+    await service.shutdown()
+    resolved()
+
+    expect(await starting).toBeInstanceOf(StartSupersededError)
+    expect(locks.owners.size).toBe(0)
+    expect(mock(channel.connect)).not.toHaveBeenCalled()
+  })
+
+  it('still disconnects when stopping the missed-message catch-up fails', async () => {
+    const h = await setup({ missed: { enabled: true, windowMs: 30 * 60_000, heartbeatMs: 60_000, maxMessages: 200 } })
+    const stop = vi.spyOn(MissedMessages.prototype, 'stop').mockRejectedValueOnce(new Error('storage closed'))
+    await h.service.shutdown()
+    stop.mockRestore()
+    expect(mock(h.channel.disconnect)).toHaveBeenCalled()
+    expect(h.service.isRunning()).toBe(false)
   })
 
   it('handles unbound /health without creating a workspace or Session', async () => {

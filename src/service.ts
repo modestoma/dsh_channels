@@ -314,6 +314,17 @@ export class InstanceLockHeldError extends Error {
 }
 
 /**
+ * `shutdown()` ran while `start()` was still awaiting: the superseded start
+ * released what it had opened and must not report a connection failure.
+ */
+export class StartSupersededError extends Error {
+  constructor() {
+    super('dsh-channels: the channel was shut down while it was starting')
+    this.name = 'StartSupersededError'
+  }
+}
+
+/**
  * One-line description of a lock owner for logs and the panel.
  * @param holder - the owner, or undefined when it did not identify itself.
  * @returns e.g. `pid 1234 · DSH_HOME /Users/a/.dsh · v0.8.0`.
@@ -408,6 +419,11 @@ export class FeishuService {
   private readonly contextWindows = new Map<string, number>()
   private readonly windowRequests = new Set<string>()
   private started = false
+  /**
+   * Incremented by every `shutdown()`. A `start()` that observes a different
+   * value after one of its awaits was superseded and releases what it opened.
+   */
+  private lifecycle = 0
   /** Machine-wide lock for the connected App ID, held while the channel runs. */
   private lock: InstanceLock | undefined
   /**
@@ -1029,6 +1045,13 @@ export class FeishuService {
       this.lastStartError = undefined
       this.runningConfig = { ...this.config }
     } catch (error) {
+      if (error instanceof StartSupersededError) {
+        // Not a connection failure: release what the superseded start
+        // registered after the teardown that superseded it.
+        this.ctx.logger?.info?.('%s', error.message)
+        await this.shutdown().catch(() => undefined)
+        throw error
+      }
       this.lastStartError = messageOf(error)
       if (error instanceof InstanceLockHeldError) {
         // Expected when another profile runs the same bot: not a failure.
@@ -1904,10 +1927,18 @@ export class FeishuService {
   async start(): Promise<void> {
     if (this.started) return
     this.started = true
+    const lifecycle = this.lifecycle
+    // A plugin reload disposes this instance's host listeners and then calls
+    // `shutdown()`, possibly while this body is still awaiting. Continuing
+    // would leave a Feishu connection whose turns never reach a card.
+    const ensureCurrent = (): void => {
+      if (this.lifecycle !== lifecycle) throw new StartSupersededError()
+    }
 
     // 1. Resolve credentials through the host seam (env > .credentials.yaml > .env).
     const appId = await resolveCredentialRef(this.ctx, this.config.appId)
     const appSecret = await resolveCredentialRef(this.ctx, this.config.appSecret)
+    ensureCurrent()
 
     // 2. Own the App ID on this machine before connecting: Feishu splits the
     //    events of one app across all its long connections.
@@ -1919,8 +1950,13 @@ export class FeishuService {
       ...(this.takeoverDeadline === undefined ? {} : { waitUntil: this.takeoverDeadline }),
     })
     if (!acquired.ok) {
+      ensureCurrent()
       this.occupied = { holder: acquired.holder }
       throw new InstanceLockHeldError(acquired.holder)
+    }
+    if (this.lifecycle !== lifecycle) {
+      await acquired.lock.release()
+      throw new StartSupersededError()
     }
     this.lock = acquired.lock
     this.occupied = undefined
@@ -1962,7 +1998,12 @@ export class FeishuService {
       this.config.statusRefreshMs,
     )
 
-    this.domain = await openFeishuDomain(this.ctx)
+    const domain = await openFeishuDomain(this.ctx)
+    if (this.lifecycle !== lifecycle) {
+      await domain.close()
+      throw new StartSupersededError()
+    }
+    this.domain = domain
     this.routes.load()
     this.accessStore.load()
     this.userLlm.load()
@@ -2063,12 +2104,19 @@ export class FeishuService {
     // one, the lookup only backs a later runtime clear and must not delay boot.
     const ownerLookup = this.resolveAppOwner(channel)
     if (this.configuredAdminUserId() === undefined) await ownerLookup
+    ensureCurrent()
     await channel.connect()
+    if (this.lifecycle !== lifecycle) {
+      // The teardown's disconnect ran before this connect resolved.
+      await channel.disconnect().catch(() => undefined)
+      throw new StartSupersededError()
+    }
     // Background: the results only feed the panel and the log.
     void this.runScopeCheck(channel, appId, ownerLookup)
     if (this.config.slashCommandPanel) void this.runSlashCommandSync(channel)
     // Before admission opens, so every `running` record left is a previous instance's.
     await this.topicLauncher.markInterrupted()
+    ensureCurrent()
     this.topicLauncher.open()
     // Read back what arrived while no instance was connected (background).
     this.missed.start()
@@ -2144,8 +2192,23 @@ export class FeishuService {
 
   /** Tear down: close the connection and dispose all live agents. */
   async shutdown(): Promise<void> {
-    // While admission is still open, so a running catch-up finishes its messages.
-    await this.missed.stop()
+    this.lifecycle++
+    // Stop Feishu intake before the first await. On a plugin reload the host
+    // has already removed this instance's session listeners, so a message
+    // admitted now would start a turn whose card never settles. Messages that
+    // arrive from here on are read back by the next instance's catch-up.
+    this.unlisten?.()
+    this.unlisten = undefined
+    this.unlistenCardAction?.()
+    this.unlistenCardAction = undefined
+    // While admission is still open, so a running catch-up finishes its
+    // messages; the stored last-alive time stays at this intake cutoff. A
+    // failure must not keep the connection open.
+    try {
+      await this.missed.stop()
+    } catch (error) {
+      this.ctx.logger?.warn?.('dsh-channels: stopping the missed-message catch-up failed: %s', String(error))
+    }
     // Close admission first. In-flight Host commands receive cancellation
     // before their Agent/channel/storage dependencies are disposed, while
     // already queued route operations observe `started === false` and retire.
@@ -2156,10 +2219,6 @@ export class FeishuService {
     await Promise.allSettled([...this.commandOperations])
     this.commandControllers.clear()
     this.commandOperations.clear()
-    this.unlisten?.()
-    this.unlisten = undefined
-    this.unlistenCardAction?.()
-    this.unlistenCardAction = undefined
     // A pending bind writes the route, the credential and then the user's
     // record; storage must outlive it so the three stay consistent.
     await this.userModels.drain()
