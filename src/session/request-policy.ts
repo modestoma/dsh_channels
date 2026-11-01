@@ -30,6 +30,15 @@ export interface ModelOverride {
   readonly model: string
 }
 
+/** Host lookups the policy consults while folding the Session log. */
+export interface RequestPolicyOptions {
+  /**
+   * Whether the host still lists a provider route. A logged `/model` naming
+   * a route that returns false is ignored. Absent: every route is kept.
+   */
+  providerAvailable?(provider: string): boolean
+}
+
 /** Channel-configured defaults for sessions this plugin creates. */
 export interface RequestPolicyConfig {
   /** Configured reasoning effort (optional → adapter/provider default). */
@@ -43,8 +52,8 @@ export interface RequestPolicyConfig {
 export interface RequestPolicyState {
   readonly configuredEffort: string | undefined
   readonly configuredModel: ModelOverride | undefined
-  /** Session-level `/effort` override. */
-  readonly effortOverride: string | undefined
+  /** Session-level `/effort` override; `null` after `/effort default` (the model's own default). */
+  readonly effortOverride: EffortOverride | undefined
   /** Session-level `/model` override. */
   readonly modelOverride: ModelOverride | undefined
   /** Effort this channel writes into the next request, when defined. */
@@ -71,16 +80,37 @@ export interface RequestPolicyController {
   dispose(): void
 }
 
+/** A Session-level effort choice: a tier id, or `null` for the model's own default. */
+export type EffortOverride = string | null
+
 type PendingSelection =
-  | { readonly kind: 'effort'; readonly value: string | undefined }
+  | { readonly kind: 'effort'; readonly value: EffortOverride | undefined }
   | { readonly kind: 'model'; readonly value: ModelOverride | undefined }
 
-/** Parse `/effort` input; only values the handler can accept. */
-function effortSelection(args: string | undefined): string | undefined | 'invalid' {
+/**
+ * Parse `/effort` input; only values the handler can accept. `reset` clears
+ * the override (back to the configured effort); `default` overrides with the
+ * model's own default.
+ */
+function effortSelection(args: string | undefined): EffortOverride | undefined | 'invalid' {
   if (args === undefined) return 'invalid'
   const value = args.trim()
   if (value === '' || /\s/u.test(value)) return 'invalid'
-  return value === 'reset' ? undefined : value
+  if (value === 'reset') return undefined
+  return value === 'default' ? null : value
+}
+
+/** The request without its reasoning effort. */
+function withoutEffort<T extends { reasoningEffort?: unknown }>(request: T): T {
+  if (!('reasoningEffort' in request)) return request
+  const { reasoningEffort: _dropped, ...rest } = request
+  return rest as T
+}
+
+/** The effort written into requests for an override over a configured effort. */
+function effectiveEffortOf(override: EffortOverride | undefined, configured: string | undefined): string | undefined {
+  if (override === null) return undefined
+  return override ?? configured
 }
 
 /**
@@ -96,13 +126,14 @@ function modelSelection(args: string | undefined): ModelOverride | undefined | '
   if (slash === -1) return { model: value }
   const provider = value.slice(0, slash)
   const model = value.slice(slash + 1)
-  if (provider === '' || model === '' || model.includes('/')) return 'invalid'
+  // Only the first slash separates the provider: catalog ids may be namespaced (`vendor/model`).
+  if (provider === '' || model === '') return 'invalid'
   return { provider, model }
 }
 
 /** One folded policy: the last successful Session-level selections. */
 export interface FoldedRequestPolicy {
-  effort: string | undefined
+  effort: EffortOverride | undefined
   model: ModelOverride | undefined
 }
 
@@ -114,7 +145,7 @@ export interface FoldedRequestPolicy {
  */
 export function foldRequestPolicy(events: readonly SessionEvent[]): FoldedRequestPolicy {
   const pending = new Map<CommandId, PendingSelection>()
-  let effort: string | undefined
+  let effort: EffortOverride | undefined
   let model: ModelOverride | undefined
   for (const event of events) {
     if (event.type === 'command/run') {
@@ -139,7 +170,7 @@ export function foldRequestPolicy(events: readonly SessionEvent[]): FoldedReques
 }
 
 /** Fold only the last successful Session-level `/effort` selection. */
-export function foldEffortOverride(events: readonly SessionEvent[]): string | undefined {
+export function foldEffortOverride(events: readonly SessionEvent[]): EffortOverride | undefined {
   return foldRequestPolicy(events).effort
 }
 
@@ -185,8 +216,9 @@ function selectPolicy(
 export function installRequestPolicy(
   agentCtx: AgentContext,
   config: RequestPolicyConfig = {},
+  options: RequestPolicyOptions = {},
 ): RequestPolicyController {
-  let effortOverride: string | undefined
+  let effortOverride: EffortOverride | undefined
   let modelOverride: ModelOverride | undefined
   let disposed = false
   /** Last policy recorded through `agent.model`; undefined until the first selecting sync. */
@@ -199,11 +231,13 @@ export function installRequestPolicy(
     const request = await next()
     // Hosts that own model selection reject a changed route or effort here.
     if (payload.agent?.model !== undefined) return request
-    const effort = effortOverride ?? config.effort
+    const effort = effectiveEffortOf(effortOverride, config.effort)
     const model = modelOverride ?? configuredModel
-    if (effort === undefined && model === undefined) return request
+    // `/effort default` also drops an effort an inner listener composed.
+    const base = effortOverride === null ? withoutEffort(request) : request
+    if (effort === undefined && model === undefined) return base
     return {
-      ...request,
+      ...base,
       ...(effort === undefined ? {} : { reasoningEffort: effort }),
       ...(model === undefined ? {} : { model: model.model }),
       ...(model?.provider === undefined ? {} : { provider: model.provider }),
@@ -212,7 +246,7 @@ export function installRequestPolicy(
 
   return {
     get state(): RequestPolicyState {
-      const effectiveEffort = effortOverride ?? config.effort
+      const effectiveEffort = effectiveEffortOf(effortOverride, config.effort)
       const effectiveModel = modelOverride ?? configuredModel
       return {
         configuredEffort: config.effort,
@@ -221,9 +255,9 @@ export function installRequestPolicy(
         modelOverride,
         effectiveEffort,
         effectiveModel,
-        effortSource: effortOverride !== undefined
+        effortSource: typeof effortOverride === 'string'
           ? 'session'
-          : config.effort !== undefined ? 'config' : 'model-default',
+          : effectiveEffort !== undefined ? 'config' : 'model-default',
         modelSource: modelOverride !== undefined
           ? 'session'
           : configuredModel !== undefined ? 'config' : 'deployment-default',
@@ -231,11 +265,14 @@ export function installRequestPolicy(
     },
     sync(events, agent, reconcile) {
       const folded = foldRequestPolicy(events)
-      effortOverride = folded.effort
-      modelOverride = folded.model
+      // A logged switch to a provider the host no longer lists falls back to
+      // the configured route; the effort chosen for that model goes with it.
+      const stale = folded.model?.provider !== undefined && options.providerAvailable?.(folded.model.provider) === false
+      effortOverride = stale ? undefined : folded.effort
+      modelOverride = stale ? undefined : folded.model
       const model = agent?.model
       if (agent === undefined || model === undefined || disposed) return
-      const next: AppliedPolicy = { effort: effortOverride ?? config.effort, model: modelOverride ?? configuredModel }
+      const next: AppliedPolicy = { effort: effectiveEffortOf(effortOverride, config.effort), model: modelOverride ?? configuredModel }
       const previous = applied ?? { effort: undefined, model: undefined }
       applied = next
       if (reconcile === undefined && previous.effort === next.effort && sameModel(previous.model, next.model)) return

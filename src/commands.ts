@@ -98,6 +98,8 @@ export type EffortCommandAction =
   | { readonly kind: 'show' }
   | { readonly kind: 'set'; readonly value: string }
   | { readonly kind: 'reset' }
+  /** Override with the model's own default, ignoring the configured effort. */
+  | { readonly kind: 'default' }
 
 type EffortOperation = (
   invocation: Parameters<CommandDefinition['handler']>[0],
@@ -119,13 +121,14 @@ function parseEffortAction(rawInput: string): EffortCommandAction | undefined {
   const value = rawInput.trim()
   if (value === '') return { kind: 'show' }
   if (/\s/u.test(value)) return undefined
-  return value === 'reset' ? { kind: 'reset' } : { kind: 'set', value }
+  if (value === 'reset') return { kind: 'reset' }
+  return value === 'default' ? { kind: 'default' } : { kind: 'set', value }
 }
 
 const effortHandler: CommandDefinition['handler'] = invocation => {
   const action = parseEffortAction(invocation.rawInput)
   if (action === undefined) {
-    return { kind: 'error', text: '用法错误：/effort [档位-id|reset]。' }
+    return { kind: 'error', text: '用法错误：/effort [档位-id|default|reset]。' }
   }
   if (action.kind !== 'show' && (
     invocation.agent.status !== 'idle'

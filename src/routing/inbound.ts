@@ -1080,8 +1080,11 @@ export class InboundRouter {
     //    be switched), then enter its own topic directory / worktree.
     let handle: AgentHandle | undefined
     let placement: TopicPlacement | undefined
+    // The owner's model preference is read once, so the Session and its
+    // route record the same starting choice.
+    const llm = this.sessions.sessionLlmFor(msg.senderId)
     try {
-      handle = await this.sessions.createSession(sessionId, plan.cwd)
+      handle = await this.sessions.createSession(sessionId, plan.cwd, llm)
       placement = await enterTopic(services, handle.agent, plan, workspace.path, topicToken, warn)
       // A workspace attachment only validates when the header cwd is the
       // workspace itself; the hard fallback (no workingDirectory service) must
@@ -1122,6 +1125,7 @@ export class InboundRouter {
       createdAt,
       lastActivityAt: createdAt,
       sessionHistory: [{ sessionId, createdAt }],
+      ...(llm === undefined ? {} : { llm }),
     }
     // The delivery gate is opened BEFORE the route becomes durable: a message
     // that can see the route must also wait for this Session's first followup

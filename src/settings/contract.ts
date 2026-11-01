@@ -579,6 +579,8 @@ export interface AccessUserWire {
   wikiRead: boolean
   wikiWrite: boolean
   codeWrite: boolean
+  /** The user's `/model` preference (`我的 API · gpt-4o · high`); absent = administrator default. */
+  llm?: string
 }
 
 /** One pending authorization request the panel may settle (same path as the DM card). */
@@ -941,6 +943,7 @@ export const PANEL_COPY = {
   accessPermWikiRead: '读知识库',
   accessPermWikiWrite: '写知识库',
   accessPermCodeWrite: '改代码',
+  accessUserModel: '模型',
   // ---- wiki ---------------------------------------------------------------
   wikiUsersTitle: '可使用的人',
   wikiUsersSummary: '读取 {read} 人 · 写入 {write} 人，管理员始终可用',
