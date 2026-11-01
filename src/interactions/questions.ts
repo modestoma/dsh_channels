@@ -40,6 +40,11 @@ export interface QuestionHooks {
    * and settle so the streaming card can show it.
    */
   onWaitingChange?(sessionId: string, waiting: boolean): void
+  /**
+   * Durable card patch (the outbox), retried until it lands. Absent = each
+   * patch is attempted once.
+   */
+  patchCard?(messageId: string, card: object): Promise<void>
 }
 
 /** One in-flight question set: card content, partial answers, resolver. */
@@ -82,7 +87,7 @@ export class QuestionAnswerer {
     private readonly hooks: QuestionHooks,
     private readonly timeoutMs: number,
   ) {
-    this.table = new PendingCardTable(channel, hooks.onError)
+    this.table = new PendingCardTable(channel, hooks.onError, hooks.patchCard?.bind(hooks))
   }
 
   /** In-flight question-set count (diagnostics/tests). */

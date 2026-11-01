@@ -47,6 +47,11 @@ export interface WikiConsentDeps {
   timeoutMs(): number
   /** Log a non-fatal delivery/update failure. */
   onError(sessionId: string, error: unknown): void
+  /**
+   * Durable card patch (the outbox), retried until it lands. Absent = each
+   * patch is attempted once.
+   */
+  patchCard?(messageId: string, card: object): Promise<void>
 }
 
 /** Consent cards for the wiki tools. */
@@ -164,7 +169,7 @@ export class WikiConsent {
 
   private tableFor(channel: FeishuChannel): PendingCardTable<Pending> {
     if (this.table?.channel !== channel) {
-      this.table = { channel, entries: new PendingCardTable<Pending>(channel, this.deps.onError) }
+      this.table = { channel, entries: new PendingCardTable<Pending>(channel, this.deps.onError, this.deps.patchCard?.bind(this.deps)) }
     }
     return this.table.entries
   }

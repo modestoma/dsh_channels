@@ -58,6 +58,8 @@ import type {
   ExpiredRouteRecord, FeishuDomainGlobal, FeishuDomainHandle, InflightSnapshot,
   ProcessedRecord, RawDomainHandle, RouteRecord, SessionOriginRecord, TopicLaunchRecord,
 } from './domain.ts'
+import { Outbox } from './outbox.ts'
+import type { OutboxEntry } from './outbox.ts'
 import { RouteStore } from './session/routes.ts'
 import { TopicLauncher } from './topics/launcher.ts'
 import { InflightRepair, storableMessage } from './session/repair.ts'
@@ -168,6 +170,7 @@ async function openFeishuDomain(ctx: HostContext): Promise<FeishuDomainHandle> {
   const accessRequestsRaw = domain.table('access_requests')
   const topicLaunchesRaw = domain.table('analyze_requests')
   const sessionOriginsRaw = domain.table('session_origins')
+  const outboxRaw = domain.table('outbox')
   return {
     routes: {
       get: key => table.get(key) as RouteRecord | undefined,
@@ -217,6 +220,12 @@ async function openFeishuDomain(ctx: HostContext): Promise<FeishuDomainHandle> {
     },
     getGlobal: () => (domain.global.get() ?? {}) as FeishuDomainGlobal,
     setGlobal: value => domain.global.set(value),
+    outbox: {
+      get: key => outboxRaw.get(key) as OutboxEntry | undefined,
+      put: (key, value) => outboxRaw.put(key, value),
+      delete: key => outboxRaw.delete(key),
+      entries: () => outboxRaw.entries() as IterableIterator<[string, OutboxEntry]>,
+    },
     close: () => domain.close(),
   }
 }
@@ -356,6 +365,8 @@ export class FeishuService {
   private channel: FeishuChannel | undefined
   private streamer: TurnStreamer | undefined
   private domain: FeishuDomainHandle | undefined
+  /** Durable retries of a turn's terminal card patches, reactions, and segments. */
+  private readonly outbox: Outbox
   /** Durable route store (cache + TTL retirement). */
   private readonly routes: RouteStore
   /** In-flight turn snapshots + startup repair. */
@@ -613,12 +624,19 @@ export class FeishuService {
       fetchAvailable: () => this.effectiveAttachmentBackend() === 'native',
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
     })
+    this.outbox = new Outbox({
+      table: () => this.domain?.outbox,
+      channel: () => this.channel,
+      sendSegment: (sessionId, segment, card, text) => this.delivery.segmentCard(sessionId, segment, card, text),
+      warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
+    })
     this.wikiConsent = new WikiConsent({
       channel: () => (this.started ? this.channel : undefined),
       timeoutMs: () => this.config.approvalTimeoutMs,
       onError: (sessionId, error) => {
         this.ctx.logger?.warn?.('dsh-channels wiki consent error (session %s): %s', sessionId, String(error))
       },
+      patchCard: (messageId, card) => this.outbox.patch(messageId, card),
     })
     this.wikiTools = new WikiToolRuntime({
       config: () => this.config,
@@ -1964,6 +1982,9 @@ export class FeishuService {
       },
       sendSegmentCard: (sessionId, segment, card, fallbackText) =>
         this.delivery.segmentCard(sessionId, segment, card, fallbackText),
+      settlePatch: (messageId, card) => this.outbox.patch(messageId, card),
+      settleReaction: (messageId, removeReactionId, add) => this.outbox.reaction(messageId, removeReactionId, add),
+      resendSegment: (sessionId, segment, card, fallbackText) => this.outbox.segment(sessionId, segment, card, fallbackText),
       hostTurnOrigin: (sessionId, message) => this.hostTurnOrigin(sessionId, message),
       onHostCardDelivered: (sessionId, messageId, mode, message) => this.writeHostSnapshot(sessionId, messageId, mode, message),
     }
@@ -1982,6 +2003,7 @@ export class FeishuService {
     this.domain = domain
     this.routes.load()
     this.accessStore.load()
+    this.outbox.start()
 
     // HITL: answer the host's approval/request waterfall for sessions this
     // channel routes. `prepend` claims such requests BEFORE the web gateway's
@@ -1995,6 +2017,7 @@ export class FeishuService {
       onWaitingChange: (sessionId, toolNames) => {
         this.streamer?.setAwaitingApproval(sessionId, toolNames)
       },
+      patchCard: (messageId, card) => this.outbox.patch(messageId, card),
     }, this.config.approvalTimeoutMs)
     this.approvalAnswerer = answerer
     this.unlistenApproval = this.ctx.on('approval/request', (req, next) => answerer.onRequest(req, next), { prepend: true })
@@ -2006,6 +2029,7 @@ export class FeishuService {
       onWaitingChange: (sessionId, waiting) => {
         this.streamer?.setAwaitingAnswer(sessionId, waiting)
       },
+      patchCard: (messageId, card) => this.outbox.patch(messageId, card),
       onError: (sessionId, error) => {
         this.ctx.logger?.warn?.('dsh-channels question error (session %s): %s', sessionId, String(error))
       },
@@ -2233,6 +2257,8 @@ export class FeishuService {
     this.inbound.clear()
     this.routes.clear()
     this.accessStore.clear()
+    // Before the disconnect: the withdrawal patches above are in flight.
+    await this.outbox.stop()
     try {
       await this.channel?.disconnect()
     } catch {
@@ -3104,6 +3130,7 @@ export class FeishuService {
       routeCount: this.routes.size(),
       liveAgentCount: this.sessions.liveCount(),
       inflightTurnCount,
+      outbox: this.outbox.health(),
     })
   }
 

@@ -10,6 +10,8 @@
 
 import { z } from 'zod'
 import type { TopicRootCard } from './topics/contract.ts'
+import { outboxEntrySchema } from './outbox.ts'
+import type { OutboxTable } from './outbox.ts'
 
 /**
  * Route key kinds. `thread` = real Feishu topic; `chat` = degraded chat-scoped
@@ -507,6 +509,10 @@ export interface FeishuDomainSpecShape {
       valueSchema: typeof sessionOriginRecordSchema
       __key?: string
     }
+    outbox: {
+      valueSchema: typeof outboxEntrySchema
+      __key?: string
+    }
   }
 }
 
@@ -555,6 +561,8 @@ export const feishuDomain: FeishuDomainSpecShape = {
     analyze_requests: { valueSchema: topicLaunchRecordSchema },
     // Session id → Feishu origin; a missing table loads empty.
     session_origins: { valueSchema: sessionOriginRecordSchema },
+    // Terminal Feishu actions waiting for a retry; a missing table loads empty.
+    outbox: { valueSchema: outboxEntrySchema },
   },
 }
 
@@ -639,6 +647,8 @@ export interface FeishuDomainHandle {
   topicLaunches: TopicLaunchesTable
   /** Feishu origin of every Session a route ever named. */
   sessionOrigins: SessionOriginsTable
+  /** Terminal Feishu actions waiting for a retry. */
+  outbox: OutboxTable
   getGlobal(): FeishuDomainGlobal
   setGlobal(value: FeishuDomainGlobal): Promise<unknown> | void
   close(): Promise<void>

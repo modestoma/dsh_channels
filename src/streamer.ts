@@ -154,6 +154,22 @@ export interface StreamerHooks {
    * restart snapshot written here precedes its segment updates.
    */
   onHostCardDelivered?(sessionId: string, messageId: string, mode: 'card' | 'text', message: UserMessage): Promise<void>
+  /**
+   * Patch a card of a finalized turn to its settled content. Absent: one
+   * `updateCard` attempt. Implementations retry until it lands.
+   */
+  settlePatch?(messageId: string, card: object): void
+  /**
+   * Swap the trigger message's reaction when a turn settles. Absent: one
+   * attempt. Implementations retry until it lands.
+   */
+  settleReaction?(messageId: string, removeReactionId: string | undefined, add: string): void
+  /**
+   * Send a segment card of a finalized turn whose send failed (after the
+   * in-turn retries), so its content still reaches the user. Absent: the
+   * content is lost.
+   */
+  resendSegment?(sessionId: string, segment: number, card: object, fallbackText: string): void
 }
 
 /** One segment card of a turn. Card 1 is the attached reply card; further
@@ -1584,6 +1600,7 @@ export class TurnStreamer {
       card.sending = false
       card.failed = true
       this.hooks.onError(sessionId, lastError)
+      if (state.finalized) this.resend(sessionId, state, index)
     })
     this.segmentChains.set(sessionId, next.then(() => {}, () => {}))
   }
@@ -1606,6 +1623,10 @@ export class TurnStreamer {
       this.cardState(sessionId, state, card.body, index),
       options,
     )
+    if (state.finalized && this.hooks.settlePatch !== undefined) {
+      this.hooks.settlePatch(card.messageId, snapshot)
+      return
+    }
     this.channel.updateCard(card.messageId, snapshot).catch((error: unknown) => {
       card.dirty = true
       card.failures++
@@ -1682,6 +1703,7 @@ export class TurnStreamer {
     // late-arriving sends are patched when they resolve).
     for (const [index] of state.cards.entries()) {
       this.patchCard(sessionId, state, index, true, false)
+      this.resend(sessionId, state, index)
     }
 
     // Reaction swap: Typing → DONE on success, Typing → No on failure.
@@ -1706,8 +1728,19 @@ export class TurnStreamer {
     }
   }
 
+  /** Hand a finalized turn's never-delivered segment with content to `resendSegment`. */
+  private resend(sessionId: string, state: TurnState, index: number): void {
+    const card = state.cards[index]
+    if (card === undefined || !card.failed || card.messageId !== undefined || card.body.trim() === '') return
+    this.hooks.resendSegment?.(sessionId, index + 1, buildCard(this.cardState(sessionId, state, card.body, index), segmentCardOptions(index)), card.body)
+  }
+
   private async swapReaction(state: TriggerReaction, failed: boolean): Promise<void> {
     if (state.triggerMessageId === undefined) return
+    if (this.hooks.settleReaction !== undefined) {
+      this.hooks.settleReaction(state.triggerMessageId, state.reactionId, failed ? 'No' : 'DONE')
+      return
+    }
     try {
       if (state.reactionId !== undefined) {
         await this.channel.removeReaction(state.triggerMessageId, state.reactionId)

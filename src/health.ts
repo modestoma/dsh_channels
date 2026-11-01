@@ -12,6 +12,8 @@ import { CordisFiberState } from './dsh-types.ts'
 import type { CordisFiber } from './dsh-types.ts'
 import type { FeishuConnectionStatus } from './feishu-channel.ts'
 import { standaloneCard } from './cards/primitives.ts'
+import { FAILING_ATTEMPTS } from './outbox.ts'
+import type { OutboxHealth } from './outbox.ts'
 
 export const HEALTH_DEPENDENCY_NAMES = [
   'agents',
@@ -55,6 +57,8 @@ export interface HealthSnapshotInput {
   routeCount: number
   liveAgentCount: number
   inflightTurnCount: number
+  /** Stored Feishu actions waiting for a retry; absent before the outbox exists. */
+  outbox?: OutboxHealth
 }
 
 export interface HealthSnapshot extends Omit<HealthSnapshotInput, 'fibers' | 'botOpenId'> {
@@ -148,6 +152,7 @@ export function foldHealthSnapshot(input: HealthSnapshotInput): HealthSnapshot {
     || fibers.pending > 0
     || fibers.loading > 0
     || fibers.unloading > 0
+    || (input.outbox?.failing ?? 0) > 0
   ) {
     level = 'degraded'
   } else {
@@ -176,6 +181,11 @@ export function foldHealthSnapshot(input: HealthSnapshotInput): HealthSnapshot {
     )
   }
 
+  const outbox = input.outbox
+  if (outbox !== undefined && outbox.failing > 0) {
+    reasons.push(`${outbox.pending} 条飞书消息更新待重发，其中 ${outbox.failing} 条已连续失败 ${FAILING_ATTEMPTS} 次以上`)
+  }
+
   return {
     level,
     fibers,
@@ -186,6 +196,7 @@ export function foldHealthSnapshot(input: HealthSnapshotInput): HealthSnapshot {
     routeCount: input.routeCount,
     liveAgentCount: input.liveAgentCount,
     inflightTurnCount: input.inflightTurnCount,
+    ...(input.outbox === undefined ? {} : { outbox: input.outbox }),
     inactiveFibers: inactive,
     inactiveTotal,
     reasons,
@@ -227,7 +238,7 @@ export function buildHealthCard(snapshot: HealthSnapshot): object {
     },
     {
       tag: 'markdown',
-      content: `**dsh-channels**\n${snapshot.started ? 'started' : 'stopped'} · 持久化路由 ${snapshot.routeCount} · live Agent ${snapshot.liveAgentCount} · in-flight turn ${snapshot.inflightTurnCount}`,
+      content: `**dsh-channels**\n${snapshot.started ? 'started' : 'stopped'} · 持久化路由 ${snapshot.routeCount} · live Agent ${snapshot.liveAgentCount} · in-flight turn ${snapshot.inflightTurnCount} · 待重发 ${snapshot.outbox?.pending ?? 0}`,
     },
   ])
 }
