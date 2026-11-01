@@ -22,7 +22,7 @@ import type { CardActionEvent, FeishuChannel } from '../feishu-channel.ts'
 import {
   bindFormOf, buildBindCard, buildBindPendingCard, buildModelCard, parseLlmBindAction, parseLlmPrefAction,
 } from './cards.ts'
-import type { ChoiceEndpoint, LlmPrefAction, ModelCardView } from './cards.ts'
+import type { ChoiceEndpoint, LlmBindAction, LlmPrefAction, ModelCardView } from './cards.ts'
 import type { BindFailureReason, PersonalRoutes } from './personal-routes.ts'
 import { sessionLlmFor } from './selection.ts'
 import type { DefaultEndpoint } from './selection.ts'
@@ -91,6 +91,9 @@ function isPersonalApi(value: string): value is PersonalLlmApi {
 }
 
 export class UserModels {
+  /** Tail of each user's queue of endpoint and preference changes. */
+  private readonly userQueues = new Map<string, Promise<void>>()
+
   constructor(private readonly deps: UserModelsDeps) {}
 
   /** The administrator's default endpoint: channel config, else the deployment default. */
@@ -199,11 +202,16 @@ export class UserModels {
     const pref = parseLlmPrefAction(event.action.value, event.action.option)
     if (pref !== undefined) {
       if (userId !== pref.owner || !this.deps.mayChat(userId)) return
-      await this.onPrefAction(event, userId, pref)
+      await this.exclusive(userId, () => this.onPrefAction(event, userId, pref))
       return
     }
     const bind = parseLlmBindAction(event.action.value)
     if (bind === undefined || userId !== bind.owner || !this.deps.mayChat(userId)) return
+    await this.exclusive(userId, () => this.onBindAction(event, userId, bind))
+  }
+
+  /** Handle one bind-form click; runs inside the user's exclusive section. */
+  private async onBindAction(event: CardActionEvent, userId: string, bind: LlmBindAction): Promise<void> {
     const channel = this.deps.channel()
     if (channel === undefined) return
     if (bind.kind === 'unbind') {
@@ -255,9 +263,29 @@ export class UserModels {
    * @param userId - Feishu user_id.
    */
   async forget(userId: string): Promise<void> {
-    const record = this.deps.store.get(userId)
-    if (record?.own !== undefined) await this.deps.routes.unbind(record.own)
-    await this.deps.store.remove(userId)
+    await this.exclusive(userId, async () => {
+      const record = this.deps.store.get(userId)
+      if (record?.own !== undefined) await this.deps.routes.unbind(record.own)
+      await this.deps.store.remove(userId)
+    })
+  }
+
+  /**
+   * Run one user's endpoint or preference change after that user's previous
+   * one settles. Two open forms share one route and credential reference, so
+   * a bind, its rollback and the stored record must not interleave with
+   * another change of the same user.
+   */
+  private async exclusive<T>(userId: string, work: () => Promise<T>): Promise<T> {
+    const previous = this.userQueues.get(userId) ?? Promise.resolve()
+    const run = previous.then(work, work)
+    const settled = run.then(() => undefined, () => undefined)
+    this.userQueues.set(userId, settled)
+    try {
+      return await run
+    } finally {
+      if (this.userQueues.get(userId) === settled) this.userQueues.delete(userId)
+    }
   }
 
   /** Remove the personal endpoint and fall back to the default endpoint. */

@@ -144,15 +144,18 @@ export class SessionManager {
    * request of the Session.
    */
   private policyConfig(recorded: SessionLlm | undefined): RequestPolicyConfig {
-    const providers = recorded?.provider === undefined ? undefined : this.deps.ctx.llm?.listProviders?.()
-    const llm = providers !== undefined && !providers.some(provider => provider.id === recorded?.provider)
-      ? undefined
-      : recorded
+    const llm = recorded?.provider !== undefined && !this.providerListed(recorded.provider) ? undefined : recorded
     return policyConfigFor(llm, {
       effort: this.deps.config.reasoningEffort,
       provider: this.deps.config.provider,
       model: this.deps.config.model,
     })
+  }
+
+  /** Whether the host lists a provider route; true when the host offers no listing. */
+  private providerListed(provider: string): boolean {
+    const providers = this.deps.ctx.llm?.listProviders?.()
+    return providers === undefined || providers.some(entry => entry.id === provider)
   }
 
   /**
@@ -301,7 +304,9 @@ export class SessionManager {
    * @returns the disposer of this policy.
    */
   mountRequestPolicy(agentCtx: AgentContext, agent?: Agent, llm?: SessionLlm): () => void {
-    const controller = installRequestPolicy(agentCtx, this.policyConfig(llm))
+    const controller = installRequestPolicy(agentCtx, this.policyConfig(llm), {
+      providerAvailable: provider => this.providerListed(provider),
+    })
     if (agent !== undefined) controller.sync(agent.session.snapshotEvents(), agent)
     this.policies.set(agentCtx, controller)
     return () => {

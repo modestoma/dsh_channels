@@ -88,6 +88,27 @@ describe('installRequestPolicy', () => {
     await ctx.fiber.dispose()
   })
 
+  it('ignores a logged switch to a provider the host no longer lists, with its effort', async () => {
+    const ctx = new Context()
+    const controller = installRequestPolicy(
+      ctx as unknown as AgentContext,
+      { provider: 'deepseek-official', model: 'deepseek-v4-flash', effort: 'high' },
+      { providerAvailable: provider => provider !== 'feishu-0a' },
+    )
+    controller.sync([
+      { type: 'command/run', seq: 0, data: { commandId: 'm', name: 'model', args: ' feishu-0a/mine', source: { kind: 'user' } } },
+      { type: 'command/done', seq: 1, data: { commandId: 'm', kind: 'success' } },
+      { type: 'command/run', seq: 2, data: { commandId: 'e', name: 'effort', args: ' max', source: { kind: 'user' } } },
+      { type: 'command/done', seq: 3, data: { commandId: 'e', kind: 'success' } },
+    ] as unknown as SessionEvent[])
+    expect(controller.state).toMatchObject({
+      modelOverride: undefined, effortOverride: undefined,
+      effectiveModel: { provider: 'deepseek-official', model: 'deepseek-v4-flash' }, effectiveEffort: 'high',
+    })
+    controller.dispose()
+    await ctx.fiber.dispose()
+  })
+
   it('drops the configured effort after /effort default', async () => {
     const ctx = new Context()
     const controller = installRequestPolicy(ctx as unknown as AgentContext, { effort: 'high' })

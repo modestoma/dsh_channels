@@ -30,6 +30,15 @@ export interface ModelOverride {
   readonly model: string
 }
 
+/** Host lookups the policy consults while folding the Session log. */
+export interface RequestPolicyOptions {
+  /**
+   * Whether the host still lists a provider route. A logged `/model` naming
+   * a route that returns false is ignored. Absent: every route is kept.
+   */
+  providerAvailable?(provider: string): boolean
+}
+
 /** Channel-configured defaults for sessions this plugin creates. */
 export interface RequestPolicyConfig {
   /** Configured reasoning effort (optional → adapter/provider default). */
@@ -207,6 +216,7 @@ function selectPolicy(
 export function installRequestPolicy(
   agentCtx: AgentContext,
   config: RequestPolicyConfig = {},
+  options: RequestPolicyOptions = {},
 ): RequestPolicyController {
   let effortOverride: EffortOverride | undefined
   let modelOverride: ModelOverride | undefined
@@ -255,8 +265,11 @@ export function installRequestPolicy(
     },
     sync(events, agent, reconcile) {
       const folded = foldRequestPolicy(events)
-      effortOverride = folded.effort
-      modelOverride = folded.model
+      // A logged switch to a provider the host no longer lists falls back to
+      // the configured route; the effort chosen for that model goes with it.
+      const stale = folded.model?.provider !== undefined && options.providerAvailable?.(folded.model.provider) === false
+      effortOverride = stale ? undefined : folded.effort
+      modelOverride = stale ? undefined : folded.model
       const model = agent?.model
       if (agent === undefined || model === undefined || disposed) return
       const next: AppliedPolicy = { effort: effectiveEffortOf(effortOverride, config.effort), model: modelOverride ?? configuredModel }

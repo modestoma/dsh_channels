@@ -5831,6 +5831,26 @@ describe('per-user models', () => {
     await h.service.shutdown()
   })
 
+  it('runs one user\'s concurrent binds one after another so a failed one cannot undo a later key', async () => {
+    const { h, settings } = await setupWithEndpoints()
+    let rejectFirst: (error: Error) => void = () => {}
+    settings.service.mutate.mockImplementationOnce(() => new Promise<void>((_resolve, reject) => { rejectFirst = reject }))
+    const first = h.channel.fireCardAction(bindEvent('om_a', { api: 'openai-completions', baseURL: 'https://a.example.com', apiKey: 'sk-a' }))
+    await waitUntil(() => expect(settings.service.mutate).toHaveBeenCalledTimes(1))
+    const second = h.channel.fireCardAction(bindEvent('om_b', { api: 'openai-completions', baseURL: 'https://b.example.com', apiKey: 'sk-b' }))
+    await flush()
+    // The second bind waits for the first instead of writing over its key.
+    expect(settings.service.mutate).toHaveBeenCalledTimes(1)
+    rejectFirst(new Error('settings unavailable'))
+    await Promise.all([first, second])
+    await waitUntil(() => expect(updatesOf(h, 'om_b').at(-1)).toContain('已绑定'))
+    expect(updatesOf(h, 'om_a').at(-1)).toContain('保存失败')
+    const [route, profile] = [...settings.providers.entries()][0]!
+    expect(profile).toMatchObject({ baseURL: 'https://b.example.com' })
+    expect(h.ctxState.credentials.values[`${route.toUpperCase().replace(/-/gu, '_')}_API_KEY`]).toBe('sk-b')
+    await h.service.shutdown()
+  })
+
   it('points a group /llm at the private chat when the form cannot be sent there', async () => {
     const { h } = await setupWithEndpoints()
     const send = h.channel.send.bind(h.channel)
