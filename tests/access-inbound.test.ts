@@ -741,6 +741,56 @@ describe('guarded 模式：代码改动开关', () => {
     expect(await trailersFor(bobRoute.sessionId)).toEqual([['Feishu-User', 'Bob <u_bob>']])
     await h.service.shutdown()
   })
+
+  it('用户设置了 Git 邮箱时，推送的提交以本人为作者，同时保留 Feishu-User 尾注', async () => {
+    const userProfiles = vi.fn(async (ids: readonly string[]) => new Map(ids.map(id => [id, id === 'u_alice' ? { name: 'Alice <A>' } : {}])))
+    const h = await setup({}, { userProfiles })
+    await h.service.addAccessUser('u_alice')
+    await h.service.addAccessUser('u_carol')
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_group', senderId: 'u_alice',
+      mentionedBot: true, messageId: 'om_alice_author', content: '改完推上去',
+    }))
+    const [, route] = await waitForRoute(h, 'u_alice')
+    const [listener] = h.ctxState.commitTrailerListeners
+    const detailsFor = async (session: string, withSetAuthor = true) => {
+      const trailers: Array<[string, string]> = []
+      const authors: Array<[string, string]> = []
+      await listener!({
+        session,
+        dir: '/ws',
+        add: (token, value) => { trailers.push([token, value]) },
+        ...withSetAuthor ? { setAuthor: (name: string, email: string) => { authors.push([name, email]) } } : {},
+      })
+      return { trailers, authors }
+    }
+
+    // No email yet: trailer only.
+    expect(await detailsFor(route.sessionId)).toEqual({ trailers: [['Feishu-User', 'Alice A <u_alice>']], authors: [] })
+
+    expect(await h.service.setAccessGitEmail('u_alice', 'alice@example.com')).toMatchObject({ ok: true })
+    expect(h.service.accessSnapshot().users.find(user => user.userId === 'u_alice')).toMatchObject({ gitEmail: 'alice@example.com' })
+    expect(await detailsFor(route.sessionId)).toEqual({
+      trailers: [['Feishu-User', 'Alice A <u_alice>']],
+      authors: [['Alice A', 'alice@example.com']],
+    })
+    // dsh-repo versions without setAuthor still get the trailer.
+    expect(await detailsFor(route.sessionId, false)).toEqual({ trailers: [['Feishu-User', 'Alice A <u_alice>']], authors: [] })
+
+    // A user without a Feishu or table name is named by user_id.
+    expect(await h.service.setAccessGitEmail('u_carol', 'carol@example.com')).toMatchObject({ ok: true })
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_p2p_carol', senderId: 'u_carol',
+      mentionedBot: false, messageId: 'om_carol_author', content: '推一下',
+    }))
+    const [, carolRoute] = await waitForRoute(h, 'u_carol')
+    expect(await detailsFor(carolRoute.sessionId)).toEqual({ trailers: [['Feishu-User', 'u_carol']], authors: [['u_carol', 'carol@example.com']] })
+
+    expect(await h.service.setAccessGitEmail('u_alice', undefined)).toMatchObject({ ok: true })
+    expect(await detailsFor(route.sessionId)).toEqual({ trailers: [['Feishu-User', 'Alice A <u_alice>']], authors: [] })
+    expect(await h.service.setAccessGitEmail('u_nobody', 'x@example.com')).toMatchObject({ ok: false, error: expect.stringContaining('不在用户表') })
+    await h.service.shutdown()
+  })
 })
 
 describe('open 模式：兼容旧行为', () => {

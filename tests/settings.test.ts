@@ -41,6 +41,7 @@ import {
   TAKEOVER_ROUTE,
   REMOVE_ACCESS_USER_ROUTE,
   RESOLVE_ACCESS_REQUEST_ROUTE,
+  SET_ACCESS_GIT_EMAIL_ROUTE,
   SET_ACCESS_PERMISSION_ROUTE,
   RESTART_KEYS,
   SAVE_CONFIG_ROUTE,
@@ -284,6 +285,17 @@ class FakeTarget implements SettingsTarget {
     const user = this.accessState.users.find(item => item.userId === userId)
     if (user === undefined) return { ok: false, error: '用户不在用户表里' }
     user[permission] = enabled
+    return { ok: true, access: this.accessSnapshot() }
+  }
+
+  async setAccessGitEmail(userId: string, gitEmail: string | undefined): Promise<AccessMutationResponse> {
+    this.accessCalls.push({ op: 'git-email', userId, gitEmail })
+    const failed = this.accessFailure()
+    if (failed !== undefined) return failed
+    const user = this.accessState.users.find(item => item.userId === userId)
+    if (user === undefined) return { ok: false, error: '用户不在用户表里' }
+    if (gitEmail === undefined) delete user.gitEmail
+    else user.gitEmail = gitEmail
     return { ok: true, access: this.accessSnapshot() }
   }
 
@@ -1579,6 +1591,25 @@ describe('SettingsSurface access control', () => {
     ])
   })
 
+  it('sets, trims, and clears a git email, rejecting malformed ones before writing', async () => {
+    const { surface, target } = makeSurface()
+    await surface.saveAccessUser('u_alice', 'Alice')
+    const set = await surface.setAccessGitEmail(' u_alice ', ' alice@example.com ')
+    expect(set.ok && set.access.users[0]?.gitEmail).toBe('alice@example.com')
+    for (const bad of ['alice', 'a b@example.com', 'Alice <a@example.com>', 'a@b@c', `${'x'.repeat(250)}@example.com`, 42]) {
+      expect((await surface.setAccessGitEmail('u_alice', bad)).ok).toBe(false)
+    }
+    expect((await surface.setAccessGitEmail('ou_alice', 'a@example.com')).ok).toBe(false)
+    const cleared = await surface.setAccessGitEmail('u_alice', '  ')
+    expect(cleared.ok && cleared.access.users[0]).not.toHaveProperty('gitEmail')
+    expect((await surface.setAccessGitEmail('u_alice', null)).ok).toBe(true)
+    expect(target.accessCalls.filter(call => call.op === 'git-email')).toEqual([
+      { op: 'git-email', userId: 'u_alice', gitEmail: 'alice@example.com' },
+      { op: 'git-email', userId: 'u_alice', gitEmail: undefined },
+      { op: 'git-email', userId: 'u_alice', gitEmail: undefined },
+    ])
+  })
+
   it('rejects invalid identifiers, switches, and values before writing anything', async () => {
     const { surface, target } = makeSurface()
     for (const userId of ['ou_alice', 'on_alice', 'user@example.com', 'bad id']) {
@@ -1805,6 +1836,7 @@ describe('settings routes', () => {
       [ADD_ACCESS_USER_ROUTE]: 'POST',
       [REMOVE_ACCESS_USER_ROUTE]: 'POST',
       [SET_ACCESS_PERMISSION_ROUTE]: 'POST',
+      [SET_ACCESS_GIT_EMAIL_ROUTE]: 'POST',
       [RESOLVE_ACCESS_REQUEST_ROUTE]: 'POST',
     })
     for (const route of routes.values()) {
@@ -2095,6 +2127,14 @@ describe('settings routes', () => {
     const badValue = await call(routes, SET_ACCESS_PERMISSION_ROUTE, post({ userId: 'u_alice', permission: 'chat' }))
     expect(badValue.status).toBe(400)
 
+    const email = await call(routes, SET_ACCESS_GIT_EMAIL_ROUTE, post({ userId: 'u_alice', gitEmail: ' alice@example.com ' }))
+    expect(email.status).toBe(200)
+    expect(JSON.parse(email.body).access.users[0]).toMatchObject({ userId: 'u_alice', gitEmail: 'alice@example.com' })
+    const badEmail = await call(routes, SET_ACCESS_GIT_EMAIL_ROUTE, post({ userId: 'u_alice', gitEmail: 'Alice <a@example.com>' }))
+    expect(badEmail.status).toBe(400)
+    const clearedEmail = await call(routes, SET_ACCESS_GIT_EMAIL_ROUTE, post({ userId: 'u_alice', gitEmail: '' }))
+    expect(JSON.parse(clearedEmail.body).access.users[0]).not.toHaveProperty('gitEmail')
+
     const removedUser = await call(routes, REMOVE_ACCESS_USER_ROUTE, post({ userId: 'u_alice' }))
     expect(JSON.parse(removedUser.body).access.users).toEqual([])
 
@@ -2170,7 +2210,7 @@ describe('apply() web wiring', () => {
     })
 
     expect(injected).toContainEqual(['connection'])
-    expect(routes.size).toBe(21)
+    expect(routes.size).toBe(22)
 
     const panel = await call(routes, PANEL_ROUTE)
     expect(panel.status).toBe(200)

@@ -19,6 +19,7 @@ import {
   TAKEOVER_ROUTE,
   REMOVE_ACCESS_USER_ROUTE,
   RESOLVE_ACCESS_REQUEST_ROUTE,
+  SET_ACCESS_GIT_EMAIL_ROUTE,
   SET_ACCESS_PERMISSION_ROUTE,
   SAVE_CONFIG_ROUTE,
   SAVE_CREDENTIALS_ROUTE,
@@ -353,6 +354,11 @@ export async function setAccessPermission(
   enabled: boolean,
 ): Promise<AccessMutationResponse> {
   return mutateAccess(SET_ACCESS_PERMISSION_ROUTE, { userId, permission, enabled })
+}
+
+/** Set one user's git email; an empty string clears it. */
+export async function setAccessGitEmail(userId: string, gitEmail: string): Promise<AccessMutationResponse> {
+  return mutateAccess(SET_ACCESS_GIT_EMAIL_ROUTE, { userId, gitEmail })
 }
 
 /** Settle one pending authorization request (same resolver as the Feishu card). */

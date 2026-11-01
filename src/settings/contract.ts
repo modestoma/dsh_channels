@@ -40,6 +40,8 @@ export const ADD_ACCESS_USER_ROUTE = '/api/dsh-channels.addAccessUser'
 export const REMOVE_ACCESS_USER_ROUTE = '/api/dsh-channels.removeAccessUser'
 /** 设置一个权限开关（POST，body `{ userId, permission, enabled }`）。 */
 export const SET_ACCESS_PERMISSION_ROUTE = '/api/dsh-channels.setAccessPermission'
+/** 设置或清除一个用户的 Git 邮箱（POST，body `{ userId, gitEmail }`；空字符串或 null 清除）。 */
+export const SET_ACCESS_GIT_EMAIL_ROUTE = '/api/dsh-channels.setAccessGitEmail'
 /** 结算一条待处理授权申请（POST，body `{ token, decision }`）。 */
 export const RESOLVE_ACCESS_REQUEST_ROUTE = '/api/dsh-channels.resolveAccessRequest'
 /**
@@ -579,6 +581,8 @@ export interface AccessUserWire {
   wikiRead: boolean
   wikiWrite: boolean
   codeWrite: boolean
+  /** Git email set by the administrator; commits for turns this user drives name them as author. */
+  gitEmail?: string
 }
 
 /** One pending authorization request the panel may settle (same path as the DM card). */
@@ -941,6 +945,12 @@ export const PANEL_COPY = {
   accessPermWikiRead: '读知识库',
   accessPermWikiWrite: '写知识库',
   accessPermCodeWrite: '改代码',
+  accessGitEmail: 'Git 邮箱',
+  accessGitEmailUnset: '未设 Git 邮箱',
+  accessGitEmailPlaceholder: 'GitHub/GitLab 账号已验证的邮箱，留空清除',
+  accessGitEmailSave: '保存',
+  accessGitEmailChanged: '已更新 Git 邮箱',
+  accessGitEmailHint: '设置了 Git 邮箱的用户在飞书里让机器人推送代码时，提交作者显示为本人（提交者仍是令牌账号）；邮箱要是本人 GitHub/GitLab 账号已验证的邮箱，平台才会显示头像和链接。',
   // ---- wiki ---------------------------------------------------------------
   wikiUsersTitle: '可使用的人',
   wikiUsersSummary: '读取 {read} 人 · 写入 {write} 人，管理员始终可用',

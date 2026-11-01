@@ -136,6 +136,22 @@ export class AccessStore {
     })
   }
 
+  /**
+   * Set or clear the git email of an existing user.
+   * @param userId - Feishu user_id.
+   * @param gitEmail - validated email, or undefined to clear it.
+   * @returns the updated record, or undefined when the user is not in the table.
+   */
+  async setGitEmail(userId: string, gitEmail: string | undefined): Promise<AccessUserRecord | undefined> {
+    return await this.serializeUserWrite(async () => {
+      const current = this.users.get(userId)
+      if (current === undefined) return undefined
+      if (current.gitEmail === gitEmail) return current
+      const { gitEmail: _previous, ...rest } = current
+      return await this.writeUser(gitEmail === undefined ? rest : { ...rest, gitEmail })
+    })
+  }
+
   async removeUser(userId: string): Promise<boolean> {
     return await this.serializeUserWrite(async () => {
       if (!this.users.has(userId)) return false
