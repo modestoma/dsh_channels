@@ -70,7 +70,8 @@ export interface AgentRequestListenerOptions {
 export interface PromptSection {
   readonly name: string
   readonly order: number
-  readonly text: string
+  /** Static text, or a provider the host calls at every prompt assembly. */
+  readonly text: string | (() => string)
   readonly interpolate?: boolean
   readonly complete?: boolean
 }

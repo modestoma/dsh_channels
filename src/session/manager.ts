@@ -27,7 +27,7 @@ import type { FeishuConfig } from '../config.ts'
 import { mountChannelCommands } from '../commands.ts'
 import { appendSessionHistory, sessionDirOf } from '../domain.ts'
 import type { RouteRecord } from '../domain.ts'
-import { mountChannelGuidance } from '../feishu/agent-context.ts'
+import { mountChannelGuidance, mountReplyGuidance } from '../feishu/agent-context.ts'
 import { attachmentsDir } from '../feishu/inbound-attachments.ts'
 import { effectiveAttachmentMode, resolveAttachmentService } from '../feishu/native-attachments.ts'
 import { installRequestPolicy } from './request-policy.ts'
@@ -143,7 +143,9 @@ export class SessionManager {
   }
 
   /**
-   * Register the attachment guidance for one Session. Called after the
+   * Register the reply guidance and the attachment guidance for one Session.
+   * The reply guidance is mounted for every Feishu Session; its text follows
+   * `replyGuidance` on each model request. Called after the
    * effective working directory is known (a worktree checkout path is only
    * returned once the worktree exists), so the archive guidance can name the
    * absolute directory. The guidance flavor follows the *effective* attachment
@@ -153,6 +155,14 @@ export class SessionManager {
    * service (headless) is a no-op and a late registration never blocks the turn.
    */
   async mountGuidance(agent: Agent, directory: string): Promise<void> {
+    try {
+      await mountReplyGuidance(agent.ctx, () => this.deps.config.replyGuidance)
+    } catch (error) {
+      this.deps.warn(
+        'dsh-channels: mounting reply guidance for session %s failed: %s',
+        agent.id, String(error),
+      )
+    }
     // With inbound attachments disabled the Agent has no attachment workflow to
     // discover (and the legacy guidance would wrongly claim files are archived).
     if (!this.deps.config.acceptAttachments) return

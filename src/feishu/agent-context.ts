@@ -20,6 +20,11 @@
  * is accurate even when that directory is a Git worktree created after Agent
  * creation.
  *
+ * The same module mounts the Feishu reply guidance
+ * ({@link FEISHU_REPLIES_SECTION}): how a final reply reads in a chat card.
+ * It applies to every Feishu Session whatever the attachment backend, and its
+ * `replyGuidance` switch is read on every model request.
+ *
  * @module dsh-channels/feishu/agent-context
  */
 
@@ -107,6 +112,46 @@ export async function mountChannelGuidance(
       name: FEISHU_ATTACHMENTS_SECTION,
       order: FEISHU_ATTACHMENTS_ORDER,
       text: attachmentsGuidance(mode, attachmentsDir),
+    })
+  })
+}
+
+/** Stable prompt-section name of the Feishu reply guidance; one registration per Agent scope. */
+export const FEISHU_REPLIES_SECTION = 'dsh-channels:feishu-replies'
+
+/** Placement right after the attachment guidance (950). */
+const FEISHU_REPLIES_ORDER = 960
+
+/**
+ * How a final reply reads in a Feishu chat card. The card already streams
+ * progress, tool calls and reasoning, so the guidance only shapes the reply
+ * text. Model-facing text kept stable so unchanged sessions keep their KV cache.
+ */
+export const FEISHU_REPLIES_GUIDANCE = `## Replying in Feishu
+Your reply appears in a Feishu chat card. The card already shows your progress, tool calls and reasoning, so the final reply is only for what the person needs now.
+
+- Lead with the result: what is done and usable, with a clickable Markdown link (for example the merge request). Then add only a next step the person must take, or a limitation that changes what they can do.
+- Keep it short: usually one to three sentences. Leave out plans, process narration, file paths, commands, test counts and library choices unless the person asked for them; put technical detail in the merge request description or a file.
+- Be honest about state. An opened merge request is not a finished or merged change; mark a draft as unfinished; report a failure as a failure.
+- When you need a decision, ask one concrete question with ask_user_question instead of burying it in a long reply. Do not ask permission for work already requested.
+- Reply in the language of the person's message.
+- In group chats others can read the reply: never repeat content from direct messages or other conversations.
+- Examples in instructions show format only; never state a fact you have not verified.`
+
+/**
+ * Mount the Feishu reply guidance into one Agent scope. The section text is
+ * resolved on every model request, so turning `replyGuidance` off or on
+ * applies to the next request without a new Session. A missing
+ * `systemPrompt` service degrades to a no-op (headless hosts).
+ * @param agentCtx - the Agent scope the section is registered in.
+ * @param enabled - reads the current `replyGuidance` switch.
+ */
+export async function mountReplyGuidance(agentCtx: AgentContext, enabled: () => boolean): Promise<void> {
+  await agentCtx.inject(['systemPrompt'], (ctx) => {
+    ctx.systemPrompt?.section({
+      name: FEISHU_REPLIES_SECTION,
+      order: FEISHU_REPLIES_ORDER,
+      text: () => enabled() ? FEISHU_REPLIES_GUIDANCE : '',
     })
   })
 }

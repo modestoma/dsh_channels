@@ -372,6 +372,13 @@ export const configSchema = z.object({
    */
   hostTurnCards: z.boolean().default(true),
   /**
+   * Add the Feishu reply guidance to every Feishu Session's system prompt
+   * (`dsh-channels:feishu-replies`): lead with the result, keep the final
+   * reply short, keep technical detail in the merge request or a file, ask one
+   * concrete question when a decision is needed. Read on every model request.
+   */
+  replyGuidance: z.boolean().default(true),
+  /**
    * Restart recovery of turns the previous process left unfinished (see
    * `session/repair.ts`). `pending`: a message that was still queued (the
    * Agent never claimed it) runs again into its own card, once. `interrupted`:
