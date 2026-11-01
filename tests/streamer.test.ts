@@ -4,6 +4,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { DROPPED_NOTICE } from '../src/cards.ts'
 import { TurnStreamer } from '../src/streamer.ts'
 import type { AttachOptions } from '../src/streamer.ts'
 import type { MessageId, Session, SessionEvent, SessionId, UserMessage } from '../src/dsh-types.ts'
@@ -97,9 +98,28 @@ function hooks() {
   }
 }
 
+/** A card's headline: its first markdown line naming the turn state. */
+const HEADLINE = /^(⚙️|🧠|✍️|🔧|🤖|🧵|✋|❓|🗜|🔁|⚠️|✅|⏹|❌) /u
+
+function elementsOf(card: object): Array<{ tag: string; content?: string; text_size?: string }> {
+  return (card as { body: { elements: Array<{ tag: string; content?: string; text_size?: string }> } }).body.elements
+}
+
+/** The card's headline, or '' when it has none. */
+function headlineOf(card: object): string {
+  const first = elementsOf(card).find(element => element.tag === 'markdown' && element.text_size === undefined)
+  return first?.content !== undefined && HEADLINE.test(first.content) ? first.content : ''
+}
+
+/** The card's elements after its headline. */
+function contentOf(card: object): Array<{ tag: string; content?: string; text_size?: string }> {
+  const elements = elementsOf(card)
+  const headline = headlineOf(card)
+  return headline === '' ? elements : elements.filter(element => element.content !== headline)
+}
+
 function markdownOf(card: object, index: number): string {
-  const elements = (card as { body: { elements: Array<{ tag: string; content?: string }> } }).body.elements
-  return elements.filter(element => element.tag === 'markdown')[index]?.content ?? ''
+  return contentOf(card).filter(element => element.tag === 'markdown')[index]?.content ?? ''
 }
 
 describe('TurnStreamer', () => {
@@ -150,14 +170,16 @@ describe('TurnStreamer', () => {
     await vi.advanceTimersByTimeAsync(500)
 
     const card = ch.updated[0]!.card as {
-      body: { elements: [{
+      body: { elements: [{ tag: string }, {
         tag: string
         header: { title: { content: string } }
         elements: Array<{ content: string }>
-      }, { tag: string }] }
+      }] }
     }
-    const panel = card.body.elements[0]
-    expect(panel?.header.title.content).toBe('回复中')
+    // The headline follows the stream; the panel only folds the reasoning away.
+    expect(headlineOf(card)).toMatch(/^✍️ 输出中 · /u)
+    const panel = card.body.elements[1]
+    expect(panel?.header.title.content).toBe('思考过程')
     expect(panel?.elements[0]?.content).toContain('先想想')
   })
 
@@ -184,14 +206,15 @@ describe('TurnStreamer', () => {
     const elements = (finalized.card as {
       body: { elements: Array<{ tag: string; content?: string; text_size?: string }> }
     }).body.elements
-    // No reasoning in this turn: no empty panel — body, divider and the two
-    // settled footer lines.
-    expect(elements.map(element => element.tag)).toEqual(['markdown', 'hr', 'markdown', 'markdown'])
-    expect(elements[0]?.content).toContain('完整回答')
-    expect(elements[2]?.text_size).toBe('notation')
-    expect(elements[2]?.content).toContain('模型')
-    expect(elements[2]?.content).toContain('推理 —')
-    expect(elements[3]?.content).toContain('上下文')
+    // No reasoning in this turn: no empty panel — the outcome headline, body,
+    // divider and the two settled footer lines.
+    expect(elements.map(element => element.tag)).toEqual(['markdown', 'markdown', 'hr', 'markdown', 'markdown'])
+    expect(elements[0]?.content).toMatch(/^✅ 已完成 · 用时 /u)
+    expect(elements[1]?.content).toContain('完整回答')
+    expect(elements[3]?.text_size).toBe('notation')
+    expect(elements[3]?.content).toContain('模型')
+    expect(elements[3]?.content).toContain('推理 —')
+    expect(elements[4]?.content).toContain('上下文')
 
     await vi.advanceTimersByTimeAsync(0)
     const remove = ch.removeReaction as unknown as ReturnType<typeof vi.fn>
@@ -269,8 +292,9 @@ describe('TurnStreamer', () => {
     // The failure diagnostic renders once, in the body — the old duplicate
     // status line is gone, and no empty panel is left behind.
     const list = finalized.body.elements
-    expect(list.map(element => element.tag)).toEqual(['markdown', 'hr', 'markdown', 'markdown'])
-    expect(list[0]?.content).toContain('本轮运行失败')
+    expect(list.map(element => element.tag)).toEqual(['markdown', 'markdown', 'hr', 'markdown', 'markdown'])
+    expect(list[0]?.content).toMatch(/^❌ 失败 · /u)
+    expect(list[1]?.content).toContain('本轮运行失败')
     const rendered = JSON.stringify(finalized)
     expect(rendered.match(/本轮运行失败/g)).toHaveLength(1)
     expect(rendered).toContain('UNSUPPORTED_REASONING_EFFORT')
@@ -305,8 +329,8 @@ describe('TurnStreamer', () => {
     streamer.onSessionEvent(session, { type: 'turn/end', seq: 3, data: { turn: 2, reason: 'stop' } })
 
     const card = ch.updated.at(-1)!.card as { body: { elements: Array<{ content?: string }> } }
-    // body, hr, model/session/reasoning line, usage line.
-    const usageLine = card.body.elements[3]?.content ?? ''
+    // headline, body, hr, model/session/reasoning line, usage line.
+    const usageLine = card.body.elements[4]?.content ?? ''
     expect(usageLine).toContain('输入 130')
     expect(usageLine).toContain('输出 50')
     expect(usageLine).toContain('缓存命中 60.0%')
@@ -595,12 +619,12 @@ describe('TurnStreamer activity status + keep-alive', () => {
     })
     streamer.setAwaitingApproval('sess-approval-wait', ['bash'])
     await vi.advanceTimersByTimeAsync(500)
-    expect(markdownLines(headCard(ch)).join('\n')).toContain('⏳ 等待你审批：bash')
+    expect(markdownLines(headCard(ch)).join('\n')).toContain('✋ 等待审批：bash')
     expect(markdownLines(headCard(ch)).join('\n')).not.toContain('调用工具')
 
     streamer.setAwaitingApproval('sess-approval-wait', [])
     await vi.advanceTimersByTimeAsync(500)
-    expect(markdownLines(headCard(ch)).join('\n')).not.toContain('等待你审批')
+    expect(markdownLines(headCard(ch)).join('\n')).not.toContain('等待审批')
     expect(markdownLines(headCard(ch)).join('\n')).toContain('🔧 调用工具：bash')
   })
 
@@ -684,8 +708,8 @@ describe('TurnStreamer activity status + keep-alive', () => {
       data: { turn: 1, step: 2, callId: 'call-2', name: 'bash', arguments: '{"command":"git log"}' },
     })
     await vi.advanceTimersByTimeAsync(500)
-    expect(markdownLines(headCard(ch))[0]).toContain('🧵 工作流 audit 结束（完成）')
-    expect(markdownLines(headCard(ch))[1]).toContain('🔧 调用工具：bash')
+    expect(headlineOf(headCard(ch))).toContain('🔧 调用工具：bash')
+    expect(markdownLines(headCard(ch))[1]).toContain('🧵 工作流 audit 结束（完成）')
 
     // Tool settles, text starts: the workflow end status persists.
     streamer.onSessionEvent(session, {
@@ -695,19 +719,20 @@ describe('TurnStreamer activity status + keep-alive', () => {
     streamer.onAssistantFrame(session, { type: 'start', attemptId: 'attempt-1', revision: 1, turn: 1, step: 2 })
     streamer.onAssistantFrame(session, { type: 'chunk', attemptId: 'attempt-1', revision: 1, index: 0, time: 1, chunk: { type: 'text-delta', index: 0, text: '结论' } })
     await vi.advanceTimersByTimeAsync(500)
-    expect(markdownLines(headCard(ch))[0]).toContain('工作流 audit 结束（完成）')
-    expect(markdownLines(headCard(ch)).join('\n')).not.toContain('调用工具')
+    expect(headlineOf(headCard(ch))).toMatch(/^✍️ 输出中/u)
+    expect(markdownLines(headCard(ch))[1]).toContain('工作流 audit 结束（完成）')
 
     // The settled card keeps the workflow conclusion; only the tool line
     // disappears.
     streamer.onSessionEvent(session, { type: 'turn/end', seq: 9, data: { turn: 1, reason: 'stop' } })
     await vi.advanceTimersByTimeAsync(0)
     const finalCard = headCard(ch)
-    expect(markdownLines(finalCard)[0]).toContain('🧵 工作流 audit 结束（完成）')
+    expect(headlineOf(finalCard)).toMatch(/^✅ 已完成/u)
+    expect(markdownLines(finalCard)[1]).toContain('🧵 工作流 audit 结束（完成）')
     expect(markdownLines(finalCard).join('\n')).not.toContain('调用工具')
-    // Settled main card: status line, body, divider and the two footer lines.
+    // Settled main card: headline, status line, body, divider and the two footer lines.
     const elements = (finalCard as { body: { elements: unknown[] } }).body.elements
-    expect(elements.length).toBe(5)
+    expect(elements.length).toBe(6)
   })
 
   it('folds tool-workflow run events into a progress line with member counts', async () => {
@@ -720,15 +745,15 @@ describe('TurnStreamer activity status + keep-alive', () => {
       type: 'tool-workflow/run-start', seq: 1, data: { runId: 'run-1', name: 'audit' },
     })
     await vi.advanceTimersByTimeAsync(500)
-    expect(markdownLines(headCard(ch))[0]).toContain('🧵 工作流 audit')
-    expect(markdownLines(headCard(ch))[0]).toContain('0/0 子代理完成')
+    expect(markdownLines(headCard(ch))[1]).toContain('🧵 工作流 audit')
+    expect(markdownLines(headCard(ch))[1]).toContain('0/0 子代理完成')
 
     streamer.onSessionEvent(session, {
       type: 'tool-workflow/agent-start', seq: 2,
       data: { runId: 'run-1', seq: 1, label: '检索代码', phase: '审查', childId: 'child-1' },
     })
     await vi.advanceTimersByTimeAsync(500)
-    const running = markdownLines(headCard(ch))[0]!
+    const running = markdownLines(headCard(ch))[1]!
     expect(running).toContain('0/1 子代理完成')
     expect(running).toContain('阶段 审查')
     expect(running).toContain('检索代码')
@@ -737,13 +762,13 @@ describe('TurnStreamer activity status + keep-alive', () => {
       type: 'tool-workflow/agent-end', seq: 3, data: { runId: 'run-1', seq: 1, outcome: 'completed' },
     })
     await vi.advanceTimersByTimeAsync(500)
-    expect(markdownLines(headCard(ch))[0]).toContain('1/1 子代理完成')
+    expect(markdownLines(headCard(ch))[1]).toContain('1/1 子代理完成')
 
     streamer.onSessionEvent(session, {
       type: 'tool-workflow/run-end', seq: 4, data: { runId: 'run-1', stopReason: 'completed' },
     })
     await vi.advanceTimersByTimeAsync(500)
-    expect(markdownLines(headCard(ch))[0]).toContain('🧵 工作流 audit 结束（完成）')
+    expect(markdownLines(headCard(ch))[1]).toContain('🧵 工作流 audit 结束（完成）')
 
     // The workflow tool's own tool/result must NOT erase the settled status.
     streamer.onSessionEvent(session, {
@@ -751,10 +776,10 @@ describe('TurnStreamer activity status + keep-alive', () => {
       data: { turn: 1, step: 1, message: { type: 'text', text: 'done' } },
     })
     await vi.advanceTimersByTimeAsync(500)
-    expect(markdownLines(headCard(ch))[0]).toContain('工作流 audit 结束（完成）')
+    expect(markdownLines(headCard(ch))[1]).toContain('工作流 audit 结束（完成）')
   })
 
-  it('heartbeats a silent turn: elapsed counter appears and ticks every statusRefreshMs', async () => {
+  it('heartbeats a silent turn: the headline elapsed counter appears and ticks every statusRefreshMs', async () => {
     const ch = channel()
     const streamer = new DrivenStreamer(ch, 500, hooks(), 5_000)
     const session = makeSession('sess-heartbeat')
@@ -763,15 +788,15 @@ describe('TurnStreamer activity status + keep-alive', () => {
     // No events at all: the slow heartbeat is what first patches the card.
     await vi.advanceTimersByTimeAsync(5_000)
     await vi.advanceTimersByTimeAsync(500)
-    expect(markdownLines(headCard(ch))[0]).toContain('⏳ 处理中 · 已运行 5s')
+    expect(headlineOf(headCard(ch))).toBe('⚙️ 进行中 · 已运行 5s')
 
     // Still no events; the elapsed counter keeps ticking.
     await vi.advanceTimersByTimeAsync(5_000)
     await vi.advanceTimersByTimeAsync(500)
-    expect(markdownLines(headCard(ch))[0]).toContain('⏳ 处理中 · 已运行 10s')
+    expect(headlineOf(headCard(ch))).toBe('⚙️ 进行中 · 已运行 10s')
   })
 
-  it('drops the heartbeat line once text arrives and finalizes without activity', async () => {
+  it('settles the headline to the outcome once the turn ends', async () => {
     const ch = channel()
     const streamer = new DrivenStreamer(ch, 500, hooks(), 5_000)
     const session = makeSession('sess-heartbeat-done')
@@ -779,7 +804,7 @@ describe('TurnStreamer activity status + keep-alive', () => {
 
     await vi.advanceTimersByTimeAsync(5_000)
     await vi.advanceTimersByTimeAsync(500)
-    expect(markdownLines(headCard(ch))[0]).toContain('⏳ 处理中')
+    expect(headlineOf(headCard(ch))).toContain('⚙️ 进行中')
 
     streamer.onAssistantFrame(session, { type: 'start', attemptId: 'attempt-1', revision: 1, turn: 1, step: 1 })
     streamer.onAssistantFrame(session, { type: 'chunk', attemptId: 'attempt-1', revision: 1, index: 0, time: 1, chunk: { type: 'text-delta', index: 0, text: '答案' } })
@@ -787,10 +812,10 @@ describe('TurnStreamer activity status + keep-alive', () => {
     await vi.advanceTimersByTimeAsync(500)
 
     const finalCard = headCard(ch)
-    expect(markdownLines(finalCard).join('\n')).not.toContain('处理中')
-    // The settled card without activity: body, divider and the two footer lines.
+    expect(headlineOf(finalCard)).toBe('✅ 已完成 · 用时 5s')
+    // The settled card without activity: headline, body, divider and the two footer lines.
     const elements = (finalCard as { body: { elements: unknown[] } }).body.elements
-    expect(elements.length).toBe(4)
+    expect(elements.length).toBe(5)
   })
 })
 
@@ -829,8 +854,9 @@ describe('TurnStreamer subagent child folding', () => {
     return ch.updated.filter(update => update.messageId === 'om_card').at(-1)!.card
   }
 
+  /** The delegation status line: the first markdown line after the headline. */
   function activity(ch: ReturnType<typeof channel>): string {
-    return markdownLines(headCard(ch))[0]!
+    return markdownOf(headCard(ch), 0)
   }
 
   it('folds a child subagent\'s descriptor and tool calls into the parent card (status only)', async () => {
@@ -928,7 +954,7 @@ describe('TurnStreamer subagent child folding', () => {
 
     const finalCard = headCard(ch)
     const lines = markdownLines(finalCard)
-    expect(lines[0]).toContain('🤖 子代理完成：检索实现方案')
+    expect(lines[1]).toContain('🤖 子代理完成：检索实现方案')
     expect(lines.join('\n')).not.toContain('调用子代理')
     expect(lines.join('\n')).not.toContain('子代理执行中')
   })
@@ -1004,7 +1030,7 @@ describe('TurnStreamer subagent child folding', () => {
     streamer.onAssistantFrame(session, { type: 'start', attemptId: 'attempt-1', revision: 1, turn: 1, step: 1 })
     streamer.onAssistantFrame(session, { type: 'chunk', attemptId: 'attempt-1', revision: 1, index: 0, time: 1, chunk: { type: 'reasoning-delta', index: 0, text: '想' } })
     await vi.advanceTimersByTimeAsync(500)
-    expect(activity(ch)).toContain('⏳ 处理中')
+    expect(headlineOf(headCard(ch))).toContain('🧠 思考中')
 
     // A child of some other session: must neither crash nor touch this card.
     const foreign = makeChildSession('child-x', 'unknown-session')
@@ -1046,10 +1072,11 @@ describe('TurnStreamer live assistant frames', () => {
     expect(ch.updated.length).toBe(1)
     expect(markdownOf(ch.updated[0]!.card, 0)).toContain('你好')
     const card = ch.updated[0]!.card as {
-      body: { elements: [{ header: { title: { content: string } }; elements: Array<{ content: string }> }] }
+      body: { elements: Array<{ header: { title: { content: string } }; elements: Array<{ content: string }> }> }
     }
-    expect(card.body.elements[0].header.title.content).toBe('回复中')
-    expect(card.body.elements[0].elements[0]?.content).toContain('先想想')
+    expect(headlineOf(card)).toMatch(/^🧠 思考中/u)
+    expect(card.body.elements[1]!.header.title.content).toBe('思考过程')
+    expect(card.body.elements[1]!.elements[0]?.content).toContain('先想想')
   })
 
   it('rolls back an abandoned attempt and keeps a committed one', async () => {
@@ -1363,7 +1390,7 @@ describe('TurnStreamer stop button', () => {
       type: 'turn/end', seq: 2, data: { turn: 1, reason: { kind: 'aborted', reason: { kind: 'user' } } },
     })
     const settled = JSON.stringify(ch.updated.at(-1)!.card)
-    expect(settled).toContain('⏹ 已按请求停止本轮回复')
+    expect(headlineOf(ch.updated.at(-1)!.card)).toMatch(/^⏹ 已停止 · /u)
     expect(settled).not.toContain('正在停止')
     // Marks on a session without a live turn are no-ops.
     streamer.markStopping('sess-stop-abort')
@@ -1505,6 +1532,94 @@ function mockCalls(fn: unknown): unknown[][] {
 function mockFn(fn: unknown): ReturnType<typeof vi.fn> {
   return fn as ReturnType<typeof vi.fn>
 }
+
+describe('TurnStreamer headline', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  function latest(ch: ReturnType<typeof channel>, messageId = 'om_card'): object {
+    return ch.updated.filter(update => update.messageId === messageId).at(-1)!.card
+  }
+
+  it('follows the stream: thinking, writing, back to in progress between steps', async () => {
+    const ch = channel()
+    const streamer = new DrivenStreamer(ch, 500, hooks())
+    const session = makeSession('sess-headline')
+    streamer.attach(session, 'om_card', 'om_trigger', undefined)
+
+    streamer.onAssistantFrame(session, { type: 'start', attemptId: 'a1', revision: 1, turn: 1, step: 1 })
+    streamer.onAssistantFrame(session, { type: 'chunk', attemptId: 'a1', revision: 1, index: 0, time: 1, chunk: { type: 'reasoning-delta', index: 0, text: '想' } })
+    await vi.advanceTimersByTimeAsync(500)
+    expect(headlineOf(latest(ch))).toBe('🧠 思考中 · 已运行 0s')
+
+    streamer.onAssistantFrame(session, { type: 'chunk', attemptId: 'a1', revision: 1, index: 1, time: 2, chunk: { type: 'text-delta', index: 0, text: '答' } })
+    await vi.advanceTimersByTimeAsync(500)
+    expect(headlineOf(latest(ch))).toBe('✍️ 输出中 · 已运行 1s')
+
+    streamer.onAssistantFrame(session, { type: 'end', attemptId: 'a1', revision: 1, index: 2, outcome: { kind: 'committed', eventType: 'assistant/message', seq: 3 } })
+    await vi.advanceTimersByTimeAsync(500)
+    expect(headlineOf(latest(ch))).toBe('⚙️ 进行中 · 已运行 1s')
+  })
+
+  it('shows the question wait and a running compaction', async () => {
+    const ch = channel()
+    const streamer = new DrivenStreamer(ch, 500, hooks())
+    const session = makeSession('sess-wait')
+    streamer.attach(session, 'om_card', 'om_trigger', undefined)
+
+    streamer.setAwaitingAnswer('sess-wait', true)
+    await vi.advanceTimersByTimeAsync(500)
+    expect(headlineOf(latest(ch))).toBe('❓ 等待回答')
+    streamer.setAwaitingAnswer('sess-wait', false)
+
+    streamer.onSessionEvent(session, { type: 'compaction/start', seq: 1, data: { compactionId: 'c1', turn: 1 } })
+    await vi.advanceTimersByTimeAsync(500)
+    expect(headlineOf(latest(ch))).toBe('🗜 正在压缩上下文 · 已运行 1s')
+    streamer.onSessionEvent(session, { type: 'compaction/end', seq: 2, data: { compactionId: 'c1', turn: 1 } })
+    await vi.advanceTimersByTimeAsync(500)
+    expect(headlineOf(latest(ch))).toBe('⚙️ 进行中 · 已运行 1s')
+  })
+
+  it('settles a queued card whose message left the inbox unclaimed', async () => {
+    const ch = channel()
+    const hooksInstance = hooks()
+    const streamer = new DrivenStreamer(ch, 500, hooksInstance)
+    const session = makeSession('sess-drop')
+    streamer.attach(session, 'om_first', 'om_trigger_1', undefined, { message: prompt('m-1') })
+    streamer.attach(session, 'om_queued', 'om_trigger_2', 'react-typing', { message: prompt('m-2') })
+
+    // Another message id, or the running turn's prompt, changes nothing.
+    streamer.onInboxDiscarded(session, prompt('m-other'))
+    streamer.onInboxDiscarded(session, prompt('m-1'))
+    expect(streamer.steerTargetOf('om_queued')).toEqual({ sessionId: 'sess-drop', message: prompt('m-2') })
+
+    streamer.onInboxDiscarded(session, prompt('m-2'))
+    expect(streamer.steerTargetOf('om_queued')).toBeUndefined()
+    expect(latest(ch, 'om_queued')).toEqual({ schema: '2.0', config: { width_mode: 'fill' }, body: { elements: [{ tag: 'markdown', content: DROPPED_NOTICE }] } })
+    expect(hooksInstance.onTurnFinalized).toHaveBeenCalledWith('sess-drop', 0, 'om_queued')
+    await vi.waitFor(() => expect(ch.addReaction).toHaveBeenCalledWith('om_trigger_2', 'No'))
+  })
+
+  it('does not treat the steer button\'s inbox removal as a drop', async () => {
+    const ch = channel()
+    const streamer = new DrivenStreamer(ch, 500, hooks())
+    const session = makeSession('sess-steer-drop')
+    streamer.attach(session, 'om_first', 'om_trigger_1', undefined, { message: prompt('m-1') })
+    streamer.attach(session, 'om_queued', 'om_trigger_2', undefined, { message: prompt('m-2') })
+    const merged = streamer.mergeQueued('om_queued', (_sessionId, message) => {
+      streamer.onInboxDiscarded(session, message)
+      return true
+    })
+    expect(merged).toBe(true)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(JSON.stringify(ch.updated.filter(update => update.messageId === 'om_queued'))).not.toContain(DROPPED_NOTICE)
+  })
+})
 
 describe('TurnStreamer host turns', () => {
   beforeEach(() => {

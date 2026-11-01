@@ -1038,7 +1038,7 @@ export class InboundRouter {
     const failCreation = async (error: unknown): Promise<void> => {
       void this.repair.clear(sent.messageId)
       await this.delivery.requireChannel().updateCard(sent.messageId, buildCard({
-        phase: 'done',
+        phase: 'error',
         reasoning: '',
         body: `会话创建失败：${String(error)}`,
         stats: { ...initialStats },

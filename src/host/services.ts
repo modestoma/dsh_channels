@@ -8,7 +8,7 @@
 
 import type { AgentRegistry } from './agent.ts'
 import type { CommandRuntime } from './commands.ts'
-import type { AssistantStreamPayload, CommitTrailersEvent, InboxClaimedPayload, PreToolDecision, PreToolExecution, Session, SessionEvent, SessionId } from './core.ts'
+import type { AssistantStreamPayload, CommitTrailersEvent, InboxClaimedPayload, InboxDiscardedPayload, PreToolDecision, PreToolExecution, Session, SessionEvent, SessionId } from './core.ts'
 import type { ApprovalAnswererListener, UserQuestionAnswererListener } from './interaction.ts'
 
 // ---- Workspace surface --------------------------------------------------
@@ -345,6 +345,8 @@ export interface HostContext {
   on(name: 'agent/assistant-stream', listener: (payload: AssistantStreamPayload) => void): () => boolean
   /** A turn claimed an inbox message; binds Feishu cards to the turn their prompt starts. */
   on(name: 'agent/inbox/claimed', listener: (payload: InboxClaimedPayload) => void): () => boolean
+  /** A message left an agent inbox unclaimed; settles the queued Feishu card it belongs to. */
+  on(name: 'agent/inbox/discarded', listener: (payload: InboxDiscardedPayload) => void): () => boolean
   /**
    * The host's structured-question waterfall (`ask_user_question`). Same
    * shape as `approval/request`: return an answer to claim, or delegate with

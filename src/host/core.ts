@@ -116,6 +116,12 @@ export interface InboxClaimedPayload {
   readonly turn: number
 }
 
+/** Payload of `agent/inbox/discarded`: a message left the inbox without being claimed. */
+export interface InboxDiscardedPayload {
+  readonly agent: Agent
+  readonly message: UserMessage
+}
+
 /**
  * The pending tool call a `tools/pre-execute` listener sees (subset of DSH
  * `ToolExecution`, `packages/core/tools/src/contracts.ts`).
@@ -392,6 +398,21 @@ export interface LlmRetryStartedEvent extends SessionEventEnvelope {
   data: { turn: number; step: number; retry: number; [key: string]: unknown }
 }
 
+/**
+ * Start of one context compaction (`dsh-compaction`); `turn` is null for a
+ * standalone manual compaction between turns.
+ */
+export interface CompactionStartEvent extends SessionEventEnvelope {
+  type: 'compaction/start'
+  data: { compactionId: string; turn: number | null; [key: string]: unknown }
+}
+
+/** End of the compaction with the same id; `error` records a failed attempt. */
+export interface CompactionEndEvent extends SessionEventEnvelope {
+  type: 'compaction/end'
+  data: { compactionId: string; turn: number | null; error?: string; [key: string]: unknown }
+}
+
 /** A prompt the Agent admitted into a request (its `UserMessage`, id included). */
 export interface UserMessageEvent extends SessionEventEnvelope {
   type: 'user/message'
@@ -402,7 +423,7 @@ export interface OtherSessionEvent extends SessionEventEnvelope {
   /** Unknown/extension event types are ignored by the folds. */
   type: Exclude<string, 'assistant/message' | 'step/start' | 'turn/end' | 'request/header'
     | 'tool/call' | 'tool/result' | 'subagent/descriptor' | 'llm/retry' | 'llm/retry-started'
-    | 'command/run' | 'command/done' | 'user/message'
+    | 'command/run' | 'command/done' | 'user/message' | 'compaction/start' | 'compaction/end'
     | 'tool-workflow/run-start' | 'tool-workflow/agent-start' | 'tool-workflow/agent-end' | 'tool-workflow/run-end'>
   data: unknown
 }
@@ -426,4 +447,6 @@ export type SessionEvent =
   | ToolWorkflowRunEndEvent
   | LlmRetryEvent
   | LlmRetryStartedEvent
+  | CompactionStartEvent
+  | CompactionEndEvent
 
