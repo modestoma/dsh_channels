@@ -12,6 +12,7 @@ import type { FeishuConfig } from '../src/config.ts'
 import { AppOwnerLookupError } from '../src/feishu-channel.ts'
 import type { ChannelFactory, NormalizedMessage } from '../src/feishu-channel.ts'
 import type { RouteRecord } from '../src/domain.ts'
+import type { Agent } from '../src/dsh-types.ts'
 import { ATTACHMENTS_DIR } from '../src/feishu/inbound-attachments.ts'
 import { TestFeishuService as FeishuService } from './helpers.ts'
 import { makeAccessConfig } from './access-fixtures.ts'
@@ -739,6 +740,27 @@ describe('guarded 模式：代码改动开关', () => {
     }))
     const [, bobRoute] = await waitForRoute(h, 'u_bob')
     expect(await trailersFor(bobRoute.sessionId)).toEqual([['Feishu-User', 'Bob <u_bob>']])
+    await h.service.shutdown()
+  })
+
+  it('PR/MR 动态唤醒飞书会话时由本插件取会话，其他会话交给下一个处理者', async () => {
+    const h = await setup()
+    await h.service.addAccessUser('u_alice')
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_group', senderId: 'u_alice',
+      mentionedBot: true, messageId: 'om_alice_watch', content: '开个 MR',
+    }))
+    const [, route] = await waitForRoute(h, 'u_alice')
+    const [registered] = h.ctxState.resolveAgentListeners
+    expect(registered?.options).toEqual({ prepend: true })
+    const other = { session: { id: 's_web' } } as unknown as Agent
+    const next = vi.fn(async () => other)
+
+    const agent = await registered!.listener(route.sessionId, next)
+    expect(agent.session.id).toBe(route.sessionId)
+    expect(next).not.toHaveBeenCalled()
+    expect(await registered!.listener('s_web', next)).toBe(other)
+    expect(next).toHaveBeenCalledTimes(1)
     await h.service.shutdown()
   })
 

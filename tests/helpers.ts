@@ -682,6 +682,8 @@ export function makeWorktrees(workingDirectory: FakeWorkingDirectory): FakeWorkt
 
 /** One `tools/pre-execute` waterfall listener. */
 export type PreExecuteListener = (exec: PreToolExecution, next: () => Promise<PreToolDecision>) => Promise<PreToolDecision>
+/** dsh-repo's `repo/resolve-agent` waterfall listener. */
+export type ResolveAgentListener = (sessionId: string, next: () => Promise<Agent>) => Promise<Agent>
 
 export function makeHostContext(
   credentialValues?: Record<string, string>,
@@ -713,6 +715,8 @@ export function makeHostContext(
   preExecuteListeners: PreExecuteListener[]
   /** Every `repo/commit-trailers` listener the service registered. */
   commitTrailerListeners: Array<(event: CommitTrailersEvent) => void | Promise<void>>
+  /** Every `repo/resolve-agent` listener the service registered, with its options. */
+  resolveAgentListeners: Array<{ listener: ResolveAgentListener; options: { prepend?: boolean } | undefined }>
   permissions: PermissionPresets & { set: ReturnType<typeof vi.fn>; preset: string }
   sessionQuery: { readTitleSnapshots: ReturnType<typeof vi.fn> }
 } {
@@ -734,6 +738,7 @@ export function makeHostContext(
   const questionListeners: Array<{ listener: UserQuestionAnswererListener; options: { prepend?: boolean } | undefined }> = []
   const preExecuteListeners: PreExecuteListener[] = []
   const commitTrailerListeners: Array<(event: CommitTrailersEvent) => void | Promise<void>> = []
+  const resolveAgentListeners: Array<{ listener: ResolveAgentListener; options: { prepend?: boolean } | undefined }> = []
   const tokenMeter = { measure: () => ({ totalTokens: 1234 }) }
   const permissions = {
     preset: 'standard',
@@ -835,6 +840,8 @@ export function makeHostContext(
         preExecuteListeners.push(listener as PreExecuteListener)
       } else if (name === 'repo/commit-trailers') {
         commitTrailerListeners.push(listener as (event: CommitTrailersEvent) => void | Promise<void>)
+      } else if (name === 'repo/resolve-agent') {
+        resolveAgentListeners.push({ listener: listener as ResolveAgentListener, options: options as { prepend?: boolean } | undefined })
       } else if (name === 'user-questions/request') {
         questionListeners.push({
           listener: listener as UserQuestionAnswererListener,
@@ -847,7 +854,7 @@ export function makeHostContext(
   }
   return {
     ctx, agents, workspaces, domain, credentials, sessionListeners, driver,
-    assistantStreamListeners, approvalListeners, questionListeners, preExecuteListeners, commitTrailerListeners, permissions, sessionQuery,
+    assistantStreamListeners, approvalListeners, questionListeners, preExecuteListeners, commitTrailerListeners, resolveAgentListeners, permissions, sessionQuery,
     workingDirectory, worktrees,
   }
 }

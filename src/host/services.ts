@@ -6,7 +6,7 @@
  * @module dsh-channels/host/services
  */
 
-import type { AgentRegistry } from './agent.ts'
+import type { Agent, AgentRegistry } from './agent.ts'
 import type { CommandRuntime } from './commands.ts'
 import type { AssistantStreamPayload, CommitTrailersEvent, InboxClaimedPayload, InboxDiscardedPayload, PreToolDecision, PreToolExecution, Session, SessionEvent, SessionId } from './core.ts'
 import type { ApprovalAnswererListener, UserQuestionAnswererListener } from './interaction.ts'
@@ -342,5 +342,16 @@ export interface HostContext {
    * dsh-repo.
    */
   on(name: 'repo/commit-trailers', listener: (event: CommitTrailersEvent) => void | Promise<void>): () => boolean
+  /**
+   * dsh-repo's `repo/resolve-agent` waterfall: the live Agent a PR/MR watch
+   * wakes for a Session. A listener returns the Agent of a Session it owns or
+   * delegates with `next()`, whose last step is the host's
+   * `sessionController`. Never fires without dsh-repo.
+   */
+  on(
+    name: 'repo/resolve-agent',
+    listener: (sessionId: string, next: () => Promise<Agent>) => Promise<Agent>,
+    options?: { prepend?: boolean },
+  ): () => boolean
   effect(callback: () => (() => void | Promise<void>) | void, label?: string): void
 }
