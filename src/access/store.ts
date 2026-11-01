@@ -6,6 +6,8 @@
  * `storageDomain` tables) so admission decisions stay synchronous and cheap;
  * every mutation writes through to the domain first and then updates memory,
  * matching the store patterns used for routes and inflight snapshots.
+ * User-table mutations run one at a time, each reading the record after the
+ * previous write, so concurrent switch changes never overwrite each other.
  *
  * The tables (`access_users`, `access_requests`) were added without bumping
  * the domain version on purpose: the JSON backend's `single` layout refuses a
@@ -43,6 +45,8 @@ export class AccessStore {
   private readonly requests = new Map<string, AccessRequestRecord>()
   /** Cached `chat`-enabled keys so `snapshot()` stays allocation-free per message. */
   private readonly chatKeys = new Set<string>()
+  /** Tail of the user-table mutation queue; always fulfilled. */
+  private userWrites: Promise<void> = Promise.resolve()
 
   constructor(private readonly deps: AccessStoreDeps) {}
 
@@ -99,9 +103,21 @@ export class AccessStore {
 
   /** Insert or replace one user record. */
   async putUser(record: AccessUserRecord): Promise<AccessUserRecord> {
-    await this.requireDomain('put access user').accessUsers.put(record.userId, record)
-    this.remember(record.userId, record)
-    return record
+    return await this.serializeUserWrite(async () => await this.writeUser(record))
+  }
+
+  /**
+   * Turn `chat` on for an existing user, or insert `record` when the user is
+   * not in the table. Both cases are one queued mutation.
+   * @param record - the record to insert for a new user.
+   * @returns the stored record.
+   */
+  async grantChat(record: AccessUserRecord): Promise<AccessUserRecord> {
+    return await this.serializeUserWrite(async () => {
+      const current = this.users.get(record.userId)
+      if (current === undefined) return await this.writeUser(record)
+      return current.chat ? current : await this.writeUser({ ...current, chat: true })
+    })
   }
 
   /**
@@ -112,18 +128,22 @@ export class AccessStore {
    * @returns the updated record, or undefined when the user is not in the table.
    */
   async setPermission(userId: string, permission: AccessPermission, enabled: boolean): Promise<AccessUserRecord | undefined> {
-    const current = this.users.get(userId)
-    if (current === undefined) return undefined
-    if (current[permission] === enabled) return current
-    return await this.putUser({ ...current, [permission]: enabled })
+    return await this.serializeUserWrite(async () => {
+      const current = this.users.get(userId)
+      if (current === undefined) return undefined
+      if (current[permission] === enabled) return current
+      return await this.writeUser({ ...current, [permission]: enabled })
+    })
   }
 
   async removeUser(userId: string): Promise<boolean> {
-    if (!this.users.has(userId)) return false
-    await this.requireDomain('remove access user').accessUsers.delete(userId)
-    this.users.delete(userId)
-    this.chatKeys.delete(userId)
-    return true
+    return await this.serializeUserWrite(async () => {
+      if (!this.users.has(userId)) return false
+      await this.requireDomain('remove access user').accessUsers.delete(userId)
+      this.users.delete(userId)
+      this.chatKeys.delete(userId)
+      return true
+    })
   }
 
   /** Every authorization request, including settled ones (audit). */
@@ -192,6 +212,26 @@ export class AccessStore {
       expired.push(next)
     }
     return expired
+  }
+
+  /**
+   * Run one user-table mutation after every earlier one settles.
+   * @param work - the mutation; it reads the current record itself.
+   * @returns the mutation's result; its failure goes only to this caller.
+   */
+  private serializeUserWrite<T>(work: () => Promise<T>): Promise<T> {
+    const run = this.userWrites.then(work)
+    this.userWrites = run.then(
+      () => undefined,
+      (_error: unknown) => { /* The failure is reported to the caller awaiting `run`; the queue continues. */ },
+    )
+    return run
+  }
+
+  private async writeUser(record: AccessUserRecord): Promise<AccessUserRecord> {
+    await this.requireDomain('put access user').accessUsers.put(record.userId, record)
+    this.remember(record.userId, record)
+    return record
   }
 
   private remember(key: string, record: AccessUserRecord): void {

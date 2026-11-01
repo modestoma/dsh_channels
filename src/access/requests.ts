@@ -406,12 +406,7 @@ export class AccessRequests {
 
   /** Write the actual grant; throws so `resolve()` can report the failure. */
   private async grant(record: AccessRequestRecord, actorUserId: string, now: number): Promise<void> {
-    const existing = this.deps.store.getUser(record.targetId)
-    if (existing !== undefined) {
-      await this.deps.store.setPermission(record.targetId, 'chat', true)
-      return
-    }
-    await this.deps.store.putUser({
+    await this.deps.store.grantChat({
       userId: record.targetId,
       ...(record.requesterName === undefined ? {} : { name: record.requesterName }),
       source: 'card',

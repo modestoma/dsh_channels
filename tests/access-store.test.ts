@@ -124,6 +124,38 @@ describe('AccessStore 用户表写穿', () => {
     expect(store.allows('u_missing', 'chat')).toBe(false)
   })
 
+  it('同一用户的并发开关修改依次生效，后写不会还原先写', async () => {
+    const { store } = makeStore()
+    store.load()
+    await store.putUser(userRecord({ userId: 'u_bob', codeWrite: true }))
+    await Promise.all([
+      store.setPermission('u_bob', 'codeWrite', false),
+      store.setPermission('u_bob', 'wikiRead', true),
+      store.grantChat(userRecord({ userId: 'u_bob' })),
+    ])
+    expect(store.getUser('u_bob')).toMatchObject({ chat: true, codeWrite: false, wikiRead: true })
+  })
+
+  it('grantChat 新增只开 chat 的用户，或只为已有用户打开 chat', async () => {
+    const { store } = makeStore()
+    store.load()
+    await store.grantChat(userRecord({ userId: 'u_new', name: 'New' }))
+    expect(store.allows('u_new', 'chat')).toBe(true)
+    await store.putUser(userRecord({ userId: 'u_paused', chat: false, wikiWrite: true, name: 'Kept' }))
+    const updated = await store.grantChat(userRecord({ userId: 'u_paused', name: 'Ignored' }))
+    expect(updated).toMatchObject({ chat: true, wikiWrite: true, name: 'Kept' })
+    await expect(store.grantChat(userRecord({ userId: 'u_paused' }))).resolves.toBe(updated)
+  })
+
+  it('一次写入失败只报给它的调用方，后续写入照常进行', async () => {
+    const { store, state, domain } = makeStore()
+    store.load()
+    state.handle = undefined
+    await expect(store.putUser(userRecord({ userId: 'u_a' }))).rejects.toThrow(/access domain not open/)
+    state.handle = domain.handle
+    await expect(store.putUser(userRecord({ userId: 'u_b' }))).resolves.toMatchObject({ userId: 'u_b' })
+  })
+
   it('removeUser 持久删除并即时退出快照；不存在时返回 false', async () => {
     const { store, domain } = makeStore()
     store.load()

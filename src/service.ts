@@ -1279,11 +1279,7 @@ export class FeishuService {
 
   /** Add a user with only `chat` on, or turn `chat` on for an existing record. */
   private async grantChat(userId: string, name: string | undefined, source: AccessUserRecord['source'], admin: string): Promise<void> {
-    if (this.accessStore.hasUser(userId)) {
-      await this.accessStore.setPermission(userId, 'chat', true)
-      return
-    }
-    await this.accessStore.putUser({
+    await this.accessStore.grantChat({
       userId,
       ...(name === undefined || name === '' ? {} : { name }),
       source,
