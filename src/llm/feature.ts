@@ -321,6 +321,11 @@ export class UserModels {
     const record = this.deps.store.get(userId)
     let change: UserLlmChange
     if (action.kind === 'effort') {
+      // A click from an older card may name an effort of a model no longer saved.
+      if (action.effort !== '' && !(await this.savedModelOffers(userId, action.effort))) {
+        await redraw('这个推理强度不适用于你现在选的模型，请在下面重新选择。')
+        return
+      }
       change = { effort: action.effort === '' ? null : action.effort }
     } else if (action.source === 'own') {
       if (record?.own === undefined || !record.own.models.includes(action.model)) {
@@ -447,6 +452,15 @@ export class UserModels {
       ...(current.model === undefined ? {} : { model: current.model }),
       ...(current.effort === undefined ? {} : { effort: current.effort }),
     }
+  }
+
+  /** Whether the user's saved model advertises an effort. */
+  private async savedModelOffers(userId: string, effort: string): Promise<boolean> {
+    const record: UserLlmRecord = this.deps.store.get(userId) ?? { userId, source: 'default', updatedAt: 0 }
+    const source = record.source === 'own' && record.own !== undefined ? 'own' : 'default'
+    const choice = this.routeOfChoice({ ...record, source })
+    if (choice === undefined) return false
+    return (await this.efforts(choice.provider, choice.model)).some(item => item.id === effort)
   }
 
   private registered(route: string): boolean {

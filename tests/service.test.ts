@@ -3961,6 +3961,10 @@ describe('command picker cards', () => {
 
   it('switches the Session to the saved model before applying an effort picked for it', async () => {
     const h = await setup()
+    mock(h.ctxState.ctx.llm!.resolveModelInfo).mockResolvedValue({
+      context: { contextWindow: 128000 },
+      reasoning: { efforts: [{ id: 'low', name: '低' }, { id: 'high', name: '高' }], defaultEffort: 'low' },
+    })
     const created = await establishWithModel(h, 'oc_pick_effort_model')
     const topic = (messageId: string, content: string) => makeMessage({
       chatType: 'group', chatId: 'oc_pick_effort_model', senderId: 'u_owner', threadId: 'omt_1', mentionedBot: false, messageId, content,
@@ -3979,6 +3983,31 @@ describe('command picker cards', () => {
     await waitUntil(() => expect(pickerUpdates(h, 'om_3')).toHaveLength(1))
     await expect(dispatchAgentRequest(created.setupCtx, { provider: 'deepseek-official', model: 'deepseek-v4-pro' }))
       .resolves.toMatchObject({ model: 'deepseek-v4-flash', reasoningEffort: 'high' })
+    await h.service.shutdown()
+  })
+
+  it('rejects an effort from an older card that the saved model does not offer', async () => {
+    const h = await setup()
+    mock(h.ctxState.ctx.llm!.resolveModelInfo).mockImplementation(async (_provider: string, model: string) => ({
+      context: { contextWindow: 128000 },
+      reasoning: { efforts: model === 'deepseek-v4-pro' ? [{ id: 'low', name: '低' }] : [{ id: 'high', name: '高' }] },
+    }))
+    await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_dm_owner', senderId: 'u_owner', content: '/model' }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
+    const stale = buttonValues(lastCard(h)).find(button => button.label === '高')!.value
+    await h.channel.fireCardAction({
+      messageId: 'om_1', chatId: 'oc_dm_owner', operator: { openId: 'ou_o', userId: 'u_owner' },
+      action: { value: buttonValues(lastCard(h))[1]!.value, tag: 'button' },
+    })
+    await waitUntil(() => expect(pickerUpdates(h, 'om_1')).toHaveLength(1))
+    await h.channel.fireCardAction({
+      messageId: 'om_1', chatId: 'oc_dm_owner', operator: { openId: 'ou_o', userId: 'u_owner' },
+      action: { value: stale, tag: 'button' },
+    })
+    await waitUntil(() => expect(pickerUpdates(h, 'om_1')).toHaveLength(2))
+    const card = JSON.stringify(pickerUpdates(h, 'om_1')[1])
+    expect(card).toContain('这个推理强度不适用于你现在选的模型')
+    expect(card).toContain('`deepseek-v4-pro` · 推理强度 模型默认')
     await h.service.shutdown()
   })
 
