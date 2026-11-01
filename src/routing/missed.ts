@@ -64,6 +64,11 @@ export class MissedMessages {
   /** Earliest time a queued or running catch-up has yet to cover. */
   private uncovered: number | undefined
   private stopping = false
+  /**
+   * When `stop()` began: the caller stopped live intake then, so no stored
+   * last-alive time may pass it, including one a draining catch-up writes.
+   */
+  private stoppedAt: number | undefined
 
   constructor(private readonly deps: MissedMessagesDeps) {}
 
@@ -75,6 +80,7 @@ export class MissedMessages {
     const config = this.deps.config()
     if (!config.enabled) return
     this.stopping = false
+    this.stoppedAt = undefined
     const since = this.deps.domain()?.getGlobal().lastAliveAt
     if (since !== undefined) this.scheduleCatchUp(since)
     this.startHeartbeat(config.heartbeatMs)
@@ -114,11 +120,13 @@ export class MissedMessages {
 
   /**
    * Stop: skip catch-ups not yet started, wait for the running one, and store
-   * the earliest time not yet caught up as the last-alive time. Call before
-   * the channel disconnects and the domain closes.
+   * the earliest time not yet caught up as the last-alive time. Call when live
+   * intake stops (the stored time never passes this call), before the channel
+   * disconnects and the domain closes.
    */
   async stop(): Promise<void> {
     this.stopping = true
+    this.stoppedAt ??= Date.now()
     this.stopHeartbeat()
     const lostAt = this.lostAt
     this.lostAt = undefined
@@ -169,7 +177,7 @@ export class MissedMessages {
     const domain = this.deps.domain()
     if (domain === undefined) return
     try {
-      await domain.setGlobal({ ...domain.getGlobal(), lastAliveAt: at })
+      await domain.setGlobal({ ...domain.getGlobal(), lastAliveAt: Math.min(at, this.stoppedAt ?? Infinity) })
     } catch (error) {
       this.deps.warn('dsh-channels: storing the last-alive time failed: %s', String(error))
     }

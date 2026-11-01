@@ -178,6 +178,25 @@ describe('MissedMessages', () => {
     expect(t.handled.map(handled => handled.messageId)).toEqual(['om_during'])
   })
 
+  it('never stores a last-alive time later than the stop, even from a draining catch-up', async () => {
+    const t = setup({ lastAliveAt: NOW - 20 * MINUTE, welcomed: ['oc_p2p'], messages: [message('om_1', 3)] })
+    let release!: () => void
+    const held = new Promise<void>(resolve => { release = resolve })
+    t.historyIds.mockImplementationOnce(async () => {
+      await held
+      return { ids: [], truncated: false }
+    })
+    t.missed.start()
+    await vi.waitFor(() => expect(t.historyIds).toHaveBeenCalled())
+    const stoppedAt = Date.now()
+    const stopping = t.missed.stop()
+    // The catch-up outlives the stop by more than a heartbeat.
+    vi.setSystemTime(stoppedAt + 5 * MINUTE)
+    release()
+    await stopping
+    expect(t.global.lastAliveAt).toBe(stoppedAt)
+  })
+
   it('stores the time of a lost connection when stopped before it came back', async () => {
     const t = setup()
     t.missed.start()

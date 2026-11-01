@@ -2202,7 +2202,8 @@ export class FeishuService {
     this.unlistenCardAction?.()
     this.unlistenCardAction = undefined
     // While admission is still open, so a running catch-up finishes its
-    // messages. A failure must not keep the connection open.
+    // messages; the stored last-alive time stays at this intake cutoff. A
+    // failure must not keep the connection open.
     try {
       await this.missed.stop()
     } catch (error) {
