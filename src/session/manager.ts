@@ -321,6 +321,18 @@ export class SessionManager {
   }
 
   /**
+   * Agent options of the Session `/renew` creates. A recorded choice replaces
+   * the old provider/model; returning to the deployment default drops the
+   * route the old Session was pinned to; otherwise the old options carry over.
+   */
+  private renewedAgentOptions(record: RouteRecord, oldLive: LiveAgent, llm: SessionLlm | undefined): Record<string, unknown> {
+    if (llm !== undefined) return { ...oldLive.agent.options, ...this.agentOptions(llm) }
+    if (record.llm?.provider === undefined) return { ...oldLive.agent.options }
+    const { provider: _pinnedProvider, model: _pinnedModel, ...rest } = oldLive.agent.options as Record<string, unknown>
+    return { ...rest, ...this.agentOptions() }
+  }
+
+  /**
    * Create, place, workspace-attach, and atomically publish one renewed route.
    *
    * A renewal keeps the topic's working directory: the new Session is created
@@ -352,8 +364,7 @@ export class SessionManager {
           cwd: switchable ? workspacePath : sessionDirOf(record),
           ...(composition.agentPreset === undefined ? {} : { agentPreset: composition.agentPreset }),
         },
-        // Without a preference the renewed Session keeps the old one's options.
-        agentOptions: llm === undefined ? { ...oldLive.agent.options } : { ...oldLive.agent.options, ...this.agentOptions(llm) },
+        agentOptions: this.renewedAgentOptions(record, oldLive, llm),
         setup: composition.setup,
       })
       this.requestPolicy(newHandle.agent)

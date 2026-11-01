@@ -5705,6 +5705,33 @@ describe('per-user models', () => {
     await h.service.shutdown()
   })
 
+  it('renews onto the default endpoint after the owner switches back from a personal route', async () => {
+    const { h, settings } = await setupWithEndpoints()
+    await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_dm_a', senderId: 'u_a', content: '/llm' }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
+    await h.channel.fireCardAction(bindEvent('om_1', { api: 'openai-completions', baseURL: 'https://api.example.com', apiKey: 'sk-1' }))
+    await waitUntil(() => expect(updatesOf(h, 'om_1').at(-1)).toContain('已绑定'))
+    const route = [...settings.providers.keys()][0]!
+    await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_dm_a', senderId: 'u_a', content: '开始' }))
+    await waitForEstablishedSession(h)
+    expect(h.ctxState.agents.created[0]!.options.agentOptions).toMatchObject({ provider: route, model: 'my-model' })
+
+    await h.channel.fireCardAction({
+      messageId: 'om_sel', chatId: 'oc_dm_a', operator: { openId: 'ou_a', userId: 'u_a' },
+      action: { value: { decision: 'llm-pref', kind: 'model', owner: 'u_a', source: 'default', model: '' }, tag: 'button' },
+    })
+    await waitUntil(() => expect(updatesOf(h, 'om_sel')).toHaveLength(1))
+
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_dm_a', senderId: 'u_a', threadId: 'omt_2', mentionedBot: false,
+      messageId: 'om_renew_default', content: '/renew',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
+    expect(h.ctxState.agents.created[1]!.options.agentOptions)
+      .toMatchObject({ provider: 'deepseek-official', model: 'deepseek-v4-flash' })
+    await h.service.shutdown()
+  })
+
   it('resumes a Session on its recorded personal route, and on the default once that route is gone', async () => {
     const { h, settings } = await setupWithEndpoints()
     await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_dm_a', senderId: 'u_a', content: '/llm' }))

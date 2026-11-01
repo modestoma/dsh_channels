@@ -30,6 +30,14 @@ describe('sessionLlmFor', () => {
     expect(sessionLlmFor(record({ model: 'pro' }), {})).toBeUndefined()
   })
 
+  it('keeps the administrator effort when the default model is pinned by name', () => {
+    expect(sessionLlmFor(record({ model: 'flash' }), defaults))
+      .toEqual({ provider: 'deepseek-official', model: 'flash', effort: 'high' })
+    expect(sessionLlmFor(record({ model: 'flash', effort: 'low' }), defaults))
+      .toEqual({ provider: 'deepseek-official', model: 'flash', effort: 'low' })
+    expect(sessionLlmFor(record({ model: 'pro' }), defaults)).toEqual({ provider: 'deepseek-official', model: 'pro' })
+  })
+
   it('uses the personal route, defaulting to its first model, and falls back while unbound', () => {
     expect(sessionLlmFor(record({ source: 'own', own }), defaults)).toEqual({ provider: own.route, model: 'm1' })
     expect(sessionLlmFor(record({ source: 'own', own, model: 'm2', effort: 'low' }), defaults))

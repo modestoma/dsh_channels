@@ -37,7 +37,13 @@ export function sessionLlmFor(record: UserLlmRecord | undefined, defaults: Defau
     return model === undefined ? undefined : { provider: record.own.route, model, ...effort }
   }
   if (record.model !== undefined) {
-    return defaults.provider === undefined ? undefined : { provider: defaults.provider, model: record.model, ...effort }
+    if (defaults.provider === undefined) return undefined
+    // The administrator's effort belongs to the default model, so pinning
+    // that model by name keeps it unless the user chose another effort.
+    const pinnedEffort = record.effort === undefined && record.model === defaults.model && defaults.effort !== undefined
+      ? { effort: defaults.effort }
+      : effort
+    return { provider: defaults.provider, model: record.model, ...pinnedEffort }
   }
   return record.effort === undefined ? undefined : { effort: record.effort }
 }
