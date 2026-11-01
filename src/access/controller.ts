@@ -6,15 +6,16 @@
  * matrix lives in `policy.ts`; this module owns the user-facing behavior on
  * denial:
  *
- *  - private chats: denied senders (non-administrators, or non-whitelisted
- *    users with `dmAllowWhitelist`) get one fixed notice (10 s per-sender
+ *  - private chats: denied senders get one fixed notice (10 s per-sender
  *    cooldown); with no administrator configured they get the bootstrap
  *    notice instead;
  *  - group chats: fully silent, except that addressed denials call back into
  *    the authorization-request lifecycle so the administrator can be asked;
- *  - slash commands: `/userid` stays available to every private sender, the
- *    administrator's commands always pass (including inside an unauthorized
- *    group), everything else must pass admission (in private chats too).
+ *  - slash commands: `/userid` stays available to every private sender,
+ *    everything else must pass admission.
+ *
+ * It also answers the per-user permission switches (knowledge base, code
+ * write) for the tool gates: the administrator holds every switch.
  *
  * The controller never creates a Session or a workspace.
  *
@@ -22,17 +23,14 @@
  */
 
 import type { FeishuConfig } from '../config.ts'
-import type { RouteRecord } from '../domain.ts'
+import type { AccessPermission, RouteRecord } from '../domain.ts'
 import type { FeishuChannel, NormalizedMessage } from '../feishu-channel.ts'
 import { decideAccess, isAdminUserId } from './policy.ts'
 import type { AccessDecision } from './policy.ts'
 import type { AccessStore, AccessStoreSnapshot } from './store.ts'
 
-/** Fixed private-chat notice for non-administrators (no model call). */
-export const DM_DENY_TEXT = '非管理员禁用私聊功能哦～如需使用，请在管理员授权的群里 @ 我；或联系管理员把你的 user_id 加入白名单。'
-
-/** Fixed private-chat notice for non-whitelisted users while `dmAllowWhitelist` is on. */
-export const DM_DENY_WHITELIST_TEXT = '你还不在白名单里，暂时不能私聊哦～发送 /userid 查看你的 user_id，请管理员加入白名单后即可使用。'
+/** Fixed private-chat notice for users without the conversation permission (no model call). */
+export const DM_DENY_TEXT = '你还没有对话权限哦～发送 /userid 查看你的 user_id，请管理员把你加入用户表并打开对话准入后，就可以私聊或在群里 @ 我。'
 
 /** Fixed private-chat notice while no administrator is configured. */
 export const DM_UNCONFIGURED_TEXT = '机器人尚未配置管理员。发送 /userid 可查看你的 user_id，交给部署者配置后即可启用。'
@@ -44,15 +42,13 @@ const DM_NOTICE_COOLDOWN_MS = 10_000
 export interface AccessControllerDeps {
   /** Current plugin configuration (administrator id + access mode). */
   config(): FeishuConfig
-  /** Durable whitelists (read through the in-memory snapshot). */
+  /** Durable user table (read through the in-memory snapshot). */
   store: AccessStore
   /** Live channel, undefined before startup / after shutdown. */
   channel(): FeishuChannel | undefined
   /** Best-effort diagnostics; never rethrown. */
   warn(message: string, ...args: unknown[]): void
-  /** Addressed message in an unauthorized group (request lifecycle hook). */
-  onDeniedGroup?(msg: NormalizedMessage): void
-  /** Addressed message from an unauthorized user in an authorized group. */
+  /** Addressed group message from a user without the conversation permission. */
   onDeniedUser?(msg: NormalizedMessage): void
   /** Clock seam for tests. */
   now?(): number
@@ -77,7 +73,20 @@ export class AccessController {
     return isAdminUserId(this.config(), userId)
   }
 
-  /** Current whitelist snapshot used by the pure policy. */
+  /**
+   * Whether `userId` holds one permission switch: the administrator holds
+   * every switch; anyone else needs the switch on in the user table (with
+   * `chat` on). Independent of `accessMode`.
+   * @param userId - Feishu user_id, or undefined when unknown.
+   * @param permission - the switch to check.
+   * @returns true when allowed.
+   */
+  mayUse(userId: string | undefined, permission: AccessPermission): boolean {
+    if (userId === undefined) return false
+    return this.isAdmin(userId) || this.deps.store.allows(userId, permission)
+  }
+
+  /** Current user-table snapshot used by the pure policy. */
   snapshot(): AccessStoreSnapshot {
     return this.deps.store.snapshot()
   }
@@ -85,7 +94,7 @@ export class AccessController {
   /** Evaluate the admission matrix for one message (pure; no side effects). */
   decide(msg: NormalizedMessage): AccessDecision {
     return decideAccess(
-      { chatType: msg.chatType, chatId: msg.chatId, senderId: msg.senderId },
+      { chatType: msg.chatType, senderId: msg.senderId },
       this.config(),
       this.deps.store.snapshot(),
     )
@@ -100,24 +109,15 @@ export class AccessController {
     const decision = this.decide(msg)
     if (decision.kind === 'allow') return true
     try {
-      if (decision.reason === 'dm-non-admin') {
-        if (msg.chatType === 'p2p') await this.noticeDeniedDm(msg)
-        return false
-      }
-      if (decision.reason === 'admin-missing') {
-        // Private chats get the bootstrap instructions; groups stay silent.
-        // Goes through the same per-sender cooldown as the regular notice so a
-        // single sender cannot make the bot answer every message while the
-        // deployment is unconfigured.
-        if (msg.chatType === 'p2p') await this.noticeDeniedDm(msg)
+      if (msg.chatType === 'p2p') {
+        // Private chats get the fixed notice (or the bootstrap instructions
+        // while no administrator exists), cooled down per sender.
+        await this.noticeDeniedDm(msg)
         return false
       }
       // Group denials are silent. Only messages actually addressed to the bot
       // may trigger the (administrator-facing) authorization request.
-      if (msg.chatType === 'group' && addressedToBot(msg)) {
-        if (decision.reason === 'group-not-authorized') this.deps.onDeniedGroup?.(msg)
-        else if (decision.reason === 'user-not-authorized') this.deps.onDeniedUser?.(msg)
-      }
+      if (decision.reason === 'user-not-authorized' && addressedToBot(msg)) this.deps.onDeniedUser?.(msg)
     } catch (error) {
       this.deps.warn('dsh-channels: admission side effect failed: %s', String(error))
     }
@@ -126,29 +126,18 @@ export class AccessController {
 
   /**
    * Slash-command admission. Runs before any command card/topic/Session side
-   * effect. `open` mode keeps the legacy behavior; otherwise private chats
-   * admit whoever the admission matrix admits (with `/userid` as the
-   * bootstrap exception) and group chats must pass the full admission
-   * matrix; the administrator is
-   * never constrained by the whitelists, so all of their commands pass even
-   * inside an unauthorized group (`/auth` is the in-conversation grant
-   * entry).
+   * effect. `open` mode admits every command; otherwise a command must pass
+   * the admission matrix, with `/userid` in a private chat as the bootstrap
+   * exception (it only echoes the sender's own user_id). A denied private
+   * sender gets the fixed notice; a denied group sender stays silent.
    */
   async admitCommand(msg: NormalizedMessage, commandName: string | undefined): Promise<boolean> {
     if (this.config().accessMode === 'open') return true
     try {
-      if (msg.chatType === 'p2p') {
-        // `/userid` is the bootstrap entry for everyone: it only echoes the
-        // sender's own user_id and has no storage/model side effect.
-        if (commandName === 'userid') return true
-        if (this.decide(msg).kind === 'allow') return true
-        await this.noticeDeniedDm(msg)
-        return false
-      }
-      if (this.isAdmin(msg.senderId) && (commandName === 'auth' || commandName === 'groupid')) {
-        return true
-      }
-      return this.decide(msg).kind === 'allow'
+      if (msg.chatType === 'p2p' && commandName === 'userid') return true
+      if (this.decide(msg).kind === 'allow') return true
+      if (msg.chatType === 'p2p') await this.noticeDeniedDm(msg)
+      return false
     } catch (error) {
       this.deps.warn('dsh-channels: command admission failed: %s', String(error))
       return false
@@ -178,21 +167,25 @@ export class AccessController {
     if (record.senderUserId === userId) return true
     if (record.shared !== true) return false
     return decideAccess(
-      { chatType: record.chatType, chatId, senderId: userId },
+      { chatType: record.chatType, senderId: userId },
       this.config(),
       this.deps.store.snapshot(),
     ).kind === 'allow'
   }
 
   /**
-   * Whether a `feishuTopics` launch may post into `chatId`: an authorized
-   * group, or any group in `open` access mode.
-   * @param chatId - target group chat id.
-   * @returns true when the chat is a permitted target.
+   * Whether a `feishuTopics` launch may start a topic for `requesterUserId`:
+   * the administrator or a user with the conversation permission, or anyone
+   * in `open` access mode. The target group itself is not checked.
+   * @param requesterUserId - Feishu user_id the launch is for.
+   * @returns true when the launch is permitted.
    */
-  mayLaunchIn(chatId: string): boolean {
-    if (this.config().accessMode === 'open') return true
-    return this.deps.store.snapshot().groups.has(chatId)
+  mayLaunchFor(requesterUserId: string): boolean {
+    return decideAccess(
+      { chatType: 'group', senderId: requesterUserId },
+      this.config(),
+      this.deps.store.snapshot(),
+    ).kind === 'allow'
   }
 
   /** Drop in-memory notices (shutdown; durable state lives in the store). */
@@ -212,10 +205,7 @@ export class AccessController {
     const last = this.dmNoticeAt.get(msg.senderId)
     if (last !== undefined && now - last < DM_NOTICE_COOLDOWN_MS) return
     this.dmNoticeAt.set(msg.senderId, now)
-    const config = this.config()
-    const text = config.adminUserId === undefined
-      ? DM_UNCONFIGURED_TEXT
-      : config.dmAllowWhitelist ? DM_DENY_WHITELIST_TEXT : DM_DENY_TEXT
+    const text = this.config().adminUserId === undefined ? DM_UNCONFIGURED_TEXT : DM_DENY_TEXT
     await this.sendText(msg.chatId, text, msg.messageId)
   }
 

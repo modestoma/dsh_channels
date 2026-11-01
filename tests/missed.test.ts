@@ -44,6 +44,7 @@ function setup(options: {
   const global: FeishuDomainGlobal = {
     ...(options.lastAliveAt === undefined ? {} : { lastAliveAt: options.lastAliveAt }),
     ...(options.welcomed === undefined ? {} : { welcomedChats: options.welcomed }),
+    ...(options.groups === undefined ? {} : { knownGroups: options.groups }),
   }
   const processed = new Map<string, ProcessedRecord>((options.processed ?? []).map(id => [id, { key: id, processedAt: 0 }]))
   const historyIds = vi.fn<NonNullable<FeishuChannel['historyIds']>>(async (container, sinceMs, limit) => {
@@ -73,7 +74,6 @@ function setup(options: {
     }),
     channel: () => channel,
     routes: () => options.routes ?? [],
-    groupChats: () => options.groups ?? [],
     handle: async message => { handled.push(message) },
     isAdmin: userId => userId === 'u_admin',
     info: vi.fn(),

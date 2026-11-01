@@ -43,7 +43,7 @@
 
 以下顺序由 [src/routing/inbound.ts](../src/routing/inbound.ts) 的 `establishSession` 实现；**任何附件字节都不在会话建立前下载**：
 
-1. 去重（`processed` 表 + 进程内守卫）与频道准入（管理员 / 群白名单 / 用户白名单）通过；未通过者不建会话、不落附件、不调模型。
+1. 去重（`processed` 表 + 进程内守卫）与频道准入（管理员 / 用户表的对话准入）通过；未通过者不建会话、不落附件、不调模型。
 2. 对触发消息加 `Typing` 表情（异步，不阻塞）。
 3. 发出卡片第一帧并以 `reply_in_thread` 创建话题（飞书拒绝时按 `threadFallback: degrade` 退化为会话级路由）。
 4. 确保用户工作区（`<baseDir>/p2p/<open_id>/` 或 `<baseDir>/groups/<chat_id>/<open_id>/`），规划话题目录（子目录或 Git worktree）。

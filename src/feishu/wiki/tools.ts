@@ -5,8 +5,10 @@
  *
  * Every call acts with the app identity and is gated, in order, by:
  * - the switch and a non-empty `wikiRoots` (otherwise nothing is mounted);
- * - the topic owner being the administrator or on the wiki whitelist
- *   (`/auth wiki add`), checked per call so revocation applies at once;
+ * - the topic owner being the administrator or holding the knowledge-base
+ *   read switch (list/read tools) or write switch (create/edit tools)
+ *   (`/auth set wiki-read|wiki-write`), checked per call so revocation
+ *   applies at once;
  * - `wikiRoots` containment of the node (see `scope.ts`);
  * - docx only for reading and editing;
  * - edits only on documents the app owns (wiki node `owner` equals the bot
@@ -239,6 +241,12 @@ const CREATE_TYPE_LABELS: Readonly<Record<'docx' | 'sheet' | 'bitable', string>>
 /** The spreadsheet and Base tool families, mounted with the docx tools under the same switches. */
 const FAMILY_SPECS: readonly WikiToolSpec[] = [...SHEET_TOOL_SPECS, ...BASE_TOOL_SPECS]
 
+/** Which permission switch a wiki tool needs: create/edit tools write, the rest read. */
+function toolAccess(tool: string): 'read' | 'write' {
+  if (tool === WIKI_CREATE_TOOL_NAME || tool === WIKI_EDIT_TOOL_NAME) return 'write'
+  return FAMILY_SPECS.find(spec => spec.name === tool)?.access ?? 'read'
+}
+
 export interface WikiToolRuntimeDeps {
   /** Live plugin configuration (switches, roots). */
   config(): FeishuConfig
@@ -246,8 +254,8 @@ export interface WikiToolRuntimeDeps {
   channel(): FeishuChannel | undefined
   /** Consent placement of one session (its topic and owner), re-read per call. */
   routeOfSession(sessionId: string): InteractionRoute | undefined
-  /** Whether a user is the administrator or on the wiki whitelist. */
-  mayUseWiki(userId: string): boolean
+  /** Whether a user (the topic owner) may use the read or the write tool family. */
+  mayUseWiki(userId: string, access: 'read' | 'write'): boolean
   /** Topic-owner consent cards. */
   consent: WikiConsent
   /** Structured warning sink. */
@@ -404,7 +412,7 @@ export class WikiToolRuntime implements WikiToolKit {
     if (!this.enabledTools().includes(tool)) return failure('TOOL_DISABLED')
     const route = this.deps.routeOfSession(sessionId)
     if (route === undefined) return failure('ROUTE_NOT_FOUND')
-    if (!this.deps.mayUseWiki(route.senderUserId)) return failure('NOT_AUTHORIZED')
+    if (!this.deps.mayUseWiki(route.senderUserId, toolAccess(tool))) return failure('NOT_AUTHORIZED')
     const channel = this.deps.channel()
     const api = channel?.wiki
     if (channel === undefined || api === undefined) return failure('CHANNEL_UNAVAILABLE')

@@ -203,6 +203,15 @@ export const inflightSnapshotSchema = z.object({
    * recovery replays it when the Session log shows the turn never claimed it.
    */
   message: inflightMessageSchema.optional(),
+  /**
+   * Feishu user_id the turn of `message` acts for: the sender of an inbound
+   * message, the requester of a launched topic, the operator of a continue
+   * button, or the Session's driver when a host turn started. Restart
+   * recovery hands it to the code-write gate with the replayed prompt. Absent
+   * in snapshots written before it was recorded, and for a host turn whose
+   * driver was unknown.
+   */
+  senderUserId: z.string().min(1).optional(),
   /** How often restart recovery already replayed `message` (cap: 1). */
   replays: z.number().int().nonnegative().optional(),
   /** Reaction id of the Typing reaction (absent when the add failed). */
@@ -218,32 +227,25 @@ export const inflightSnapshotSchema = z.object({
 export type InflightSnapshot = z.infer<typeof inflightSnapshotSchema>
 
 /**
- * Access-control grants (v1 format, added without a domain version bump —
- * see the notes on `feishuDomain` below).
- *
- * One record per authorized group: the group gate is the first of the two
- * independent admission gates. Inside an authorized group only the
- * administrator and explicitly authorized users may start conversations.
+ * Retired group grant written by versions that had a group whitelist. The
+ * `access_groups` table stays declared only so the JSON backend keeps the
+ * stored records; nothing reads it.
  */
-export const accessGroupRecordSchema = z.object({
-  /** Feishu chat id (`oc_...`) — also the table key. */
+export const retiredAccessGroupRecordSchema = z.object({
   chatId: z.string().min(1),
-  /** Human-readable group name captured at authorization time (optional). */
   name: z.string().optional(),
-  /** Which authorization entry produced this grant. */
   source: z.enum(['command', 'card', 'panel']),
-  /** Administrator user_id that authorized it. */
   addedBy: z.string().min(1),
-  /** Epoch ms when it was authorized. */
   addedAt: z.number().int().nonnegative(),
 })
 
-export type AccessGroupRecord = z.infer<typeof accessGroupRecordSchema>
-
 /**
- * One authorized user (`user_id`), global across every authorized group.
- * Private chats are administrator-only unless `dmAllowWhitelist` is on, so
- * by default this grant only affects group conversations.
+ * One user (`user_id`) of the access table (v1 format, added without a domain
+ * version bump — see the notes on `feishuDomain` below). Each user carries
+ * four independent permission switches; `chat` gates everything, so a user
+ * with `chat` off is suspended and the other switches have no effect.
+ * Records written before the switches existed parse as a conversation grant
+ * only.
  */
 export const accessUserRecordSchema = z.object({
   /** Feishu `user_id` — also the table key. */
@@ -256,7 +258,21 @@ export const accessUserRecordSchema = z.object({
   addedBy: z.string().min(1),
   /** Epoch ms when it was authorized. */
   addedAt: z.number().int().nonnegative(),
+  /** May talk to the bot in a private chat and in any group. */
+  chat: z.boolean().default(true),
+  /** Topics the user drives may use the knowledge-base read tools. */
+  wikiRead: z.boolean().default(false),
+  /** Topics the user drives may use the knowledge-base create/edit tools. */
+  wikiWrite: z.boolean().default(false),
+  /** Turns the user drives may call the configured code-write tools. */
+  codeWrite: z.boolean().default(false),
 })
+
+/** The four permission switches of one access-table user. */
+export type AccessPermission = 'chat' | 'wikiRead' | 'wikiWrite' | 'codeWrite'
+
+/** Every permission switch, in display order. */
+export const ACCESS_PERMISSIONS: readonly AccessPermission[] = ['chat', 'wikiRead', 'wikiWrite', 'codeWrite']
 
 export type AccessUserRecord = z.infer<typeof accessUserRecordSchema>
 
@@ -269,13 +285,17 @@ export type AccessUserRecord = z.infer<typeof accessUserRecordSchema>
 export const accessRequestRecordSchema = z.object({
   /** Opaque token carried by the card buttons — also the table key. */
   token: z.string().min(1),
-  /** What is being requested. */
+  /**
+   * What is being requested. Only `user` requests are created; `group` only
+   * appears in records written by versions that had a group whitelist, and
+   * the access store skips those records.
+   */
   kind: z.enum(['group', 'user']),
-  /** `chat_id` for a group request; `user_id` for a user request. */
+  /** `user_id` the request asks to whitelist. */
   targetId: z.string().min(1),
   /** Chat the request originated from, when applicable. */
   chatId: z.string().optional(),
-  /** Group name captured for the card (group requests, or the group the user was seen in). */
+  /** Name of the group the request came from, when known. */
   groupName: z.string().optional(),
   /** User who triggered a user request. */
   requesterUserId: z.string().optional(),
@@ -458,7 +478,7 @@ export interface FeishuDomainSpecShape {
       __key?: string
     }
     access_groups: {
-      valueSchema: typeof accessGroupRecordSchema
+      valueSchema: typeof retiredAccessGroupRecordSchema
       __key?: string
     }
     access_users: {
@@ -491,6 +511,8 @@ export const feishuDomainGlobalSchema = z.object({
   chevronImgKey: z.string().optional(),
   /** p2p chats already shown the one-time onboarding card (bounded list). */
   welcomedChats: z.array(z.string()).optional(),
+  /** Groups the bot was added to (bounded list), read by missed-message catch-up. */
+  knownGroups: z.array(z.string()).optional(),
   /** Epoch ms the long connection was last known up (missed-message catch-up). */
   lastAliveAt: z.number().int().nonnegative().optional(),
 })
@@ -516,12 +538,12 @@ export const feishuDomain: FeishuDomainSpecShape = {
     inflight: { valueSchema: inflightSnapshotSchema },
     processed: { valueSchema: processedRecordSchema },
     expired_routes: { valueSchema: expiredRouteRecordSchema },
-    access_groups: { valueSchema: accessGroupRecordSchema },
+    // Retired group whitelist: declared so the stored records survive, never read.
+    access_groups: { valueSchema: retiredAccessGroupRecordSchema },
     access_users: { valueSchema: accessUserRecordSchema },
     access_requests: { valueSchema: accessRequestRecordSchema },
-    // Wiki whitelist (`/auth wiki add`): same record as `access_users`, an
-    // independent grant. Added without a version bump like the other access
-    // tables: a missing table loads empty.
+    // Retired wiki whitelist (knowledge-base access now lives on `access_users`):
+    // declared so the stored records survive, never read.
     access_wiki_users: { valueSchema: accessUserRecordSchema },
     // `feishuTopics` launch records (historical name); a missing table loads empty.
     analyze_requests: { valueSchema: topicLaunchRecordSchema },
@@ -569,15 +591,7 @@ export interface ExpiredRoutesTable {
   entries(): IterableIterator<[string, ExpiredRouteRecord]>
 }
 
-/** Normalized table handle for authorized groups (key = `chat_id`). */
-export interface AccessGroupsTable {
-  get(key: string): AccessGroupRecord | undefined
-  put(key: string, value: AccessGroupRecord): Promise<unknown> | void
-  delete(key: string): Promise<unknown> | void
-  entries(): IterableIterator<[string, AccessGroupRecord]>
-}
-
-/** Normalized table handle for authorized users (key = `user_id`). */
+/** Normalized table handle for the access-table users (key = `user_id`). */
 export interface AccessUsersTable {
   get(key: string): AccessUserRecord | undefined
   put(key: string, value: AccessUserRecord): Promise<unknown> | void
@@ -613,11 +627,8 @@ export interface FeishuDomainHandle {
   inflight: InflightTable
   processed: ProcessedTable
   expiredRoutes: ExpiredRoutesTable
-  accessGroups: AccessGroupsTable
   accessUsers: AccessUsersTable
   accessRequests: AccessRequestsTable
-  /** Wiki whitelist (key = `user_id`); same records as {@link AccessUsersTable}. */
-  accessWikiUsers: AccessUsersTable
   /** `feishuTopics` launch records. */
   topicLaunches: TopicLaunchesTable
   /** Feishu origin of every Session a route ever named. */

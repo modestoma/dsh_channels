@@ -1,56 +1,38 @@
 /**
- * 「知识库」tab：知识库工具字段（读取 / 编辑开关、可访问范围）+ 知识库
- * 白名单（「可使用的人」）。字段保存走全局 draft，白名单增删是独立即时
- * mutation。
+ * 「知识库」tab：知识库工具字段（读取 / 编辑开关、可访问范围）与谁能用的
+ * 汇总。按人授予读取 / 写入在「访问授权」tab 的用户表里完成。
  *
  * @module dsh-channels/client/panel/wiki-tab
  */
 
 import { fillCopy, PANEL_COPY, TAB_FIELD_GROUPS } from '../../settings/contract.ts'
 import type { ProfileView } from './profiles.ts'
-import { FieldSections, NoticeBar } from './shared.tsx'
+import { EmptyRow, FieldSections, Section } from './shared.tsx'
 import type { FormView } from './shared.tsx'
-import { Whitelist } from './whitelist.tsx'
 
 export interface WikiTabProps {
   form: FormView
   profiles: ProfileView
-  accessNotice: string | null
-  accessError: string | null
-  onAddUser: (userId: string, name: string) => Promise<boolean>
-  onRemoveUser: (userId: string) => void
 }
 
 export function WikiTab(props: WikiTabProps): JSX.Element {
-  const { form, profiles, accessNotice, accessError, onAddUser, onRemoveUser } = props
+  const { form, profiles } = props
   const { access } = form.panel
-  const disabled = form.busy !== null || form.locked || !access.loaded
+  const active = access.users.filter(user => user.chat)
   return (
     <div className="dsh-channels-cfg__tabBody">
-      {accessNotice === null ? null : <NoticeBar kind="ok" text={accessNotice} />}
-      {accessError === null ? null : <NoticeBar kind="error" text={accessError} />}
       {profiles.warning === undefined ? null : <p className="dsh-channels-cfg__secFoot">{fillCopy(PANEL_COPY.profilesWarning, { reason: profiles.warning })}</p>}
       <FieldSections form={form} groups={TAB_FIELD_GROUPS.wiki} />
-      <Whitelist
-        title={PANEL_COPY.wikiUsersTitle}
-        countLabel={fillCopy(PANEL_COPY.wikiUsersAdminPlus, { n: access.wikiUsers.length })}
-        entries={access.wikiUsers.map(user => ({
-          id: user.userId,
-          name: profiles.user(user.userId)?.name ?? user.name,
-          avatarUrl: profiles.user(user.userId)?.avatarUrl,
-          source: user.source,
-        }))}
-        empty={PANEL_COPY.wikiUsersEmpty}
-        loaded={access.loaded}
-        addLabel={PANEL_COPY.accessAddUser}
-        idPlaceholder={PANEL_COPY.accessUserIdPlaceholder}
-        namePlaceholder={PANEL_COPY.accessUserNamePlaceholder}
-        footnote={PANEL_COPY.wikiUsersHint}
-        disabled={disabled}
-        working={form.busy === 'access'}
-        onAdd={onAddUser}
-        onRemove={onRemoveUser}
-      />
+      <Section title={PANEL_COPY.wikiUsersTitle} footnote={PANEL_COPY.wikiUsersHint}>
+        <EmptyRow
+          text={access.loaded
+            ? fillCopy(PANEL_COPY.wikiUsersSummary, {
+                read: active.filter(user => user.wikiRead).length,
+                write: active.filter(user => user.wikiWrite).length,
+              })
+            : PANEL_COPY.accessNotLoaded}
+        />
+      </Section>
     </div>
   )
 }

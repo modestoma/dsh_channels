@@ -7,9 +7,7 @@
 
 import {
   ACCESS_ROUTE,
-  ADD_ACCESS_GROUP_ROUTE,
   ADD_ACCESS_USER_ROUTE,
-  ADD_WIKI_USER_ROUTE,
   CATALOG_ROUTE,
   CLEAR_CONFIG_ROUTE,
   CLEAR_CREDENTIAL_ROUTE,
@@ -19,10 +17,9 @@ import {
   PROFILES_ROUTE,
   RECONNECT_ROUTE,
   TAKEOVER_ROUTE,
-  REMOVE_ACCESS_GROUP_ROUTE,
   REMOVE_ACCESS_USER_ROUTE,
-  REMOVE_WIKI_USER_ROUTE,
   RESOLVE_ACCESS_REQUEST_ROUTE,
+  SET_ACCESS_PERMISSION_ROUTE,
   SAVE_CONFIG_ROUTE,
   SAVE_CREDENTIALS_ROUTE,
   SESSION_ORIGIN_ROUTE,
@@ -34,6 +31,7 @@ import {
 } from '../settings/contract.ts'
 import type {
   AccessMutationResponse,
+  AccessPermissionWire,
   AccessWire,
   CatalogWire,
   ChannelStatusWire,
@@ -335,20 +333,7 @@ async function mutateAccess(path: string, body: unknown): Promise<AccessMutation
   return JSON.parse(text) as AccessMutationResponse
 }
 
-/** Authorize one group; resolves with the refreshed access snapshot. */
-export async function addAccessGroup(chatId: string, name?: string): Promise<AccessMutationResponse> {
-  return mutateAccess(
-    ADD_ACCESS_GROUP_ROUTE,
-    name === undefined || name === '' ? { chatId } : { chatId, name },
-  )
-}
-
-/** Revoke one group authorization (takes effect on the next message). */
-export async function removeAccessGroup(chatId: string): Promise<AccessMutationResponse> {
-  return mutateAccess(REMOVE_ACCESS_GROUP_ROUTE, { chatId })
-}
-
-/** Authorize one user `user_id` (global across authorized groups). */
+/** Add one user `user_id` with only the conversation switch on (or turn it back on). */
 export async function addAccessUser(userId: string, name?: string): Promise<AccessMutationResponse> {
   return mutateAccess(
     ADD_ACCESS_USER_ROUTE,
@@ -356,22 +341,18 @@ export async function addAccessUser(userId: string, name?: string): Promise<Acce
   )
 }
 
-/** Revoke one user authorization (takes effect on the next message). */
+/** Remove one user from the user table (takes effect on the next message). */
 export async function removeAccessUser(userId: string): Promise<AccessMutationResponse> {
   return mutateAccess(REMOVE_ACCESS_USER_ROUTE, { userId })
 }
 
-/** Add one user `user_id` to the wiki whitelist. */
-export async function addWikiUser(userId: string, name?: string): Promise<AccessMutationResponse> {
-  return mutateAccess(
-    ADD_WIKI_USER_ROUTE,
-    name === undefined || name === '' ? { userId } : { userId, name },
-  )
-}
-
-/** Remove one user from the wiki whitelist (takes effect on the next wiki tool call). */
-export async function removeWikiUser(userId: string): Promise<AccessMutationResponse> {
-  return mutateAccess(REMOVE_WIKI_USER_ROUTE, { userId })
+/** Set one permission switch of a user already in the table. */
+export async function setAccessPermission(
+  userId: string,
+  permission: AccessPermissionWire,
+  enabled: boolean,
+): Promise<AccessMutationResponse> {
+  return mutateAccess(SET_ACCESS_PERMISSION_ROUTE, { userId, permission, enabled })
 }
 
 /** Settle one pending authorization request (same resolver as the Feishu card). */

@@ -16,7 +16,7 @@
 2. **会话本体与事件日志**：宿主代持。插件消费的 `assistant/chunk`、`tool/call`、`tool-workflow/run-*`、`subagent/descriptor` 等全部在持久化日志里，因此 `src/stats.ts` 的 token/缓存统计不单独存，`foldAll()` 重放日志，重启后继续累计。`meta.cwd`、`agentPreset` 随 header 落盘。
 3. **工作区与话题目录**：工作区目录确定性生成、幂等 mkdir，宿主 `workspace.json` 持久化 path/title/sessionIds；话题目录路径记录在路由的 `sessionDir`，实际工作目录同时由 Session 的 `working-directory/change` 事件持久化。
 4. **凭据**：密钥存宿主 `$DSH_HOME/.credentials.yaml`，插件只持引用名。
-5. **准入授权**（`src/domain.ts` 域 `channels_routes_v2`，同样保持 `version: 1` 加法新增）：`access_groups` 表以 `chat_id` 保存已授权群（群名/来源/授权人/时间）；`access_users` 表以 `user_id` 保存全局用户白名单；`access_requests` 表以不透明 token 保存入群/用户授权申请（含 `messageId`，重启后旧授权卡仍可点击结算；过期状态在同一表落审计）。管理员 user_id 与准入模式属于配置层（profile + Web 覆盖），不在这三张表里。
+5. **准入授权**（`src/domain.ts` 域 `channels_routes_v2`，同样保持 `version: 1` 加法新增）：`access_users` 表以 `user_id` 保存用户表，每条记录带四个开关 `chat` / `wikiRead` / `wikiWrite` / `codeWrite`（旧记录缺开关时读作只有 `chat`）；`access_requests` 表以不透明 token 保存用户授权申请（含 `messageId`，重启后旧授权卡仍可点击结算；过期状态在同一表落审计；旧的群申请记录保留但加载时跳过）。已退役的 `access_groups`（群白名单）与 `access_wiki_users`（知识库白名单）仍在域里声明，以免 JSON 后端写入时丢掉旧数据，但不再读取。域全局值的 `knownGroups` 记录机器人被拉进过的群（最多 500 个），供断连补偿使用。管理员 user_id 与准入模式属于配置层（profile + Web 覆盖），不在这些表里。
 
 ## 二、内存态（有意不持久化）
 
@@ -63,6 +63,7 @@
   reactionId?: string            // Typing 表情的 reaction id（add 失败时缺省）
   routeKey?: string              // 这一轮所在的路由，恢复时据此找回 Session
   message?: UserMessage          // 交给 followup() 的消息（序列化 ≤ 256 KB，超出不存）
+  senderUserId?: string          // 这一轮代表的飞书用户：入站消息的发送者、发起话题的请求者、点「继续」的人，或宿主回合开始时会话的当前驱动者；重放时交给代码改动闸门（旧快照没有，重放的回合拒绝代码改动工具）
   replays?: number               // 已重放次数（上限 1）
   cards: Array<{ messageId: string; mode: 'card' | 'text' }>  // 段卡列表，[0] = 主卡
   startedAt: number              // 附加时间（TTL 清理用）
@@ -224,14 +225,14 @@
 
 补偿起点：启动时取上一个实例留下的 `lastAliveAt`，断线重连时取内存里记下的断开时刻；再往前留一个心跳间隔应对时钟偏差，最远不超过 `processed` 记录的保留期（24 小时），保证补偿范围内处理过的消息仍能被去重识别。
 
-读取范围：路由里的会话、已授权群、发过引导卡的私聊（`im.v1.message.list`，按会话），以及最近活跃的话题（同一接口按话题读）。列表接口只给 open_id，插件再用 `message.mget` 分别按 open_id 和 user_id 读一次，拼出长连接事件体交给 SDK 的 `normalize`，与实时消息走同一套解析。
+读取范围：路由里的会话、机器人被拉进过的群（`knownGroups`，从本版本起记录）、发过引导卡的私聊（`im.v1.message.list`，按会话），以及最近活跃的话题（同一接口按话题读）。列表接口只给 open_id，插件再用 `message.mget` 分别按 open_id 和 user_id 读一次，拼出长连接事件体交给 SDK 的 `normalize`，与实时消息走同一套解析。
 
 分流：`missed.windowMs` 以内的消息直接进入入站管线（`processed` 去重丢掉已处理的）；更早的消息只保留会触发机器人的（私聊、@ 机器人、已有话题里的回复），按会话发一张待处理卡。卡片按钮值里带着消息 id 和发送者，不额外落库；发送者或管理员点「全部处理」时重新读取这些消息并按顺序处理，点「忽略」时把它们写进 `processed`。
 
 ## 已知取舍
 
 - 心跳写入频率决定崩溃后往回多读多少：读多了由去重兜底，不会重复处理。
-- 补偿只覆盖插件已知的会话；从没和机器人说过话、也不在授权群里的会话读不到。
+- 补偿只覆盖插件已知的会话；从没和机器人说过话、也不在 `knownGroups` 里的群读不到。升级前授权过、但升级后机器人没有重新入群且没有活动路由的群，补偿读不到。
 - 待处理卡在进程内防重复点击；重启后再点由 `processed` 去重保证不会处理两遍。
 
 ## 涉及文件

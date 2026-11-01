@@ -32,20 +32,14 @@ export const RECONNECT_ROUTE = '/api/dsh-channels.reconnect'
 export const TAKEOVER_ROUTE = '/api/dsh-channels.takeover'
 /** 模型/推理档位/预设选择器的宿主目录（provider → model → effort 级联刷新）。 */
 export const CATALOG_ROUTE = '/api/dsh-channels.catalog'
-/** 访问与授权只读快照（GET）：准入模式、管理员、群/用户/知识库白名单、待处理申请。 */
+/** 访问与授权只读快照（GET）：准入模式、管理员、用户表、待处理申请。 */
 export const ACCESS_ROUTE = '/api/dsh-channels.access'
-/** 授权一个群（POST，body `{ chatId, name? }`）。 */
-export const ADD_ACCESS_GROUP_ROUTE = '/api/dsh-channels.addAccessGroup'
-/** 撤销一个群（POST，body `{ chatId }`）。 */
-export const REMOVE_ACCESS_GROUP_ROUTE = '/api/dsh-channels.removeAccessGroup'
-/** 用户白名单添加（POST，body `{ userId, name? }`）。 */
+/** 用户表添加（POST，body `{ userId, name? }`）：新用户只打开对话准入；已在表中的用户重新打开对话准入。 */
 export const ADD_ACCESS_USER_ROUTE = '/api/dsh-channels.addAccessUser'
-/** 用户白名单移除（POST，body `{ userId }`）。 */
+/** 用户表移除（POST，body `{ userId }`）。 */
 export const REMOVE_ACCESS_USER_ROUTE = '/api/dsh-channels.removeAccessUser'
-/** 知识库白名单添加（POST，body `{ userId, name? }`）。 */
-export const ADD_WIKI_USER_ROUTE = '/api/dsh-channels.addWikiUser'
-/** 知识库白名单移除（POST，body `{ userId }`）。 */
-export const REMOVE_WIKI_USER_ROUTE = '/api/dsh-channels.removeWikiUser'
+/** 设置一个权限开关（POST，body `{ userId, permission, enabled }`）。 */
+export const SET_ACCESS_PERMISSION_ROUTE = '/api/dsh-channels.setAccessPermission'
 /** 结算一条待处理授权申请（POST，body `{ token, decision }`）。 */
 export const RESOLVE_ACCESS_REQUEST_ROUTE = '/api/dsh-channels.resolveAccessRequest'
 /**
@@ -269,9 +263,8 @@ export const EDITABLE_KEYS = [
   'feishuTools.attachmentFetchTimeoutMs',
   'feishuTools.topicMessagesTimeoutMs',
   'promptContextTimeoutMs',
-  // 准入与授权（白名单由「访问授权」tab 的列表管理）
+  // 准入与授权（用户表由「访问授权」tab 的列表管理）
   'accessMode',
-  'dmAllowWhitelist',
   'adminUserId',
   'authRequestTtlDays',
   // 知识库（顶层 `wikiRoots` 字符串列表；为空时不挂载任何知识库工具）
@@ -569,18 +562,10 @@ export interface PanelConfigWire {
   }
 }
 
-/** One authorized group (the first of the two admission gates). */
-export interface AccessGroupWire {
-  chatId: string
-  /** Human-readable group name captured at authorization time. */
-  name?: string
-  /** Which authorization entry produced the grant. */
-  source: 'command' | 'card' | 'panel'
-  /** Epoch ms when it was authorized. */
-  addedAt: number
-}
+/** Permission switches of one access-table user (same names as the stored record). */
+export type AccessPermissionWire = 'chat' | 'wikiRead' | 'wikiWrite' | 'codeWrite'
 
-/** One authorized user `user_id` (global across every authorized group). */
+/** One access-table user `user_id` with its permission switches. */
 export interface AccessUserWire {
   userId: string
   /** Display name captured at authorization time. */
@@ -589,23 +574,25 @@ export interface AccessUserWire {
   source: 'command' | 'card' | 'panel'
   /** Epoch ms when it was authorized. */
   addedAt: number
+  /** May talk to the bot; off suspends the user and every other switch. */
+  chat: boolean
+  wikiRead: boolean
+  wikiWrite: boolean
+  codeWrite: boolean
 }
 
 /** One pending authorization request the panel may settle (same path as the DM card). */
 export interface AccessRequestWire {
   /** Opaque token; never derived from the target id. */
   token: string
-  kind: 'group' | 'user'
-  /** `chat_id` for a group request, `user_id` for a user request. */
+  /** `user_id` the request asks to add. */
   targetId: string
-  /** Display name of the requested target (group name / user name), when known. */
+  /** Display name of that user, when known. */
   name?: string
-  /** Chat the request originated from, when applicable. */
+  /** Group the request came from, when applicable. */
   chatId?: string
-  /** Group name captured for the card. */
+  /** Name of that group, when known. */
   groupName?: string
-  /** Open_id of the user who triggered a user request. */
-  requester?: string
   /** Epoch ms when the request was created. */
   createdAt: number
   /** Epoch ms after which the request can no longer be decided. */
@@ -614,8 +601,7 @@ export interface AccessRequestWire {
 
 /**
  * `GET /api/dsh-channels.access` payload: admission mode, the administrator
- * reference, the group, user, and wiki whitelists, and the still-pending
- * authorization requests.
+ * reference, the user table, and the still-pending authorization requests.
  */
 export interface AccessWire {
   mode: 'open' | 'guarded'
@@ -630,15 +616,12 @@ export interface AccessWire {
     ownerLookupError?: string
   }
   /**
-   * Whether the persisted whitelists were loaded. While the channel holds no
+   * Whether the persisted user table was loaded. While the channel holds no
    * connection the plugin storage domain is closed, so the lists are unknown
    * (not empty) and the panel must not offer mutations.
    */
   loaded: boolean
-  groups: AccessGroupWire[]
   users: AccessUserWire[]
-  /** Wiki whitelist (`/auth wiki add`): topic owners allowed to use the wiki tools. */
-  wikiUsers: AccessUserWire[]
   requests: AccessRequestWire[]
 }
 
@@ -932,15 +915,11 @@ export const PANEL_COPY = {
   profilesWarning: '部分飞书名字和头像未能读取：{reason}',
   accessNotLoaded: '飞书连接建立后加载授权列表',
   accessRequestsTitle: '待处理申请',
-  accessGroupsTitle: '已授权群',
-  accessUsersTitle: '已授权用户',
-  accessGroupsEmpty: '还没有授权任何群',
-  accessUsersEmpty: '还没有授权任何用户',
-  accessGroupChatIdPlaceholder: 'chat_id（oc_…，群里发 /groupid 获取）',
-  accessGroupNamePlaceholder: '群名（可选）',
+  accessUsersTitle: '用户表',
+  accessUsersEmpty: '还没有添加任何用户；管理员始终拥有全部权限',
+  accessUsersHint: '关掉「对话」即停用该用户，其余开关随之不生效。也可以在飞书发 /auth add @用户、/auth set code on @用户。',
   accessUserIdPlaceholder: 'user_id（私聊机器人发 /userid 获取）',
   accessUserNamePlaceholder: '昵称（可选）',
-  accessAddGroup: '添加群',
   accessAddUser: '添加用户',
   accessAdd: '添加',
   accessRemove: '移除',
@@ -950,23 +929,22 @@ export const PANEL_COPY = {
   accessSourceCommand: '对话命令',
   accessSourceCard: '授权卡',
   accessSourcePanel: '设置面板',
-  accessRequestGroup: '申请授权群',
   accessRequestUser: '申请使用',
   accessRequestIn: '在「{group}」',
   accessRequestExpires: '{date} 前有效',
-  accessGroupAdded: '已添加群授权',
-  accessGroupRemoved: '已移除群授权',
-  accessUserAdded: '已添加用户授权',
-  accessUserRemoved: '已移除用户授权',
+  accessUserAdded: '已添加用户，已打开对话',
+  accessUserRemoved: '已移除用户',
+  accessPermissionChanged: '已更新权限',
   accessRequestAllowed: '已授权',
   accessRequestDenied: '已忽略',
+  accessPermChat: '对话',
+  accessPermWikiRead: '读知识库',
+  accessPermWikiWrite: '写知识库',
+  accessPermCodeWrite: '改代码',
   // ---- wiki ---------------------------------------------------------------
   wikiUsersTitle: '可使用的人',
-  wikiUsersAdminPlus: '管理员 + {n}',
-  wikiUsersEmpty: '目前只有管理员发起的话题能用知识库工具',
-  wikiUsersHint: '也可以在飞书发 /auth wiki add @用户',
-  wikiUserAdded: '已加入知识库白名单',
-  wikiUserRemoved: '已移出知识库白名单',
+  wikiUsersSummary: '读取 {read} 人 · 写入 {write} 人，管理员始终可用',
+  wikiUsersHint: '在「访问授权」的用户表里按人打开「读知识库」「写知识库」。',
 } as const
 
 /**

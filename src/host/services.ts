@@ -8,7 +8,7 @@
 
 import type { AgentRegistry } from './agent.ts'
 import type { CommandRuntime } from './commands.ts'
-import type { AssistantStreamPayload, InboxClaimedPayload, Session, SessionEvent, SessionId } from './core.ts'
+import type { AssistantStreamPayload, CommitTrailersEvent, InboxClaimedPayload, PreToolDecision, PreToolExecution, Session, SessionEvent, SessionId } from './core.ts'
 import type { ApprovalAnswererListener, UserQuestionAnswererListener } from './interaction.ts'
 
 // ---- Workspace surface --------------------------------------------------
@@ -325,5 +325,20 @@ export interface HostContext {
     listener: ApprovalAnswererListener,
     options?: { prepend?: boolean },
   ): () => boolean
+  /**
+   * The host's pre-dispatch tool policy waterfall. Untagged plugin contexts
+   * receive every agent's calls; a listener returns a decision or delegates
+   * with `next()`.
+   */
+  on(
+    name: 'tools/pre-execute',
+    listener: (exec: PreToolExecution, next: () => Promise<PreToolDecision>) => Promise<PreToolDecision>,
+  ): () => boolean
+  /**
+   * dsh-repo's `repo/commit-trailers` event, dispatched with `ctx.parallel`
+   * before `repo_workspace_push` commits for a Session. Never fires without
+   * dsh-repo.
+   */
+  on(name: 'repo/commit-trailers', listener: (event: CommitTrailersEvent) => void | Promise<void>): () => boolean
   effect(callback: () => (() => void | Promise<void>) | void, label?: string): void
 }

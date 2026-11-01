@@ -116,6 +116,41 @@ export interface InboxClaimedPayload {
   readonly turn: number
 }
 
+/**
+ * The pending tool call a `tools/pre-execute` listener sees (subset of DSH
+ * `ToolExecution`, `packages/core/tools/src/contracts.ts`).
+ */
+export interface PreToolExecution {
+  readonly name: string
+  /** The agent the call runs for; absent for calls outside an agent loop. */
+  readonly agent?: Agent
+}
+
+/**
+ * Decision of a `tools/pre-execute` listener (subset of DSH
+ * `PreToolDecision`): `deny` turns the call into an error result whose text
+ * is `reason`.
+ */
+export type PreToolDecision =
+  | { readonly kind: 'allow' }
+  | { readonly kind: 'deny'; readonly reason: string }
+  | { readonly kind: 'cancel' }
+  | { readonly kind: 'ask'; readonly reason?: string }
+
+/**
+ * Payload of dsh-repo's `repo/commit-trailers` event, declared locally so
+ * this plugin needs no dsh-repo package. `add` takes a trailer token and a
+ * one-line value of at most 200 characters without control characters; it
+ * must be called before the listener settles.
+ */
+export interface CommitTrailersEvent {
+  /** Session id of the Agent pushing the workspace. */
+  readonly session: string
+  /** Workspace directory being pushed. */
+  readonly dir: string
+  add(token: string, value: string): void
+}
+
 // ---- Session surface ----------------------------------------------------
 
 export interface SessionHeader {

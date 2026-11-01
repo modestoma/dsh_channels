@@ -1,9 +1,59 @@
 # dsh-channels 准入与授权（Access Control）设计
 
-> 状态：已实现（P1 + 入群群信息卡/用户授权卡；P3 增强项仍待做）。
+> 状态：已实现。2026-11 起准入改为**扁平用户表 + 四个权限开关**（见 §A），取代下文 §0 起描述的「群白名单 + 用户白名单 + 知识库白名单」三份名单和 `dmAllowWhitelist`。§0 之后保留为原始设计记录，其中的群授权、`/auth allow|revoke`、`/auth user …`、`/auth wiki …`、群信息卡上的授权按钮均已删除。
 >
 > 用户标识已从 open_id 改为 `user_id`：下文的 open_id / `ou_...` / `adminOpenId` 现在分别对应 `user_id` / `adminUserId`，存储域改为 `channels_routes_v2`，旧数据不迁移（见 README「飞书侧准备」的 `contact:user.employee_id:readonly` 权限）。
-> 目标：唯一管理员（Web 面板配置 open_id）**不受白名单限制**，在任意私聊/群聊（含未授权群）都能直接发起会话；**非管理员**需要「群已授权 + 用户在白名单」两层同时命中。机器人可以被拉进任意群，但非管理员未授权时不做任何回复、不产生任何会话。
+
+## A. 当前模型：用户表与权限开关
+
+### A.1 规则
+
+- **管理员**（`adminUserId`，留空时为应用所有者）不进用户表，始终拥有全部权限。
+- **用户表**（`access_users`）每人一条记录，四个独立开关：
+
+| 开关 | `/auth set` 名称 | 面板标签 | 作用 | 新用户默认 |
+|---|---|---|---|---|
+| `chat` | `chat` | 对话 | 可以私聊，也可以在任何群里 @ 机器人；关闭等于停用，其他开关一并失效 | 开 |
+| `wikiRead` | `wiki-read` | 读知识库 | 该用户发起的话题可以用知识库读取类工具 | 关 |
+| `wikiWrite` | `wiki-write` | 写知识库 | 该用户发起的话题可以用知识库新建、修改类工具（不依赖 `wikiRead`） | 关 |
+| `codeWrite` | `code` | 改代码 | 该用户发的消息驱动的回合可以调用 `codeWriteTools` | 关 |
+
+- 开关之间没有隐含关系，只有 `chat` 关闭会让其他开关失效（记录和开关值保留）。
+- 准入只看发送者：私聊和群聊同一规则，没有群白名单。对话准入打开的人自己把机器人拉进的群里也能直接用。
+- `accessMode: open` 只放开对话准入；知识库和代码改动开关仍然按用户表判断（不在表里的人没有这两类权限）。
+- 实现：纯策略 `src/access/policy.ts`（`AccessSnapshot.users` 是 `chat` 打开的 user_id 集合），持久化 `src/access/store.ts`（`allows(userId, permission)` = 记录存在且 `chat` 打开且该开关打开），入口 `AccessController.mayUse(userId, permission)` = 管理员或 `store.allows`。
+
+### A.2 授权入口
+
+| 入口 | 操作 |
+|---|---|
+| 飞书 `/auth`（仅管理员） | `status`、`list`、`add <@用户\|user_id>`（加入并打开 `chat`；已在表里只重新打开 `chat`）、`remove …`、`set <chat\|wiki-read\|wiki-write\|code> <on\|off> …`（人必须已在表里） |
+| 用户授权申请卡 | 不在表里的人在群里 @ 机器人，或把机器人拉进群时发给管理员；「授权用户」= 加入并只打开 `chat`。同一人有未处理申请或刚被忽略时不重复发 |
+| Web 面板「访问授权」 | 添加、移除、逐个切换四个开关（`POST /api/dsh-channels.setAccessPermission`） |
+
+被拉进群时，邀请人是管理员或对话准入打开的用户，管理员只收到一张没有按钮的群信息卡。
+
+### A.3 代码改动闸门（`src/access/code-write.ts`）
+
+- 插件在宿主 `tools/pre-execute` 瀑布注册监听；工具名在 `codeWriteTools` 里、且调用方 Session 属于飞书路由时检查，否则直接交给下一个监听。
+- **归属**：Session 本身有路由，或沿 `parentSession` 追溯到有路由的 Session（子代理、嵌套子代理）。每次调用都记下 Session 到路由根的对应关系。
+- **发言人**：`agent/inbox/claimed` 认领的那条用户消息的飞书发送者。入站管线把每条交给 Agent 的消息 id 和发送者记下（共享话题里的追问、恢复按钮的点击人也记），认领时设为该 Session 的发言人。没有飞书消息开启的回合（子代理结果、后台任务、定时任务）沿用上一位；从未认领过时按路由所有者。重启后重放的未认领消息带着随在途快照保存的发送者（`inflight.senderUserId`）；快照里没有发送者时（升级前写入），那一轮的受控工具一律拒绝。
+- 发言人不是管理员、也没有打开 `codeWrite` 时返回 `deny`，原因写明用户和开通方式，模型据此转告用户。检查在工具自身审批之前，所以 dsh-repo 的 `tools.writes` 设为 `allow` 时也生效。
+- 只拦列出的工具，不拦本地文件编辑与 shell。状态只在内存里，关闭时清空。
+- 同一个发言人也写进提交：插件监听 dsh-repo 的 `repo/commit-trailers` 事件（事件类型在本插件 `src/host/core.ts` 里自行声明，不依赖 dsh-repo 的包），对飞书会话及其已见过的子代理追加 `Feishu-User: 名字 <user_id>`。名字取通讯录，其次用户表，去掉 `<` `>`、空白和控制字符合并为一个空格、最多 80 个字符；读不到名字时只写 user_id。
+- 默认 `codeWriteTools`：`repo_workspace_push`、`repo_mr_create|update|comment|merge`、`repo_issue_create|update|comment`、`logalyze_improve_skill`、`logalyze_submit_init`。dsh_channels 不依赖这些插件，只按工具名匹配。
+
+### A.4 存储与升级
+
+- `access_users` 记录新增四个布尔字段，旧记录缺省读作只开 `chat`；域版本不变。
+- `access_groups`、`access_wiki_users` 不再读取，但仍声明在域里：JSON 后端写入时会丢掉未声明的表。
+- `access_requests.kind` 的枚举仍保留 `group`，以免加载旧记录时校验失败；加载时跳过群申请。
+- 原知识库白名单不迁移，需要管理员逐个打开 `wikiRead` / `wikiWrite`。原用户白名单里的人升级后可以私聊和在任何群使用。
+- 断连补偿读取的群改为域全局值 `knownGroups`（机器人入群时记录，最多 500 个）。
+
+### A.5 未做
+
+- 共享话题里任何有对话准入的人都能点审批卡；代码改动工具只认发言人的开关，不另外限制谁能点卡。
 
 ## 0. 一句话方案
 

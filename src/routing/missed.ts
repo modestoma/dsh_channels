@@ -9,7 +9,7 @@
  * - after a reconnect, from the moment the connection was lost.
  *
  * Each catch-up lists the user messages since that time in every chat the
- * channel knows (route chats, whitelisted groups, private chats it greeted)
+ * channel knows (route chats, groups the bot joined, private chats it greeted)
  * and in the topics of recently active thread routes. A message newer than the
  * window goes through the normal inbound pipeline, whose `processed` dedup
  * drops anything already handled live. Older messages that would have reached
@@ -45,8 +45,6 @@ export interface MissedMessagesDeps {
   channel(): FeishuChannel | undefined
   /** Active route records. */
   routes(): readonly RouteRecord[]
-  /** Chat ids of the whitelisted groups. */
-  groupChats(): readonly string[]
   /** Hand one message to the inbound pipeline (dedup included). Never rejects. */
   handle(message: NormalizedMessage): Promise<void>
   /** Whether `userId` administers the channel. */
@@ -255,7 +253,7 @@ export class MissedMessages {
         threads.push({ type: 'thread', id: route.key, chatType: route.chatType })
       }
     }
-    for (const chatId of this.deps.groupChats()) if (!chats.has(chatId)) chats.set(chatId, 'group')
+    for (const chatId of this.deps.domain()?.getGlobal().knownGroups ?? []) if (!chats.has(chatId)) chats.set(chatId, 'group')
     for (const chatId of this.deps.domain()?.getGlobal().welcomedChats ?? []) if (!chats.has(chatId)) chats.set(chatId, 'p2p')
     return [...[...chats].map(([id, chatType]): HistoryContainer => ({ type: 'chat', id, chatType })), ...threads]
   }

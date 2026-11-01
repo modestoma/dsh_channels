@@ -57,7 +57,7 @@ function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
     allowPermissionSwitch: false,
     // Tests exercise routing/hitl behavior; access control has its own tests.
     accessMode: 'open',
-    dmAllowWhitelist: false,
+    codeWriteTools: [],
     authRequestTtlDays: 7,
     // Onboarding is opt-in per test: it adds a card that would shift send counts.
     welcomeOnboarding: false,
@@ -2413,7 +2413,7 @@ describe('FeishuService', () => {
   /** Establish one p2p session, then restart with its turn left unfinished. */
   async function restartMidTurn(
     prepareLog: (session: Session, prompt: { id: string }, agent: Agent) => void,
-    options: { live?: boolean; beforeStart?: (channel: ReturnType<typeof makeChannel>) => void } = {},
+    options: { live?: boolean; beforeStart?: (channel: ReturnType<typeof makeChannel>) => void; afterShutdown?: (h: Harness) => void } = {},
   ): Promise<{ h: Harness; channel2: ReturnType<typeof makeChannel>; service2: FeishuService; original: Agent; prompt: { id: string }; trigger: string }> {
     const agentsOptions: FakeAgentsOptions = {}
     const h = await setup(recoveryConfig, {}, undefined, agentsOptions)
@@ -2424,6 +2424,7 @@ describe('FeishuService', () => {
     const prompt = mock(original.followup).mock.calls[0]![0] as { id: string }
     prepareLog(original.session, prompt, original)
     await h.service.shutdown()
+    options.afterShutdown?.(h)
     if (options.live !== true) {
       // A new process: the durable log survives, the inbox does not.
       agentsOptions.resumeSession = original.session
@@ -2456,6 +2457,37 @@ describe('FeishuService', () => {
     await waitUntil(() => expect(inflightEntries(h)).toHaveLength(0))
     expect(channel2.sent).toHaveLength(0)
     await service2.shutdown()
+  })
+
+  it('replays a prompt with its stored Feishu sender as the code-write driver, and denies when none was stored', async () => {
+    const gatedPush = async (h: Harness) => {
+      h.config.codeWriteTools = ['repo_workspace_push']
+      await waitUntil(() => expect(h.ctxState.agents.resumed).toHaveLength(1))
+      const resumed = h.ctxState.agents.resumed[0]!.handle.agent
+      // The fake inbox claims the replayed prompt as soon as it is submitted.
+      await waitUntil(() => expect(mock(resumed.followup)).toHaveBeenCalledTimes(1))
+      return { resumed, claimed: h.ctxState.preExecuteListeners.at(-1)! }
+    }
+    const stored = await restartMidTurn(() => {})
+    expect(inflightEntries(stored.h)).toEqual([['om_1', expect.objectContaining({ senderUserId: 'u_alice' })]])
+    const first = await gatedPush(stored.h)
+    expect(await first.claimed({ name: 'repo_workspace_push', agent: first.resumed }, async () => ({ kind: 'allow' })))
+      .toMatchObject({ kind: 'deny', reason: expect.stringContaining('飞书用户 u_alice 没有代码改动权限') })
+    await stored.service2.shutdown()
+
+    const legacy = await restartMidTurn(() => {}, {
+      afterShutdown: (h) => {
+        const table = h.ctxState.domain.raw.table('inflight')
+        for (const [key, value] of [...(table.entries() as IterableIterator<[string, Record<string, unknown>]>)]) {
+          const { senderUserId: _dropped, ...rest } = value
+          table.put(key, rest)
+        }
+      },
+    })
+    const second = await gatedPush(legacy.h)
+    expect(await second.claimed({ name: 'repo_workspace_push', agent: second.resumed }, async () => ({ kind: 'allow' })))
+      .toMatchObject({ kind: 'deny', reason: expect.stringContaining('无法确认这一轮的飞书发言人') })
+    await legacy.service2.shutdown()
   })
 
   it('renders the final reply of a turn that completed before its card was patched', async () => {
@@ -2498,7 +2530,7 @@ describe('FeishuService', () => {
     await channel2.fireCardAction({ messageId: 'om_1', chatId: 'oc_p2p', operator: { openId: 'ou_a', userId: 'u_alice' }, action: { value, tag: 'button' } })
     await waitUntil(() => expect(mock(resumed.followup)).toHaveBeenCalledTimes(1))
     expect(JSON.stringify(mock(resumed.followup).mock.calls[0]![0])).toContain('从中断处继续')
-    expect(inflightEntries(h)).toEqual([['om_1', expect.objectContaining({ triggerMessageId: 'om_msg_1', routeKey: expect.any(String) })]])
+    expect(inflightEntries(h)).toEqual([['om_1', expect.objectContaining({ triggerMessageId: 'om_msg_1', routeKey: expect.any(String), senderUserId: 'u_alice' })]])
     await waitUntil(() => expect(JSON.stringify(channel2.updated.at(-1))).toContain('turn-stop'))
 
     // A second click does not start another turn.
@@ -2629,7 +2661,8 @@ describe('FeishuService', () => {
     const [key, snapshot] = inflightEntries(h)[0]!
     expect(key).toBe('om_2')
     expect(snapshot).not.toHaveProperty('triggerMessageId')
-    expect(snapshot).toMatchObject({ message: { id: 'msg_job' }, cards: [{ messageId: 'om_2', mode: 'card' }] })
+    // The host turn acts for the Session's current driver.
+    expect(snapshot).toMatchObject({ message: { id: 'msg_job' }, senderUserId: 'u_alice', cards: [{ messageId: 'om_2', mode: 'card' }] })
 
     h.ctxState.sessionListeners[0]!(agent.session, { type: 'turn/end', seq: 2, data: { turn: 2, reason: 'stop' } })
     await waitUntil(() => expect(inflightEntries(h)).toHaveLength(0))
@@ -5369,7 +5402,7 @@ describe('quote excerpts and first-turn topic history', () => {
     await h.service.shutdown()
   })
 
-  it('mounts the wiki tools, gates them on the wiki whitelist, and routes consent clicks', async () => {
+  it('mounts the wiki tools, gates them on the owner\'s wiki-read switch, and routes consent clicks', async () => {
     const node = {
       spaceId: '1', nodeToken: 'wikcnServiceDoc01', objToken: 'doc_1', objType: 'docx' as const,
       nodeType: 'origin' as const, title: '服务测试', hasChild: false,
@@ -5399,11 +5432,18 @@ describe('quote excerpts and first-turn topic history', () => {
     expect(await readTool!.execute({ doc: 'wikcnServiceDoc01' }, { signal: new AbortController().signal }))
       .toMatchObject({ ok: false, code: 'NOT_AUTHORIZED' })
 
-    await h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_admin', senderId: 'u_admin', mentionedBot: false,
-      messageId: 'om_wiki_grant', content: '/auth wiki add u_owner',
+    const admin = (messageId: string, content: string) => h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_admin', senderId: 'u_admin', mentionedBot: false, messageId, content,
     }))
-    await waitUntil(() => expect(JSON.stringify(h.channel.sent)).toContain('加入知识库白名单'))
+    await admin('om_wiki_early', '/auth set wiki-read on u_owner')
+    await waitUntil(() => expect(JSON.stringify(h.channel.sent)).toContain('不在用户表中，请先 /auth add'))
+    await admin('om_wiki_add', '/auth add u_owner')
+    await waitUntil(() => expect(JSON.stringify(h.channel.sent)).toContain('加入用户表并打开对话准入'))
+    // Chat alone grants no knowledge-base access.
+    expect(await readTool!.execute({ doc: 'wikcnServiceDoc01' }, { signal: new AbortController().signal }))
+      .toMatchObject({ ok: false, code: 'NOT_AUTHORIZED' })
+    await admin('om_wiki_grant', '/auth set wiki-read on u_owner')
+    await waitUntil(() => expect(JSON.stringify(h.channel.sent)).toContain('当前：对话准入 · 知识库读取'))
     const before = h.channel.sent.length
     const pending = readTool!.execute({ doc: 'wikcnServiceDoc01' }, { signal: new AbortController().signal })
     await waitUntil(() => expect(h.channel.sent).toHaveLength(before + 1))

@@ -3,7 +3,7 @@
  * `feishuTools.wikiRead`) and `feishu_wiki_sheet_edit` (switch
  * `feishuTools.wikiWrite`).
  *
- * Both run through the same gates as the docx tools (whitelist, `wikiRoots`
+ * Both run through the same gates as the docx tools (permission switch, `wikiRoots`
  * containment, consent cards). Reading shares the docx read grant per Session
  * and document. Editing writes cell values and formulas only (no styles,
  * charts, or row/column structure), only on spreadsheets the app owns, and
