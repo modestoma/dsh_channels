@@ -184,6 +184,19 @@ interface TriggerReaction {
   reactionId: string | undefined
 }
 
+/** The turn an Agent is running and the state that renders it. */
+interface RunningTurn {
+  turn: number
+  /** Undefined while the turn is undecided or renders nowhere. */
+  state: TurnState | undefined
+  /**
+   * Messages claimed for this turn while no queued state owns it yet; the
+   * decision runs once the claiming batch has been emitted. Undefined once
+   * decided.
+   */
+  batch: UserMessage[] | undefined
+}
+
 /** Settled outcome of one turn, as its card shows it. */
 export type TurnOutcome = 'done' | 'stopped' | 'error'
 
@@ -400,11 +413,12 @@ export class TurnStreamer {
   private readonly bySession = new Map<string, TurnState[]>()
   /**
    * sessionId → the turn the Agent is running, and the state that owns it.
-   * Ownership is decided when the turn claims its prompt
-   * (`agent/inbox/claimed`): the queued state carrying that message, or a new
-   * host-turn state, or none (`state` undefined: the turn renders nowhere).
+   * Ownership is decided from the batch the turn claims
+   * (`agent/inbox/claimed`): the queued state carrying one of its messages, or
+   * a new host-turn state, or none (`state` undefined: the turn renders
+   * nowhere).
    */
-  private readonly running = new Map<string, { turn: number; state: TurnState | undefined }>()
+  private readonly running = new Map<string, RunningTurn>()
   /** sessionId → session-log stats fold (session cumulative). */
   private readonly folds = new Map<string, StatsFold>()
   /** sessionId → the Session object for context measurement. */
@@ -525,10 +539,15 @@ export class TurnStreamer {
 
   /**
    * Bind a turn the Agent just started to the state that renders it
-   * (`agent/inbox/claimed`). The first claim of a turn decides: the queued
-   * state whose prompt was claimed owns it; otherwise the turn was not started
-   * by a Feishu message and `hostTurnOrigin` decides whether it gets its own
-   * card. Later claims of the same turn (steered messages) change nothing.
+   * (`agent/inbox/claimed`). The Agent claims a step's whole batch at once and
+   * emits one claim per message, synchronously: pending next-step input (for
+   * example the workspace instructions DSH injects before a Session's first
+   * prompt) comes before the queued turn prompt. So the decision covers the
+   * batch, not its first message: a queued state whose prompt is anywhere in
+   * the batch owns the turn; only when the batch ends without one does the
+   * turn count as not started by a Feishu message, and `hostTurnOrigin`
+   * decides, from the batch's last message (the turn prompt), whether it gets
+   * its own card. Claims of a decided turn (steered messages) change nothing.
    * @param session - the Agent's session.
    * @param message - the claimed message.
    * @param turn - the turn that claimed it.
@@ -536,18 +555,37 @@ export class TurnStreamer {
   onInboxClaimed(session: Session, message: UserMessage, turn: number): void {
     // Subagent children fold into their parent's card.
     if (session.header.origin === 'subagent') return
-    if (this.running.get(session.id)?.turn === turn) return
+    const running = this.running.get(session.id)
+    if (running?.turn === turn && running.batch === undefined) return
     const queue = this.bySession.get(session.id) ?? []
     const owner = queue.find(state => !state.finalized && state.turn === undefined
       && state.message !== undefined && state.message.id === message.id)
     if (owner !== undefined) {
       owner.turn = turn
-      this.running.set(session.id, { turn, state: owner })
+      this.running.set(session.id, { turn, state: owner, batch: undefined })
       this.track(session)
       this.markDirty(session.id, owner)
       return
     }
-    this.running.set(session.id, { turn, state: undefined })
+    if (running?.turn === turn) {
+      running.batch?.push(message)
+      return
+    }
+    const entry: RunningTurn = { turn, state: undefined, batch: [message] }
+    this.running.set(session.id, entry)
+    queueMicrotask(() => this.decideHostTurn(session, entry))
+  }
+
+  /**
+   * Settle a claimed batch no queued state owned: the turn gets its own card
+   * when `hostTurnOrigin` returns an origin line, and renders nowhere
+   * otherwise.
+   */
+  private decideHostTurn(session: Session, entry: RunningTurn): void {
+    const batch = entry.batch
+    if (this.running.get(session.id) !== entry || batch === undefined) return
+    entry.batch = undefined
+    const message = batch[batch.length - 1]!
     const origin = this.hooks.hostTurnOrigin?.(session.id, message)
     if (origin === undefined) return
     this.track(session)
@@ -559,10 +597,11 @@ export class TurnStreamer {
       origin,
       cardMessageId: undefined,
     })
-    state.turn = turn
+    state.turn = entry.turn
+    const queue = this.bySession.get(session.id) ?? []
     queue.push(state)
     this.bySession.set(session.id, queue)
-    this.running.set(session.id, { turn, state })
+    entry.state = state
     this.scheduleHeartbeat(session.id, state)
     this.sendSegment(session.id, state, 0)
   }

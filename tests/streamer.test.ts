@@ -1515,7 +1515,7 @@ describe('TurnStreamer host turns', () => {
     vi.useRealTimers()
   })
 
-  function frame(streamer: DrivenStreamer, session: Session, turn: number, text: string): void {
+  function frame(streamer: TurnStreamer, session: Session, turn: number, text: string): void {
     streamer.onAssistantFrame(session, { type: 'start', attemptId: `a-${turn}`, revision: 1, turn, step: 1 })
     streamer.onAssistantFrame(session, { type: 'chunk', attemptId: `a-${turn}`, revision: 1, index: 0, time: 1, chunk: { type: 'text-delta', index: 0, text } })
   }
@@ -1527,8 +1527,8 @@ describe('TurnStreamer host turns', () => {
     const session = makeSession('sess-host')
 
     streamer.hostTurn(session, prompt('subagent-done', 'subagent-settled'))
-    expect(hooksInstance.hostTurnOrigin).toHaveBeenCalledWith('sess-host', prompt('subagent-done', 'subagent-settled'))
     await vi.advanceTimersByTimeAsync(0)
+    expect(hooksInstance.hostTurnOrigin).toHaveBeenCalledWith('sess-host', prompt('subagent-done', 'subagent-settled'))
     expect(hooksInstance.sendSegmentCard).toHaveBeenCalledTimes(1)
     expect(JSON.stringify(mockFn(hooksInstance.sendSegmentCard).mock.calls[0]![2])).toContain('子代理已结束')
 
@@ -1553,6 +1553,42 @@ describe('TurnStreamer host turns', () => {
     expect(JSON.stringify(ch.updated.filter(update => update.messageId === 'om_user').at(-1))).toContain('用户问题的回答')
     streamer.onSessionEvent(session, { type: 'turn/end', seq: 2, data: { turn: 2, reason: 'stop' } })
     await vi.waitFor(() => expect(ch.addReaction).toHaveBeenCalledWith('om_trigger', 'DONE'))
+  })
+
+  it('binds a turn to the Feishu card whose prompt follows injected next-step input in the same batch', async () => {
+    const ch = channel()
+    const hooksInstance = { ...hooks(), hostTurnOrigin: vi.fn(() => 'origin') }
+    const streamer = new TurnStreamer(ch, 500, hooksInstance)
+    const session = makeSession('sess-batch')
+    const feishu = prompt('m-feishu')
+    streamer.attach(session, 'om_user', 'om_trigger', 'react-typing', { message: feishu })
+
+    // DSH claims the workspace instructions (next-step) before the prompt.
+    streamer.onInboxClaimed(session, prompt('instructions', 'agent-instructions'), 1)
+    streamer.onInboxClaimed(session, feishu, 1)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(hooksInstance.hostTurnOrigin).not.toHaveBeenCalled()
+    expect(hooksInstance.sendSegmentCard).not.toHaveBeenCalled()
+
+    frame(streamer, session, 1, '你好')
+    await vi.advanceTimersByTimeAsync(500)
+    expect(JSON.stringify(ch.updated.filter(update => update.messageId === 'om_user').at(-1))).toContain('你好')
+    streamer.onSessionEvent(session, { type: 'turn/end', seq: 1, data: { turn: 1, reason: 'stop' } })
+    await vi.waitFor(() => expect(ch.addReaction).toHaveBeenCalledWith('om_trigger', 'DONE'))
+  })
+
+  it('takes a host card\'s origin from the batch\'s turn prompt, not injected next-step input', async () => {
+    const ch = channel()
+    const hooksInstance = { ...hooks(), hostTurnOrigin: vi.fn(() => 'origin') }
+    const streamer = new TurnStreamer(ch, 500, hooksInstance)
+    const session = makeSession('sess-batch-host')
+
+    streamer.onInboxClaimed(session, prompt('instructions', 'agent-instructions'), 1)
+    streamer.onInboxClaimed(session, prompt('job-done', 'tool-jobs'), 1)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(hooksInstance.hostTurnOrigin).toHaveBeenCalledTimes(1)
+    expect(hooksInstance.hostTurnOrigin).toHaveBeenCalledWith('sess-batch-host', prompt('job-done', 'tool-jobs'))
+    expect(hooksInstance.sendSegmentCard).toHaveBeenCalledTimes(1)
   })
 
   it('keeps output that arrived while a host card fell back to text', async () => {
