@@ -91,6 +91,13 @@ function effortSelection(args: string | undefined): EffortOverride | undefined |
   return value === 'default' ? null : value
 }
 
+/** The request without its reasoning effort. */
+function withoutEffort<T extends { reasoningEffort?: unknown }>(request: T): T {
+  if (!('reasoningEffort' in request)) return request
+  const { reasoningEffort: _dropped, ...rest } = request
+  return rest as T
+}
+
 /** The effort written into requests for an override over a configured effort. */
 function effectiveEffortOf(override: EffortOverride | undefined, configured: string | undefined): string | undefined {
   if (override === null) return undefined
@@ -110,7 +117,8 @@ function modelSelection(args: string | undefined): ModelOverride | undefined | '
   if (slash === -1) return { model: value }
   const provider = value.slice(0, slash)
   const model = value.slice(slash + 1)
-  if (provider === '' || model === '' || model.includes('/')) return 'invalid'
+  // Only the first slash separates the provider: catalog ids may be namespaced (`vendor/model`).
+  if (provider === '' || model === '') return 'invalid'
   return { provider, model }
 }
 
@@ -215,9 +223,11 @@ export function installRequestPolicy(
     if (payload.agent?.model !== undefined) return request
     const effort = effectiveEffortOf(effortOverride, config.effort)
     const model = modelOverride ?? configuredModel
-    if (effort === undefined && model === undefined) return request
+    // `/effort default` also drops an effort an inner listener composed.
+    const base = effortOverride === null ? withoutEffort(request) : request
+    if (effort === undefined && model === undefined) return base
     return {
-      ...request,
+      ...base,
       ...(effort === undefined ? {} : { reasoningEffort: effort }),
       ...(model === undefined ? {} : { model: model.model }),
       ...(model?.provider === undefined ? {} : { provider: model.provider }),
