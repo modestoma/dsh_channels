@@ -1553,6 +1553,20 @@ export class FeishuService {
     return result
   }
 
+  /**
+   * `名字 <user_id>` for a commit trailer, or the bare user_id when no name is
+   * known. The name comes from the contact profile, else the user table; `<`
+   * and `>` are dropped, whitespace and control characters become one space,
+   * and it is cut to 80 characters.
+   * Lookup failures only lose the name.
+   */
+  private async feishuUserTrailer(userId: string): Promise<string> {
+    const profile = (await this.feishuProfiles([userId], [])).users[userId]
+    const raw = profile?.name ?? this.accessStore.getUser(userId)?.name ?? ''
+    const name = raw.replace(/[<>]/gu, '').replace(/[\s\u0000-\u001f\u007f]+/gu, ' ').trim().slice(0, 80)
+    return name === '' ? userId : `${name} <${userId}>`
+  }
+
   /** Chat-member-list name for a user the contact profile cannot name. */
   private async memberName(userId: string, chatId: string): Promise<string | undefined> {
     const cached = this.profileCache.get(`member:${chatId}:${userId}`)
@@ -1984,6 +1998,10 @@ export class FeishuService {
       this.streamer?.onInboxClaimed(agent.session, message, turn)
     }))
     this.unlistenHost.push(this.ctx.on('tools/pre-execute', async (exec, next) => this.codeWriteGate.decide(exec) ?? await next()))
+    this.unlistenHost.push(this.ctx.on('repo/commit-trailers', async (event) => {
+      const userId = this.codeWriteGate.driverOf(event.session)
+      if (userId !== undefined) event.add('Feishu-User', await this.feishuUserTrailer(userId))
+    }))
     this.unlisten = channel.onMessage(message => {
       void this.dispatchInbound(channel, message)
     })

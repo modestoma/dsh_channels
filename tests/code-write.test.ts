@@ -91,6 +91,17 @@ describe('CodeWriteGate', () => {
     expect(gate.decide(call('s_grandchild', 's_child'))?.kind).toBe('deny')
   })
 
+  it('names the driver of routed Sessions and of descendants it has seen', () => {
+    const { gate } = setup()
+    expect(gate.driverOf('s_root')).toBe('u_owner')
+    expect(gate.driverOf('s_child')).toBeUndefined()
+    gate.decide(call('s_child', 's_root', 'read_file'))
+    gate.noteMessage('m_bob', 'u_bob')
+    gate.onClaimed('s_root', 'm_bob')
+    expect(gate.driverOf('s_child')).toBe('u_bob')
+    expect(gate.driverOf('s_web')).toBeUndefined()
+  })
+
   it('forgets the oldest noted senders beyond its bound', () => {
     const { gate } = setup({ u_bob: ['codeWrite'] })
     gate.noteMessage('m_first', 'u_bob')

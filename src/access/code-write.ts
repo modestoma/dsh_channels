@@ -14,6 +14,9 @@
  * - The check runs in `tools/pre-execute`, before the tool's own approval, so
  *   it holds whatever approval mode the tool's plugin uses.
  *
+ * The same driver names the Feishu user in the `Feishu-User:` trailer of
+ * commits the Session pushes (see {@link CodeWriteGate.driverOf}).
+ *
  * State is in memory only and ends with the process.
  *
  * @module dsh-channels/access/code-write
@@ -81,14 +84,28 @@ export class CodeWriteGate {
     // root: a child spawns its own child through an ungated tool.
     const root = this.rootOf(agent.session.id, agent.session.header.parentSession)
     if (root === undefined || !this.deps.config().codeWriteTools.includes(exec.name)) return undefined
-    const route = this.deps.routeOf(root)
-    if (route === undefined) return undefined
-    const driver = this.drivers.get(root) ?? route.senderUserId
-    if (this.deps.mayUse(driver, 'codeWrite')) return undefined
+    const driver = this.driverOfRoot(root)
+    if (driver === undefined || this.deps.mayUse(driver, 'codeWrite')) return undefined
     return {
       kind: 'deny',
       reason: `飞书用户 ${driver} 没有代码改动权限，不能调用 ${exec.name}。请告诉用户：需要管理员在设置面板「访问授权」里打开该用户的「改代码」，或在飞书发送 /auth set code on @该用户；本地工作区里的修改不受影响。`,
     }
+  }
+
+  /**
+   * The Feishu user driving the current turn of a routed Session or of a
+   * descendant this gate has already seen a call from.
+   * @param sessionId - the Session.
+   * @returns the driver's user_id, or undefined when Feishu does not route the Session.
+   */
+  driverOf(sessionId: string): string | undefined {
+    const root = this.deps.routeOf(sessionId) !== undefined ? sessionId : this.roots.get(sessionId)
+    return root === undefined ? undefined : this.driverOfRoot(root)
+  }
+
+  private driverOfRoot(root: string): string | undefined {
+    const route = this.deps.routeOf(root)
+    return route === undefined ? undefined : this.drivers.get(root) ?? route.senderUserId
   }
 
   /** Drop every remembered sender, driver, and descendant (shutdown). */

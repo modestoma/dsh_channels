@@ -13,7 +13,7 @@ import type { AcquireOptions, InstanceLockProvider, LockHolderInfo } from '../sr
 import { FeishuService } from '../src/service.ts'
 import type {
   Agent, AgentContext, AgentHandle, AgentOptions, AgentRegistry, AgentRequestConfig, AgentRequestListener, ApprovalAnswererListener,
-  AssistantStreamPayload, AttachmentStore, InboxClaimedPayload, CommandDefinition, CommandInvocation, CommandRuntime, EncodedImageAttachment,
+  AssistantStreamPayload, AttachmentStore, CommitTrailersEvent, InboxClaimedPayload, CommandDefinition, CommandInvocation, CommandRuntime, EncodedImageAttachment,
   FileAttachmentRef, HostContext, ImageAttachmentLimits, ImageAttachmentRef, ImageMediaType, PermissionPresets, PreToolDecision,
   PreToolExecution, PromptSection,
   Session, SessionEvent, SessionId, SessionProjections, StorageDomainFacility, ToolDefinition, ToolRuntime,
@@ -711,6 +711,8 @@ export function makeHostContext(
   questionListeners: Array<{ listener: UserQuestionAnswererListener; options: { prepend?: boolean } | undefined }>
   /** Every `tools/pre-execute` listener the service registered. */
   preExecuteListeners: PreExecuteListener[]
+  /** Every `repo/commit-trailers` listener the service registered. */
+  commitTrailerListeners: Array<(event: CommitTrailersEvent) => void | Promise<void>>
   permissions: PermissionPresets & { set: ReturnType<typeof vi.fn>; preset: string }
   sessionQuery: { readTitleSnapshots: ReturnType<typeof vi.fn> }
 } {
@@ -731,6 +733,7 @@ export function makeHostContext(
   const approvalListeners: Array<{ listener: ApprovalAnswererListener; options: { prepend?: boolean } | undefined }> = []
   const questionListeners: Array<{ listener: UserQuestionAnswererListener; options: { prepend?: boolean } | undefined }> = []
   const preExecuteListeners: PreExecuteListener[] = []
+  const commitTrailerListeners: Array<(event: CommitTrailersEvent) => void | Promise<void>> = []
   const tokenMeter = { measure: () => ({ totalTokens: 1234 }) }
   const permissions = {
     preset: 'standard',
@@ -830,6 +833,8 @@ export function makeHostContext(
         })
       } else if (name === 'tools/pre-execute') {
         preExecuteListeners.push(listener as PreExecuteListener)
+      } else if (name === 'repo/commit-trailers') {
+        commitTrailerListeners.push(listener as (event: CommitTrailersEvent) => void | Promise<void>)
       } else if (name === 'user-questions/request') {
         questionListeners.push({
           listener: listener as UserQuestionAnswererListener,
@@ -842,7 +847,7 @@ export function makeHostContext(
   }
   return {
     ctx, agents, workspaces, domain, credentials, sessionListeners, driver,
-    assistantStreamListeners, approvalListeners, questionListeners, preExecuteListeners, permissions, sessionQuery,
+    assistantStreamListeners, approvalListeners, questionListeners, preExecuteListeners, commitTrailerListeners, permissions, sessionQuery,
     workingDirectory, worktrees,
   }
 }

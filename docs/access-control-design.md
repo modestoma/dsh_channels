@@ -40,6 +40,7 @@
 - **发言人**：`agent/inbox/claimed` 认领的那条用户消息的飞书发送者。入站管线把每条交给 Agent 的消息 id 和发送者记下（共享话题里的追问、恢复按钮的点击人也记），认领时设为该 Session 的发言人。没有飞书消息开启的回合（子代理结果、后台任务、定时任务）沿用上一位；从未认领过时按路由所有者。
 - 发言人不是管理员、也没有打开 `codeWrite` 时返回 `deny`，原因写明用户和开通方式，模型据此转告用户。检查在工具自身审批之前，所以 dsh-repo 的 `tools.writes` 设为 `allow` 时也生效。
 - 只拦列出的工具，不拦本地文件编辑与 shell。状态只在内存里，关闭时清空。
+- 同一个发言人也写进提交：插件监听 dsh-repo 的 `repo/commit-trailers` 事件（事件类型在本插件 `src/host/core.ts` 里自行声明，不依赖 dsh-repo 的包），对飞书会话及其已见过的子代理追加 `Feishu-User: 名字 <user_id>`。名字取通讯录，其次用户表，去掉 `<` `>`、空白和控制字符合并为一个空格、最多 80 个字符；读不到名字时只写 user_id。
 - 默认 `codeWriteTools`：`repo_workspace_push`、`repo_mr_create|update|comment|merge`、`repo_issue_create|update|comment`、`logalyze_improve_skill`、`logalyze_submit_init`。dsh_channels 不依赖这些插件，只按工具名匹配。
 
 ### A.4 存储与升级

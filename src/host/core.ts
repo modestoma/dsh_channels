@@ -137,6 +137,20 @@ export type PreToolDecision =
   | { readonly kind: 'cancel' }
   | { readonly kind: 'ask'; readonly reason?: string }
 
+/**
+ * Payload of dsh-repo's `repo/commit-trailers` event, declared locally so
+ * this plugin needs no dsh-repo package. `add` takes a trailer token and a
+ * one-line value of at most 200 characters without control characters; it
+ * must be called before the listener settles.
+ */
+export interface CommitTrailersEvent {
+  /** Session id of the Agent pushing the workspace. */
+  readonly session: string
+  /** Workspace directory being pushed. */
+  readonly dir: string
+  add(token: string, value: string): void
+}
+
 // ---- Session surface ----------------------------------------------------
 
 export interface SessionHeader {

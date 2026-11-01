@@ -711,6 +711,36 @@ describe('guarded 模式：代码改动开关', () => {
     expect(await listener!({ name: 'repo_mr_create', agent }, next)).toMatchObject({ kind: 'deny' })
     await h.service.shutdown()
   })
+
+  it('推送的提交带上当前发言人的 Feishu-User 尾注；名字取通讯录，读不到时取用户表；非飞书会话不加', async () => {
+    const userProfiles = vi.fn(async (ids: readonly string[]) => new Map(ids.map(id => [id, id === 'u_alice' ? { name: 'Alice <A>\n李' } : {}])))
+    const h = await setup({}, { userProfiles })
+    await h.service.addAccessUser('u_alice')
+    await h.service.addAccessUser('u_bob', 'Bob')
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_group', senderId: 'u_alice',
+      mentionedBot: true, messageId: 'om_alice_push', content: '改完推上去',
+    }))
+    await waitUntil(() => expect(followupsOf(h, 0)).toBe(1))
+    const [, route] = await waitForRoute(h, 'u_alice')
+    const [listener] = h.ctxState.commitTrailerListeners
+    const trailersFor = async (session: string) => {
+      const added: Array<[string, string]> = []
+      await listener!({ session, dir: '/ws', add: (token, value) => { added.push([token, value]) } })
+      return added
+    }
+
+    expect(await trailersFor(route.sessionId)).toEqual([['Feishu-User', 'Alice A 李 <u_alice>']])
+    expect(await trailersFor('s_not_feishu')).toEqual([])
+
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_p2p_bob', senderId: 'u_bob',
+      mentionedBot: false, messageId: 'om_bob_push', content: '我也推一下',
+    }))
+    const [, bobRoute] = await waitForRoute(h, 'u_bob')
+    expect(await trailersFor(bobRoute.sessionId)).toEqual([['Feishu-User', 'Bob <u_bob>']])
+    await h.service.shutdown()
+  })
 })
 
 describe('open 模式：兼容旧行为', () => {
