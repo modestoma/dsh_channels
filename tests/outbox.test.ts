@@ -163,6 +163,32 @@ describe('Outbox', () => {
     expect(table.rows.size).toBe(0)
   })
 
+  it('never performs a stored action that is already past 24 hours', async () => {
+    const table = memoryTable()
+    table.rows.set('segment:x', { kind: 'segment', key: 'segment:x', sessionId: 's', segment: 2, card: {}, text: 't', createdAt: 1_000_000 - 25 * 60 * 60 * 1000, attempts: 4, nextAt: 0 })
+    const { outbox, sendSegment, warn } = setup(table)
+    outbox.start()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(sendSegment).not.toHaveBeenCalled()
+    expect(table.rows.size).toBe(0)
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('older than 24 h'), 'segment', 4)
+  })
+
+  it('does not spin while a due action is still in flight', async () => {
+    const table = memoryTable()
+    table.rows.set('card:om_1', { kind: 'card', key: 'card:om_1', messageId: 'om_1', card: { v: 1 }, createdAt: 999_000, attempts: 1, nextAt: 0 })
+    const { outbox, channel } = setup(table)
+    let release: () => void = () => {}
+    channel.updateCard.mockImplementationOnce(() => new Promise<void>(resolve => { release = resolve }))
+    const scans = vi.spyOn(table, 'entries')
+    outbox.start()
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(scans.mock.calls.length).toBeLessThan(5)
+    release()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(table.rows.size).toBe(0)
+  })
+
   it('stop waits for an attempt in flight', async () => {
     const { outbox, channel } = setup()
     outbox.start()

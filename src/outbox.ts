@@ -221,13 +221,24 @@ export class Outbox {
       this.deps.warn('dsh-channels: outbox action %s failed to store: %s', key, errorText(error))
     })
     this.chains.set(key, settled)
-    void settled.then(() => { if (this.chains.get(key) === settled) this.chains.delete(key) })
+    void settled.then(() => {
+      if (this.chains.get(key) !== settled) return
+      this.chains.delete(key)
+      // The timer skips in-flight keys; re-arm once one settles.
+      this.arm()
+    })
     return settled
   }
 
   /** Run one action; store it for a retry on failure, drop it when done, gone, or expired. */
   private async attempt(entry: OutboxEntry): Promise<void> {
     const table = this.deps.table()
+    if (this.now() - entry.createdAt >= MAX_AGE_MS) {
+      // Stored past the cutoff (for example across a long outage): never perform it late.
+      await table?.delete(entry.key)
+      this.deps.warn('dsh-channels: dropped Feishu %s action older than 24 h after %d attempts', entry.kind, entry.attempts)
+      return
+    }
     let progress: OutboxEntry = entry
     try {
       await this.run(entry, (next) => { progress = next })
@@ -272,11 +283,13 @@ export class Outbox {
     await channel.addReaction(entry.messageId, entry.add)
   }
 
-  /** Arm the timer for the earliest stored action. */
+  /** Arm the timer for the earliest stored action that is not in flight. */
   private arm(): void {
     if (!this.running) return
     let due = Number.POSITIVE_INFINITY
-    for (const [, entry] of this.deps.table()?.entries() ?? []) due = Math.min(due, entry.nextAt)
+    for (const [key, entry] of this.deps.table()?.entries() ?? []) {
+      if (!this.chains.has(key)) due = Math.min(due, entry.nextAt)
+    }
     if (!Number.isFinite(due)) return
     if (this.timer !== undefined) clearTimeout(this.timer)
     this.timer = setTimeout(() => {
