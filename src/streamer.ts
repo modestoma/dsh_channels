@@ -235,7 +235,12 @@ interface TurnState {
   mergedTriggers: TriggerReaction[]
   phase: PanelPhase
   reasoning: string
-  /** Request header produced during THIS turn; never inherited from history. */
+  /**
+   * Request header in effect for a request THIS turn sent. DSH logs
+   * `request/header` only when the request envelope changes, so a turn whose
+   * requests continue the series adopts the session's latest header once it
+   * actually sends one; a turn that never sends a request keeps `undefined`.
+   */
   header: HeaderSample | undefined
   /** Provider usage produced during THIS turn; never inherited from history. */
   lastUsage: UsageSample | undefined
@@ -868,6 +873,7 @@ export class TurnStreamer {
 
     switch (event.type) {
       case 'assistant/message': {
+        this.adoptSeriesHeader(session.id, state)
         if (state.retry !== undefined) {
           state.retry = undefined
           this.markDirty(session.id, state)
@@ -1025,6 +1031,7 @@ export class TurnStreamer {
         // open (defensive — its `end` frame normally does this first).
         this.closeReasoning(state)
         state.attempts.set(frame.attemptId, this.attemptMark(state))
+        if (this.adoptSeriesHeader(session.id, state)) this.markDirty(session.id, state)
         break
       }
       case 'chunk': {
@@ -1142,6 +1149,17 @@ export class TurnStreamer {
     state.reasoningSince = mark.reasoningSince
   }
 
+  /**
+   * Give a turn that sent a request without logging a new `request/header` the
+   * session's latest header, which is the one that request continues.
+   * @returns whether the turn's header changed.
+   */
+  private adoptSeriesHeader(sessionId: string, state: TurnState): boolean {
+    if (state.header !== undefined) return false
+    state.header = this.folds.get(sessionId)?.lastHeader
+    return state.header !== undefined
+  }
+
   private markDirty(sessionId: string, state: TurnState): void {
     if (state.disposed) return
     state.dirty = true
@@ -1180,8 +1198,8 @@ export class TurnStreamer {
       cacheHitPct: projected?.cacheHitPct ?? cacheHitPct(lastUsage),
       contextTokens: context?.contextTokens,
       // The context-token count is session-wide, but the model window belongs
-      // to the current request. Suppress it when this turn failed before a
-      // request header was emitted, just like model/effort/cache.
+      // to the current request. Suppress it when this turn failed before
+      // sending a request, just like model/effort/cache.
       contextWindow: header === undefined
         ? undefined
         : context?.contextWindow ?? projected?.contextWindow,

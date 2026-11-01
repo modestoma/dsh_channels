@@ -1312,6 +1312,29 @@ describe('TurnStreamer live assistant frames', () => {
     expect(json).toContain('输出 22')
     expect(json).toContain('64,000')
   })
+
+  it('shows the series header on a later turn whose request logs no new request/header', async () => {
+    const ch = channel()
+    const streamer = new DrivenStreamer(ch, 500, hooks())
+    const session = makeSession('sess-series')
+    // DSH logs request/header only when the envelope changes: the first turn
+    // logged it, the second turn continues the same request series.
+    ;(sessionEvents(session) as SessionEvent[]).push({
+      type: 'request/header', seq: 1,
+      data: { header: { config: { provider: 'p', model: 'deepseek-v4-pro', reasoningEffort: 'max' } } },
+    })
+    streamer.attach(session, 'om_card', 'om_trigger', undefined)
+    streamer.onAssistantFrame(session, { type: 'start', attemptId: 'a2', revision: 1, turn: 1, step: 1 })
+    streamer.onAssistantFrame(session, {
+      type: 'chunk', attemptId: 'a2', revision: 1, index: 0, time: 1,
+      chunk: { type: 'text-delta', index: 0, text: 'hi' },
+    })
+    streamer.onSessionEvent(session, { type: 'turn/end', seq: 2, data: { turn: 1, reason: 'stop' } })
+    await vi.advanceTimersByTimeAsync(0)
+    const json = JSON.stringify(ch.updated.at(-1)!.card)
+    expect(json).toContain('模型 deepseek-v4-pro(max)')
+    expect(json).toContain('64,000')
+  })
 })
 
 describe('TurnStreamer stop button', () => {
