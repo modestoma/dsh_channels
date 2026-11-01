@@ -95,8 +95,8 @@ export const CHANNEL_COMMANDS = [
     usage: '[id|provider/model|reset]',
   },
   {
-    name: 'llm', group: '模型与上下文', description: '绑定或修改自己的模型 API 地址和 key（仅私聊）',
-    routeFree: true, chatType: 'p2p', directReply: true, agentScoped: false,
+    name: 'llm', group: '模型与上下文', description: '绑定或修改自己的模型 API 地址和 key（表单私聊发送）',
+    routeFree: true, directReply: true, agentScoped: false,
   },
   {
     name: 'compact', group: '模型与上下文', description: '压缩当前 Session 上下文', agentScoped: false,

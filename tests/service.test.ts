@@ -3880,10 +3880,8 @@ describe('command picker cards', () => {
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
     const buttons = buttonValues(lastCard(h))
-    expect(buttons.map(button => button.label)).toEqual([
-      '✅ 跟随管理员缺省（deepseek-v4-flash）', 'deepseek-v4-flash', 'deepseek-v4-pro',
-    ])
-    const pro = buttons[2]!.value
+    expect(buttons.map(button => button.label)).toEqual(['✅ deepseek-v4-flash（缺省）', 'deepseek-v4-pro'])
+    const pro = buttons[1]!.value
     expect(pro).toMatchObject({
       decision: 'llm-pref', kind: 'model', owner: 'u_owner', source: 'default', model: 'deepseek-v4-pro',
       sessionId: created.handle.agent.session.id,
@@ -3928,13 +3926,36 @@ describe('command picker cards', () => {
       await waitUntil(() => expect(pickerUpdates(h, 'om_2')).toHaveLength(count))
     }
 
-    await click(buttonValues(lastCard(h))[2]!.value, 1)
+    await click(buttonValues(lastCard(h))[1]!.value, 1)
     const switched = await request()
     expect(switched).toMatchObject({ model: 'deepseek-v4-pro' })
     expect(switched).not.toHaveProperty('reasoningEffort')
 
     await click(buttonValues(pickerUpdates(h, 'om_2')[0]!)[0]!.value, 2)
     await expect(request()).resolves.toMatchObject({ model: 'deepseek-v4-flash', reasoningEffort: 'high' })
+    await h.service.shutdown()
+  })
+
+  it('tells the owner what the Session runs on when it differs from the saved choice', async () => {
+    const h = await setup()
+    await establishWithModel(h, 'oc_pick_diff')
+    const topic = (messageId: string, content: string) => makeMessage({
+      chatType: 'group', chatId: 'oc_pick_diff', senderId: 'u_owner', threadId: 'omt_1', mentionedBot: false, messageId, content,
+    })
+    await h.onMessage(topic('om_diff_typed', '/model deepseek-v4-pro'))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
+    await h.onMessage(topic('om_diff_pick', '/model'))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(3))
+    const selector = JSON.stringify(lastCard(h))
+    expect(selector).toContain('本会话目前用的是 缺省 API · `deepseek-v4-pro`')
+
+    // Picking the saved choice switches the Session back, and the line goes away.
+    await h.channel.fireCardAction({
+      messageId: 'om_3', chatId: 'oc_pick_diff',
+      operator: { openId: 'ou_o', userId: 'u_owner' }, action: { value: buttonValues(lastCard(h))[0]!.value, tag: 'button' },
+    })
+    await waitUntil(() => expect(pickerUpdates(h, 'om_3')).toHaveLength(1))
+    expect(JSON.stringify(pickerUpdates(h, 'om_3')[0])).not.toContain('本会话目前用的是')
     await h.service.shutdown()
   })
 
@@ -5637,8 +5658,8 @@ describe('per-user models', () => {
     await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_dm_a', senderId: 'u_a', content: '/model' }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
     const selector = JSON.stringify((h.channel.sent[0] as { input: object }).input)
-    expect(selector).toContain('跟随管理员缺省（deepseek-v4-flash）')
-    expect(selector).toContain('之后新发起会话的默认模型')
+    expect(selector).toContain('deepseek-v4-flash（缺省）')
+    expect(selector).toContain('之后新发起会话的模型')
 
     await h.channel.fireCardAction({
       messageId: 'om_1', chatId: 'oc_dm_a', operator: { openId: 'ou_a', userId: 'u_a' },
@@ -5673,9 +5694,12 @@ describe('per-user models', () => {
     await h.channel.fireCardAction(bindEvent('om_1', {
       api: 'openai-completions', baseURL: 'https://api.example.com/v1/', apiKey: ' sk-secret ',
     }))
-    await waitUntil(() => expect(updatesOf(h, 'om_1')).toHaveLength(1))
-    expect(updatesOf(h, 'om_1')[0]).toContain('已绑定，拉取到 2 个模型')
-    expect(updatesOf(h, 'om_1')[0]).not.toContain('sk-secret')
+    await waitUntil(() => expect(updatesOf(h, 'om_1')).toHaveLength(2))
+    // The form becomes the model selector, already on the user's own endpoint.
+    const bound = updatesOf(h, 'om_1')[1]!
+    expect(bound).toContain('已绑定，拉取到 2 个模型')
+    expect(bound).toContain('✅ my-model')
+    expect(updatesOf(h, 'om_1').join('')).not.toContain('sk-secret')
     expect(llm.discoverModels).toHaveBeenCalledWith(
       'llm-pi-ai', { api: 'openai-completions', baseURL: 'https://api.example.com/v1', apiKey: 'sk-secret' }, expect.anything(),
     )
@@ -5771,46 +5795,64 @@ describe('per-user models', () => {
     await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_dm_a', senderId: 'u_a', content: '/llm' }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
     await h.channel.fireCardAction(bindEvent('om_1', { api: 'openai-completions', baseURL: 'https://bad.example.com', apiKey: 'sk-wrong' }))
-    await waitUntil(() => expect(updatesOf(h, 'om_1')).toHaveLength(1))
-    const card = updatesOf(h, 'om_1')[0]!
+    await waitUntil(() => expect(updatesOf(h, 'om_1')).toHaveLength(2))
+    expect(updatesOf(h, 'om_1')[0]).toContain('正在用你填的 key 拉取')
+    const card = updatesOf(h, 'om_1')[1]!
     expect(card).toContain('拉取模型列表失败')
     expect(card).not.toContain('sk-wrong')
     expect(card).toContain('llm_bind_submit')
+    // The typed address stays in the form; only the key has to be typed again.
+    expect(card).toContain('"default_value":"https://bad.example.com"')
     expect(settings.providers.size).toBe(0)
     expect(h.ctxState.credentials.set).not.toHaveBeenCalledWith(expect.stringMatching(/^FEISHU_/u), expect.anything())
     await h.service.shutdown()
   })
 
-  it('refuses /llm in a group and unbinds from the form', async () => {
-    const { h, settings } = await setupWithEndpoints()
+  it('points a group /llm at the private chat when the form cannot be sent there', async () => {
+    const { h } = await setupWithEndpoints()
+    const send = h.channel.send.bind(h.channel)
+    h.channel.send = vi.fn(async (chatId: string, ...rest: unknown[]) => {
+      if (chatId === 'u_a') throw new Error('bot cannot reach the user')
+      return await (send as (...args: unknown[]) => ReturnType<typeof send>)(chatId, ...rest)
+    }) as typeof h.channel.send
     await h.onMessage(makeMessage({ chatType: 'group', chatId: 'oc_group', senderId: 'u_a', mentionedBot: true, content: '/llm' }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
-    const refusal = JSON.stringify(h.channel.sent[0])
-    expect(refusal).toContain('仅支持在私聊中使用')
-    expect(refusal).not.toContain('llm_bind_submit')
+    const reply = JSON.stringify(h.channel.sent[0])
+    expect(reply).toContain('私聊发送绑定表单失败')
+    expect(reply).not.toContain('llm_bind_submit')
+    await h.service.shutdown()
+  })
 
-    await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_dm_a', senderId: 'u_a', content: '/llm' }))
+  it('answers /llm in a group with a private form and unbinds from the form', async () => {
+    const { h, settings } = await setupWithEndpoints()
+    await h.onMessage(makeMessage({ chatType: 'group', chatId: 'oc_group', senderId: 'u_a', mentionedBot: true, content: '/llm' }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
-    await h.channel.fireCardAction(bindEvent('om_2', { api: 'anthropic-messages', baseURL: 'https://api.example.com', apiKey: 'sk-a' }))
-    await waitUntil(() => expect(updatesOf(h, 'om_2').at(-1)).toContain('已绑定'))
+    const [privateForm, groupReply] = h.channel.sent.map(entry => JSON.stringify(entry))
+    expect(privateForm).toContain('"chatId":"u_a"')
+    expect(privateForm).toContain('llm_bind_submit')
+    expect(groupReply).toContain('已私聊你发送绑定表单')
+    expect(groupReply).not.toContain('llm_bind_submit')
+    await h.channel.fireCardAction(bindEvent('om_1', { api: 'anthropic-messages', baseURL: 'https://api.example.com', apiKey: 'sk-a' }))
+    await waitUntil(() => expect(updatesOf(h, 'om_1').at(-1)).toContain('已绑定'))
     const ref = [...h.ctxState.credentials.set.mock.calls].map(call => call[0] as string).find(name => name.startsWith('FEISHU_'))!
 
     await h.channel.fireCardAction({
-      messageId: 'om_2', chatId: 'oc_dm_a', operator: { openId: 'ou_a', userId: 'u_a' },
+      messageId: 'om_1', chatId: 'oc_dm_a', operator: { openId: 'ou_a', userId: 'u_a' },
       action: { value: { decision: 'llm-bind', kind: 'unbind', owner: 'u_a', rev: 'r2' }, tag: 'button' },
     })
     await waitUntil(() => expect(settings.providers.size).toBe(0))
     expect(h.ctxState.credentials.values[ref]).toBeUndefined()
-    await waitUntil(() => expect(updatesOf(h, 'om_2').at(-1)).toContain('已解绑'))
+    await waitUntil(() => expect(updatesOf(h, 'om_1').at(-1)).toContain('已解绑'))
+    expect(updatesOf(h, 'om_1').at(-1)).toContain('绑定我的 API')
 
     // A stranger cannot submit someone else's form.
-    const updates = updatesOf(h, 'om_2').length
+    const updates = updatesOf(h, 'om_1').length
     await h.channel.fireCardAction({
-      ...bindEvent('om_2', { api: 'openai-completions', baseURL: 'https://x.example.com', apiKey: 'k' }),
+      ...bindEvent('om_1', { api: 'openai-completions', baseURL: 'https://x.example.com', apiKey: 'k' }),
       operator: { openId: 'ou_x', userId: 'u_x' },
     })
     await flush()
-    expect(updatesOf(h, 'om_2')).toHaveLength(updates)
+    expect(updatesOf(h, 'om_1')).toHaveLength(updates)
     expect(settings.providers.size).toBe(0)
     await h.service.shutdown()
   })

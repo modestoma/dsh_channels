@@ -53,6 +53,7 @@ import { commandSpec } from './commands/registry.ts'
 import type { ChannelCommandSpec } from './commands/registry.ts'
 import type { AgentDefaultModel, PermissionPresets, SessionQuery, SettingsService } from './dsh-types.ts'
 import { PersonalRoutes, UserLlmStore, UserModels } from './llm/index.ts'
+import type { SessionChoice } from './llm/index.ts'
 import { ACCESS_PERMISSIONS, FEISHU_USER_ID_PATTERN, feishuDomain, PROCESSED_RETENTION_MS, sessionDirOf } from './domain.ts'
 import type {
   AccessPermission, AccessRequestRecord, AccessUserRecord,
@@ -676,6 +677,7 @@ export class FeishuService {
       displayName: userId => this.accessStore.getUser(userId)?.name,
       routeOf: sessionId => this.routes.findBySession(sessionId),
       switchSession: (route, lines) => this.switchSessionModel(route, lines),
+      sessionChoice: sessionId => this.sessionModelChoice(sessionId),
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
     })
     this.codeWriteGate = new CodeWriteGate({
@@ -2904,6 +2906,26 @@ export class FeishuService {
     })
   }
 
+  /** What a live Session's next request uses, for the model selector; undefined when not live here. */
+  private sessionModelChoice(sessionId: string): SessionChoice | undefined {
+    const live = this.sessions.get(sessionId)
+    if (live === undefined) return undefined
+    let controller: RequestPolicyController
+    try {
+      controller = this.sessions.requestPolicy(live.agent)
+    } catch (_notMounted) {
+      // A borrowed Agent without this plugin's policy: the selector shows only the stored choice.
+      return undefined
+    }
+    const { provider, model } = currentModelRoute(live, controller)
+    const effort = controller.state.effectiveEffort
+    return {
+      ...(provider === undefined ? {} : { provider }),
+      ...(model === undefined ? {} : { model }),
+      ...(effort === undefined ? {} : { effort }),
+    }
+  }
+
   /** Bare `/model`: the per-user selector, bound to the sender's own Session when there is one. */
   private async runModelSelector(msg: NormalizedMessage): Promise<void> {
     if (msg.chatType === 'group' && msg.threadId === undefined && this.config.requireMention && !msg.mentionedBot) return
@@ -2917,16 +2939,10 @@ export class FeishuService {
     })
   }
 
-  /** `/llm`: the personal endpoint form, private chat only. */
+  /** `/llm`: the personal endpoint form, always delivered in the sender's private chat. */
   private async runLlmCommand(msg: NormalizedMessage, parsed: ParsedSlashCommand): Promise<void> {
+    if (msg.chatType === 'group' && msg.threadId === undefined && this.config.requireMention && !msg.mentionedBot) return
     const direct = { createThread: false }
-    if (msg.chatType !== 'p2p') {
-      await this.delivery.commandCard(msg, {
-        kind: 'context-error', command: 'llm',
-        text: '命令 /llm 仅支持在私聊中使用，请不要把 API key 发到群里。也可以发送 /model，点「绑定我的 API」，我会私聊你发表单。',
-      }, direct)
-      return
-    }
     if (parsed.rawInput.trim() !== '') {
       await this.delivery.commandCard(msg, {
         kind: 'input-error', command: 'llm', text: '用法错误：/llm 不接受参数，请在卡片表单里填写 API 地址和 key。',
@@ -2940,9 +2956,30 @@ export class FeishuService {
       }, direct)
       return
     }
-    await this.delivery.withCommandReaction(msg, async () => {
-      await this.delivery.standaloneReply(msg, this.userModels.bindCard(msg.senderId), direct)
-    })
+    if (msg.chatType === 'p2p') {
+      await this.delivery.withCommandReaction(msg, async () => {
+        await this.delivery.standaloneReply(msg, this.userModels.bindCard(msg.senderId), direct)
+      })
+      return
+    }
+    // In a group the form goes to the sender's private chat, so the key is
+    // never typed where other members can see it.
+    const sent = await this.sendPrivateCard(msg.senderId, this.userModels.bindCard(msg.senderId))
+    await this.delivery.commandCard(msg, sent
+      ? { kind: 'success', command: 'llm', text: '已私聊你发送绑定表单，请到和我的私聊里填写，不要把 key 发到群里。' }
+      : { kind: 'unavailable', command: 'llm', text: '私聊发送绑定表单失败，请先私聊我，再发送 /llm。' }, direct)
+  }
+
+  /** Send a card to a user's private chat; false (logged) when it could not be sent. */
+  private async sendPrivateCard(userId: string, card: object): Promise<boolean> {
+    if (this.channel === undefined) return false
+    try {
+      await this.channel.send(userId, { card })
+      return true
+    } catch (error) {
+      this.ctx.logger?.warn?.('dsh-channels: sending a private card to %s failed: %s', userId, String(error))
+      return false
+    }
   }
 
   /** Drop a removed user's model preference and personal endpoint; failures only warn. */

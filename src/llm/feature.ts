@@ -20,9 +20,9 @@ import { PERSONAL_LLM_APIS } from '../domain.ts'
 import type { PersonalLlmApi, RouteRecord, SessionLlm, UserLlmRecord } from '../domain.ts'
 import type { CardActionEvent, FeishuChannel } from '../feishu-channel.ts'
 import {
-  bindFormOf, buildBindCard, buildBindDoneCard, buildModelCard, parseLlmBindAction, parseLlmPrefAction,
+  bindFormOf, buildBindCard, buildBindPendingCard, buildModelCard, parseLlmBindAction, parseLlmPrefAction,
 } from './cards.ts'
-import type { LlmPrefAction, ModelCardView } from './cards.ts'
+import type { ChoiceEndpoint, LlmPrefAction, ModelCardView } from './cards.ts'
 import type { BindFailureReason, PersonalRoutes } from './personal-routes.ts'
 import { sessionLlmFor } from './selection.ts'
 import type { DefaultEndpoint } from './selection.ts'
@@ -30,9 +30,6 @@ import type { UserLlmChange, UserLlmStore } from './store.ts'
 
 /** Upper bound of one catalog lookup while rendering the selector. */
 const LOOKUP_TIMEOUT_MS = 4_000
-
-/** Longest endpoint error text a card shows. */
-const MAX_DETAIL_LENGTH = 200
 
 export interface UserModelsDeps {
   store: UserLlmStore
@@ -53,7 +50,16 @@ export interface UserModelsDeps {
    * @returns an error text, or undefined when every line succeeded.
    */
   switchSession(route: RouteRecord, lines: readonly string[]): Promise<string | undefined>
+  /** What a live Session's next request uses; undefined when the Session is not live here. */
+  sessionChoice(sessionId: string): SessionChoice | undefined
   warn(message: string, ...args: unknown[]): void
+}
+
+/** The provider, model and effort a live Session's next request uses, as far as known. */
+export interface SessionChoice {
+  provider?: string
+  model?: string
+  effort?: string
 }
 
 const BIND_ERRORS: Readonly<Record<BindFailureReason, string>> = {
@@ -171,12 +177,13 @@ export class UserModels {
    * @param error - why the previous submit failed.
    * @returns the card JSON.
    */
-  bindCard(userId: string, error?: string): object {
+  bindCard(userId: string, error?: string, draft?: { api: PersonalLlmApi; baseURL: string }): object {
     const own = this.deps.store.get(userId)?.own
     return buildBindCard({
       owner: userId,
       rev: randomUUID().slice(0, 8),
       ...(own === undefined ? {} : { current: { api: own.api, baseURL: own.baseURL, models: own.models.length } }),
+      ...(draft === undefined ? {} : { draft }),
       ...(error === undefined ? {} : { error }),
     })
   }
@@ -189,7 +196,7 @@ export class UserModels {
    */
   async onCardAction(event: CardActionEvent): Promise<void> {
     const userId = event.operator.userId
-    const pref = parseLlmPrefAction(event.action.value)
+    const pref = parseLlmPrefAction(event.action.value, event.action.option)
     if (pref !== undefined) {
       if (userId !== pref.owner || !this.deps.mayChat(userId)) return
       await this.onPrefAction(event, userId, pref)
@@ -201,7 +208,7 @@ export class UserModels {
     if (channel === undefined) return
     if (bind.kind === 'unbind') {
       await this.forgetEndpoint(userId)
-      await channel.updateCard(event.messageId, buildBindDoneCard('已解绑你的 API，之后的新会话改用缺省 API。'))
+      await channel.updateCard(event.messageId, await this.selectorCard(userId, undefined, '已解绑你的 API，之后新发起的会话改用缺省 API。'))
       return
     }
     const form = bindFormOf(event.raw)
@@ -210,8 +217,10 @@ export class UserModels {
       await channel.updateCard(event.messageId, this.bindCard(userId, '请选择接口协议。'))
       return
     }
+    const draft = { api, baseURL: form.baseURL.trim() }
     const previous = this.deps.store.get(userId)
     const name = this.deps.displayName(userId) ?? userId
+    await channel.updateCard(event.messageId, buildBindPendingCard(draft.baseURL))
     const result = await this.deps.routes.bind({
       userId,
       displayName: `飞书 · ${name}`,
@@ -221,8 +230,8 @@ export class UserModels {
       ...(previous?.own === undefined ? {} : { previous: previous.own }),
     })
     if (!result.ok) {
-      const detail = result.detail === undefined ? '' : `：${redact(result.detail, form.apiKey)}`
-      await channel.updateCard(event.messageId, this.bindCard(userId, `${BIND_ERRORS[result.reason]}${detail}`))
+      const detail = result.detail === undefined ? '' : `：${result.detail}`
+      await channel.updateCard(event.messageId, this.bindCard(userId, `${BIND_ERRORS[result.reason]}${detail}`, draft))
       return
     }
     // Binding switches new Sessions to the user's own endpoint; a model the
@@ -234,8 +243,9 @@ export class UserModels {
       ...(keepModel ? {} : { model: null, effort: null }),
     })
     const model = stored.model ?? result.own.models[0] ?? ''
-    await channel.updateCard(event.messageId, buildBindDoneCard(
-      `✅ 已绑定，拉取到 ${result.own.models.length} 个模型。之后你新发起的会话使用你的 API 上的 \`${model}\`。`,
+    await channel.updateCard(event.messageId, await this.selectorCard(
+      userId, undefined,
+      `✅ 已绑定，拉取到 ${result.own.models.length} 个模型。之后新发起的会话用你的 API 上的 \`${model}\`，想换模型直接在下面点。`,
     ))
   }
 
@@ -270,8 +280,14 @@ export class UserModels {
         await redraw('当前部署没有开启个人 API 绑定。')
         return
       }
-      await channel.send(userId, { card: this.bindCard(userId) })
-      await redraw('已私聊你发送绑定表单。')
+      try {
+        await channel.send(userId, { card: this.bindCard(userId) })
+      } catch (error) {
+        this.deps.warn('dsh-channels: sending the /llm form to %s failed: %s', userId, String(error))
+        await redraw('私聊发送绑定表单失败，请先私聊我发送 /llm。')
+        return
+      }
+      await redraw('已私聊你发送绑定表单，请到和我的私聊里填写。')
       return
     }
     const record = this.deps.store.get(userId)
@@ -286,7 +302,9 @@ export class UserModels {
       // Efforts are model-specific: a new model starts on its default effort.
       change = { source: 'own', model: action.model, effort: null }
     } else {
-      change = { source: 'default', model: action.model === '' ? null : action.model, effort: null }
+      // Naming the administrator's default model is the same as following it.
+      const followsDefault = action.model === '' || action.model === this.defaultEndpoint().model
+      change = { source: 'default', model: followsDefault ? null : action.model, effort: null }
     }
     const stored = await this.deps.store.update(userId, change)
     await redraw(await this.applyToSession(userId, sessionId, action, stored))
@@ -323,11 +341,16 @@ export class UserModels {
    * Session's starting effort, which belongs to the model it started on.
    */
   private defaultEffortLine(record: UserLlmRecord): string {
+    const effort = this.defaultEffortOf(record)
+    return effort === undefined ? '/effort default' : `/effort ${effort}`
+  }
+
+  /** The effort a preference without its own effort runs at: the administrator's, on the default model only. */
+  private defaultEffortOf(record: UserLlmRecord): string | undefined {
     const defaults = this.defaultEndpoint()
     const onDefaultModel = !(record.source === 'own' && record.own !== undefined)
       && (record.model === undefined || record.model === defaults.model)
-    if (onDefaultModel && defaults.effort !== undefined) return `/effort ${defaults.effort}`
-    return '/effort default'
+    return onDefaultModel ? defaults.effort : undefined
   }
 
   /** Provider and model a stored preference names. */
@@ -346,7 +369,9 @@ export class UserModels {
     const defaults = this.defaultEndpoint()
     const own = record?.own
     const source = record?.source === 'own' && own !== undefined ? 'own' : 'default'
-    const choice = this.routeOfChoice({ ...(record ?? { userId, updatedAt: 0 }), source })
+    const effective = { ...(record ?? { userId, updatedAt: 0 }), source } as UserLlmRecord
+    const choice = this.routeOfChoice(effective)
+    const session = sessionId === undefined ? undefined : this.sessionDifference(sessionId, effective, choice)
     return {
       owner: userId,
       rev: randomUUID().slice(0, 8),
@@ -355,12 +380,39 @@ export class UserModels {
       defaults: {
         ...(defaults.model === undefined ? {} : { model: defaults.model }),
         models: defaults.provider === undefined ? [] : await this.models(defaults.provider),
+        ...(defaults.effort === undefined ? {} : { effort: defaults.effort }),
       },
       ...(own === undefined ? {} : { own: { baseURL: own.baseURL, models: own.models } }),
       selected: { source, ...(record?.model === undefined ? {} : { model: record.model }) },
       efforts: choice === undefined ? [] : await this.efforts(choice.provider, choice.model),
       ...(record?.effort === undefined ? {} : { effort: record.effort }),
+      ...(session === undefined ? {} : { session }),
       ...(notice === undefined ? {} : { notice }),
+    }
+  }
+
+  /**
+   * What the bound Session uses, when that differs from the stored choice
+   * (started before the choice changed, or switched with a typed command).
+   */
+  private sessionDifference(
+    sessionId: string,
+    record: UserLlmRecord,
+    choice: { provider: string; model: string } | undefined,
+  ): ModelCardView['session'] {
+    const current = this.deps.sessionChoice(sessionId)
+    if (current === undefined) return undefined
+    const effort = record.effort ?? this.defaultEffortOf(record)
+    if (current.provider === choice?.provider && current.model === choice?.model && current.effort === effort) return undefined
+    const defaults = this.defaultEndpoint()
+    const endpoint: ChoiceEndpoint = current.provider === defaults.provider
+      ? 'default'
+      : current.provider !== undefined && current.provider === record.own?.route ? 'own' : 'other'
+    return {
+      endpoint,
+      ...(current.provider === undefined ? {} : { provider: current.provider }),
+      ...(current.model === undefined ? {} : { model: current.model }),
+      ...(current.effort === undefined ? {} : { effort: current.effort }),
     }
   }
 
@@ -380,11 +432,4 @@ export class UserModels {
     const info = await within(llm.resolveModelInfo(provider, model), LOOKUP_TIMEOUT_MS)
     return (info?.reasoning?.efforts ?? []).map(effort => ({ id: effort.id, name: effort.name }))
   }
-}
-
-/** Endpoint error text with the typed key removed and its length capped. */
-function redact(detail: string, apiKey: string): string {
-  const key = apiKey.trim()
-  const clean = key === '' ? detail : detail.split(key).join('***')
-  return clean.length > MAX_DETAIL_LENGTH ? `${clean.slice(0, MAX_DETAIL_LENGTH)}…` : clean
 }

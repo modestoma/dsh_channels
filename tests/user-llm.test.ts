@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { FeishuDomainHandle, UserLlmRecord } from '../src/domain.ts'
 import {
-  bindFormOf, buildModelCard, credentialRefFor, normalizeBaseURL, parseLlmBindAction, parseLlmPrefAction,
+  bindFormOf, buildBindCard, buildModelCard, credentialRefFor, normalizeBaseURL, parseLlmBindAction, parseLlmPrefAction,
   personalRouteFor, PersonalRoutes, policyConfigFor, sessionLlmFor, UserLlmStore,
 } from '../src/llm/index.ts'
 import type { ModelCardView } from '../src/llm/index.ts'
@@ -174,12 +174,62 @@ describe('model cards', () => {
 
   it('renders both endpoints and the efforts of the effective model', () => {
     const json = JSON.stringify(buildModelCard(view))
-    expect(json).toContain('跟随管理员缺省（flash）')
+    expect(json).toContain('✅ flash（缺省）')
+    expect(json).not.toContain('跟随管理员缺省')
     expect(json).toContain('绑定我的 API')
-    expect(json).toContain('模型默认')
+    expect(json).toContain('✅ 模型默认')
     const owned = JSON.stringify(buildModelCard({ ...view, own: { baseURL: own.baseURL, models: own.models }, selected: { source: 'own' } }))
     expect(owned).toContain('我的 API · `m1`')
+    expect(owned).toContain('✅ m1')
     expect(owned).toContain('修改或解绑我的 API')
+  })
+
+  it('shows the administrator effort as the default model\'s default effort only', () => {
+    const withEffort: ModelCardView = { ...view, defaults: { ...view.defaults, effort: 'low' } }
+    const json = JSON.stringify(buildModelCard(withEffort))
+    expect(json).toContain('推理强度 `低`')
+    expect(json).toContain('✅ 缺省（低）')
+    const pinned = JSON.stringify(buildModelCard({ ...withEffort, selected: { source: 'default', model: 'pro' } }))
+    expect(pinned).toContain('推理强度 模型默认')
+    expect(pinned).toContain('✅ pro')
+  })
+
+  it('switches long model lists to one dropdown that reports the picked model', () => {
+    const models = Array.from({ length: 20 }, (_, index) => `m${index}`)
+    const card = JSON.stringify(buildModelCard({ ...view, own: { baseURL: own.baseURL, models }, selected: { source: 'own', model: 'm7' } }))
+    expect(card).toContain('"tag":"select_static"')
+    expect(card).toContain('"initial_option":"m7"')
+    const value = { rev: 'r1', decision: 'llm-pref', owner: 'u_a', kind: 'model', source: 'own', pick: true }
+    expect(parseLlmPrefAction(value, 'm9')).toEqual({ decision: 'llm-pref', kind: 'model', owner: 'u_a', source: 'own', model: 'm9' })
+    expect(parseLlmPrefAction(value)).toBeUndefined()
+    expect(parseLlmPrefAction({ ...value, source: 'default' }, '@@default'))
+      .toEqual({ decision: 'llm-pref', kind: 'model', owner: 'u_a', source: 'default', model: '' })
+  })
+
+  it('keeps the render nonce within the channel\'s deduplicated value prefix', () => {
+    const card = buildModelCard({ ...view, owner: 'u_0123456789abcdef', sessionId: '01234567-89ab-cdef-0123-456789abcdef' })
+    const values = [...JSON.stringify(card).matchAll(/"value":(\{[^}]*\})/gu)].map(match => match[1]!)
+    expect(values.length).toBeGreaterThan(0)
+    for (const value of values) expect(value.slice(0, 128)).toContain('"rev":"r1"')
+  })
+
+  it('tells the owner when the bound Session runs on something else', () => {
+    const json = JSON.stringify(buildModelCard({
+      ...view, sessionId: 's1', session: { endpoint: 'other', provider: 'openrouter', model: 'x', effort: 'high' },
+    }))
+    expect(json).toContain('本会话目前用的是 `openrouter` · `x` · 推理强度 `high`')
+    expect(json).not.toContain('🔑')
+  })
+
+  it('keeps a failed submit\'s protocol and URL and confirms before unbinding', () => {
+    const json = JSON.stringify(buildBindCard({
+      owner: 'u_a', rev: 'r1', error: 'x',
+      current: { api: 'openai-completions', baseURL: 'https://old', models: 2 },
+      draft: { api: 'anthropic-messages', baseURL: 'https://new' },
+    }))
+    expect(json).toContain('"initial_option":"anthropic-messages"')
+    expect(json).toContain('"default_value":"https://new"')
+    expect(json).toContain('"confirm"')
   })
 
   it('parses only well-formed selector and form actions', () => {
