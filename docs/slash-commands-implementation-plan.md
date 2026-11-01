@@ -25,7 +25,7 @@
 明确排除：
 
 - 不提供 `/model list`、`/model <name>` 或 `/effort list`；`/status` 仍只读。
-- `/effort <档位-id>` 将不透明 id 写入当前 Session 的后续请求；`/effort reset` 恢复频道配置默认。插件不预判 provider 是否支持该 id。
+- `/effort <档位-id>` 将不透明 id 写入当前 Session 的后续请求；`/effort reset` 恢复频道配置默认；`/effort default` 改用模型适配器/provider 默认。插件不预判 provider 是否支持该 id。
 - 不修改 Harness，不新增 Host 服务或修改 Web UI。
 - `/export` 不追求 Web 导出 ZIP 的完整语义：不递归包含子代理 Session，不收集附件，不复制持久化后端的原始物理文件。
 - 不将斜杠命令作为普通用户消息传给模型，也不让未知命令退化为模型输入。

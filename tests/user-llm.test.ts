@@ -69,10 +69,14 @@ describe('personal routes', () => {
     expect(normalizeBaseURL('not a url')).toBeUndefined()
   })
 
-  function makeRoutes(overrides: { discover?: () => Promise<unknown[]>; mutate?: () => Promise<void> } = {}) {
+  function makeRoutes(overrides: { discover?: () => Promise<unknown[]>; mutate?: () => Promise<void>; env?: Record<string, string> } = {}) {
     const values: Record<string, string> = {}
+    const env = overrides.env ?? {}
     const credentials = {
-      resolve: vi.fn(async (ref: string) => (values[ref] === undefined ? undefined : { value: values[ref]!, source: 'file' })),
+      resolve: vi.fn(async (ref: string) => {
+        if (values[ref] !== undefined) return { value: values[ref]!, source: 'file' }
+        return env[ref] === undefined ? undefined : { value: env[ref]!, source: 'env' }
+      }),
       set: vi.fn(async (ref: string, value: string) => { values[ref] = value }),
       unset: vi.fn(async (ref: string) => { delete values[ref] }),
     }
@@ -109,6 +113,31 @@ describe('personal routes', () => {
     const { routes, values } = makeRoutes({ mutate: async () => { throw new Error('not volatile') } })
     await expect(routes.bind(request)).resolves.toEqual({ ok: false, reason: 'write-failed', detail: 'not volatile' })
     expect(values).toEqual({})
+  })
+
+  it('restores the replaced key when a re-bind route write fails', async () => {
+    const ref = credentialRefFor(personalRouteFor(request.userId))
+    const { routes, values } = makeRoutes({ mutate: async () => { throw new Error('not volatile') } })
+    values[ref] = 'sk-old'
+    await expect(routes.bind({ ...request, apiKey: 'sk-new' })).resolves.toMatchObject({ ok: false, reason: 'write-failed' })
+    expect(values).toEqual({ [ref]: 'sk-old' })
+  })
+
+  it('does not store an environment key when rolling a failed bind back', async () => {
+    const ref = credentialRefFor(personalRouteFor(request.userId))
+    const { routes, values } = makeRoutes({ mutate: async () => { throw new Error('not volatile') }, env: { [ref]: 'sk-env' } })
+    await expect(routes.bind(request)).resolves.toMatchObject({ ok: false, reason: 'write-failed' })
+    expect(values).toEqual({})
+  })
+
+  it('masks the submitted key in failure details', async () => {
+    const { routes } = makeRoutes({ discover: async () => { throw new Error(`401 for key sk-1: invalid ${'x'.repeat(400)}`) } })
+    const result = await routes.bind(request)
+    expect(result).toMatchObject({ ok: false, reason: 'discovery-failed' })
+    const detail = result.ok ? '' : result.detail ?? ''
+    expect(detail).toContain('401 for key ***: invalid')
+    expect(detail).not.toContain('sk-1')
+    expect(detail.length).toBeLessThanOrEqual(301)
   })
 
   it('re-binds with the stored key when the key field is blank', async () => {

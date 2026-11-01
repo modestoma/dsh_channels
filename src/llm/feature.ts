@@ -306,14 +306,28 @@ export class UserModels {
     if (route.senderUserId !== userId) return `${saved}当前会话由发起人决定，没有切换。`
     const lines: string[] = []
     if (action.kind === 'effort') {
-      lines.push(stored.effort === undefined ? '/effort reset' : `/effort ${stored.effort}`)
+      lines.push(stored.effort === undefined ? this.defaultEffortLine(stored) : `/effort ${stored.effort}`)
     } else {
       const target = this.routeOfChoice(stored)
       if (target === undefined) return `${saved}缺省模型未知，当前会话没有切换。`
-      lines.push(`/model ${target.provider}/${target.model}`, '/effort reset')
+      lines.push(`/model ${target.provider}/${target.model}`, this.defaultEffortLine(stored))
     }
     const error = await this.deps.switchSession(route, lines)
     return error === undefined ? `已切换当前会话，并${saved}` : `${saved}切换当前会话失败：${error}`
+  }
+
+  /**
+   * The `/effort` line that gives a Session the default effort of the
+   * preference's model: the administrator's effort on the default model,
+   * otherwise the model's own default. `/effort reset` would restore the
+   * Session's starting effort, which belongs to the model it started on.
+   */
+  private defaultEffortLine(record: UserLlmRecord): string {
+    const defaults = this.defaultEndpoint()
+    const onDefaultModel = !(record.source === 'own' && record.own !== undefined)
+      && (record.model === undefined || record.model === defaults.model)
+    if (onDefaultModel && defaults.effort !== undefined) return `/effort ${defaults.effort}`
+    return '/effort default'
   }
 
   /** Provider and model a stored preference names. */

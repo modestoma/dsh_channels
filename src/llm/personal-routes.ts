@@ -113,6 +113,21 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
+/** Longest failure detail a card shows. */
+const DETAIL_LIMIT = 300
+
+/**
+ * A failure detail safe to show on a card: the key a provider or the host
+ * may echo back is masked, and the text is capped.
+ * @param error - the caught failure.
+ * @param apiKey - the key the failed request carried.
+ * @returns the redacted message.
+ */
+function redactedDetail(error: unknown, apiKey: string): string {
+  const message = messageOf(error).split(apiKey).join('***')
+  return message.length > DETAIL_LIMIT ? `${message.slice(0, DETAIL_LIMIT)}…` : message
+}
+
 export class PersonalRoutes {
   constructor(private readonly deps: PersonalRoutesDeps) {}
 
@@ -157,12 +172,16 @@ export class PersonalRoutes {
         AbortSignal.timeout(DISCOVERY_TIMEOUT_MS),
       )
     } catch (error) {
-      return { ok: false, reason: 'discovery-failed', detail: messageOf(error) }
+      return { ok: false, reason: 'discovery-failed', detail: redactedDetail(error, apiKey) }
     }
     const models = discovered.filter(model => model.id !== '')
     if (models.length === 0) return { ok: false, reason: 'no-models' }
 
-    const hadKey = request.previous !== undefined
+    // The key stored under the reference before this bind, restored when the
+    // route write fails so the unchanged route keeps its working key. An
+    // environment value is not stored, so removing the new key restores it.
+    const before = await this.deps.credentials.resolve(credentialRef)
+    const previousKey = before === undefined || before.source === 'env' ? undefined : before.value
     try {
       await setCredential(credentialRef, apiKey)
       await settings.mutate(namespace, [{
@@ -177,10 +196,8 @@ export class PersonalRoutes {
         },
       }])
     } catch (error) {
-      // A first bind leaves no key behind; a re-bind keeps the new key, which
-      // the unchanged previous route then uses.
-      if (!hadKey) await this.deps.credentials.unset?.(credentialRef).catch(() => {})
-      return { ok: false, reason: 'write-failed', detail: messageOf(error) }
+      await this.restoreCredential(credentialRef, previousKey, setCredential)
+      return { ok: false, reason: 'write-failed', detail: redactedDetail(error, apiKey) }
     }
     await this.awaitRegistration(llm, route)
     return {
@@ -211,6 +228,20 @@ export class PersonalRoutes {
       await this.deps.credentials.unset?.(own.credentialRef)
     } catch (error) {
       this.deps.warn('dsh-channels: removing personal key %s failed: %s', own.credentialRef, messageOf(error))
+    }
+  }
+
+  /** Put back the key a failed bind replaced, or remove the one it added; failures are logged. */
+  private async restoreCredential(
+    credentialRef: string,
+    previousKey: string | undefined,
+    setCredential: (ref: string, value: string) => Promise<void>,
+  ): Promise<void> {
+    try {
+      if (previousKey === undefined) await this.deps.credentials.unset?.(credentialRef)
+      else await setCredential(credentialRef, previousKey)
+    } catch (error) {
+      this.deps.warn('dsh-channels: restoring personal key %s failed: %s', credentialRef, messageOf(error))
     }
   }
 

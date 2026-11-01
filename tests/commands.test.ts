@@ -30,7 +30,7 @@ describe('slash command primitives', () => {
       expect(help).toContain(`**${group}**`)
     }
     // The usage hint comes from the registry, not a second hand-written copy.
-    expect(help).toContain('**/effort** [id|reset] — 查看或切换当前 Session 推理强度')
+    expect(help).toContain('**/effort** [id|default|reset] — 查看或切换当前 Session 推理强度')
   })
 
   it('accepts the /new alias and resolves it to /renew', () => {

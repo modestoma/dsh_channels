@@ -28,7 +28,7 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 - `/health`：显示 Harness 与飞书通道健康状态，无需绑定 Session；回复方式同 `/help`（直接回复，话题内回在话题中）
 - `/status`：显示当前 Session 状态与性能指标
 - `/workspace`：显示当前 Session 工作目录
-- `/effort`：查看当前 Session 推理强度；当前模型声明了可选档位时，回复卡附档位按钮，点一下即切换；`/effort <档位-id>` 切换，`/effort reset` 恢复配置默认
+- `/effort`：查看当前 Session 推理强度；当前模型声明了可选档位时，回复卡附档位按钮，点一下即切换；`/effort <档位-id>` 切换，`/effort default` 改用模型自身默认（忽略配置值），`/effort reset` 恢复配置默认
 - `/model`：不带参数时回复一张**个人模型选择卡**，有没有 Session 都能用（发起会话前 @ 机器人发 `/model` 即可）：上半部分是管理员配置的缺省 API 的模型（含「跟随管理员缺省」），中间是「我的 API」上的模型，下半部分是当前所选模型声明的推理强度。点选保存为**你之后新发起会话的默认模型**；在你自己发起的会话里点选，还会立即切换当前会话（群里共用话题只有发起人能切换当前会话）。带参数时只切换当前 Session：`/model <模型-id>`（沿用当前 provider）、`/model <provider>/<model>`，`/model reset` 恢复本会话创建时的模型；非管理员只能切到缺省 API 或自己绑定的 API
 - `/llm`：**仅私聊**。回复一张表单卡，填写接口协议、API 地址和 API key（密码框）绑定**自己的模型 API**；提交时先用这个 key 拉取模型列表验证，通过后 key 存入本机 DSH 凭据库，并在宿主 `llm-pi-ai` 里登记一条只属于你的 provider 路由，之后你新发起的会话改用你的 API。再次发送可修改（key 留空保留原 key）或解绑。群里发 `/llm` 会被拒绝；在 `/model` 卡上点「绑定我的 API」，机器人会私聊你发这张表单
 - `/compact`：调用 Harness 原生命令压缩当前 Session 上下文
@@ -346,7 +346,7 @@ npm 发行包已包含构建产物：Host 入口是 `lib/index.js`（profile 直
     loggerLevel: 'info'
 ```
 
-`reasoningEffort` 是每个 Session 的初始/重置默认值。DSH 0.2.2 起模型选择归 Agent 所有（`agent.model`），插件在新建、恢复、借用 Agent 以及 `/model`、`/effort` 成功后用 `agent.model.select()` 记录生效的 provider/model/推理强度（`/model reset` 回到 Agent 的部署默认路由）；DSH 0.2.1 没有 `agent.model`，插件改为在该 Agent 作用域内以 `prepend` 外层覆盖 `agent/request`，因此胜过已存在的模型选择与 provider 默认。两种宿主自动识别，无需配置；借用外部 Agent 时，插件关闭只移除这条频道策略，不销毁外部 Agent。话题所有者可用 `/effort <档位-id>` 覆盖当前 Session，`/effort` 查看生效来源，`/effort reset` 恢复该配置值（未配置时恢复模型适配器/provider 默认）。成功选择由 Session 自带的 `command/run` / `command/done` 日志恢复，重启后仍生效；新建 Session 不继承旧 Session 的覆盖。
+`reasoningEffort` 是每个 Session 的初始/重置默认值。DSH 0.2.2 起模型选择归 Agent 所有（`agent.model`），插件在新建、恢复、借用 Agent 以及 `/model`、`/effort` 成功后用 `agent.model.select()` 记录生效的 provider/model/推理强度（`/model reset` 回到 Agent 的部署默认路由）；DSH 0.2.1 没有 `agent.model`，插件改为在该 Agent 作用域内以 `prepend` 外层覆盖 `agent/request`，因此胜过已存在的模型选择与 provider 默认。两种宿主自动识别，无需配置；借用外部 Agent 时，插件关闭只移除这条频道策略，不销毁外部 Agent。话题所有者可用 `/effort <档位-id>` 覆盖当前 Session，`/effort` 查看生效来源，`/effort reset` 恢复该配置值（未配置时恢复模型适配器/provider 默认），`/effort default` 则忽略配置值、改用模型适配器/provider 默认。成功选择由 Session 自带的 `command/run` / `command/done` 日志恢复，重启后仍生效；新建 Session 不继承旧 Session 的覆盖。
 
 推理档位是适配器拥有的不透明 id（常见如 `off`、`low`、`high`、`max`），命令不会猜测或预校验 provider 的能力；不受支持的值会在下一次模型请求前被 Harness 拒绝，并按失败终态显示错误。
 

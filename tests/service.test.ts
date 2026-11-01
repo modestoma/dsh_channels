@@ -592,6 +592,10 @@ describe('FeishuService', () => {
     })
     await expect(request()).resolves.toMatchObject({ reasoningEffort: '123456' })
 
+    await command('om_effort_default', '/effort default')
+    await expect(request()).resolves.not.toHaveProperty('reasoningEffort')
+    expect(JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)).toContain('provider 默认推理强度')
+
     await command('om_effort_reset', '/effort reset')
     await expect(request()).resolves.toMatchObject({ reasoningEffort: 'high' })
     expect(JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)).toContain('配置默认')
@@ -3904,6 +3908,33 @@ describe('command picker cards', () => {
     expect(h.channel.sent).toHaveLength(2)
     await expect(dispatchAgentRequest(created.setupCtx, { provider: 'deepseek-official', model: 'deepseek-v4-flash' }))
       .resolves.toMatchObject({ model: 'deepseek-v4-pro' })
+    await h.service.shutdown()
+  })
+
+  it('starts a switched model on its own default effort and the default model on the configured one', async () => {
+    const h = await setup({ reasoningEffort: 'high' })
+    const created = await establishWithModel(h, 'oc_pick_effort_reset')
+    const request = () => dispatchAgentRequest(created.setupCtx, { provider: 'deepseek-official', model: 'deepseek-v4-flash' })
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_pick_effort_reset', senderId: 'u_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_pick_effort_reset', content: '/model',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
+    const click = async (value: unknown, count: number) => {
+      await h.channel.fireCardAction({
+        messageId: 'om_2', chatId: 'oc_pick_effort_reset',
+        operator: { openId: 'ou_o', userId: 'u_owner' }, action: { value, tag: 'button' },
+      })
+      await waitUntil(() => expect(pickerUpdates(h, 'om_2')).toHaveLength(count))
+    }
+
+    await click(buttonValues(lastCard(h))[2]!.value, 1)
+    const switched = await request()
+    expect(switched).toMatchObject({ model: 'deepseek-v4-pro' })
+    expect(switched).not.toHaveProperty('reasoningEffort')
+
+    await click(buttonValues(pickerUpdates(h, 'om_2')[0]!)[0]!.value, 2)
+    await expect(request()).resolves.toMatchObject({ model: 'deepseek-v4-flash', reasoningEffort: 'high' })
     await h.service.shutdown()
   })
 

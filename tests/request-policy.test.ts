@@ -59,6 +59,27 @@ describe('installRequestPolicy', () => {
       event('command/run', 2, { commandId: 'reset', name: 'effort', args: ' reset', source: { kind: 'user' } }),
       event('command/done', 3, { commandId: 'reset', kind: 'success' }),
     ])).toBeUndefined()
+
+    expect(foldEffortOverride([
+      event('command/run', 0, { commandId: 'one', name: 'effort', args: ' tiny', source: { kind: 'user' } }),
+      event('command/done', 1, { commandId: 'one', kind: 'success' }),
+      event('command/run', 2, { commandId: 'default', name: 'effort', args: ' default', source: { kind: 'user' } }),
+      event('command/done', 3, { commandId: 'default', kind: 'success' }),
+    ])).toBeNull()
+  })
+
+  it('drops the configured effort after /effort default', async () => {
+    const ctx = new Context()
+    const controller = installRequestPolicy(ctx as unknown as AgentContext, { effort: 'high' })
+    controller.sync([
+      { type: 'command/run', seq: 0, data: { commandId: 'd', name: 'effort', args: ' default', source: { kind: 'user' } } },
+      { type: 'command/done', seq: 1, data: { commandId: 'd', kind: 'success' } },
+    ] as unknown as SessionEvent[])
+    expect(controller.state).toMatchObject({
+      configuredEffort: 'high', effortOverride: null, effectiveEffort: undefined, effortSource: 'model-default',
+    })
+    controller.dispose()
+    await ctx.fiber.dispose()
   })
 
   it('switches a live controller from config default to Session override', async () => {

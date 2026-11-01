@@ -3485,7 +3485,10 @@ export class FeishuService {
       if (state.effortSource === 'config') {
         return { kind: 'success', text: `当前 Session 推理强度：\`${state.effectiveEffort}\`（配置默认）。` }
       }
-      return { kind: 'success', text: '当前 Session 未设置推理强度覆盖，使用模型适配器/provider 默认。' }
+      return { kind: 'success', text: '当前 Session 使用模型适配器/provider 默认推理强度。' }
+    }
+    if (action.kind === 'default') {
+      return { kind: 'success', text: '已切换为模型适配器/provider 默认推理强度。' }
     }
     if (action.kind === 'reset') {
       return state.configuredEffort === undefined
