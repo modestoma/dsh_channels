@@ -35,6 +35,11 @@ export interface QuestionHooks {
   routeFor(sessionId: string): InteractionRoute | undefined
   /** Log a non-fatal error (delivery/update failures). */
   onError(sessionId: string, error: unknown): void
+  /**
+   * Whether a session has an unanswered question set, called on every open
+   * and settle so the streaming card can show it.
+   */
+  onWaitingChange?(sessionId: string, waiting: boolean): void
 }
 
 /** One in-flight question set: card content, partial answers, resolver. */
@@ -133,6 +138,7 @@ export class QuestionAnswerer {
       }
       request.signal?.addEventListener('abort', onAbort, { once: true })
       this.table.add(entry)
+      this.notifyWaiting(entry.sessionId)
       void this.table.deliver(entry, {
         card: buildQuestionCard(this.cardInput(entry)),
         onWithdrawn: e => this.table.patch(e, buildQuestionSettledCard(this.cardInput(e), 'cancelled')),
@@ -148,6 +154,7 @@ export class QuestionAnswerer {
         },
         onFailure: (e, error) => {
           this.table.close(e, () => {})
+          this.notifyWaiting(e.sessionId)
           e.reject(error instanceof Error ? error : new Error(String(error)))
         },
       })
@@ -227,6 +234,7 @@ export class QuestionAnswerer {
     const closed = this.table.close(entry, () => {
       this.table.patch(entry, buildQuestionSettledCard(this.cardInput(entry), 'answered'))
     })
+    this.notifyWaiting(entry.sessionId)
     if (closed) entry.resolve(answer)
   }
 
@@ -270,5 +278,10 @@ export class QuestionAnswerer {
     this.table.close(entry, () => {
       this.table.patch(entry, buildQuestionSettledCard(this.cardInput(entry), state))
     })
+    this.notifyWaiting(entry.sessionId)
+  }
+
+  private notifyWaiting(sessionId: string): void {
+    this.hooks.onWaitingChange?.(sessionId, this.hasPendingFor(sessionId))
   }
 }

@@ -29,6 +29,22 @@ export function note(content: string): object {
   return markdown(content, { text_size: 'notation' })
 }
 
+/**
+ * Plain-text element: no markdown is interpreted, line breaks are kept and
+ * long lines wrap. Used for text a tool or model supplied.
+ */
+export function plainText(content: string, options: { size?: 'normal' | 'notation'; color?: 'default' | 'grey' } = {}): object {
+  return {
+    tag: 'div',
+    text: {
+      tag: 'plain_text',
+      content,
+      ...(options.size === undefined ? {} : { text_size: options.size }),
+      ...(options.color === undefined ? {} : { text_color: options.color }),
+    },
+  }
+}
+
 /** Horizontal divider. */
 export function divider(): object {
   return { tag: 'hr' }
@@ -63,6 +79,11 @@ export function textButton(options: TextButtonOptions): object {
  * streaming card's reasoning window and any future "secondary detail" area.
  */
 export function foldPanel(title: string, content: string, iconToken: string): object {
+  return foldPanelOf(title, [markdown(content)], iconToken)
+}
+
+/** {@link foldPanel} holding arbitrary elements. */
+export function foldPanelOf(title: string, elements: object[], iconToken: string): object {
   return {
     tag: 'collapsible_panel',
     expanded: false,
@@ -73,7 +94,7 @@ export function foldPanel(title: string, content: string, iconToken: string): ob
       icon_position: 'right',
       icon_expanded_angle: 180,
     },
-    elements: [markdown(content)],
+    elements,
   }
 }
 

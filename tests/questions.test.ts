@@ -93,6 +93,20 @@ describe('QuestionAnswerer', () => {
     expect(JSON.stringify(settled)).not.toContain('behaviors')
   })
 
+  it('reports the question wait when a card opens and when it is answered', async () => {
+    const channel = makeChannel()
+    const onWaitingChange = vi.fn()
+    const answerer = new QuestionAnswerer(channel, { routeFor: () => ROUTE, onError: vi.fn(), onWaitingChange }, 60_000)
+    const pending = answerer.onRequest({
+      questions: [{ id: 'q1', question: '自由作答？' }], agent: makeAgent(makeSession('s1')),
+    }, vi.fn(async () => ({ answers: [] })))
+    expect(onWaitingChange).toHaveBeenLastCalledWith('s1', true)
+    await vi.advanceTimersByTimeAsync(0)
+    answerer.submitText('s1', '答')
+    await pending
+    expect(onWaitingChange).toHaveBeenLastCalledWith('s1', false)
+  })
+
   it('delegates through next() for unowned sessions', async () => {
     const { answerer, channel } = makeAnswerer()
     const next = vi.fn(async () => ({ answers: [{ id: 'q', selected: ['x'] }] }))

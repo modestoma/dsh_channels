@@ -2028,6 +2028,9 @@ export class FeishuService {
     // fail every ask with NO_PROVIDER.
     const questions = new QuestionAnswerer(channel, {
       routeFor: sessionId => this.approvalRouteFor(sessionId),
+      onWaitingChange: (sessionId, waiting) => {
+        this.streamer?.setAwaitingAnswer(sessionId, waiting)
+      },
       onError: (sessionId, error) => {
         this.ctx.logger?.warn?.('dsh-channels question error (session %s): %s', sessionId, String(error))
       },
@@ -2086,6 +2089,9 @@ export class FeishuService {
     this.unlistenHost.push(this.ctx.on('agent/inbox/claimed', ({ agent, message, turn }) => {
       this.codeWriteGate.onClaimed(agent.session.id, message.id)
       this.streamer?.onInboxClaimed(agent.session, message, turn)
+    }))
+    this.unlistenHost.push(this.ctx.on('agent/inbox/discarded', ({ agent, message }) => {
+      this.streamer?.onInboxDiscarded(agent.session, message)
     }))
     this.unlistenHost.push(this.ctx.on('tools/pre-execute', async (exec, next) => this.codeWriteGate.decide(exec) ?? await next()))
     this.unlistenHost.push(this.ctx.on('repo/commit-trailers', async (event) => {

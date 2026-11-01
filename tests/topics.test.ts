@@ -179,7 +179,7 @@ describe('topic launch flow', () => {
     await waitUntil(() => expect(h.routes()).toHaveLength(1))
     const streaming = h.channel.sent[1]!
     expect(streaming.options).toEqual({ replyTo: 'om_1', replyInThread: true })
-    expect(JSON.stringify(streaming.input)).toContain('推理中')
+    expect(JSON.stringify(streaming.input)).toContain('⚙️ 进行中')
     expect(h.routes()[0]).toMatchObject({
       key: 'omt_2', kind: 'thread', chatId: 'oc_group', senderUserId: 'u_alice',
       cardMessageId: 'om_2', shared: true,

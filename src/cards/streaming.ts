@@ -5,17 +5,18 @@
  *
  * Composition, main card:
  *
- *   [fold panel] [activity status] [activity tool] [body]
+ *   [origin] [headline] [reasoning fold panel] [delegation status] [body]
  *   [hr] [model · session · reasoning time]
  *   [context share · input · output · cache hit]
  *
- * - The panel shows the reasoning behind its own window. While the turn is
- *   still thinking it doubles as the phase indicator; once the turn settles
- *   without any reasoning content (non-reasoning models) it is omitted
- *   entirely instead of leaving an empty bordered box.
- * - The two activity lines are transient: the streamer only passes them for
- *   the card that is currently streaming, so frozen segment cards never repeat
- *   a stale "正在调用工具" line.
+ * - The headline is the one place the turn's state shows: what it is doing
+ *   while it runs, its outcome once settled.
+ * - The panel (`思考过程`) folds the reasoning behind its own window and
+ *   renders only when there is reasoning; it never indicates state.
+ * - The headline and the delegation line are transient: the streamer only
+ *   passes them for the card that is currently streaming, so frozen segment
+ *   cards never repeat a stale status. A live turn without answer text shows
+ *   no body placeholder.
  * - The settled footer is a divider plus two notation lines and renders
  *   exactly once: on the main card, only after the turn settles. It carries
  *   the model/effort, session id and the turn's accumulated reasoning time
@@ -47,13 +48,21 @@ import { card, divider, foldPanel, markdown, note, textButton } from './primitiv
 
 export type PanelPhase = 'thinking' | 'replying' | 'done' | 'stopped' | 'error'
 
-export const PANEL_TITLES: Record<PanelPhase, string> = {
-  thinking: '推理中',
-  replying: '回复中',
-  done: '回复结束',
-  stopped: '已停止',
-  error: '回复失败',
+/**
+ * Headline per phase, used when the caller passes none (first frames and
+ * terminal cards built outside the streamer). The streamer passes a precise
+ * headline mapped from the live DSH events.
+ */
+export const TURN_HEADLINES: Record<PanelPhase, string> = {
+  thinking: '⚙️ 进行中',
+  replying: '✍️ 输出中',
+  done: '✅ 已完成',
+  stopped: '⏹ 已停止',
+  error: '❌ 失败',
 }
+
+/** Title of the fold panel holding the turn's reasoning. */
+export const REASONING_PANEL_TITLE = '思考过程'
 
 /** `decision` carried by the interrupted card's continue button. */
 export const RESUME_ACTION = 'turn-resume'
@@ -138,12 +147,17 @@ export interface CardState {
    */
   status?: string
   /**
-   * The parent agent's in-flight tool call, rendered as a notation line below
-   * the status line. Independent of `status`: neither ever supersedes the
-   * other. Same rule as `status` — only the actively streaming card renders it.
-   * Empty/undefined → omitted.
+   * What the turn is doing, rendered as the card's first line. Undefined →
+   * the phase's {@link TURN_HEADLINES} entry on the main card (none on a
+   * continuation card); '' → omitted (the streamer passes it only for the
+   * card that is currently streaming, and the outcome only for the main card).
    */
-  tool?: string
+  headline?: string
+  /**
+   * The queued message left the agent inbox unclaimed: the main card renders
+   * only the removed-from-queue notice.
+   */
+  dropped?: boolean
   /**
    * Stop control for the actively streaming card. Same rule as `status`: the
    * streamer passes it only for the current card of an unsettled turn.
@@ -347,28 +361,24 @@ function buildUsageLine(stats: CardStats): string {
     + ` · 📩 输入 ${fmt(stats.inputTokens)} · 📨 输出 ${fmt(stats.outputTokens)} · ⚡ 缓存命中 ${fmtCacheHit(stats.cacheHitPct)}`
 }
 
-function reasoningPlaceholder(phase: PanelPhase): string {
-  return phase === 'thinking' ? '*等待模型输出…*' : '*（本次无推理内容）*'
+/** Body of a settled turn that wrote no answer text. */
+const EMPTY_BODY = '*（本次无正文输出）*'
+
+/** The panel's markdown: the reasoning stripped of tables. */
+function panelContent(reasoning: string): string {
+  return stripTables(reasoning)
 }
 
-function bodyPlaceholder(phase: PanelPhase): string {
-  return isSettled(phase) ? '*（本次无正文输出）*' : '*正在生成…*'
+/** Whether the fold panel renders: only when there is reasoning to fold away. */
+function panelShown(reasoning: string): boolean {
+  return stripTables(reasoning).trim() !== ''
 }
 
-/** The panel's markdown: stripped of tables, with a placeholder when empty. */
-function panelContent(phase: PanelPhase, reasoning: string): string {
-  const stripped = stripTables(reasoning)
-  return stripped.trim() === '' ? reasoningPlaceholder(phase) : stripped
-}
-
-/**
- * Whether the fold panel renders. `thinking` always does (it carries the
- * phase indicator while the card is otherwise empty); every later phase only
- * when there is actual reasoning to fold away — a settled non-reasoning turn
- * gets no empty bordered box.
- */
-function panelShown(phase: PanelPhase, reasoning: string): boolean {
-  return phase === 'thinking' || stripTables(reasoning).trim() !== ''
+/** `思考过程`, plus the reasoning time once the turn settled. */
+function panelTitle(state: CardState): string {
+  return isSettled(state.phase) && state.stats.reasoningMs !== undefined
+    ? `${REASONING_PANEL_TITLE} · ${fmtReasoningTime(state.stats.reasoningMs)}`
+    : REASONING_PANEL_TITLE
 }
 
 /** Continuation header: `📄 回复分段 {n}`. */
@@ -392,17 +402,13 @@ function isSettled(phase: PanelPhase): boolean {
  */
 const ACTIVITY_LINE_MAX_CHARS = 512
 
-/** One caller-supplied notation line, defensively capped; undefined when empty. */
-function activityNote(text: string | undefined): object | undefined {
+/** One caller-supplied status line, defensively capped; undefined when empty. */
+function activityLine(text: string | undefined): string | undefined {
   if (text === undefined || text === '') return undefined
-  const clipped = text.length <= ACTIVITY_LINE_MAX_CHARS
+  return text.length <= ACTIVITY_LINE_MAX_CHARS
     ? text
     : `${text.slice(0, ACTIVITY_LINE_MAX_CHARS - 1)}…`
-  return note(clipped)
 }
-
-/** Main-card line of a turn that ended through a stop request. */
-export const STOPPED_NOTICE = '⏹ 已按请求停止本轮回复'
 
 /** The stop button plus its optional owner-only notice. */
 function stopElements(stop: StopControl, denied: boolean): object[] {
@@ -426,6 +432,9 @@ export const STEER_LABEL = '⚡ 立即补充到当前回复'
 
 /** Body of a queued card after its message moved into the running turn. */
 export const MERGED_NOTICE = '↪️ 已补充到当前回复：当前这一步结束后模型就会读到这条消息，回复继续在上一张卡片中输出'
+
+/** Body of a queued card whose message was removed from the agent inbox before any turn claimed it. */
+export const DROPPED_NOTICE = '↩️ 这条消息已从队列中移除，没有处理'
 
 /** The queued card: notice, steer button and the optional owner-only notice. */
 function queuedElements(denied: boolean): object[] {
@@ -454,32 +463,27 @@ function renderCard(
 ): object {
   const segment = options.segment
   const main = segment === undefined
+  if (main && state.dropped === true) return card([markdown(DROPPED_NOTICE)])
   if (main && state.queued === true) return card(queuedElements(state.queuedDenied === true))
   const elements: object[] = []
 
-  if (main) {
-    if (state.origin !== undefined && state.origin !== '') elements.push(note(state.origin))
-    if (panelShown(state.phase, reasoning)) {
-      elements.push(foldPanel(
-        PANEL_TITLES[state.phase],
-        panelContent(state.phase, reasoning),
-        PANEL_CHEVRON_TOKEN,
-      ))
-    }
-  } else {
-    elements.push(note(segmentHeader(segment)))
+  if (main && state.origin !== undefined && state.origin !== '') elements.push(note(state.origin))
+  if (!main) elements.push(note(segmentHeader(segment)))
+  const headline = state.headline ?? (main ? TURN_HEADLINES[state.phase] : '')
+  const headlineLine = activityLine(headline)
+  if (headlineLine !== undefined) elements.push(markdown(headlineLine))
+  if (main && panelShown(reasoning)) {
+    elements.push(foldPanel(panelTitle(state), panelContent(reasoning), PANEL_CHEVRON_TOKEN))
   }
 
-  const statusNote = activityNote(state.status)
-  if (statusNote !== undefined) elements.push(statusNote)
-  const toolNote = activityNote(state.tool)
-  if (toolNote !== undefined) elements.push(toolNote)
+  const statusLine = activityLine(state.status)
+  if (statusLine !== undefined) elements.push(note(statusLine))
 
-  elements.push(markdown(body.trim() === '' ? bodyPlaceholder(state.phase) : body))
+  // A live turn without answer text yet shows only its headline.
+  if (body.trim() !== '') elements.push(markdown(body))
+  else if (main && isSettled(state.phase)) elements.push(markdown(EMPTY_BODY))
 
   if (state.stop !== undefined) elements.push(...stopElements(state.stop, state.stopDenied === true))
-
-  if (main && state.phase === 'stopped') elements.push(note(STOPPED_NOTICE))
 
   if (main && isSettled(state.phase)) {
     // The divider separates the answer from the turn's metadata; the two
@@ -523,7 +527,7 @@ function budgetReasoning(state: CardState): string {
   return fitPrefix(
     state.reasoning,
     REASONING_MAX_BYTES,
-    content => jsonBytes(panelContent(state.phase, content)),
+    content => jsonBytes(panelContent(content)),
     TRUNCATION_SUFFIX,
   )
 }
@@ -557,6 +561,9 @@ export function buildCard(state: CardState, options: CardOptions = {}): object {
  */
 const PANEL_PROBE_MARKDOWN = 'r'.repeat(REASONING_MAX_BYTES - 2)
 
+/** Worst-case status line: the streamer's 64-character cap, in 3-byte CJK characters. */
+const LINE_PROBE = '状'.repeat(64)
+
 /**
  * Split a body so one card fits: `head` re-renders within `CARD_TARGET_BYTES`
  * and `tail` flows into the next segment card ('' when everything fits).
@@ -565,8 +572,9 @@ const PANEL_PROBE_MARKDOWN = 'r'.repeat(REASONING_MAX_BYTES - 2)
  * always budgets the panel's full window (reasoning may keep growing after the
  * split) and its settled footer, while continuation cards have neither. Every
  * card also budgets the stop button with its notice, since the newest card
- * carries it while streaming. The `error` phase is probed because it has the
- * longest panel title.
+ * carries it while streaming. The headline and the delegation line are
+ * probed at the streamer's 64-character cap in CJK text, and the settled panel
+ * title with its reasoning time.
  */
 export function segmentCardContent(state: CardState, options: CardOptions = {}): BodySplit {
   const main = options.segment === undefined
@@ -574,8 +582,11 @@ export function segmentCardContent(state: CardState, options: CardOptions = {}):
     ...state,
     phase: 'error',
     reasoning: main ? PANEL_PROBE_MARKDOWN : '',
+    headline: LINE_PROBE,
+    status: LINE_PROBE,
     stop: 'stopping',
     stopDenied: true,
+    stats: { ...state.stats, reasoningMs: state.stats.reasoningMs ?? 0 },
   }
   const limit = fitPrefix(
     state.body,
