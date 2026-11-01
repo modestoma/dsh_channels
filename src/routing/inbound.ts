@@ -1141,7 +1141,7 @@ export class InboundRouter {
         firstTurn: true,
         excludeMessageIds: [msg.messageId, sent.messageId],
       })
-      await this.repair.recordMessage(sent.messageId, message)
+      await this.repair.recordMessage(sent.messageId, message, msg.senderId)
       this.streamer?.attach(handle.agent.session, sent.messageId, msg.messageId, typingId, { message })
       handle.agent.followup(message)
     } finally {
@@ -1206,7 +1206,7 @@ export class InboundRouter {
     const message = await this.deliverTurnMessage(msg, current, content, {
       excludeMessageIds: [msg.messageId, sent.messageId],
     })
-    await this.repair.recordMessage(sent.messageId, message)
+    await this.repair.recordMessage(sent.messageId, message, msg.senderId)
     this.streamer?.attach(live.agent.session, sent.messageId, msg.messageId, typingId, { message })
     live.agent.followup(message)
   }

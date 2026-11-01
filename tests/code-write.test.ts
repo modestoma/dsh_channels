@@ -102,6 +102,19 @@ describe('CodeWriteGate', () => {
     expect(gate.driverOf('s_web')).toBeUndefined()
   })
 
+  it('denies every gated call of a turn whose sender is unknown, and names no driver for it', () => {
+    const { gate } = setup({ u_owner: ['codeWrite'] })
+    gate.noteMessage('m_replayed', undefined)
+    gate.onClaimed('s_root', 'm_replayed')
+    const decision = gate.decide(call('s_root'))
+    expect(decision).toMatchObject({ kind: 'deny', reason: expect.stringContaining('无法确认这一轮的飞书发言人') })
+    expect(gate.decide(call('s_root', undefined, 'read_file'))).toBeUndefined()
+    expect(gate.driverOf('s_root')).toBeUndefined()
+    gate.noteMessage('m_next', 'u_owner')
+    gate.onClaimed('s_root', 'm_next')
+    expect(gate.decide(call('s_root'))).toBeUndefined()
+  })
+
   it('forgets the oldest noted senders beyond its bound', () => {
     const { gate } = setup({ u_bob: ['codeWrite'] })
     gate.noteMessage('m_first', 'u_bob')

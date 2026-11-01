@@ -10,7 +10,9 @@
  *   of Sessions the channel does not route are never touched.
  * - Driver: the Feishu sender of the message the current turn claimed. Turns
  *   no Feishu message started (subagent results, jobs, schedules) keep the
- *   previous driver; before any claimed message the route owner drives.
+ *   previous driver; before any claimed message the route owner drives. A
+ *   prompt replayed after a restart carries the sender stored with it; when
+ *   none was stored, every gated call of that turn is denied.
  * - The check runs in `tools/pre-execute`, before the tool's own approval, so
  *   it holds whatever approval mode the tool's plugin uses.
  *
@@ -29,6 +31,10 @@ import type { PreToolDecision, PreToolExecution } from '../dsh-types.ts'
 /** Remembered message senders (bounded; oldest dropped first). */
 const MAX_NOTED_MESSAGES = 2_000
 
+/** Driver of a turn whose Feishu sender cannot be established (a replayed prompt of an older snapshot). */
+const UNKNOWN_SENDER = Symbol('unknown sender')
+type Driver = string | typeof UNKNOWN_SENDER
+
 export interface CodeWriteGateDeps {
   /** Live configuration (`codeWriteTools`). */
   config(): Pick<FeishuConfig, 'codeWriteTools'>
@@ -39,10 +45,10 @@ export interface CodeWriteGateDeps {
 }
 
 export class CodeWriteGate {
-  /** Feishu message id (DSH `UserMessage.id`) → sender user_id. */
-  private readonly senders = new Map<string, string>()
+  /** DSH `UserMessage.id` → Feishu sender user_id. */
+  private readonly senders = new Map<string, Driver>()
   /** Routed Session id → user_id that drives its current turn. */
-  private readonly drivers = new Map<string, string>()
+  private readonly drivers = new Map<string, Driver>()
   /** Descendant Session id → routed ancestor Session id. */
   private readonly roots = new Map<string, string>()
 
@@ -51,10 +57,11 @@ export class CodeWriteGate {
   /**
    * Record who sent the prompt carried by one DSH user message.
    * @param messageId - the `UserMessage.id` submitted to the Agent.
-   * @param userId - Feishu user_id of the sender.
+   * @param userId - Feishu user_id of the sender; undefined when it cannot be
+   *   established, which denies every gated call of the turn it starts.
    */
-  noteMessage(messageId: string, userId: string): void {
-    this.senders.set(messageId, userId)
+  noteMessage(messageId: string, userId: string | undefined): void {
+    this.senders.set(messageId, userId ?? UNKNOWN_SENDER)
     if (this.senders.size <= MAX_NOTED_MESSAGES) return
     const oldest = this.senders.keys().next().value
     if (oldest !== undefined) this.senders.delete(oldest)
@@ -85,7 +92,14 @@ export class CodeWriteGate {
     const root = this.rootOf(agent.session.id, agent.session.header.parentSession)
     if (root === undefined || !this.deps.config().codeWriteTools.includes(exec.name)) return undefined
     const driver = this.driverOfRoot(root)
-    if (driver === undefined || this.deps.mayUse(driver, 'codeWrite')) return undefined
+    if (driver === undefined) return undefined
+    if (driver === UNKNOWN_SENDER) {
+      return {
+        kind: 'deny',
+        reason: `无法确认这一轮的飞书发言人（重启后恢复的消息），不能调用 ${exec.name}。请告诉用户：重新发送一条消息后再试。`,
+      }
+    }
+    if (this.deps.mayUse(driver, 'codeWrite')) return undefined
     return {
       kind: 'deny',
       reason: `飞书用户 ${driver} 没有代码改动权限，不能调用 ${exec.name}。请告诉用户：需要管理员在设置面板「访问授权」里打开该用户的「改代码」，或在飞书发送 /auth set code on @该用户；本地工作区里的修改不受影响。`,
@@ -96,14 +110,16 @@ export class CodeWriteGate {
    * The Feishu user driving the current turn of a routed Session or of a
    * descendant this gate has already seen a call from.
    * @param sessionId - the Session.
-   * @returns the driver's user_id, or undefined when Feishu does not route the Session.
+   * @returns the driver's user_id, or undefined when Feishu does not route the
+   *   Session or the driver cannot be established.
    */
   driverOf(sessionId: string): string | undefined {
     const root = this.deps.routeOf(sessionId) !== undefined ? sessionId : this.roots.get(sessionId)
-    return root === undefined ? undefined : this.driverOfRoot(root)
+    const driver = root === undefined ? undefined : this.driverOfRoot(root)
+    return driver === UNKNOWN_SENDER ? undefined : driver
   }
 
-  private driverOfRoot(root: string): string | undefined {
+  private driverOfRoot(root: string): Driver | undefined {
     const route = this.deps.routeOf(root)
     return route === undefined ? undefined : this.drivers.get(root) ?? route.senderUserId
   }

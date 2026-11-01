@@ -203,6 +203,12 @@ export const inflightSnapshotSchema = z.object({
    * recovery replays it when the Session log shows the turn never claimed it.
    */
   message: inflightMessageSchema.optional(),
+  /**
+   * Feishu user_id of the sender of `message`; restart recovery hands it to
+   * the code-write gate with the replayed prompt. Absent in snapshots written
+   * before it was recorded.
+   */
+  senderUserId: z.string().min(1).optional(),
   /** How often restart recovery already replayed `message` (cap: 1). */
   replays: z.number().int().nonnegative().optional(),
   /** Reaction id of the Typing reaction (absent when the add failed). */

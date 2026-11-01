@@ -63,6 +63,7 @@
   reactionId?: string            // Typing 表情的 reaction id（add 失败时缺省）
   routeKey?: string              // 这一轮所在的路由，恢复时据此找回 Session
   message?: UserMessage          // 交给 followup() 的消息（序列化 ≤ 256 KB，超出不存）
+  senderUserId?: string          // message 的飞书发送者；重放时交给代码改动闸门（旧快照没有，重放的回合拒绝代码改动工具）
   replays?: number               // 已重放次数（上限 1）
   cards: Array<{ messageId: string; mode: 'card' | 'text' }>  // 段卡列表，[0] = 主卡
   startedAt: number              // 附加时间（TTL 清理用）

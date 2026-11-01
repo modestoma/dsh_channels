@@ -2413,7 +2413,7 @@ describe('FeishuService', () => {
   /** Establish one p2p session, then restart with its turn left unfinished. */
   async function restartMidTurn(
     prepareLog: (session: Session, prompt: { id: string }, agent: Agent) => void,
-    options: { live?: boolean; beforeStart?: (channel: ReturnType<typeof makeChannel>) => void } = {},
+    options: { live?: boolean; beforeStart?: (channel: ReturnType<typeof makeChannel>) => void; afterShutdown?: (h: Harness) => void } = {},
   ): Promise<{ h: Harness; channel2: ReturnType<typeof makeChannel>; service2: FeishuService; original: Agent; prompt: { id: string }; trigger: string }> {
     const agentsOptions: FakeAgentsOptions = {}
     const h = await setup(recoveryConfig, {}, undefined, agentsOptions)
@@ -2424,6 +2424,7 @@ describe('FeishuService', () => {
     const prompt = mock(original.followup).mock.calls[0]![0] as { id: string }
     prepareLog(original.session, prompt, original)
     await h.service.shutdown()
+    options.afterShutdown?.(h)
     if (options.live !== true) {
       // A new process: the durable log survives, the inbox does not.
       agentsOptions.resumeSession = original.session
@@ -2456,6 +2457,37 @@ describe('FeishuService', () => {
     await waitUntil(() => expect(inflightEntries(h)).toHaveLength(0))
     expect(channel2.sent).toHaveLength(0)
     await service2.shutdown()
+  })
+
+  it('replays a prompt with its stored Feishu sender as the code-write driver, and denies when none was stored', async () => {
+    const gatedPush = async (h: Harness) => {
+      h.config.codeWriteTools = ['repo_workspace_push']
+      await waitUntil(() => expect(h.ctxState.agents.resumed).toHaveLength(1))
+      const resumed = h.ctxState.agents.resumed[0]!.handle.agent
+      // The fake inbox claims the replayed prompt as soon as it is submitted.
+      await waitUntil(() => expect(mock(resumed.followup)).toHaveBeenCalledTimes(1))
+      return { resumed, claimed: h.ctxState.preExecuteListeners.at(-1)! }
+    }
+    const stored = await restartMidTurn(() => {})
+    expect(inflightEntries(stored.h)).toEqual([['om_1', expect.objectContaining({ senderUserId: 'u_alice' })]])
+    const first = await gatedPush(stored.h)
+    expect(await first.claimed({ name: 'repo_workspace_push', agent: first.resumed }, async () => ({ kind: 'allow' })))
+      .toMatchObject({ kind: 'deny', reason: expect.stringContaining('飞书用户 u_alice 没有代码改动权限') })
+    await stored.service2.shutdown()
+
+    const legacy = await restartMidTurn(() => {}, {
+      afterShutdown: (h) => {
+        const table = h.ctxState.domain.raw.table('inflight')
+        for (const [key, value] of [...(table.entries() as IterableIterator<[string, Record<string, unknown>]>)]) {
+          const { senderUserId: _dropped, ...rest } = value
+          table.put(key, rest)
+        }
+      },
+    })
+    const second = await gatedPush(legacy.h)
+    expect(await second.claimed({ name: 'repo_workspace_push', agent: second.resumed }, async () => ({ kind: 'allow' })))
+      .toMatchObject({ kind: 'deny', reason: expect.stringContaining('无法确认这一轮的飞书发言人') })
+    await legacy.service2.shutdown()
   })
 
   it('renders the final reply of a turn that completed before its card was patched', async () => {

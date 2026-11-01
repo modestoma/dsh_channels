@@ -496,7 +496,9 @@ export class FeishuService {
         liveAgent: snapshot => this.recoveryAgent(snapshot),
         replay: (agent, snapshot, message, submit) => {
           this.streamer?.attach(agent.session, snapshot.cards[0]!.messageId, snapshot.triggerMessageId, snapshot.reactionId, { message })
-          if (submit) agent.followup(message)
+          if (!submit) return
+          this.codeWriteGate.noteMessage(message.id, snapshot.senderUserId)
+          agent.followup(message)
         },
       },
     })

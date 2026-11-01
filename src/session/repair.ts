@@ -164,14 +164,15 @@ export class InflightRepair {
   }
 
   /**
-   * Store the prompt of a turn whose snapshot was written before the prompt
-   * was assembled. A missing snapshot (the turn already settled) is skipped.
+   * Store the prompt of a turn, and its Feishu sender, whose snapshot was
+   * written before the prompt was assembled. A missing snapshot (the turn
+   * already settled) is skipped.
    */
-  async recordMessage(key: string, message: UserMessage): Promise<void> {
+  async recordMessage(key: string, message: UserMessage, senderUserId: string): Promise<void> {
     const stored = storableMessage(message)
     if (stored === undefined) return
     try {
-      await this.deps.domain()?.inflight.update(key, snapshot => ({ ...snapshot, message: stored }))
+      await this.deps.domain()?.inflight.update(key, snapshot => ({ ...snapshot, message: stored, senderUserId }))
     } catch (error) {
       this.deps.warn('dsh-channels: storing the prompt of inflight snapshot %s failed: %s', key, String(error))
     }
