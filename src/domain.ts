@@ -266,6 +266,12 @@ export const accessUserRecordSchema = z.object({
   wikiWrite: z.boolean().default(false),
   /** Turns the user drives may call the configured code-write tools. */
   codeWrite: z.boolean().default(false),
+  /**
+   * Git email the administrator set for this user; commits pushed for a turn
+   * the user drives name them as author with it. Absent: the host token's
+   * account stays the author.
+   */
+  gitEmail: z.string().optional(),
 })
 
 /** The four permission switches of one access-table user. */

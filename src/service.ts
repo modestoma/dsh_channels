@@ -280,6 +280,7 @@ function userWire(record: AccessUserRecord): AccessUserWire {
     wikiRead: record.wikiRead,
     wikiWrite: record.wikiWrite,
     codeWrite: record.codeWrite,
+    ...(record.gitEmail === undefined ? {} : { gitEmail: record.gitEmail }),
   }
 }
 
@@ -1298,6 +1299,24 @@ export class FeishuService {
     }
   }
 
+  /**
+   * Panel: set or clear the git email of a user already in the table.
+   * @param userId - Feishu user_id.
+   * @param gitEmail - validated email, or undefined to clear it.
+   * @returns the refreshed access snapshot, or the failure.
+   */
+  async setAccessGitEmail(userId: string, gitEmail: string | undefined): Promise<AccessMutationResponse> {
+    const id = this.cleanAccessUserId(userId)
+    if (id === undefined) return { ok: false, error: 'user_id 不合法' }
+    try {
+      const updated = await this.accessStore.setGitEmail(id, gitEmail)
+      if (updated === undefined) return { ok: false, error: '该用户不在用户表中，请先添加' }
+      return { ok: true, access: this.accessSnapshot() }
+    } catch (error) {
+      return { ok: false, error: `写入 Git 邮箱失败：${messageOf(error)}` }
+    }
+  }
+
   /** Add a user with only `chat` on, or turn `chat` on for an existing record. */
   private async grantChat(userId: string, name: string | undefined, source: AccessUserRecord['source'], admin: string): Promise<void> {
     await this.accessStore.grantChat({
@@ -1579,11 +1598,17 @@ export class FeishuService {
    * and it is cut to 80 characters.
    * Lookup failures only lose the name.
    */
-  private async feishuUserTrailer(userId: string): Promise<string> {
+  /**
+   * Name of a Feishu user as commits record it: the contact name, else the
+   * name in the user table, without `<`, `>`, or control characters.
+   * @param userId - Feishu user_id.
+   * @returns the name, or undefined when neither source has one.
+   */
+  private async commitName(userId: string): Promise<string | undefined> {
     const profile = (await this.feishuProfiles([userId], [])).users[userId]
     const raw = profile?.name ?? this.accessStore.getUser(userId)?.name ?? ''
     const name = raw.replace(/[<>]/gu, '').replace(/[\s\u0000-\u001f\u007f]+/gu, ' ').trim().slice(0, 80)
-    return name === '' ? userId : `${name} <${userId}>`
+    return name === '' ? undefined : name
   }
 
   /** Chat-member-list name for a user the contact profile cannot name. */
@@ -2043,7 +2068,11 @@ export class FeishuService {
     this.unlistenHost.push(this.ctx.on('tools/pre-execute', async (exec, next) => this.codeWriteGate.decide(exec) ?? await next()))
     this.unlistenHost.push(this.ctx.on('repo/commit-trailers', async (event) => {
       const userId = this.codeWriteGate.driverOf(event.session)
-      if (userId !== undefined) event.add('Feishu-User', await this.feishuUserTrailer(userId))
+      if (userId === undefined) return
+      const name = await this.commitName(userId)
+      event.add('Feishu-User', name === undefined ? userId : `${name} <${userId}>`)
+      const gitEmail = this.accessStore.getUser(userId)?.gitEmail
+      if (gitEmail !== undefined) event.setAuthor?.(name ?? userId, gitEmail)
     }))
     this.unlisten = channel.onMessage(message => {
       void this.dispatchInbound(channel, message)

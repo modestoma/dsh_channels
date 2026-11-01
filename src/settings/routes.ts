@@ -28,6 +28,7 @@ import {
   TAKEOVER_ROUTE,
   REMOVE_ACCESS_USER_ROUTE,
   RESOLVE_ACCESS_REQUEST_ROUTE,
+  SET_ACCESS_GIT_EMAIL_ROUTE,
   SET_ACCESS_PERMISSION_ROUTE,
   SAVE_CONFIG_ROUTE,
   SAVE_CREDENTIALS_ROUTE,
@@ -248,6 +249,10 @@ export function registerSettingsRoutes(connection: HostConnection, surface: Sett
     post(SET_ACCESS_PERMISSION_ROUTE, async (request) => {
       const payload = await readJsonObject(request)
       return result(await surface.setAccessPermission(payload.userId, payload.permission, payload.enabled))
+    }),
+    post(SET_ACCESS_GIT_EMAIL_ROUTE, async (request) => {
+      const payload = await readJsonObject(request)
+      return result(await surface.setAccessGitEmail(payload.userId, payload.gitEmail))
     }),
     post(RESOLVE_ACCESS_REQUEST_ROUTE, async (request) => {
       const payload = await readJsonObject(request)

@@ -41,6 +41,7 @@
 - 发言人不是管理员、也没有打开 `codeWrite` 时返回 `deny`，原因写明用户和开通方式，模型据此转告用户。检查在工具自身审批之前，所以 dsh-repo 的 `tools.writes` 设为 `allow` 时也生效。
 - 只拦列出的工具，不拦本地文件编辑与 shell。状态只在内存里，关闭时清空。
 - 同一个发言人也写进提交：插件监听 dsh-repo 的 `repo/commit-trailers` 事件（事件类型在本插件 `src/host/core.ts` 里自行声明，不依赖 dsh-repo 的包），对飞书会话及其已见过的子代理追加 `Feishu-User: 名字 <user_id>`。名字取通讯录，其次用户表，去掉 `<` `>`、空白和控制字符合并为一个空格、最多 80 个字符；读不到名字时只写 user_id。
+- 同一个发言人也可以是提交作者：用户表记录有可选的 `gitEmail`，只能由管理员在设置面板填写（`/api/dsh-channels.setAccessGitEmail`，去掉首尾空白，必须是一个不含空白、`<`、`>` 的 `local@domain`，最长 254 个字符，空值清除）。发言人有 `gitEmail` 时，监听者在追加尾注之外调用事件的 `setAuthor(名字, gitEmail)`，名字同尾注，读不到时用 user_id；提交者仍是 dsh-repo 的令牌账号。用户不能自己登记邮箱，避免以同事的名义提交。事件没有 `setAuthor`（旧版 dsh-repo）时只加尾注。
 - 默认 `codeWriteTools`：`repo_workspace_push`、`repo_mr_create|update|comment|merge`、`repo_issue_create|update|comment`、`logalyze_improve_skill`、`logalyze_submit_init`。dsh_channels 不依赖这些插件，只按工具名匹配。
 
 ### A.4 存储与升级

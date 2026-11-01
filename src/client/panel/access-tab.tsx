@@ -25,11 +25,12 @@ export interface AccessTabProps {
   onAddUser: (userId: string, name: string) => Promise<boolean>
   onRemoveUser: (userId: string) => void
   onTogglePermission: (userId: string, permission: AccessPermissionWire, enabled: boolean) => void
+  onSetGitEmail: (userId: string, gitEmail: string) => Promise<boolean>
   onResolveRequest: (token: string, decision: 'allow' | 'deny') => void
 }
 
 export function AccessTab(props: AccessTabProps): JSX.Element {
-  const { form, profiles, accessNotice, accessError, onAddUser, onRemoveUser, onTogglePermission, onResolveRequest } = props
+  const { form, profiles, accessNotice, accessError, onAddUser, onRemoveUser, onTogglePermission, onSetGitEmail, onResolveRequest } = props
   const { access } = form.panel
   const working = form.busy === 'access'
   const disabled = form.busy !== null || form.locked || !access.loaded
@@ -68,6 +69,7 @@ export function AccessTab(props: AccessTabProps): JSX.Element {
         onAdd={onAddUser}
         onRemove={onRemoveUser}
         onToggle={onTogglePermission}
+        onSetGitEmail={onSetGitEmail}
       />
     </div>
   )

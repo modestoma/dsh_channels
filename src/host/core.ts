@@ -146,8 +146,12 @@ export type PreToolDecision =
 /**
  * Payload of dsh-repo's `repo/commit-trailers` event, declared locally so
  * this plugin needs no dsh-repo package. `add` takes a trailer token and a
- * one-line value of at most 200 characters without control characters; it
- * must be called before the listener settles.
+ * one-line value of at most 200 characters without control characters;
+ * `setAuthor` makes someone other than the committer the commit's author
+ * (name without `<` `>` or newlines, email without `<` `>` or whitespace) and
+ * may be called once per push across all listeners. Both must be called
+ * before the listener settles. Versions of dsh-repo before `setAuthor`
+ * existed omit it.
  */
 export interface CommitTrailersEvent {
   /** Session id of the Agent pushing the workspace. */
@@ -155,6 +159,7 @@ export interface CommitTrailersEvent {
   /** Workspace directory being pushed. */
   readonly dir: string
   add(token: string, value: string): void
+  setAuthor?(name: string, email: string): void
 }
 
 // ---- Session surface ----------------------------------------------------

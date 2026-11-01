@@ -38,6 +38,7 @@ import {
   takeover,
   removeAccessUser,
   resolveAccessRequest,
+  setAccessGitEmail,
   setAccessPermission,
   saveConfig,
   saveCredentials,
@@ -473,6 +474,28 @@ function FeishuChannelsPanel(): JSX.Element | null {
     }
   }, [applyAccess])
 
+  /** Set or clear one user's git email; resolves true when the editor should close. */
+  const onSetGitEmail = useCallback(async (userId: string, gitEmail: string): Promise<boolean> => {
+    setBusy('access')
+    setAccessError(null)
+    setAccessNotice(null)
+    try {
+      const result = await setAccessGitEmail(userId, gitEmail)
+      if (!result.ok) {
+        setAccessError(result.error)
+        return false
+      }
+      applyAccess(result.access)
+      setAccessNotice(PANEL_COPY.accessGitEmailChanged)
+      return true
+    } catch (error) {
+      setAccessError(messageOf(error))
+      return false
+    } finally {
+      setBusy(null)
+    }
+  }, [applyAccess])
+
   /** Add one user to the user table; resolves true when the input should clear. */
   const addUser = useCallback(async (
     add: (userId: string, name: string) => Promise<AccessMutationResponse>,
@@ -736,6 +759,7 @@ function FeishuChannelsPanel(): JSX.Element | null {
                 onAddUser={(userId, name) => addUser(addAccessUser, userId, name, PANEL_COPY.accessUserAdded)}
                 onRemoveUser={userId => { void removeUser(removeAccessUser, userId, PANEL_COPY.accessUserRemoved) }}
                 onTogglePermission={(userId, permission, enabled) => { void onTogglePermission(userId, permission, enabled) }}
+                onSetGitEmail={onSetGitEmail}
                 onResolveRequest={(token, decision) => { void onResolveAccessRequest(token, decision) }}
               />
             )

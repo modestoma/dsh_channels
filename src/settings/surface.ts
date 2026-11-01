@@ -121,6 +121,8 @@ export interface SettingsTarget {
   removeAccessUser(userId: string): Promise<AccessMutationResponse>
   /** Set one permission switch of a user already in the table (takes effect on the next check). */
   setAccessPermission(userId: string, permission: AccessPermissionWire, enabled: boolean): Promise<AccessMutationResponse>
+  /** Set or clear the git email of a user already in the table (used by the next push). */
+  setAccessGitEmail(userId: string, gitEmail: string | undefined): Promise<AccessMutationResponse>
   /** Settle one pending request (panel shares this path with the Feishu DM card). */
   resolveAccessRequest(token: string, decision: 'allow' | 'deny'): Promise<AccessMutationResponse>
   /** Feishu origin of one Session, or null when Feishu never routed it. */
@@ -615,6 +617,28 @@ export function normalizeAccessId(
   if (invalidFormat !== undefined && !FEISHU_USER_ID_PATTERN.test(value)) {
     return { ok: false, message: invalidFormat }
   }
+  return { ok: true, value }
+}
+
+/** Longest accepted git email (RFC 5321 path limit). */
+const MAX_GIT_EMAIL_LENGTH = 254
+
+/**
+ * Optional git email: trimmed; empty or null clears it. It must be one
+ * `local@domain` without whitespace, `<`, or `>`, so it fits a git
+ * `Name <email>` identity.
+ * @param raw - value from the request body.
+ * @returns the email, undefined to clear, or the rejection.
+ */
+export function normalizeGitEmail(
+  raw: unknown,
+): { ok: true; value: string | undefined } | { ok: false; message: string } {
+  if (raw === undefined || raw === null) return { ok: true, value: undefined }
+  if (typeof raw !== 'string') return { ok: false, message: 'Git 邮箱必须是字符串' }
+  const value = raw.trim()
+  if (value === '') return { ok: true, value: undefined }
+  if (value.length > MAX_GIT_EMAIL_LENGTH) return { ok: false, message: `Git 邮箱长度不得超过 ${MAX_GIT_EMAIL_LENGTH}` }
+  if (!/^[^\s<>@]+@[^\s<>@]+$/u.test(value)) return { ok: false, message: 'Git 邮箱格式不对：应为 name@example.com，不能含空白、< 或 >' }
   return { ok: true, value }
 }
 
@@ -1130,6 +1154,20 @@ export class SettingsSurface {
     }
     if (typeof enabled !== 'boolean') return { ok: false, error: 'enabled 必须是 true 或 false' }
     return this.mutateAccess(() => this.target.setAccessPermission(id.value, permission, enabled))
+  }
+
+  /**
+   * Set or clear one user's git email from the panel. Validation happens before the write.
+   * @param userId - raw `user_id` from the request body.
+   * @param gitEmail - raw email; empty string or null clears it.
+   * @returns the refreshed snapshot, or the validation/write failure.
+   */
+  async setAccessGitEmail(userId: unknown, gitEmail: unknown): Promise<AccessMutationResponse> {
+    const id = normalizeAccessId(userId, '用户 user_id', USER_ID_FORMAT)
+    if (!id.ok) return { ok: false, error: id.message }
+    const email = normalizeGitEmail(gitEmail)
+    if (!email.ok) return { ok: false, error: email.message }
+    return this.mutateAccess(() => this.target.setAccessGitEmail(id.value, email.value))
   }
 
   private async saveUser(
