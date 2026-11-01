@@ -27,7 +27,7 @@ import type { FeishuConfig } from '../config.ts'
 import { mountChannelCommands } from '../commands.ts'
 import { appendSessionHistory, sessionDirOf } from '../domain.ts'
 import type { RouteRecord } from '../domain.ts'
-import { mountChannelGuidance } from '../feishu/agent-context.ts'
+import { mountChannelGuidance, mountReplyGuidance } from '../feishu/agent-context.ts'
 import { attachmentsDir } from '../feishu/inbound-attachments.ts'
 import { effectiveAttachmentMode, resolveAttachmentService } from '../feishu/native-attachments.ts'
 import { installRequestPolicy } from './request-policy.ts'
@@ -89,6 +89,8 @@ function borrowLiveAgent(agent: Agent, release: () => void = () => {}): LiveAgen
 
 export class SessionManager {
   private readonly live = new Map<string, LiveAgent>()
+  /** Agents whose prompt sections this channel already registered. */
+  private readonly guided = new WeakSet<Agent>()
   private readonly pendingResume = new Map<string, Promise<LiveAgent>>()
   private readonly policies = new WeakMap<AgentContext, RequestPolicyController>()
   /** Agent scopes this plugin already attempted to mount model tools into. */
@@ -143,7 +145,9 @@ export class SessionManager {
   }
 
   /**
-   * Register the attachment guidance for one Session. Called after the
+   * Register the reply guidance and the attachment guidance for one Session.
+   * The reply guidance is mounted for every Feishu Session; its text follows
+   * `replyGuidance` on each model request. Called after the
    * effective working directory is known (a worktree checkout path is only
    * returned once the worktree exists), so the archive guidance can name the
    * absolute directory. The guidance flavor follows the *effective* attachment
@@ -153,6 +157,17 @@ export class SessionManager {
    * service (headless) is a no-op and a late registration never blocks the turn.
    */
   async mountGuidance(agent: Agent, directory: string): Promise<void> {
+    // One registration per Agent scope: a re-borrowed Agent keeps its sections.
+    if (this.guided.has(agent)) return
+    this.guided.add(agent)
+    try {
+      await mountReplyGuidance(agent.ctx, () => this.deps.config.replyGuidance)
+    } catch (error) {
+      this.deps.warn(
+        'dsh-channels: mounting reply guidance for session %s failed: %s',
+        agent.id, String(error),
+      )
+    }
     // With inbound attachments disabled the Agent has no attachment workflow to
     // discover (and the legacy guidance would wrongly claim files are archived).
     if (!this.deps.config.acceptAttachments) return
@@ -193,7 +208,7 @@ export class SessionManager {
     if (own !== undefined) return own
 
     const foreign = this.deps.ctx.agents.get(sessionId as SessionId)
-    if (foreign !== undefined) return await this.borrow(sessionId, foreign)
+    if (foreign !== undefined) return await this.borrow(record, foreign)
 
     let pending = this.pendingResume.get(sessionId)
     if (pending === undefined) {
@@ -205,8 +220,9 @@ export class SessionManager {
     return await pending
   }
 
-  /** Borrow one foreign live agent and mount this channel's scoped policy. */
-  private async borrow(sessionId: string, agent: Agent): Promise<LiveAgent> {
+  /** Borrow one foreign live agent and mount this channel's scoped policy, tools, and guidance. */
+  private async borrow(record: RouteRecord, agent: Agent): Promise<LiveAgent> {
+    const sessionId = record.sessionId
     const borrowed = borrowLiveAgent(agent, this.mountRequestPolicy(agent.ctx, agent))
     this.live.set(sessionId, borrowed)
     // Best-effort tool backfill (D7): the foreign owner may have composed the
@@ -214,6 +230,8 @@ export class SessionManager {
     // instance). mountToolsFor swallows failures, so the borrow itself never
     // fails; awaiting it makes the tool available before the first turn.
     await this.mountToolsFor(agent.ctx, sessionId)
+    // The foreign composition lacks this channel's prompt sections as well.
+    await this.mountGuidance(agent, sessionDirOf(record))
     return borrowed
   }
 
@@ -247,7 +265,7 @@ export class SessionManager {
       // Lost a cold-resume race: another owner published the session while our
       // resume was in flight. Borrow the winner instead of failing the turn.
       const winner = this.deps.ctx.agents.get(sessionId)
-      if (winner !== undefined) return await this.borrow(sessionId, winner)
+      if (winner !== undefined) return await this.borrow(record, winner)
       throw error
     }
   }

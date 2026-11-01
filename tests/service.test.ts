@@ -22,7 +22,7 @@ import type { Agent, AgentHandle, ApprovalOutcome, CordisPluginRuntime, MessageI
 import { RESUME_ACTION } from '../src/cards.ts'
 import type { RouteRecord } from '../src/domain.ts'
 import { sessionDirOf } from '../src/domain.ts'
-import { FEISHU_ATTACHMENTS_SECTION } from '../src/feishu/agent-context.ts'
+import { FEISHU_ATTACHMENTS_SECTION, FEISHU_REPLIES_GUIDANCE, FEISHU_REPLIES_SECTION } from '../src/feishu/agent-context.ts'
 import { ATTACHMENT_FETCH_TOOL_NAME, TOPIC_MESSAGES_TOOL_NAME } from '../src/feishu/tools.ts'
 import { SEND_FILE_TOOL_NAME } from '../src/feishu/send-file.ts'
 import type { SessionExportBuilder } from '../src/session-export.ts'
@@ -63,6 +63,7 @@ function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
     // Onboarding is opt-in per test: it adds a card that would shift send counts.
     welcomeOnboarding: false,
     hostTurnCards: true,
+    replyGuidance: true,
     // Restart recovery as before replay existed; the recovery tests opt in.
     replay: { pending: false, interrupted: 'notify' },
     // Catch-up stores a heartbeat in the domain global; its tests opt in.
@@ -2094,6 +2095,11 @@ describe('FeishuService', () => {
       provider: 'deepseek-official', model: 'deepseek-v4-flash',
     })).resolves.toMatchObject({ reasoningEffort: 'tiny' })
 
+    // The foreign composition gets this channel's prompt sections once.
+    await handler(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'u_alice', content: '再问一句', threadId: 'omt_1' }))
+    await waitUntil(() => expect(mock(foreignAgent.followup)).toHaveBeenCalledTimes(2))
+    expect(promptSectionsOf(foreignAgent.ctx).filter(section => section.name === 'dsh-channels:feishu-replies')).toHaveLength(1)
+
     // The reply card still lands in the topic as usual.
     const sends = channel2.sent as Array<{ options?: { replyInThread?: boolean } }>
     expect(sends[0]?.options?.replyInThread).toBe(true)
@@ -2136,6 +2142,7 @@ describe('FeishuService', () => {
 
     // The race must not surface to the user as a 处理失败 message.
     expect(JSON.stringify(channel2.sent)).not.toContain('处理失败')
+    expect(promptSectionsOf(winner!.agent.ctx).map(section => section.name)).toContain('dsh-channels:feishu-replies')
     await service2.shutdown()
   })
 
@@ -2601,6 +2608,7 @@ describe('FeishuService', () => {
     await channel2.fireCardAction({ messageId: 'om_1', chatId: 'oc_p2p', operator: { openId: 'ou_a', userId: 'u_alice' }, action: { value, tag: 'button' } })
     await waitUntil(() => expect(mock(resumed.followup)).toHaveBeenCalledTimes(1))
     expect(JSON.stringify(mock(resumed.followup).mock.calls[0]![0])).toContain('从中断处继续')
+    expect(JSON.stringify(mock(resumed.followup).mock.calls[0]![0])).toContain('已经完成的对外操作不要重做')
     expect(inflightEntries(h)).toEqual([['om_1', expect.objectContaining({ triggerMessageId: 'om_msg_1', routeKey: expect.any(String), senderUserId: 'u_alice' })]])
     await waitUntil(() => expect(JSON.stringify(channel2.updated.at(-1))).toContain('turn-stop'))
 
@@ -3984,6 +3992,42 @@ describe('command picker cards', () => {
     await waitUntil(() => expect(h.channel.sent).toHaveLength(3))
     expect((h.channel.sent.at(-1) as { options: Record<string, unknown> }).options)
       .toMatchObject({ replyTo: 'om_2', replyInThread: true })
+    await h.service.shutdown()
+  })
+})
+
+describe('reply guidance', () => {
+  /** Resolve a section's text the way the host does at prompt assembly. */
+  const resolved = (section: { text: string | (() => string) } | undefined): string | undefined =>
+    section === undefined ? undefined : typeof section.text === 'function' ? section.text() : section.text
+
+  it('adds the reply guidance to a Feishu session and follows the switch on every request', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_reply', senderId: 'u_owner',
+      messageId: 'om_reply', content: '开始',
+    }))
+    await waitForEstablishedSession(h)
+    const section = promptSectionsOf(h.ctxState.agents.created[0]!.setupCtx)
+      .find(entry => entry.name === FEISHU_REPLIES_SECTION)
+    expect(resolved(section)).toBe(FEISHU_REPLIES_GUIDANCE)
+    h.service.applyOverlay({ replyGuidance: false })
+    expect(resolved(section)).toBe('')
+    h.service.applyOverlay({})
+    expect(resolved(section)).toBe(FEISHU_REPLIES_GUIDANCE)
+    await h.service.shutdown()
+  })
+
+  it('adds the reply guidance even when inbound attachments are off', async () => {
+    const h = await setup({ acceptAttachments: false })
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_reply_dm', senderId: 'u_owner',
+      messageId: 'om_reply_dm', content: '开始',
+    }))
+    await waitForEstablishedSession(h)
+    const names = promptSectionsOf(h.ctxState.agents.created[0]!.setupCtx).map(entry => entry.name)
+    expect(names).toContain(FEISHU_REPLIES_SECTION)
+    expect(names).not.toContain(FEISHU_ATTACHMENTS_SECTION)
     await h.service.shutdown()
   })
 })

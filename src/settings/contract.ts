@@ -239,6 +239,7 @@ export const EDITABLE_KEYS = [
   // 会话：飞书侧功能
   'welcomeOnboarding',
   'hostTurnCards',
+  'replyGuidance',
   'slashCommandPanel',
   'allowPermissionSwitch',
   // 模型

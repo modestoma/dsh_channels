@@ -166,6 +166,7 @@ const BOOLEAN_KEYS = new Set<EditableKey>([
   'requireMention',
   'welcomeOnboarding',
   'hostTurnCards',
+  'replyGuidance',
   'slashCommandPanel',
   'allowPermissionSwitch',
   'acceptAttachments',
@@ -356,6 +357,12 @@ const FIELD_META: Record<EditableKey, FieldMeta> = {
     group: 'features',
     summary: '子代理、后台任务、定时跟进唤醒会话时，在话题里新发一张回复卡',
     help: '这些回合不是飞书消息触发的。关闭后它们不在飞书显示，但仍会照常运行，在 dsh 客户端里可以看到。',
+  },
+  replyGuidance: {
+    label: '回复写法规范',
+    group: 'features',
+    summary: '要求模型最终回复先给结果、保持简短，技术细节放进 MR 或文件',
+    help: '在飞书会话的系统提示词里加一段回复写法说明，只影响最终回复的文字，流式卡片的状态和思考过程不变。修改后从下一次模型请求开始生效。',
   },
   slashCommandPanel: {
     label: '同步斜杠指令面板',
