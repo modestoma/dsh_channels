@@ -46,6 +46,11 @@ export interface ApprovalHooks {
    * none), called on every open and settle so the streaming card can show it.
    */
   onWaitingChange?(sessionId: string, toolNames: readonly string[]): void
+  /**
+   * Durable card patch (the outbox), retried until it lands. Absent = each
+   * patch is attempted once.
+   */
+  patchCard?(messageId: string, card: object): Promise<void>
 }
 
 /**
@@ -134,7 +139,7 @@ export class ApprovalAnswerer {
     private readonly hooks: ApprovalHooks,
     private readonly timeoutMs: number,
   ) {
-    this.table = new PendingCardTable(channel, hooks.onError)
+    this.table = new PendingCardTable(channel, hooks.onError, hooks.patchCard?.bind(hooks))
   }
 
   /** In-flight question count (diagnostics/tests). */

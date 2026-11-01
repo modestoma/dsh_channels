@@ -1788,3 +1788,83 @@ describe('TurnStreamer host turns', () => {
     expect(streamer.hasLiveTurn('sess-child')).toBe(false)
   })
 })
+
+describe('TurnStreamer settle hooks', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('routes the settled patch and the reaction swap through the settle hooks', async () => {
+    const ch = channel()
+    const settlePatch = vi.fn()
+    const settleReaction = vi.fn()
+    const streamer = new DrivenStreamer(ch, 500, { ...hooks(), settlePatch, settleReaction })
+    const session = makeSession('sess-settle')
+    streamer.attach(session, 'om_card', 'om_trigger', 'react-typing')
+    streamer.onAssistantFrame(session, { type: 'start', attemptId: 'attempt-1', revision: 1, turn: 1, step: 1 })
+    streamer.onAssistantFrame(session, { type: 'chunk', attemptId: 'attempt-1', revision: 1, index: 0, time: 1, chunk: { type: 'text-delta', index: 0, text: '答案' } })
+    await vi.advanceTimersByTimeAsync(500)
+    const streamed = ch.updated.length
+    expect(streamed).toBeGreaterThan(0)
+
+    streamer.onSessionEvent(session, { type: 'turn/end', seq: 1, data: { turn: 1, reason: 'stop' } })
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(ch.updated.length).toBe(streamed)
+    expect(settlePatch).toHaveBeenCalledWith('om_card', expect.any(Object))
+    expect(headlineOf(settlePatch.mock.calls.at(-1)![1] as object)).toMatch(/^✅ /u)
+    expect(settleReaction).toHaveBeenCalledWith('om_trigger', 'react-typing', 'DONE')
+    expect(ch.addReaction).not.toHaveBeenCalled()
+  })
+
+  it('hands a segment that never landed to resendSegment once the turn settles', async () => {
+    const ch = channel()
+    const hooksInstance = hooks()
+    const sendSegment = hooksInstance.sendSegmentCard as unknown as ReturnType<typeof vi.fn>
+    const resendSegment = vi.fn()
+    const streamer = new DrivenStreamer(ch, 500, { ...hooksInstance, resendSegment })
+    const session = makeSession('sess-resend')
+    streamer.attach(session, 'om_card', 'om_trigger', undefined)
+    sendSegment.mockRejectedValue(new Error('send failed'))
+    streamer.onAssistantFrame(session, { type: 'start', attemptId: 'attempt-1', revision: 1, turn: 1, step: 1 })
+    streamer.onAssistantFrame(session, { type: 'chunk', attemptId: 'attempt-1', revision: 1, index: 0, time: 1, chunk: { type: 'text-delta', index: 0, text: 'x'.repeat(30_000) } })
+    await vi.advanceTimersByTimeAsync(500)
+    await vi.advanceTimersByTimeAsync(3_000)
+    expect(resendSegment).not.toHaveBeenCalled()
+
+    streamer.onSessionEvent(session, { type: 'turn/end', seq: 1, data: { turn: 1, reason: 'stop' } })
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(resendSegment).toHaveBeenCalledTimes(1)
+    const [sessionId, segment, card, text] = resendSegment.mock.calls[0]!
+    expect(sessionId).toBe('sess-resend')
+    expect(segment).toBe(2)
+    expect(elementsOf(card as object).some(element => element.content?.includes('xxxx') === true)).toBe(true)
+    expect(text as string).toMatch(/^x+$/u)
+  })
+
+  it('resends a segment whose last attempt fails after the turn settled', async () => {
+    const ch = channel()
+    const hooksInstance = hooks()
+    const sendSegment = hooksInstance.sendSegmentCard as unknown as ReturnType<typeof vi.fn>
+    const resendSegment = vi.fn()
+    const streamer = new DrivenStreamer(ch, 500, { ...hooksInstance, resendSegment })
+    const session = makeSession('sess-resend-late')
+    streamer.attach(session, 'om_card', 'om_trigger', undefined)
+    sendSegment.mockRejectedValue(new Error('send failed'))
+    streamer.onAssistantFrame(session, { type: 'start', attemptId: 'attempt-1', revision: 1, turn: 1, step: 1 })
+    streamer.onAssistantFrame(session, { type: 'chunk', attemptId: 'attempt-1', revision: 1, index: 0, time: 1, chunk: { type: 'text-delta', index: 0, text: 'x'.repeat(30_000) } })
+    await vi.advanceTimersByTimeAsync(500)
+    streamer.onSessionEvent(session, { type: 'turn/end', seq: 1, data: { turn: 1, reason: 'stop' } })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(resendSegment).not.toHaveBeenCalled()
+
+    await vi.advanceTimersByTimeAsync(3_000)
+    expect(resendSegment).toHaveBeenCalledTimes(1)
+    expect(resendSegment.mock.calls[0]![1]).toBe(2)
+  })
+})

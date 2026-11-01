@@ -69,9 +69,15 @@ export interface DeliverHandlers<E extends PendingCardEntry> {
 export class PendingCardTable<E extends PendingCardEntry> {
   private readonly entries = new Map<string, E>()
 
+  /**
+   * @param channel - channel that sends the cards.
+   * @param onError - logs a contained delivery or patch failure.
+   * @param patchCard - durable patch path (the outbox); absent = patch once through `channel`.
+   */
   constructor(
     private readonly channel: FeishuChannel,
     private readonly onError: (sessionId: string, error: unknown) => void,
+    private readonly patchCard?: (messageId: string, card: object) => Promise<void>,
   ) {}
 
   add(entry: E): void {
@@ -137,6 +143,10 @@ export class PendingCardTable<E extends PendingCardEntry> {
   /** Full-replacement patch of one delivered card; failures stay contained. */
   patch(entry: E, card: object): void {
     if (entry.messageId === undefined) return
+    if (this.patchCard !== undefined) {
+      void this.patchCard(entry.messageId, card)
+      return
+    }
     void this.channel.updateCard(entry.messageId, card)
       .catch((error: unknown) => { this.onError(entry.sessionId, error) })
   }
