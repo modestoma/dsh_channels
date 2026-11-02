@@ -15,7 +15,7 @@ import { columnSet, divider, markdown, note, standaloneCard, textButton } from '
 /** Terminal status of one settled authorization request. */
 export type SettledRequestStatus = 'approved' | 'denied' | 'expired'
 
-/** Inputs of the group-information card sent to the administrator. */
+/** Inputs of the group-information card sent to the administrators. */
 export interface GroupInfoCardInput {
   /** Feishu `chat_id` of the group the bot was added to (or was seen in). */
   chatId: string
@@ -33,7 +33,7 @@ export interface GroupInfoCardInput {
   now?: number
 }
 
-/** Inputs of the user-authorization request card sent to the administrator. */
+/** Inputs of the user-authorization request card sent to the administrators. */
 export interface UserRequestCardInput {
   /** `user_id` of the user asking for access. */
   userId: string
@@ -104,7 +104,7 @@ function field(label: string, value: string): object {
 }
 
 /**
- * The group-information card the administrator receives when the bot joins a
+ * The group-information card each administrator receives when the bot joins a
  * group. It carries no buttons: a group needs no grant, and an inviter
  * without the conversation permission gets a user request card instead.
  */

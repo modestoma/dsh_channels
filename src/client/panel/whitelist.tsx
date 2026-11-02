@@ -1,5 +1,5 @@
 /**
- * 用户表：每个用户一行（头像、名字、user_id、Git 邮箱、四个权限开关、移除），
+ * 用户表：每个用户一行（头像、名字、user_id、Git 邮箱、管理员和四个权限开关、移除），
  * 点 Git 邮箱展开该用户的邮箱编辑行，添加表单点「＋ 添加用户」才展开；以及
  * 待处理申请行。
  *
@@ -30,13 +30,21 @@ function sourceLabel(source: AccessUserWire['source']): string {
   }
 }
 
-/** The four switches in display order with their chip labels. */
+/** The administrator flag and the four switches in display order with their chip labels. */
 const PERMISSION_CHIPS: ReadonlyArray<{ permission: AccessPermissionWire; label: string }> = [
+  { permission: 'admin', label: PANEL_COPY.accessPermAdmin },
   { permission: 'chat', label: PANEL_COPY.accessPermChat },
   { permission: 'wikiRead', label: PANEL_COPY.accessPermWikiRead },
   { permission: 'wikiWrite', label: PANEL_COPY.accessPermWikiWrite },
   { permission: 'codeWrite', label: PANEL_COPY.accessPermCodeWrite },
 ]
+
+/** Whether a chip has no effect: an administrator holds everything; a suspended user's other switches are off. */
+function chipMuted(user: AccessUserWire, permission: AccessPermissionWire): boolean {
+  if (permission === 'admin') return false
+  if (user.admin) return true
+  return permission !== 'chat' && !user.chat
+}
 
 /** One user row as the table renders it. */
 export interface UserTableEntry {
@@ -48,8 +56,9 @@ export interface UserTableEntry {
 }
 
 /**
- * The flat user table: one dense row per user with four toggle chips (a
- * suspended user's other chips are dimmed), remove buttons, a git email link
+ * The flat user table: one dense row per user with an administrator chip
+ * and four switch chips (an administrator's switch chips and a suspended
+ * user's other chips are dimmed), remove buttons, a git email link
  * that opens one inline editor, and a collapsed add form. `onAdd` and
  * `onSetGitEmail` resolve true when the write succeeded (the form then
  * closes).
@@ -117,7 +126,7 @@ export function UserTable(props: {
                   <button
                     key={permission}
                     type="button"
-                    className={`dsh-channels-cfg__perm${permission !== 'chat' && !user.chat ? ' dsh-channels-cfg__perm--muted' : ''}`}
+                    className={`dsh-channels-cfg__perm${chipMuted(user, permission) ? ' dsh-channels-cfg__perm--muted' : ''}`}
                     aria-pressed={user[permission]}
                     disabled={disabled}
                     onClick={() => onToggle(user.userId, permission, !user[permission])}

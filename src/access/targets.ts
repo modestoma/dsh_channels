@@ -1,5 +1,5 @@
 /**
- * Target resolution for `/auth add|remove|set`: the administrator names the
+ * Target resolution for `/auth add|remove|set`: an administrator names the
  * user either by a pasted `user_id` or by @-mentioning them in the command.
  *
  * Feishu replaces each mention in the text with `@<name>`, so the mentioned

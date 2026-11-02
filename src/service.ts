@@ -54,7 +54,7 @@ import type { ChannelCommandSpec } from './commands/registry.ts'
 import type { PermissionPresets, SessionQuery } from './dsh-types.ts'
 import { ACCESS_PERMISSIONS, FEISHU_USER_ID_PATTERN, feishuDomain, PROCESSED_RETENTION_MS, sessionDirOf } from './domain.ts'
 import type {
-  AccessPermission, AccessRequestRecord, AccessUserRecord,
+  AccessPermission, AccessRequestRecord, AccessSwitch, AccessUserRecord,
   ExpiredRouteRecord, FeishuDomainGlobal, FeishuDomainHandle, InflightSnapshot,
   ProcessedRecord, RawDomainHandle, RouteRecord, SessionOriginRecord, TopicLaunchRecord,
 } from './domain.ts'
@@ -84,7 +84,7 @@ import { feishuUserMessage, InboundRouter } from './routing/inbound.ts'
 import { MissedMessages } from './routing/missed.ts'
 import type { RequestPolicyController } from './session/request-policy.ts'
 import type { CardActionEvent, ChannelFactory, FeishuChannel, NormalizedMessage } from './feishu-channel.ts'
-import { AppOwnerLookupError, FeishuApiError } from './feishu-channel.ts'
+import { FeishuApiError } from './feishu-channel.ts'
 import { buildHealthCard, foldHealthSnapshot, HEALTH_DEPENDENCY_NAMES } from './health.ts'
 import type { HealthDependencyName, HealthSnapshot } from './health.ts'
 import {
@@ -119,18 +119,10 @@ import type { OverlayPatch, OverlayStore } from './settings/overlay.ts'
  *  dead records; TTL semantics make 6 h granularity more than sufficient). */
 const GC_SWEEP_INTERVAL_MS = 6 * 60 * 60 * 1000
 
-/** Upper bound on the boot-time app-owner lookup before the connection opens. */
-const APP_OWNER_LOOKUP_TIMEOUT_MS = 10_000
 /** Upper bound on the post-connect scope grant query. */
 const SCOPE_CHECK_TIMEOUT_MS = 10_000
 /** Upper bound on the whole post-connect slash-command panel sync (one list plus per-command writes). */
 const SLASH_COMMAND_SYNC_TIMEOUT_MS = 30_000
-
-/** Outcome of the app-owner lookup for the current connection. */
-type AppOwnerState =
-  | { readonly userId: string }
-  /** `apiRejected`: Feishu answered with an error code (typically a missing app-info scope). */
-  | { readonly error: string; readonly apiRejected: boolean }
 
 
 interface RenewAdmission {
@@ -233,7 +225,7 @@ async function openFeishuDomain(ctx: HostContext): Promise<FeishuDomainHandle> {
 /** `/auth` usage line (input-error card). */
 const AUTH_USAGE = '用法：/auth [status|list]；/auth add <@用户|user_id>；/auth remove <@用户|user_id>；/auth set <chat|wiki-read|wiki-write|code> <on|off> <@用户|user_id>'
 
-/** `/auth set` switch names → permission switches. */
+/** `/auth set` switch names → permission switches. The administrator flag is set only in the Web panel. */
 const AUTH_SWITCHES: Readonly<Record<string, AccessPermission>> = {
   'chat': 'chat',
   'wiki-read': 'wikiRead',
@@ -249,8 +241,9 @@ const PERMISSION_LABELS: Readonly<Record<AccessPermission, string>> = {
   codeWrite: '代码改动',
 }
 
-/** `对话准入 · 知识库读取` list of the switches one user holds, or `（全部关闭）`. */
+/** `对话准入 · 知识库读取` list of the switches one user holds, `管理员（全部权限）`, or `（全部关闭）`. */
 function permissionSummary(record: AccessUserRecord): string {
+  if (record.admin) return '管理员（全部权限）'
   const held = ACCESS_PERMISSIONS.filter(permission => record[permission]).map(permission => PERMISSION_LABELS[permission])
   return held.length === 0 ? '（全部关闭）' : held.join(' · ')
 }
@@ -285,6 +278,7 @@ function userWire(record: AccessUserRecord): AccessUserWire {
     ...(record.name === undefined ? {} : { name: record.name }),
     source: record.source,
     addedAt: record.addedAt,
+    admin: record.admin,
     chat: record.chat,
     wikiRead: record.wikiRead,
     wikiWrite: record.wikiWrite,
@@ -476,11 +470,6 @@ export class FeishuService {
   private accessRequests: AccessRequests | undefined
   private unlistenBotAdded: (() => void) | undefined
   private unlistenConnection: (() => void) | undefined
-  /**
-   * App owner resolved at `start()`; the administrator whenever `adminUserId`
-   * is unset. Cleared on shutdown so a reconnect looks it up again.
-   */
-  private appOwner: AppOwnerState | undefined
   /** Live-resolved user and chat profiles, by `user:`/`chat:` key; misses are kept as `{}`. */
   private readonly profileCache = new Map<string, { profile: FeishuProfileWire; at: number }>()
   /** Post-connect scope self-check; cleared on shutdown. */
@@ -677,7 +666,7 @@ export class FeishuService {
       mayUse: (userId, permission) => this.accessController.mayUse(userId, permission),
     })
     this.accessController = new AccessController({
-      config: () => this.accessConfig(),
+      config: () => this.config,
       store: this.accessStore,
       channel: () => this.channel,
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
@@ -1235,18 +1224,11 @@ export class FeishuService {
 
   /** User table + pending authorization requests (read-only Web projection). */
   accessSnapshot(): AccessWire {
-    const admin = this.effectiveAdminUserId()
-    const owner = this.appOwner
     return {
       mode: this.config.accessMode,
       // The user table lives in the storage domain, which is only open while the
       // channel runs; an unconnected panel must not present them as empty.
       loaded: this.domain !== undefined,
-      admin: {
-        ...(admin === undefined ? {} : { userId: admin, source: this.configuredAdminUserId() === undefined ? 'owner' : 'config' }),
-        configured: admin !== undefined,
-        ...(owner !== undefined && 'error' in owner ? { ownerLookupError: owner.error } : {}),
-      },
       users: this.accessStore.userRecords().map(userWire),
       requests: this.accessStore.pendingRequests().map(record => {
         const wire: AccessRequestWire = {
@@ -1273,10 +1255,8 @@ export class FeishuService {
   async addAccessUser(userId: string, name?: string): Promise<AccessMutationResponse> {
     const id = this.cleanAccessUserId(userId)
     if (id === undefined) return { ok: false, error: 'user_id 不合法（只能包含字母、数字、_ 和 -，不是 ou_ 开头的 open_id）' }
-    const admin = this.effectiveAdminUserId()
-    if (admin === undefined) return { ok: false, error: '请先在「访问授权」标签页设置管理员 user_id' }
     try {
-      await this.grantChat(id, name?.trim(), 'panel', admin)
+      await this.grantChat(id, name?.trim(), 'panel', 'panel')
       return { ok: true, access: this.accessSnapshot() }
     } catch (error) {
       return { ok: false, error: `写入授权失败：${messageOf(error)}` }
@@ -1300,13 +1280,15 @@ export class FeishuService {
   }
 
   /**
-   * Panel: set one permission switch of a user already in the table.
+   * Panel: set the administrator flag or one permission switch of a user
+   * already in the table. The panel may remove the last administrator; it is
+   * also the way to add one back.
    * @param userId - Feishu user_id.
-   * @param permission - the switch.
+   * @param permission - the flag or switch.
    * @param enabled - new value.
    * @returns the refreshed access snapshot, or the failure.
    */
-  async setAccessPermission(userId: string, permission: AccessPermission, enabled: boolean): Promise<AccessMutationResponse> {
+  async setAccessPermission(userId: string, permission: AccessSwitch, enabled: boolean): Promise<AccessMutationResponse> {
     const id = this.cleanAccessUserId(userId)
     if (id === undefined) return { ok: false, error: 'user_id 不合法' }
     try {
@@ -1344,6 +1326,7 @@ export class FeishuService {
       source,
       addedBy: admin,
       addedAt: Date.now(),
+      admin: false,
       chat: true,
       wikiRead: false,
       wikiWrite: false,
@@ -1643,77 +1626,12 @@ export class FeishuService {
   async resolveAccessRequest(token: string, decision: 'allow' | 'deny'): Promise<AccessMutationResponse> {
     const requests = this.accessRequests
     if (requests === undefined) return { ok: false, error: '授权服务尚未启动' }
-    const actor = this.effectiveAdminUserId()
-    if (actor === undefined) return { ok: false, error: '请先在「访问授权」标签页配置管理员 user_id' }
     try {
-      const result = await requests.resolve(token, decision, actor)
+      const result = await requests.resolve(token, decision, { kind: 'panel' })
       if (!result.ok) return { ok: false, error: result.error }
       return { ok: true, access: this.accessSnapshot() }
     } catch (error) {
       return { ok: false, error: `处理授权申请失败：${messageOf(error)}` }
-    }
-  }
-
-  /** `/auth status` administrator line: id plus where it came from. */
-  private adminStatusLine(): string {
-    const admin = this.effectiveAdminUserId()
-    if (admin === undefined) return '未配置'
-    return this.configuredAdminUserId() === undefined ? `\`${admin}\`（应用所有者，自动）` : `\`${admin}\``
-  }
-
-  /** The explicitly configured administrator, trimmed; empty counts as unset. */
-  private configuredAdminUserId(): string | undefined {
-    const admin = this.config.adminUserId?.trim()
-    return admin === undefined || admin === '' ? undefined : admin
-  }
-
-  /** Configured administrator, else the app owner looked up at `start()`. */
-  private effectiveAdminUserId(): string | undefined {
-    const configured = this.configuredAdminUserId()
-    if (configured !== undefined) return configured
-    const owner = this.appOwner
-    return owner !== undefined && 'userId' in owner ? owner.userId : undefined
-  }
-
-  /** Live config with `adminUserId` replaced by the effective administrator. */
-  private accessConfig(): FeishuConfig {
-    return { ...this.config, adminUserId: this.effectiveAdminUserId() }
-  }
-
-  /**
-   * Look up the app owner for the administrator fallback. Never throws: a
-   * failure is recorded for the panel and only warned about when no
-   * administrator is configured (the fallback is then what admission needs).
-   */
-  private async resolveAppOwner(channel: FeishuChannel): Promise<void> {
-    this.appOwner = undefined
-    if (channel.appOwnerUserId === undefined) return
-    let timer: ReturnType<typeof setTimeout> | undefined
-    let state: AppOwnerState
-    try {
-      const userId = await Promise.race([
-        channel.appOwnerUserId(),
-        new Promise<never>((_, reject) => {
-          timer = setTimeout(() => reject(new Error(`超时（${APP_OWNER_LOOKUP_TIMEOUT_MS} ms）`)), APP_OWNER_LOOKUP_TIMEOUT_MS)
-        }),
-      ])
-      state = userId !== undefined && FEISHU_USER_ID_PATTERN.test(userId)
-        ? { userId }
-        : { error: '应用所有者不是企业内成员，或接口未返回其 user_id', apiRejected: false }
-    } catch (error) {
-      const detail = error instanceof AppOwnerLookupError ? error.detail : messageOf(error)
-      state = {
-        error: `获取应用信息失败：${detail}。请在「访问授权」手动填写管理员 user_id（私聊机器人发 /userid 获取，私聊模式关闭时可在飞书管理后台的成员详情里查看用户 ID）；或为应用开通「获取应用信息」权限并发布版本后重新连接`,
-        apiRejected: error instanceof AppOwnerLookupError && error.code !== undefined,
-      }
-    } finally {
-      if (timer !== undefined) clearTimeout(timer)
-    }
-    // A background lookup can outlive its connection (shutdown/reconnect).
-    if (this.channel !== channel) return
-    this.appOwner = state
-    if ('error' in state && this.configuredAdminUserId() === undefined) {
-      this.ctx.logger?.warn?.('dsh-channels: app owner fallback unavailable: %s', state.error)
     }
   }
 
@@ -1771,13 +1689,11 @@ export class FeishuService {
 
   /**
    * Compare the app's granted scopes with what the plugin uses and log the
-   * missing ones. Never throws; waits for the owner lookup so the app-info
-   * need reflects its outcome.
+   * missing ones. Never throws.
    */
-  private async runScopeCheck(channel: FeishuChannel, appId: string, ownerLookup: Promise<void>): Promise<void> {
+  private async runScopeCheck(channel: FeishuChannel, appId: string): Promise<void> {
     this.scopeCheckState = undefined
     if (channel.grantedScopes === undefined) return
-    await ownerLookup
     let timer: ReturnType<typeof setTimeout> | undefined
     let state: ScopeCheckWire
     try {
@@ -1790,9 +1706,6 @@ export class FeishuService {
       const result = checkScopes(grants, appId, {
         dmEnabled: this.config.dmMode === 'open',
         requireMention: this.config.requireMention,
-        ownerLookupFailed: this.config.accessMode === 'guarded'
-          && this.configuredAdminUserId() === undefined
-          && this.appOwner !== undefined && 'error' in this.appOwner && this.appOwner.apiRejected,
         slashCommandPanel: this.config.slashCommandPanel,
         sendFile: this.config.feishuTools.sendFile,
         wikiRead: this.config.feishuTools.wikiRead && this.config.wikiRoots.length > 0,
@@ -2042,7 +1955,7 @@ export class FeishuService {
       { prepend: true },
     )
     const accessRequests = new AccessRequests({
-      config: () => this.accessConfig(),
+      config: () => this.config,
       store: this.accessStore,
       channel: () => this.channel,
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
@@ -2113,11 +2026,6 @@ export class FeishuService {
       if (change === 'reconnecting') this.missed.onReconnecting()
       else this.missed.onReconnected()
     })
-    // Without a configured administrator, resolve the owner before the
-    // handshake so the first inbound message already sees the fallback; with
-    // one, the lookup only backs a later runtime clear and must not delay boot.
-    const ownerLookup = this.resolveAppOwner(channel)
-    if (this.configuredAdminUserId() === undefined) await ownerLookup
     ensureCurrent()
     await channel.connect()
     if (this.lifecycle !== lifecycle) {
@@ -2126,7 +2034,7 @@ export class FeishuService {
       throw new StartSupersededError()
     }
     // Background: the results only feed the panel and the log.
-    void this.runScopeCheck(channel, appId, ownerLookup)
+    void this.runScopeCheck(channel, appId)
     if (this.config.slashCommandPanel) void this.runSlashCommandSync(channel)
     // Before admission opens, so every `running` record left is a previous instance's.
     await this.topicLauncher.markInterrupted()
@@ -2165,17 +2073,13 @@ export class FeishuService {
     })
     if (this.config.accessMode === 'open') {
       console.warn('[dsh-channels] 准入=open：任何应用可用范围内的用户都可以对话（不安全，仅调试）')
-    } else if (this.effectiveAdminUserId() === undefined) {
-      const ownerError = this.appOwner !== undefined && 'error' in this.appOwner ? this.appOwner.error : undefined
+    } else if (this.accessStore.adminIds().length === 0) {
       console.warn(
-        '[dsh-channels] 准入=guarded 但未配置管理员 user_id，也无法使用应用所有者兜底：所有对话都会被拒绝；'
-        + '私聊机器人发送 /userid 取得 user_id 后填入 Web 设置面板'
-        + (ownerError === undefined ? '' : `（${ownerError}）`),
+        '[dsh-channels] 准入=guarded 但用户表里没有管理员：所有对话都会被拒绝；'
+        + '私聊机器人发送 /userid 取得 user_id，在 Web 设置面板「访问授权」的用户表里添加并打开「管理员」',
       )
-    } else if (this.configuredAdminUserId() === undefined) {
-      console.info('[dsh-channels] 准入=guarded，未配置管理员，使用应用所有者', this.effectiveAdminUserId())
     } else {
-      console.info('[dsh-channels] 准入=guarded，管理员已配置')
+      console.info('[dsh-channels] 准入=guarded，管理员 %d 人', this.accessStore.adminIds().length)
     }
     const approvalMounted = this.ctx.get?.('approval') !== undefined
     console.info(
@@ -2281,7 +2185,6 @@ export class FeishuService {
     await this.lock?.release()
     this.lock = undefined
     this.runningConfig = undefined
-    this.appOwner = undefined
     this.scopeCheckState = undefined
     this.slashCommandSyncState = undefined
     this.slashCommandSyncAbort?.abort()
@@ -2400,20 +2303,22 @@ export class FeishuService {
     try {
       if (action === 'status') {
         const users = this.accessStore.userRecords()
-        const count = (permission: AccessPermission): number => users.filter(user => user.chat && user[permission]).length
+        const members = users.filter(user => !user.admin)
+        const count = (permission: AccessPermission): number => members.filter(user => user.chat && user[permission]).length
+        const admins = users.filter(user => user.admin).map(user => `${user.name ?? user.userId} \`${user.userId}\``)
         await this.delivery.standaloneReply(msg, standaloneInfoCard('**🔐 访问授权状态**', [
           `**准入模式**：\`${this.config.accessMode}\``,
-          `**管理员**：${this.adminStatusLine()}`,
-          `**用户表**：${users.length} 人 · 对话准入 ${count('chat')} · 知识库读取 ${count('wikiRead')} · 知识库写入 ${count('wikiWrite')} · 代码改动 ${count('codeWrite')}`,
+          `**管理员（${admins.length}）**：${admins.join('、')}`,
+          `**其他用户**：${members.length} 人 · 对话准入 ${count('chat')} · 知识库读取 ${count('wikiRead')} · 知识库写入 ${count('wikiWrite')} · 代码改动 ${count('codeWrite')}`,
           `**待处理申请**：${this.accessStore.pendingRequests().length} 个`,
-          '添加：`/auth add @用户`；开关：`/auth set <chat|wiki-read|wiki-write|code> <on|off> @用户`；移除：`/auth remove @用户`。',
+          '添加：`/auth add @用户`；开关：`/auth set <chat|wiki-read|wiki-write|code> <on|off> @用户`；移除：`/auth remove @用户`。管理员只能在 Web 设置面板设置。',
         ]), direct)
         return
       }
       if (action === 'list') {
         const users = this.accessStore.userRecords()
         const lines = users.length === 0
-          ? ['（暂无；管理员始终拥有全部权限）']
+          ? ['（暂无）']
           : users.slice(0, 30).map(user => `- ${user.name ?? user.userId} \`${user.userId}\`：${permissionSummary(user)}`)
         await this.delivery.standaloneReply(msg, standaloneInfoCard('**🔐 用户表**', [
           `**用户（${users.length}）**`,
@@ -2440,6 +2345,11 @@ export class FeishuService {
       }
       const { userId } = target
       const label = target.name === undefined ? `\`${userId}\`` : `${target.name}（\`${userId}\`）`
+      // Administrators are granted and removed only in the Web panel.
+      if (action === 'remove' && this.accessStore.isAdmin(userId)) {
+        await reply('unavailable', `${label} 是管理员，只能在 Web 设置面板取消管理员或移出用户表。`)
+        return
+      }
       if (action === 'add') {
         await this.grantChat(userId, target.name, 'command', msg.senderId)
         await reply('success', `✅ 已把 ${label} 加入用户表并打开对话准入：可以私聊，也可以在任何群里 @ 我。`)

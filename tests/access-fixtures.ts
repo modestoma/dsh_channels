@@ -13,13 +13,12 @@ import type {
 } from '../src/domain.ts'
 import { makeDomain } from './helpers.ts'
 
-/** One validated config with admission control enabled and an administrator. */
+/** One validated config with admission control enabled (administrators live in the user table). */
 export function makeAccessConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
   return resolveConfig({
     appId: 'FEISHU_APP_ID',
     appSecret: 'FEISHU_APP_SECRET',
     accessMode: 'guarded',
-    adminUserId: 'u_admin',
     ...partial,
   })
 }
@@ -58,12 +57,18 @@ export function userRecord(partial: Partial<AccessUserRecord> = {}): AccessUserR
     source: 'command',
     addedBy: 'u_admin',
     addedAt: 1_000,
+    admin: false,
     chat: true,
     wikiRead: false,
     wikiWrite: false,
     codeWrite: false,
     ...partial,
   }
+}
+
+/** One administrator record of the user table. */
+export function adminRecord(userId = 'u_admin'): AccessUserRecord {
+  return userRecord({ userId, source: 'panel', addedBy: 'panel', admin: true })
 }
 
 /** One authorization-request record (pending unless overridden). */

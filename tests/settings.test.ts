@@ -153,7 +153,6 @@ class FakeTarget implements SettingsTarget {
   /** Admission snapshot handed to the panel (the real service keeps it in memory). */
   accessState: AccessWire = {
     mode: 'guarded',
-    admin: { configured: false },
     loaded: true,
     users: [],
     requests: [],
@@ -261,6 +260,7 @@ class FakeTarget implements SettingsTarget {
         ...(name === undefined ? {} : { name }),
         source: 'panel',
         addedAt: 1_700_000_000_000,
+        admin: false,
         chat: true,
         wikiRead: false,
         wikiWrite: false,
@@ -350,6 +350,7 @@ class FakeTarget implements SettingsTarget {
         ...(request.name === undefined ? {} : { name: request.name }),
         source: 'card',
         addedAt: 1_700_000_000_000,
+        admin: false,
         chat: true,
         wikiRead: false,
         wikiWrite: false,
@@ -679,16 +680,11 @@ describe('field descriptors', () => {
 
   it('describes the access-control fields without restarting the channel', () => {
     const byKey = new Map(FIELD_DESCRIPTORS.map(field => [field.key, field]))
-    for (const key of ['adminUserId', 'accessMode', 'authRequestTtlDays'] as const) {
+    for (const key of ['accessMode', 'authRequestTtlDays'] as const) {
       expect(EDITABLE_KEYS).toContain(key)
       expect(byKey.get(key)).toMatchObject({ group: 'access', restartRequired: false })
     }
-
-    const admin = byKey.get('adminUserId')
-    expect(admin).toMatchObject({ kind: 'text' })
-    expect(admin?.label).toContain('管理员')
-    expect(admin?.summary).toContain('/userid')
-    expect(admin?.help).toContain('ou_')
+    expect(byKey.has('adminUserId' as never)).toBe(false)
 
     const mode = byKey.get('accessMode')
     expect(mode).toMatchObject({ kind: 'select', toggle: { on: 'open', off: 'guarded' } })
@@ -1366,32 +1362,20 @@ describe('SettingsSurface', () => {
     await expect(store.load()).resolves.toEqual({})
   })
 
-  it('saves the access-control config and clears the administrator override', async () => {
+  it('saves the access-control config live and rejects an invalid request lifetime', async () => {
     const { surface, store } = makeSurface()
-    const saved = await surface.save({ adminUserId: 'u_admin', accessMode: 'open', authRequestTtlDays: 14 })
+    const saved = await surface.save({ accessMode: 'open', authRequestTtlDays: 14 })
     expect(saved.ok).toBe(true)
     if (!saved.ok) return
-    await expect(store.load()).resolves.toEqual({
-      adminUserId: 'u_admin',
-      accessMode: 'open',
-      authRequestTtlDays: 14,
-    })
-    expect(saved.panel.config.effective.adminUserId).toBe('u_admin')
+    await expect(store.load()).resolves.toEqual({ accessMode: 'open', authRequestTtlDays: 14 })
     expect(saved.panel.config.effective.accessMode).toBe('open')
     expect(saved.panel.config.effective.authRequestTtlDays).toBe(14)
     expect(saved.panel.config.restartPendingKeys).toEqual([])
 
-    const invalid = await surface.save({ adminUserId: 'ou_alice', authRequestTtlDays: 0 })
+    const invalid = await surface.save({ authRequestTtlDays: 0 })
     expect(invalid.ok).toBe(false)
     if (invalid.ok) return
-    expect(invalid.issues?.map(issue => issue.key))
-      .toEqual(expect.arrayContaining(['adminUserId', 'authRequestTtlDays']))
-
-    const cleared = await surface.save({ adminUserId: '' })
-    expect(cleared.ok).toBe(true)
-    const overlay = await store.load()
-    expect(overlay.adminUserId).toBeUndefined()
-    expect(overlay.accessMode).toBe('open')
+    expect(invalid.issues?.map(issue => issue.key)).toEqual(['authRequestTtlDays'])
   })
 
   it('saves the newly editable session and model fields live and clears maxTokens on empty', async () => {
@@ -1515,13 +1499,13 @@ describe('SettingsSurface', () => {
 describe('SettingsSurface access control', () => {
   const SAMPLE_ACCESS: AccessWire = {
     mode: 'guarded',
-    admin: { userId: 'u_admin', configured: true },
     loaded: true,
     users: [{
       userId: 'u_alice',
       name: 'Alice',
       source: 'command',
       addedAt: 1_700_000_100_000,
+      admin: false,
       chat: true,
       wikiRead: true,
       wikiWrite: false,
@@ -1552,7 +1536,6 @@ describe('SettingsSurface access control', () => {
     const panel = await surface.panel()
     expect(panel.access).toEqual({
       mode: 'open',
-      admin: { configured: false },
       loaded: false,
       users: [],
       requests: [],
@@ -1570,12 +1553,15 @@ describe('SettingsSurface access control', () => {
       name: 'Alice',
       source: 'panel',
       addedAt: 1_700_000_000_000,
+      admin: false,
       chat: true,
       wikiRead: false,
       wikiWrite: false,
       codeWrite: false,
     }])
 
+    const admin = await surface.setAccessPermission('u_alice', 'admin', true)
+    expect(admin.ok && admin.access.users[0]?.admin).toBe(true)
     const code = await surface.setAccessPermission(' u_alice ', 'codeWrite', true)
     expect(code.ok).toBe(true)
     if (!code.ok) return
@@ -1586,6 +1572,7 @@ describe('SettingsSurface access control', () => {
     expect(suspended.access.users[0]).toMatchObject({ chat: false, codeWrite: true })
     expect(target.accessCalls).toEqual([
       { op: 'add-user', userId: 'u_alice', name: 'Alice' },
+      { op: 'set', userId: 'u_alice', permission: 'admin', enabled: true },
       { op: 'set', userId: 'u_alice', permission: 'codeWrite', enabled: true },
       { op: 'set', userId: 'u_alice', permission: 'chat', enabled: false },
     ])
@@ -1622,8 +1609,8 @@ describe('SettingsSurface access control', () => {
     expect(badName.ok).toBe(false)
     expect((await surface.removeAccessUser('bad id')).ok).toBe(false)
     expect((await surface.setAccessPermission('ou_bob', 'chat', true)).ok).toBe(false)
-    const badSwitch = await surface.setAccessPermission('u_bob', 'admin', true)
-    expect(badSwitch).toEqual({ ok: false, error: '权限开关只能是 chat、wikiRead、wikiWrite 或 codeWrite' })
+    const badSwitch = await surface.setAccessPermission('u_bob', 'owner', true)
+    expect(badSwitch).toEqual({ ok: false, error: '权限开关只能是 admin、chat、wikiRead、wikiWrite 或 codeWrite' })
     const badValue = await surface.setAccessPermission('u_bob', 'chat', 'yes')
     expect(badValue).toEqual({ ok: false, error: 'enabled 必须是 true 或 false' })
     expect(target.accessCalls).toEqual([])
@@ -2091,7 +2078,6 @@ describe('settings routes', () => {
     const { surface, target } = makeSurface()
     target.accessState = {
       mode: 'guarded',
-      admin: { userId: 'u_admin', configured: true },
       loaded: true,
       users: [],
       requests: [{
@@ -2108,7 +2094,7 @@ describe('settings routes', () => {
     const read = await call(routes, ACCESS_ROUTE)
     expect(read.status).toBe(200)
     const snapshot = JSON.parse(read.body) as AccessWire
-    expect(snapshot.admin).toEqual({ userId: 'u_admin', configured: true })
+    expect(snapshot.mode).toBe('guarded')
     expect(snapshot.requests).toEqual(target.accessState.requests)
 
     const invalidUser = await call(routes, ADD_ACCESS_USER_ROUTE, post({ userId: 'ou_alice' }))

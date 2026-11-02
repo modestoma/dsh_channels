@@ -38,7 +38,7 @@ export const ACCESS_ROUTE = '/api/dsh-channels.access'
 export const ADD_ACCESS_USER_ROUTE = '/api/dsh-channels.addAccessUser'
 /** 用户表移除（POST，body `{ userId }`）。 */
 export const REMOVE_ACCESS_USER_ROUTE = '/api/dsh-channels.removeAccessUser'
-/** 设置一个权限开关（POST，body `{ userId, permission, enabled }`）。 */
+/** 设置管理员标记或一个权限开关（POST，body `{ userId, permission, enabled }`，permission 可为 admin）。 */
 export const SET_ACCESS_PERMISSION_ROUTE = '/api/dsh-channels.setAccessPermission'
 /** 设置或清除一个用户的 Git 邮箱（POST，body `{ userId, gitEmail }`；空字符串或 null 清除）。 */
 export const SET_ACCESS_GIT_EMAIL_ROUTE = '/api/dsh-channels.setAccessGitEmail'
@@ -268,7 +268,6 @@ export const EDITABLE_KEYS = [
   'promptContextTimeoutMs',
   // 准入与授权（用户表由「访问授权」tab 的列表管理）
   'accessMode',
-  'adminUserId',
   'authRequestTtlDays',
   // 知识库（顶层 `wikiRoots` 字符串列表；为空时不挂载任何知识库工具）
   'feishuTools.wikiRead',
@@ -565,8 +564,8 @@ export interface PanelConfigWire {
   }
 }
 
-/** Permission switches of one access-table user (same names as the stored record). */
-export type AccessPermissionWire = 'chat' | 'wikiRead' | 'wikiWrite' | 'codeWrite'
+/** Administrator flag and permission switches of one access-table user (same names as the stored record). */
+export type AccessPermissionWire = 'admin' | 'chat' | 'wikiRead' | 'wikiWrite' | 'codeWrite'
 
 /** One access-table user `user_id` with its permission switches. */
 export interface AccessUserWire {
@@ -577,12 +576,14 @@ export interface AccessUserWire {
   source: 'command' | 'card' | 'panel'
   /** Epoch ms when it was authorized. */
   addedAt: number
-  /** May talk to the bot; off suspends the user and every other switch. */
+  /** Administrator: always admitted, holds every permission, settles requests. */
+  admin: boolean
+  /** May talk to the bot; off suspends a non-administrator and every other switch. */
   chat: boolean
   wikiRead: boolean
   wikiWrite: boolean
   codeWrite: boolean
-  /** Git email set by the administrator; commits for turns this user drives name them as author. */
+  /** Git email set by an administrator; commits for turns this user drives name them as author. */
   gitEmail?: string
 }
 
@@ -605,21 +606,12 @@ export interface AccessRequestWire {
 }
 
 /**
- * `GET /api/dsh-channels.access` payload: admission mode, the administrator
- * reference, the user table, and the still-pending authorization requests.
+ * `GET /api/dsh-channels.access` payload: admission mode, the user table
+ * (administrators are users with `admin` on), and the still-pending
+ * authorization requests.
  */
 export interface AccessWire {
   mode: 'open' | 'guarded'
-  admin: {
-    /** The effective administrator: configured `adminUserId`, else the app owner. */
-    userId?: string
-    /** Where `userId` came from: explicit config or the app-owner fallback. */
-    source?: 'config' | 'owner'
-    /** false while guarded mode would refuse every conversation (fail closed). */
-    configured: boolean
-    /** Why the app-owner fallback is unavailable, when its lookup failed. */
-    ownerLookupError?: string
-  }
   /**
    * Whether the persisted user table was loaded. While the channel holds no
    * connection the plugin storage domain is closed, so the lists are unknown
@@ -913,16 +905,13 @@ export const PANEL_COPY = {
   cleared: '已恢复为 profile 配置',
   // ---- access -------------------------------------------------------------
   debugModeWarning: '调试模式已打开：应用可用范围内的任何人都能和机器人对话。用完请在「访问授权」关闭。',
-  accessAdminMissingWarning: '没有可用的管理员，所有对话都会被拒绝。请在下方填写管理员 user_id（私聊机器人发送 /userid 获取）。',
-  accessAdminCurrent: '当前管理员',
-  accessAdminSourceConfig: '已配置',
-  accessAdminSourceOwner: '应用所有者',
+  accessAdminMissingWarning: '用户表里还没有管理员，所有对话都会被拒绝。请在下方添加你自己（私聊机器人发送 /userid 获取 user_id），再打开「管理员」。',
   profilesWarning: '部分飞书名字和头像未能读取：{reason}',
   accessNotLoaded: '飞书连接建立后加载授权列表',
   accessRequestsTitle: '待处理申请',
   accessUsersTitle: '用户表',
-  accessUsersEmpty: '还没有添加任何用户；管理员始终拥有全部权限',
-  accessUsersHint: '关掉「对话」即停用该用户，其余开关随之不生效。也可以在飞书发 /auth add @用户、/auth set code on @用户。',
+  accessUsersEmpty: '还没有添加任何用户',
+  accessUsersHint: '打开「管理员」的用户拥有全部权限，可以处理授权申请，可以有多位。其他用户关掉「对话」即停用，其余开关随之不生效。管理员只能在本页设置；其他用户也可以在飞书发 /auth add @用户、/auth set code on @用户。',
   accessUserIdPlaceholder: 'user_id（私聊机器人发 /userid 获取）',
   accessUserNamePlaceholder: '昵称（可选）',
   accessAddUser: '添加用户',
@@ -942,6 +931,7 @@ export const PANEL_COPY = {
   accessPermissionChanged: '已更新权限',
   accessRequestAllowed: '已授权',
   accessRequestDenied: '已忽略',
+  accessPermAdmin: '管理员',
   accessPermChat: '对话',
   accessPermWikiRead: '读知识库',
   accessPermWikiWrite: '写知识库',

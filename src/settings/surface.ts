@@ -119,7 +119,7 @@ export interface SettingsTarget {
   addAccessUser(userId: string, name?: string): Promise<AccessMutationResponse>
   /** Remove one user from the table (takes effect on the next message). */
   removeAccessUser(userId: string): Promise<AccessMutationResponse>
-  /** Set one permission switch of a user already in the table (takes effect on the next check). */
+  /** Set the administrator flag or one permission switch of a user already in the table (takes effect on the next check). */
   setAccessPermission(userId: string, permission: AccessPermissionWire, enabled: boolean): Promise<AccessMutationResponse>
   /** Set or clear the git email of a user already in the table (used by the next push). */
   setAccessGitEmail(userId: string, gitEmail: string | undefined): Promise<AccessMutationResponse>
@@ -159,7 +159,6 @@ const OPTIONAL_TEXT_KEYS = new Set<EditableKey>([
   'reasoningEffort',
   'agentPreset',
   'maxTokens',
-  'adminUserId',
 ])
 
 const BOOLEAN_KEYS = new Set<EditableKey>([
@@ -429,14 +428,7 @@ const FIELD_META: Record<EditableKey, FieldMeta> = {
     label: '调试模式',
     group: 'access',
     summary: '打开后所有人都能聊，不安全，只在调试时用',
-    help: '关闭时（默认）：管理员随时可用；其他人要在用户表里并打开「对话准入」，才能私聊或在任何群里 @ 机器人。授权入口有三个：飞书 /auth 命令、授权卡、本页。撤销立即生效。打开后知识库与代码改动开关仍然生效。',
-  },
-  adminUserId: {
-    label: '管理员 user_id',
-    group: 'access',
-    summary: '私聊机器人发送 /userid 获取；留空使用应用所有者',
-    help: '不是 ou_ 开头的 open_id，也不是邮箱。也可以在飞书管理后台的成员详情里查看。自动使用应用所有者需要可选的「获取应用信息」权限。',
-    placeholder: 'user_id',
+    help: '关闭时（默认）：用户表里的管理员随时可用；其他人要在用户表里并打开「对话准入」，才能私聊或在任何群里 @ 机器人。授权入口有三个：飞书 /auth 命令、授权卡、本页。撤销立即生效。打开后知识库与代码改动开关仍然生效。',
   },
   authRequestTtlDays: { label: '申请有效期', group: 'access', summary: '授权申请卡多久内可以处理', min: 1, max: 30, step: 1, unit: '天' },
   'feishuTools.wikiRead': {
@@ -876,7 +868,6 @@ export class SettingsSurface {
       this.logger?.warn?.('dsh-channels: 访问授权快照读取失败：%s', messageOf(error))
       access = {
         mode: effective.accessMode,
-        admin: { configured: false },
         loaded: false,
         users: [],
         requests: [],
@@ -1156,8 +1147,8 @@ export class SettingsSurface {
   async setAccessPermission(userId: unknown, permission: unknown, enabled: unknown): Promise<AccessMutationResponse> {
     const id = normalizeAccessId(userId, '用户 user_id', USER_ID_FORMAT)
     if (!id.ok) return { ok: false, error: id.message }
-    if (permission !== 'chat' && permission !== 'wikiRead' && permission !== 'wikiWrite' && permission !== 'codeWrite') {
-      return { ok: false, error: '权限开关只能是 chat、wikiRead、wikiWrite 或 codeWrite' }
+    if (permission !== 'admin' && permission !== 'chat' && permission !== 'wikiRead' && permission !== 'wikiWrite' && permission !== 'codeWrite') {
+      return { ok: false, error: '权限开关只能是 admin、chat、wikiRead、wikiWrite 或 codeWrite' }
     }
     if (typeof enabled !== 'boolean') return { ok: false, error: 'enabled 必须是 true 或 false' }
     return this.mutateAccess(() => this.target.setAccessPermission(id.value, permission, enabled))

@@ -5,14 +5,13 @@ import { profileIds } from '../src/client/panel/profiles.ts'
 import type { AccessWire } from '../src/settings/contract.ts'
 
 describe('profileIds', () => {
-  it('collects the administrator, the user table, and pending requests once each, sorted', () => {
+  it('collects the user table (administrators included) and pending requests once each, sorted', () => {
     const access: AccessWire = {
       mode: 'guarded',
-      admin: { userId: 'u_admin', source: 'owner', configured: true },
       loaded: true,
       users: [
-        { userId: 'u_b', source: 'card', addedAt: 1, chat: true, wikiRead: true, wikiWrite: false, codeWrite: false },
-        { userId: 'u_admin', source: 'panel', addedAt: 1, chat: true, wikiRead: false, wikiWrite: false, codeWrite: false },
+        { userId: 'u_b', source: 'card', addedAt: 1, admin: false, chat: true, wikiRead: true, wikiWrite: false, codeWrite: false },
+        { userId: 'u_admin', source: 'panel', addedAt: 1, admin: true, chat: true, wikiRead: false, wikiWrite: false, codeWrite: false },
       ],
       requests: [
         { token: 't1', targetId: 'u_c', chatId: 'oc_a', createdAt: 1, expiresAt: 2 },

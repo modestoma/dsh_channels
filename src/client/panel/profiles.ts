@@ -26,7 +26,6 @@ export interface ProfileView {
 export function profileIds(access: AccessWire): { users: string[]; chats: string[] } {
   const users = new Set<string>()
   const chats = new Set<string>()
-  if (access.admin.userId !== undefined) users.add(access.admin.userId)
   for (const user of access.users) users.add(user.userId)
   for (const request of access.requests) {
     users.add(request.targetId)

@@ -243,11 +243,13 @@ export const retiredAccessGroupRecordSchema = z.object({
 
 /**
  * One user (`user_id`) of the access table (v1 format, added without a domain
- * version bump — see the notes on `feishuDomain` below). Each user carries
- * four independent permission switches; `chat` gates everything, so a user
- * with `chat` off is suspended and the other switches have no effect.
- * Records written before the switches existed parse as a conversation grant
- * only.
+ * version bump — see the notes on `feishuDomain` below). A user with `admin`
+ * on is an administrator: always admitted, holding every permission, and
+ * able to settle authorization requests; any number of users may be. Every
+ * other user carries four independent permission switches; `chat` gates
+ * everything, so a user with `chat` off is suspended and the other switches
+ * have no effect. Records written before the switches existed parse as a
+ * conversation grant only.
  */
 export const accessUserRecordSchema = z.object({
   /** Feishu `user_id` — also the table key. */
@@ -256,10 +258,12 @@ export const accessUserRecordSchema = z.object({
   name: z.string().optional(),
   /** Which authorization entry produced this grant. */
   source: z.enum(['command', 'card', 'panel']),
-  /** Administrator user_id that authorized it. */
+  /** Administrator user_id that authorized it, or `panel` for the Web settings panel. */
   addedBy: z.string().min(1),
   /** Epoch ms when it was authorized. */
   addedAt: z.number().int().nonnegative(),
+  /** Administrator: overrides every switch below. */
+  admin: z.boolean().default(false),
   /** May talk to the bot in a private chat and in any group. */
   chat: z.boolean().default(true),
   /** Topics the user drives may use the knowledge-base read tools. */
@@ -269,7 +273,7 @@ export const accessUserRecordSchema = z.object({
   /** Turns the user drives may call the configured code-write tools. */
   codeWrite: z.boolean().default(false),
   /**
-   * Git email the administrator set for this user; commits pushed for a turn
+   * Git email an administrator set for this user; commits pushed for a turn
    * the user drives name them as author with it. Absent: the host token's
    * account stays the author.
    */
@@ -279,13 +283,16 @@ export const accessUserRecordSchema = z.object({
 /** The four permission switches of one access-table user. */
 export type AccessPermission = 'chat' | 'wikiRead' | 'wikiWrite' | 'codeWrite'
 
+/** Every boolean field of an access-table user administrators set: the administrator flag and the four permissions. */
+export type AccessSwitch = 'admin' | AccessPermission
+
 /** Every permission switch, in display order. */
 export const ACCESS_PERMISSIONS: readonly AccessPermission[] = ['chat', 'wikiRead', 'wikiWrite', 'codeWrite']
 
 export type AccessUserRecord = z.infer<typeof accessUserRecordSchema>
 
 /**
- * One authorization request the administrator has been (or should be) asked
+ * One authorization request the administrators have been (or should be) asked
  * about. Requests are persisted so the DM card stays decidable across plugin
  * restarts; settled records are kept as an audit trail and for request
  * de-duplication/cooldown.
@@ -315,8 +322,10 @@ export const accessRequestRecordSchema = z.object({
   createdAt: z.number().int().nonnegative(),
   /** Epoch ms after which a pending request can no longer be decided. */
   expiresAt: z.number().int().nonnegative(),
-  /** DM message id of the administrator card, once delivery succeeded. */
+  /** DM message id of the card, written by versions with a single administrator. */
   messageId: z.string().optional(),
+  /** DM message ids of the cards delivered to the administrators. */
+  messageIds: z.array(z.string()).optional(),
 })
 
 export type AccessRequestRecord = z.infer<typeof accessRequestRecordSchema>

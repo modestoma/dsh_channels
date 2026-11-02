@@ -40,7 +40,9 @@ describe('AccessStore.load', () => {
     const { store, domain } = makeStore()
     const alice = userRecord({ userId: 'u_a', addedAt: 10 })
     const suspended = userRecord({ userId: 'u_s', addedAt: 20, chat: false, codeWrite: true })
+    const admin = userRecord({ userId: 'u_root', addedAt: 5, admin: true, chat: false })
     const request = requestRecord({ token: 'tok-a', targetId: 'u_b' })
+    void domain.handle.accessUsers.put(admin.userId, admin)
     void domain.handle.accessUsers.put(alice.userId, alice)
     void domain.handle.accessUsers.put(suspended.userId, suspended)
     void domain.handle.accessRequests.put(request.token, request)
@@ -51,7 +53,10 @@ describe('AccessStore.load', () => {
     expect(store.hasUser('u_s')).toBe(true)
     expect(store.getUser('u_a')).toEqual(alice)
     expect(store.getRequest('tok-a')).toEqual(request)
-    expect(store.snapshot()).toEqual({ users: new Set(['u_a']) })
+    expect(store.snapshot()).toEqual({ users: new Set(['u_a']), admins: new Set(['u_root']) })
+    expect(store.isAdmin('u_root')).toBe(true)
+    expect(store.isAdmin('u_a')).toBe(false)
+    expect(store.adminIds()).toEqual(['u_root'])
   })
 
   it('跳过旧版本写下的群申请记录', () => {
@@ -172,10 +177,10 @@ describe('AccessStore 用户表写穿', () => {
   it('removeUser 持久删除并即时退出快照；不存在时返回 false', async () => {
     const { store, domain } = makeStore()
     store.load()
-    await store.putUser(userRecord({ userId: 'u_a' }))
+    await store.putUser(userRecord({ userId: 'u_a', admin: true }))
     await expect(store.removeUser('u_a')).resolves.toBe(true)
     expect(durableEntries(domain, 'access_users')).toEqual([])
-    expect(store.snapshot()).toEqual({ users: new Set() })
+    expect(store.snapshot()).toEqual({ users: new Set(), admins: new Set() })
     await expect(store.removeUser('u_missing')).resolves.toBe(false)
   })
 

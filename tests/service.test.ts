@@ -111,6 +111,12 @@ interface Harness {
   config: FeishuConfig
 }
 
+/** Adds `userId` to the user table as an administrator through the settings-panel path. */
+async function makeAdmin(h: Harness, userId: string): Promise<void> {
+  await h.service.addAccessUser(userId)
+  await h.service.setAccessPermission(userId, 'admin', true)
+}
+
 async function setup(
   partial: Partial<FeishuConfig> = {},
   channelOptions: Parameters<typeof makeChannel>[0] = {},
@@ -4782,12 +4788,13 @@ describe('native attachment pipeline', () => {
 
   it('keeps a denied sender\'s attachments inert (AC3)', async () => {
     const downloads: string[] = []
-    const { h } = await setupNative({ accessMode: 'guarded', adminUserId: 'u_admin' }, {
+    const { h } = await setupNative({ accessMode: 'guarded' }, {
       downloadResource: (_messageId, fileKey) => {
         downloads.push(fileKey)
         return [PNG]
       },
     })
+    await makeAdmin(h, 'u_admin')
     await h.onMessage(makeMessage({
       chatType: 'p2p', chatId: 'oc_denied', senderId: 'u_mallory', mentionedBot: false,
       messageId: 'om_denied_image', rawContentType: 'image', content: '![image](img_x)',
@@ -5458,11 +5465,11 @@ describe('quote excerpts and first-turn topic history', () => {
       updateDocument: vi.fn(async () => ({ result: 'success', warnings: [] })),
     }
     const { h, tools } = await setupTurnReader({
-      adminUserId: 'u_admin',
       wikiRoots: ['https://mi.feishu.cn/wiki/space/1'],
       feishuTools: { ...makeConfig().feishuTools, wikiRead: true },
     }, {})
     Object.assign(h.channel, { wiki })
+    await makeAdmin(h, 'u_admin')
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_wiki', senderId: 'u_owner',
       messageId: 'om_wiki_trigger', content: '读一下知识库',

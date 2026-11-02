@@ -21,6 +21,7 @@
 import type {
   AccessPermission,
   AccessRequestRecord,
+  AccessSwitch,
   AccessUserRecord,
   FeishuDomainHandle,
 } from '../domain.ts'
@@ -35,6 +36,8 @@ export interface AccessStoreDeps {
 export interface AccessStoreSnapshot {
   /** Users whose `chat` switch is on. */
   users: ReadonlySet<string>
+  /** Users whose `admin` flag is on. */
+  admins: ReadonlySet<string>
 }
 
 /** One settled authorization request (audit trail). */
@@ -45,6 +48,8 @@ export class AccessStore {
   private readonly requests = new Map<string, AccessRequestRecord>()
   /** Cached `chat`-enabled keys so `snapshot()` stays allocation-free per message. */
   private readonly chatKeys = new Set<string>()
+  /** Cached `admin` keys, likewise. */
+  private readonly adminKeys = new Set<string>()
   /** Tail of the user-table mutation queue; always fulfilled. */
   private userWrites: Promise<void> = Promise.resolve()
 
@@ -69,10 +74,21 @@ export class AccessStore {
     this.users.clear()
     this.requests.clear()
     this.chatKeys.clear()
+    this.adminKeys.clear()
   }
 
   snapshot(): AccessStoreSnapshot {
-    return { users: this.chatKeys }
+    return { users: this.chatKeys, admins: this.adminKeys }
+  }
+
+  /** Whether `userId` is an administrator (`admin` on). */
+  isAdmin(userId: string): boolean {
+    return this.adminKeys.has(userId)
+  }
+
+  /** Every administrator's user_id, oldest record first. */
+  adminIds(): string[] {
+    return this.userRecords().filter(record => record.admin).map(record => record.userId)
   }
 
   /** Whether `userId` has a record in the user table (any switch state). */
@@ -121,13 +137,13 @@ export class AccessStore {
   }
 
   /**
-   * Set one permission switch of an existing user.
+   * Set the administrator flag or one permission switch of an existing user.
    * @param userId - Feishu user_id.
-   * @param permission - the switch to set.
+   * @param permission - the flag or switch to set.
    * @param enabled - new value.
    * @returns the updated record, or undefined when the user is not in the table.
    */
-  async setPermission(userId: string, permission: AccessPermission, enabled: boolean): Promise<AccessUserRecord | undefined> {
+  async setPermission(userId: string, permission: AccessSwitch, enabled: boolean): Promise<AccessUserRecord | undefined> {
     return await this.serializeUserWrite(async () => {
       const current = this.users.get(userId)
       if (current === undefined) return undefined
@@ -158,6 +174,7 @@ export class AccessStore {
       await this.requireDomain('remove access user').accessUsers.delete(userId)
       this.users.delete(userId)
       this.chatKeys.delete(userId)
+      this.adminKeys.delete(userId)
       return true
     })
   }
@@ -192,7 +209,7 @@ export class AccessStore {
 
   /**
    * True when the same user was denied recently — used to keep a rejected
-   * request from immediately re-notifying the administrator.
+   * request from immediately re-notifying the administrators.
    */
   recentlyDenied(userId: string, windowMs: number, now = Date.now()): boolean {
     const cutoff = now - windowMs
@@ -254,6 +271,8 @@ export class AccessStore {
     this.users.set(key, record)
     if (record.chat) this.chatKeys.add(key)
     else this.chatKeys.delete(key)
+    if (record.admin) this.adminKeys.add(key)
+    else this.adminKeys.delete(key)
   }
 
   private requireDomain(action: string): FeishuDomainHandle {

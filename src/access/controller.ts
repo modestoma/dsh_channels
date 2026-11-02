@@ -7,15 +7,15 @@
  * denial:
  *
  *  - private chats: denied senders get one fixed notice (10 s per-sender
- *    cooldown); with no administrator configured they get the bootstrap
- *    notice instead;
+ *    cooldown); while the user table has no administrator they get the
+ *    bootstrap notice instead;
  *  - group chats: fully silent, except that addressed denials call back into
- *    the authorization-request lifecycle so the administrator can be asked;
+ *    the authorization-request lifecycle so the administrators can be asked;
  *  - slash commands: `/userid` stays available to every private sender,
  *    everything else must pass admission.
  *
  * It also answers the per-user permission switches (knowledge base, code
- * write) for the tool gates: the administrator holds every switch.
+ * write) for the tool gates: an administrator holds every switch.
  *
  * The controller never creates a Session or a workspace.
  *
@@ -25,22 +25,22 @@
 import type { FeishuConfig } from '../config.ts'
 import type { AccessPermission, RouteRecord } from '../domain.ts'
 import type { FeishuChannel, NormalizedMessage } from '../feishu-channel.ts'
-import { decideAccess, isAdminUserId } from './policy.ts'
+import { decideAccess } from './policy.ts'
 import type { AccessDecision } from './policy.ts'
 import type { AccessStore, AccessStoreSnapshot } from './store.ts'
 
 /** Fixed private-chat notice for users without the conversation permission (no model call). */
 export const DM_DENY_TEXT = '你还没有对话权限哦～发送 /userid 查看你的 user_id，请管理员把你加入用户表并打开对话准入后，就可以私聊或在群里 @ 我。'
 
-/** Fixed private-chat notice while no administrator is configured. */
-export const DM_UNCONFIGURED_TEXT = '机器人尚未配置管理员。发送 /userid 可查看你的 user_id，交给部署者配置后即可启用。'
+/** Fixed private-chat notice while the user table has no administrator. */
+export const DM_UNCONFIGURED_TEXT = '机器人还没有管理员。发送 /userid 可查看你的 user_id，交给部署者在设置面板的用户表里把你设为管理员后即可启用。'
 
 /** Per-sender cooldown for the repeated private-chat notice (10 s). */
 const DM_NOTICE_COOLDOWN_MS = 10_000
 
 /** Collaborators of the admission gate. */
 export interface AccessControllerDeps {
-  /** Current plugin configuration (administrator id + access mode). */
+  /** Current plugin configuration (access mode). */
   config(): FeishuConfig
   /** Durable user table (read through the in-memory snapshot). */
   store: AccessStore
@@ -68,13 +68,13 @@ export class AccessController {
     return this.deps.now?.() ?? Date.now()
   }
 
-  /** True when `userId` is exactly the configured administrator. */
+  /** True when `userId` is an administrator in the user table. */
   isAdmin(userId?: string): boolean {
-    return isAdminUserId(this.config(), userId)
+    return userId !== undefined && this.deps.store.isAdmin(userId)
   }
 
   /**
-   * Whether `userId` holds one permission switch: the administrator holds
+   * Whether `userId` holds one permission switch: an administrator holds
    * every switch; anyone else needs the switch on in the user table (with
    * `chat` on). Independent of `accessMode`.
    * @param userId - Feishu user_id, or undefined when unknown.
@@ -175,7 +175,7 @@ export class AccessController {
 
   /**
    * Whether a `feishuTopics` launch may start a topic for `requesterUserId`:
-   * the administrator or a user with the conversation permission, or anyone
+   * an administrator or a user with the conversation permission, or anyone
    * in `open` access mode. The target group itself is not checked.
    * @param requesterUserId - Feishu user_id the launch is for.
    * @returns true when the launch is permitted.
@@ -197,7 +197,7 @@ export class AccessController {
 
   /**
    * Deliver the fixed private-chat notice (cooled down). While no
-   * administrator is configured the bootstrap text is used instead, so users
+   * administrator exists the bootstrap text is used instead, so users
    * are never pointed at an administrator that does not exist yet.
    */
   private async noticeDeniedDm(msg: NormalizedMessage): Promise<void> {
@@ -205,7 +205,7 @@ export class AccessController {
     const last = this.dmNoticeAt.get(msg.senderId)
     if (last !== undefined && now - last < DM_NOTICE_COOLDOWN_MS) return
     this.dmNoticeAt.set(msg.senderId, now)
-    const text = this.config().adminUserId === undefined ? DM_UNCONFIGURED_TEXT : DM_DENY_TEXT
+    const text = this.deps.store.snapshot().admins.size === 0 ? DM_UNCONFIGURED_TEXT : DM_DENY_TEXT
     await this.sendText(msg.chatId, text, msg.messageId)
   }
 
