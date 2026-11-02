@@ -13,24 +13,18 @@ import { randomUUID } from 'node:crypto'
 import type {
   AgentHandle, AttachmentStore, ContentBlock, HostContext, SessionId, UserMessage, Workspace,
 } from '../dsh-types.ts'
-import type { AttachmentStoreMode, FeishuConfig } from '../config.ts'
+import type { FeishuConfig } from '../config.ts'
 import { buildCard, buildOnboardingCard, initialStreamingCard, queuedStreamingCard } from '../cards.ts'
 import { RouteOperationQueue } from '../commands.ts'
 import { chatRouteKey, sessionDirOf } from '../domain.ts'
 import type { FeishuDomainHandle, RouteRecord } from '../domain.ts'
 import type { CardDelivery } from '../feishu/delivery.ts'
 import {
-  adoptStagedAttachments, attachmentsDir, attachmentResources, hasAttachmentPayload,
-  inboundAttachmentState, prefetchImageAttachments,
+  attachmentResources, inboundAttachmentState, prefetchImageAttachments,
 } from '../feishu/inbound-attachments.ts'
-import type {
-  AttachmentFailure, InboundAttachmentState,
-} from '../feishu/inbound-attachments.ts'
+import type { InboundAttachmentState } from '../feishu/inbound-attachments.ts'
 import { buildFeishuContextBlock, manifestEntriesOfKnownMessage, triggerManifestAttachments } from '../feishu/manifest.ts'
-import {
-  InboundAttachmentStore, NativeAttachmentStore, effectiveAttachmentMode,
-} from '../feishu/native-attachments.ts'
-import type { InboundAttachmentStoreResult } from '../feishu/native-attachments.ts'
+import { NativeAttachmentStore } from '../feishu/native-attachments.ts'
 import type { KnownAttachmentMessageInput, KnownAttachmentSource } from '../feishu/tools.ts'
 import type { FeishuChannel, NormalizedMessage } from '../feishu-channel.ts'
 import type { QuestionAnswerer } from '../interactions/questions.ts'
@@ -43,7 +37,7 @@ import {
   enterTopic, placementServices, planTopic, restoreTopicDir,
 } from '../session/isolation.ts'
 import type { PlacementServices, TopicPlacement, TopicPlan } from '../session/isolation.ts'
-import { ensureWorkspace, stagingPathFor, topicTokenFor } from '../workspaces.ts'
+import { ensureWorkspace, topicTokenFor } from '../workspaces.ts'
 
 /** The command plane the inbound router delegates admission-time work to. */
 export interface CommandPlanePort {
@@ -120,12 +114,8 @@ export interface InboundDeps {
   repair: InflightRepair
   delivery: CardDelivery
   sessions: SessionManager
-  /** Configured inbound attachment backend (`attachmentStore`). */
-  attachmentMode(): AttachmentStoreMode
-  /** Host-level native attachment library; undefined = not mounted. */
-  nativeAttachments(): AttachmentStore | undefined
-  /** Backend-selecting archive/fallback store (legacy workspace download). */
-  attachmentStore: InboundAttachmentStore
+  /** Host-level DSH native attachment library (required plugin dependency). */
+  nativeAttachments(): AttachmentStore
   /**
    * Pre-authorize a message's attachments for `feishu_attachment_fetch`:
    * `trigger` (the triggering message) by default, `quote`/`history`/`recent`
@@ -164,20 +154,6 @@ const APPROVAL_TEXT_REPLIES: Record<Exclude<ApprovalTextResult, 'superseded'>, s
   allowed: '已允许本次操作。',
   remembered: '已允许，本话题内同类操作不再询问。',
   denied: '已拒绝本次操作。',
-}
-
-/**
- * User-facing text for attachments that could not be archived. Delivered as a
- * plain reply (never a card) so the user learns why the Agent cannot read a
- * file instead of silently getting an answer about older attachments.
- */
-export function buildAttachmentFailureNotice(failures: readonly AttachmentFailure[]): string {
-  const lines = failures.map(failure => `• ${failure.name}：${failure.reason}`)
-  return [
-    '⚠️ 附件保存失败，Agent 无法读取：',
-    ...lines,
-    '可尝试压缩/拆分后重发，或把文件直接放到工作区目录。',
-  ].join('\n')
 }
 
 /** Build one durable user message from inbound Feishu text. */
@@ -294,7 +270,6 @@ export class InboundRouter {
   private get repair(): InflightRepair { return this.deps.repair }
   private get delivery(): CardDelivery { return this.deps.delivery }
   private get sessions(): SessionManager { return this.deps.sessions }
-  private get attachmentStore(): InboundAttachmentStore { return this.deps.attachmentStore }
   private get routeOperations(): RouteOperationQueue { return this.deps.queue }
   private get streamer(): TurnStreamer | undefined { return this.deps.streamer() }
   private get questionAnswerer(): QuestionAnswerer | undefined { return this.deps.questionAnswerer() }
@@ -409,7 +384,7 @@ export class InboundRouter {
 
     // Channel-plane admission (administrator / user table `chat` switch).
     // Nothing below this point may run for a denied sender: no
-    // TTL tombstone, attachment archive, workspace, Session, or model call.
+    // TTL tombstone, attachment download, workspace, Session, or model call.
     if (!(await this.access.admit(msg))) return
 
     // A reserved topic has no route yet: wait for its starter so the TTL,
@@ -435,37 +410,17 @@ export class InboundRouter {
       return
     }
 
-    // Attachment admission. The effective backend selects between the legacy
-    // synchronous workspace download (`attachmentStore: 'archive'`, or a
-    // native deployment whose host does not mount the attachment service) and
-    // the v2 lazy pipeline: no attachment bytes are downloaded before the
-    // session/card exists, and files are never downloaded by admission at all.
-    if (this.attachmentBackend() === 'archive') {
-      // Attachments are archived before session work: an attachment-only
-      // message produces no model turn, and a caption mixed with attachments
-      // keeps only the caption as the prompt. The Agent reads the files on
-      // demand later.
-      const archived = await this.archiveAttachments(msg)
-      if (archived !== undefined) {
-        if (archived.failures.length > 0) {
-          await this.delivery.noticeText(msg, buildAttachmentFailureNotice(archived.failures))
-        }
-        if (archived.attachmentOnly) return
-        content = archived.text
-        if (content === '') return
-      }
-    } else {
-      // Native pipeline: classify without downloading. Attachment-only
-      // messages and messages that cannot start a turn stay inert (no reply,
-      // no reaction, no Session); a mixed caption becomes the prompt with its
-      // placeholders stripped.
-      const state = inboundAttachmentState(msg)
-      if (state.hasPayload) {
-        const resolution = this.resolveNativeAttachmentMessage(msg, state)
-        if (resolution.kind === 'silent') return
-        content = resolution.text
-        if (content === '') return
-      }
+    // Attachment admission: classify without downloading. No attachment
+    // bytes are fetched before the session/card exists, and files are never
+    // downloaded by admission at all. Attachment-only messages and messages
+    // that cannot start a turn stay inert (no reply, no reaction, no Session);
+    // a mixed caption becomes the prompt with its placeholders stripped.
+    const state = inboundAttachmentState(msg)
+    if (state.hasPayload) {
+      const resolution = this.resolveNativeAttachmentMessage(msg, state)
+      if (resolution.kind === 'silent') return
+      content = resolution.text
+      if (content === '') return
     }
 
     // A session blocked on an approval card reads the owner's reply as the
@@ -530,101 +485,6 @@ export class InboundRouter {
     if (msg.chatType === 'group' && this.config.requireMention && !msg.mentionedBot) return
 
     await this.startSession(msg, content)
-  }
-
-  /**
-   * Legacy archive path: download every resource of one message into the
-   * conversation workspace (or its pre-topic staging directory). Returns
-   * `undefined` when the message carries no archivable payload; otherwise the
-   * storage result whose `text` is the remaining prompt (possibly empty).
-   *
-   * Runs inside the same per-route FIFO as turns so a caption sent right after
-   * a file is queued behind the file's download instead of racing it. Only the
-   * `archive` effective backend calls this; the native pipeline never downloads
-   * files during admission.
-   */
-  private async archiveAttachments(msg: NormalizedMessage): Promise<InboundAttachmentStoreResult | undefined> {
-    if (!hasAttachmentPayload(msg)) return undefined
-
-    const threadRecord = msg.threadId === undefined ? undefined : this.routes.get(msg.threadId)
-    // A foreign topic must never receive this sender's attachments: the
-    // archive path resolves the workspace from the route record.
-    if (threadRecord !== undefined && !this.access.ownsRoute(msg, threadRecord)) return undefined
-    const chatKey = chatRouteKey(msg.chatType, msg.chatId, msg.senderId)
-    const record = threadRecord ?? this.routes.get(chatKey)
-    // A brand-new group conversation still needs a mention; a topic the bot
-    // already owns does not.
-    if (record === undefined && msg.chatType === 'group'
-      && this.config.requireMention && !msg.mentionedBot) {
-      return {
-        mode: 'archive', saved: 0, failed: 0, failures: [], stored: [], attachmentOnly: true, text: '',
-      }
-    }
-
-    return await this.routeOperations.run(record?.key ?? chatKey, async () => {
-      if (!this.started) {
-        return {
-          mode: 'archive', saved: 0, failed: 0, failures: [], stored: [], attachmentOnly: true, text: '',
-        } satisfies InboundAttachmentStoreResult
-      }
-      // An existing topic already has its own working directory; a
-      // conversation without one stages files below baseDir until its first
-      // Session creates the topic directory and adopts them.
-      const directory = record === undefined
-        ? stagingPathFor(this.config.baseDir, msg.chatType, msg.chatId, msg.senderId)
-        : attachmentsDir(sessionDirOf(record))
-      return await this.attachmentStore.store(msg, directory)
-    })
-  }
-
-  /**
-   * One-time legacy migration: move files older plugin versions staged below
-   * `<baseDir>/_staging/...` into this conversation's topic directory.
-   *
-   * The v2 pipeline stores inbound attachments in the DSH native library and
-   * never writes staging, so this path only adopts files left by a pre-v2
-   * deployment. It is kept for one release cycle after attachment_pipeline_v2
-   * ships and is then removed together with `stagingPathFor` (decisions D12).
-   * A successful adoption logs one warning so operators can retire the old
-   * data instead of relying on this compatibility path indefinitely.
-   */
-  private async adoptLegacyStagedAttachments(
-    msg: NormalizedMessage,
-    sessionDir: string,
-    warn: (message: string, ...args: unknown[]) => void,
-  ): Promise<void> {
-    const adopted = await adoptStagedAttachments(
-      stagingPathFor(this.config.baseDir, msg.chatType, msg.chatId, msg.senderId),
-      sessionDir,
-    ).catch((error: unknown) => {
-      warn('dsh-channels: adopting staged attachments failed: %s', String(error))
-      return 0
-    })
-    if (adopted > 0) {
-      warn(
-        'dsh-channels: adopted %d legacy staged attachment(s) into %s; the one-time _staging migration is deprecated and will be removed after one release cycle (decisions D12)',
-        adopted,
-        sessionDir,
-      )
-    }
-  }
-
-  /**
-   * Effective inbound attachment backend for the live deployment.
-   *
-   * The lazy native pipeline can only deliver files through
-   * `feishu_attachment_fetch`; with that tool disabled (or without the host
-   * attachment library) the deployment falls back to the legacy archive
-   * backend, where the Agent reads the downloaded workspace copies instead of
-   * a manifest that would name an unavailable tool.
-   */
-  private attachmentBackend(): AttachmentStoreMode {
-    return effectiveAttachmentMode(
-      this.deps.attachmentMode(),
-      this.deps.nativeAttachments(),
-      this.config.feishuTools.attachmentFetch,
-      this.config.acceptAttachments,
-    )
   }
 
   /**
@@ -751,11 +611,9 @@ export class InboundRouter {
   }
 
   /**
-   * Deliver the prompt for one turn. The lazy native pipeline assembles the
-   * attachment blocks + manifest; every other deployment keeps the plain text
-   * prompt. Both backends still carry the quoted-message excerpt and (first
-   * turn only) the bounded topic history: those are read-only text context and
-   * remain useful without the lazy fetch tool.
+   * Deliver the prompt for one turn: caption text, quoted-message excerpt,
+   * prefetched images, attachment manifest, and (first turn only) the bounded
+   * topic history; see {@link nativeTurnMessage}.
    *
    * A failure in prompt assembly degrades to the plain text prompt (the turn
    * must run); a failed quote/history read degrades silently to its absence.
@@ -779,9 +637,6 @@ export class InboundRouter {
     options: TurnDeliveryOptions,
   ): Promise<UserMessage> {
     try {
-      if (this.attachmentBackend() !== 'native') {
-        return await this.textTurnMessage(msg, record, content, options)
-      }
       return await this.nativeTurnMessage(msg, record, content, options)
     } catch (error) {
       this.ctx.logger?.warn?.(
@@ -790,30 +645,6 @@ export class InboundRouter {
       )
       return feishuUserMessage(content)
     }
-  }
-
-  /**
-   * Text-only turn prompt (archive/fallback deployments): the legacy single
-   * text block, extended with the quote excerpt and the first-turn history
-   * block when they exist. With nothing extra this is byte-identical to
-   * {@link feishuUserMessage}.
-   */
-  private async textTurnMessage(
-    msg: NormalizedMessage,
-    record: RouteRecord,
-    content: string,
-    options: TurnDeliveryOptions,
-  ): Promise<UserMessage> {
-    const context = await this.readTurnContext(msg, record, options)
-    if (context.quoteBlock === undefined && context.historyBlock === undefined) {
-      return feishuUserMessage(content)
-    }
-    const blocks: ContentBlock[] = content === '' ? [] : [{ type: 'text', text: content }]
-    if (context.quoteBlock !== undefined) blocks.push({ type: 'text', text: context.quoteBlock })
-    if (context.historyBlock !== undefined) blocks.push({ type: 'text', text: context.historyBlock })
-    const message = feishuUserMessage(content)
-    message.content = blocks
-    return message
   }
 
   /**
@@ -1091,10 +922,7 @@ export class InboundRouter {
           warn('dsh-channels: attaching initial session %s to workspace failed: %s', sessionId, String(error))
         })
       }
-      // Files staged before this topic existed by a pre-v2 deployment belong
-      // to this conversation (one-time legacy adoption, see decisions D12).
-      await this.adoptLegacyStagedAttachments(msg, placement.sessionDir, warn)
-      await this.sessions.mountGuidance(handle.agent, placement.sessionDir)
+      await this.sessions.mountGuidance(handle.agent)
     } catch (error) {
       // The card lands in a final failure state — no repair needed later. A
       // Session created just before the failure must not stay live unnoticed.
@@ -1173,9 +1001,6 @@ export class InboundRouter {
       delete current.worktreeBranch
       if (placement.worktreeBranch !== undefined) current = { ...current, worktreeBranch: placement.worktreeBranch }
     }
-    // Files staged before this conversation's topic existed by a pre-v2
-    // deployment follow its next turn (one-time legacy adoption, D12).
-    await this.adoptLegacyStagedAttachments(msg, placement.sessionDir, warn)
 
     // A message behind a running turn opens as a queued card whose button can
     // move it into that turn instead (see `TurnStreamer.mergeQueued`).

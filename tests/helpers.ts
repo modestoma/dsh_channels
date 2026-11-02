@@ -148,7 +148,6 @@ export function promptSectionsOf(ctx: AgentContext): readonly PromptSection[] {
 /** Optional host services exposed inside a fake Agent scope. */
 export interface FakeAgentServices {
   tools?: ToolRuntime
-  attachments?: AttachmentStore
 }
 
 export function makeAgentContext(
@@ -169,7 +168,6 @@ export function makeAgentContext(
       },
     },
     ...(services.tools === undefined ? {} : { tools: services.tools }),
-    ...(services.attachments === undefined ? {} : { attachments: services.attachments }),
     on(_event, listener, options) {
       const prepend = options === true || (typeof options === 'object' && options.prepend === true)
       if (prepend) listeners.unshift(listener)
@@ -300,7 +298,6 @@ export function makeAttachmentStore(options: FakeAttachmentStoreOptions = {}): A
       path.join(tmpdir(), 'dsh-channels-fake-attachments', ref.name)),
     imageHostPath: vi.fn((ref: ImageAttachmentRef) =>
       path.join(tmpdir(), 'dsh-channels-fake-attachments', `${ref.attachmentId.slice(-16)}.png`)),
-    admitPromptContent: vi.fn(async (content: readonly unknown[]) => content),
     isAttachmentError: vi.fn(() => false),
   }
   return store as unknown as AttachmentStore & { savedImages: FakeSavedImage[]; savedFiles: FakeSavedFile[] }
@@ -422,7 +419,7 @@ export interface FakeAgentsOptions {
   onFailResume?: (options: Parameters<AgentRegistry['resume']>[0]) => void
   /** Optional durable Session snapshot returned by the next fake resume. */
   resumeSession?: Session
-  /** Host services exposed inside every fake Agent scope (tools/attachments). */
+  /** Host services exposed inside every fake Agent scope (tools). */
   agentExtras?: FakeAgentServices
   /** Fake inbox loop that turns followups into `agent/inbox/claimed`. */
   driver?: FakeTurnDriver
@@ -792,8 +789,12 @@ export function makeHostContext(
       value: { title: { title: '测试标题', updatedAt: 1 } },
     }))),
   }
+  // The native attachment library is a required plugin dependency; a test may
+  // pass its own fake through `extraServices.attachments` to inspect it.
+  const attachments = (extraServices.attachments as AttachmentStore | undefined) ?? makeAttachmentStore()
   const services: Record<string, unknown> = {
     agents: agents.registry,
+    attachments,
     sessionQuery,
     commands,
     workspaceRegistry: workspaces.registry,
@@ -817,6 +818,7 @@ export function makeHostContext(
     credentials,
     tokenMeter,
     llm,
+    attachments,
     registry: { size: 0, values: () => new Map().values() },
     logger: { warn: vi.fn(), error: vi.fn(), info: vi.fn(), debug: vi.fn() },
     get: (name: string) => services[name],

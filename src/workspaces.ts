@@ -16,13 +16,8 @@
  * The plugin never deletes workspace or topic directories; operators remove
  * stale ones by hand (a missing topic directory is recreated on the next turn).
  *
- * Attachments received before a topic exists were staged by older plugin
- * versions below `<baseDir>/_staging/<chatType>/<chat_id>/<user_id>/` and
- * adopted into the topic directory once its first Session is created. The v2
- * pipeline stores inbound attachments in the DSH native attachment library and
- * never writes staging, so this is a one-release compatibility path only: it is
- * scheduled for removal in the release cycle after attachment_pipeline_v2 ships
- * (see Roadmap decisions D12 and docs/attachment-pipeline-v2.md).
+ * Inbound attachments never land in these directories: they are stored in
+ * the DSH native attachment library (see `./feishu/native-attachments.ts`).
  *
  * Feishu ids (`user_id`, `oc_…`) are safe path segments, but they are validated
  * anyway so a hostile id can never escape `baseDir`.
@@ -168,39 +163,6 @@ export function workspacePathFor(
 /** Per-topic working directory inside one user workspace. */
 export function topicDirFor(workspacePath: string, topicToken: string): string {
   return path.join(workspacePath, 'topics', safeSegment(topicToken, 'topic token'))
-}
-
-/**
- * Legacy pre-topic attachment staging root.
- *
- * Only older plugin versions wrote here; the v2 native pipeline never does.
- * Scheduled for removal together with
- * the one-time adoption in the release cycle after attachment_pipeline_v2
- * (decisions D12).
- *
- * @deprecated legacy archive-upload path, kept for one release cycle only.
- */
-export function stagingRoot(baseDir: string): string {
-  return path.join(baseDir, '_staging')
-}
-
-/**
- * Staging directory for attachments that arrive before their topic (and so
- * its topic directory) exists. Not a registered workspace: files move into the
- * real topic directory as soon as the first Session of that topic is created.
- *
- * @deprecated v2 never writes staging; kept for one-time adoption of legacy
- * files for one release cycle (decisions D12).
- */
-export function stagingPathFor(
-  baseDir: string,
-  chatType: 'p2p' | 'group',
-  chatId: string,
-  senderUserId: string,
-): string {
-  const chat = safeSegment(chatId, 'chatId')
-  const user = safeSegment(senderUserId, 'senderUserId')
-  return path.join(stagingRoot(baseDir), chatType, chat, user)
 }
 
 /** Human-friendly workspace title shown in the DSH workspace list. */

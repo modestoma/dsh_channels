@@ -34,10 +34,6 @@ export const DEFAULT_APPROVAL_TIMEOUT_MS = 5 * 60 * 1000
 /** Default structured-question window: 5 minutes per `ask_user_question` call. */
 export const DEFAULT_QUESTION_TIMEOUT_MS = 5 * 60 * 1000
 
-/** Backends for inbound attachment storage, selected by `attachmentStore`. */
-export const ATTACHMENT_STORE_MODES = ['native', 'archive'] as const
-export type AttachmentStoreMode = (typeof ATTACHMENT_STORE_MODES)[number]
-
 /** Default per-call attachment count of `feishu_attachment_fetch`. */
 export const DEFAULT_ATTACHMENT_FETCH_MAX_RESOURCES = 10
 
@@ -178,33 +174,16 @@ export const configSchema = z.object({
   /**
    * Accept inbound Feishu images, files, and merged-forward chat records.
    *
-   * With the native backend (default) images of the triggering message are
-   * prefetched into the DSH native attachment library and files stay lazy
-   * behind a prompt manifest; with the archive backend the resources are saved
-   * below `<workspace>/attachments/` before the turn, exactly like the legacy
-   * pipeline. Disabled keeps attachment messages inert (no save, no turn, no
-   * manifest rows).
+   * Images of the triggering message are prefetched into the DSH native
+   * attachment library and files stay lazy behind a prompt manifest until the
+   * model calls `feishu_attachment_fetch` (mounted only while this is on).
+   * Disabled keeps attachment messages inert (no save, no turn, no manifest
+   * rows, no fetch tool).
    */
   acceptAttachments: z.boolean().default(true),
   /**
-   * Backend for inbound Feishu images and files.
-   *
-   * - `native` (default): store into the DSH native attachment library
-   *   (`ctx.attachments`) as durable `ImageBlock`/`FileBlock` references; if
-   *   the host does not mount that service, the storage layer falls back to
-   *   `archive` for that deployment.
-   * - `archive`: legacy behavior — write the resources into the topic
-   *   workspace `attachments/` directory through the existing intake.
-   *
-   * Admission consumes this switch through the backend-selecting inbound
-   * store: an explicit `archive` always uses the legacy download path, and a
-   * `native` deployment without the mounted host service degrades to the same
-   * legacy path (see `effectiveAttachmentMode`).
-   */
-  attachmentStore: z.enum(ATTACHMENT_STORE_MODES).default('native'),
-  /**
    * Prefetch images attached to the triggering message into the first model
-   * turn (native attachment backend only). The session, topic, and streaming
+   * turn. The session, topic, and streaming
    * card are already visible before the prefetch starts; the turn only waits
    * for the (short, bounded) image download, never for file bytes. Failed,
    * oversized, or timed-out images degrade to a manifest row that the model
@@ -256,13 +235,12 @@ export const configSchema = z.object({
   /**
    * Model-facing Feishu tools.
    *
-   * - `attachmentFetch` (default on): register `feishu_attachment_fetch` in
-   *   channel sessions so the model can fetch images/files of a known message
-   *   on demand. Registration is skipped (with one warning) on deployments
-   *   without the host `tools` / `attachments` services. Turning it off also
-   *   keeps inbound attachments on the archive backend: lazy native files
-   *   would be unreachable without the tool, so admission downloads them to
-   *   the workspace instead (see `effectiveAttachmentMode`).
+   * `feishu_attachment_fetch` lets the model fetch images/files of a known
+   * message on demand into the DSH native attachment library. It is mounted
+   * exactly while `acceptAttachments` is on (without it lazy files would be
+   * unreachable) and skipped with one warning on Agent scopes without the
+   * host `tools` service.
+   *
    * - `attachmentFetchMaxResources`: maximum attachments one tool call may
    *   fetch (1–50). A message with more attachments is refused with a readable
    *   reason so the model can retry per `file_key`.
@@ -280,9 +258,10 @@ export const configSchema = z.object({
    *   a readable tool failure and never fails the turn. This switch only
    *   controls the model-facing tool: the passive `<feishu_quote>` /
    *   `<feishu_history>` prompt excerpts stay enabled (they are bounded and
-   *   degrade silently) and are configured by `historyBootstrapLimit`. On the
-   *   archive backend the tool is still mounted for history text, while its
-   *   description states that `feishu_attachment_fetch` is unavailable.
+   *   degrade silently) and are configured by `historyBootstrapLimit`. With
+   *   `acceptAttachments` off the tool is still mounted for history text,
+   *   while its description states that `feishu_attachment_fetch` is
+   *   unavailable.
    * - `topicMessagesTimeoutMs`: whole-call timeout of one model-initiated
    *   topic read (default 20 s). Passive prompt excerpts use a separate short
    *   (~3 s) budget and never wait this long.
@@ -321,7 +300,6 @@ export const configSchema = z.object({
    * The Web panel/metrics ship with `panel_docs_release`.
    */
   feishuTools: z.object({
-    attachmentFetch: z.boolean().default(true),
     attachmentFetchMaxResources: z.number().int().min(1).max(50)
       .default(DEFAULT_ATTACHMENT_FETCH_MAX_RESOURCES),
     attachmentFetchMaxBytes: z.number().int().min(1)
@@ -335,7 +313,6 @@ export const configSchema = z.object({
     wikiRead: z.boolean().default(false),
     wikiWrite: z.boolean().default(false),
   }).default({
-    attachmentFetch: true,
     attachmentFetchMaxResources: DEFAULT_ATTACHMENT_FETCH_MAX_RESOURCES,
     attachmentFetchMaxBytes: DEFAULT_ATTACHMENT_FETCH_MAX_BYTES,
     attachmentFetchTimeoutMs: DEFAULT_ATTACHMENT_FETCH_TIMEOUT_MS,

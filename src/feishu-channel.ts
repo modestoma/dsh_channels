@@ -245,7 +245,7 @@ export type ResourceRangeFetcher = (range: string) => Promise<{
 /**
  * Download one object through sequential bounded Range requests. The caller
  * supplies the first response's total size and a fetcher for the remaining
- * ranges; bytes are yielded as they arrive so the archive writes them
+ * ranges; bytes are yielded as they arrive so the attachment library writes them
  * straight to disk.
  */
 export async function* downloadResourceInRanges(

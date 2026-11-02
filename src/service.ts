@@ -66,8 +66,6 @@ import { InflightRepair, storableMessage } from './session/repair.ts'
 import { SessionManager } from './session/manager.ts'
 import type { LiveAgent, RenewCommit } from './session/manager.ts'
 import { CardDelivery } from './feishu/delivery.ts'
-import { AttachmentIntake } from './feishu/inbound-attachments.ts'
-import { InboundAttachmentStore, effectiveAttachmentMode, resolveAttachmentService } from './feishu/native-attachments.ts'
 import { AttachmentFetchToolRuntime, TopicMessagesToolRuntime } from './feishu/tools.ts'
 import { SendFileToolRuntime } from './feishu/send-file.ts'
 import { WikiConsent } from './feishu/wiki/consent.ts'
@@ -79,7 +77,6 @@ import {
   readQuoteItems,
 } from './feishu/message-read.ts'
 import type { MessageReadRoute, RawMessageItem } from './feishu/message-read.ts'
-import type { AttachmentStore } from './host/attachments.ts'
 import { feishuUserMessage, InboundRouter } from './routing/inbound.ts'
 import { MissedMessages } from './routing/missed.ts'
 import type { RequestPolicyController } from './session/request-policy.ts'
@@ -369,15 +366,6 @@ export class FeishuService {
   private readonly missed: MissedMessages
   /** Outbound card delivery + reaction lifecycle. */
   private readonly delivery: CardDelivery
-  /** Inbound attachment archival (Feishu resources → workspace files). */
-  private readonly attachments: AttachmentIntake
-  /**
-   * Backend-selecting inbound storage facade. The native path stays lazy in
-   * admission (prefetch images + manifest); this facade owns the legacy
-   * workspace download used by `attachmentStore: 'archive'` and by the
-   * fallback when the host does not mount `ctx.attachments`.
-   */
-  private readonly inboundAttachmentStore: InboundAttachmentStore
   /**
    * Read-only Feishu message access (P2): the quoted-message excerpt and the
    * first-turn topic history. Constructed before the inbound router so the
@@ -438,8 +426,6 @@ export class FeishuService {
   private runningConfig: FeishuConfig | undefined
   /** Guards overlapping panel-triggered reconnects. */
   private restarting = false
-  /** One-shot warning for a native deployment without the host attachment library. */
-  private warnedNativeAttachmentsUnmounted = false
   /** One-shot warning for silently degraded quote/history reads (missing scope). */
   private warnedPromptReadDegraded = false
   private unlisten: (() => void) | undefined
@@ -535,19 +521,13 @@ export class FeishuService {
       started: () => this.started,
       detachStream: sessionId => this.streamer?.detach(sessionId),
       mountTools: (agentCtx, sessionId) => {
-        // The fetch tool only makes sense for the lazy native backend: in
-        // archive deployments (explicit, missing host library, or fetch tool
-        // disabled) every attachment is downloaded before the turn and the
-        // Agent reads the workspace copy, so mounting the tool would only
-        // advertise an operation that can never be authorized.
-        //
-        // The topic-messages tool is backend-independent: quoted excerpts and
-        // topic history are read-only, so it is mounted for both backends and
-        // self-gates on `feishuTools.topicMessages`; `feishu_send_file`
-        // self-gates on `feishuTools.sendFile`. The mounts start together and
-        // resolve as one promise (no serial blocking).
+        // The fetch tool is the only way the model reaches attachment bytes,
+        // so it is mounted exactly when the deployment accepts attachments.
+        // The topic-messages tool self-gates on `feishuTools.topicMessages`
+        // and `feishu_send_file` on `feishuTools.sendFile`. The mounts start
+        // together and resolve as one promise (no serial blocking).
         const mounts: Array<Promise<void>> = []
-        if (this.effectiveAttachmentBackend() === 'native') {
+        if (this.config.acceptAttachments) {
           mounts.push(this.attachmentFetchTools.mount(agentCtx, sessionId))
         }
         mounts.push(this.topicMessagesTools.mount(agentCtx, sessionId))
@@ -557,25 +537,10 @@ export class FeishuService {
       },
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
     })
-    this.attachments = new AttachmentIntake({
-      enabled: () => this.config.acceptAttachments,
-      channel: () => this.channel,
-      warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
-    })
-    this.inboundAttachmentStore = new InboundAttachmentStore({
-      enabled: () => this.config.acceptAttachments,
-      // Effective backend, not the raw config: `store()` is only called after
-      // admission already decided `archive`, so a native-configured deployment
-      // with the fetch tool disabled must download to the workspace here too.
-      mode: () => this.effectiveAttachmentBackend(),
-      service: () => this.nativeAttachmentService(),
-      channel: () => this.channel,
-      archive: this.attachments,
-      warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
-    })
     this.attachmentFetchTools = new AttachmentFetchToolRuntime({
       config: () => this.config,
       channel: () => this.channel,
+      attachments: () => this.ctx.attachments,
       routeOfSession: sessionId => {
         const record = this.routes.findBySession(sessionId)
         if (record === undefined) return undefined
@@ -609,9 +574,9 @@ export class FeishuService {
         this.attachmentFetchTools.noteKnownMessage(route, message, source)
       },
       isKnownMessage: (route, messageId) => this.attachmentFetchTools.isKnownMessage(route, messageId),
-      // The tool description must not promise a fetch tool that archive
-      // deployments do not mount; the runtime appends a degradation note.
-      fetchAvailable: () => this.effectiveAttachmentBackend() === 'native',
+      // The tool description must not promise a fetch tool that is not
+      // mounted; the runtime appends a note when attachments are disabled.
+      fetchAvailable: () => this.config.acceptAttachments,
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
     })
     this.outbox = new Outbox({
@@ -685,9 +650,7 @@ export class FeishuService {
       repair: this.repair,
       delivery: this.delivery,
       sessions: this.sessions,
-      attachmentMode: () => this.config.attachmentStore,
-      nativeAttachments: () => this.nativeAttachmentService(),
-      attachmentStore: this.inboundAttachmentStore,
+      nativeAttachments: () => this.ctx.attachments,
       noteKnownAttachments: (record, message, source) => {
         this.noteKnownAttachmentMessage(record, message, source ?? 'trigger')
       },
@@ -729,40 +692,6 @@ export class FeishuService {
       reserveTopic: threadId => this.inbound.reserveTopic(threadId),
       mayLaunchFor: requesterUserId => this.accessController.mayLaunchFor(requesterUserId),
     })
-  }
-
-  /** Effective inbound attachment backend (matches the inbound router). */
-  private effectiveAttachmentBackend(): 'native' | 'archive' {
-    return effectiveAttachmentMode(
-      this.config.attachmentStore,
-      this.nativeAttachmentService(),
-      this.config.feishuTools.attachmentFetch,
-      this.config.acceptAttachments,
-    )
-  }
-
-  /**
-   * Resolve the host's native attachment library from the plugin scope.
-   *
-   * The service is registered host-wide (`@deepseek-ai/dsh-attachment-local`),
-   * so the safe `ctx.get` lookup resolves it even though this plugin does not
-   * declare `attachments` in its cordis `inject` list (the per-Agent scopes
-   * still inject it for the fetch tool). A missing service reads as
-   * `undefined` and switches admission to the legacy archive backend.
-   */
-  private nativeAttachmentService(): AttachmentStore | undefined {
-    const service = resolveAttachmentService(this.ctx)
-    if (service === undefined && this.config.attachmentStore === 'native'
-      && !this.warnedNativeAttachmentsUnmounted) {
-      // The facade now receives the effective backend, so its own downgrade
-      // warning cannot fire: report the missing library once from the resolver.
-      this.warnedNativeAttachmentsUnmounted = true
-      this.ctx.logger?.warn?.(
-        'dsh-channels: attachmentStore=native 但宿主未挂载 ctx.attachments，'
-        + '入站附件回退话题 attachments/ 工作区落盘',
-      )
-    }
-    return service
   }
 
   /**
@@ -923,7 +852,7 @@ export class FeishuService {
 
   /** Whether this deployment mounts the lazy attachment fetch tool. */
   private attachmentFetchMounted(): boolean {
-    return this.effectiveAttachmentBackend() === 'native'
+    return this.config.acceptAttachments
   }
 
   /**

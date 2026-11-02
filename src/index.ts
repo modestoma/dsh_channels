@@ -67,7 +67,7 @@ export { FeishuService } from './service.ts'
 export { FEISHU_TOPICS_SERVICE, FEISHU_TOPICS_VERSION, TopicLauncher } from './topics/launcher.ts'
 export type { TopicLauncherDeps } from './topics/launcher.ts'
 export { TurnStreamer } from './streamer.ts'
-export { ensureWorkspace, stagingPathFor, stagingRoot, topicDirFor, topicTokenFor, workspacePathFor, workspaceTitleFor, worktreeBranchFor } from './workspaces.ts'
+export { ensureWorkspace, topicDirFor, topicTokenFor, workspacePathFor, workspaceTitleFor, worktreeBranchFor } from './workspaces.ts'
 export { ACCESS_PERMISSIONS, accessRequestRecordSchema, accessUserRecordSchema, appendSessionHistory, chatRouteKey, expiredRouteRecordSchema, feishuDomain, normalizeRouteRecord, normalizeSessionHistory, routeRecordSchema, sessionDirOf, sessionHistoryEntrySchema, inflightSnapshotSchema, processedRecordSchema } from './domain.ts'
 
 /** Cordis function-plugin name. */
@@ -79,9 +79,11 @@ export const name = 'channels'
  * process environment: at boot the credentials provider may not be visible
  * yet (a race observed in real profiles), and inject makes the loader wait
  * for it. `llm` / `tokenMeter` feed the card's context line and ship with
- * every dsh-base profile.
+ * every dsh-base profile. `attachments` is the DSH native attachment library
+ * (`@deepseek-ai/dsh-attachment-local`, mounted by the shipped base
+ * composition): it is the only storage for inbound Feishu images and files.
  */
-export const inject = ['agents', 'commands', 'workspaceRegistry', 'storageDomain', 'credentials', 'llm', 'tokenMeter'] as const
+export const inject = ['agents', 'commands', 'workspaceRegistry', 'storageDomain', 'credentials', 'llm', 'tokenMeter', 'attachments'] as const
 
 /**
  * Cordis Standard Schema declaration for the plugin config.

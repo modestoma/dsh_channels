@@ -7,6 +7,7 @@
  */
 
 import type { Agent, AgentRegistry } from './agent.ts'
+import type { AttachmentStore } from './attachments.ts'
 import type { CommandRuntime } from './commands.ts'
 import type { AssistantStreamPayload, CommitTrailersEvent, InboxClaimedPayload, InboxDiscardedPayload, PreToolDecision, PreToolExecution, Session, SessionEvent, SessionId } from './core.ts'
 import type { ApprovalAnswererListener, UserQuestionAnswererListener } from './interaction.ts'
@@ -285,6 +286,8 @@ export interface HostContext {
   credentials: CredentialProvider
   tokenMeter: TokenMeter
   llm: LlmService
+  /** DSH native attachment library (`@deepseek-ai/dsh-attachment-local`). */
+  attachments: AttachmentStore
   /** Built-in Cordis plugin registry used for aggregate health diagnostics. */
   registry: CordisRegistry
   logger?: HostLogger

@@ -466,13 +466,13 @@ describe('overlay paths and validation', () => {
   it('validates nested feishuTools keys and stores only the edited sub-fields', () => {
     const ok = parseOverlay({
       dmMode: 'disabled',
-      feishuTools: { attachmentFetch: false, attachmentFetchTimeoutMs: 60_000 },
+      feishuTools: { sendFile: false, attachmentFetchTimeoutMs: 60_000 },
     })
     expect(ok.ok).toBe(true)
     if (!ok.ok) return
     expect(ok.patch).toEqual({
       dmMode: 'disabled',
-      feishuTools: { attachmentFetch: false, attachmentFetchTimeoutMs: 60_000 },
+      feishuTools: { sendFile: false, attachmentFetchTimeoutMs: 60_000 },
     })
 
     // Canonical schema defaults must not leak into the overlay.
@@ -498,38 +498,45 @@ describe('overlay paths and validation', () => {
   })
 
   it('merges nested feishuTools over the profile config without dropping sibling keys', () => {
-    const base = makeConfig({ attachmentStore: 'native' })
-    const merged = mergeOverlay(base, { feishuTools: { attachmentFetch: false } })
-    expect(merged.feishuTools.attachmentFetch).toBe(false)
+    const base = makeConfig()
+    const merged = mergeOverlay(base, { feishuTools: { sendFile: false } })
+    expect(merged.feishuTools.sendFile).toBe(false)
     expect(merged.feishuTools.topicMessages).toBe(true)
     expect(merged.feishuTools.attachmentFetchMaxBytes).toBe(base.feishuTools.attachmentFetchMaxBytes)
-    expect(configValueOf(merged, 'feishuTools.attachmentFetch')).toBe(false)
-    expect(configValueOf(merged, 'attachmentStore')).toBe('native')
+    expect(configValueOf(merged, 'feishuTools.sendFile')).toBe(false)
 
     // A pre-v2 overlay (flat keys only) still validates, keys of removed
-    // settings (workspace retention) are dropped, and every new key falls back
-    // to the profile/default layer.
-    const old = normalizeOverlay({ requireMention: false, workspaceRetention: '30d', workspaceRetentionAuto: true })
+    // settings (workspace retention, the archive attachment backend and its
+    // fetch-tool switch) are dropped, and every new key falls back to the
+    // profile/default layer.
+    const old = normalizeOverlay({
+      requireMention: false,
+      workspaceRetention: '30d',
+      workspaceRetentionAuto: true,
+      attachmentStore: 'archive',
+      feishuTools: { attachmentFetch: false },
+    })
     expect(old).toEqual({ requireMention: false })
+    const parsed = parseOverlay({ attachmentStore: 'archive', feishuTools: { attachmentFetch: false } })
+    expect(parsed).toEqual({ ok: true, patch: {} })
     const migrated = mergeOverlay(base, old)
     expect(migrated.requireMention).toBe(false)
-    expect(migrated.attachmentStore).toBe('native')
     expect(migrated.prefetchImages).toBe(true)
-    expect(migrated.feishuTools.attachmentFetch).toBe(true)
+    expect(migrated.feishuTools.sendFile).toBe(true)
   })
 
   it('deep-merges and clears nested overlay keys', () => {
-    const first = normalizeOverlay({ feishuTools: { attachmentFetch: false, topicMessages: false } })
-    const second = normalizeOverlay({ feishuTools: { attachmentFetch: true } })
+    const first = normalizeOverlay({ feishuTools: { sendFile: false, topicMessages: false } })
+    const second = normalizeOverlay({ feishuTools: { sendFile: true } })
     const merged = mergeOverlayPatch(first, second)
-    expect(merged.feishuTools).toEqual({ attachmentFetch: true, topicMessages: false })
+    expect(merged.feishuTools).toEqual({ sendFile: true, topicMessages: false })
     deleteOverlayKey(merged, 'feishuTools.topicMessages')
-    expect(merged.feishuTools).toEqual({ attachmentFetch: true })
-    deleteOverlayKey(merged, 'feishuTools.attachmentFetch')
+    expect(merged.feishuTools).toEqual({ sendFile: true })
+    deleteOverlayKey(merged, 'feishuTools.sendFile')
     expect(merged.feishuTools).toBeUndefined()
     // Wire projection uses the flat dotted key space the form renders.
     expect(overlayValues(first)).toEqual({
-      'feishuTools.attachmentFetch': false,
+      'feishuTools.sendFile': false,
       'feishuTools.topicMessages': false,
     })
   })
@@ -552,13 +559,13 @@ describe('OverlayStore', () => {
   it('round-trips nested feishuTools overrides in the hand-editable nested shape', async () => {
     const file = tempOverlayFile()
     const store = new OverlayStore(file)
-    await store.save({ feishuTools: { attachmentFetch: false, attachmentFetchMaxBytes: 2048 } })
+    await store.save({ feishuTools: { sendFile: false, attachmentFetchMaxBytes: 2048 } })
     await expect(store.load()).resolves.toEqual({
-      feishuTools: { attachmentFetch: false, attachmentFetchMaxBytes: 2048 },
+      feishuTools: { sendFile: false, attachmentFetchMaxBytes: 2048 },
     })
     // The file mirrors the profile config shape, so an operator can edit it by hand.
     expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({
-      feishuTools: { attachmentFetch: false, attachmentFetchMaxBytes: 2048 },
+      feishuTools: { sendFile: false, attachmentFetchMaxBytes: 2048 },
     })
   })
 
@@ -639,7 +646,6 @@ describe('field descriptors', () => {
     expect(toggles).toEqual({
       dmMode: { on: 'open', off: 'disabled' },
       threadFallback: { on: 'degrade', off: 'strict' },
-      attachmentStore: { on: 'native', off: 'archive' },
       accessMode: { on: 'open', off: 'guarded' },
     })
     for (const field of FIELD_DESCRIPTORS) {
@@ -717,11 +723,10 @@ describe('field descriptors', () => {
 
   it('describes the v2 attachment pipeline and model-tool fields with bounds', () => {
     const byKey = new Map(FIELD_DESCRIPTORS.map(field => [field.key, field]))
-    const store = byKey.get('attachmentStore')
-    expect(store).toMatchObject({ kind: 'select', group: 'attachments', restartRequired: false })
-    expect(store?.options?.map(option => option.value)).toEqual(['native', 'archive'])
-    expect(store?.label).toContain('原生附件库')
-    expect(store?.help).toContain('不可变')
+    const keys: readonly string[] = FIELD_DESCRIPTORS.map(field => field.key)
+    expect(keys).not.toContain('attachmentStore')
+    expect(keys).not.toContain('feishuTools.attachmentFetch')
+    expect(byKey.get('acceptAttachments')?.help).toContain('原生附件库')
 
     expect(byKey.get('prefetchImages')).toMatchObject({ kind: 'boolean', group: 'attachments' })
     expect(byKey.get('prefetchTimeoutMs')).toMatchObject({
@@ -731,7 +736,7 @@ describe('field descriptors', () => {
     expect(byKey.get('prefetchTotalMaxBytes')).toMatchObject({ kind: 'number', min: 1 })
     expect(byKey.get('historyBootstrapLimit')).toMatchObject({ kind: 'number', min: 0, max: 20 })
     expect(byKey.get('promptContextTimeoutMs')).toMatchObject({ kind: 'number', group: 'limits' })
-    expect(byKey.get('feishuTools.attachmentFetch')).toMatchObject({
+    expect(byKey.get('feishuTools.sendFile')).toMatchObject({
       kind: 'boolean', group: 'tools', restartRequired: false,
     })
     expect(byKey.get('feishuTools.attachmentFetchMaxResources')).toMatchObject({
@@ -747,8 +752,8 @@ describe('field descriptors', () => {
     })
     // The attachment pipeline and model tools render under「附件与工具」.
     const attachmentsTab = new Set([
-      'attachmentStore', 'prefetchImages', 'prefetchTimeoutMs',
-      'historyBootstrapLimit', 'feishuTools.attachmentFetch', 'feishuTools.topicMessages',
+      'acceptAttachments', 'prefetchImages', 'prefetchTimeoutMs',
+      'historyBootstrapLimit', 'feishuTools.sendFile', 'feishuTools.topicMessages',
     ])
     for (const field of FIELD_DESCRIPTORS) {
       if (!attachmentsTab.has(field.key)) continue
@@ -1174,14 +1179,13 @@ describe('SettingsSurface', () => {
   it('saves the v2 attachment pipeline fields, including nested feishuTools keys', async () => {
     const { surface, target, store } = makeSurface()
     const result = await surface.save({
-      attachmentStore: 'archive',
       prefetchImages: false,
       prefetchTimeoutMs: 5_000,
       prefetchImageMaxBytes: 1024,
       prefetchTotalMaxBytes: 4096,
       historyBootstrapLimit: 3,
       promptContextTimeoutMs: 1_500,
-      'feishuTools.attachmentFetch': false,
+      'feishuTools.sendFile': false,
       'feishuTools.attachmentFetchMaxResources': 4,
       'feishuTools.attachmentFetchMaxBytes': 2048,
       'feishuTools.attachmentFetchTimeoutMs': 30_000,
@@ -1192,7 +1196,6 @@ describe('SettingsSurface', () => {
     if (!result.ok) return
     // The overlay file keeps the nested profile shape; untouched siblings stay out.
     await expect(store.load()).resolves.toEqual({
-      attachmentStore: 'archive',
       prefetchImages: false,
       prefetchTimeoutMs: 5_000,
       prefetchImageMaxBytes: 1024,
@@ -1200,7 +1203,7 @@ describe('SettingsSurface', () => {
       historyBootstrapLimit: 3,
       promptContextTimeoutMs: 1_500,
       feishuTools: {
-        attachmentFetch: false,
+        sendFile: false,
         attachmentFetchMaxResources: 4,
         attachmentFetchMaxBytes: 2048,
         attachmentFetchTimeoutMs: 30_000,
@@ -1208,10 +1211,9 @@ describe('SettingsSurface', () => {
         topicMessagesTimeoutMs: 15_000,
       },
     })
-    expect(result.panel.config.effective.attachmentStore).toBe('archive')
-    expect(result.panel.config.effective['feishuTools.attachmentFetch']).toBe(false)
-    expect(target.applied?.feishuTools?.attachmentFetch).toBe(false)
-    expect(result.panel.config.overriddenKeys).toContain('feishuTools.attachmentFetch')
+    expect(result.panel.config.effective['feishuTools.sendFile']).toBe(false)
+    expect(target.applied?.feishuTools?.sendFile).toBe(false)
+    expect(result.panel.config.overriddenKeys).toContain('feishuTools.sendFile')
     // The wire projection uses the same dotted keys as the form.
     expect(result.panel.config.overlay['feishuTools.topicMessages']).toBe(false)
 
@@ -1220,7 +1222,7 @@ describe('SettingsSurface', () => {
     expect(later.ok).toBe(true)
     const overlay = await store.load()
     expect(overlay.feishuTools).toMatchObject({
-      attachmentFetch: false,
+      sendFile: false,
       topicMessages: true,
       attachmentFetchTimeoutMs: 30_000,
     })
@@ -2289,21 +2291,21 @@ describe('FeishuService settings integration', () => {
   })
 
   it('deep-merges a nested feishuTools overlay over the profile config', async () => {
-    const h = harness({ feishuTools: { attachmentFetch: false } })
+    const h = harness({ feishuTools: { sendFile: false } })
     const service = new FeishuService(h.ctx, h.config, () => h.channel, undefined, h.store)
     await service.boot()
     const config = service.configSnapshot()
-    expect(config.feishuTools.attachmentFetch).toBe(false)
+    expect(config.feishuTools.sendFile).toBe(false)
     // Sibling tool settings keep their profile/default values.
     expect(config.feishuTools.topicMessages).toBe(true)
     expect(config.feishuTools.attachmentFetchMaxBytes).toBe(h.config.feishuTools.attachmentFetchMaxBytes)
-    expect(service.runningConfigSnapshot()?.feishuTools.attachmentFetch).toBe(false)
+    expect(service.runningConfigSnapshot()?.feishuTools.sendFile).toBe(false)
 
     // A live panel write starts from the profile base (not from the previous
     // overlay) and applies only the sub-fields it carries.
     service.applyOverlay({ feishuTools: { topicMessages: false } })
     expect(service.configSnapshot().feishuTools.topicMessages).toBe(false)
-    expect(service.configSnapshot().feishuTools.attachmentFetch).toBe(true)
+    expect(service.configSnapshot().feishuTools.sendFile).toBe(true)
     await service.shutdown()
   })
 

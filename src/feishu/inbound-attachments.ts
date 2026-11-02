@@ -1,99 +1,29 @@
 /**
- * Inbound attachment archival: Feishu image/file resources and merged-forward
- * chat records are written verbatim below `<workspace>/attachments/`.
+ * Inbound attachment payload classification and the trigger-message image
+ * prefetch.
  *
- * Nothing is forwarded to the model. The Agent's own filesystem tools read
- * whichever attachment the conversation needs, so an attachment message costs
- * no model request at all and unreferenced files never enter the context.
- * Files are streamed straight to disk: there is no plugin-side size cap, so a
- * large upload must not be collected in memory.
+ * Nothing here writes to a workspace: images and files are stored only in the
+ * DSH native attachment library (see `native-attachments.ts`), images through
+ * the bounded prefetch below and files lazily through `feishu_attachment_fetch`.
  *
- * Two payload shapes need care because the SDK normalizer drops them:
- * rich-text (`post`) messages keep their attached files in a top-level
- * `files` array that `convertPost` ignores, and merged-forward records are
- * plain text rather than resources. Both are recovered here; the post files
- * come from the raw event, which the channel adapter asks the SDK to attach.
+ * Rich-text (`post`) messages need care because the SDK normalizer drops them:
+ * their attached files live in a top-level `files` array that `convertPost`
+ * ignores. They are recovered here from the raw event, which the channel
+ * adapter asks the SDK to attach.
  *
  * @module dsh-channels/feishu/inbound-attachments
  */
 
-import { randomUUID } from 'node:crypto'
-import { createWriteStream } from 'node:fs'
-import { mkdir, open, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
-import path from 'node:path'
-import { Readable } from 'node:stream'
-import { pipeline } from 'node:stream/promises'
 import type { FeishuChannel, NormalizedMessage, ResourceChunkStream } from '../feishu-channel.ts'
-import { sniffImageMediaType } from '../feishu-channel.ts'
 import type { ImageBlock } from '../host/attachments.ts'
 
-/** Workspace subdirectory that holds every archived attachment. */
-export const ATTACHMENTS_DIR = 'attachments'
-
-/** `<workspace>/attachments` directory of one topic workspace. */
-export function attachmentsDir(workspacePath: string): string {
-  return path.join(workspacePath, ATTACHMENTS_DIR)
-}
-
-/**
- * Move every staged attachment into one topic workspace. Staging holds files
- * received before their topic (and therefore its workspace) existed; they
- * belong to the first Session created for that topic. Best-effort per file.
- *
- * @returns how many files were adopted.
- */
-export async function adoptStagedAttachments(stagingDir: string, workspacePath: string): Promise<number> {
-  let entries: Array<{ name: string; isFile(): boolean }>
-  try {
-    entries = await readdir(stagingDir, { withFileTypes: true })
-  } catch {
-    return 0
-  }
-  const files = entries.filter(entry => entry.isFile() && !entry.name.startsWith('.'))
-  if (files.length === 0) return 0
-  const target = attachmentsDir(workspacePath)
-  try {
-    await mkdir(target, { recursive: true })
-  } catch {
-    return 0
-  }
-  let adopted = 0
-  for (const entry of files) {
-    const destination = await uniqueName(target, entry.name)
-    try {
-      await rename(path.join(stagingDir, entry.name), path.join(target, destination))
-      adopted += 1
-    } catch {
-      // Leave the staged file for the next attempt; never block the turn.
-    }
-  }
-  return adopted
-}
-
-/**
- * The SDK placeholder for a rich-text message that carried no visible text.
- * Exported so the native storage layer classifies attachment-only messages
- * with exactly the same rule as the workspace archive.
- */
+/** The SDK placeholder for a rich-text message that carried no visible text. */
 export const EMPTY_POST_PLACEHOLDER = '[rich text message]'
 
 /** Placeholders the SDK leaves in normalized content for attachment payloads. */
 const IMAGE_PLACEHOLDER = /!\[image\]\([^)]*\)/gu
 const FILE_PLACEHOLDER = /<file[^>]*\/>/gu
 const FORWARDED_PLACEHOLDER = /<forwarded_messages(?:\/>|>[\s\S]*?<\/forwarded_messages>)/gu
-/** An expanded record always starts with this wrapper; a bare empty one means the fetch failed. */
-const EMPTY_FORWARDED = '<forwarded_messages/>'
-
-export interface AttachmentIntakeDeps {
-  /** Whether this deployment archives inbound attachments at all. */
-  enabled(): boolean
-  /** Live channel; undefined after shutdown. */
-  channel(): FeishuChannel | undefined
-  /** Structured warning sink (never throws). */
-  warn(message: string, ...args: unknown[]): void
-  /** Deterministic clock seam for file-name prefixes. */
-  now?(): number
-}
 
 /** One decoded attachment recovered from the normalized message or its raw post payload. */
 export interface AttachmentResource {
@@ -104,23 +34,10 @@ export interface AttachmentResource {
   readonly folder?: boolean
 }
 
-/** One attachment that could not be archived, with a user-facing reason. */
+/** One attachment that could not be stored, with a user-facing reason. */
 export interface AttachmentFailure {
   readonly name: string
   readonly reason: string
-}
-
-export interface AttachmentArchiveResult {
-  /** Resources durably written to the workspace. */
-  saved: number
-  /** Resources that failed to download, write, or are unsupported. */
-  failed: number
-  /** User-facing per-attachment failure notes (only when `failed > 0`). */
-  failures: readonly AttachmentFailure[]
-  /** True when the message carried no prompt text after removing placeholders. */
-  attachmentOnly: boolean
-  /** Remaining text after attachment placeholders are removed. */
-  text: string
 }
 
 /** One file attached to a rich-text (`post`) message. */
@@ -151,13 +68,6 @@ export function attachmentResources(msg: NormalizedMessage): AttachmentResource[
   return resources
 }
 
-/** Whether one message may carry an attachment payload worth archiving. */
-export function hasAttachmentPayload(msg: NormalizedMessage): boolean {
-  if (msg.rawContentType === 'merge_forward') return true
-  if (msg.rawContentType === 'post') return true
-  return attachmentResources(msg).length > 0
-}
-
 /** One inbound attachment payload classified without downloading a byte. */
 export interface InboundAttachmentState {
   /** Whether the message carries an attachment payload (resources or a merged-forward record). */
@@ -176,9 +86,8 @@ export interface InboundAttachmentState {
  * Classify one inbound message's attachment payload without downloading
  * anything or touching state outside the message itself.
  *
- * The rules are exactly the ones the archive intake and the native storage
- * layer already use, so admission can decide "stay inert" versus "start a
- * turn" before any Session exists: no resources and no merged-forward record
+ * Admission uses it to decide "stay inert" versus "start a turn" before any
+ * Session exists: no resources and no merged-forward record
  * means "no payload" and the raw content is the prompt; otherwise placeholders
  * are stripped and an empty remainder marks an attachment-only message.
  */
@@ -251,154 +160,11 @@ function collectFileEntries(node: unknown, depth: number): Array<Record<string, 
   return out
 }
 
-export class AttachmentIntake {
-  constructor(private readonly deps: AttachmentIntakeDeps) {}
-
-  /**
-   * Archive every image/file resource and merged-forward record of one
-   * inbound message. Failures are contained per attachment; the method never
-   * throws and always reports the remaining prompt text.
-   */
-  async archive(msg: NormalizedMessage, directory: string): Promise<AttachmentArchiveResult> {
-    const resources = attachmentResources(msg)
-    const forwarded = msg.rawContentType === 'merge_forward'
-    if (resources.length === 0 && !forwarded) {
-      return { saved: 0, failed: 0, failures: [], attachmentOnly: false, text: msg.content ?? '' }
-    }
-
-    const stripped = stripAttachmentPlaceholders(msg.content ?? '', forwarded)
-    const remainingText = stripped === EMPTY_POST_PLACEHOLDER ? '' : stripped
-    const result = (
-      saved: number,
-      failures: readonly AttachmentFailure[],
-    ): AttachmentArchiveResult => ({
-      saved,
-      failed: failures.length,
-      failures,
-      attachmentOnly: remainingText === '',
-      text: remainingText,
-    })
-
-    if (!this.deps.enabled()) return result(0, [])
-
-    const channel = this.deps.channel()
-    if (channel === undefined) {
-      return result(0, resources.map(resource => ({
-        name: resourceName(resource),
-        reason: '飞书连接未运行，附件未保存',
-      })))
-    }
-
-    const dir = directory
-    let saved = 0
-    const failures: AttachmentFailure[] = []
-    try {
-      await mkdir(dir, { recursive: true })
-    } catch (error) {
-      this.deps.warn('dsh-channels: creating attachments directory %s failed: %s', dir, String(error))
-      return result(0, resources.map(resource => ({
-        name: resourceName(resource),
-        reason: `无法创建工作区附件目录：${describeFailure(error)}`,
-      })))
-    }
-
-    for (const resource of resources) {
-      const name = resourceName(resource)
-      if (resource.folder === true) {
-        failures.push({ name, reason: '飞书文件夹消息暂不支持下载' })
-        continue
-      }
-      try {
-        await this.saveResource(msg, resource, dir)
-        saved += 1
-      } catch (error) {
-        failures.push({ name, reason: describeFailure(error) })
-        this.deps.warn(
-          'dsh-channels: archiving resource %s of message %s failed: %s',
-          resource.fileKey, msg.messageId, String(error),
-        )
-      }
-    }
-
-    if (forwarded) {
-      try {
-        await this.saveForwardedRecord(msg, dir)
-        saved += 1
-      } catch (error) {
-        failures.push({ name: '会话记录', reason: describeFailure(error) })
-        this.deps.warn(
-          'dsh-channels: archiving forwarded record of message %s failed: %s',
-          msg.messageId, String(error),
-        )
-      }
-    }
-
-    if (saved > 0) {
-      await channel.addReaction(msg.messageId, 'DONE').catch(() => undefined)
-    } else if (failures.length > 0) {
-      await channel.addReaction(msg.messageId, 'No').catch(() => undefined)
-    }
-
-    return result(saved, failures)
-  }
-
-  /** Stream one image/file resource to disk, then publish it under a stable name. */
-  private async saveResource(
-    msg: NormalizedMessage,
-    resource: AttachmentResource,
-    dir: string,
-  ): Promise<void> {
-    const channel = this.deps.channel()
-    if (channel === undefined) throw new Error('channel is not running')
-    const stream = await channel.downloadResource(
-      msg.messageId,
-      resource.fileKey,
-      resource.type === 'file' ? 'file' : 'image',
-    )
-    const temporary = path.join(dir, `.tmp-${randomUUID()}`)
-    try {
-      await pipeline(Readable.from(stream), createWriteStream(temporary, { mode: 0o600 }))
-      const original = sanitizeFileName(resource.fileName)
-      const base = original ?? (resource.type === 'image'
-        ? `image${await sniffExtension(temporary)}`
-        : 'file.bin')
-      const finalName = await uniqueName(dir, `${this.stamp()}-${base}`)
-      await rename(temporary, path.join(dir, finalName))
-    } catch (error) {
-      await rm(temporary, { force: true }).catch(() => undefined)
-      throw error
-    }
-  }
-
-  /**
-   * Persist one expanded merged-forward record as UTF-8 text. The content is
-   * already plain text (`<forwarded_messages>…`), so no parsing or conversion
-   * happens here — the Agent reads the file when the conversation needs it.
-   */
-  private async saveForwardedRecord(msg: NormalizedMessage, dir: string): Promise<void> {
-    const content = msg.content ?? ''
-    if (content.trim() === '' || content.trim() === EMPTY_FORWARDED) {
-      throw new Error('会话记录为空（机器人可能缺少源消息的读取权限）')
-    }
-    const name = await uniqueName(dir, `${this.stamp()}-forwarded-record.txt`)
-    await writeFile(path.join(dir, name), `${content}\n`, { encoding: 'utf8', mode: 0o600 })
-  }
-
-  private stamp(): string {
-    return compactTimestamp(this.deps.now?.() ?? Date.now())
-  }
-}
-
 /** Remove attachment placeholders while keeping ordinary prompt text. */
 export function stripAttachmentPlaceholders(content: string, forwarded: boolean): string {
   let text = content.replace(IMAGE_PLACEHOLDER, ' ').replace(FILE_PLACEHOLDER, ' ')
   if (forwarded) text = text.replace(FORWARDED_PLACEHOLDER, ' ')
   return text.replace(/[ \t]+/gu, ' ').replace(/\s*\n\s*/gu, '\n').trim()
-}
-
-/** `YYYYMMDD-HHmmss`, UTC, filesystem- and sort-friendly. */
-export function compactTimestamp(epochMs: number): string {
-  return new Date(epochMs).toISOString().replace(/[-:]/gu, '').replace(/\..+$/u, '').replace('T', '-')
 }
 
 /** Strip directories, control characters, and reserved path characters from a display name. */
@@ -443,42 +209,6 @@ function truncateUtf8(value: string, maxBytes: number): string {
     out += char
   }
   return out
-}
-
-/** Pick a non-colliding destination name inside one directory. */
-async function uniqueName(dir: string, candidate: string): Promise<string> {
-  const parsed = path.parse(candidate)
-  for (let attempt = 1; attempt <= 100; attempt += 1) {
-    const name = attempt === 1 ? candidate : `${parsed.name}-${attempt}${parsed.ext}`
-    try {
-      await stat(path.join(dir, name))
-    } catch {
-      return name
-    }
-  }
-  throw new Error('no free attachment file name after 100 attempts')
-}
-
-/** Detect an image extension from the first bytes of a staged file. */
-async function sniffExtension(file: string): Promise<string> {
-  let handle: Awaited<ReturnType<typeof open>> | undefined
-  try {
-    handle = await open(file, 'r')
-    const buffer = Buffer.alloc(16)
-    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0)
-    const type = sniffImageMediaType(new Uint8Array(buffer.subarray(0, bytesRead)))
-    switch (type) {
-      case 'image/png': return '.png'
-      case 'image/jpeg': return '.jpg'
-      case 'image/webp': return '.webp'
-      case 'image/gif': return '.gif'
-      default: return '.bin'
-    }
-  } catch {
-    return '.bin'
-  } finally {
-    await handle?.close().catch(() => undefined)
-  }
 }
 
 // ---- Trigger-message image prefetch -------------------------------------
