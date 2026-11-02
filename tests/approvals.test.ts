@@ -57,7 +57,7 @@ function makeEnv(timeoutMs = TIMEOUT) {
   const channel = makeChannel()
   const routeFor = vi.fn<(sessionId: string) => ApprovalRoute | undefined>(() => ROUTE)
   const onError = vi.fn()
-  const answerer = new ApprovalAnswerer(channel, { routeFor, onError }, timeoutMs)
+  const answerer = new ApprovalAnswerer(channel, { routeFor, onError, isAdmin: userId => userId === 'u_admin' }, timeoutMs)
   return { channel, routeFor, onError, answerer }
 }
 
@@ -126,7 +126,7 @@ describe('ApprovalAnswerer', () => {
   it('routes the settled patch through the durable patchCard hook when given', async () => {
     const channel = makeChannel()
     const patchCard = vi.fn(async (_messageId: string, _card: object) => {})
-    const answerer = new ApprovalAnswerer(channel, { routeFor: () => ROUTE, onError: vi.fn(), patchCard }, TIMEOUT)
+    const answerer = new ApprovalAnswerer(channel, { routeFor: () => ROUTE, onError: vi.fn(), patchCard, isAdmin: () => false }, TIMEOUT)
     const pending = answerer.onRequest(makeRequest(), nextOf('unavailable'))
     await vi.waitFor(() => expect(channel.sent).toHaveLength(1))
     answerer.onCardAction(clickEvent('om_1', 'allow'))
@@ -176,6 +176,7 @@ describe('ApprovalAnswerer', () => {
     const answerer = new ApprovalAnswerer(channel, {
       routeFor: () => ({ ...ROUTE, mayDecide }),
       onError: vi.fn(),
+      isAdmin: () => false,
     }, TIMEOUT)
     const pending = answerer.onRequest(makeRequest(), nextOf('unavailable'))
     await vi.waitFor(() => expect(channel.sent).toHaveLength(1))
@@ -247,7 +248,7 @@ describe('ApprovalAnswerer', () => {
     } as unknown as FeishuChannel & { send: ReturnType<typeof vi.fn> }
     const answerer = new ApprovalAnswerer(
       slowChannel,
-      { routeFor: () => ROUTE, onError: vi.fn() },
+      { routeFor: () => ROUTE, onError: vi.fn(), isAdmin: () => false },
       TIMEOUT,
     )
     const controller = new AbortController()
@@ -265,7 +266,7 @@ describe('ApprovalAnswerer', () => {
   it('fails closed (unavailable) when the card cannot be delivered', async () => {
     const channel = makeChannel({ failCardSends: true })
     const onError = vi.fn()
-    const answerer = new ApprovalAnswerer(channel, { routeFor: () => ROUTE, onError }, TIMEOUT)
+    const answerer = new ApprovalAnswerer(channel, { routeFor: () => ROUTE, onError, isAdmin: () => false }, TIMEOUT)
     await expect(answerer.onRequest(makeRequest(), nextOf('unavailable'))).resolves.toBe('unavailable')
     expect(onError).toHaveBeenCalled()
     expect(answerer.pendingCount()).toBe(0)
@@ -334,6 +335,59 @@ describe('ApprovalAnswerer usability', () => {
     expect(sentCard(channel)).toContain('提升到 `danger-full-access`')
     answerer.dispose()
     await pending
+  })
+
+  it('lets only an administrator allow an escalation to danger-full-access; the owner may still reject', async () => {
+    const { channel, answerer } = makeEnv()
+    answerer.onSessionEvent('sess-approval', toolCall('call-1', {
+      command: 'cat /etc/shadow', sandbox_permissions: 'danger-full-access', justification: 'read',
+    }))
+    const pending = answerer.onRequest(makeRequest('sess-approval', { callId: 'call-1' }), nextOf('unavailable'))
+    await vi.waitFor(() => expect(channel.sent).toHaveLength(1))
+    expect(sentCard(channel)).toContain('只能由管理员批准')
+
+    // The owner's allow (button, keyword, or stop-asking) decides nothing and earns one notice.
+    answerer.onCardAction(clickEvent('om_1', 'allow'))
+    answerer.onCardAction(clickEvent('om_1', 'always'))
+    await vi.waitFor(() => expect(channel.updated).toHaveLength(1))
+    expect(JSON.stringify(channel.updated[0]!.card)).toContain('非管理员的「允许」不生效')
+    expect(answerer.submitText('sess-approval', '允许', 'u_owner')).toBe('admin-required')
+    expect(answerer.submitText('sess-approval', '全部允许', 'u_owner')).toBe('admin-required')
+    expect(answerer.pendingCount()).toBe(1)
+
+    // An administrator decides even though the route is owner-only.
+    answerer.onCardAction(clickEvent('om_1', 'allow', 'u_admin'))
+    await expect(pending).resolves.toBe('allowed-once')
+
+    answerer.onSessionEvent('sess-approval', toolCall('call-2', {
+      command: 'cat /etc/shadow', sandbox_permissions: 'danger-full-access', justification: 'read',
+    }))
+    const rejected = answerer.onRequest(makeRequest('sess-approval', { callId: 'call-2' }), nextOf('unavailable'))
+    await vi.waitFor(() => expect(channel.sent).toHaveLength(2))
+    expect(answerer.submitText('sess-approval', '拒绝', 'u_owner')).toBe('denied')
+    await expect(rejected).resolves.toBe('rejected')
+  })
+
+  it('treats an ask whose audit reason names danger-full-access as admin-only even without a recorded call', async () => {
+    const { channel, answerer } = makeEnv()
+    const pending = answerer.onRequest(makeRequest('sess-approval', {
+      toolName: 'run_code', callId: 'inner-1' as never, reason: 'escalate sandbox to danger-full-access: need it',
+    }), nextOf('unavailable'))
+    await vi.waitFor(() => expect(channel.sent).toHaveLength(1))
+    expect(sentCard(channel)).toContain('提升到 `danger-full-access`')
+    expect(answerer.submitText('sess-approval', '允许', 'u_owner')).toBe('admin-required')
+    // A stranger who is not an administrator still cannot click.
+    answerer.onCardAction(clickEvent('om_1', 'allow', 'u_stranger'))
+    await flush()
+    expect(answerer.pendingCount()).toBe(1)
+    expect(answerer.submitText('sess-approval', '允许', 'u_admin')).toBe('allowed')
+    await expect(pending).resolves.toBe('allowed-once')
+
+    // A narrower escalation stays decidable by the owner.
+    const narrower = answerer.onRequest(makeRequest('sess-approval', { reason: 'escalate sandbox to workspace-write: need it' }), nextOf('unavailable'))
+    await vi.waitFor(() => expect(channel.sent).toHaveLength(2))
+    expect(answerer.submitText('sess-approval', '允许', 'u_owner')).toBe('allowed')
+    await expect(narrower).resolves.toBe('allowed-once')
   })
 
   it('forgets a turn\'s calls at turn end and falls back to the summary', async () => {
@@ -407,11 +461,11 @@ describe('ApprovalAnswerer usability', () => {
     const older = answerer.onRequest(makeRequest('sess-a'), nextOf('unavailable'))
     const newer = answerer.onRequest(makeRequest('sess-a', { toolName: 'edit' }), nextOf('unavailable'))
     await vi.waitFor(() => expect(channel.sent).toHaveLength(2))
-    expect(answerer.submitText('sess-a', '允许！')).toBe('allowed')
+    expect(answerer.submitText('sess-a', '允许！', 'u_owner')).toBe('allowed')
     await expect(newer).resolves.toBe('allowed-once')
-    expect(answerer.submitText('sess-a', 'N')).toBe('denied')
+    expect(answerer.submitText('sess-a', 'N', 'u_owner')).toBe('denied')
     await expect(older).resolves.toBe('rejected')
-    expect(answerer.submitText('sess-a', '允许')).toBeUndefined()
+    expect(answerer.submitText('sess-a', '允许', 'u_owner')).toBeUndefined()
     await vi.waitFor(() => expect(channel.updated).toHaveLength(2))
     expect(channel.updated.map(update => JSON.stringify(update.card)).join('\n')).toContain('文字回复')
   })
@@ -420,7 +474,7 @@ describe('ApprovalAnswerer usability', () => {
     const { channel, answerer } = makeEnv()
     const pending = answerer.onRequest(makeRequest('sess-a'), nextOf('unavailable'))
     await vi.waitFor(() => expect(channel.sent).toHaveLength(1))
-    expect(answerer.submitText('sess-a', '全部允许')).toBe('remembered')
+    expect(answerer.submitText('sess-a', '全部允许', 'u_owner')).toBe('remembered')
     await expect(pending).resolves.toBe('allowed-once')
     await expect(answerer.onRequest(makeRequest('sess-a'), nextOf('unavailable'))).resolves.toBe('allowed-once')
   })
@@ -432,7 +486,7 @@ describe('ApprovalAnswerer usability', () => {
     const other = answerer.onRequest(makeRequest('sess-b'), nextOf('unavailable'))
     await vi.waitFor(() => expect(channel.sent).toHaveLength(3))
     expect(answerer.hasPendingFor('sess-a')).toBe(true)
-    expect(answerer.submitText('sess-a', '先别删，改用 git mv')).toBe('superseded')
+    expect(answerer.submitText('sess-a', '先别删，改用 git mv', 'u_owner')).toBe('superseded')
     await expect(a).resolves.toBe('rejected')
     await expect(b).resolves.toBe('rejected')
     expect(answerer.hasPendingFor('sess-a')).toBe(false)
@@ -446,7 +500,7 @@ describe('ApprovalAnswerer usability', () => {
   it('reports the session\'s waiting tools on open and settle', async () => {
     const channel = makeChannel()
     const onWaitingChange = vi.fn()
-    const answerer = new ApprovalAnswerer(channel, { routeFor: () => ROUTE, onError: vi.fn(), onWaitingChange }, TIMEOUT)
+    const answerer = new ApprovalAnswerer(channel, { routeFor: () => ROUTE, onError: vi.fn(), onWaitingChange, isAdmin: () => false }, TIMEOUT)
     const pending = answerer.onRequest(makeRequest('sess-a'), nextOf('unavailable'))
     expect(onWaitingChange).toHaveBeenLastCalledWith('sess-a', ['bash'])
     await vi.waitFor(() => expect(channel.sent).toHaveLength(1))

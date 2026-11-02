@@ -12,6 +12,7 @@
  * @module dsh-channels/config
  */
 
+import path from 'node:path'
 import { z } from 'zod'
 import { parseWikiRootLink, WIKI_ROOT_LINK_ERRORS } from './feishu/wiki/links.ts'
 
@@ -422,6 +423,33 @@ export const configSchema = z.object({
     'logalyze_improve_skill',
     'logalyze_submit_init',
   ]),
+  /**
+   * Read fence for in-process file tools in Feishu Sessions (and the
+   * subagents they spawn). A listed tool's path arguments must resolve, after
+   * symlinks, inside the route's workspace, its topic directory, or one of
+   * `readableRoots`; otherwise the call is denied before it runs. Relative
+   * paths resolve against the Session's effective working directory. Shell,
+   * terminal, and code-execution tools spawn processes and are not covered
+   * here: confine them with the sandbox runner described in the README.
+   */
+  readFence: z.object({
+    /** Turn the fence off (every Feishu Session may read any path the Host can). */
+    enabled: z.boolean().default(true),
+    /** Absolute directories every Feishu Session may also read (shared skill directories). */
+    readableRoots: z.array(z.string().trim().min(1).refine(value => path.isAbsolute(value), 'readableRoots must be absolute paths')).default([]),
+    /**
+     * Tool name → names of its path arguments. A glob `pattern` argument is
+     * checked by its leading non-wildcard directories and may not contain `..`.
+     */
+    tools: z.record(z.string().trim().min(1), z.array(z.string().trim().min(1)).min(1)).default({
+      read: ['file_path'],
+      read_image: ['file_path'],
+      grep: ['path'],
+      glob: ['path', 'pattern'],
+      str_replace_editor: ['path'],
+      lsp: ['file_path'],
+    }),
+  }).prefault({}),
   /**
    * Lifetime of one pending authorization request and of the DM card that asks
    * the administrators to add a user to the access table. Expired requests stay in

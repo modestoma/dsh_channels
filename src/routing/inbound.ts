@@ -150,6 +150,7 @@ const APPROVAL_TEXT_REPLIES: Record<Exclude<ApprovalTextResult, 'superseded'>, s
   allowed: '已允许本次操作。',
   remembered: '已允许，本话题内同类操作不再询问。',
   denied: '已拒绝本次操作。',
+  'admin-required': '提升到完全访问只能由管理员批准，你的回复没有生效；可以回复「拒绝」，或请管理员在卡片上点「允许」。',
 }
 
 /**
@@ -745,7 +746,7 @@ export class InboundRouter {
     const route = await this.commandRoute(msg)
     if (route === undefined || !this.access.ownsRoute(msg, route)) return false
     if (!answerer.hasPendingFor(route.sessionId)) return false
-    const result = answerer.submitText(route.sessionId, content)
+    const result = answerer.submitText(route.sessionId, content, msg.senderId)
     if (result === undefined || result === 'superseded') return false
     await this.delivery.commandCard(msg, {
       kind: 'success', command: 'approval', sessionId: route.sessionId,

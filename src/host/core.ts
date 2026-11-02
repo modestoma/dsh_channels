@@ -128,6 +128,8 @@ export interface InboxDiscardedPayload {
  */
 export interface PreToolExecution {
   readonly name: string
+  /** Parsed model arguments; the tool validates its own schema later, so read them defensively. */
+  readonly arguments?: unknown
   /** The agent the call runs for; absent for calls outside an agent loop. */
   readonly agent?: Agent
 }

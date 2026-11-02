@@ -7,12 +7,15 @@ import { defineConfig } from 'tsdown'
  * parameter properties; shipping the built host is also what other DSH plugins
  * (dsh-pet, dsh-balance) do.
  *
+ * `lib/confine.js` is the sandbox runner wrapper deployments name in
+ * `sandbox-local` `runnerCommand` (see README).
+ *
  * Runtime deps stay external — the consuming profile resolves them through
  * the package's own `node_modules`.
  */
 export default defineConfig({
   name: 'dsh-channels/host',
-  entry: { index: 'src/index.ts' },
+  entry: { index: 'src/index.ts', confine: 'src/confine/main.ts' },
   tsconfig: 'tsconfig.json',
   outDir: 'lib',
   format: 'esm',
