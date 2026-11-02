@@ -10,7 +10,7 @@ import type { FeishuConfig } from '../src/config.ts'
 import { FeishuApiError } from '../src/feishu-channel.ts'
 import { desiredSlashCommands, planSlashCommandSync, syncSlashCommands } from '../src/feishu/slash-commands.ts'
 import type { RemoteSlashCommand, SlashCommandApi, SlashCommandEntry } from '../src/feishu/slash-commands.ts'
-import { FeishuService } from '../src/service.ts'
+import { TestFeishuService as FeishuService } from './helpers.ts'
 import { makeAccessConfig } from './access-fixtures.ts'
 import { makeChannel, makeHostContext, makeTempBaseDir } from './helpers.ts'
 

@@ -123,6 +123,19 @@ describe('ApprovalAnswerer', () => {
     expect(buttonsOf(patchedOf(channel))).toHaveLength(0)
   })
 
+  it('routes the settled patch through the durable patchCard hook when given', async () => {
+    const channel = makeChannel()
+    const patchCard = vi.fn(async (_messageId: string, _card: object) => {})
+    const answerer = new ApprovalAnswerer(channel, { routeFor: () => ROUTE, onError: vi.fn(), patchCard }, TIMEOUT)
+    const pending = answerer.onRequest(makeRequest(), nextOf('unavailable'))
+    await vi.waitFor(() => expect(channel.sent).toHaveLength(1))
+    answerer.onCardAction(clickEvent('om_1', 'allow'))
+    await expect(pending).resolves.toBe('allowed-once')
+    expect(patchCard).toHaveBeenCalledWith('om_1', expect.any(Object))
+    expect(firstMarkdown(patchCard.mock.calls[0]![1] as unknown as PatchedCard)).toContain('已允许执行')
+    expect(channel.updated).toHaveLength(0)
+  })
+
   it('rejects on the owner\'s 拒绝 click and patches the card to the denied state', async () => {
     const { channel, answerer } = makeEnv()
     const pending = answerer.onRequest(makeRequest(), nextOf('unavailable'))
@@ -343,7 +356,7 @@ describe('ApprovalAnswerer usability', () => {
     const b = answerer.onRequest(makeRequest('sess-approval', { toolName: 'edit', callId: 'call-2' }), nextOf('unavailable'))
     await vi.waitFor(() => expect(channel.sent).toHaveLength(2))
     expect(sentCard(channel, 0)).toContain('{not json')
-    expect(sentCard(channel, 1)).toContain('a.txt')
+    expect(sentCard(channel, 1)).toContain('path: a.txt')
     answerer.dispose()
     await Promise.all([a, b])
   })

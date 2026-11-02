@@ -29,27 +29,39 @@
  *     message.
  *
  * Stop button: the card that is currently streaming in the session's active
- * (front) turn carries a stop button until the turn settles; queued turns
- * gain it when they become the front. `stopTargetOf()` resolves a clicked card to its
+ * turn carries a stop button until the turn settles; queued turns gain it
+ * once the Agent claims their prompt. `stopTargetOf()` resolves a clicked card to its
  * session; `markStopping()` / `markStopDenied()` record the click's outcome
  * on the card. Ownership checks and the cancellation itself belong to the
  * caller.
  *
+ * Turn ownership: each `followup()` runs as its own turn. A state is bound to
+ * the turn that claims its prompt (`onInboxClaimed`), never to "the next turn",
+ * because the Agent also starts turns no Feishu message triggered: a subagent
+ * finishing or messaging its parent, a background job completing, a schedule
+ * firing, or a prompt typed in a dsh client. Such a turn gets its own card
+ * (sent as a fresh reply in the route's topic, with an origin line) when
+ * `hostTurnOrigin` allows it, and otherwise renders nowhere; either way it
+ * never streams into a queued Feishu card.
+ *
  * Queued turns: a turn attached behind the session's active turn renders as
- * a queued card (notice + steer button) until it becomes the front.
+ * a queued card (notice + steer button) until the Agent claims its prompt.
  * `steerTargetOf()` resolves a clicked queued card; `mergeQueued()` lets the
  * caller move the queued message into the running turn and retires the
  * queued card, handing its trigger reaction to the running turn.
  *
- * The first visible text delta flips the panel title 推理中 → 回复中; the
- * final patch flips it to 回复结束 or 回复失败. Patching is throttled to `refreshMs` and
- * only runs when the content actually changed. Segment sends are serialized
- * per session so cards arrive in order.
+ * Headline: the card's first line says what the turn is doing, mapped from
+ * DSH events in the DSH session-status vocabulary (进行中 / 思考中 / 输出中 /
+ * 调用工具 / 等待审批 / 等待回答 / 正在压缩上下文 / 重试), and the settled
+ * outcome (已完成 / 已停止 / 失败) with the total time. A queued prompt that
+ * leaves the agent inbox unclaimed (`agent/inbox/discarded`) settles its card
+ * as removed from the queue. Patching is throttled to `refreshMs` and only
+ * runs when the content actually changed. Segment sends are serialized per
+ * session so cards arrive in order.
  *
- * Keep-alive: turns that produce no text deltas for a while (tool calls,
- * subagent/workflow runs, provider-side work) are kept visibly alive by the
- * activity lines, whose elapsed counters are re-rendered on a slow heartbeat
- * (`heartbeatMs`, default 5 s) — the card never sits silently on a live turn.
+ * Keep-alive: the headline's elapsed counter is re-rendered on a slow
+ * heartbeat (`heartbeatMs`, default 5 s), so the card never sits silently on
+ * a live turn.
  *
  * @module dsh-channels/streamer
  */
@@ -66,7 +78,7 @@ import type { HeaderSample, StatsFold, UsageSample } from './stats.ts'
  * console can confirm which build of the activity status line is loaded.
  * Bump on every behavior change to this feature.
  */
-export const ACTIVITY_BUILD_MARKER = 'activity-status-v7'
+export const ACTIVITY_BUILD_MARKER = 'activity-status-v8'
 
 /** How a segment card reached Feishu. */
 export interface SegmentDelivery {
@@ -128,6 +140,36 @@ export interface StreamerHooks {
     card: object,
     fallbackText: string,
   ): Promise<SegmentDelivery>
+  /**
+   * Decide whether a turn no Feishu message started (a subagent, background
+   * job, or schedule waking the Agent, or a prompt typed in a dsh client)
+   * gets its own streaming card. Returns the origin line shown on that card,
+   * or undefined to leave the turn without a card. The card is sent through
+   * {@link sendSegmentCard} as segment 1.
+   */
+  hostTurnOrigin?(sessionId: string, message: UserMessage): string | undefined
+  /**
+   * A host turn's main card was delivered (see {@link hostTurnOrigin}); the
+   * returned promise settles before any later card of that turn is sent, so a
+   * restart snapshot written here precedes its segment updates.
+   */
+  onHostCardDelivered?(sessionId: string, messageId: string, mode: 'card' | 'text', message: UserMessage): Promise<void>
+  /**
+   * Patch a card of a finalized turn to its settled content. Absent: one
+   * `updateCard` attempt. Implementations retry until it lands.
+   */
+  settlePatch?(messageId: string, card: object): void
+  /**
+   * Swap the trigger message's reaction when a turn settles. Absent: one
+   * attempt. Implementations retry until it lands.
+   */
+  settleReaction?(messageId: string, removeReactionId: string | undefined, add: string): void
+  /**
+   * Send a segment card of a finalized turn whose send failed (after the
+   * in-turn retries), so its content still reaches the user. Absent: the
+   * content is lost.
+   */
+  resendSegment?(sessionId: string, segment: number, card: object, fallbackText: string): void
 }
 
 /** One segment card of a turn. Card 1 is the attached reply card; further
@@ -155,9 +197,23 @@ interface SegmentCard {
 
 /** A Feishu message whose Typing reaction swaps to DONE/No when a turn settles. */
 interface TriggerReaction {
-  triggerMessageId: string
+  /** Undefined for a turn no Feishu message started (no reaction to swap). */
+  triggerMessageId: string | undefined
   /** Reaction id of the Typing reaction (undefined when the add failed). */
   reactionId: string | undefined
+}
+
+/** The turn an Agent is running and the state that renders it. */
+interface RunningTurn {
+  turn: number
+  /** Undefined while the turn is undecided or renders nowhere. */
+  state: TurnState | undefined
+  /**
+   * Messages claimed for this turn while no queued state owns it yet; the
+   * decision runs once the claiming batch has been emitted. Undefined once
+   * decided.
+   */
+  batch: UserMessage[] | undefined
 }
 
 /** Settled outcome of one turn, as its card shows it. */
@@ -168,19 +224,25 @@ export interface AttachOptions {
   /** Called once when the turn's card reaches its final state. */
   readonly onSettled?: (outcome: TurnOutcome) => void
   /**
-   * The prompt this turn will run; only a turn that carries it can be
-   * steered into the running turn while queued.
+   * The prompt handed to `followup()` for this turn. The turn that claims it
+   * renders into this card; while queued, the card can steer it into the
+   * running turn.
    */
-  readonly message?: UserMessage
+  readonly message: UserMessage
 }
 
 interface TurnState {
   /** `AttachOptions.onSettled`. */
   onSettled: ((outcome: TurnOutcome) => void) | undefined
-  /** Turn number once known; undefined until the first `step/start`. */
+  /**
+   * Turn number once the Agent claimed this state's prompt (or, for a host
+   * turn, the turn it was created for); undefined while queued.
+   */
   turn: number | undefined
-  /** Message whose reaction carries Typing → DONE/No. */
-  triggerMessageId: string
+  /** Message whose reaction carries Typing → DONE/No; undefined for a host turn. */
+  triggerMessageId: string | undefined
+  /** Origin line of a host turn's card (see `StreamerHooks.hostTurnOrigin`). */
+  origin: string | undefined
   /** Reaction id of the Typing reaction (undefined when the add failed). */
   reactionId: string | undefined
   /** Prompt queued for this turn; a queued card can steer it into the running turn. */
@@ -189,7 +251,12 @@ interface TurnState {
   mergedTriggers: TriggerReaction[]
   phase: PanelPhase
   reasoning: string
-  /** Request header produced during THIS turn; never inherited from history. */
+  /**
+   * Request header in effect for a request THIS turn sent. DSH logs
+   * `request/header` only when the request envelope changes, so a turn whose
+   * requests continue the series adopts the session's latest header once it
+   * actually sends one; a turn that never sends a request keeps `undefined`.
+   */
   header: HeaderSample | undefined
   /** Provider usage produced during THIS turn; never inherited from history. */
   lastUsage: UsageSample | undefined
@@ -201,7 +268,7 @@ interface TurnState {
   finalized: boolean
   /** Set by `detach()`; pending sends then stop scheduling further patches. */
   disposed: boolean
-  /** Unix ms when the turn was attached (heartbeat elapsed base). */
+  /** Unix ms when the turn started (attach, reset when a queued prompt is claimed). */
   turnStartedAt: number
   /** Wall-clock start of the currently open reasoning phase (undefined = not reasoning). */
   reasoningSince: number | undefined
@@ -233,10 +300,25 @@ interface TurnState {
   status: string
   /** Kind of the status line currently logged (change-detection only). */
   statusKind: string
-  /** Currently rendered tool-call line (recomputed on every snapshot). */
-  tool: string
-  /** Kind of the tool line currently logged (change-detection only). */
-  toolKind: string
+  /** Currently rendered headline (recomputed on every snapshot). */
+  headline: string
+  /** Kind of the headline currently logged (change-detection only). */
+  headlineKind: string
+  /**
+   * What the current stream attempt is producing: reasoning or answer text;
+   * undefined between steps, before the first delta, and during tool calls.
+   */
+  output: 'reasoning' | 'text' | undefined
+  /** An `ask_user_question` card of this session is unanswered. */
+  awaitingAnswer: boolean
+  /** A context compaction of this turn is running (`compaction/start` → `compaction/end`). */
+  compacting: boolean
+  /** Unix ms when the turn settled; undefined while it runs. */
+  endedAt: number | undefined
+  /** The queued message left the agent inbox unclaimed; the card says so instead of a reply. */
+  dropped: boolean
+  /** The steer button is moving the queued message; its inbox removal is not a drop. */
+  merging: boolean
   /** Slow keep-alive timer re-rendering the activity elapsed counter. */
   heartbeatTimer: ReturnType<typeof setTimeout> | undefined
   /**
@@ -245,12 +327,34 @@ interface TurnState {
    * durable model history, so the card must drop them again.
    */
   attempts: Map<string, AttemptMark>
+  /**
+   * The model-request retry `dsh-llm-retry` scheduled for the current step
+   * (`llm/retry`), shown on the tool line until the retried request produces
+   * output. A retry stays inside the open turn: only `turn/end` settles it.
+   */
+  retry: RetryActivity | undefined
+  /** Retries scheduled during this turn (reported on a failed settled card). */
+  retries: number
   /** The owner clicked stop; the button renders disabled until the turn settles. */
   stopRequested: boolean
   /** A non-owner clicked stop; the owner-only notice renders under the button. */
   stopDenied: boolean
   /** A non-owner clicked the queued card's steer button. */
   queuedDenied: boolean
+}
+
+/** One scheduled model-request retry (`llm/retry` → `llm/retry-started`). */
+interface RetryActivity {
+  /** 1-based retry number. */
+  retry: number
+  /** Normal-mode budget; undefined in always mode. */
+  maxRetries: number | undefined
+  /** Failure code of the attempt that triggered the retry. */
+  code: string
+  /** Unix ms when the backoff wait ends. */
+  until: number
+  /** Set by `llm/retry-started`: the retried request is in flight. */
+  started: boolean
 }
 
 /** Card/body lengths captured at one stream attempt's `start` frame. */
@@ -307,6 +411,11 @@ function fmtElapsed(ms: number): string {
   return `已运行 ${Math.floor(total / 60)}分${total % 60}s`
 }
 
+/** `用时 45s` / `用时 2分5s` — a settled turn's total time. */
+function fmtDuration(ms: number): string {
+  return fmtElapsed(ms).replace('已运行', '用时')
+}
+
 /**
  * Human label for one tool call: the subagent tool contributes its
  * `description`, the workflow tool its `meta.name`; anything else uses the
@@ -344,8 +453,16 @@ export class TurnStreamer {
   private readonly hooks: StreamerHooks
   /** Slow keep-alive interval for the activity line's elapsed counter. */
   private readonly heartbeatMs: number
-  /** sessionId → queue of turn states (FIFO consumption of the driver). */
+  /** sessionId → unsettled turn states: the running turn's and the queued ones. */
   private readonly bySession = new Map<string, TurnState[]>()
+  /**
+   * sessionId → the turn the Agent is running, and the state that owns it.
+   * Ownership is decided from the batch the turn claims
+   * (`agent/inbox/claimed`): the queued state carrying one of its messages, or
+   * a new host-turn state, or none (`state` undefined: the turn renders
+   * nowhere).
+   */
+  private readonly running = new Map<string, RunningTurn>()
   /** sessionId → session-log stats fold (session cumulative). */
   private readonly folds = new Map<string, StatsFold>()
   /** sessionId → the Session object for context measurement. */
@@ -373,39 +490,69 @@ export class TurnStreamer {
   attach(
     session: Session,
     cardMessageId: string,
-    triggerMessageId: string,
+    triggerMessageId: string | undefined,
     reactionId: string | undefined,
-    options: AttachOptions = {},
+    options: AttachOptions,
   ): void {
-    this.sessions.set(session.id, session)
-    let fold = this.folds.get(session.id)
-    if (fold === undefined) {
-      fold = foldAll(session.snapshotEvents())
-      this.folds.set(session.id, fold)
-    }
+    this.track(session)
     const queue = this.bySession.get(session.id) ?? []
-    queue.push({
+    queue.push(this.newState({
       onSettled: options.onSettled,
-      turn: undefined,
       triggerMessageId,
       reactionId,
       message: options.message,
+      origin: undefined,
+      cardMessageId,
+    }))
+    this.bySession.set(session.id, queue)
+    const state = queue[queue.length - 1]!
+    this.scheduleHeartbeat(session.id, state)
+    // The first frame is sent without a stop button; a state that does not
+    // wait behind a running turn gains it on its first patch.
+    if (!this.isQueued(session.id, state)) this.markDirty(session.id, state)
+  }
+
+  /** Remember a session and seed its stats fold from the log. */
+  private track(session: Session): void {
+    this.sessions.set(session.id, session)
+    if (!this.folds.has(session.id)) this.folds.set(session.id, foldAll(session.snapshotEvents()))
+  }
+
+  /** A fresh, unbound turn state with one main card. */
+  private newState(init: {
+    onSettled: ((outcome: TurnOutcome) => void) | undefined
+    triggerMessageId: string | undefined
+    reactionId: string | undefined
+    message: UserMessage | undefined
+    origin: string | undefined
+    /** The already-sent main card; undefined when the card is still to be sent. */
+    cardMessageId: string | undefined
+  }): TurnState {
+    return {
+      onSettled: init.onSettled,
+      turn: undefined,
+      triggerMessageId: init.triggerMessageId,
+      reactionId: init.reactionId,
+      message: init.message,
+      origin: init.origin,
       mergedTriggers: [],
       phase: 'thinking',
       reasoning: '',
       header: undefined,
       lastUsage: undefined,
-      cards: [{
-        messageId: cardMessageId,
-        body: '',
-        dirty: true,
-        frozen: false,
-        mode: 'card',
-        failed: false,
-        sending: false,
-        failures: 0,
-        nextRetryAt: 0,
-      }],
+      cards: [init.cardMessageId === undefined
+        ? this.freshSegment('')
+        : {
+            messageId: init.cardMessageId,
+            body: '',
+            dirty: true,
+            frozen: false,
+            mode: 'card',
+            failed: false,
+            sending: false,
+            failures: 0,
+            nextRetryAt: 0,
+          }],
       dirty: true,
       lastPatchAt: 0,
       timer: undefined,
@@ -422,20 +569,92 @@ export class TurnStreamer {
       settled: [],
       status: '',
       statusKind: '',
-      tool: '',
-      toolKind: '',
+      headline: '',
+      headlineKind: '',
+      output: undefined,
+      awaitingAnswer: false,
+      compacting: false,
+      endedAt: undefined,
+      dropped: false,
+      merging: false,
       heartbeatTimer: undefined,
       attempts: new Map(),
+      retry: undefined,
+      retries: 0,
       stopRequested: false,
       stopDenied: false,
       queuedDenied: false,
+    }
+  }
+
+  /**
+   * Bind a turn the Agent just started to the state that renders it
+   * (`agent/inbox/claimed`). The Agent claims a step's whole batch at once and
+   * emits one claim per message, synchronously: pending next-step input (for
+   * example the workspace instructions DSH injects before a Session's first
+   * prompt) comes before the queued turn prompt. So the decision covers the
+   * batch, not its first message: a queued state whose prompt is anywhere in
+   * the batch owns the turn; only when the batch ends without one does the
+   * turn count as not started by a Feishu message, and `hostTurnOrigin`
+   * decides, from the batch's last message (the turn prompt), whether it gets
+   * its own card. Claims of a decided turn (steered messages) change nothing.
+   * @param session - the Agent's session.
+   * @param message - the claimed message.
+   * @param turn - the turn that claimed it.
+   */
+  onInboxClaimed(session: Session, message: UserMessage, turn: number): void {
+    // Subagent children fold into their parent's card.
+    if (session.header.origin === 'subagent') return
+    const running = this.running.get(session.id)
+    if (running?.turn === turn && running.batch === undefined) return
+    const queue = this.bySession.get(session.id) ?? []
+    const owner = queue.find(state => !state.finalized && state.turn === undefined
+      && state.message !== undefined && state.message.id === message.id)
+    if (owner !== undefined) {
+      owner.turn = turn
+      owner.turnStartedAt = Date.now()
+      this.running.set(session.id, { turn, state: owner, batch: undefined })
+      this.track(session)
+      this.markDirty(session.id, owner)
+      return
+    }
+    if (running?.turn === turn) {
+      running.batch?.push(message)
+      return
+    }
+    const entry: RunningTurn = { turn, state: undefined, batch: [message] }
+    this.running.set(session.id, entry)
+    queueMicrotask(() => this.decideHostTurn(session, entry))
+  }
+
+  /**
+   * Settle a claimed batch no queued state owned: the turn gets its own card
+   * when `hostTurnOrigin` returns an origin line, and renders nowhere
+   * otherwise.
+   */
+  private decideHostTurn(session: Session, entry: RunningTurn): void {
+    const batch = entry.batch
+    if (this.running.get(session.id) !== entry || batch === undefined) return
+    entry.batch = undefined
+    const message = batch[batch.length - 1]!
+    const origin = this.hooks.hostTurnOrigin?.(session.id, message)
+    if (origin === undefined) return
+    this.track(session)
+    const state = this.newState({
+      onSettled: undefined,
+      triggerMessageId: undefined,
+      reactionId: undefined,
+      message,
+      origin,
+      cardMessageId: undefined,
     })
+    state.turn = entry.turn
+    const queue = this.bySession.get(session.id) ?? []
+    queue.push(state)
     this.bySession.set(session.id, queue)
-    const state = queue[queue.length - 1]!
+    entry.state = state
     this.scheduleHeartbeat(session.id, state)
-    // The first frame is sent without a stop button; the front turn gains it
-    // on its first patch.
-    if (this.front(session.id) === state) this.markDirty(session.id, state)
+    this.sendSegment(session.id, state, 0)
   }
 
   /** Drop all state for a session (agent disposed / route removed). */
@@ -447,6 +666,7 @@ export class TurnStreamer {
       if (state.heartbeatTimer !== undefined) clearTimeout(state.heartbeatTimer)
     }
     this.bySession.delete(sessionId)
+    this.running.delete(sessionId)
     this.folds.delete(sessionId)
     this.sessions.delete(sessionId)
     this.contextCache.delete(sessionId)
@@ -455,7 +675,7 @@ export class TurnStreamer {
 
   /** Drop every session's state and timers (service shutdown). */
   detachAll(): void {
-    for (const sessionId of [...this.bySession.keys()]) this.detach(sessionId)
+    for (const sessionId of new Set([...this.bySession.keys(), ...this.running.keys()])) this.detach(sessionId)
   }
 
   hasSession(sessionId: string): boolean {
@@ -463,15 +683,15 @@ export class TurnStreamer {
   }
 
   /**
-   * The session whose active (front) turn streams into `messageId`, or
+   * The session whose running turn streams into `messageId`, or
    * undefined when the card belongs to no such turn (queued, settled,
-   * detached, or unknown). Only the front turn is the one `cancel` stops.
+   * detached, or unknown). Only the running turn is the one `cancel` stops.
    * @param messageId Feishu message id of a clicked card.
    * @returns The owning session id.
    */
   stopTargetOf(messageId: string): string | undefined {
     for (const sessionId of this.bySession.keys()) {
-      if (this.front(sessionId)?.cards.some(card => card.messageId === messageId) === true) return sessionId
+      if (this.current(sessionId)?.cards.some(card => card.messageId === messageId) === true) return sessionId
     }
     return undefined
   }
@@ -483,7 +703,7 @@ export class TurnStreamer {
    * @returns true while a turn is streaming or queued.
    */
   hasLiveTurn(sessionId: string): boolean {
-    return this.front(sessionId) !== undefined
+    return this.running.has(sessionId) || (this.bySession.get(sessionId) ?? []).some(state => !state.finalized)
   }
 
   /**
@@ -500,8 +720,7 @@ export class TurnStreamer {
   /** The steerable queued turn whose main card is `messageId`. */
   private queuedState(messageId: string): { sessionId: string; state: TurnState; message: UserMessage } | undefined {
     for (const [sessionId, queue] of this.bySession) {
-      const front = this.front(sessionId)
-      const state = queue.find(entry => !entry.finalized && entry !== front && entry.cards[0]?.messageId === messageId)
+      const state = queue.find(entry => !entry.finalized && entry.turn === undefined && entry.cards[0]?.messageId === messageId)
       if (state?.message !== undefined) return { sessionId, state, message: state.message }
     }
     return undefined
@@ -522,8 +741,14 @@ export class TurnStreamer {
     const target = this.queuedState(messageId)
     if (target === undefined) return false
     const { sessionId, state } = target
-    const front = this.front(sessionId)!
-    if (front.stopRequested || !steer(sessionId, target.message)) return false
+    // Steering joins the running turn's next step; it needs a turn that
+    // renders somewhere so the merged trigger settles with it.
+    const front = this.current(sessionId)
+    if (front === undefined || front.stopRequested) return false
+    state.merging = true
+    const moved = steer(sessionId, target.message)
+    state.merging = false
+    if (!moved) return false
     const queue = this.bySession.get(sessionId)!
     queue.splice(queue.indexOf(state), 1)
     state.disposed = true
@@ -565,13 +790,41 @@ export class TurnStreamer {
   }
 
   /**
-   * Show (or clear) the approval wait on the session's live turn: the tool
-   * line reads `⏳ 等待你审批：bash` while any approval card is undecided.
+   * A message left the agent inbox without being claimed
+   * (`agent/inbox/discarded`). When it is a queued card's prompt, that card
+   * settles as removed from the queue: no turn will ever answer it.
+   * @param session - the Agent's session.
+   * @param message - the discarded message.
+   */
+  onInboxDiscarded(session: Session, message: UserMessage): void {
+    const state = (this.bySession.get(session.id) ?? []).find(entry => !entry.finalized && !entry.merging
+      && entry.turn === undefined && entry.message !== undefined && entry.message.id === message.id)
+    if (state === undefined) return
+    state.dropped = true
+    this.finalize(session.id, state, undefined)
+  }
+
+  /**
+   * Show (or clear) the question wait on the session's live turn: the
+   * headline reads `❓ 等待回答` while an `ask_user_question` card is open.
+   * @param sessionId - the session asking.
+   * @param waiting - whether a question is unanswered.
+   */
+  setAwaitingAnswer(sessionId: string, waiting: boolean): void {
+    const state = this.current(sessionId)
+    if (state === undefined || state.awaitingAnswer === waiting) return
+    state.awaitingAnswer = waiting
+    this.markDirty(sessionId, state)
+  }
+
+  /**
+   * Show (or clear) the approval wait on the session's live turn: the
+   * headline reads `✋ 等待审批：bash` while any approval card is undecided.
    * @param sessionId - the session waiting on approval.
    * @param toolNames - the tools still waiting; empty clears the line.
    */
   setAwaitingApproval(sessionId: string, toolNames: readonly string[]): void {
-    const state = this.front(sessionId)
+    const state = this.current(sessionId)
     if (state === undefined) return
     if (state.awaitingApproval.join('\u0000') === toolNames.join('\u0000')) return
     state.awaitingApproval = [...toolNames]
@@ -589,21 +842,22 @@ export class TurnStreamer {
   }
 
   private markStop(sessionId: string, apply: (state: TurnState) => void): void {
-    const state = this.front(sessionId)
+    const state = this.current(sessionId)
     if (state === undefined) return
     const before = `${state.stopRequested}/${state.stopDenied}`
     apply(state)
     if (`${state.stopRequested}/${state.stopDenied}` !== before) this.markDirty(sessionId, state)
   }
 
-  /** The front (oldest unfinished) turn state of a session. */
-  private front(sessionId: string): TurnState | undefined {
-    const queue = this.bySession.get(sessionId)
-    if (queue === undefined || queue.length === 0) return undefined
-    for (const state of queue) {
-      if (!state.finalized) return state
-    }
-    return undefined
+  /** The unsettled state rendering the session's running turn, if any. */
+  private current(sessionId: string): TurnState | undefined {
+    const state = this.running.get(sessionId)?.state
+    return state === undefined || state.finalized ? undefined : state
+  }
+
+  /** Whether `state` is still waiting for its prompt behind a running turn. */
+  private isQueued(sessionId: string, state: TurnState): boolean {
+    return !state.finalized && state.turn === undefined && this.running.has(sessionId)
   }
 
   /** Consume one appended session event. */
@@ -618,26 +872,28 @@ export class TurnStreamer {
     // forks may also carry parentSession; only `origin` marks a subagent.
     const parentId = session.header.origin === 'subagent' ? session.header.parentSession : undefined
     if (parentId !== undefined) {
-      const parentState = this.front(parentId)
+      const parentState = this.current(parentId)
       if (parentState !== undefined) {
         this.foldChildEvent(parentId, parentState, session, event)
         return
       }
     }
 
-    const state = this.front(session.id)
+    if (event.type === 'turn/end') {
+      this.endTurn(session.id, event.data.turn, event.data.reason)
+      return
+    }
+    const state = this.current(session.id)
     if (state === undefined) return
+    if ('turn' in event.data && typeof event.data.turn === 'number' && event.data.turn !== state.turn) return
 
     switch (event.type) {
-      case 'step/start': {
-        if (state.turn === undefined) {
-          state.turn = event.data.turn
+      case 'assistant/message': {
+        this.adoptSeriesHeader(session.id, state)
+        if (state.retry !== undefined) {
+          state.retry = undefined
           this.markDirty(session.id, state)
         }
-        break
-      }
-      case 'assistant/message': {
-        if (state.turn === undefined) state.turn = event.data.turn
         if (event.data.usage !== undefined) {
           state.lastUsage = {
             usage: event.data.usage,
@@ -661,7 +917,7 @@ export class TurnStreamer {
         break
       }
       case 'tool/call': {
-        if (state.turn === undefined) state.turn = event.data.turn
+        state.output = undefined
         state.toolActivity = {
           name: event.data.name,
           label: toolActivityLabel(event.data.name, event.data.arguments),
@@ -673,14 +929,13 @@ export class TurnStreamer {
         break
       }
       case 'tool/result': {
-        if (state.turn === undefined) state.turn = event.data.turn
         state.toolActivity = undefined
         this.markDirty(session.id, state)
         break
       }
       case 'tool-workflow/run-start': {
         // Workflow record events carry no turn/step — they belong to the
-        // front (oldest unfinished) turn by construction.
+        // running turn by construction.
         state.workflowRuns.set(event.data.runId, {
           name: event.data.name,
           startedAt: Date.now(),
@@ -726,15 +981,48 @@ export class TurnStreamer {
         }
         break
       }
-      case 'turn/end': {
-        // The ended turn belongs to the front state: assign it if a turn was
-        // rejected/emptied before any step started.
-        if (state.turn === undefined) state.turn = event.data.turn
-        this.finalize(session.id, state, turnFailure(event.data.reason), turnAborted(event.data.reason))
+      case 'compaction/start':
+      case 'compaction/end': {
+        state.compacting = event.type === 'compaction/start'
+        this.markDirty(session.id, state)
+        break
+      }
+      case 'llm/retry': {
+        // The failed attempt ended the step's request, not the turn: the loop
+        // re-runs the step after the backoff, so the card stays live.
+        state.retry = {
+          retry: event.data.retry,
+          maxRetries: event.data.mode === 'normal' ? event.data.maxRetries : undefined,
+          code: event.data.failure.code,
+          until: Date.now() + Math.max(0, event.data.delayMs),
+          started: false,
+        }
+        state.retries++
+        this.markDirty(session.id, state)
+        break
+      }
+      case 'llm/retry-started': {
+        if (state.retry !== undefined && state.retry.retry === event.data.retry) {
+          state.retry.started = true
+          this.markDirty(session.id, state)
+        }
         break
       }
       default:
         break
+    }
+  }
+
+  /** Settle the running turn's state and forget the running turn. */
+  private endTurn(sessionId: string, turn: number, reason: TurnEndReason): void {
+    const running = this.running.get(sessionId)
+    if (running === undefined || running.turn !== turn) return
+    this.running.delete(sessionId)
+    const state = running.state
+    if (state !== undefined) this.finalize(sessionId, state, turnFailure(reason), turnAborted(reason))
+    // Queued cards lose their queue notice once nothing runs ahead of them.
+    for (const queued of this.bySession.get(sessionId) ?? []) {
+      if (!queued.finalized && queued.turn === undefined) this.markDirty(sessionId, queued)
     }
   }
 
@@ -749,21 +1037,35 @@ export class TurnStreamer {
    */
   onAssistantFrame(session: Session, frame: AssistantStreamFrame): void {
     this.sessions.set(session.id, session)
-    const state = this.front(session.id)
+    const state = this.current(session.id)
     if (state === undefined || state.disposed) return
+    // Only the running turn streams; `start` names the turn the attempt belongs to.
+    if (frame.type === 'start' && frame.turn !== state.turn) return
     switch (frame.type) {
       case 'start': {
         // A new step starts: close any reasoning phase the previous step left
         // open (defensive — its `end` frame normally does this first).
         this.closeReasoning(state)
         state.attempts.set(frame.attemptId, this.attemptMark(state))
-        if (state.turn === undefined) state.turn = frame.turn
+        if (this.adoptSeriesHeader(session.id, state)) this.markDirty(session.id, state)
         break
       }
       case 'chunk': {
         const chunk = frame.chunk
+        if ((chunk.type === 'text-delta' || chunk.type === 'reasoning-delta')
+          && chunk.text !== '' && state.retry !== undefined) {
+          // The retried request is producing output again.
+          state.retry = undefined
+          this.markDirty(session.id, state)
+        }
         if (chunk.type === 'text-delta') {
-          if (chunk.text !== '') this.closeReasoning(state)
+          if (chunk.text !== '') {
+            this.closeReasoning(state)
+            if (state.output !== 'text') {
+              state.output = 'text'
+              this.markDirty(session.id, state)
+            }
+          }
           const last = state.cards[state.cards.length - 1]
           if (last !== undefined && !last.frozen && chunk.text !== '') {
             last.body += chunk.text
@@ -772,6 +1074,7 @@ export class TurnStreamer {
           }
         } else if (chunk.type === 'reasoning-delta' && chunk.text !== '') {
           if (state.reasoningSince === undefined) state.reasoningSince = Date.now()
+          state.output = 'reasoning'
           state.reasoning += chunk.text
           this.markDirty(session.id, state)
         }
@@ -782,9 +1085,17 @@ export class TurnStreamer {
         // tool call (no answer text) stops counting here, so the tool run that
         // follows is not miscounted as reasoning time.
         this.closeReasoning(state)
+        state.output = undefined
+        this.markDirty(session.id, state)
         const mark = state.attempts.get(frame.attemptId)
         state.attempts.delete(frame.attemptId)
-        if (frame.outcome.kind === 'abandoned' && mark !== undefined) {
+        // A failed request attempt settles as `assistant/attempt`: like an
+        // abandoned one, its partial output is not model-visible history, and
+        // a retry streams the step again from scratch — keeping it would
+        // repeat the reply on the card.
+        const discarded = frame.outcome.kind === 'abandoned'
+          || frame.outcome.eventType === 'assistant/attempt'
+        if (discarded && mark !== undefined) {
           this.rollbackAttempt(state, mark)
           this.markDirty(session.id, state)
         }
@@ -812,11 +1123,13 @@ export class TurnStreamer {
   }
 
   /**
-   * Drop one abandoned attempt's deltas. The attempt's text is a contiguous
+   * Drop one discarded attempt's deltas. The attempt's text is a contiguous
    * suffix of the logical body: segments created during the attempt are
    * removed, the segment that was last at `start` is truncated, and the
    * reasoning tail is cut. Already-delivered plain-text segments cannot be
-   * retracted and stop the removal.
+   * retracted and stop the removal; segment cards already sent (or being
+   * sent) cannot be withdrawn, so they are emptied and kept. The newest
+   * remaining card is reopened so a retry streams into it again.
    */
   private rollbackAttempt(state: TurnState, mark: AttemptMark): void {
     const lastIndex = mark.cardCount - 1
@@ -824,6 +1137,11 @@ export class TurnStreamer {
       const card = state.cards[index]
       if (card === undefined) continue
       if (card.mode === 'text' && card.messageId !== undefined) break
+      if (card.messageId !== undefined || card.sending) {
+        card.body = ''
+        card.dirty = true
+        continue
+      }
       state.cards.splice(index, 1)
     }
     const tail = state.cards[lastIndex]
@@ -833,10 +1151,29 @@ export class TurnStreamer {
       tail.body = tail.body.slice(0, length)
       tail.dirty = true
     }
+    const last = state.cards[state.cards.length - 1]
+    if (last !== undefined) {
+      if ((last.mode === 'text' && last.messageId !== undefined) || last.failed) {
+        state.cards.push(this.freshSegment(''))
+      } else {
+        last.frozen = false
+      }
+    }
     state.reasoning = state.reasoning.slice(0, mark.reasoningLength)
-    // The abandoned attempt's reasoning time is not part of the visible turn.
+    // The discarded attempt's reasoning time is not part of the visible turn.
     state.reasoningMs = mark.reasoningMs
     state.reasoningSince = mark.reasoningSince
+  }
+
+  /**
+   * Give a turn that sent a request without logging a new `request/header` the
+   * session's latest header, which is the one that request continues.
+   * @returns whether the turn's header changed.
+   */
+  private adoptSeriesHeader(sessionId: string, state: TurnState): boolean {
+    if (state.header !== undefined) return false
+    state.header = this.folds.get(sessionId)?.lastHeader
+    return state.header !== undefined
   }
 
   private markDirty(sessionId: string, state: TurnState): void {
@@ -877,8 +1214,8 @@ export class TurnStreamer {
       cacheHitPct: projected?.cacheHitPct ?? cacheHitPct(lastUsage),
       contextTokens: context?.contextTokens,
       // The context-token count is session-wide, but the model window belongs
-      // to the current request. Suppress it when this turn failed before a
-      // request header was emitted, just like model/effort/cache.
+      // to the current request. Suppress it when this turn failed before
+      // sending a request, just like model/effort/cache.
       contextWindow: header === undefined
         ? undefined
         : context?.contextWindow ?? projected?.contextWindow,
@@ -958,9 +1295,8 @@ export class TurnStreamer {
    *  2. running subagent children (label + current tool + elapsed);
    *  3. the last settled workflow run's outcome — it persists across later
    *     tool calls and text streaming (only a new run-start replaces it), so
-   *     the workflow conclusion stays visible;
-   *  4. heartbeat fallback — a thinking turn with no output yet still shows
-   *     an elapsed counter so the card never sits silently.
+   *     the workflow conclusion stays visible.
+   * Liveness (the elapsed counter) belongs to the headline.
    * Once the turn is finalized, the line switches to the SETTLED form
    * (workflow conclusion + finished-subagent summary) — the final card keeps
    * the delegation status; only the tool line disappears. A failed turn shows
@@ -999,13 +1335,6 @@ export class TurnStreamer {
       const { name, stopReason } = state.workflowEndStatus
       return clipActivity(`🧵 工作流 ${name} 结束（${stopReason}）`)
     }
-
-    const empty = state.cards.every(card => card.body === '')
-    // The tool line already shows liveness while a call is in flight, so the
-    // heartbeat fallback stays out of the way.
-    if (state.phase === 'thinking' && empty && state.toolActivity === undefined) {
-      return clipActivity(`⏳ 处理中 · ${fmtElapsed(now - state.turnStartedAt)}`)
-    }
     return ''
   }
 
@@ -1039,28 +1368,51 @@ export class TurnStreamer {
   }
 
   /**
-   * The tool-call line: the parent agent's in-flight tool call, independent
-   * of the delegation status line — workflow/subagent status never hides it
-   * and it never hides them. Cleared by the tool's `tool/result`; always
-   * empty on the settled card.
+   * The headline: what the turn is doing right now, in the vocabulary of the
+   * DSH session status, by priority — waiting on a human (approval, then
+   * question), compacting the context, retrying a model request, running a
+   * tool, then the current stream attempt's output (thinking / writing), and
+   * otherwise in progress. Running headlines carry the turn's elapsed time;
+   * a settled turn shows its outcome and total time.
    */
-  private toolLine(state: TurnState, now: number): string {
-    if (state.finalized) return ''
+  private headlineOf(state: TurnState, now: number): string {
+    if (state.finalized) {
+      const took = fmtDuration((state.endedAt ?? now) - state.turnStartedAt)
+      switch (state.phase) {
+        case 'error': return `❌ 失败 · ${took}`
+        case 'stopped': return `⏹ 已停止 · ${took}`
+        default: return `✅ 已完成 · ${took}`
+      }
+    }
+    const elapsed = fmtElapsed(now - state.turnStartedAt)
     if (state.awaitingApproval.length > 0) {
-      return clipActivity(`⏳ 等待你审批：${[...new Set(state.awaitingApproval)].join('、')}`)
+      return clipActivity(`✋ 等待审批：${[...new Set(state.awaitingApproval)].join('、')}`)
+    }
+    if (state.awaitingAnswer) return '❓ 等待回答'
+    if (state.compacting) return `🗜 正在压缩上下文 · ${elapsed}`
+    const retry = state.retry
+    if (retry !== undefined) {
+      const count = retry.maxRetries === undefined ? `${retry.retry}` : `${retry.retry}/${retry.maxRetries}`
+      if (retry.started) return clipActivity(`🔁 模型请求重试中（第 ${count} 次）`)
+      const wait = Math.max(0, Math.ceil((retry.until - now) / 1_000))
+      return clipActivity(`⚠️ 模型请求失败（${retry.code}），${wait} 秒后第 ${count} 次重试`)
     }
     const tool = state.toolActivity
-    if (tool === undefined) return ''
-    const prefix = tool.name === 'subagent'
-      ? '🤖 调用子代理：'
-      : tool.name === 'workflow'
-        ? '🧵 调用工作流：'
-        : '🔧 调用工具：'
-    return clipActivity(`${prefix}${tool.label} · ${fmtElapsed(now - tool.since)}`)
+    if (tool !== undefined) {
+      const prefix = tool.name === 'subagent'
+        ? '🤖 调用子代理：'
+        : tool.name === 'workflow'
+          ? '🧵 调用工作流：'
+          : '🔧 调用工具：'
+      return clipActivity(`${prefix}${tool.label} · ${fmtElapsed(now - tool.since)}`)
+    }
+    if (state.output === 'text') return `✍️ 输出中 · ${elapsed}`
+    if (state.output === 'reasoning') return `🧠 思考中 · ${elapsed}`
+    return `⚙️ 进行中 · ${elapsed}`
   }
 
   /**
-   * Slow keep-alive: recompute both activity lines and patch only when their
+   * Slow keep-alive: recompute the headline and the delegation line and patch only when their
    * rendered text actually changed (the elapsed counter ticking). Reschedules
    * itself while the turn is pending; `finalize`/`detach` cancel it.
    */
@@ -1071,7 +1423,7 @@ export class TurnStreamer {
       if (state.disposed || state.finalized) return
       const now = Date.now()
       if (this.delegationLine(state, now) !== state.status
-        || this.toolLine(state, now) !== state.tool) {
+        || this.headlineOf(state, now) !== state.headline) {
         this.markDirty(sessionId, state)
       }
       this.scheduleHeartbeat(sessionId, state)
@@ -1080,12 +1432,14 @@ export class TurnStreamer {
 
   /**
    * Snapshot one card. `active` is true for the card currently streaming:
-   * only that card renders the transient activity lines, so frozen segment
-   * cards never repeat a stale tool/delegation line. Both lines are still
-   * recomputed (and remembered) on every snapshot so heartbeat/transition
-   * logging stays accurate.
+   * only that card renders the transient lines (headline, delegation line,
+   * stop button), so frozen segment cards never repeat a stale status. Once
+   * the turn settles, the outcome headline moves to the main card. Both lines
+   * are still recomputed (and remembered) on every snapshot so heartbeat and
+   * transition logging stay accurate.
    */
-  private cardState(sessionId: string, state: TurnState, body: string, active = true): CardState {
+  private cardState(sessionId: string, state: TurnState, body: string, index: number): CardState {
+    const active = index === state.cards.length - 1
     const now = Date.now()
     const status = this.delegationLine(state, now)
     if (status !== state.status) {
@@ -1093,24 +1447,27 @@ export class TurnStreamer {
       const kind = this.noteKind('status', status, state.statusKind)
       if (kind !== undefined) state.statusKind = kind
     }
-    const tool = this.toolLine(state, now)
-    if (tool !== state.tool) {
-      state.tool = tool
-      const kind = this.noteKind('tool', tool, state.toolKind)
-      if (kind !== undefined) state.toolKind = kind
+    const headline = this.headlineOf(state, now)
+    if (headline !== state.headline) {
+      state.headline = headline
+      const kind = this.noteKind('headline', headline, state.headlineKind)
+      if (kind !== undefined) state.headlineKind = kind
     }
-    const queued = !state.finalized && this.front(sessionId) !== state
+    const queued = this.isQueued(sessionId, state)
     const stop: StopControl | undefined = !active || state.finalized || queued
       ? undefined
       : state.stopRequested ? 'stopping' : 'ready'
+    const showHeadline = state.finalized ? index === 0 : active
     return {
       phase: state.phase,
       reasoning: state.reasoning,
       body,
+      ...(state.origin === undefined ? {} : { origin: state.origin }),
+      headline: showHeadline ? state.headline : '',
       status: active ? state.status : '',
-      tool: active ? state.tool : '',
       ...(stop === undefined ? {} : { stop, stopDenied: state.stopDenied }),
       ...(queued ? { queued, queuedDenied: state.queuedDenied } : {}),
+      ...(state.dropped ? { dropped: true } : {}),
       stats: this.statsFor(sessionId, state),
     }
   }
@@ -1120,7 +1477,7 @@ export class TurnStreamer {
    * line, stable across elapsed/count ticks) so a live test can confirm
    * exactly which status the card is being patched with.
    */
-  private noteKind(slot: 'status' | 'tool', line: string, current: string): string | undefined {
+  private noteKind(slot: 'status' | 'headline', line: string, current: string): string | undefined {
     const kind = line === '' ? '' : (line.split('·')[0] ?? '').trim()
     if (kind === current) return undefined
     console.info(`[dsh-channels] activity ${slot} →`, kind === '' ? '（收起）' : kind)
@@ -1139,7 +1496,7 @@ export class TurnStreamer {
       if (card === undefined || card.frozen || card.mode === 'text') return
 
       const options = segmentCardOptions(index)
-      const split = segmentCardContent(this.cardState(sessionId, state, card.body), options)
+      const split = segmentCardContent(this.cardState(sessionId, state, card.body, index), options)
       if (split.head === '') {
         // Degenerate budget (cannot happen with the real fixed overhead):
         // keep streaming into this card; buildCard's absolute clip still
@@ -1201,13 +1558,18 @@ export class TurnStreamer {
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
           const snapshot = buildCard(
-            this.cardState(sessionId, state, card.body, index === state.cards.length - 1),
+            this.cardState(sessionId, state, card.body, index),
             segmentCardOptions(index),
           )
-          const delivery = await this.hooks.sendSegmentCard(sessionId, index + 1, snapshot, card.body)
+          const sentBody = card.body
+          const delivery = await this.hooks.sendSegmentCard(sessionId, index + 1, snapshot, sentBody)
           card.sending = false
           card.messageId = delivery.messageId
           card.mode = delivery.mode
+          // A turn that settled before its card arrived needs no restart snapshot.
+          if (index === 0 && state.origin !== undefined && state.message !== undefined && !state.finalized) {
+            await this.hooks.onHostCardDelivered?.(sessionId, delivery.messageId, delivery.mode, state.message)
+          }
           this.hooks.onSegmentDelivered?.(
             state.cards[0]?.messageId ?? '',
             index,
@@ -1218,10 +1580,13 @@ export class TurnStreamer {
             card.dirty = true
             this.markDirty(sessionId, state)
           } else if (!card.frozen && !state.disposed) {
-            // Text fallback: this card is final; keep streaming into a new one.
+            // Text fallback: this card is final; keep streaming into a new one,
+            // which also carries whatever arrived while the text was sent.
             card.frozen = true
             if (state.cards[state.cards.length - 1] === card) {
-              state.cards.push(this.freshSegment(''))
+              const pending = card.body.startsWith(sentBody) ? card.body.slice(sentBody.length) : ''
+              card.body = sentBody
+              state.cards.push(this.freshSegment(pending))
             }
             this.markDirty(sessionId, state)
           }
@@ -1235,6 +1600,7 @@ export class TurnStreamer {
       card.sending = false
       card.failed = true
       this.hooks.onError(sessionId, lastError)
+      if (state.finalized) this.resend(sessionId, state, index)
     })
     this.segmentChains.set(sessionId, next.then(() => {}, () => {}))
   }
@@ -1254,9 +1620,13 @@ export class TurnStreamer {
     card.dirty = false
     const options = segmentCardOptions(index)
     const snapshot = buildCard(
-      this.cardState(sessionId, state, card.body, index === state.cards.length - 1),
+      this.cardState(sessionId, state, card.body, index),
       options,
     )
+    if (state.finalized && this.hooks.settlePatch !== undefined) {
+      this.hooks.settlePatch(card.messageId, snapshot)
+      return
+    }
     this.channel.updateCard(card.messageId, snapshot).catch((error: unknown) => {
       card.dirty = true
       card.failures++
@@ -1287,15 +1657,17 @@ export class TurnStreamer {
   ): void {
     if (state.finalized) return
     state.finalized = true
+    state.endedAt = Date.now()
     // Only a stop this channel requested reads as 已停止; other cancellation
     // causes (parent, hook, disposal) settle like a normal end.
-    state.phase = failure !== undefined ? 'error' : aborted && state.stopRequested ? 'stopped' : 'done'
+    state.phase = failure !== undefined ? 'error' : state.dropped || (aborted && state.stopRequested) ? 'stopped' : 'done'
     // A turn that ends inside a reasoning phase (e.g. no answer text) still
     // reports the time it spent reasoning.
     this.closeReasoning(state)
     if (failure !== undefined) {
       const code = failure.code === undefined ? '' : `\n\n错误码：\`${failure.code}\``
-      const notice = `❌ **本轮运行失败**\n\n${failure.message}${code}`
+      const retried = state.retries === 0 ? '' : `\n\n已自动重试 ${state.retries} 次`
+      const notice = `❌ **本轮运行失败**\n\n${failure.message}${code}${retried}`
       const tail = state.cards[state.cards.length - 1]
       if (tail !== undefined) {
         if (tail.mode === 'text' || tail.failed) {
@@ -1321,7 +1693,8 @@ export class TurnStreamer {
       clearTimeout(state.heartbeatTimer)
       state.heartbeatTimer = undefined
     }
-    state.tool = ''
+    state.retry = undefined
+    state.output = undefined
     // Freeze the tail and spawn any remaining segment cards.
     this.splitOverflow(sessionId, state)
 
@@ -1330,21 +1703,19 @@ export class TurnStreamer {
     // late-arriving sends are patched when they resolve).
     for (const [index] of state.cards.entries()) {
       this.patchCard(sessionId, state, index, true, false)
+      this.resend(sessionId, state, index)
     }
 
     // Reaction swap: Typing → DONE on success, Typing → No on failure.
-    for (const trigger of [state, ...state.mergedTriggers]) void this.swapReaction(trigger, failure !== undefined)
+    // A dropped message was never answered: it settles like a failure.
+    for (const trigger of [state, ...state.mergedTriggers]) void this.swapReaction(trigger, failure !== undefined || state.dropped)
 
-    // Prune the finalized state lazily (kept until the next attach so the
-    // front-scan skips it, then removed).
+    // Prune the finalized state lazily (after the current dispatch).
     void Promise.resolve().then(() => {
       const queue = this.bySession.get(sessionId)
       if (queue === undefined) return
       const index = queue.indexOf(state)
       if (index >= 0) queue.splice(index, 1)
-      // The next queued turn becomes the active one and gains the stop button.
-      const next = this.front(sessionId)
-      if (next !== undefined) this.markDirty(sessionId, next)
     })
 
     this.hooks.onTurnFinalized(sessionId, state.turn ?? 0, state.cards[0]?.messageId ?? '')
@@ -1357,7 +1728,19 @@ export class TurnStreamer {
     }
   }
 
+  /** Hand a finalized turn's never-delivered segment with content to `resendSegment`. */
+  private resend(sessionId: string, state: TurnState, index: number): void {
+    const card = state.cards[index]
+    if (card === undefined || !card.failed || card.messageId !== undefined || card.body.trim() === '') return
+    this.hooks.resendSegment?.(sessionId, index + 1, buildCard(this.cardState(sessionId, state, card.body, index), segmentCardOptions(index)), card.body)
+  }
+
   private async swapReaction(state: TriggerReaction, failed: boolean): Promise<void> {
+    if (state.triggerMessageId === undefined) return
+    if (this.hooks.settleReaction !== undefined) {
+      this.hooks.settleReaction(state.triggerMessageId, state.reactionId, failed ? 'No' : 'DONE')
+      return
+    }
     try {
       if (state.reactionId !== undefined) {
         await this.channel.removeReaction(state.triggerMessageId, state.reactionId)

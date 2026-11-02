@@ -9,6 +9,9 @@
  */
 
 import { z } from 'zod'
+import type { TopicRootCard } from './topics/contract.ts'
+import { outboxEntrySchema } from './outbox.ts'
+import type { OutboxTable } from './outbox.ts'
 
 /**
  * Route key kinds. `thread` = real Feishu topic; `chat` = degraded chat-scoped
@@ -62,7 +65,7 @@ export const routeRecordSchema = z.object({
   /** Sessions this topic has pointed at, oldest first. Optional for v1 compatibility. */
   sessionHistory: z.array(sessionHistoryEntrySchema).optional(),
   /**
-   * Group-shared route (log-platform analysis topics): every member admitted
+   * Group-shared route (topics started through `feishuTopics`): every member admitted
    * in `chatId` may continue the Session and decide its cards, not only
    * `senderUserId` (who then names the requester). Absent = owner-only.
    */
@@ -171,6 +174,17 @@ export const inflightCardSchema = z.object({
 
 export type InflightCard = z.infer<typeof inflightCardSchema>
 
+/** Largest serialized prompt kept in a snapshot for restart replay. */
+export const INFLIGHT_PROMPT_MAX_BYTES = 256 * 1024
+
+/** A persisted `UserMessage` (content blocks are kept as the host wrote them). */
+export const inflightMessageSchema = z.object({
+  id: z.string().min(1),
+  role: z.literal('user'),
+  content: z.array(z.looseObject({ type: z.string() })),
+  source: z.looseObject({ kind: z.string() }),
+})
+
 export const inflightSnapshotSchema = z.object({
   /** Key the snapshot is stored under (= `cards[0].messageId`, the main card). */
   key: z.string().min(1),
@@ -178,8 +192,30 @@ export const inflightSnapshotSchema = z.object({
   sessionId: z.string().min(1),
   /** Feishu chat the cards live in (reaction targeting). */
   chatId: z.string().min(1),
-  /** User message that triggered the turn (Typing/DONE reaction anchor). */
-  triggerMessageId: z.string().min(1),
+  /**
+   * User message that triggered the turn (Typing/DONE reaction anchor).
+   * Absent for a turn no Feishu message started (a host-turn card).
+   */
+  triggerMessageId: z.string().min(1).optional(),
+  /** Route the turn ran under; restart recovery resumes its Session. */
+  routeKey: z.string().min(1).optional(),
+  /**
+   * The prompt handed to `followup()` (absent while it is being assembled, for
+   * a host turn, or when it exceeded `INFLIGHT_PROMPT_MAX_BYTES`). Restart
+   * recovery replays it when the Session log shows the turn never claimed it.
+   */
+  message: inflightMessageSchema.optional(),
+  /**
+   * Feishu user_id the turn of `message` acts for: the sender of an inbound
+   * message, the requester of a launched topic, the operator of a continue
+   * button, or the Session's driver when a host turn started. Restart
+   * recovery hands it to the code-write gate with the replayed prompt. Absent
+   * in snapshots written before it was recorded, and for a host turn whose
+   * driver was unknown.
+   */
+  senderUserId: z.string().min(1).optional(),
+  /** How often restart recovery already replayed `message` (cap: 1). */
+  replays: z.number().int().nonnegative().optional(),
   /** Reaction id of the Typing reaction (absent when the add failed). */
   reactionId: z.string().optional(),
   /** Segment cards in order; `[0]` is the main card. */
@@ -193,32 +229,27 @@ export const inflightSnapshotSchema = z.object({
 export type InflightSnapshot = z.infer<typeof inflightSnapshotSchema>
 
 /**
- * Access-control grants (v1 format, added without a domain version bump —
- * see the notes on `feishuDomain` below).
- *
- * One record per authorized group: the group gate is the first of the two
- * independent admission gates. Inside an authorized group only the
- * administrator and explicitly authorized users may start conversations.
+ * Retired group grant written by versions that had a group whitelist. The
+ * `access_groups` table stays declared only so the JSON backend keeps the
+ * stored records; nothing reads it.
  */
-export const accessGroupRecordSchema = z.object({
-  /** Feishu chat id (`oc_...`) — also the table key. */
+export const retiredAccessGroupRecordSchema = z.object({
   chatId: z.string().min(1),
-  /** Human-readable group name captured at authorization time (optional). */
   name: z.string().optional(),
-  /** Which authorization entry produced this grant. */
   source: z.enum(['command', 'card', 'panel']),
-  /** Administrator user_id that authorized it. */
   addedBy: z.string().min(1),
-  /** Epoch ms when it was authorized. */
   addedAt: z.number().int().nonnegative(),
 })
 
-export type AccessGroupRecord = z.infer<typeof accessGroupRecordSchema>
-
 /**
- * One authorized user (`user_id`), global across every authorized group.
- * Private chats are administrator-only unless `dmAllowWhitelist` is on, so
- * by default this grant only affects group conversations.
+ * One user (`user_id`) of the access table (v1 format, added without a domain
+ * version bump — see the notes on `feishuDomain` below). A user with `admin`
+ * on is an administrator: always admitted, holding every permission, and
+ * able to settle authorization requests; any number of users may be. Every
+ * other user carries four independent permission switches; `chat` gates
+ * everything, so a user with `chat` off is suspended and the other switches
+ * have no effect. Records written before the switches existed parse as a
+ * conversation grant only.
  */
 export const accessUserRecordSchema = z.object({
   /** Feishu `user_id` — also the table key. */
@@ -227,16 +258,41 @@ export const accessUserRecordSchema = z.object({
   name: z.string().optional(),
   /** Which authorization entry produced this grant. */
   source: z.enum(['command', 'card', 'panel']),
-  /** Administrator user_id that authorized it. */
+  /** Administrator user_id that authorized it, or `panel` for the Web settings panel. */
   addedBy: z.string().min(1),
   /** Epoch ms when it was authorized. */
   addedAt: z.number().int().nonnegative(),
+  /** Administrator: overrides every switch below. */
+  admin: z.boolean().default(false),
+  /** May talk to the bot in a private chat and in any group. */
+  chat: z.boolean().default(true),
+  /** Topics the user drives may use the knowledge-base read tools. */
+  wikiRead: z.boolean().default(false),
+  /** Topics the user drives may use the knowledge-base create/edit tools. */
+  wikiWrite: z.boolean().default(false),
+  /** Turns the user drives may call the configured code-write tools. */
+  codeWrite: z.boolean().default(false),
+  /**
+   * Git email an administrator set for this user; commits pushed for a turn
+   * the user drives name them as author with it. Absent: the host token's
+   * account stays the author.
+   */
+  gitEmail: z.string().optional(),
 })
+
+/** The four permission switches of one access-table user. */
+export type AccessPermission = 'chat' | 'wikiRead' | 'wikiWrite' | 'codeWrite'
+
+/** Every boolean field of an access-table user administrators set: the administrator flag and the four permissions. */
+export type AccessSwitch = 'admin' | AccessPermission
+
+/** Every permission switch, in display order. */
+export const ACCESS_PERMISSIONS: readonly AccessPermission[] = ['chat', 'wikiRead', 'wikiWrite', 'codeWrite']
 
 export type AccessUserRecord = z.infer<typeof accessUserRecordSchema>
 
 /**
- * One authorization request the administrator has been (or should be) asked
+ * One authorization request the administrators have been (or should be) asked
  * about. Requests are persisted so the DM card stays decidable across plugin
  * restarts; settled records are kept as an audit trail and for request
  * de-duplication/cooldown.
@@ -244,13 +300,17 @@ export type AccessUserRecord = z.infer<typeof accessUserRecordSchema>
 export const accessRequestRecordSchema = z.object({
   /** Opaque token carried by the card buttons — also the table key. */
   token: z.string().min(1),
-  /** What is being requested. */
+  /**
+   * What is being requested. Only `user` requests are created; `group` only
+   * appears in records written by versions that had a group whitelist, and
+   * the access store skips those records.
+   */
   kind: z.enum(['group', 'user']),
-  /** `chat_id` for a group request; `user_id` for a user request. */
+  /** `user_id` the request asks to whitelist. */
   targetId: z.string().min(1),
   /** Chat the request originated from, when applicable. */
   chatId: z.string().optional(),
-  /** Group name captured for the card (group requests, or the group the user was seen in). */
+  /** Name of the group the request came from, when known. */
   groupName: z.string().optional(),
   /** User who triggered a user request. */
   requesterUserId: z.string().optional(),
@@ -262,8 +322,10 @@ export const accessRequestRecordSchema = z.object({
   createdAt: z.number().int().nonnegative(),
   /** Epoch ms after which a pending request can no longer be decided. */
   expiresAt: z.number().int().nonnegative(),
-  /** DM message id of the administrator card, once delivery succeeded. */
+  /** DM message id of the card, written by versions with a single administrator. */
   messageId: z.string().optional(),
+  /** DM message ids of the cards delivered to the administrators. */
+  messageIds: z.array(z.string()).optional(),
 })
 
 export type AccessRequestRecord = z.infer<typeof accessRequestRecordSchema>
@@ -278,6 +340,9 @@ export type AccessRequestRecord = z.infer<typeof accessRequestRecordSchema>
  */
 export const PROCESSED_VERSION = 1
 
+/** Retention of `processed` records; also the farthest back missed-message catch-up reads. */
+export const PROCESSED_RETENTION_MS = 24 * 60 * 60 * 1000
+
 export const processedRecordSchema = z.object({
   /** Key the record is stored under (the Feishu message id). */
   key: z.string().min(1),
@@ -287,44 +352,104 @@ export const processedRecordSchema = z.object({
 
 export type ProcessedRecord = z.infer<typeof processedRecordSchema>
 
+/** {@link TopicRootCard} as stored in a launch record. */
+export const topicRootCardSchema = z.object({
+  title: z.string(),
+  taskName: z.string(),
+  lead: z.array(z.object({ text: z.string(), bold: z.boolean().optional() })),
+  links: z.object({
+    nameHeader: z.string(),
+    linkHeader: z.string(),
+    rows: z.array(z.object({ name: z.string(), url: z.string() })),
+  }).optional(),
+})
+
 /**
- * One accepted analyze API request, keyed by its `Idempotency-Key`. Kept
- * forever: a retried key returns the stored response instead of posting a
- * second analysis, and a reused key with a different body is refused.
+ * Root card content written by plugin versions before the `feishuTopics`
+ * service (the built-in log-platform analyze API). Read only; converted by
+ * {@link rootCardOf}.
  */
-export const analyzeRequestRecordSchema = z.object({
-  /** The request's `Idempotency-Key` (also the table key). */
+const legacyAnalyzeSubjectSchema = z.object({
+  requesterUserId: z.string(),
+  triggeredAt: z.string(),
+  app: z.string(),
+  errorCode: z.string(),
+  logDetails: z.array(z.object({ name: z.string(), url: z.string() })),
+})
+
+/**
+ * One accepted `feishuTopics` launch, keyed by its idempotency key. Kept
+ * forever: a retried key answers the stored root card instead of posting a
+ * second topic, and a reused key with another fingerprint is refused. The
+ * records live in the `analyze_requests` table, named after the analyze API
+ * that wrote the first of them; those older records carry `subject` instead
+ * of `requesterUserId` + `card`, and their keys are the analyze API's
+ * `Idempotency-Key`s.
+ */
+export const topicLaunchRecordSchema = z.object({
+  /** The launch's idempotency key (also the table key). */
   key: z.string().min(1),
-  /** SHA-256 (hex) of the canonical request body. */
+  /** The launch's fingerprint (older records: SHA-256 of the analyze request). */
   bodyHash: z.string().min(1),
   /** Target group chat. */
   chatId: z.string().min(1),
-  /** Root card message id (the analysis topic's root). */
+  /** Root card message id (the topic's root). */
   messageId: z.string().min(1),
-  /** Epoch ms when the request was accepted. */
+  /** Epoch ms when the launch was accepted. */
   acceptedAt: z.number().int().nonnegative(),
-  /** What the root card shows, kept so the card can be redrawn after a restart. */
-  subject: z.object({
-    requesterUserId: z.string(),
-    triggeredAt: z.string(),
-    app: z.string(),
-    errorCode: z.string(),
-    logDetails: z.array(z.object({ name: z.string(), url: z.string() })),
-  }),
+  /** Requester @-mentioned on the root card; absent on older records. */
+  requesterUserId: z.string().optional(),
+  /** What the root card shows, kept so the card can be redrawn after a restart; absent on older records. */
+  card: topicRootCardSchema.optional(),
+  /** Root card content of older records. */
+  subject: legacyAnalyzeSubjectSchema.optional(),
   /**
    * Root card status. `running` until the first turn settles; a record still
-   * `running` when the channel starts belongs to an analysis the previous
+   * `running` when the channel starts belongs to a topic the previous
    * instance never finished, and becomes `interrupted`.
    */
   status: z.enum(['running', 'done', 'stopped', 'error', 'failed', 'interrupted']),
+  /** Why the topic could not be started (status `failed`); absent on older records. */
+  reason: z.string().optional(),
+  /** Topic id (the route key) once the topic is opened; absent on older records. */
+  threadId: z.string().min(1).optional(),
 })
 
-export type AnalyzeRequestRecord = z.infer<typeof analyzeRequestRecordSchema>
+export type TopicLaunchRecord = z.infer<typeof topicLaunchRecordSchema>
+
+/**
+ * The requester and root card content of one launch record, converting the
+ * analyze API's older records to the card that API drew.
+ * @param record - stored launch record.
+ * @returns what to redraw, or undefined for a record carrying neither form.
+ */
+export function rootCardOf(record: TopicLaunchRecord): { requesterUserId: string; card: TopicRootCard } | undefined {
+  if (record.card !== undefined && record.requesterUserId !== undefined) {
+    return { requesterUserId: record.requesterUserId, card: record.card }
+  }
+  const subject = record.subject
+  if (subject === undefined) return undefined
+  return {
+    requesterUserId: subject.requesterUserId,
+    card: {
+      title: '日志分析',
+      taskName: '分析',
+      lead: [
+        { text: `于 ${subject.triggeredAt} 发起了对 ` },
+        { text: subject.app, bold: true },
+        { text: ' 应用 ' },
+        { text: subject.errorCode, bold: true },
+        { text: ' 错误码不良日志的分析。' },
+      ],
+      links: { nameHeader: '日志', linkHeader: '详情页', rows: subject.logDetails },
+    },
+  }
+}
 
 /**
  * Where one Feishu-routed Session came from, keyed by its DSH session id.
  * Written the first time a route record names the Session (new topic,
- * `/renew`, analyze API) and kept after the route retires, so the Web
+ * `/renew`, `feishuTopics` launch) and kept after the route retires, so the Web
  * client can still show the origin of an old Session. Names are resolved
  * live when read, never stored.
  */
@@ -339,11 +464,11 @@ export const sessionOriginRecordSchema = z.object({
   chatId: z.string().min(1),
   /** `p2p` or `group`. */
   chatType: z.enum(['p2p', 'group']),
-  /** `user_id` of the user who started the Session (the requester for analyze topics). */
+  /** `user_id` of the user who started the Session (the requester for launched topics). */
   senderUserId: z.string().min(1),
   /** Epoch ms when the Session was bound to the route. */
   createdAt: z.number().int().nonnegative(),
-  /** Group-shared route (log-platform analysis topic). */
+  /** Group-shared route (topic started through `feishuTopics`). */
   shared: z.literal(true).optional(),
 })
 
@@ -374,7 +499,7 @@ export interface FeishuDomainSpecShape {
       __key?: string
     }
     access_groups: {
-      valueSchema: typeof accessGroupRecordSchema
+      valueSchema: typeof retiredAccessGroupRecordSchema
       __key?: string
     }
     access_users: {
@@ -390,11 +515,15 @@ export interface FeishuDomainSpecShape {
       __key?: string
     }
     analyze_requests: {
-      valueSchema: typeof analyzeRequestRecordSchema
+      valueSchema: typeof topicLaunchRecordSchema
       __key?: string
     }
     session_origins: {
       valueSchema: typeof sessionOriginRecordSchema
+      __key?: string
+    }
+    outbox: {
+      valueSchema: typeof outboxEntrySchema
       __key?: string
     }
   }
@@ -407,6 +536,10 @@ export const feishuDomainGlobalSchema = z.object({
   chevronImgKey: z.string().optional(),
   /** p2p chats already shown the one-time onboarding card (bounded list). */
   welcomedChats: z.array(z.string()).optional(),
+  /** Groups the bot was added to (bounded list), read by missed-message catch-up. */
+  knownGroups: z.array(z.string()).optional(),
+  /** Epoch ms the long connection was last known up (missed-message catch-up). */
+  lastAliveAt: z.number().int().nonnegative().optional(),
 })
 
 export type FeishuDomainGlobal = z.infer<typeof feishuDomainGlobalSchema>
@@ -430,17 +563,19 @@ export const feishuDomain: FeishuDomainSpecShape = {
     inflight: { valueSchema: inflightSnapshotSchema },
     processed: { valueSchema: processedRecordSchema },
     expired_routes: { valueSchema: expiredRouteRecordSchema },
-    access_groups: { valueSchema: accessGroupRecordSchema },
+    // Retired group whitelist: declared so the stored records survive, never read.
+    access_groups: { valueSchema: retiredAccessGroupRecordSchema },
     access_users: { valueSchema: accessUserRecordSchema },
     access_requests: { valueSchema: accessRequestRecordSchema },
-    // Wiki whitelist (`/auth wiki add`): same record as `access_users`, an
-    // independent grant. Added without a version bump like the other access
-    // tables: a missing table loads empty.
+    // Retired wiki whitelist (knowledge-base access now lives on `access_users`):
+    // declared so the stored records survive, never read.
     access_wiki_users: { valueSchema: accessUserRecordSchema },
-    // Analyze API idempotency records; a missing table loads empty.
-    analyze_requests: { valueSchema: analyzeRequestRecordSchema },
+    // `feishuTopics` launch records (historical name); a missing table loads empty.
+    analyze_requests: { valueSchema: topicLaunchRecordSchema },
     // Session id → Feishu origin; a missing table loads empty.
     session_origins: { valueSchema: sessionOriginRecordSchema },
+    // Terminal Feishu actions waiting for a retry; a missing table loads empty.
+    outbox: { valueSchema: outboxEntrySchema },
   },
 }
 
@@ -483,15 +618,7 @@ export interface ExpiredRoutesTable {
   entries(): IterableIterator<[string, ExpiredRouteRecord]>
 }
 
-/** Normalized table handle for authorized groups (key = `chat_id`). */
-export interface AccessGroupsTable {
-  get(key: string): AccessGroupRecord | undefined
-  put(key: string, value: AccessGroupRecord): Promise<unknown> | void
-  delete(key: string): Promise<unknown> | void
-  entries(): IterableIterator<[string, AccessGroupRecord]>
-}
-
-/** Normalized table handle for authorized users (key = `user_id`). */
+/** Normalized table handle for the access-table users (key = `user_id`). */
 export interface AccessUsersTable {
   get(key: string): AccessUserRecord | undefined
   put(key: string, value: AccessUserRecord): Promise<unknown> | void
@@ -507,17 +634,18 @@ export interface AccessRequestsTable {
   entries(): IterableIterator<[string, AccessRequestRecord]>
 }
 
-/** Normalized table handle for analyze API requests (key = `Idempotency-Key`). */
-export interface AnalyzeRequestsTable {
-  get(key: string): AnalyzeRequestRecord | undefined
-  put(key: string, value: AnalyzeRequestRecord): Promise<unknown> | void
-  entries(): IterableIterator<[string, AnalyzeRequestRecord]>
+/** Normalized table handle for `feishuTopics` launches (key = idempotency key). */
+export interface TopicLaunchesTable {
+  get(key: string): TopicLaunchRecord | undefined
+  put(key: string, value: TopicLaunchRecord): Promise<unknown> | void
+  entries(): IterableIterator<[string, TopicLaunchRecord]>
 }
 
 /** Normalized table handle for the session-origin table (key = DSH session id). */
 export interface SessionOriginsTable {
   get(key: string): SessionOriginRecord | undefined
   put(key: string, value: SessionOriginRecord): Promise<unknown> | void
+  entries(): IterableIterator<[string, SessionOriginRecord]>
 }
 
 /** Normalized domain handle. */
@@ -526,15 +654,14 @@ export interface FeishuDomainHandle {
   inflight: InflightTable
   processed: ProcessedTable
   expiredRoutes: ExpiredRoutesTable
-  accessGroups: AccessGroupsTable
   accessUsers: AccessUsersTable
   accessRequests: AccessRequestsTable
-  /** Wiki whitelist (key = `user_id`); same records as {@link AccessUsersTable}. */
-  accessWikiUsers: AccessUsersTable
-  /** Analyze API idempotency records. */
-  analyzeRequests: AnalyzeRequestsTable
+  /** `feishuTopics` launch records. */
+  topicLaunches: TopicLaunchesTable
   /** Feishu origin of every Session a route ever named. */
   sessionOrigins: SessionOriginsTable
+  /** Terminal Feishu actions waiting for a retry. */
+  outbox: OutboxTable
   getGlobal(): FeishuDomainGlobal
   setGlobal(value: FeishuDomainGlobal): Promise<unknown> | void
   close(): Promise<void>

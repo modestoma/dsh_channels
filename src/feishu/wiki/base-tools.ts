@@ -3,7 +3,7 @@
  * `feishuTools.wikiRead`) and `feishu_wiki_base_edit` (switch
  * `feishuTools.wikiWrite`).
  *
- * Both run through the same gates as the docx tools (whitelist, `wikiRoots`
+ * Both run through the same gates as the docx tools (permission switch, `wikiRoots`
  * containment, consent cards). Reading shares the docx read grant per Session
  * and document. Editing changes records only (no table or field structure):
  * on a base the app owns it may create, update, and delete records; on any

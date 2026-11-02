@@ -7,9 +7,7 @@
 
 import {
   ACCESS_ROUTE,
-  ADD_ACCESS_GROUP_ROUTE,
   ADD_ACCESS_USER_ROUTE,
-  ADD_WIKI_USER_ROUTE,
   CATALOG_ROUTE,
   CLEAR_CONFIG_ROUTE,
   CLEAR_CREDENTIAL_ROUTE,
@@ -18,17 +16,23 @@ import {
   PROFILES_MAX_IDS,
   PROFILES_ROUTE,
   RECONNECT_ROUTE,
-  REMOVE_ACCESS_GROUP_ROUTE,
+  TAKEOVER_ROUTE,
   REMOVE_ACCESS_USER_ROUTE,
-  REMOVE_WIKI_USER_ROUTE,
   RESOLVE_ACCESS_REQUEST_ROUTE,
+  SET_ACCESS_GIT_EMAIL_ROUTE,
+  SET_ACCESS_PERMISSION_ROUTE,
   SAVE_CONFIG_ROUTE,
   SAVE_CREDENTIALS_ROUTE,
   SESSION_ORIGIN_ROUTE,
+  SESSION_RECORDS_ROUTE,
   STATUS_ROUTE,
+  WORKSPACE_FILE_DOWNLOAD_ROUTE,
+  WORKSPACE_FILE_PREVIEW_ROUTE,
+  WORKSPACE_FILES_ROUTE,
 } from '../settings/contract.ts'
 import type {
   AccessMutationResponse,
+  AccessPermissionWire,
   AccessWire,
   CatalogWire,
   ChannelStatusWire,
@@ -44,6 +48,9 @@ import type {
   SaveCredentialsRequest,
   SaveCredentialsResponse,
   SessionOriginResponse,
+  SessionRecordsWire,
+  WorkspaceListingWire,
+  WorkspacePreviewWire,
 } from '../settings/contract.ts'
 
 function messageOf(error: unknown): string {
@@ -100,6 +107,49 @@ export async function fetchStatus(): Promise<ChannelStatusWire> {
 export async function fetchSessionOrigin(sessionId: string): Promise<SessionOriginResponse> {
   const query = new URLSearchParams({ sessionId }).toString()
   return readJson<SessionOriginResponse>(await request(`${SESSION_ORIGIN_ROUTE}?${query}`))
+}
+
+/** Every Feishu-routed Session, grouped by group chat → user and private-chat user. */
+export async function fetchSessionRecords(): Promise<SessionRecordsWire> {
+  return readJson<SessionRecordsWire>(await request(SESSION_RECORDS_ROUTE))
+}
+
+function workspaceQuery(workspace: string, path: string): string {
+  return new URLSearchParams({ workspace, path }).toString()
+}
+
+/**
+ * One directory of a Feishu workspace.
+ * @param workspace - workspace root as the records listed it.
+ * @param path - directory relative to the root (`''` = root).
+ * @returns the listing, directories first.
+ */
+export async function fetchWorkspaceFiles(workspace: string, path: string): Promise<WorkspaceListingWire> {
+  return readJson<WorkspaceListingWire>(await request(`${WORKSPACE_FILES_ROUTE}?${workspaceQuery(workspace, path)}`))
+}
+
+/**
+ * Preview of one workspace file: text excerpt, inline image, or binary facts.
+ * @param workspace - workspace root as the records listed it.
+ * @param path - file relative to the root.
+ * @returns the preview.
+ */
+export async function fetchWorkspaceFilePreview(workspace: string, path: string): Promise<WorkspacePreviewWire> {
+  return readJson<WorkspacePreviewWire>(await request(`${WORKSPACE_FILE_PREVIEW_ROUTE}?${workspaceQuery(workspace, path)}`))
+}
+
+/**
+ * Bytes of one workspace file, read through the authenticated route.
+ * @param workspace - workspace root as the records listed it.
+ * @param path - file relative to the root.
+ * @returns the file contents.
+ */
+export async function fetchWorkspaceFileBlob(workspace: string, path: string): Promise<Blob> {
+  const response = await request(`${WORKSPACE_FILE_DOWNLOAD_ROUTE}?${workspaceQuery(workspace, path)}`, {
+    headers: { accept: 'application/octet-stream' },
+  })
+  if (!response.ok) throw new Error(errorFromBody(response.status, await response.text()))
+  return response.blob()
 }
 
 /**
@@ -179,6 +229,20 @@ export async function clearConfig(): Promise<ClearConfigResponse> {
 /** Reopen the Feishu long connection (interrupts in-flight replies). */
 export async function reconnect(): Promise<ReconnectResponse> {
   const response = await request(RECONNECT_ROUTE, { method: 'POST' })
+  const text = await response.text()
+  if (!response.ok) {
+    try {
+      return JSON.parse(text) as ReconnectResponse
+    } catch {
+      return { ok: false, error: errorFromBody(response.status, text) }
+    }
+  }
+  return JSON.parse(text) as ReconnectResponse
+}
+
+/** Take this bot's connection over from another dsh process on this machine. */
+export async function takeover(): Promise<ReconnectResponse> {
+  const response = await request(TAKEOVER_ROUTE, { method: 'POST' })
   const text = await response.text()
   if (!response.ok) {
     try {
@@ -270,20 +334,7 @@ async function mutateAccess(path: string, body: unknown): Promise<AccessMutation
   return JSON.parse(text) as AccessMutationResponse
 }
 
-/** Authorize one group; resolves with the refreshed access snapshot. */
-export async function addAccessGroup(chatId: string, name?: string): Promise<AccessMutationResponse> {
-  return mutateAccess(
-    ADD_ACCESS_GROUP_ROUTE,
-    name === undefined || name === '' ? { chatId } : { chatId, name },
-  )
-}
-
-/** Revoke one group authorization (takes effect on the next message). */
-export async function removeAccessGroup(chatId: string): Promise<AccessMutationResponse> {
-  return mutateAccess(REMOVE_ACCESS_GROUP_ROUTE, { chatId })
-}
-
-/** Authorize one user `user_id` (global across authorized groups). */
+/** Add one user `user_id` with only the conversation switch on (or turn it back on). */
 export async function addAccessUser(userId: string, name?: string): Promise<AccessMutationResponse> {
   return mutateAccess(
     ADD_ACCESS_USER_ROUTE,
@@ -291,22 +342,23 @@ export async function addAccessUser(userId: string, name?: string): Promise<Acce
   )
 }
 
-/** Revoke one user authorization (takes effect on the next message). */
+/** Remove one user from the user table (takes effect on the next message). */
 export async function removeAccessUser(userId: string): Promise<AccessMutationResponse> {
   return mutateAccess(REMOVE_ACCESS_USER_ROUTE, { userId })
 }
 
-/** Add one user `user_id` to the wiki whitelist. */
-export async function addWikiUser(userId: string, name?: string): Promise<AccessMutationResponse> {
-  return mutateAccess(
-    ADD_WIKI_USER_ROUTE,
-    name === undefined || name === '' ? { userId } : { userId, name },
-  )
+/** Set one permission switch of a user already in the table. */
+export async function setAccessPermission(
+  userId: string,
+  permission: AccessPermissionWire,
+  enabled: boolean,
+): Promise<AccessMutationResponse> {
+  return mutateAccess(SET_ACCESS_PERMISSION_ROUTE, { userId, permission, enabled })
 }
 
-/** Remove one user from the wiki whitelist (takes effect on the next wiki tool call). */
-export async function removeWikiUser(userId: string): Promise<AccessMutationResponse> {
-  return mutateAccess(REMOVE_WIKI_USER_ROUTE, { userId })
+/** Set one user's git email; an empty string clears it. */
+export async function setAccessGitEmail(userId: string, gitEmail: string): Promise<AccessMutationResponse> {
+  return mutateAccess(SET_ACCESS_GIT_EMAIL_ROUTE, { userId, gitEmail })
 }
 
 /** Settle one pending authorization request (same resolver as the Feishu card). */

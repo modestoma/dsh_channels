@@ -23,7 +23,7 @@ import { defaultChannelFactory } from './feishu-channel.ts'
 import type { ChannelFactory } from './feishu-channel.ts'
 import { OverlayStore, defaultOverlayPath } from './settings/overlay.ts'
 import { mountSettingsRoutes } from './settings/routes.ts'
-import { mountAnalyzeRoute } from './analyze/server.ts'
+import { FEISHU_TOPICS_SERVICE } from './topics/launcher.ts'
 import { SettingsSurface } from './settings/surface.ts'
 import { createHostCatalog } from './settings/catalog.ts'
 import { createSettingsDirectoryPicker } from './settings/directory-picker.ts'
@@ -40,8 +40,9 @@ export type * from './session-export.ts'
 export type * from './stats.ts'
 export type * from './questions.ts'
 export type * from './settings/contract.ts'
+export type * from './topics/contract.ts'
 export * from './access/index.ts'
-export type { AccessGroupRecord, AccessRequestRecord, AccessUserRecord } from './domain.ts'
+export type { AccessPermission, AccessRequestRecord, AccessSwitch, AccessUserRecord } from './domain.ts'
 export { CATALOG_ROUTE, CLEAR_CONFIG_ROUTE, CLEAR_CREDENTIAL_ROUTE, EDITABLE_KEYS, PANEL_COPY, PANEL_ROUTE, PICK_DIRECTORY_ROUTE, RECONNECT_ROUTE, RESTART_KEYS, SAVE_CONFIG_ROUTE, SAVE_CREDENTIALS_ROUTE, STATUS_ROUTE } from './settings/contract.ts'
 export type { PickDirectoryResponse } from './settings/contract.ts'
 export { defaultOverlayPath, mergeOverlay, normalizeOverlay, OverlayStore, parseOverlay, pickEditable, resolveDshHome } from './settings/overlay.ts'
@@ -54,18 +55,20 @@ export type { HostDirectoryPickerService, SettingsDirectoryPicker } from './sett
 export { mountSettingsRoutes, registerSettingsRoutes } from './settings/routes.ts'
 export type { HostConnection, HostFetchRoute } from './settings/routes.ts'
 export type { ApprovalOutcome, ApprovalRequest, ApprovalAnswererListener, AssistantStreamFrame, AskUserQuestionAnswer, AskUserQuestionAnswerItem, AskUserQuestionItem, AskUserQuestionRequestEvent, UserQuestionAnswererListener, AgentCancelCause, SessionStatsView, TokenUsageView, ContextPressureView, SessionProjections } from './dsh-types.ts'
-export { buildCard, buildInterruptionCard, cardJsonBytes, CARD_MAX_BYTES, CARD_TARGET_BYTES, REASONING_MAX_BYTES, INTERRUPTION_NOTICE, MAX_TABLES_PER_CARD, PANEL_TITLES, PANEL_CHEVRON_TOKEN, segmentCardContent, splitBodyForCard, stripTables, tableBlocks, TRUNCATION_SUFFIX, buildApprovalCard, buildApprovalSettledCard, buildQuestionCard, buildQuestionSettledCard, MAX_QUESTION_OPTIONS } from './cards.ts'
+export { buildCard, buildInterruptionCard, cardJsonBytes, CARD_MAX_BYTES, CARD_TARGET_BYTES, REASONING_MAX_BYTES, INTERRUPTION_NOTICE, MAX_TABLES_PER_CARD, TURN_HEADLINES, REASONING_PANEL_TITLE, PANEL_CHEVRON_TOKEN, segmentCardContent, splitBodyForCard, stripTables, tableBlocks, TRUNCATION_SUFFIX, buildApprovalCard, buildApprovalSettledCard, buildQuestionCard, buildQuestionSettledCard, buildTopicRootCard, MAX_QUESTION_OPTIONS } from './cards.ts'
 export { ApprovalAnswerer } from './approvals.ts'
 export { QuestionAnswerer } from './questions.ts'
-export { armModelCommand, buildCommandResultCard, CHANNEL_COMMAND_NAMES, commandResultCardKind, isSupportedCommand, parseSlashCommand, registerChannelCommands, registerModelCommand, RouteOperationQueue, SUPPORTED_COMMAND_NAMES, supportedCommandHelp, supportedCommandList } from './commands.ts'
+export { buildCommandResultCard, CHANNEL_COMMAND_NAMES, commandResultCardKind, isSupportedCommand, parseSlashCommand, registerChannelCommands, RouteOperationQueue, SUPPORTED_COMMAND_NAMES, supportedCommandHelp, supportedCommandList } from './commands.ts'
 export { buildHealthCard, countFiberStates, foldHealthSnapshot, HEALTH_DEPENDENCY_NAMES, maskOpenIdTail } from './health.ts'
 export { buildCompactComparisonCard, buildRenewCard, buildSessionHistoryCard, buildSessionStatusCard, buildWorkDirCard, compactFailureContext, querySessionHistory, resolveWorkDir, SESSION_HISTORY_DISPLAY_LIMIT } from './session-commands.ts'
 export { createLogicalSessionExport, DSH_CHANNELS_VERSION, LOGICAL_EXPORT_FORMAT, LOGICAL_EXPORT_FORMAT_VERSION, serializeLogicalSession } from './session-export.ts'
 export { addUsage, applyProjectionViews, averageDecodeTokensPerSecond, averageTtftMs, cacheHitPct, EMPTY_TOTALS, foldAll, foldEvent, foldSessionStats, measureSessionContext, readProjectionViews, usageFromBuckets } from './stats.ts'
 export { FeishuService } from './service.ts'
+export { FEISHU_TOPICS_SERVICE, FEISHU_TOPICS_VERSION, TopicLauncher } from './topics/launcher.ts'
+export type { TopicLauncherDeps } from './topics/launcher.ts'
 export { TurnStreamer } from './streamer.ts'
-export { ensureWorkspace, stagingPathFor, stagingRoot, topicDirFor, topicTokenFor, workspacePathFor, workspaceTitleFor, worktreeBranchFor } from './workspaces.ts'
-export { accessGroupRecordSchema, accessRequestRecordSchema, accessUserRecordSchema, appendSessionHistory, chatRouteKey, expiredRouteRecordSchema, feishuDomain, normalizeRouteRecord, normalizeSessionHistory, routeRecordSchema, sessionDirOf, sessionHistoryEntrySchema, inflightSnapshotSchema, processedRecordSchema } from './domain.ts'
+export { ensureWorkspace, topicDirFor, topicTokenFor, workspacePathFor, workspaceTitleFor, worktreeBranchFor } from './workspaces.ts'
+export { ACCESS_PERMISSIONS, accessRequestRecordSchema, accessUserRecordSchema, appendSessionHistory, chatRouteKey, expiredRouteRecordSchema, feishuDomain, normalizeRouteRecord, normalizeSessionHistory, routeRecordSchema, sessionDirOf, sessionHistoryEntrySchema, inflightSnapshotSchema, processedRecordSchema } from './domain.ts'
 
 /** Cordis function-plugin name. */
 export const name = 'channels'
@@ -76,9 +79,11 @@ export const name = 'channels'
  * process environment: at boot the credentials provider may not be visible
  * yet (a race observed in real profiles), and inject makes the loader wait
  * for it. `llm` / `tokenMeter` feed the card's context line and ship with
- * every dsh-base profile.
+ * every dsh-base profile. `attachments` is the DSH native attachment library
+ * (`@deepseek-ai/dsh-attachment-local`, mounted by the shipped base
+ * composition): it is the only storage for inbound Feishu images and files.
  */
-export const inject = ['agents', 'commands', 'workspaceRegistry', 'storageDomain', 'credentials', 'llm', 'tokenMeter'] as const
+export const inject = ['agents', 'commands', 'workspaceRegistry', 'storageDomain', 'credentials', 'llm', 'tokenMeter', 'attachments'] as const
 
 /**
  * Cordis Standard Schema declaration for the plugin config.
@@ -125,7 +130,9 @@ export function apply(ctx: HostContext, config?: unknown): void {
     createHostCatalog(ctx, warn),
     createSettingsDirectoryPicker(ctx),
   ))
-  mountAnalyzeRoute(ctx, service.analyzeHandler(), warn)
+  // Other plugins start group-shared topics through this
+  // service; it answers `not-connected` until the Feishu connection is up.
+  ctx.provide?.(FEISHU_TOPICS_SERVICE, service.topics())
   ctx.effect(() => {
     // Boot loads the Web overlay and connects only when the Feishu application
     // credentials are complete; an incomplete configuration or a failed

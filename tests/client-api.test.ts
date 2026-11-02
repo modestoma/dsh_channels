@@ -5,7 +5,16 @@
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { fetchCatalog, fetchFeishuProfiles, fetchPanel, removeAccessUser } from '../src/client/api.ts'
+import {
+  fetchCatalog,
+  fetchFeishuProfiles,
+  fetchPanel,
+  fetchSessionRecords,
+  fetchWorkspaceFileBlob,
+  fetchWorkspaceFilePreview,
+  fetchWorkspaceFiles,
+  removeAccessUser,
+} from '../src/client/api.ts'
 import { PROFILES_MAX_IDS } from '../src/settings/contract.ts'
 
 function stubFetch(): ReturnType<typeof vi.fn> {
@@ -56,5 +65,29 @@ describe('fetchFeishuProfiles', () => {
     expect(String(fetcher.mock.calls[1]?.[0])).toBe(`api/dsh-channels.profiles?users=u_${PROFILES_MAX_IDS}&chats=`)
     expect(Object.keys(result.users)).toHaveLength(PROFILES_MAX_IDS + 1)
     expect(result.warning).toBe('code=1 denied')
+  })
+})
+
+describe('session records and workspace files', () => {
+  it('addresses the records and file routes with the workspace root and relative path', async () => {
+    const fetcher = stubFetch()
+    await fetchSessionRecords()
+    await fetchWorkspaceFiles('/ws/p2p/u_1', 'topics')
+    await fetchWorkspaceFilePreview('/ws/p2p/u_1', 'topics/a b.md')
+    expect(fetcher.mock.calls.map(call => call[0])).toEqual([
+      'api/dsh-channels.sessionRecords',
+      'api/dsh-channels.workspaceFiles?workspace=%2Fws%2Fp2p%2Fu_1&path=topics',
+      'api/dsh-channels.workspaceFilePreview?workspace=%2Fws%2Fp2p%2Fu_1&path=topics%2Fa+b.md',
+    ])
+  })
+
+  it('returns downloaded bytes as a blob and surfaces the Host refusal message', async () => {
+    const fetcher = vi.fn(async (_url: string, _init?: RequestInit) => new Response('csv,data', { status: 200 }))
+    vi.stubGlobal('fetch', fetcher)
+    const blob = await fetchWorkspaceFileBlob('/ws', 'a.csv')
+    expect(await blob.text()).toBe('csv,data')
+    expect(fetcher.mock.calls[0]?.[0]).toBe('api/dsh-channels.workspaceFileDownload?workspace=%2Fws&path=a.csv')
+    fetcher.mockResolvedValueOnce(new Response(JSON.stringify({ ok: false, error: '目标位于工作区之外' }), { status: 403 }))
+    await expect(fetchWorkspaceFileBlob('/ws', 'escape')).rejects.toThrow('目标位于工作区之外')
   })
 })

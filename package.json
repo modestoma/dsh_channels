@@ -19,6 +19,9 @@
       "types": "./src/client/index.ts",
       "default": "./lib/client.js"
     },
+    "./topics": {
+      "types": "./src/topics/contract.ts"
+    },
     "./package.json": "./package.json"
   },
   "files": [

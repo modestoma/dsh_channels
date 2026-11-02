@@ -22,10 +22,11 @@ export interface ConnectionTabProps {
   busy: BusyAction | null
   credentials: CredentialsView
   onReconnect: () => void
+  onTakeover: () => void
 }
 
 export function ConnectionTab(props: ConnectionTabProps): JSX.Element {
-  const { panel, status, busy, credentials, onReconnect } = props
+  const { panel, status, busy, credentials, onReconnect, onTakeover } = props
   const checks = status.scopeCheck !== undefined || status.slashCommandSync !== undefined
   return (
     <div className="dsh-channels-cfg__tabBody">
@@ -34,7 +35,7 @@ export function ConnectionTab(props: ConnectionTabProps): JSX.Element {
         : <RestartBanner panel={panel} busy={busy} locked={status.busy} onReconnect={onReconnect} />}
       {status.phase === 'unconfigured'
         ? <OnboardingSection status={status} />
-        : <StatusBlock status={status} busy={busy} onReconnect={onReconnect} />}
+        : <StatusBlock status={status} busy={busy} onReconnect={onReconnect} onTakeover={onTakeover} />}
       {checks
         ? (
             <Section title={PANEL_COPY.checksTitle}>
@@ -88,8 +89,9 @@ function StatusBlock(props: {
   status: ChannelStatusWire
   busy: BusyAction | null
   onReconnect: () => void
+  onTakeover: () => void
 }): JSX.Element {
-  const { status, busy, onReconnect } = props
+  const { status, busy, onReconnect, onTakeover } = props
   const badge = phaseBadge(status.phase)
   // `status.busy` covers a connection attempt started outside this panel; the
   // local busy flag covers the panel's own action. Either way the button waits.
@@ -109,6 +111,12 @@ function StatusBlock(props: {
         {busy === 'reconnect' ? PANEL_COPY.connecting : status.phase === 'idle' ? PANEL_COPY.connect : PANEL_COPY.retry}
       </button>
     )
+  } else if (status.phase === 'occupied') {
+    action = (
+      <button type="button" className="dsh-channels-cfg__btn dsh-channels-cfg__btn--primary" onClick={onTakeover} disabled={actionBusy}>
+        {busy === 'takeover' ? PANEL_COPY.takingOver : PANEL_COPY.takeover}
+      </button>
+    )
   } else if (status.phase === 'connected') {
     action = (
       <button type="button" className="dsh-channels-cfg__btn" onClick={onReconnect} disabled={actionBusy}>
@@ -124,7 +132,19 @@ function StatusBlock(props: {
         <span className="dsh-channels-cfg__spacer" />
         {action}
       </div>
-      {status.lastStartError === undefined
+      {status.occupiedBy === undefined
+        ? null
+        : (
+            <span className="dsh-channels-cfg__rowSummary">
+              {PANEL_COPY.occupiedHolder}：
+              <span className="dsh-channels-cfg__mono">
+                {status.occupiedBy.holder === undefined
+                  ? PANEL_COPY.occupiedHolderUnknown
+                  : `pid ${status.occupiedBy.holder.pid} · ${status.occupiedBy.holder.home} · v${status.occupiedBy.holder.version}`}
+              </span>
+            </span>
+          )}
+      {status.lastStartError === undefined || status.phase === 'occupied'
         ? null
         : (
             <div className="dsh-channels-cfg__notice dsh-channels-cfg__notice--error">

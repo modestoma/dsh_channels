@@ -81,7 +81,7 @@
 |------|------|------|
 | 工作区（私聊） | `(bot, open_id)` → 目录 `<baseDir>/p2p/<open_id>/`（header cwd） | `ctx.workspaceRegistry` + 磁盘 |
 | 工作区（群聊） | `(bot, chat_id, open_id)` → 目录 `<baseDir>/groups/<chat_id>/<open_id>/` | 同上 |
-| 话题工作目录 | `<工作区>/topics/<topic>/`（实际 cwd；入站附件 v2 默认进 DSH 原生附件库，仅 archive 降级落 `<目录>/attachments/`） | Session 日志 `working-directory/change` + 路由记录 `sessionDir` |
+| 话题工作目录 | `<工作区>/topics/<topic>/`（实际 cwd；入站附件只进 DSH 原生附件库，不落这里） | Session 日志 `working-directory/change` + 路由记录 `sessionDir` |
 | session | `thread_id` → DSH `sessionId`（每话题一个） | 插件 `storageDomain` 域 `channels_routes` |
 | 会话延续 | 事件 `thread_id` 命中映射 → `agent.followup()` | — |
 
@@ -91,7 +91,7 @@
 
 1. 收到事件 → 异步 `reaction.create("Typing")`（非阻塞，记录 reaction_id）。
 2. 确保用户工作区（不存在则 mkdir + `workspaceRegistry.create`），规划话题工作目录（普通子目录或 Git worktree）。
-3. 通过 `im.message.reply(message_id, { reply_in_thread: true, msg_type: "interactive", content: 卡片初始 JSON })` 创建话题并发出卡片第一帧（折叠面板标题“推理中”），拿到 `thread_id` + `message_id`。
+3. 通过 `im.message.reply(message_id, { reply_in_thread: true, msg_type: "interactive", content: 卡片初始 JSON })` 创建话题并发出卡片第一帧（状态行“⚙️ 进行中”），拿到 `thread_id` + `message_id`。
 4. `ctx.agents.create({ sessionId: <uuid>, meta: { cwd: 用户工作区 }, ... })`，随后 `ctx.workingDirectory.set(agent, 话题目录)`（worktree 模式由 `ctx.worktrees.create` 完成切换），再投递首个 user 消息。
 5. 持久化 `thread_id → sessionId` 映射。
 
@@ -108,8 +108,8 @@
 - **活动状态两行**（**只在当前正在流式输出的那张卡上渲染**——已冻结的续卡/主卡不再重复；互相独立、互不顶替）：**状态行**折叠 `tool-workflow/run-start / agent-start / agent-end / run-end`（workflow 进度：完成数/总数、阶段、活动成员、结束原因），run 结束转为 `结束（完成）` 并**保留到最终卡片**（后续工具调用/正文不顶掉）；子代理完成后汇总为 `子代理完成：a、b` 同样留在最终卡片；**工具行**显示父会话当前 `tool/call`（subagent 取 description、workflow 取 meta.name），`tool/result` 即清、回合结束后收起（完成态只保留结算状态行：工作流结论 / 子代理完成摘要）。两行可同屏（如 `🧵 工作流 xxx 结束（完成）` + `🔧 调用工具：bash`）；无正文输出的等待期以 `statusRefreshMs`（默认 5s）慢心跳刷新“已运行 Ns”计时——进入 subagent / workflow 时卡片不再静默等待。
 - **子代理进度（跨会话映射）**：子代理是独立 session（header `parentSession` 指向主会话、`origin: 'subagent'`），其 `subagent/descriptor`（label）、`tool/call`（当前工具）、`turn/end`（结束移除）经全局 `session/event` 总线折叠进主卡片的同一状态行；workflow 成员经 `tool-workflow/agent-start` 的 `childId` 登记在 run 折叠里、跳过通用子代理折叠以免重复。**只显示状态不显示输出**：子代理正文是父模型的中间产物（工具契约“You receive its result, not its intermediate steps”），绝不进卡片正文。
 - 500ms 节流器（仅内容变化时 patch），拼接卡片 2.0 JSON 全量 `im.v1.message.patch`。
-- 折叠面板成功三态：首个 reasoning 增量前“推理中”（此时面板兼作阶段指示灯与占位）；推理结束、正文开始后“回复中”；成功 `turn/end` 后“回复结束”。失败 `turn/end` 则进入“回复失败”。`thinking` 阶段面板始终渲染；进入 `replying` / `done` / `error` 后仅当存在推理内容才渲染——无推理的回合结算后不出现空面板。
-- 终态：`turn/end.reason.kind === "error"` 时错误只写入正文一次（`❌ **本轮运行失败**` + `error.message`，有 `error.code` 时追加 `错误码：<code>`），不再重复 🔴 状态行，再执行 `reaction.delete(Typing)` → `reaction.create("No")`；其他终态进入「回复结束」并添加 `DONE`。每轮模型头与 usage 单独折叠，失败发生在 `request/header` 前时页脚中模型/缓存命中显示 `—`、推理强度省略，不沿用上一轮；推理时长由插件按「每个 step 首个推理增量 → 该 step 输出结束（首个正文增量或 step end）」的墙钟时间跨 step 累加，工具执行时间不计入。
+- 状态行：卡片第一行由 DSH 回合事件驱动（等待审批 / 等待回答 / 正在压缩上下文 / 模型重试 / 调用工具 / 思考中 / 输出中 / 进行中，结束后 已完成 / 已停止 / 失败 并附用时），完整规则见 README「流式卡片」。折叠面板标题固定为“思考过程”，只在有推理内容时渲染，不表示状态。
+- 终态：`turn/end.reason.kind === "error"` 时错误只写入正文一次（`❌ **本轮运行失败**` + `error.message`，有 `error.code` 时追加 `错误码：<code>`），不再重复 🔴 状态行，再执行 `reaction.delete(Typing)` → `reaction.create("No")`；其他终态状态行变为「✅ 已完成」并添加 `DONE`。每轮模型头与 usage 单独折叠，失败发生在 `request/header` 前时页脚中模型/缓存命中显示 `—`、推理强度省略，不沿用上一轮；推理时长由插件按「每个 step 首个推理增量 → 该 step 输出结束（首个正文增量或 step end）」的墙钟时间跨 step 累加，工具执行时间不计入。
 
 ### 3.3 卡片 JSON（卡片 JSON 2.0 结构）
 
@@ -130,7 +130,7 @@
         "expanded": false,
         "border": { "color": "grey", "corner_radius": "8px" },
         "header": {
-          "title": { "tag": "plain_text", "content": "回复结束" }, // 推理中|回复中|回复结束|回复失败
+          "title": { "tag": "plain_text", "content": "思考过程 · 12.3s" }, // 只在有推理内容时渲染
           "icon": { "tag": "standard_icon", "token": "down-small-ccm_outlined" }, // 折叠向下
           "icon_position": "right",
           "icon_expanded_angle": 180 // 展开时旋转 180° → 箭头向上

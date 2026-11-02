@@ -9,12 +9,15 @@ import { mkdirSync, mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { vi } from 'vitest'
+import type { AcquireOptions, InstanceLockProvider, LockHolderInfo } from '../src/instance-lock.ts'
+import { FeishuService } from '../src/service.ts'
 import type {
   Agent, AgentContext, AgentHandle, AgentOptions, AgentRegistry, AgentRequestConfig, AgentRequestListener, ApprovalAnswererListener,
-  AssistantStreamPayload, AttachmentStore, CommandDefinition, CommandInvocation, CommandRuntime, EncodedImageAttachment,
-  FileAttachmentRef, HostContext, ImageAttachmentLimits, ImageAttachmentRef, ImageMediaType, PermissionPresets, PromptSection,
+  AssistantStreamPayload, AttachmentStore, CommitTrailersEvent, InboxClaimedPayload, CommandDefinition, CommandInvocation, CommandRuntime, EncodedImageAttachment,
+  FileAttachmentRef, HostContext, ImageAttachmentLimits, ImageAttachmentRef, ImageMediaType, PermissionPresets, PreToolDecision,
+  PreToolExecution, PromptSection,
   Session, SessionEvent, SessionId, SessionProjections, StorageDomainFacility, ToolDefinition, ToolRuntime,
-  UserQuestionAnswererListener, Workspace, WorkspaceRegistry,
+  UserMessage, UserQuestionAnswererListener, Workspace, WorkspaceRegistry,
 } from '../src/dsh-types.ts'
 import type {
   CreatedWorktree, WorkingDirectoryService, WorktreeService,
@@ -145,7 +148,6 @@ export function promptSectionsOf(ctx: AgentContext): readonly PromptSection[] {
 /** Optional host services exposed inside a fake Agent scope. */
 export interface FakeAgentServices {
   tools?: ToolRuntime
-  attachments?: AttachmentStore
 }
 
 export function makeAgentContext(
@@ -166,7 +168,6 @@ export function makeAgentContext(
       },
     },
     ...(services.tools === undefined ? {} : { tools: services.tools }),
-    ...(services.attachments === undefined ? {} : { attachments: services.attachments }),
     on(_event, listener, options) {
       const prepend = options === true || (typeof options === 'object' && options.prepend === true)
       if (prepend) listeners.unshift(listener)
@@ -297,7 +298,6 @@ export function makeAttachmentStore(options: FakeAttachmentStoreOptions = {}): A
       path.join(tmpdir(), 'dsh-channels-fake-attachments', ref.name)),
     imageHostPath: vi.fn((ref: ImageAttachmentRef) =>
       path.join(tmpdir(), 'dsh-channels-fake-attachments', `${ref.attachmentId.slice(-16)}.png`)),
-    admitPromptContent: vi.fn(async (content: readonly unknown[]) => content),
     isAttachmentError: vi.fn(() => false),
   }
   return store as unknown as AttachmentStore & { savedImages: FakeSavedImage[]; savedFiles: FakeSavedFile[] }
@@ -313,7 +313,91 @@ function mockCallsOf(fn: unknown): unknown[][] {
 }
 
 
-export function makeAgent(session: Session, options: AgentOptions = {}, ctx?: AgentContext): Agent {
+/**
+ * Emulates the Agent loop's inbox for tests: each `followup` runs as its own
+ * turn, claimed at once when the session is idle and otherwise after the
+ * running turn's `turn/end`; a steered message leaves the queue.
+ */
+export class FakeTurnDriver {
+  private readonly bySession = new Map<string, { session: Session; turn: number; busy: boolean; queue: UserMessage[] }>()
+
+  /**
+   * @param claim - receives every `agent/inbox/claimed` the fake loop emits.
+   * @param logClaims - also append each claimed prompt as `user/message`.
+   */
+  constructor(
+    private readonly claim: (session: Session, message: UserMessage, turn: number) => void,
+    private readonly logClaims = false,
+  ) {}
+
+  /**
+   * Queue a followup, claiming it now when nothing runs.
+   * @param session - the Agent's session.
+   * @param message - the followup message.
+   */
+  followup(session: Session, message: UserMessage): void {
+    const entry = this.of(session)
+    if (entry.busy) entry.queue.push(message)
+    else this.start(entry, message)
+  }
+
+  /**
+   * Forget a session's inbox and running turn, as a process restart does.
+   * @param sessionId - the session.
+   */
+  forget(sessionId: string): void {
+    this.bySession.delete(sessionId)
+  }
+
+  /**
+   * Drop a message moved into the running turn.
+   * @param session - the Agent's session.
+   * @param message - the steered message.
+   */
+  steered(session: Session, message: UserMessage): void {
+    const entry = this.of(session)
+    entry.queue = entry.queue.filter(queued => queued.id !== message.id)
+  }
+
+  /**
+   * Observe a session event; `turn/end` of the running turn claims the next followup.
+   * @param session - the event's session.
+   * @param event - the appended event.
+   */
+  observe(session: Session, event: SessionEvent): void {
+    if (event.type !== 'turn/end') return
+    const entry = this.of(session)
+    if (!entry.busy || entry.turn !== event.data.turn) return
+    entry.busy = false
+    const next = entry.queue.shift()
+    if (next !== undefined) this.start(entry, next)
+  }
+
+  private of(session: Session): { session: Session; turn: number; busy: boolean; queue: UserMessage[] } {
+    let entry = this.bySession.get(session.id)
+    if (entry === undefined) {
+      // Turns continue the numbering already in the session log.
+      const turn = Math.max(0, ...session.snapshotEvents().map(event =>
+        'turn' in event.data && typeof event.data.turn === 'number' ? event.data.turn : 0))
+      entry = { session, turn, busy: false, queue: [] }
+      this.bySession.set(session.id, entry)
+    }
+    return entry
+  }
+
+  private start(entry: { session: Session; turn: number; busy: boolean }, message: UserMessage): void {
+    entry.busy = true
+    entry.turn += 1
+    this.claim(entry.session, message, entry.turn)
+    // The loop logs the claimed prompt when the turn's first request starts.
+    if (this.logClaims) {
+      const log = sessionEvents(entry.session)
+      log.push({ type: 'user/message', seq: log.length, data: message })
+    }
+  }
+}
+
+export function makeAgent(session: Session, options: AgentOptions = {}, ctx?: AgentContext, driver?: FakeTurnDriver): Agent {
   return {
     id: session.id,
     options,
@@ -321,8 +405,8 @@ export function makeAgent(session: Session, options: AgentOptions = {}, ctx?: Ag
     status: 'idle',
     inbox: { nextTurn: [], nextStep: [], remove: vi.fn(() => true) },
     ctx: ctx ?? makeAgentContext(),
-    followup: vi.fn(),
-    steer: vi.fn(),
+    followup: vi.fn((message: UserMessage) => { driver?.followup(session, message) }),
+    steer: vi.fn((message: UserMessage) => { driver?.steered(session, message) }),
   }
 }
 
@@ -335,8 +419,10 @@ export interface FakeAgentsOptions {
   onFailResume?: (options: Parameters<AgentRegistry['resume']>[0]) => void
   /** Optional durable Session snapshot returned by the next fake resume. */
   resumeSession?: Session
-  /** Host services exposed inside every fake Agent scope (tools/attachments). */
+  /** Host services exposed inside every fake Agent scope (tools). */
   agentExtras?: FakeAgentServices
+  /** Fake inbox loop that turns followups into `agent/inbox/claimed`. */
+  driver?: FakeTurnDriver
 }
 
 export function makeAgentRegistry(fail: FakeAgentsOptions = {}): {
@@ -359,7 +445,7 @@ export function makeAgentRegistry(fail: FakeAgentsOptions = {}): {
       const setupCtx = makeAgentContext(undefined, fail.agentExtras ?? {})
       await options.setup?.(setupCtx)
       const session = makeSession(options.sessionId, options.meta?.cwd, options.meta?.agentPreset)
-      const agent = makeAgent(session, options.agentOptions, setupCtx)
+      const agent = makeAgent(session, options.agentOptions, setupCtx, fail.driver)
       const handle: AgentHandle = { agent, dispose: vi.fn(async () => { liveAgents.delete(options.sessionId) }) }
       liveAgents.set(options.sessionId, handle)
       created.push({ options, handle, setupCtx })
@@ -373,7 +459,7 @@ export function makeAgentRegistry(fail: FakeAgentsOptions = {}): {
       const setupCtx = makeAgentContext(undefined, fail.agentExtras ?? {})
       await options.setup?.(setupCtx)
       const session = fail.resumeSession ?? makeSession(options.resumeSessionId)
-      const agent = makeAgent(session, options.agentOptions, setupCtx)
+      const agent = makeAgent(session, options.agentOptions, setupCtx, fail.driver)
       const handle: AgentHandle = { agent, dispose: vi.fn(async () => { liveAgents.delete(options.resumeSessionId) }) }
       liveAgents.set(options.resumeSessionId, handle)
       resumed.push({ options, handle, setupCtx })
@@ -591,6 +677,11 @@ export function makeWorktrees(workingDirectory: FakeWorkingDirectory): FakeWorkt
   return fake
 }
 
+/** One `tools/pre-execute` waterfall listener. */
+export type PreExecuteListener = (exec: PreToolExecution, next: () => Promise<PreToolDecision>) => Promise<PreToolDecision>
+/** dsh-repo's `repo/resolve-agent` waterfall listener. */
+export type ResolveAgentListener = (sessionId: string, next: () => Promise<Agent>) => Promise<Agent>
+
 export function makeHostContext(
   credentialValues?: Record<string, string>,
   agentPresets?: FakeAgentPresets,
@@ -613,11 +704,26 @@ export function makeHostContext(
   }
   sessionListeners: Array<(session: Session, event: SessionEvent) => void>
   assistantStreamListeners: Array<(payload: AssistantStreamPayload) => void>
+  /** The fake inbox loop behind every fake Agent's `followup`. */
+  driver: FakeTurnDriver
   approvalListeners: Array<{ listener: ApprovalAnswererListener; options: { prepend?: boolean } | undefined }>
   questionListeners: Array<{ listener: UserQuestionAnswererListener; options: { prepend?: boolean } | undefined }>
+  /** Every `tools/pre-execute` listener the service registered. */
+  preExecuteListeners: PreExecuteListener[]
+  /** Every `repo/commit-trailers` listener the service registered. */
+  commitTrailerListeners: Array<(event: CommitTrailersEvent) => void | Promise<void>>
+  /** Every `repo/resolve-agent` listener the service registered, with its options. */
+  resolveAgentListeners: Array<{ listener: ResolveAgentListener; options: { prepend?: boolean } | undefined }>
   permissions: PermissionPresets & { set: ReturnType<typeof vi.fn>; preset: string }
   sessionQuery: { readTitleSnapshots: ReturnType<typeof vi.fn> }
 } {
+  const inboxClaimedListeners: Array<(payload: InboxClaimedPayload) => void> = []
+  const driver = new FakeTurnDriver((session, message, turn) => {
+    const agent = agents.registry.get(session.id)
+    for (const listener of inboxClaimedListeners) listener({ agent: agent ?? makeAgent(session), message, turn })
+  })
+  // Mutated in place: tests adjust failure options after setup.
+  agentsOptions.driver = driver
   const agents = makeAgentRegistry(agentsOptions)
   const workspaces = makeWorkspaceRegistry()
   const domain = makeDomain()
@@ -627,6 +733,9 @@ export function makeHostContext(
   const assistantStreamListeners: Array<(payload: AssistantStreamPayload) => void> = []
   const approvalListeners: Array<{ listener: ApprovalAnswererListener; options: { prepend?: boolean } | undefined }> = []
   const questionListeners: Array<{ listener: UserQuestionAnswererListener; options: { prepend?: boolean } | undefined }> = []
+  const preExecuteListeners: PreExecuteListener[] = []
+  const commitTrailerListeners: Array<(event: CommitTrailersEvent) => void | Promise<void>> = []
+  const resolveAgentListeners: Array<{ listener: ResolveAgentListener; options: { prepend?: boolean } | undefined }> = []
   const tokenMeter = { measure: () => ({ totalTokens: 1234 }) }
   const permissions = {
     preset: 'standard',
@@ -680,8 +789,12 @@ export function makeHostContext(
       value: { title: { title: '测试标题', updatedAt: 1 } },
     }))),
   }
+  // The native attachment library is a required plugin dependency; a test may
+  // pass its own fake through `extraServices.attachments` to inspect it.
+  const attachments = (extraServices.attachments as AttachmentStore | undefined) ?? makeAttachmentStore()
   const services: Record<string, unknown> = {
     agents: agents.registry,
+    attachments,
     sessionQuery,
     commands,
     workspaceRegistry: workspaces.registry,
@@ -705,13 +818,19 @@ export function makeHostContext(
     credentials,
     tokenMeter,
     llm,
+    attachments,
     registry: { size: 0, values: () => new Map().values() },
     logger: { warn: vi.fn(), error: vi.fn(), info: vi.fn(), debug: vi.fn() },
     get: (name: string) => services[name],
     on: vi.fn((name: unknown, listener?: unknown, options?: unknown) => {
       if (name === 'session/event') {
-        const wrapped = listener as (session: Session, event: SessionEvent) => void
-        sessionListeners.push(wrapped)
+        const inner = listener as (session: Session, event: SessionEvent) => void
+        sessionListeners.push((session, event) => {
+          inner(session, event)
+          driver.observe(session, event)
+        })
+      } else if (name === 'agent/inbox/claimed') {
+        inboxClaimedListeners.push(listener as (payload: InboxClaimedPayload) => void)
       } else if (name === 'agent/assistant-stream') {
         assistantStreamListeners.push(listener as (payload: AssistantStreamPayload) => void)
       } else if (name === 'approval/request') {
@@ -719,6 +838,12 @@ export function makeHostContext(
           listener: listener as ApprovalAnswererListener,
           options: options as { prepend?: boolean } | undefined,
         })
+      } else if (name === 'tools/pre-execute') {
+        preExecuteListeners.push(listener as PreExecuteListener)
+      } else if (name === 'repo/commit-trailers') {
+        commitTrailerListeners.push(listener as (event: CommitTrailersEvent) => void | Promise<void>)
+      } else if (name === 'repo/resolve-agent') {
+        resolveAgentListeners.push({ listener: listener as ResolveAgentListener, options: options as { prepend?: boolean } | undefined })
       } else if (name === 'user-questions/request') {
         questionListeners.push({
           listener: listener as UserQuestionAnswererListener,
@@ -730,8 +855,8 @@ export function makeHostContext(
     effect: vi.fn(),
   }
   return {
-    ctx, agents, workspaces, domain, credentials, sessionListeners,
-    assistantStreamListeners, approvalListeners, questionListeners, permissions, sessionQuery,
+    ctx, agents, workspaces, domain, credentials, sessionListeners, driver,
+    assistantStreamListeners, approvalListeners, questionListeners, preExecuteListeners, commitTrailerListeners, resolveAgentListeners, permissions, sessionQuery,
     workingDirectory, worktrees,
   }
 }
@@ -766,8 +891,6 @@ export interface FakeChannelOptions {
   chatProfile?: (chatId: string) => Promise<FeishuProfile>
   /** Chat-member name stub; omitted = the channel has no member-list lookup. */
   memberName?: (userId: string, chatId: string) => Promise<string | undefined>
-  /** App-owner lookup stub; omitted = the channel has no owner lookup. */
-  appOwnerUserId?: () => Promise<string | undefined>
   /** Scope-grant stub; omitted = the channel has no scope self-check. */
   grantedScopes?: () => Promise<readonly ScopeGrant[]>
   /** Slash-command panel stub; omitted = the channel has no panel sync. */
@@ -913,7 +1036,6 @@ export function makeChannel(options: FakeChannelOptions = {}): FeishuChannel & {
       removedReactions.push({ messageId, reactionId })
     }),
     threadIdOfMessage: options.threadIdOfMessage ?? (async () => `omt_${serial}`),
-    ...(options.appOwnerUserId === undefined ? {} : { appOwnerUserId: options.appOwnerUserId }),
     ...(options.grantedScopes === undefined ? {} : { grantedScopes: options.grantedScopes }),
     ...(options.slashCommands === undefined ? {} : { slashCommands: options.slashCommands }),
     ...(options.messageGet === undefined
@@ -968,4 +1090,61 @@ export function makeMessage(partial: Partial<Omit<NormalizedMessage, 'content'>>
 
 export function makeTempBaseDir(): string {
   return mkdtempSync(path.join(tmpdir(), 'dsh-channels-test-'))
+}
+
+/**
+ * In-memory {@link InstanceLockProvider}: one shared table of owners per
+ * provider, so several services built with the same provider contend like
+ * processes on one machine.
+ */
+export function makeInstanceLocks(): InstanceLockProvider & {
+  owners: Map<string, { self: LockHolderInfo; options: AcquireOptions }>
+} {
+  const owners = new Map<string, { self: LockHolderInfo; options: AcquireOptions }>()
+  return {
+    owners,
+    address: appId => `memory:${appId}`,
+    async acquire(options) {
+      for (;;) {
+        const owner = owners.get(options.address)
+        if (owner === undefined) {
+          const entry = { self: options.self, options }
+          owners.set(options.address, entry)
+          return {
+            ok: true,
+            lock: {
+              async release() {
+                if (owners.get(options.address) === entry) owners.delete(options.address)
+              },
+            },
+          }
+        }
+        if (options.waitUntil === undefined || Date.now() >= options.waitUntil) {
+          return { ok: false, holder: owner.self }
+        }
+        await new Promise(resolve => setTimeout(resolve, 10))
+      }
+    },
+    async requestYield(address, self) {
+      const owner = owners.get(address)
+      if (owner === undefined) return 'absent'
+      if (!owner.options.canYield()) return 'busy'
+      owner.options.onYield(self)
+      return 'yielding'
+    },
+  }
+}
+
+/** {@link FeishuService} with an uncontended in-memory instance lock (tests never touch real IPC endpoints). */
+export class TestFeishuService extends FeishuService {
+  constructor(
+    ctx: ConstructorParameters<typeof FeishuService>[0],
+    config: ConstructorParameters<typeof FeishuService>[1],
+    channelFactory: ConstructorParameters<typeof FeishuService>[2],
+    sessionExportBuilder?: ConstructorParameters<typeof FeishuService>[3],
+    overlay?: ConstructorParameters<typeof FeishuService>[4],
+    instanceLock: InstanceLockProvider = makeInstanceLocks(),
+  ) {
+    super(ctx, config, channelFactory, sessionExportBuilder, overlay, instanceLock)
+  }
 }

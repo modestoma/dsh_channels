@@ -28,22 +28,20 @@ export const CLEAR_CREDENTIAL_ROUTE = '/api/dsh-channels.clearCredential'
  * one "connect / reconnect" button. Credentials are resolved again either way.
  */
 export const RECONNECT_ROUTE = '/api/dsh-channels.reconnect'
+/** `POST`: ask the dsh process owning this bot's connection to yield, then connect. Answers {@link ReconnectResponse}. */
+export const TAKEOVER_ROUTE = '/api/dsh-channels.takeover'
 /** 模型/推理档位/预设选择器的宿主目录（provider → model → effort 级联刷新）。 */
 export const CATALOG_ROUTE = '/api/dsh-channels.catalog'
-/** 访问与授权只读快照（GET）：准入模式、管理员、群/用户/知识库白名单、待处理申请。 */
+/** 访问与授权只读快照（GET）：准入模式、管理员、用户表、待处理申请。 */
 export const ACCESS_ROUTE = '/api/dsh-channels.access'
-/** 授权一个群（POST，body `{ chatId, name? }`）。 */
-export const ADD_ACCESS_GROUP_ROUTE = '/api/dsh-channels.addAccessGroup'
-/** 撤销一个群（POST，body `{ chatId }`）。 */
-export const REMOVE_ACCESS_GROUP_ROUTE = '/api/dsh-channels.removeAccessGroup'
-/** 用户白名单添加（POST，body `{ userId, name? }`）。 */
+/** 用户表添加（POST，body `{ userId, name? }`）：新用户只打开对话准入；已在表中的用户重新打开对话准入。 */
 export const ADD_ACCESS_USER_ROUTE = '/api/dsh-channels.addAccessUser'
-/** 用户白名单移除（POST，body `{ userId }`）。 */
+/** 用户表移除（POST，body `{ userId }`）。 */
 export const REMOVE_ACCESS_USER_ROUTE = '/api/dsh-channels.removeAccessUser'
-/** 知识库白名单添加（POST，body `{ userId, name? }`）。 */
-export const ADD_WIKI_USER_ROUTE = '/api/dsh-channels.addWikiUser'
-/** 知识库白名单移除（POST，body `{ userId }`）。 */
-export const REMOVE_WIKI_USER_ROUTE = '/api/dsh-channels.removeWikiUser'
+/** 设置管理员标记或一个权限开关（POST，body `{ userId, permission, enabled }`，permission 可为 admin）。 */
+export const SET_ACCESS_PERMISSION_ROUTE = '/api/dsh-channels.setAccessPermission'
+/** 设置或清除一个用户的 Git 邮箱（POST，body `{ userId, gitEmail }`；空字符串或 null 清除）。 */
+export const SET_ACCESS_GIT_EMAIL_ROUTE = '/api/dsh-channels.setAccessGitEmail'
 /** 结算一条待处理授权申请（POST，body `{ token, decision }`）。 */
 export const RESOLVE_ACCESS_REQUEST_ROUTE = '/api/dsh-channels.resolveAccessRequest'
 /**
@@ -69,13 +67,13 @@ export interface SessionOriginWire {
   chatName?: string
   /** 群头像 URL（群聊且能读取群信息时）。 */
   chatAvatarUrl?: string
-  /** 发起人 user_id（日志平台分析话题为请求人）。 */
+  /** 发起人 user_id（群共享话题为调用方指定的发起人）。 */
   senderUserId: string
   /** 发起人姓名（通讯录或群成员列表能查到时）。 */
   senderName?: string
   /** 发起人头像 URL（通讯录能查到时）。 */
   senderAvatarUrl?: string
-  /** 日志平台分析话题：群内成员都可以继续。 */
+  /** 群共享话题（经 `feishuTopics` 发起）：群内成员都可以继续。 */
   shared: boolean
   /** Epoch ms when the Session was bound to its Feishu route. */
   createdAt: number
@@ -120,6 +118,94 @@ export interface SessionOriginResponse {
   origin: SessionOriginWire | null
 }
 
+/** 飞书会话记录（GET，无参数）：「会话记录」标签页按群聊/私聊、用户分组展示。 */
+export const SESSION_RECORDS_ROUTE = '/api/dsh-channels.sessionRecords'
+/** 工作区目录列表（GET，`?workspace=<根目录>&path=<相对路径>`）。 */
+export const WORKSPACE_FILES_ROUTE = '/api/dsh-channels.workspaceFiles'
+/** 工作区文件预览（GET，`?workspace=&path=`）。 */
+export const WORKSPACE_FILE_PREVIEW_ROUTE = '/api/dsh-channels.workspaceFilePreview'
+/** 工作区文件下载（GET，`?workspace=&path=`），成功时响应体是文件原始字节。 */
+export const WORKSPACE_FILE_DOWNLOAD_ROUTE = '/api/dsh-channels.workspaceFileDownload'
+
+/** One Feishu-routed Session in the records view. */
+export interface SessionRecordWire {
+  sessionId: string
+  /** Latest log-backed title; absent when the Session has none or the host cannot read it. */
+  title?: string
+  /** `thread` = 话题内会话，`chat` = 整个聊天一个会话。 */
+  kind: 'thread' | 'chat'
+  /** 群共享话题（经 `feishuTopics` 发起）。 */
+  shared: boolean
+  /** Epoch ms when the Session was bound to its Feishu route. */
+  createdAt: number
+  /** Whether the Feishu route still points at this Session. */
+  bound: boolean
+  /** Epoch ms of the route's last activity, while bound. */
+  lastActivityAt?: number
+  /** Whether the Session currently has a live Agent. */
+  live: boolean
+  /** Workspace root (Session header cwd); absent when unknown. */
+  workspace?: string
+}
+
+/** One user's Sessions inside a group, or in their private chat. */
+export interface SessionRecordUserWire {
+  userId: string
+  /** 用户姓名（通讯录或群成员列表能查到时）。 */
+  name?: string
+  avatarUrl?: string
+  /** Distinct workspace roots of the Sessions, most recently active first. */
+  workspaces: string[]
+  /** Sessions, most recently active first. */
+  sessions: SessionRecordWire[]
+}
+
+/** One group chat with its users. */
+export interface SessionRecordGroupWire {
+  chatId: string
+  /** 群名（能读取群信息时）。 */
+  chatName?: string
+  chatAvatarUrl?: string
+  /** Users, most recently active first. */
+  users: SessionRecordUserWire[]
+}
+
+/** `GET SESSION_RECORDS_ROUTE` response. */
+export interface SessionRecordsWire {
+  /** Group chats, most recently active first. */
+  groups: SessionRecordGroupWire[]
+  /** Private-chat users, most recently active first. */
+  directs: SessionRecordUserWire[]
+  /** Name lookup failures (typically a missing scope); ids are shown instead. */
+  warning?: string
+}
+
+/** One workspace directory entry; `symlink` entries are not followed. */
+export interface WorkspaceEntryWire {
+  name: string
+  kind: 'dir' | 'file' | 'symlink' | 'other'
+  /** Bytes, for regular files. */
+  size?: number
+  /** Last modification, epoch ms. */
+  mtimeMs?: number
+}
+
+/** `GET WORKSPACE_FILES_ROUTE` response; directories sort first. */
+export interface WorkspaceListingWire {
+  /** Normalized relative path of the listed directory (`''` = workspace root). */
+  path: string
+  entries: WorkspaceEntryWire[]
+  /** Whether the directory held more entries than one listing returns. */
+  truncated: boolean
+}
+
+/** `GET WORKSPACE_FILE_PREVIEW_ROUTE` response. */
+export type WorkspacePreviewWire =
+  | { kind: 'text'; path: string; size: number; mtimeMs: number; content: string; truncated: boolean }
+  | { kind: 'image'; path: string; size: number; mtimeMs: number; mime: string; dataBase64: string }
+  /** Binary content or an oversized image: download only. */
+  | { kind: 'binary'; path: string; size: number; mtimeMs: number }
+
 /**
  * 可由 Web 面板覆盖的配置项。顶层键对应 `src/config.ts` 的字段；`feishuTools.*`
  * 是嵌套字段（覆盖层里仍写成 `{ "feishuTools": { ... } }` 对象）。覆盖值写进
@@ -152,6 +238,8 @@ export const EDITABLE_KEYS = [
   'statusRefreshMs',
   // 会话：飞书侧功能
   'welcomeOnboarding',
+  'hostTurnCards',
+  'replyGuidance',
   'slashCommandPanel',
   'allowPermissionSwitch',
   // 模型
@@ -162,11 +250,9 @@ export const EDITABLE_KEYS = [
   'agentPreset',
   // 附件（v2 管线）
   'acceptAttachments',
-  'attachmentStore',
   'prefetchImages',
   'historyBootstrapLimit',
   // 模型工具（`feishuTools.*` 是嵌套配置，覆盖层仍写成嵌套对象）
-  'feishuTools.attachmentFetch',
   'feishuTools.topicMessages',
   'feishuTools.sendFile',
   // 限额与超时
@@ -178,17 +264,13 @@ export const EDITABLE_KEYS = [
   'feishuTools.attachmentFetchTimeoutMs',
   'feishuTools.topicMessagesTimeoutMs',
   'promptContextTimeoutMs',
-  // 准入与授权（白名单由「访问授权」tab 的列表管理）
+  // 准入与授权（用户表由「访问授权」tab 的列表管理）
   'accessMode',
-  'dmAllowWhitelist',
-  'adminUserId',
   'authRequestTtlDays',
   // 知识库（顶层 `wikiRoots` 字符串列表；为空时不挂载任何知识库工具）
   'feishuTools.wikiRead',
   'feishuTools.wikiWrite',
   'wikiRoots',
-  // 日志平台分析接口（访问令牌是凭据引用 analyzeToken，值写在 DSH 凭据里）
-  'analyzeEnabled',
   // 日志
   'loggerLevel',
 ] as const
@@ -242,7 +324,6 @@ export type FieldGroup =
   | 'limits'
   | 'access'
   | 'wiki'
-  | 'analyze'
   | 'logging'
 
 /** One selectable value rendered by the generic form. */
@@ -355,11 +436,8 @@ export interface CredentialRefWire {
   source?: string
 }
 
-/**
- * The credential slots the panel may write: the Feishu application pair
- * (resolved on connect) and the analyze API token (resolved per request).
- */
-export type CredentialField = 'appId' | 'appSecret' | 'analyzeToken'
+/** The credential slots the panel may write: the Feishu application pair (resolved on connect). */
+export type CredentialField = 'appId' | 'appSecret'
 
 /** Official-SDK WebSocket lifecycle snapshot (structural copy, no SDK import on the wire). */
 export interface ConnectionWire {
@@ -386,6 +464,17 @@ export type ChannelPhaseWire =
   | 'connected'
   /** The last connection attempt failed; the reason is in `lastStartError`. */
   | 'error'
+  /** Another dsh process on this machine owns this bot's connection; `occupiedBy` names it. */
+  | 'occupied'
+
+/** The dsh process owning this bot's Feishu connection on this machine. */
+export interface LockHolderWire {
+  pid: number
+  /** That process's `$DSH_HOME`. */
+  home: string
+  /** Its dsh-channels version. */
+  version: string
+}
 
 /** Runtime connection/liveness facts. */
 export interface ChannelStatusWire {
@@ -409,6 +498,10 @@ export interface ChannelStatusWire {
   inflightTurnCount: number
   /** 最近一次连接失败的原因（成功后清空）。 */
   lastStartError?: string
+  /**
+   * 本机另一个 dsh 实例占用了同一个机器人的连接时给出；`holder` 缺省表示对方未响应身份查询。
+   */
+  occupiedBy?: { holder?: LockHolderWire }
   /** 健康判定的原因说明（空数组 = 健康）；由 Host 的 health 折叠给出。 */
   reasons: string[]
   /** 面板显示的所有键值对来源版本。 */
@@ -466,22 +559,13 @@ export interface PanelConfigWire {
   credentials: {
     appId: CredentialRefWire
     appSecret: CredentialRefWire
-    analyzeToken: CredentialRefWire
   }
 }
 
-/** One authorized group (the first of the two admission gates). */
-export interface AccessGroupWire {
-  chatId: string
-  /** Human-readable group name captured at authorization time. */
-  name?: string
-  /** Which authorization entry produced the grant. */
-  source: 'command' | 'card' | 'panel'
-  /** Epoch ms when it was authorized. */
-  addedAt: number
-}
+/** Administrator flag and permission switches of one access-table user (same names as the stored record). */
+export type AccessPermissionWire = 'admin' | 'chat' | 'wikiRead' | 'wikiWrite' | 'codeWrite'
 
-/** One authorized user `user_id` (global across every authorized group). */
+/** One access-table user `user_id` with its permission switches. */
 export interface AccessUserWire {
   userId: string
   /** Display name captured at authorization time. */
@@ -490,23 +574,29 @@ export interface AccessUserWire {
   source: 'command' | 'card' | 'panel'
   /** Epoch ms when it was authorized. */
   addedAt: number
+  /** Administrator: always admitted, holds every permission, settles requests. */
+  admin: boolean
+  /** May talk to the bot; off suspends a non-administrator and every other switch. */
+  chat: boolean
+  wikiRead: boolean
+  wikiWrite: boolean
+  codeWrite: boolean
+  /** Git email set by an administrator; commits for turns this user drives name them as author. */
+  gitEmail?: string
 }
 
 /** One pending authorization request the panel may settle (same path as the DM card). */
 export interface AccessRequestWire {
   /** Opaque token; never derived from the target id. */
   token: string
-  kind: 'group' | 'user'
-  /** `chat_id` for a group request, `user_id` for a user request. */
+  /** `user_id` the request asks to add. */
   targetId: string
-  /** Display name of the requested target (group name / user name), when known. */
+  /** Display name of that user, when known. */
   name?: string
-  /** Chat the request originated from, when applicable. */
+  /** Group the request came from, when applicable. */
   chatId?: string
-  /** Group name captured for the card. */
+  /** Name of that group, when known. */
   groupName?: string
-  /** Open_id of the user who triggered a user request. */
-  requester?: string
   /** Epoch ms when the request was created. */
   createdAt: number
   /** Epoch ms after which the request can no longer be decided. */
@@ -514,32 +604,19 @@ export interface AccessRequestWire {
 }
 
 /**
- * `GET /api/dsh-channels.access` payload: admission mode, the administrator
- * reference, the group, user, and wiki whitelists, and the still-pending
+ * `GET /api/dsh-channels.access` payload: admission mode, the user table
+ * (administrators are users with `admin` on), and the still-pending
  * authorization requests.
  */
 export interface AccessWire {
   mode: 'open' | 'guarded'
-  admin: {
-    /** The effective administrator: configured `adminUserId`, else the app owner. */
-    userId?: string
-    /** Where `userId` came from: explicit config or the app-owner fallback. */
-    source?: 'config' | 'owner'
-    /** false while guarded mode would refuse every conversation (fail closed). */
-    configured: boolean
-    /** Why the app-owner fallback is unavailable, when its lookup failed. */
-    ownerLookupError?: string
-  }
   /**
-   * Whether the persisted whitelists were loaded. While the channel holds no
+   * Whether the persisted user table was loaded. While the channel holds no
    * connection the plugin storage domain is closed, so the lists are unknown
    * (not empty) and the panel must not offer mutations.
    */
   loaded: boolean
-  groups: AccessGroupWire[]
   users: AccessUserWire[]
-  /** Wiki whitelist (`/auth wiki add`): topic owners allowed to use the wiki tools. */
-  wikiUsers: AccessUserWire[]
   requests: AccessRequestWire[]
 }
 
@@ -602,7 +679,6 @@ export type ClearConfigResponse =
 export interface SaveCredentialsRequest {
   appId?: string
   appSecret?: string
-  analyzeToken?: string
 }
 
 /** `POST /api/dsh-channels.clearCredential` body. */
@@ -615,8 +691,7 @@ export interface ClearCredentialRequest {
  *
  * - `auto`: the channel was stopped and connected immediately after the save.
  * - `pending`: the channel is running; reconnect for the value to take effect.
- * - `not-needed`: removed while stopped, or only the analyze API token
- *   changed (it applies to the next request), nothing to reconnect.
+ * - `not-needed`: removed while stopped, nothing to reconnect.
  * - `unconfigured`: saved, but the other credential of the pair is still
  *   missing — the plugin keeps waiting (no connection attempt) until it is
  *   configured.
@@ -649,6 +724,7 @@ export type ClearCredentialResponse =
 export const PANEL_TABS = [
   { id: 'connection', label: '连接' },
   { id: 'sessions', label: '会话' },
+  { id: 'records', label: '会话记录' },
   { id: 'model', label: '模型' },
   { id: 'attachments', label: '附件与工具' },
   { id: 'access', label: '访问授权' },
@@ -662,11 +738,12 @@ export type PanelTabId = (typeof PANEL_TABS)[number]['id']
 export const TAB_FIELD_GROUPS: Readonly<Record<PanelTabId, readonly FieldGroup[]>> = {
   connection: [],
   sessions: ['trigger', 'workspace', 'cards', 'features'],
+  records: [],
   model: ['model'],
   attachments: ['attachments', 'tools', 'limits'],
   access: ['access'],
   wiki: ['wiki'],
-  advanced: ['analyze', 'logging'],
+  advanced: ['logging'],
 }
 
 /** Section heading for one field group inside its tab. */
@@ -681,7 +758,6 @@ export const FIELD_GROUP_LABELS: Readonly<Record<FieldGroup, string>> = {
   limits: '限额与超时',
   access: '准入',
   wiki: '知识库工具',
-  analyze: '日志分析接口',
   logging: '日志',
 }
 
@@ -700,11 +776,19 @@ export const PANEL_COPY = {
   phaseConnecting: '连接中',
   phaseConnected: '已连接',
   phaseError: '连接失败',
+  phaseOccupied: '已被占用',
   statusSummaryConnected: '机器人在线，可以收发消息',
   statusSummaryUnconfigured: '还没有填写飞书应用凭据，插件不会连接飞书',
   statusSummaryIdle: '凭据已就绪，还没有建立连接',
   statusSummaryConnecting: '正在连接飞书…',
   statusSummaryError: '连接飞书失败，请检查凭据与网络后重试',
+  statusSummaryOccupied: '本机另一个 dsh 实例正在使用这个机器人，同一个机器人只能由一个实例连接',
+  occupiedHolder: '占用方',
+  occupiedHolderUnknown: '对方未响应身份查询',
+  takeover: '接管连接',
+  takingOver: '接管中…',
+  takeoverWarning: '接管会断开另一个实例的飞书连接，并中断它正在进行的回复。确定接管？',
+  takeoverDone: '已接管飞书连接',
   uptimePrefix: '运行',
   lastError: '最近一次连接失败',
   checksTitle: '自检',
@@ -808,11 +892,6 @@ export const PANEL_COPY = {
   loading: '加载中…',
   loadFailed: '设置面板加载失败',
   // ---- advanced -----------------------------------------------------------
-  analyzeTokenLabel: '访问令牌',
-  analyzeTokenSummary: '请求头 Authorization: Bearer 的值，保存后立即生效；未配置时接口拒绝所有请求',
-  analyzeTokenPlaceholder: '填写新令牌（建议 32 位以上随机串）',
-  analyzeTokenSaved: '令牌已保存，下一次请求生效',
-  analyzeTokenRemoved: '令牌已移除，接口将拒绝所有请求',
   overlayTitle: 'Web 覆盖',
   overlayPath: '覆盖文件',
   overlayCount: '{n} 项配置由面板覆盖',
@@ -824,22 +903,15 @@ export const PANEL_COPY = {
   cleared: '已恢复为 profile 配置',
   // ---- access -------------------------------------------------------------
   debugModeWarning: '调试模式已打开：应用可用范围内的任何人都能和机器人对话。用完请在「访问授权」关闭。',
-  accessAdminMissingWarning: '没有可用的管理员，所有对话都会被拒绝。请在下方填写管理员 user_id（私聊机器人发送 /userid 获取）。',
-  accessAdminCurrent: '当前管理员',
-  accessAdminSourceConfig: '已配置',
-  accessAdminSourceOwner: '应用所有者',
+  accessAdminMissingWarning: '用户表里还没有管理员，所有对话都会被拒绝。请在下方添加你自己（私聊机器人发送 /userid 获取 user_id），再打开「管理员」。',
   profilesWarning: '部分飞书名字和头像未能读取：{reason}',
   accessNotLoaded: '飞书连接建立后加载授权列表',
   accessRequestsTitle: '待处理申请',
-  accessGroupsTitle: '已授权群',
-  accessUsersTitle: '已授权用户',
-  accessGroupsEmpty: '还没有授权任何群',
-  accessUsersEmpty: '还没有授权任何用户',
-  accessGroupChatIdPlaceholder: 'chat_id（oc_…，群里发 /groupid 获取）',
-  accessGroupNamePlaceholder: '群名（可选）',
+  accessUsersTitle: '用户表',
+  accessUsersEmpty: '还没有添加任何用户',
+  accessUsersHint: '打开「管理员」的用户拥有全部权限，可以处理授权申请，可以有多位。其他用户关掉「对话」即停用，其余开关随之不生效。管理员只能在本页设置；其他用户也可以在飞书发 /auth add @用户、/auth set code on @用户。',
   accessUserIdPlaceholder: 'user_id（私聊机器人发 /userid 获取）',
   accessUserNamePlaceholder: '昵称（可选）',
-  accessAddGroup: '添加群',
   accessAddUser: '添加用户',
   accessAdd: '添加',
   accessRemove: '移除',
@@ -849,23 +921,29 @@ export const PANEL_COPY = {
   accessSourceCommand: '对话命令',
   accessSourceCard: '授权卡',
   accessSourcePanel: '设置面板',
-  accessRequestGroup: '申请授权群',
   accessRequestUser: '申请使用',
   accessRequestIn: '在「{group}」',
   accessRequestExpires: '{date} 前有效',
-  accessGroupAdded: '已添加群授权',
-  accessGroupRemoved: '已移除群授权',
-  accessUserAdded: '已添加用户授权',
-  accessUserRemoved: '已移除用户授权',
+  accessUserAdded: '已添加用户，已打开对话',
+  accessUserRemoved: '已移除用户',
+  accessPermissionChanged: '已更新权限',
   accessRequestAllowed: '已授权',
   accessRequestDenied: '已忽略',
+  accessPermAdmin: '管理员',
+  accessPermChat: '对话',
+  accessPermWikiRead: '读知识库',
+  accessPermWikiWrite: '写知识库',
+  accessPermCodeWrite: '改代码',
+  accessGitEmail: 'Git 邮箱',
+  accessGitEmailUnset: '未设 Git 邮箱',
+  accessGitEmailPlaceholder: 'GitHub/GitLab 账号已验证的邮箱，留空清除',
+  accessGitEmailSave: '保存',
+  accessGitEmailChanged: '已更新 Git 邮箱',
+  accessGitEmailHint: '设置了 Git 邮箱的用户在飞书里让机器人推送代码时，提交作者显示为本人（提交者仍是令牌账号）；邮箱要是本人 GitHub/GitLab 账号已验证的邮箱，平台才会显示头像和链接。',
   // ---- wiki ---------------------------------------------------------------
   wikiUsersTitle: '可使用的人',
-  wikiUsersAdminPlus: '管理员 + {n}',
-  wikiUsersEmpty: '目前只有管理员发起的话题能用知识库工具',
-  wikiUsersHint: '也可以在飞书发 /auth wiki add @用户',
-  wikiUserAdded: '已加入知识库白名单',
-  wikiUserRemoved: '已移出知识库白名单',
+  wikiUsersSummary: '读取 {read} 人 · 写入 {write} 人，管理员始终可用',
+  wikiUsersHint: '在「访问授权」的用户表里按人打开「读知识库」「写知识库」。',
 } as const
 
 /**

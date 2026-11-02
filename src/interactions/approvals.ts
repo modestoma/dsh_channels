@@ -46,6 +46,11 @@ export interface ApprovalHooks {
    * none), called on every open and settle so the streaming card can show it.
    */
   onWaitingChange?(sessionId: string, toolNames: readonly string[]): void
+  /**
+   * Durable card patch (the outbox), retried until it lands. Absent = each
+   * patch is attempted once.
+   */
+  patchCard?(messageId: string, card: object): Promise<void>
 }
 
 /**
@@ -92,11 +97,12 @@ export function classifyApprovalReply(text: string): 'allow' | 'always' | 'deny'
 }
 
 /**
- * Read what a call will run and the sandbox mode it asks for. `bash` shows
- * its `command`; other tools show their raw arguments. Arguments are
+ * Read what a call will run and the sandbox mode it asks for. A string
+ * `command` argument is the command; the other arguments become `name: value`
+ * lines (strings verbatim, other values as JSON). Arguments are
  * model-produced JSON, so a parse failure shows the raw text.
  */
-function describeCall(call: RecordedCall | undefined): { command?: string; escalateTo?: string } {
+function describeCall(call: RecordedCall | undefined): { command?: string; arguments?: string; escalateTo?: string } {
   if (call === undefined) return {}
   let args: Record<string, unknown> | undefined
   try {
@@ -105,14 +111,19 @@ function describeCall(call: RecordedCall | undefined): { command?: string; escal
   } catch {
     // Unparseable arguments: shown verbatim below.
   }
-  if (args === undefined) return call.arguments === '' ? {} : { command: call.arguments }
+  if (args === undefined) return call.arguments === '' ? {} : { arguments: call.arguments }
   const escalateTo = typeof args.sandbox_permissions === 'string' && args.sandbox_permissions !== ''
     ? args.sandbox_permissions
     : undefined
-  const command = typeof args.command === 'string' && args.command !== ''
-    ? args.command
-    : JSON.stringify(args, null, 2)
-  return { command, ...(escalateTo === undefined ? {} : { escalateTo }) }
+  const command = typeof args.command === 'string' && args.command !== '' ? args.command : undefined
+  const rest = Object.entries(args)
+    .filter(([name]) => !(name === 'command' && command !== undefined) && !(name === 'sandbox_permissions' && escalateTo !== undefined))
+    .map(([name, value]) => `${name}: ${typeof value === 'string' ? value : JSON.stringify(value)}`)
+  return {
+    ...(command === undefined ? {} : { command }),
+    ...(rest.length === 0 ? {} : { arguments: rest.join('\n') }),
+    ...(escalateTo === undefined ? {} : { escalateTo }),
+  }
 }
 
 export class ApprovalAnswerer {
@@ -128,7 +139,7 @@ export class ApprovalAnswerer {
     private readonly hooks: ApprovalHooks,
     private readonly timeoutMs: number,
   ) {
-    this.table = new PendingCardTable(channel, hooks.onError)
+    this.table = new PendingCardTable(channel, hooks.onError, hooks.patchCard?.bind(hooks))
   }
 
   /** In-flight question count (diagnostics/tests). */

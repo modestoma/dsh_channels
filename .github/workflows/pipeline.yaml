@@ -5,8 +5,7 @@ on:
     branches: [main, dev]
   pull_request:
     branches: [main, dev]
-  # Pushes to main release a stable version automatically; dev (beta) releases
-  # only from a manual dispatch.
+  # A push to dev publishes a beta; main publishes only from a manual dispatch.
   workflow_dispatch:
     inputs:
       dry_run:
@@ -50,12 +49,12 @@ jobs:
       - name: Typecheck, test, build, and verify loaders
         run: pnpm check
 
-  # A push to main publishes a stable version once checks pass. Pushes to dev
-  # only run checks, so beta commits accumulate until a manual dispatch.
-  # Dispatching on main or dev publishes (or, with dry_run, previews) a release.
+  # A push to dev publishes a beta prerelease once checks pass; a push to main
+  # only runs checks. A manual dispatch on main publishes a stable version; on
+  # dev it previews or publishes a beta.
   release:
     if: >-
-      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/dev') ||
       (github.event_name == 'workflow_dispatch' &&
       (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'))
     needs: check
@@ -67,7 +66,7 @@ jobs:
     concurrency:
       group: dsh-channels-release
       cancel-in-progress: false
-      # Queued dispatches can differ in dry_run, so none may replace another.
+      # Queued runs can differ in dry_run, so none may replace another.
       queue: max
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

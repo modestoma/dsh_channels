@@ -105,6 +105,63 @@ export interface AssistantStreamPayload {
   readonly frame: AssistantStreamFrame
 }
 
+/**
+ * One inbox message claimed by a turn (`agent/inbox/claimed`, DSH
+ * `packages/core/agent/src/runtime-types.ts`). Emitted when the turn opens
+ * (its next-turn message) and when a step claims steered messages.
+ */
+export interface InboxClaimedPayload {
+  readonly agent: Agent
+  readonly message: UserMessage
+  readonly turn: number
+}
+
+/** Payload of `agent/inbox/discarded`: a message left the inbox without being claimed. */
+export interface InboxDiscardedPayload {
+  readonly agent: Agent
+  readonly message: UserMessage
+}
+
+/**
+ * The pending tool call a `tools/pre-execute` listener sees (subset of DSH
+ * `ToolExecution`, `packages/core/tools/src/contracts.ts`).
+ */
+export interface PreToolExecution {
+  readonly name: string
+  /** The agent the call runs for; absent for calls outside an agent loop. */
+  readonly agent?: Agent
+}
+
+/**
+ * Decision of a `tools/pre-execute` listener (subset of DSH
+ * `PreToolDecision`): `deny` turns the call into an error result whose text
+ * is `reason`.
+ */
+export type PreToolDecision =
+  | { readonly kind: 'allow' }
+  | { readonly kind: 'deny'; readonly reason: string }
+  | { readonly kind: 'cancel' }
+  | { readonly kind: 'ask'; readonly reason?: string }
+
+/**
+ * Payload of dsh-repo's `repo/commit-trailers` event, declared locally so
+ * this plugin needs no dsh-repo package. `add` takes a trailer token and a
+ * one-line value of at most 200 characters without control characters;
+ * `setAuthor` makes someone other than the committer the commit's author
+ * (name without `<` `>` or newlines, email without `<` `>` or whitespace) and
+ * may be called once per push across all listeners. Both must be called
+ * before the listener settles. Versions of dsh-repo before `setAuthor`
+ * existed omit it.
+ */
+export interface CommitTrailersEvent {
+  /** Session id of the Agent pushing the workspace. */
+  readonly session: string
+  /** Workspace directory being pushed. */
+  readonly dir: string
+  add(token: string, value: string): void
+  setAuthor?(name: string, email: string): void
+}
+
 // ---- Session surface ----------------------------------------------------
 
 export interface SessionHeader {
@@ -317,17 +374,68 @@ export interface AgentPresetSelectedEvent extends SessionEventEnvelope {
   data: { agentPreset: string }
 }
 
+/**
+ * Durable record of one model-request retry scheduled by `dsh-llm-retry`
+ * (DSH `packages/llm/llm-retry/src/types.ts`), appended before the backoff
+ * wait. The retry re-runs the failed step inside the SAME open turn: only
+ * `turn/end` ends the turn.
+ */
+export interface LlmRetryEvent extends SessionEventEnvelope {
+  type: 'llm/retry'
+  data: {
+    turn: number
+    step: number
+    provider: string
+    mode: 'normal' | 'always'
+    /** 1-based retry number. */
+    retry: number
+    /** Retry budget in `normal` mode; absent in `always` mode (unbounded). */
+    maxRetries?: number
+    delayMs: number
+    failure: { message: string; code: string; [key: string]: unknown }
+    [key: string]: unknown
+  }
+}
+
+/** Appended when a retry's backoff wait ends, right before the retried request starts. */
+export interface LlmRetryStartedEvent extends SessionEventEnvelope {
+  type: 'llm/retry-started'
+  data: { turn: number; step: number; retry: number; [key: string]: unknown }
+}
+
+/**
+ * Start of one context compaction (`dsh-compaction`); `turn` is null for a
+ * standalone manual compaction between turns.
+ */
+export interface CompactionStartEvent extends SessionEventEnvelope {
+  type: 'compaction/start'
+  data: { compactionId: string; turn: number | null; [key: string]: unknown }
+}
+
+/** End of the compaction with the same id; `error` records a failed attempt. */
+export interface CompactionEndEvent extends SessionEventEnvelope {
+  type: 'compaction/end'
+  data: { compactionId: string; turn: number | null; error?: string; [key: string]: unknown }
+}
+
+/** A prompt the Agent admitted into a request (its `UserMessage`, id included). */
+export interface UserMessageEvent extends SessionEventEnvelope {
+  type: 'user/message'
+  data: UserMessage
+}
+
 export interface OtherSessionEvent extends SessionEventEnvelope {
   /** Unknown/extension event types are ignored by the folds. */
   type: Exclude<string, 'assistant/message' | 'step/start' | 'turn/end' | 'request/header'
-    | 'tool/call' | 'tool/result' | 'subagent/descriptor'
-    | 'command/run' | 'command/done'
+    | 'tool/call' | 'tool/result' | 'subagent/descriptor' | 'llm/retry' | 'llm/retry-started'
+    | 'command/run' | 'command/done' | 'user/message' | 'compaction/start' | 'compaction/end'
     | 'tool-workflow/run-start' | 'tool-workflow/agent-start' | 'tool-workflow/agent-end' | 'tool-workflow/run-end'>
   data: unknown
 }
 
 export type SessionEvent =
   | AssistantMessageEvent
+  | UserMessageEvent
   | StepStartEvent
   | StepEndEvent
   | TurnEndEvent
@@ -342,4 +450,8 @@ export type SessionEvent =
   | ToolWorkflowAgentStartEvent
   | ToolWorkflowAgentEndEvent
   | ToolWorkflowRunEndEvent
+  | LlmRetryEvent
+  | LlmRetryStartedEvent
+  | CompactionStartEvent
+  | CompactionEndEvent
 

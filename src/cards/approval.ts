@@ -4,7 +4,8 @@
  * @module dsh-channels/cards/approval
  */
 
-import { columnSet, divider, markdown, note, standaloneCard, textButton } from './primitives.ts'
+import { columnSet, divider, foldPanelOf, markdown, note, plainText, standaloneCard, textButton } from './primitives.ts'
+import { PANEL_CHEVRON_TOKEN } from './streaming.ts'
 
 // ---- HITL approval decision cards ----------------------------------------
 
@@ -30,10 +31,20 @@ export interface ApprovalQuestion {
   token: string
   /** Model-facing tool name asking for approval (e.g. `bash`). */
   toolName: string
-  /** The asker's human-readable justification; clipped to a safe length. */
+  /**
+   * What the asker says the call will do; clipped to a safe length. Rendered
+   * line by line as the card's main content: `标签：value` (or `Label: value`)
+   * lines become label/value rows, indented lines a list under them.
+   */
   reason?: string
-  /** What the call will run: the bash command or the raw arguments JSON. */
+  /** The shell command the call will run (tools with a string `command` argument). */
   command?: string
+  /**
+   * The call's other arguments as `name: value` lines (or the raw text when
+   * they are not a JSON object). Folded away when `reason` or `command`
+   * already says what will happen.
+   */
+  arguments?: string
   /** The sandbox mode the call asks to be raised to, when it asks. */
   escalateTo?: string
   /** Timeout window shown on the card (milliseconds). */
@@ -51,8 +62,15 @@ export interface ApprovalCardOptions {
 /** Cap on the rendered command so the card stays readable on a phone. */
 const APPROVAL_COMMAND_MAX_CHARS = 600
 
-/** Cap on the rendered reason so the card can never approach the size budget. */
-const APPROVAL_REASON_MAX_CHARS = 1_000
+/** Caps on the rendered reason so the card can never approach the size budget. */
+const APPROVAL_REASON_MAX_CHARS = 4_000
+const APPROVAL_REASON_MAX_LINES = 30
+
+/** Cap on the rendered arguments text. */
+const APPROVAL_ARGUMENTS_MAX_CHARS = 4_000
+
+/** A `label：value` reason line: a short label without spaces, then a full-width colon or `: `. */
+const LABEL_LINE = /^([^\s:：]{1,16})(?:：|: )(.*)$/u
 
 /** The sandbox mode whose standing grant removes all confinement. */
 const UNCONFINED_MODE = 'danger-full-access'
@@ -115,21 +133,76 @@ function approvalActions(question: ApprovalQuestion): object[] {
   ]
 }
 
+/** One label/value row of the reason: grey label, wrapping value. */
+function labelRow(label: string, value: string): object {
+  return {
+    tag: 'column_set',
+    flex_mode: 'none',
+    horizontal_spacing: '8px',
+    margin: '0px',
+    columns: [
+      { tag: 'column', width: 'auto', elements: [plainText(label, { color: 'grey' })] },
+      { tag: 'column', width: 'weighted', weight: 1, elements: [plainText(value)] },
+    ],
+  }
+}
+
+/**
+ * The reason, line by line: plain lines as text, `label：value` lines as
+ * label/value rows, and runs of indented lines as one list block. Nothing is
+ * read as markdown, so paths and identifiers show exactly as given.
+ */
+function reasonElements(reason: string): object[] {
+  const clipped = clip(reason, APPROVAL_REASON_MAX_CHARS)
+  const lines = clipped.shown.split('\n')
+  const shown = lines.slice(0, APPROVAL_REASON_MAX_LINES)
+  const elements: object[] = []
+  let indented: string[] = []
+  const flush = (): void => {
+    if (indented.length > 0) elements.push(plainText(indented.join('\n')))
+    indented = []
+  }
+  for (const line of shown) {
+    if (line.trim() === '') continue
+    if (/^\s/u.test(line)) {
+      indented.push(`· ${line.trim()}`)
+      continue
+    }
+    flush()
+    const label = LABEL_LINE.exec(line)
+    elements.push(label === null ? plainText(line) : labelRow(label[1]!, label[2]!))
+  }
+  flush()
+  const hiddenLines = lines.length - shown.length
+  if (hiddenLines > 0 || clipped.hidden > 0) {
+    elements.push(note(hiddenLines > 0 ? `另有 ${hiddenLines} 行未显示` : `已截断 ${clipped.hidden} 个字符`))
+  }
+  return elements
+}
+
 /** The question summary shared by the pending and settled variants. */
 function approvalQuestionElements(question: ApprovalQuestion): object[] {
-  const elements: object[] = [
-    markdown(question.escalateTo === undefined
-      ? `工具 \`${question.toolName}\` 请求执行一个需要授权的操作。`
-      : `工具 \`${question.toolName}\` 请求把本次调用提升到 \`${question.escalateTo}\` 权限。`),
-  ]
-  if (question.command !== undefined && question.command !== '') {
-    const command = clip(question.command, APPROVAL_COMMAND_MAX_CHARS)
-    elements.push(markdown(`**将执行**\n\`\`\`\n${command.shown.replace(/```/gu, '`​``')}\n\`\`\``))
+  const elements: object[] = []
+  const hasReason = question.reason !== undefined && question.reason.trim() !== ''
+  const hasCommand = question.command !== undefined && question.command !== ''
+  if (question.escalateTo !== undefined) {
+    elements.push(markdown(`工具 \`${question.toolName}\` 请求把本次调用提升到 \`${question.escalateTo}\` 权限。`))
+  } else if (!hasReason && !hasCommand) {
+    elements.push(markdown(`工具 \`${question.toolName}\` 请求执行一个需要授权的操作。`))
+  }
+  if (hasReason) elements.push(...reasonElements(question.reason!))
+  if (hasCommand) {
+    const command = clip(question.command!, APPROVAL_COMMAND_MAX_CHARS)
+    elements.push(markdown(`**将执行**\n\`\`\`\n${command.shown.replace(/```/gu, '`\u200b``')}\n\`\`\``))
     if (command.hidden > 0) elements.push(note(`已截断 ${command.hidden} 个字符`))
   }
-  if (question.reason !== undefined && question.reason !== '') {
-    const reason = clip(question.reason, APPROVAL_REASON_MAX_CHARS)
-    elements.push(markdown(`> ${reason.shown.replace(/\s+/gu, ' ')}${reason.hidden > 0 ? '…' : ''}`))
+  if (question.arguments !== undefined && question.arguments !== '') {
+    const args = clip(question.arguments, APPROVAL_ARGUMENTS_MAX_CHARS)
+    const body = [plainText(args.shown, { size: 'notation' })]
+    if (args.hidden > 0) body.push(note(`已截断 ${args.hidden} 个字符`))
+    // The arguments are the only description when nothing else says what will happen.
+    if (hasReason || hasCommand) elements.push(foldPanelOf('调用参数', body, PANEL_CHEVRON_TOKEN))
+    else elements.push(markdown('**调用参数**'), ...body)
   }
   return elements
 }
@@ -155,7 +228,7 @@ export function buildApprovalCard(question: ApprovalQuestion, options: ApprovalC
     elements.push(note(`🔑 ${question.sessionId}`))
   }
   elements.push(...approvalActions(question))
-  return standaloneCard('**⚠️ 需要你的审批**', elements)
+  return standaloneCard(`**⚠️ 需要你的审批 · \`${question.toolName}\`**`, elements)
 }
 
 /** Settled-card status lines, one per terminal state. */
@@ -180,5 +253,5 @@ export function buildApprovalSettledCard(question: ApprovalQuestion, state: Appr
   if (state === 'remembered') {
     elements.push(note(`本话题内 ${approvalGrantScope(question)} 将自动允许；/renew 或重启后恢复询问`))
   }
-  return standaloneCard(`**${APPROVAL_SETTLED_LINES[state]}**`, elements)
+  return standaloneCard(`**${APPROVAL_SETTLED_LINES[state]} · \`${question.toolName}\`**`, elements)
 }

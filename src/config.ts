@@ -13,7 +13,6 @@
  */
 
 import { z } from 'zod'
-import { FEISHU_USER_ID_PATTERN } from './domain.ts'
 import { parseWikiRootLink, WIKI_ROOT_LINK_ERRORS } from './feishu/wiki/links.ts'
 
 export const FEISHU_LOGGER_LEVELS = ['debug', 'info', 'warn', 'error'] as const
@@ -34,10 +33,6 @@ export const DEFAULT_APPROVAL_TIMEOUT_MS = 5 * 60 * 1000
 
 /** Default structured-question window: 5 minutes per `ask_user_question` call. */
 export const DEFAULT_QUESTION_TIMEOUT_MS = 5 * 60 * 1000
-
-/** Backends for inbound attachment storage, selected by `attachmentStore`. */
-export const ATTACHMENT_STORE_MODES = ['native', 'archive'] as const
-export type AttachmentStoreMode = (typeof ATTACHMENT_STORE_MODES)[number]
 
 /** Default per-call attachment count of `feishu_attachment_fetch`. */
 export const DEFAULT_ATTACHMENT_FETCH_MAX_RESOURCES = 10
@@ -79,9 +74,6 @@ export const DEFAULT_TOPIC_MESSAGES_TIMEOUT_MS = 20_000
  * optional context block.
  */
 export const DEFAULT_PROMPT_CONTEXT_TIMEOUT_MS = 3_000
-
-/** Conventional credential reference holding the log-platform analyze API bearer token. */
-export const DEFAULT_ANALYZE_TOKEN_REF = 'DSH_CHANNELS_ANALYZE_TOKEN'
 
 /** A credential reference: `FEISHU_APP_ID`-style name resolved through ctx.credentials. */
 const credentialRefSchema = z.string().regex(
@@ -182,33 +174,16 @@ export const configSchema = z.object({
   /**
    * Accept inbound Feishu images, files, and merged-forward chat records.
    *
-   * With the native backend (default) images of the triggering message are
-   * prefetched into the DSH native attachment library and files stay lazy
-   * behind a prompt manifest; with the archive backend the resources are saved
-   * below `<workspace>/attachments/` before the turn, exactly like the legacy
-   * pipeline. Disabled keeps attachment messages inert (no save, no turn, no
-   * manifest rows).
+   * Images of the triggering message are prefetched into the DSH native
+   * attachment library and files stay lazy behind a prompt manifest until the
+   * model calls `feishu_attachment_fetch` (mounted only while this is on).
+   * Disabled keeps attachment messages inert (no save, no turn, no manifest
+   * rows, no fetch tool).
    */
   acceptAttachments: z.boolean().default(true),
   /**
-   * Backend for inbound Feishu images and files.
-   *
-   * - `native` (default): store into the DSH native attachment library
-   *   (`ctx.attachments`) as durable `ImageBlock`/`FileBlock` references; if
-   *   the host does not mount that service, the storage layer falls back to
-   *   `archive` for that deployment.
-   * - `archive`: legacy behavior — write the resources into the topic
-   *   workspace `attachments/` directory through the existing intake.
-   *
-   * Admission consumes this switch through the backend-selecting inbound
-   * store: an explicit `archive` always uses the legacy download path, and a
-   * `native` deployment without the mounted host service degrades to the same
-   * legacy path (see `effectiveAttachmentMode`).
-   */
-  attachmentStore: z.enum(ATTACHMENT_STORE_MODES).default('native'),
-  /**
    * Prefetch images attached to the triggering message into the first model
-   * turn (native attachment backend only). The session, topic, and streaming
+   * turn. The session, topic, and streaming
    * card are already visible before the prefetch starts; the turn only waits
    * for the (short, bounded) image download, never for file bytes. Failed,
    * oversized, or timed-out images degrade to a manifest row that the model
@@ -260,13 +235,12 @@ export const configSchema = z.object({
   /**
    * Model-facing Feishu tools.
    *
-   * - `attachmentFetch` (default on): register `feishu_attachment_fetch` in
-   *   channel sessions so the model can fetch images/files of a known message
-   *   on demand. Registration is skipped (with one warning) on deployments
-   *   without the host `tools` / `attachments` services. Turning it off also
-   *   keeps inbound attachments on the archive backend: lazy native files
-   *   would be unreachable without the tool, so admission downloads them to
-   *   the workspace instead (see `effectiveAttachmentMode`).
+   * `feishu_attachment_fetch` lets the model fetch images/files of a known
+   * message on demand into the DSH native attachment library. It is mounted
+   * exactly while `acceptAttachments` is on (without it lazy files would be
+   * unreachable) and skipped with one warning on Agent scopes without the
+   * host `tools` service.
+   *
    * - `attachmentFetchMaxResources`: maximum attachments one tool call may
    *   fetch (1–50). A message with more attachments is refused with a readable
    *   reason so the model can retry per `file_key`.
@@ -284,9 +258,10 @@ export const configSchema = z.object({
    *   a readable tool failure and never fails the turn. This switch only
    *   controls the model-facing tool: the passive `<feishu_quote>` /
    *   `<feishu_history>` prompt excerpts stay enabled (they are bounded and
-   *   degrade silently) and are configured by `historyBootstrapLimit`. On the
-   *   archive backend the tool is still mounted for history text, while its
-   *   description states that `feishu_attachment_fetch` is unavailable.
+   *   degrade silently) and are configured by `historyBootstrapLimit`. With
+   *   `acceptAttachments` off the tool is still mounted for history text,
+   *   while its description states that `feishu_attachment_fetch` is
+   *   unavailable.
    * - `topicMessagesTimeoutMs`: whole-call timeout of one model-initiated
    *   topic read (default 20 s). Passive prompt excerpts use a separate short
    *   (~3 s) budget and never wait this long.
@@ -315,15 +290,16 @@ export const configSchema = z.object({
    *   plus the read scopes above.
    *
    * The wiki tools act with the app identity and are mounted only while
-   * `wikiRoots` is non-empty. Each call is limited to topics whose owner is
-   * the administrator or on the wiki whitelist (`/auth wiki add`); opening a
+   * `wikiRoots` is non-empty. Each read call is limited to topics whose owner
+   * is an administrator or has the user table's `wikiRead` switch on, and
+   * each create or edit call to owners with `wikiWrite` on
+   * (`/auth set wiki-read|wiki-write on`); opening a
    * document, creating one, and editing one each need the topic owner's
    * consent on an authorization card (a read consent lasts for the topic).
    *
    * The Web panel/metrics ship with `panel_docs_release`.
    */
   feishuTools: z.object({
-    attachmentFetch: z.boolean().default(true),
     attachmentFetchMaxResources: z.number().int().min(1).max(50)
       .default(DEFAULT_ATTACHMENT_FETCH_MAX_RESOURCES),
     attachmentFetchMaxBytes: z.number().int().min(1)
@@ -337,7 +313,6 @@ export const configSchema = z.object({
     wikiRead: z.boolean().default(false),
     wikiWrite: z.boolean().default(false),
   }).default({
-    attachmentFetch: true,
     attachmentFetchMaxResources: DEFAULT_ATTACHMENT_FETCH_MAX_RESOURCES,
     attachmentFetchMaxBytes: DEFAULT_ATTACHMENT_FETCH_MAX_BYTES,
     attachmentFetchTimeoutMs: DEFAULT_ATTACHMENT_FETCH_TIMEOUT_MS,
@@ -365,6 +340,47 @@ export const configSchema = z.object({
    */
   welcomeOnboarding: z.boolean().default(true),
   /**
+   * Give a turn no Feishu message started its own streaming card in the
+   * route's topic: a subagent finishing or messaging the Agent, a background
+   * job completing, a schedule firing, or a prompt typed in a dsh client.
+   * When off such turns render nowhere (they never stream into a Feishu
+   * message's card either way).
+   */
+  hostTurnCards: z.boolean().default(true),
+  /**
+   * Add the Feishu reply guidance to every Feishu Session's system prompt
+   * (`dsh-channels:feishu-replies`): lead with the result, keep the final
+   * reply short, keep technical detail in the merge request or a file, ask one
+   * concrete question when a decision is needed. Read on every model request.
+   */
+  replyGuidance: z.boolean().default(true),
+  /**
+   * Restart recovery of turns the previous process left unfinished (see
+   * `session/repair.ts`). `pending`: a message that was still queued (the
+   * Agent never claimed it) runs again into its own card, once. `interrupted`:
+   * a turn cut off mid-way gets a continue button (`ask`) or only the
+   * interruption notice (`notify`). A turn that completed unseen always gets
+   * its final reply re-rendered from the Session log.
+   */
+  replay: z.object({
+    pending: z.boolean().default(true),
+    interrupted: z.enum(['ask', 'notify']).default('ask'),
+  }).default({ pending: true, interrupted: 'ask' }),
+  /**
+   * Catch-up of messages that arrived while the long connection was down (a
+   * restart or a reconnect; see `routing/missed.ts`). Messages newer than
+   * `windowMs` are handled as if delivered live; older ones in the same chats
+   * are offered on a pending card (handle all / ignore). `heartbeatMs` is how
+   * often the last-alive time is stored, which bounds how far back a restart
+   * after a crash looks. At most `maxMessages` messages are read per catch-up.
+   */
+  missed: z.object({
+    enabled: z.boolean().default(true),
+    windowMs: z.number().int().min(60_000).max(24 * 60 * 60_000).default(30 * 60_000),
+    heartbeatMs: z.number().int().min(5_000).max(10 * 60_000).default(60_000),
+    maxMessages: z.number().int().min(1).max(1_000).default(200),
+  }).default({ enabled: true, windowMs: 30 * 60_000, heartbeatMs: 60_000, maxMessages: 200 }),
+  /**
    * Sync the command registry to Feishu's native `/` panel on every connect
    * (needs the `application:app_slash_command:read`/`write` scopes). Off by
    * default: some tenants forbid apps from adding slash commands. When off,
@@ -380,37 +396,35 @@ export const configSchema = z.object({
   /**
    * Admission policy for inbound Feishu traffic.
    *
-   * - `guarded` (default): only the configured administrator can talk in
-   *   private chats (plus whitelisted users when `dmAllowWhitelist` is on),
-   *   and a group conversation additionally requires the group to be
-   *   authorized and the sender to be the administrator or an explicitly
-   *   authorized user.
-   * - `open`: legacy behavior — any user inside the app's availability scope
-   *   can start a conversation. Debug/compatibility only; unsafe.
+   * - `guarded` (default): administrators, and users of the access table
+   *   whose `chat` switch is on, may talk in private chats and in any group;
+   *   everyone else is refused.
+   * - `open`: any user inside the app's availability scope can start a
+   *   conversation. Debug only; unsafe. The knowledge-base and code-write
+   *   switches still apply.
    */
   accessMode: z.enum(['open', 'guarded']).default('guarded'),
   /**
-   * In `guarded` mode, also admit users on the global user whitelist
-   * (`/auth user`) in private chats. Off by default: private chats stay
-   * administrator-only. Each private-chat user already has an own workspace.
+   * Tools that write to a remote repository (push, merge requests, issues).
+   * In a Feishu Session a call is refused unless the user who drives the
+   * current turn is an administrator or holds the `codeWrite` switch. Names
+   * are matched exactly; an empty list turns the check off.
    */
-  dmAllowWhitelist: z.boolean().default(false),
-  /**
-   * The unique administrator's Feishu `user_id`. Set it in the Web
-   * settings panel (or the profile config). Get it by sending `/userid` to the
-   * bot in a private chat. When unset, the Feishu app owner (looked up via
-   * `application.v6.application.get` at connect; needs an app-info read scope)
-   * is the administrator. While `accessMode` is `guarded` and neither is
-   * available, every conversation is refused (fail closed); `/userid` and a
-   * fixed notice stay available so the deployment can be bootstrapped.
-   */
-  adminUserId: z.string().regex(
-    FEISHU_USER_ID_PATTERN,
-    'must be a Feishu user_id, not an open_id (send /userid to the bot in a private chat to see it)',
-  ).optional(),
+  codeWriteTools: z.array(z.string().trim().min(1)).default([
+    'repo_workspace_push',
+    'repo_mr_create',
+    'repo_mr_update',
+    'repo_mr_comment',
+    'repo_mr_merge',
+    'repo_issue_create',
+    'repo_issue_update',
+    'repo_issue_comment',
+    'logalyze_improve_skill',
+    'logalyze_submit_init',
+  ]),
   /**
    * Lifetime of one pending authorization request and of the DM card that asks
-   * the administrator to approve a group or a user. Expired requests stay in
+   * the administrators to add a user to the access table. Expired requests stay in
    * the store as an audit trail but can no longer be decided.
    */
   authRequestTtlDays: z.number().int().min(1).max(30).default(7),
@@ -421,18 +435,6 @@ export const configSchema = z.object({
    * its own deadline and is left to the host signal instead.
    */
   questionTimeoutMs: z.number().int().min(10_000).max(3_600_000).default(DEFAULT_QUESTION_TIMEOUT_MS),
-  /**
-   * Switch for the log-platform analyze API (`POST /open-api/logalyze`
-   * on the DSH Web server). Off (default) answers 404; read per request, so
-   * toggling it needs no reconnect. Needs a host with a Web server.
-   */
-  analyzeEnabled: z.boolean().default(false),
-  /**
-   * Credential reference holding the analyze API bearer token (defaults to
-   * `DSH_CHANNELS_ANALYZE_TOKEN`). Resolved per request, so rotating the value
-   * applies to the next request; an unresolvable token refuses every request.
-   */
-  analyzeToken: credentialRefSchema.default(DEFAULT_ANALYZE_TOKEN_REF),
 })
 
 export type FeishuConfig = z.infer<typeof configSchema>

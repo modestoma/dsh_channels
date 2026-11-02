@@ -18,6 +18,7 @@
  * @module dsh-channels/service
  */
 
+import { CodeWriteGate } from './access/code-write.ts'
 import { AccessController } from './access/controller.ts'
 import { AccessRequests } from './access/requests.ts'
 import { AccessStore } from './access/store.ts'
@@ -26,6 +27,7 @@ import { ApprovalAnswerer } from './approvals.ts'
 import type { ApprovalRoute } from './approvals.ts'
 import { QuestionAnswerer } from './questions.ts'
 import type {
+  Agent,
   CommandInvocation,
   CommandResult,
   CredentialInfo,
@@ -38,32 +40,32 @@ import type {
   SessionId,
   SessionProjections,
   TokenMeter,
+  UserMessage,
 } from './dsh-types.ts'
-import { buildPickerCard, parsePickAction, standaloneInfoCard, STEER_ACTION, STOP_ACTION } from './cards.ts'
+import { buildPickerCard, parsePickAction, parseResumeAction, standaloneInfoCard, STEER_ACTION, STOP_ACTION } from './cards.ts'
 import type { PickerOption } from './cards.ts'
 import {
-  armEffortCommand, armModelCommand, armRenewCommand, registerModelCommand, commandResultCardKind, parseSlashCommand,
+  armEffortCommand, armRenewCommand, commandResultCardKind, parseSlashCommand,
   registerEffortCommand, registerRenewCommand, RouteOperationQueue, supportedCommandHelp, supportedCommandList,
 } from './commands.ts'
 import type { EffortCommandAction, ParsedSlashCommand } from './commands.ts'
 import { commandSpec } from './commands/registry.ts'
 import type { ChannelCommandSpec } from './commands/registry.ts'
 import type { PermissionPresets, SessionQuery } from './dsh-types.ts'
-import { FEISHU_USER_ID_PATTERN, feishuDomain, sessionDirOf } from './domain.ts'
+import { ACCESS_PERMISSIONS, FEISHU_USER_ID_PATTERN, feishuDomain, PROCESSED_RETENTION_MS, sessionDirOf } from './domain.ts'
 import type {
-  AccessGroupRecord, AccessRequestRecord, AccessUserRecord,
-  AnalyzeRequestRecord, ExpiredRouteRecord, FeishuDomainGlobal, FeishuDomainHandle, InflightSnapshot,
-  ProcessedRecord, RawDomainHandle, RouteRecord, SessionOriginRecord,
+  AccessPermission, AccessRequestRecord, AccessSwitch, AccessUserRecord,
+  ExpiredRouteRecord, FeishuDomainGlobal, FeishuDomainHandle, InflightSnapshot,
+  ProcessedRecord, RawDomainHandle, RouteRecord, SessionOriginRecord, TopicLaunchRecord,
 } from './domain.ts'
+import { Outbox } from './outbox.ts'
+import type { OutboxEntry } from './outbox.ts'
 import { RouteStore } from './session/routes.ts'
-import { AnalyzeLauncher } from './analyze/launcher.ts'
-import type { AnalyzeHandler } from './analyze/server.ts'
-import { InflightRepair } from './session/repair.ts'
+import { TopicLauncher } from './topics/launcher.ts'
+import { InflightRepair, storableMessage } from './session/repair.ts'
 import { SessionManager } from './session/manager.ts'
 import type { LiveAgent, RenewCommit } from './session/manager.ts'
 import { CardDelivery } from './feishu/delivery.ts'
-import { AttachmentIntake } from './feishu/inbound-attachments.ts'
-import { InboundAttachmentStore, effectiveAttachmentMode, resolveAttachmentService } from './feishu/native-attachments.ts'
 import { AttachmentFetchToolRuntime, TopicMessagesToolRuntime } from './feishu/tools.ts'
 import { SendFileToolRuntime } from './feishu/send-file.ts'
 import { WikiConsent } from './feishu/wiki/consent.ts'
@@ -75,11 +77,11 @@ import {
   readQuoteItems,
 } from './feishu/message-read.ts'
 import type { MessageReadRoute, RawMessageItem } from './feishu/message-read.ts'
-import type { AttachmentStore } from './host/attachments.ts'
-import { InboundRouter } from './routing/inbound.ts'
+import { feishuUserMessage, InboundRouter } from './routing/inbound.ts'
+import { MissedMessages } from './routing/missed.ts'
 import type { RequestPolicyController } from './session/request-policy.ts'
 import type { CardActionEvent, ChannelFactory, FeishuChannel, NormalizedMessage } from './feishu-channel.ts'
-import { AppOwnerLookupError, FeishuApiError } from './feishu-channel.ts'
+import { FeishuApiError } from './feishu-channel.ts'
 import { buildHealthCard, foldHealthSnapshot, HEALTH_DEPENDENCY_NAMES } from './health.ts'
 import type { HealthDependencyName, HealthSnapshot } from './health.ts'
 import {
@@ -97,33 +99,27 @@ import type { ProjectedStats, StreamerHooks } from './streamer.ts'
 import type { FeishuConfig } from './config.ts'
 import type {
   AccessMutationResponse, AccessRequestWire, AccessUserWire, AccessWire, CredentialField, FeishuProfilesWire, FeishuProfileWire,
-  ScopeCheckWire, SessionOriginWire,
-  SlashCommandSyncWire,
+  ScopeCheckWire, SessionOriginWire, SessionRecordGroupWire, SessionRecordsWire, SessionRecordUserWire, SessionRecordWire,
+  SlashCommandSyncWire, WorkspaceListingWire, WorkspacePreviewWire,
 } from './settings/contract.ts'
+import { listWorkspaceDirectory, previewWorkspaceFile, readWorkspaceFile, WorkspaceFileError } from './workspace-files.ts'
+import type { WorkspaceDownload } from './workspace-files.ts'
 import { checkScopes } from './feishu/scopes.ts'
 import { desiredSlashCommands, syncSlashCommands } from './feishu/slash-commands.ts'
-import { mergeOverlay } from './settings/overlay.ts'
+import { mergeOverlay, resolveDshHome } from './settings/overlay.ts'
+import { SYSTEM_INSTANCE_LOCK } from './instance-lock.ts'
+import type { InstanceLock, InstanceLockProvider, LockHolderInfo } from './instance-lock.ts'
+import { DSH_CHANNELS_VERSION } from './session-export.ts'
 import type { OverlayPatch, OverlayStore } from './settings/overlay.ts'
 
 /** Periodic route-GC sweep cadence (a long-running instance also accumulates
  *  dead records; TTL semantics make 6 h granularity more than sufficient). */
 const GC_SWEEP_INTERVAL_MS = 6 * 60 * 60 * 1000
 
-/** Dedup-record retention: Feishu redelivery windows are minutes-scale, so a
- *  day is 100×+ headroom while keeping the table bounded. */
-const PROCESSED_RETENTION_MS = 24 * 60 * 60 * 1000
-/** Upper bound on the boot-time app-owner lookup before the connection opens. */
-const APP_OWNER_LOOKUP_TIMEOUT_MS = 10_000
 /** Upper bound on the post-connect scope grant query. */
 const SCOPE_CHECK_TIMEOUT_MS = 10_000
 /** Upper bound on the whole post-connect slash-command panel sync (one list plus per-command writes). */
 const SLASH_COMMAND_SYNC_TIMEOUT_MS = 30_000
-
-/** Outcome of the app-owner lookup for the current connection. */
-type AppOwnerState =
-  | { readonly userId: string }
-  /** `apiRejected`: Feishu answered with an error code (typically a missing app-info scope). */
-  | { readonly error: string; readonly apiRejected: boolean }
 
 
 interface RenewAdmission {
@@ -133,11 +129,6 @@ interface RenewAdmission {
 }
 
 interface EffortAdmission {
-  live: LiveAgent
-  controller: RequestPolicyController
-}
-
-interface ModelAdmission {
   live: LiveAgent
   controller: RequestPolicyController
 }
@@ -164,12 +155,11 @@ async function openFeishuDomain(ctx: HostContext): Promise<FeishuDomainHandle> {
   const inflightRaw = domain.table('inflight')
   const processedRaw = domain.table('processed')
   const expiredRoutesRaw = domain.table('expired_routes')
-  const accessGroupsRaw = domain.table('access_groups')
   const accessUsersRaw = domain.table('access_users')
   const accessRequestsRaw = domain.table('access_requests')
-  const accessWikiUsersRaw = domain.table('access_wiki_users')
-  const analyzeRequestsRaw = domain.table('analyze_requests')
+  const topicLaunchesRaw = domain.table('analyze_requests')
   const sessionOriginsRaw = domain.table('session_origins')
+  const outboxRaw = domain.table('outbox')
   return {
     routes: {
       get: key => table.get(key) as RouteRecord | undefined,
@@ -195,12 +185,6 @@ async function openFeishuDomain(ctx: HostContext): Promise<FeishuDomainHandle> {
       put: (key, value) => expiredRoutesRaw.put(key, value),
       entries: () => expiredRoutesRaw.entries() as IterableIterator<[string, ExpiredRouteRecord]>,
     },
-    accessGroups: {
-      get: key => accessGroupsRaw.get(key) as AccessGroupRecord | undefined,
-      put: (key, value) => accessGroupsRaw.put(key, value),
-      delete: key => accessGroupsRaw.delete(key),
-      entries: () => accessGroupsRaw.entries() as IterableIterator<[string, AccessGroupRecord]>,
-    },
     accessUsers: {
       get: key => accessUsersRaw.get(key) as AccessUserRecord | undefined,
       put: (key, value) => accessUsersRaw.put(key, value),
@@ -213,29 +197,53 @@ async function openFeishuDomain(ctx: HostContext): Promise<FeishuDomainHandle> {
       delete: key => accessRequestsRaw.delete(key),
       entries: () => accessRequestsRaw.entries() as IterableIterator<[string, AccessRequestRecord]>,
     },
-    accessWikiUsers: {
-      get: key => accessWikiUsersRaw.get(key) as AccessUserRecord | undefined,
-      put: (key, value) => accessWikiUsersRaw.put(key, value),
-      delete: key => accessWikiUsersRaw.delete(key),
-      entries: () => accessWikiUsersRaw.entries() as IterableIterator<[string, AccessUserRecord]>,
-    },
-    analyzeRequests: {
-      get: key => analyzeRequestsRaw.get(key) as AnalyzeRequestRecord | undefined,
-      put: (key, value) => analyzeRequestsRaw.put(key, value),
-      entries: () => analyzeRequestsRaw.entries() as IterableIterator<[string, AnalyzeRequestRecord]>,
+    topicLaunches: {
+      get: key => topicLaunchesRaw.get(key) as TopicLaunchRecord | undefined,
+      put: (key, value) => topicLaunchesRaw.put(key, value),
+      entries: () => topicLaunchesRaw.entries() as IterableIterator<[string, TopicLaunchRecord]>,
     },
     sessionOrigins: {
       get: key => sessionOriginsRaw.get(key) as SessionOriginRecord | undefined,
       put: (key, value) => sessionOriginsRaw.put(key, value),
+      entries: () => sessionOriginsRaw.entries() as IterableIterator<[string, SessionOriginRecord]>,
     },
     getGlobal: () => (domain.global.get() ?? {}) as FeishuDomainGlobal,
     setGlobal: value => domain.global.set(value),
+    outbox: {
+      get: key => outboxRaw.get(key) as OutboxEntry | undefined,
+      put: (key, value) => outboxRaw.put(key, value),
+      delete: key => outboxRaw.delete(key),
+      entries: () => outboxRaw.entries() as IterableIterator<[string, OutboxEntry]>,
+    },
     close: () => domain.close(),
   }
 }
 
-/** `/auth wiki` usage line (input-error card). */
-const AUTH_WIKI_USAGE = '用法：/auth wiki add <@用户|user_id> 或 /auth wiki remove <@用户|user_id>。知识库白名单里的用户（以及管理员）发起的话题可以使用知识库工具。'
+/** `/auth` usage line (input-error card). */
+const AUTH_USAGE = '用法：/auth [status|list]；/auth add <@用户|user_id>；/auth remove <@用户|user_id>；/auth set <chat|wiki-read|wiki-write|code> <on|off> <@用户|user_id>'
+
+/** `/auth set` switch names → permission switches. The administrator flag is set only in the Web panel. */
+const AUTH_SWITCHES: Readonly<Record<string, AccessPermission>> = {
+  'chat': 'chat',
+  'wiki-read': 'wikiRead',
+  'wiki-write': 'wikiWrite',
+  'code': 'codeWrite',
+}
+
+/** Display label of each permission switch. */
+const PERMISSION_LABELS: Readonly<Record<AccessPermission, string>> = {
+  chat: '对话准入',
+  wikiRead: '知识库读取',
+  wikiWrite: '知识库写入',
+  codeWrite: '代码改动',
+}
+
+/** `对话准入 · 知识库读取` list of the switches one user holds, `管理员（全部权限）`, or `（全部关闭）`. */
+function permissionSummary(record: AccessUserRecord): string {
+  if (record.admin) return '管理员（全部权限）'
+  const held = ACCESS_PERMISSIONS.filter(permission => record[permission]).map(permission => PERMISSION_LABELS[permission])
+  return held.length === 0 ? '（全部关闭）' : held.join(' · ')
+}
 
 /**
  * Resolve one credential reference through the host credentials seam.
@@ -260,13 +268,75 @@ async function resolveCredentialRef(ctx: HostContext, ref: string): Promise<stri
 }
 
 /** Best-effort human-readable error text for the settings panel. */
-/** One whitelisted user as the panel shows it. */
+/** One access-table user as the panel shows it. */
 function userWire(record: AccessUserRecord): AccessUserWire {
   return {
     userId: record.userId,
     ...(record.name === undefined ? {} : { name: record.name }),
     source: record.source,
     addedAt: record.addedAt,
+    admin: record.admin,
+    chat: record.chat,
+    wikiRead: record.wikiRead,
+    wikiWrite: record.wikiWrite,
+    codeWrite: record.codeWrite,
+    ...(record.gitEmail === undefined ? {} : { gitEmail: record.gitEmail }),
+  }
+}
+
+/** How long a takeover waits for the previous owner to tear down and free the lock. */
+const TAKEOVER_WAIT_MS = 15_000
+
+/**
+ * The Feishu connection of this App ID is owned by another dsh process on this
+ * machine (see `instance-lock.ts`).
+ */
+export class InstanceLockHeldError extends Error {
+  constructor(readonly holder: LockHolderInfo | undefined) {
+    super(`飞书连接已被本机另一个 dsh 实例占用（${describeLockHolder(holder)}），可在设置面板「接管连接」`)
+    this.name = 'InstanceLockHeldError'
+  }
+}
+
+/**
+ * `shutdown()` ran while `start()` was still awaiting: the superseded start
+ * released what it had opened and must not report a connection failure.
+ */
+export class StartSupersededError extends Error {
+  constructor() {
+    super('dsh-channels: the channel was shut down while it was starting')
+    this.name = 'StartSupersededError'
+  }
+}
+
+/**
+ * One-line description of a lock owner for logs and the panel.
+ * @param holder - the owner, or undefined when it did not identify itself.
+ * @returns e.g. `pid 1234 · DSH_HOME /Users/a/.dsh · v0.8.0`.
+ */
+export function describeLockHolder(holder: LockHolderInfo | undefined): string {
+  if (holder === undefined) return '对方未响应身份查询'
+  return `pid ${holder.pid} · DSH_HOME ${holder.home} · v${holder.version}`
+}
+
+/** Prompt of the turn an interrupted card's continue button starts. */
+export const RESUME_PROMPT = '服务重启打断了上一轮回复。继续前先核对实际状态：工作目录里的文件和 git 状态、远端分支和 MR、已经发出的消息或文件。已经完成的对外操作不要重做，包括推送、创建或评论 MR、发送文件、写知识库；结果不确定的先查清楚。确认后从中断处继续完成上一轮的任务。'
+
+/**
+ * Origin line of a host-started turn's card, by the claimed message's source.
+ * @param kind - `UserMessage.source.kind` of the message that opened the turn.
+ * @returns the line rendered at the top of the card.
+ */
+export function hostTurnOriginLine(kind: string): string {
+  switch (kind) {
+    case 'subagent-settled': return '🤖 子代理已结束，继续处理'
+    case 'agent-message': return '🤖 收到子代理的消息，继续处理'
+    case 'tool-jobs': return '⚙️ 后台任务已完成，继续处理'
+    case 'schedule': return '⏰ 定时跟进'
+    case 'repo-activity': return '🔔 PR/MR 有新动态，继续处理'
+    case 'user': return '💻 来自 dsh 客户端的消息'
+    // Other sources come from plugins this channel does not know.
+    default: return '⚙️ 会话被唤醒，继续处理'
   }
 }
 
@@ -287,21 +357,15 @@ export class FeishuService {
   private channel: FeishuChannel | undefined
   private streamer: TurnStreamer | undefined
   private domain: FeishuDomainHandle | undefined
+  /** Durable retries of a turn's terminal card patches, reactions, and segments. */
+  private readonly outbox: Outbox
   /** Durable route store (cache + TTL retirement). */
   private readonly routes: RouteStore
   /** In-flight turn snapshots + startup repair. */
   private readonly repair: InflightRepair
+  private readonly missed: MissedMessages
   /** Outbound card delivery + reaction lifecycle. */
   private readonly delivery: CardDelivery
-  /** Inbound attachment archival (Feishu resources → workspace files). */
-  private readonly attachments: AttachmentIntake
-  /**
-   * Backend-selecting inbound storage facade. The native path stays lazy in
-   * admission (prefetch images + manifest); this facade owns the legacy
-   * workspace download used by `attachmentStore: 'archive'` and by the
-   * fallback when the host does not mount `ctx.attachments`.
-   */
-  private readonly inboundAttachmentStore: InboundAttachmentStore
   /**
    * Read-only Feishu message access (P2): the quoted-message excerpt and the
    * first-turn topic history. Constructed before the inbound router so the
@@ -310,8 +374,8 @@ export class FeishuService {
   private readonly messageReader = new MessageReader({ channel: () => this.channel })
   /** Inbound routing: dedup, admission, decision tree, session establishment. */
   private readonly inbound: InboundRouter
-  /** Log-platform analyze API business side (requests → shared analysis topics). */
-  private readonly analyzeLauncher: AnalyzeLauncher
+  /** The `feishuTopics` service (other plugins' launches → shared topics). */
+  private readonly topicLauncher: TopicLauncher
   /** Agent/session lifecycle: live registry, resume, presets, renew. */
   private readonly sessions: SessionManager
   /**
@@ -334,6 +398,20 @@ export class FeishuService {
   private readonly contextWindows = new Map<string, number>()
   private readonly windowRequests = new Set<string>()
   private started = false
+  /**
+   * Incremented by every `shutdown()`. A `start()` that observes a different
+   * value after one of its awaits was superseded and releases what it opened.
+   */
+  private lifecycle = 0
+  /** Machine-wide lock for the connected App ID, held while the channel runs. */
+  private lock: InstanceLock | undefined
+  /**
+   * Set while the connection is unavailable because another process owns the
+   * lock: after a refused acquisition, or after yielding to a takeover.
+   */
+  private occupied: { holder: LockHolderInfo | undefined } | undefined
+  /** Acquisition deadline while a takeover waits for the previous owner. */
+  private takeoverDeadline: number | undefined
   /** Epoch ms when `start()` completed (uptime for `/status`). */
   private startedAt: number | undefined
   /** Last failed connection attempt, surfaced in the Web settings panel. */
@@ -348,8 +426,6 @@ export class FeishuService {
   private runningConfig: FeishuConfig | undefined
   /** Guards overlapping panel-triggered reconnects. */
   private restarting = false
-  /** One-shot warning for a native deployment without the host attachment library. */
-  private warnedNativeAttachmentsUnmounted = false
   /** One-shot warning for silently degraded quote/history reads (missing scope). */
   private warnedPromptReadDegraded = false
   private unlisten: (() => void) | undefined
@@ -359,6 +435,10 @@ export class FeishuService {
   private gcTimer: ReturnType<typeof setInterval> | undefined
   /** HITL approval answerer (created in `start()`). */
   private approvalAnswerer: ApprovalAnswerer | undefined
+  /** Interrupted cards whose continue button already started a turn. */
+  private readonly resumedCards = new Set<string>()
+  /** Workspace roots of Feishu-routed Sessions seen by the last records read; file routes serve only these and active routes' roots. */
+  private recordWorkspaces = new Set<string>()
   /** HITL structured-question answerer (`ask_user_question`). */
   private questionAnswerer: QuestionAnswerer | undefined
   /** Disposers for the host approval waterfall listener + card actions. */
@@ -366,18 +446,16 @@ export class FeishuService {
   /** Disposer for the host user-questions waterfall listener. */
   private unlistenQuestions: (() => boolean) | undefined
   private unlistenCardAction: (() => void) | undefined
-  /** Durable access-control whitelists (groups + users + authorization requests). */
+  /** Code-write tool gate for Feishu Sessions (in-memory turn drivers). */
+  private readonly codeWriteGate: CodeWriteGate
+  /** Durable access-control user table and authorization requests. */
   private readonly accessStore: AccessStore
   /** Channel-plane admission gate (administrator / group / user). */
   private readonly accessController: AccessController
   /** Administrator DM authorization cards + bot-added group info cards. */
   private accessRequests: AccessRequests | undefined
   private unlistenBotAdded: (() => void) | undefined
-  /**
-   * App owner resolved at `start()`; the administrator whenever `adminUserId`
-   * is unset. Cleared on shutdown so a reconnect looks it up again.
-   */
-  private appOwner: AppOwnerState | undefined
+  private unlistenConnection: (() => void) | undefined
   /** Live-resolved user and chat profiles, by `user:`/`chat:` key; misses are kept as `{}`. */
   private readonly profileCache = new Map<string, { profile: FeishuProfileWire; at: number }>()
   /** Post-connect scope self-check; cleared on shutdown. */
@@ -393,6 +471,7 @@ export class FeishuService {
     channelFactory: ChannelFactory,
     sessionExportBuilder: SessionExportBuilder = createLogicalSessionExport,
     overlay?: OverlayStore,
+    private readonly instanceLock: InstanceLockProvider = SYSTEM_INSTANCE_LOCK,
   ) {
     this.ctx = ctx
     this.config = config
@@ -411,6 +490,29 @@ export class FeishuService {
       ttlMs: () => this.config.routeTtlMs,
       info: (message, ...args) => this.ctx.logger?.info?.(message, ...args),
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
+      recovery: {
+        policy: () => this.config.replay,
+        liveAgent: snapshot => this.recoveryAgent(snapshot),
+        replay: (agent, snapshot, message, submit) => {
+          this.streamer?.attach(agent.session, snapshot.cards[0]!.messageId, snapshot.triggerMessageId, snapshot.reactionId, { message })
+          if (!submit) return
+          this.codeWriteGate.noteMessage(snapshot.sessionId, message.id, snapshot.senderUserId)
+          agent.followup(message)
+        },
+      },
+    })
+    this.missed = new MissedMessages({
+      config: () => this.config.missed,
+      domain: () => this.domain,
+      channel: () => this.channel,
+      routes: () => this.routes.records(),
+      handle: async message => {
+        const channel = this.channel
+        if (channel !== undefined) await this.dispatchInbound(channel, message)
+      },
+      isAdmin: userId => this.accessController.isAdmin(userId),
+      info: (message, ...args) => this.ctx.logger?.info?.(message, ...args),
+      warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
     })
     this.sessions = new SessionManager({
       ctx: this.ctx,
@@ -419,19 +521,13 @@ export class FeishuService {
       started: () => this.started,
       detachStream: sessionId => this.streamer?.detach(sessionId),
       mountTools: (agentCtx, sessionId) => {
-        // The fetch tool only makes sense for the lazy native backend: in
-        // archive deployments (explicit, missing host library, or fetch tool
-        // disabled) every attachment is downloaded before the turn and the
-        // Agent reads the workspace copy, so mounting the tool would only
-        // advertise an operation that can never be authorized.
-        //
-        // The topic-messages tool is backend-independent: quoted excerpts and
-        // topic history are read-only, so it is mounted for both backends and
-        // self-gates on `feishuTools.topicMessages`; `feishu_send_file`
-        // self-gates on `feishuTools.sendFile`. The mounts start together and
-        // resolve as one promise (no serial blocking).
+        // The fetch tool is the only way the model reaches attachment bytes,
+        // so it is mounted exactly when the deployment accepts attachments.
+        // The topic-messages tool self-gates on `feishuTools.topicMessages`
+        // and `feishu_send_file` on `feishuTools.sendFile`. The mounts start
+        // together and resolve as one promise (no serial blocking).
         const mounts: Array<Promise<void>> = []
-        if (this.effectiveAttachmentBackend() === 'native') {
+        if (this.config.acceptAttachments) {
           mounts.push(this.attachmentFetchTools.mount(agentCtx, sessionId))
         }
         mounts.push(this.topicMessagesTools.mount(agentCtx, sessionId))
@@ -441,25 +537,10 @@ export class FeishuService {
       },
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
     })
-    this.attachments = new AttachmentIntake({
-      enabled: () => this.config.acceptAttachments,
-      channel: () => this.channel,
-      warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
-    })
-    this.inboundAttachmentStore = new InboundAttachmentStore({
-      enabled: () => this.config.acceptAttachments,
-      // Effective backend, not the raw config: `store()` is only called after
-      // admission already decided `archive`, so a native-configured deployment
-      // with the fetch tool disabled must download to the workspace here too.
-      mode: () => this.effectiveAttachmentBackend(),
-      service: () => this.nativeAttachmentService(),
-      channel: () => this.channel,
-      archive: this.attachments,
-      warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
-    })
     this.attachmentFetchTools = new AttachmentFetchToolRuntime({
       config: () => this.config,
       channel: () => this.channel,
+      attachments: () => this.ctx.attachments,
       routeOfSession: sessionId => {
         const record = this.routes.findBySession(sessionId)
         if (record === undefined) return undefined
@@ -493,9 +574,15 @@ export class FeishuService {
         this.attachmentFetchTools.noteKnownMessage(route, message, source)
       },
       isKnownMessage: (route, messageId) => this.attachmentFetchTools.isKnownMessage(route, messageId),
-      // The tool description must not promise a fetch tool that archive
-      // deployments do not mount; the runtime appends a degradation note.
-      fetchAvailable: () => this.effectiveAttachmentBackend() === 'native',
+      // The tool description must not promise a fetch tool that is not
+      // mounted; the runtime appends a note when attachments are disabled.
+      fetchAvailable: () => this.config.acceptAttachments,
+      warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
+    })
+    this.outbox = new Outbox({
+      table: () => this.domain?.outbox,
+      channel: () => this.channel,
+      sendSegment: (sessionId, segment, card, text) => this.delivery.segmentCard(sessionId, segment, card, text),
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
     })
     this.wikiConsent = new WikiConsent({
@@ -504,12 +591,13 @@ export class FeishuService {
       onError: (sessionId, error) => {
         this.ctx.logger?.warn?.('dsh-channels wiki consent error (session %s): %s', sessionId, String(error))
       },
+      patchCard: (messageId, card) => this.outbox.patch(messageId, card),
     })
     this.wikiTools = new WikiToolRuntime({
       config: () => this.config,
       channel: () => (this.started ? this.channel : undefined),
       routeOfSession: sessionId => this.approvalRouteFor(sessionId),
-      mayUseWiki: userId => this.accessController.isAdmin(userId) || this.accessStore.hasWikiUser(userId),
+      mayUseWiki: (userId, access) => this.accessController.mayUse(userId, access === 'read' ? 'wikiRead' : 'wikiWrite'),
       consent: this.wikiConsent,
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
     })
@@ -537,16 +625,16 @@ export class FeishuService {
       domain: () => this.domain,
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
     })
+    this.codeWriteGate = new CodeWriteGate({
+      config: () => this.config,
+      routeOf: sessionId => this.routes.findBySession(sessionId),
+      mayUse: (userId, permission) => this.accessController.mayUse(userId, permission),
+    })
     this.accessController = new AccessController({
-      config: () => this.accessConfig(),
+      config: () => this.config,
       store: this.accessStore,
       channel: () => this.channel,
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
-      onDeniedGroup: msg => {
-        void this.accessRequests?.ensureGroupRequest(msg).catch((error: unknown) => {
-          this.ctx.logger?.warn?.('dsh-channels: group authorization request failed: %s', String(error))
-        })
-      },
       onDeniedUser: msg => {
         void this.accessRequests?.ensureUserRequest(msg).catch((error: unknown) => {
           this.ctx.logger?.warn?.('dsh-channels: user authorization request failed: %s', String(error))
@@ -562,12 +650,11 @@ export class FeishuService {
       repair: this.repair,
       delivery: this.delivery,
       sessions: this.sessions,
-      attachmentMode: () => this.config.attachmentStore,
-      nativeAttachments: () => this.nativeAttachmentService(),
-      attachmentStore: this.inboundAttachmentStore,
+      nativeAttachments: () => this.ctx.attachments,
       noteKnownAttachments: (record, message, source) => {
         this.noteKnownAttachmentMessage(record, message, source ?? 'trigger')
       },
+      noteTurnSender: (sessionId, messageId, userId) => this.codeWriteGate.noteMessage(sessionId, messageId, userId),
       messageRead: {
         quote: input => this.readQuoteContext(input),
         history: input => this.readHistoryContext(input),
@@ -591,7 +678,7 @@ export class FeishuService {
         handleSlash: (msg, line) => this.handleSlashMessage(msg, line),
       },
     })
-    this.analyzeLauncher = new AnalyzeLauncher({
+    this.topicLauncher = new TopicLauncher({
       ctx: this.ctx,
       config: this.config,
       started: () => this.started,
@@ -603,43 +690,8 @@ export class FeishuService {
       streamer: () => this.streamer,
       queue: this.routeOperations,
       reserveTopic: threadId => this.inbound.reserveTopic(threadId),
-      mayAnalyzeIn: chatId => this.accessController.mayAnalyzeIn(chatId),
-      resolveToken: () => resolveCredentialRef(this.ctx, this.config.analyzeToken).catch(() => undefined),
+      mayLaunchFor: requesterUserId => this.accessController.mayLaunchFor(requesterUserId),
     })
-  }
-
-  /** Effective inbound attachment backend (matches the inbound router). */
-  private effectiveAttachmentBackend(): 'native' | 'archive' {
-    return effectiveAttachmentMode(
-      this.config.attachmentStore,
-      this.nativeAttachmentService(),
-      this.config.feishuTools.attachmentFetch,
-      this.config.acceptAttachments,
-    )
-  }
-
-  /**
-   * Resolve the host's native attachment library from the plugin scope.
-   *
-   * The service is registered host-wide (`@deepseek-ai/dsh-attachment-local`),
-   * so the safe `ctx.get` lookup resolves it even though this plugin does not
-   * declare `attachments` in its cordis `inject` list (the per-Agent scopes
-   * still inject it for the fetch tool). A missing service reads as
-   * `undefined` and switches admission to the legacy archive backend.
-   */
-  private nativeAttachmentService(): AttachmentStore | undefined {
-    const service = resolveAttachmentService(this.ctx)
-    if (service === undefined && this.config.attachmentStore === 'native'
-      && !this.warnedNativeAttachmentsUnmounted) {
-      // The facade now receives the effective backend, so its own downgrade
-      // warning cannot fire: report the missing library once from the resolver.
-      this.warnedNativeAttachmentsUnmounted = true
-      this.ctx.logger?.warn?.(
-        'dsh-channels: attachmentStore=native 但宿主未挂载 ctx.attachments，'
-        + '入站附件回退话题 attachments/ 工作区落盘',
-      )
-    }
-    return service
   }
 
   /**
@@ -800,7 +852,7 @@ export class FeishuService {
 
   /** Whether this deployment mounts the lazy attachment fetch tool. */
   private attachmentFetchMounted(): boolean {
-    return this.effectiveAttachmentBackend() === 'native'
+    return this.config.acceptAttachments
   }
 
   /**
@@ -886,11 +938,24 @@ export class FeishuService {
       this.lastStartError = undefined
       this.runningConfig = { ...this.config }
     } catch (error) {
+      if (error instanceof StartSupersededError) {
+        // Not a connection failure: release what the superseded start
+        // registered after the teardown that superseded it.
+        this.ctx.logger?.info?.('%s', error.message)
+        await this.shutdown().catch(() => undefined)
+        throw error
+      }
       this.lastStartError = messageOf(error)
-      this.ctx.logger?.error?.('dsh-channels: 飞书连接失败：%s', String(error))
-      // Headless profiles have no settings panel; keep the failure visible on
-      // the console, symmetric with the success line at the end of `start()`.
-      console.error('[dsh-channels] feishu connection failed:', error)
+      if (error instanceof InstanceLockHeldError) {
+        // Expected when another profile runs the same bot: not a failure.
+        this.ctx.logger?.info?.('dsh-channels: %s', error.message)
+        console.warn('[dsh-channels]', error.message)
+      } else {
+        this.ctx.logger?.error?.('dsh-channels: 飞书连接失败：%s', String(error))
+        // Headless profiles have no settings panel; keep the failure visible on
+        // the console, symmetric with the success line at the end of `start()`.
+        console.error('[dsh-channels] feishu connection failed:', error)
+      }
       try {
         await this.shutdown()
       } catch {
@@ -975,8 +1040,96 @@ export class FeishuService {
     }
   }
 
-  /** The analyze API's business side, for the Web route. */
-  analyzeHandler(): AnalyzeHandler { return this.analyzeLauncher }
+  /** This process's identity as answered to lock queries. */
+  private lockIdentity(): LockHolderInfo {
+    return { pid: process.pid, home: resolveDshHome(), version: DSH_CHANNELS_VERSION, startedAt: Date.now() }
+  }
+
+  /**
+   * Hand the connection to another process that asked to take over. The lock
+   * already answered the request; tearing down releases it.
+   */
+  private async yieldConnection(from: LockHolderInfo): Promise<void> {
+    this.restarting = true
+    try {
+      await this.shutdown()
+    } catch (error) {
+      this.ctx.logger?.warn?.('dsh-channels: shutdown during takeover failed: %s', String(error))
+    } finally {
+      this.restarting = false
+    }
+    this.occupied = { holder: from }
+    this.lastStartError = `飞书连接已被本机另一个 dsh 实例接管（${describeLockHolder(from)}）`
+    this.ctx.logger?.info?.('dsh-channels: yielded the feishu connection to %s', describeLockHolder(from))
+  }
+
+  /**
+   * Panel action: ask the process owning this App ID to yield, then connect.
+   * Interrupts the replies in flight over there; those cards are repaired when
+   * that process starts its channel again.
+   */
+  async takeover(): Promise<void> {
+    if (this.started) return
+    if (this.connecting || this.restarting) throw new Error('飞书连接正在连接或重启，请稍候再试')
+    await this.refreshReadiness()
+    if (!this.configured) {
+      throw new Error(`飞书应用凭据尚未配置完整：缺少 ${this.missingConfigItems.join('、')}`)
+    }
+    const appId = await resolveCredentialRef(this.ctx, this.config.appId)
+    const outcome = await this.instanceLock.requestYield(this.instanceLock.address(appId), this.lockIdentity())
+    if (outcome === 'busy') throw new Error('另一个 dsh 实例正在连接或重启，请稍候再试')
+    this.takeoverDeadline = Date.now() + TAKEOVER_WAIT_MS
+    try {
+      await this.connect()
+    } finally {
+      this.takeoverDeadline = undefined
+    }
+  }
+
+  /**
+   * The process owning this App ID's connection, while it keeps this one from
+   * connecting; `undefined` otherwise. `holder` is undefined when the owner did
+   * not identify itself.
+   */
+  occupiedBy(): { holder: LockHolderInfo | undefined } | undefined {
+    return this.started ? undefined : this.occupied
+  }
+
+  /**
+   * Origin line for a turn no Feishu message started, or undefined when it
+   * gets no card (disabled, or the session has no Feishu route).
+   */
+  private hostTurnOrigin(sessionId: string, message: UserMessage): string | undefined {
+    if (!this.config.hostTurnCards || this.routes.findBySession(sessionId) === undefined) return undefined
+    return hostTurnOriginLine(message.source.kind)
+  }
+
+  /** Restart snapshot of a host turn's card (no trigger message to settle). */
+  private async writeHostSnapshot(sessionId: string, messageId: string, mode: 'card' | 'text', message: UserMessage): Promise<void> {
+    const route = this.routes.findBySession(sessionId)
+    if (route === undefined) return
+    const stored = storableMessage(message)
+    // A host turn acts for the Session's current driver; replay restores it.
+    const driver = this.codeWriteGate.driverOf(sessionId)
+    try {
+      await this.repair.write({
+        key: messageId,
+        sessionId,
+        chatId: route.chatId,
+        routeKey: route.key,
+        ...(stored === undefined ? {} : { message: stored }),
+        ...(driver === undefined ? {} : { senderUserId: driver }),
+        cards: [{ messageId, mode }],
+        startedAt: Date.now(),
+        attempts: 0,
+      })
+    } catch (error) {
+      this.ctx.logger?.warn?.('dsh-channels: writing the host-turn snapshot %s failed: %s', messageId, String(error))
+    }
+  }
+
+  /** The `feishuTopics` service, provided by `apply()`. */
+  topics(): TopicLauncher { return this.topicLauncher }
   isRunning(): boolean { return this.started }
   isRestarting(): boolean { return this.restarting }
   /** True while the panel's explicit connect action is in flight. */
@@ -998,135 +1151,132 @@ export class FeishuService {
 
   // ---- access-control panel surface ------------------------------------
 
-  /** Whitelists + pending authorization requests (read-only Web projection). */
+  /** User table + pending authorization requests (read-only Web projection). */
   accessSnapshot(): AccessWire {
-    const admin = this.effectiveAdminUserId()
-    const owner = this.appOwner
     return {
       mode: this.config.accessMode,
-      // Whitelists live in the storage domain, which is only open while the
+      // The user table lives in the storage domain, which is only open while the
       // channel runs; an unconnected panel must not present them as empty.
       loaded: this.domain !== undefined,
-      admin: {
-        ...(admin === undefined ? {} : { userId: admin, source: this.configuredAdminUserId() === undefined ? 'owner' : 'config' }),
-        configured: admin !== undefined,
-        ...(owner !== undefined && 'error' in owner ? { ownerLookupError: owner.error } : {}),
-      },
-      groups: this.accessStore.groupRecords().map(record => ({
-        chatId: record.chatId,
-        ...(record.name === undefined ? {} : { name: record.name }),
-        source: record.source,
-        addedAt: record.addedAt,
-      })),
       users: this.accessStore.userRecords().map(userWire),
-      wikiUsers: this.accessStore.wikiUserRecords().map(userWire),
       requests: this.accessStore.pendingRequests().map(record => {
         const wire: AccessRequestWire = {
           token: record.token,
-          kind: record.kind,
           targetId: record.targetId,
           createdAt: record.createdAt,
           expiresAt: record.expiresAt,
         }
-        const name = record.kind === 'group' ? record.groupName : record.requesterName
-        if (name !== undefined) wire.name = name
+        if (record.requesterName !== undefined) wire.name = record.requesterName
         if (record.chatId !== undefined) wire.chatId = record.chatId
         if (record.groupName !== undefined) wire.groupName = record.groupName
-        const requester = record.requesterName ?? record.requesterUserId
-        if (requester !== undefined) wire.requester = requester
         return wire
       }),
     }
   }
 
-  /** Panel: authorize one group by id. */
-  async addAccessGroup(chatId: string, name?: string): Promise<AccessMutationResponse> {
-    const id = this.cleanAccessTargetId(chatId)
-    if (id === undefined) return { ok: false, error: 'chat_id 不合法（应为 oc_ 开头的群 ID）' }
-    const admin = this.effectiveAdminUserId()
-    if (admin === undefined) return { ok: false, error: '请先在「访问授权」标签页设置管理员 user_id' }
-    try {
-      if (!this.accessStore.hasGroup(id)) {
-        await this.accessStore.addGroup({
-          chatId: id,
-          ...(name === undefined || name.trim() === '' ? {} : { name: name.trim() }),
-          source: 'panel',
-          addedBy: admin,
-          addedAt: Date.now(),
-        })
-      }
-      return { ok: true, access: this.accessSnapshot() }
-    } catch (error) {
-      return { ok: false, error: `写入授权失败：${messageOf(error)}` }
-    }
-  }
-
-  /** Panel: revoke one group. */
-  async removeAccessGroup(chatId: string): Promise<AccessMutationResponse> {
-    const id = this.cleanAccessTargetId(chatId)
-    if (id === undefined) return { ok: false, error: 'chat_id 不合法' }
-    try {
-      await this.accessStore.removeGroup(id)
-      return { ok: true, access: this.accessSnapshot() }
-    } catch (error) {
-      return { ok: false, error: `撤销授权失败：${messageOf(error)}` }
-    }
-  }
-
-  /** Panel: authorize one user (global across authorized groups). */
+  /**
+   * Panel: add one user to the user table with only `chat` on, or turn `chat`
+   * back on for a user already in it.
+   * @param userId - Feishu user_id.
+   * @param name - optional display name for a new record.
+   * @returns the refreshed access snapshot, or the failure.
+   */
   async addAccessUser(userId: string, name?: string): Promise<AccessMutationResponse> {
-    return this.addPanelUser(userId, name, id => this.accessStore.hasUser(id), record => this.accessStore.addUser(record))
-  }
-
-  /** Panel: revoke one user. */
-  async removeAccessUser(userId: string): Promise<AccessMutationResponse> {
-    return this.removePanelUser(userId, id => this.accessStore.removeUser(id))
-  }
-
-  /** Panel: add one user to the wiki whitelist. */
-  async addWikiUser(userId: string, name?: string): Promise<AccessMutationResponse> {
-    return this.addPanelUser(userId, name, id => this.accessStore.hasWikiUser(id), record => this.accessStore.addWikiUser(record))
-  }
-
-  /** Panel: remove one user from the wiki whitelist. */
-  async removeWikiUser(userId: string): Promise<AccessMutationResponse> {
-    return this.removePanelUser(userId, id => this.accessStore.removeWikiUser(id))
-  }
-
-  private async addPanelUser(
-    userId: string,
-    name: string | undefined,
-    has: (id: string) => boolean,
-    add: (record: AccessUserRecord) => Promise<AccessUserRecord>,
-  ): Promise<AccessMutationResponse> {
     const id = this.cleanAccessUserId(userId)
     if (id === undefined) return { ok: false, error: 'user_id 不合法（只能包含字母、数字、_ 和 -，不是 ou_ 开头的 open_id）' }
-    const admin = this.effectiveAdminUserId()
-    if (admin === undefined) return { ok: false, error: '请先在「访问授权」标签页设置管理员 user_id' }
     try {
-      if (!has(id)) {
-        await add({
-          userId: id,
-          ...(name === undefined || name.trim() === '' ? {} : { name: name.trim() }),
-          source: 'panel',
-          addedBy: admin,
-          addedAt: Date.now(),
-        })
-      }
+      await this.grantChat(id, name?.trim(), 'panel', 'panel')
       return { ok: true, access: this.accessSnapshot() }
     } catch (error) {
       return { ok: false, error: `写入授权失败：${messageOf(error)}` }
     }
   }
 
-  private async removePanelUser(userId: string, remove: (id: string) => Promise<boolean>): Promise<AccessMutationResponse> {
+  /**
+   * Panel: remove one user (and every switch) from the user table.
+   * @param userId - Feishu user_id.
+   * @returns the refreshed access snapshot, or the failure.
+   */
+  async removeAccessUser(userId: string): Promise<AccessMutationResponse> {
     const id = this.cleanAccessUserId(userId)
     if (id === undefined) return { ok: false, error: 'user_id 不合法' }
     try {
-      await remove(id)
+      await this.accessStore.removeUser(id)
       return { ok: true, access: this.accessSnapshot() }
     } catch (error) {
       return { ok: false, error: `撤销授权失败：${messageOf(error)}` }
+    }
+  }
+
+  /**
+   * Panel: set the administrator flag or one permission switch of a user
+   * already in the table. The panel may remove the last administrator; it is
+   * also the way to add one back.
+   * @param userId - Feishu user_id.
+   * @param permission - the flag or switch.
+   * @param enabled - new value.
+   * @returns the refreshed access snapshot, or the failure.
+   */
+  async setAccessPermission(userId: string, permission: AccessSwitch, enabled: boolean): Promise<AccessMutationResponse> {
+    const id = this.cleanAccessUserId(userId)
+    if (id === undefined) return { ok: false, error: 'user_id 不合法' }
+    try {
+      const updated = await this.accessStore.setPermission(id, permission, enabled)
+      if (updated === undefined) return { ok: false, error: '该用户不在用户表中，请先添加' }
+      return { ok: true, access: this.accessSnapshot() }
+    } catch (error) {
+      return { ok: false, error: `写入授权失败：${messageOf(error)}` }
+    }
+  }
+
+  /**
+   * Panel: set or clear the git email of a user already in the table.
+   * @param userId - Feishu user_id.
+   * @param gitEmail - validated email, or undefined to clear it.
+   * @returns the refreshed access snapshot, or the failure.
+   */
+  async setAccessGitEmail(userId: string, gitEmail: string | undefined): Promise<AccessMutationResponse> {
+    const id = this.cleanAccessUserId(userId)
+    if (id === undefined) return { ok: false, error: 'user_id 不合法' }
+    try {
+      const updated = await this.accessStore.setGitEmail(id, gitEmail)
+      if (updated === undefined) return { ok: false, error: '该用户不在用户表中，请先添加' }
+      return { ok: true, access: this.accessSnapshot() }
+    } catch (error) {
+      return { ok: false, error: `写入 Git 邮箱失败：${messageOf(error)}` }
+    }
+  }
+
+  /** Add a user with only `chat` on, or turn `chat` on for an existing record. */
+  private async grantChat(userId: string, name: string | undefined, source: AccessUserRecord['source'], admin: string): Promise<void> {
+    await this.accessStore.grantChat({
+      userId,
+      ...(name === undefined || name === '' ? {} : { name }),
+      source,
+      addedBy: admin,
+      addedAt: Date.now(),
+      admin: false,
+      chat: true,
+      wikiRead: false,
+      wikiWrite: false,
+      codeWrite: false,
+    })
+  }
+
+  /**
+   * Remember a group the bot joined for missed-message catch-up (bounded to
+   * the 500 most recent). Best-effort: a failure only warns.
+   */
+  private async rememberGroup(chatId: string): Promise<void> {
+    const domain = this.domain
+    if (domain === undefined) return
+    try {
+      const global = domain.getGlobal()
+      const known = global.knownGroups ?? []
+      if (known.includes(chatId)) return
+      await domain.setGlobal({ ...global, knownGroups: [...known, chatId].slice(-500) })
+    } catch (error) {
+      this.ctx.logger?.warn?.('dsh-channels: remembering group %s failed: %s', chatId, String(error))
     }
   }
 
@@ -1157,6 +1307,144 @@ export class FeishuService {
       ...(bound ? { lastActivityAt: route.lastActivityAt } : {}),
       chatLink: `https://applink.feishu.cn/client/chat/open?openChatId=${encodeURIComponent(origin.chatId)}`,
     }
+  }
+
+  /**
+   * Panel: every Feishu-routed Session, grouped by group chat → user and by
+   * private-chat user, with live names, log-backed titles and workspace roots.
+   * Titles and roots come from `sessionQuery`; without it, roots fall back to
+   * the active route's workspace and titles are absent.
+   * @returns the grouped records, most recently active first at every level.
+   */
+  async sessionRecords(): Promise<SessionRecordsWire> {
+    const origins = this.routes.origins()
+    const sessions = await this.sessionRecordFacts(origins)
+    const userIds = new Set<string>()
+    const chatIds = new Set<string>()
+    for (const origin of origins) {
+      userIds.add(origin.senderUserId)
+      if (origin.chatType === 'group') chatIds.add(origin.chatId)
+    }
+    const profiles = await this.feishuProfiles([...userIds], [...chatIds])
+    const activity = (record: SessionRecordWire): number => record.lastActivityAt ?? record.createdAt
+    const byActivity = (a: SessionRecordWire, b: SessionRecordWire): number => activity(b) - activity(a)
+    const latest = (user: SessionRecordUserWire): number => activity(user.sessions[0]!)
+    const groupMembers = new Map<string, Map<string, SessionRecordWire[]>>()
+    const directMembers = new Map<string, SessionRecordWire[]>()
+    origins.forEach((origin, index) => {
+      const record = sessions[index]!
+      if (origin.chatType === 'group') {
+        const members = groupMembers.get(origin.chatId) ?? new Map<string, SessionRecordWire[]>()
+        groupMembers.set(origin.chatId, members)
+        members.set(origin.senderUserId, [...(members.get(origin.senderUserId) ?? []), record])
+      } else {
+        directMembers.set(origin.senderUserId, [...(directMembers.get(origin.senderUserId) ?? []), record])
+      }
+    })
+    const userEntry = async (userId: string, records: SessionRecordWire[], chatId?: string): Promise<SessionRecordUserWire> => {
+      records.sort(byActivity)
+      const profile = profiles.users[userId] ?? {}
+      const name = profile.name ?? (chatId === undefined ? undefined : await this.memberName(userId, chatId))
+      const workspaces = [...new Set(records.flatMap(record => (record.workspace === undefined ? [] : [record.workspace])))]
+      return {
+        userId,
+        ...(name === undefined ? {} : { name }),
+        ...(profile.avatarUrl === undefined ? {} : { avatarUrl: profile.avatarUrl }),
+        workspaces,
+        sessions: records,
+      }
+    }
+    const groups = await Promise.all([...groupMembers].map(async ([chatId, members]): Promise<SessionRecordGroupWire> => {
+      const users = await Promise.all([...members].map(([userId, records]) => userEntry(userId, records, chatId)))
+      users.sort((a, b) => latest(b) - latest(a))
+      const chat = profiles.chats[chatId] ?? {}
+      return {
+        chatId,
+        ...(chat.name === undefined ? {} : { chatName: chat.name }),
+        ...(chat.avatarUrl === undefined ? {} : { chatAvatarUrl: chat.avatarUrl }),
+        users,
+      }
+    }))
+    groups.sort((a, b) => latest(b.users[0]!) - latest(a.users[0]!))
+    const directs = await Promise.all([...directMembers].map(([userId, records]) => userEntry(userId, records)))
+    directs.sort((a, b) => latest(b) - latest(a))
+    return {
+      groups,
+      directs,
+      ...(profiles.warning === undefined ? {} : { warning: profiles.warning }),
+    }
+  }
+
+  /**
+   * One records-view entry per origin (same order), and refresh the set of
+   * browsable workspace roots from them.
+   */
+  private async sessionRecordFacts(origins: readonly SessionOriginRecord[]): Promise<SessionRecordWire[]> {
+    const bound = new Map<string, RouteRecord>()
+    for (const record of this.routes.records()) bound.set(record.sessionId, record)
+    const titles = new Map<string, string>()
+    const roots = new Map<string, string>()
+    const query = this.ctx.get?.('sessionQuery') as SessionQuery | undefined
+    if (query !== undefined && origins.length > 0) {
+      try {
+        for (const item of await query.readTitleSnapshots(origins.map(origin => origin.key as SessionId))) {
+          if (item.status !== 'fulfilled') continue
+          if (item.value.title !== undefined) titles.set(item.sessionId, item.value.title.title)
+          const cwd = item.value.session?.cwd
+          if (cwd !== undefined && cwd !== '') roots.set(item.sessionId, cwd)
+        }
+      } catch (error) {
+        this.ctx.logger?.warn?.('dsh-channels: session records lookup failed: %s', String(error))
+      }
+    }
+    const records = origins.map((origin): SessionRecordWire => {
+      const id = origin.key
+      const route = bound.get(id)
+      const title = titles.get(id)
+      const workspace = roots.get(id) ?? route?.workspacePath
+      return {
+        sessionId: id,
+        ...(title === undefined ? {} : { title }),
+        kind: origin.kind,
+        shared: origin.shared === true,
+        createdAt: origin.createdAt,
+        bound: route !== undefined,
+        ...(route === undefined ? {} : { lastActivityAt: route.lastActivityAt }),
+        live: this.sessions.get(id) !== undefined || this.ctx.agents.get(id as SessionId) !== undefined,
+        ...(workspace === undefined ? {} : { workspace }),
+      }
+    })
+    this.recordWorkspaces = new Set(records.flatMap(record => (record.workspace === undefined ? [] : [record.workspace])))
+    return records
+  }
+
+  /**
+   * A workspace root the file routes may serve: a root of some Feishu-routed
+   * Session. An unknown root re-reads the records once (the page may outlive
+   * a restart) before it is refused.
+   * @throws {WorkspaceFileError} 403 for any other directory.
+   */
+  private async browsableWorkspace(workspace: string): Promise<string> {
+    const known = (): boolean => this.recordWorkspaces.has(workspace)
+      || this.routes.records().some(record => record.workspacePath === workspace)
+    if (!known()) await this.sessionRecordFacts(this.routes.origins())
+    if (!known()) throw new WorkspaceFileError(403, '该目录不是飞书会话的工作区')
+    return workspace
+  }
+
+  /** Panel: list one directory of a Feishu workspace. */
+  async workspaceFiles(workspace: string, path: string | undefined): Promise<WorkspaceListingWire> {
+    return listWorkspaceDirectory(await this.browsableWorkspace(workspace), path)
+  }
+
+  /** Panel: preview one file of a Feishu workspace. */
+  async workspaceFilePreview(workspace: string, path: string | undefined): Promise<WorkspacePreviewWire> {
+    return previewWorkspaceFile(await this.browsableWorkspace(workspace), path)
+  }
+
+  /** Panel: read one file of a Feishu workspace for download. */
+  async workspaceFileDownload(workspace: string, path: string | undefined): Promise<WorkspaceDownload> {
+    return readWorkspaceFile(await this.browsableWorkspace(workspace), path)
   }
 
   /**
@@ -1234,6 +1522,26 @@ export class FeishuService {
     return result
   }
 
+  /**
+   * `名字 <user_id>` for a commit trailer, or the bare user_id when no name is
+   * known. The name comes from the contact profile, else the user table; `<`
+   * and `>` are dropped, whitespace and control characters become one space,
+   * and it is cut to 80 characters.
+   * Lookup failures only lose the name.
+   */
+  /**
+   * Name of a Feishu user as commits record it: the contact name, else the
+   * name in the user table, without `<`, `>`, or control characters.
+   * @param userId - Feishu user_id.
+   * @returns the name, or undefined when neither source has one.
+   */
+  private async commitName(userId: string): Promise<string | undefined> {
+    const profile = (await this.feishuProfiles([userId], [])).users[userId]
+    const raw = profile?.name ?? this.accessStore.getUser(userId)?.name ?? ''
+    const name = raw.replace(/[<>]/gu, '').replace(/[\s\u0000-\u001f\u007f]+/gu, ' ').trim().slice(0, 80)
+    return name === '' ? undefined : name
+  }
+
   /** Chat-member-list name for a user the contact profile cannot name. */
   private async memberName(userId: string, chatId: string): Promise<string | undefined> {
     const cached = this.profileCache.get(`member:${chatId}:${userId}`)
@@ -1247,77 +1555,12 @@ export class FeishuService {
   async resolveAccessRequest(token: string, decision: 'allow' | 'deny'): Promise<AccessMutationResponse> {
     const requests = this.accessRequests
     if (requests === undefined) return { ok: false, error: '授权服务尚未启动' }
-    const actor = this.effectiveAdminUserId()
-    if (actor === undefined) return { ok: false, error: '请先在「访问授权」标签页配置管理员 user_id' }
     try {
-      const result = await requests.resolve(token, decision, actor)
+      const result = await requests.resolve(token, decision, { kind: 'panel' })
       if (!result.ok) return { ok: false, error: result.error }
       return { ok: true, access: this.accessSnapshot() }
     } catch (error) {
       return { ok: false, error: `处理授权申请失败：${messageOf(error)}` }
-    }
-  }
-
-  /** `/auth status` administrator line: id plus where it came from. */
-  private adminStatusLine(): string {
-    const admin = this.effectiveAdminUserId()
-    if (admin === undefined) return '未配置'
-    return this.configuredAdminUserId() === undefined ? `\`${admin}\`（应用所有者，自动）` : `\`${admin}\``
-  }
-
-  /** The explicitly configured administrator, trimmed; empty counts as unset. */
-  private configuredAdminUserId(): string | undefined {
-    const admin = this.config.adminUserId?.trim()
-    return admin === undefined || admin === '' ? undefined : admin
-  }
-
-  /** Configured administrator, else the app owner looked up at `start()`. */
-  private effectiveAdminUserId(): string | undefined {
-    const configured = this.configuredAdminUserId()
-    if (configured !== undefined) return configured
-    const owner = this.appOwner
-    return owner !== undefined && 'userId' in owner ? owner.userId : undefined
-  }
-
-  /** Live config with `adminUserId` replaced by the effective administrator. */
-  private accessConfig(): FeishuConfig {
-    return { ...this.config, adminUserId: this.effectiveAdminUserId() }
-  }
-
-  /**
-   * Look up the app owner for the administrator fallback. Never throws: a
-   * failure is recorded for the panel and only warned about when no
-   * administrator is configured (the fallback is then what admission needs).
-   */
-  private async resolveAppOwner(channel: FeishuChannel): Promise<void> {
-    this.appOwner = undefined
-    if (channel.appOwnerUserId === undefined) return
-    let timer: ReturnType<typeof setTimeout> | undefined
-    let state: AppOwnerState
-    try {
-      const userId = await Promise.race([
-        channel.appOwnerUserId(),
-        new Promise<never>((_, reject) => {
-          timer = setTimeout(() => reject(new Error(`超时（${APP_OWNER_LOOKUP_TIMEOUT_MS} ms）`)), APP_OWNER_LOOKUP_TIMEOUT_MS)
-        }),
-      ])
-      state = userId !== undefined && FEISHU_USER_ID_PATTERN.test(userId)
-        ? { userId }
-        : { error: '应用所有者不是企业内成员，或接口未返回其 user_id', apiRejected: false }
-    } catch (error) {
-      const detail = error instanceof AppOwnerLookupError ? error.detail : messageOf(error)
-      state = {
-        error: `获取应用信息失败：${detail}。请在「访问授权」手动填写管理员 user_id（私聊机器人发 /userid 获取，私聊模式关闭时可在飞书管理后台的成员详情里查看用户 ID）；或为应用开通「获取应用信息」权限并发布版本后重新连接`,
-        apiRejected: error instanceof AppOwnerLookupError && error.code !== undefined,
-      }
-    } finally {
-      if (timer !== undefined) clearTimeout(timer)
-    }
-    // A background lookup can outlive its connection (shutdown/reconnect).
-    if (this.channel !== channel) return
-    this.appOwner = state
-    if ('error' in state && this.configuredAdminUserId() === undefined) {
-      this.ctx.logger?.warn?.('dsh-channels: app owner fallback unavailable: %s', state.error)
     }
   }
 
@@ -1375,13 +1618,11 @@ export class FeishuService {
 
   /**
    * Compare the app's granted scopes with what the plugin uses and log the
-   * missing ones. Never throws; waits for the owner lookup so the app-info
-   * need reflects its outcome.
+   * missing ones. Never throws.
    */
-  private async runScopeCheck(channel: FeishuChannel, appId: string, ownerLookup: Promise<void>): Promise<void> {
+  private async runScopeCheck(channel: FeishuChannel, appId: string): Promise<void> {
     this.scopeCheckState = undefined
     if (channel.grantedScopes === undefined) return
-    await ownerLookup
     let timer: ReturnType<typeof setTimeout> | undefined
     let state: ScopeCheckWire
     try {
@@ -1394,9 +1635,6 @@ export class FeishuService {
       const result = checkScopes(grants, appId, {
         dmEnabled: this.config.dmMode === 'open',
         requireMention: this.config.requireMention,
-        ownerLookupFailed: this.config.accessMode === 'guarded'
-          && this.configuredAdminUserId() === undefined
-          && this.appOwner !== undefined && 'error' in this.appOwner && this.appOwner.apiRejected,
         slashCommandPanel: this.config.slashCommandPanel,
         sendFile: this.config.feishuTools.sendFile,
         wikiRead: this.config.feishuTools.wikiRead && this.config.wikiRoots.length > 0,
@@ -1475,10 +1713,8 @@ export class FeishuService {
         return { configured: false, writable: false }
       }
     }
-    const [appId, appSecret, analyzeToken] = await Promise.all([
-      read(this.config.appId), read(this.config.appSecret), read(this.config.analyzeToken),
-    ])
-    return { appId, appSecret, analyzeToken }
+    const [appId, appSecret] = await Promise.all([read(this.config.appId), read(this.config.appSecret)])
+    return { appId, appSecret }
   }
 
   /** The host credentials seam, when mounted. */
@@ -1521,7 +1757,6 @@ export class FeishuService {
     switch (field) {
       case 'appId': return this.config.appId
       case 'appSecret': return this.config.appSecret
-      case 'analyzeToken': return this.config.analyzeToken
     }
   }
 
@@ -1529,12 +1764,41 @@ export class FeishuService {
   async start(): Promise<void> {
     if (this.started) return
     this.started = true
+    const lifecycle = this.lifecycle
+    // A plugin reload disposes this instance's host listeners and then calls
+    // `shutdown()`, possibly while this body is still awaiting. Continuing
+    // would leave a Feishu connection whose turns never reach a card.
+    const ensureCurrent = (): void => {
+      if (this.lifecycle !== lifecycle) throw new StartSupersededError()
+    }
 
     // 1. Resolve credentials through the host seam (env > .credentials.yaml > .env).
     const appId = await resolveCredentialRef(this.ctx, this.config.appId)
     const appSecret = await resolveCredentialRef(this.ctx, this.config.appSecret)
+    ensureCurrent()
 
-    // 2. Build the channel with the resolved secrets.
+    // 2. Own the App ID on this machine before connecting: Feishu splits the
+    //    events of one app across all its long connections.
+    const acquired = await this.instanceLock.acquire({
+      address: this.instanceLock.address(appId),
+      self: this.lockIdentity(),
+      canYield: () => this.started && !this.connecting && !this.restarting,
+      onYield: (from) => { void this.yieldConnection(from) },
+      ...(this.takeoverDeadline === undefined ? {} : { waitUntil: this.takeoverDeadline }),
+    })
+    if (!acquired.ok) {
+      ensureCurrent()
+      this.occupied = { holder: acquired.holder }
+      throw new InstanceLockHeldError(acquired.holder)
+    }
+    if (this.lifecycle !== lifecycle) {
+      await acquired.lock.release()
+      throw new StartSupersededError()
+    }
+    this.lock = acquired.lock
+    this.occupied = undefined
+
+    // 3. Build the channel with the resolved secrets.
     const channel = this.channelFactory({
       appId,
       appSecret,
@@ -1561,6 +1825,11 @@ export class FeishuService {
       },
       sendSegmentCard: (sessionId, segment, card, fallbackText) =>
         this.delivery.segmentCard(sessionId, segment, card, fallbackText),
+      settlePatch: (messageId, card) => this.outbox.patch(messageId, card),
+      settleReaction: (messageId, removeReactionId, add) => this.outbox.reaction(messageId, removeReactionId, add),
+      resendSegment: (sessionId, segment, card, fallbackText) => this.outbox.segment(sessionId, segment, card, fallbackText),
+      hostTurnOrigin: (sessionId, message) => this.hostTurnOrigin(sessionId, message),
+      onHostCardDelivered: (sessionId, messageId, mode, message) => this.writeHostSnapshot(sessionId, messageId, mode, message),
     }
     this.streamer = new TurnStreamer(
       channel,
@@ -1569,9 +1838,15 @@ export class FeishuService {
       this.config.statusRefreshMs,
     )
 
-    this.domain = await openFeishuDomain(this.ctx)
+    const domain = await openFeishuDomain(this.ctx)
+    if (this.lifecycle !== lifecycle) {
+      await domain.close()
+      throw new StartSupersededError()
+    }
+    this.domain = domain
     this.routes.load()
     this.accessStore.load()
+    this.outbox.start()
 
     // HITL: answer the host's approval/request waterfall for sessions this
     // channel routes. `prepend` claims such requests BEFORE the web gateway's
@@ -1585,6 +1860,7 @@ export class FeishuService {
       onWaitingChange: (sessionId, toolNames) => {
         this.streamer?.setAwaitingApproval(sessionId, toolNames)
       },
+      patchCard: (messageId, card) => this.outbox.patch(messageId, card),
     }, this.config.approvalTimeoutMs)
     this.approvalAnswerer = answerer
     this.unlistenApproval = this.ctx.on('approval/request', (req, next) => answerer.onRequest(req, next), { prepend: true })
@@ -1593,6 +1869,10 @@ export class FeishuService {
     // fail every ask with NO_PROVIDER.
     const questions = new QuestionAnswerer(channel, {
       routeFor: sessionId => this.approvalRouteFor(sessionId),
+      onWaitingChange: (sessionId, waiting) => {
+        this.streamer?.setAwaitingAnswer(sessionId, waiting)
+      },
+      patchCard: (messageId, card) => this.outbox.patch(messageId, card),
       onError: (sessionId, error) => {
         this.ctx.logger?.warn?.('dsh-channels question error (session %s): %s', sessionId, String(error))
       },
@@ -1604,13 +1884,14 @@ export class FeishuService {
       { prepend: true },
     )
     const accessRequests = new AccessRequests({
-      config: () => this.accessConfig(),
+      config: () => this.config,
       store: this.accessStore,
       channel: () => this.channel,
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
     })
     this.accessRequests = accessRequests
     this.unlistenBotAdded = channel.onBotAdded(event => {
+      void this.rememberGroup(event.chatId)
       void accessRequests.handleBotAdded(event).catch((error: unknown) => {
         this.ctx.logger?.warn?.('dsh-channels: bot-added group info card failed: %s', String(error))
       })
@@ -1623,8 +1904,12 @@ export class FeishuService {
       answerer.onCardAction(event)
       questions.onCardAction(event)
       this.wikiConsent.onCardAction(event)
+      this.missed.onCardAction(event)
       this.onStopAction(event)
       this.onSteerAction(event)
+      void this.onResumeAction(event).catch((error: unknown) => {
+        this.ctx.logger?.warn?.('dsh-channels: continue action failed: %s', String(error))
+      })
       void this.onPickAction(event).catch((error: unknown) => {
         this.ctx.logger?.warn?.('dsh-channels: picker card action failed: %s', String(error))
       })
@@ -1639,27 +1924,53 @@ export class FeishuService {
     this.unlistenHost.push(this.ctx.on('agent/assistant-stream', ({ agent, frame }) => {
       this.streamer?.onAssistantFrame(agent.session, frame)
     }))
+    // Binds each card to the turn its own prompt opens (see `TurnStreamer`).
+    this.unlistenHost.push(this.ctx.on('agent/inbox/claimed', ({ agent, message, turn }) => {
+      this.codeWriteGate.onClaimed(agent.session.id, message.id)
+      this.streamer?.onInboxClaimed(agent.session, message, turn)
+    }))
+    this.unlistenHost.push(this.ctx.on('agent/inbox/discarded', ({ agent, message }) => {
+      this.streamer?.onInboxDiscarded(agent.session, message)
+    }))
+    this.unlistenHost.push(this.ctx.on('tools/pre-execute', async (exec, next) => this.codeWriteGate.decide(exec) ?? await next()))
+    this.unlistenHost.push(this.ctx.on('repo/commit-trailers', async (event) => {
+      const userId = this.codeWriteGate.driverOf(event.session)
+      if (userId === undefined) return
+      const name = await this.commitName(userId)
+      event.add('Feishu-User', name === undefined ? userId : `${name} <${userId}>`)
+      const gitEmail = this.accessStore.getUser(userId)?.gitEmail
+      if (gitEmail !== undefined) event.setAuthor?.(name ?? userId, gitEmail)
+    }))
+    // A cold Feishu Session resumed by the host's generic controller would
+    // lack this channel's tools and guidance; resume it here instead.
+    this.unlistenHost.push(this.ctx.on('repo/resolve-agent', async (sessionId, next) => {
+      const route = this.routes.findBySession(sessionId)
+      if (route === undefined) return await next()
+      return (await this.sessions.ensureLive(route)).agent
+    }, { prepend: true }))
     this.unlisten = channel.onMessage(message => {
-      void this.inbound.handle(message).catch((error: unknown) => {
-        this.ctx.logger?.warn?.('dsh-channels inbound error: %s', String(error))
-        // User-facing safety net: never leave the user without a reply.
-        void channel
-          .send(message.chatId, { text: `dsh-channels 处理失败：${String(error)}` }, { replyTo: message.messageId })
-          .catch(() => {})
-      })
+      void this.dispatchInbound(channel, message)
     })
-    // Without a configured administrator, resolve the owner before the
-    // handshake so the first inbound message already sees the fallback; with
-    // one, the lookup only backs a later runtime clear and must not delay boot.
-    const ownerLookup = this.resolveAppOwner(channel)
-    if (this.configuredAdminUserId() === undefined) await ownerLookup
+    this.unlistenConnection = channel.onConnectionChange?.(change => {
+      if (change === 'reconnecting') this.missed.onReconnecting()
+      else this.missed.onReconnected()
+    })
+    ensureCurrent()
     await channel.connect()
+    if (this.lifecycle !== lifecycle) {
+      // The teardown's disconnect ran before this connect resolved.
+      await channel.disconnect().catch(() => undefined)
+      throw new StartSupersededError()
+    }
     // Background: the results only feed the panel and the log.
-    void this.runScopeCheck(channel, appId, ownerLookup)
+    void this.runScopeCheck(channel, appId)
     if (this.config.slashCommandPanel) void this.runSlashCommandSync(channel)
     // Before admission opens, so every `running` record left is a previous instance's.
-    await this.analyzeLauncher.markInterrupted()
-    this.analyzeLauncher.open()
+    await this.topicLauncher.markInterrupted()
+    ensureCurrent()
+    this.topicLauncher.open()
+    // Read back what arrived while no instance was connected (background).
+    this.missed.start()
     // Repair cards a previous instance left mid-flight (best-effort, background).
     void this.repair.repairAll().catch((error: unknown) => {
       this.ctx.logger?.warn?.('dsh-channels: inflight repair failed: %s', String(error))
@@ -1691,17 +2002,13 @@ export class FeishuService {
     })
     if (this.config.accessMode === 'open') {
       console.warn('[dsh-channels] 准入=open：任何应用可用范围内的用户都可以对话（不安全，仅调试）')
-    } else if (this.effectiveAdminUserId() === undefined) {
-      const ownerError = this.appOwner !== undefined && 'error' in this.appOwner ? this.appOwner.error : undefined
+    } else if (this.accessStore.adminIds().length === 0) {
       console.warn(
-        '[dsh-channels] 准入=guarded 但未配置管理员 user_id，也无法使用应用所有者兜底：所有对话都会被拒绝；'
-        + '私聊机器人发送 /userid 取得 user_id 后填入 Web 设置面板'
-        + (ownerError === undefined ? '' : `（${ownerError}）`),
+        '[dsh-channels] 准入=guarded 但用户表里没有管理员：所有对话都会被拒绝；'
+        + '私聊机器人发送 /userid 取得 user_id，在 Web 设置面板「访问授权」的用户表里添加并打开「管理员」',
       )
-    } else if (this.configuredAdminUserId() === undefined) {
-      console.info('[dsh-channels] 准入=guarded，未配置管理员，使用应用所有者', this.effectiveAdminUserId())
     } else {
-      console.info('[dsh-channels] 准入=guarded，管理员已配置')
+      console.info('[dsh-channels] 准入=guarded，管理员 %d 人', this.accessStore.adminIds().length)
     }
     const approvalMounted = this.ctx.get?.('approval') !== undefined
     console.info(
@@ -1717,27 +2024,56 @@ export class FeishuService {
     )
   }
 
+  /** Run one inbound message; a failure is logged and answered in the chat. */
+  private async dispatchInbound(channel: FeishuChannel, message: NormalizedMessage): Promise<void> {
+    try {
+      await this.inbound.handle(message)
+    } catch (error) {
+      this.ctx.logger?.warn?.('dsh-channels inbound error: %s', String(error))
+      // User-facing safety net: never leave the user without a reply.
+      await channel
+        .send(message.chatId, { text: `dsh-channels 处理失败：${String(error)}` }, { replyTo: message.messageId })
+        .catch(() => {})
+    }
+  }
+
   /** Tear down: close the connection and dispose all live agents. */
   async shutdown(): Promise<void> {
-    // Close admission first. In-flight Host commands receive cancellation
-    // before their Agent/channel/storage dependencies are disposed, while
-    // already queued route operations observe `started === false` and retire.
-    this.started = false
-    this.analyzeLauncher.close()
-    await this.analyzeLauncher.drain()
-    for (const controller of this.commandControllers) controller.abort()
-    await Promise.allSettled([...this.commandOperations])
-    this.commandControllers.clear()
-    this.commandOperations.clear()
+    this.lifecycle++
+    // Stop Feishu intake before the first await. On a plugin reload the host
+    // has already removed this instance's session listeners, so a message
+    // admitted now would start a turn whose card never settles. Messages that
+    // arrive from here on are read back by the next instance's catch-up.
     this.unlisten?.()
     this.unlisten = undefined
     this.unlistenCardAction?.()
     this.unlistenCardAction = undefined
+    // While admission is still open, so a running catch-up finishes its
+    // messages; the stored last-alive time stays at this intake cutoff. A
+    // failure must not keep the connection open.
+    try {
+      await this.missed.stop()
+    } catch (error) {
+      this.ctx.logger?.warn?.('dsh-channels: stopping the missed-message catch-up failed: %s', String(error))
+    }
+    // Close admission first. In-flight Host commands receive cancellation
+    // before their Agent/channel/storage dependencies are disposed, while
+    // already queued route operations observe `started === false` and retire.
+    this.started = false
+    this.topicLauncher.close()
+    await this.topicLauncher.drain()
+    for (const controller of this.commandControllers) controller.abort()
+    await Promise.allSettled([...this.commandOperations])
+    this.commandControllers.clear()
+    this.commandOperations.clear()
     this.unlistenBotAdded?.()
     this.unlistenBotAdded = undefined
+    this.unlistenConnection?.()
+    this.unlistenConnection = undefined
     this.accessRequests?.clear()
     this.accessRequests = undefined
     this.accessController.clear()
+    this.codeWriteGate.clear()
     this.unlistenApproval?.()
     this.unlistenApproval = undefined
     this.unlistenQuestions?.()
@@ -1762,6 +2098,8 @@ export class FeishuService {
     this.inbound.clear()
     this.routes.clear()
     this.accessStore.clear()
+    // Before the disconnect: the withdrawal patches above are in flight.
+    await this.outbox.stop()
     try {
       await this.channel?.disconnect()
     } catch {
@@ -1772,8 +2110,10 @@ export class FeishuService {
     this.streamer = undefined
     await this.domain?.close()
     this.domain = undefined
+    // Last: the lock may only pass on once this process holds no connection.
+    await this.lock?.release()
+    this.lock = undefined
     this.runningConfig = undefined
-    this.appOwner = undefined
     this.scopeCheckState = undefined
     this.slashCommandSyncState = undefined
     this.slashCommandSyncAbort?.abort()
@@ -1878,184 +2218,86 @@ export class FeishuService {
   }
 
   /**
-   * `/auth`: administrator-only access management on the channel plane. It
-   * never creates a Session or resumes an Agent; every reply is a fixed card.
+   * `/auth`: administrator-only management of the user table on the channel
+   * plane. It never creates a Session or resumes an Agent; every reply is a
+   * fixed card.
    */
   private async runAuthCommand(msg: NormalizedMessage, parsed: ParsedSlashCommand): Promise<void> {
     if (!this.accessController.isAdmin(msg.senderId)) return
     const direct = { createThread: false }
     const words = parsed.rawInput.trim().split(/\s+/u).filter(word => word !== '')
     const action = words[0] ?? 'status'
-    const now = Date.now()
+    const reply = (kind: 'success' | 'unavailable' | 'input-error', text: string): Promise<void> =>
+      this.delivery.commandCard(msg, { kind, command: 'auth', text }, direct)
     try {
       if (action === 'status') {
-        const groups = this.accessStore.groupRecords()
         const users = this.accessStore.userRecords()
-        const pending = this.accessStore.pendingRequests()
+        const members = users.filter(user => !user.admin)
+        const count = (permission: AccessPermission): number => members.filter(user => user.chat && user[permission]).length
+        const admins = users.filter(user => user.admin).map(user => `${user.name ?? user.userId} \`${user.userId}\``)
         await this.delivery.standaloneReply(msg, standaloneInfoCard('**🔐 访问授权状态**', [
           `**准入模式**：\`${this.config.accessMode}\``,
-          `**管理员**：${this.adminStatusLine()}`,
-          `**私聊**：${this.config.dmAllowWhitelist ? '管理员与白名单用户' : '仅管理员'}`,
-          ...(msg.chatType === 'group'
-            ? [`**本群**：${this.accessStore.hasGroup(msg.chatId) ? '已授权' : '未授权'}（\`${msg.chatId}\`）`]
-            : []),
-          `**白名单**：群 ${groups.length} 个 · 用户 ${users.length} 个 · 知识库 ${this.accessStore.wikiUserRecords().length} 个 · 待处理申请 ${pending.length} 个`,
-          '群授权：`/auth allow` 或 `/auth revoke`（在目标群内发）；用户授权：`/auth user add @用户` 或 `/auth user add <user_id>`；知识库授权：`/auth wiki add @用户`。',
+          `**管理员（${admins.length}）**：${admins.join('、')}`,
+          `**其他用户**：${members.length} 人 · 对话准入 ${count('chat')} · 知识库读取 ${count('wikiRead')} · 知识库写入 ${count('wikiWrite')} · 代码改动 ${count('codeWrite')}`,
+          `**待处理申请**：${this.accessStore.pendingRequests().length} 个`,
+          '添加：`/auth add @用户`；开关：`/auth set <chat|wiki-read|wiki-write|code> <on|off> @用户`；移除：`/auth remove @用户`。管理员只能在 Web 设置面板设置。',
         ]), direct)
-        return
-      }
-      if (action === 'allow' || action === 'revoke') {
-        if (msg.chatType !== 'group') {
-          await this.delivery.commandCard(msg, {
-            kind: 'input-error', command: 'auth',
-            text: '群授权命令只能在群聊中使用：在目标群里发送 /auth allow 或 /auth revoke。',
-          }, direct)
-          return
-        }
-        if (action === 'allow') {
-          if (this.accessStore.hasGroup(msg.chatId)) {
-            await this.delivery.commandCard(msg, {
-              kind: 'success', command: 'auth', text: `本群已经授权（\`${msg.chatId}\`）。`,
-            }, direct)
-            return
-          }
-          let name: string | undefined
-          try {
-            name = (await this.channel?.getChatInfo(msg.chatId))?.name
-          } catch {
-            name = undefined
-          }
-          await this.accessStore.addGroup({
-            chatId: msg.chatId,
-            ...(name === undefined || name === '' ? {} : { name }),
-            source: 'command',
-            addedBy: msg.senderId,
-            addedAt: now,
-          })
-          await this.delivery.commandCard(msg, {
-            kind: 'success', command: 'auth',
-            text: '✅ 已授权本群。群内只有管理员与已授权用户能与我对话。',
-          }, direct)
-          return
-        }
-        const removed = await this.accessStore.removeGroup(msg.chatId)
-        await this.delivery.commandCard(msg, {
-          kind: removed ? 'success' : 'unavailable', command: 'auth',
-          text: removed ? '已撤销本群授权，立即生效。' : '本群当前未被授权。',
-        }, direct)
-        return
-      }
-      if (action === 'user') {
-        const sub = words[1]
-        const target = sub === 'add' || sub === 'remove'
-          ? resolveAuthUserTarget(words.slice(2).join(' '), msg.mentions, this.channel?.botOpenId())
-          : { ok: false as const, reason: 'usage' as const }
-        if (!target.ok) {
-          await this.delivery.commandCard(msg, {
-            kind: 'input-error', command: 'auth', text: AUTH_USER_TARGET_ERRORS[target.reason],
-          }, direct)
-          return
-        }
-        const { userId } = target
-        const label = target.name === undefined ? `\`${userId}\`` : `${target.name}（\`${userId}\`）`
-        if (sub === 'add') {
-          if (this.accessStore.hasUser(userId)) {
-            await this.delivery.commandCard(msg, {
-              kind: 'success', command: 'auth', text: `该用户已在白名单中：${label}。`,
-            }, direct)
-            return
-          }
-          await this.accessStore.addUser({
-            userId,
-            ...(target.name === undefined ? {} : { name: target.name }),
-            source: 'command', addedBy: msg.senderId, addedAt: now,
-          })
-          await this.delivery.commandCard(msg, {
-            kind: 'success', command: 'auth',
-            text: `✅ 已授权用户 ${label}（在所有已授权群里生效）。`,
-          }, direct)
-          return
-        }
-        const removed = await this.accessStore.removeUser(userId)
-        await this.delivery.commandCard(msg, {
-          kind: removed ? 'success' : 'unavailable', command: 'auth',
-          text: removed ? `已移除用户 ${label}，立即生效。` : `用户 ${label} 不在白名单中。`,
-        }, direct)
-        return
-      }
-      if (action === 'wiki') {
-        const sub = words[1]
-        const target = sub === 'add' || sub === 'remove'
-          ? resolveAuthUserTarget(words.slice(2).join(' '), msg.mentions, this.channel?.botOpenId())
-          : { ok: false as const, reason: 'usage' as const }
-        if (!target.ok) {
-          await this.delivery.commandCard(msg, {
-            kind: 'input-error', command: 'auth',
-            text: target.reason === 'usage' ? AUTH_WIKI_USAGE : AUTH_USER_TARGET_ERRORS[target.reason],
-          }, direct)
-          return
-        }
-        const { userId } = target
-        const label = target.name === undefined ? `\`${userId}\`` : `${target.name}（\`${userId}\`）`
-        if (sub === 'add') {
-          if (this.accessStore.hasWikiUser(userId)) {
-            await this.delivery.commandCard(msg, {
-              kind: 'success', command: 'auth', text: `该用户已在知识库白名单中：${label}。`,
-            }, direct)
-            return
-          }
-          await this.accessStore.addWikiUser({
-            userId,
-            ...(target.name === undefined ? {} : { name: target.name }),
-            source: 'command', addedBy: msg.senderId, addedAt: now,
-          })
-          await this.delivery.commandCard(msg, {
-            kind: 'success', command: 'auth',
-            text: `✅ 已把 ${label} 加入知识库白名单：他发起的话题里可以使用知识库工具（每次读取、新建、修改仍需他在授权卡上确认）。`,
-          }, direct)
-          return
-        }
-        const removed = await this.accessStore.removeWikiUser(userId)
-        await this.delivery.commandCard(msg, {
-          kind: removed ? 'success' : 'unavailable', command: 'auth',
-          text: removed ? `已把 ${label} 移出知识库白名单，立即生效。` : `用户 ${label} 不在知识库白名单中。`,
-        }, direct)
         return
       }
       if (action === 'list') {
-        const groups = this.accessStore.groupRecords()
         const users = this.accessStore.userRecords()
-        const pending = this.accessStore.pendingRequests()
-        const groupLines = groups.length === 0
+        const lines = users.length === 0
           ? ['（暂无）']
-          : groups.slice(0, 30).map(group => `- ${group.name ?? group.chatId} \`${group.chatId}\``)
-        const userLines = users.length === 0
-          ? ['（暂无）']
-          : users.slice(0, 30).map(user => `- ${user.name ?? user.userId} \`${user.userId}\``)
-        const wikiUsers = this.accessStore.wikiUserRecords()
-        const wikiLines = wikiUsers.length === 0
-          ? ['（暂无；管理员始终可用）']
-          : wikiUsers.slice(0, 30).map(user => `- ${user.name ?? user.userId} \`${user.userId}\``)
-        await this.delivery.standaloneReply(msg, standaloneInfoCard('**🔐 访问授权清单**', [
-          `**已授权群（${groups.length}）**`,
-          ...groupLines,
-          `**已授权用户（${users.length}）**`,
-          ...userLines,
-          `**知识库白名单（${wikiUsers.length}）**`,
-          ...wikiLines,
-          `**待处理申请**：${pending.length} 个（可在 Web 设置面板处理）`,
+          : users.slice(0, 30).map(user => `- ${user.name ?? user.userId} \`${user.userId}\`：${permissionSummary(user)}`)
+        await this.delivery.standaloneReply(msg, standaloneInfoCard('**🔐 用户表**', [
+          `**用户（${users.length}）**`,
+          ...lines,
+          `**待处理申请**：${this.accessStore.pendingRequests().length} 个（可在 Web 设置面板处理）`,
         ]), direct)
         return
       }
-      await this.delivery.commandCard(msg, {
-        kind: 'input-error', command: 'auth',
-        text: '用法：/auth [status|allow|revoke|list|user add <@用户|user_id>|user remove <@用户|user_id>|wiki add <@用户|user_id>|wiki remove <@用户|user_id>]',
-      }, direct)
+      const isSet = action === 'set'
+      if (action !== 'add' && action !== 'remove' && !isSet) {
+        await reply('input-error', AUTH_USAGE)
+        return
+      }
+      const permission = isSet ? AUTH_SWITCHES[words[1] ?? ''] : undefined
+      const state = isSet ? words[2] : undefined
+      if (isSet && (permission === undefined || (state !== 'on' && state !== 'off'))) {
+        await reply('input-error', AUTH_USAGE)
+        return
+      }
+      const target = resolveAuthUserTarget(words.slice(isSet ? 3 : 1).join(' '), msg.mentions, this.channel?.botOpenId())
+      if (!target.ok) {
+        await reply('input-error', target.reason === 'usage' ? AUTH_USAGE : AUTH_USER_TARGET_ERRORS[target.reason])
+        return
+      }
+      const { userId } = target
+      const label = target.name === undefined ? `\`${userId}\`` : `${target.name}（\`${userId}\`）`
+      // Administrators are granted and removed only in the Web panel.
+      if (action === 'remove' && this.accessStore.isAdmin(userId)) {
+        await reply('unavailable', `${label} 是管理员，只能在 Web 设置面板取消管理员或移出用户表。`)
+        return
+      }
+      if (action === 'add') {
+        await this.grantChat(userId, target.name, 'command', msg.senderId)
+        await reply('success', `✅ 已把 ${label} 加入用户表并打开对话准入：可以私聊，也可以在任何群里 @ 我。`)
+        return
+      }
+      if (action === 'remove') {
+        const removed = await this.accessStore.removeUser(userId)
+        await reply(removed ? 'success' : 'unavailable', removed ? `已把 ${label} 移出用户表，立即生效。` : `用户 ${label} 不在用户表中。`)
+        return
+      }
+      const updated = await this.accessStore.setPermission(userId, permission!, state === 'on')
+      if (updated === undefined) {
+        await reply('unavailable', `用户 ${label} 不在用户表中，请先 /auth add。`)
+        return
+      }
+      await reply('success', `已${state === 'on' ? '打开' : '关闭'} ${label} 的「${PERMISSION_LABELS[permission!]}」。当前：${permissionSummary(updated)}。`)
     } catch (error) {
       this.ctx.logger?.warn?.('dsh-channels: /auth failed: %s', String(error))
-      await this.delivery.commandCard(msg, {
-        kind: 'unavailable', command: 'auth', text: `授权操作失败：${messageOf(error)}`,
-      }, direct).catch(() => {})
+      await reply('unavailable', `授权操作失败：${messageOf(error)}`).catch(() => {})
     }
   }
 
@@ -2238,6 +2480,75 @@ export class FeishuService {
   }
 
   /**
+   * The live Agent of an interrupted turn's route, cold-resumed when needed;
+   * undefined when the route is gone, was renewed to another Session, or the
+   * resume failed.
+   */
+  private async recoveryAgent(snapshot: InflightSnapshot): Promise<Agent | undefined> {
+    const route = snapshot.routeKey === undefined
+      ? this.routes.findBySession(snapshot.sessionId)
+      : this.routes.get(snapshot.routeKey)
+    if (route === undefined || route.sessionId !== snapshot.sessionId) return undefined
+    try {
+      return (await this.sessions.ensureLive(route)).agent
+    } catch (error) {
+      this.ctx.logger?.warn?.('dsh-channels: resuming session %s for recovery failed: %s', snapshot.sessionId, String(error))
+      return undefined
+    }
+  }
+
+  /** Stream a new turn running `message` into an existing card. */
+  private runIntoCard(
+    agent: Agent,
+    cardMessageId: string,
+    triggerMessageId: string | undefined,
+    reactionId: string | undefined,
+    message: UserMessage,
+  ): void {
+    this.streamer?.attach(agent.session, cardMessageId, triggerMessageId, reactionId, { message })
+    agent.followup(message)
+  }
+
+  /**
+   * Interrupted-card continue button: a user who may act on the route,
+   * clicking inside the session's own chat, starts a turn that continues the
+   * interrupted work, streaming into the clicked card. Each card continues
+   * at most once.
+   */
+  private async onResumeAction(event: CardActionEvent): Promise<void> {
+    if (!this.started) return
+    const target = parseResumeAction(event.action.value)
+    if (target === undefined || this.resumedCards.has(event.messageId)) return
+    const route = this.routes.findBySession(target.sessionId)
+    if (route === undefined) return
+    if (!this.accessController.mayActOnRoute(event.operator.userId, event.chatId, route)) return
+    this.resumedCards.add(event.messageId)
+    try {
+      const live = await this.sessions.ensureLive(route)
+      const message = feishuUserMessage(RESUME_PROMPT)
+      const operator = event.operator.userId
+      if (operator !== undefined) this.codeWriteGate.noteMessage(route.sessionId, message.id, operator)
+      const stored = storableMessage(message)
+      await this.repair.write({
+        key: event.messageId,
+        sessionId: route.sessionId,
+        chatId: route.chatId,
+        ...(target.triggerMessageId === undefined ? {} : { triggerMessageId: target.triggerMessageId }),
+        routeKey: route.key,
+        ...(stored === undefined ? {} : { message: stored }),
+        ...(operator === undefined ? {} : { senderUserId: operator }),
+        cards: [{ messageId: event.messageId, mode: 'card' }],
+        startedAt: Date.now(),
+        attempts: 0,
+      })
+      this.runIntoCard(live.agent, event.messageId, target.triggerMessageId, undefined, message)
+    } catch (error) {
+      this.resumedCards.delete(event.messageId)
+      throw error
+    }
+  }
+
+  /**
    * Picker-card click: run the chosen `/<command> <arg>` exactly as if the
    * operator had typed it under the picker card, so access admission, route
    * ownership and validation are the typed command's. The result replaces
@@ -2371,10 +2682,6 @@ export class FeishuService {
       unregisterBorrowedCommand = registerEffortCommand(live.agent.ctx.commands)
       definition = this.ctx.commands.find(live.agent, spec.name)
     }
-    if (definition === undefined && spec.name === 'model') {
-      unregisterBorrowedCommand = registerModelCommand(live.agent.ctx.commands)
-      definition = this.ctx.commands.find(live.agent, spec.name)
-    }
     if (definition === undefined) {
       unregisterBorrowedCommand?.()
       const text = spec.name === 'compact'
@@ -2396,9 +2703,6 @@ export class FeishuService {
     const effortAdmission: EffortAdmission | undefined = spec.name === 'effort'
       ? { live, controller: this.sessions.requestPolicy(live.agent) }
       : undefined
-    const modelAdmission: ModelAdmission | undefined = spec.name === 'model'
-      ? { live, controller: this.sessions.requestPolicy(live.agent) }
-      : undefined
     const disarmRenew = renewAdmission === undefined
       ? undefined
       : armRenewCommand(controller.signal, invocation => this.runRenewCommand(invocation, renewAdmission))
@@ -2408,12 +2712,6 @@ export class FeishuService {
           controller.signal,
           (invocation, action) => this.runEffortCommand(invocation, action, effortAdmission),
         )
-    const disarmModel = modelAdmission === undefined
-      ? undefined
-      : armModelCommand(
-          controller.signal,
-          (invocation, rawInput) => this.runModelCommand(invocation, rawInput, modelAdmission),
-        )
     let execution
     try {
       execution = await this.ctx.commands.execute(live.agent, line, [], controller.signal)
@@ -2421,7 +2719,6 @@ export class FeishuService {
       this.commandControllers.delete(controller)
       disarmRenew?.()
       disarmEffort?.()
-      disarmModel?.()
       unregisterBorrowedCommand?.()
       if (renewAdmission?.commit !== undefined) {
         await this.sessions.releaseRenewed(renewAdmission.commit)
@@ -2442,7 +2739,6 @@ export class FeishuService {
       compactBefore,
       renewAdmission,
       effortAdmission,
-      modelAdmission,
     })
   }
 
@@ -2458,24 +2754,15 @@ export class FeishuService {
     compactBefore: ContextMeasurement | undefined
     renewAdmission: RenewAdmission | undefined
     effortAdmission: EffortAdmission | undefined
-    modelAdmission: ModelAdmission | undefined
   }): Promise<void> {
-    const { spec, msg, current, live, result, compactBefore, renewAdmission, effortAdmission, modelAdmission } = input
+    const { spec, msg, current, live, result, compactBefore, renewAdmission, effortAdmission } = input
     // A settled switch (not a bare view) reconciles the Agent's selection even
     // when the folded policy looks unchanged, e.g. a reset after restart.
-    const reconcile = !input.bare && result.kind === 'success' ? spec.name : undefined
-    if (spec.name === 'effort') {
-      effortAdmission?.controller.sync(live.agent.session.snapshotEvents(), live.agent, reconcile === 'effort' ? 'effort' : undefined)
-    }
-    if (spec.name === 'model') {
-      modelAdmission?.controller.sync(live.agent.session.snapshotEvents(), live.agent, reconcile === 'model' ? 'model' : undefined)
-    }
-    if (input.bare && result.kind === 'success') {
-      const picker = spec.name === 'model' && modelAdmission !== undefined
-        ? await this.modelPicker(current, live, modelAdmission)
-        : spec.name === 'effort' && effortAdmission !== undefined
-          ? await this.effortPicker(current, live, effortAdmission, result.text ?? '')
-          : undefined
+    effortAdmission?.controller.sync(
+      live.agent.session.snapshotEvents(), live.agent, !input.bare && result.kind === 'success',
+    )
+    if (input.bare && result.kind === 'success' && effortAdmission !== undefined) {
+      const picker = await this.effortPicker(current, live, effortAdmission, result.text ?? '')
       if (picker !== undefined) {
         await this.delivery.standaloneReply(msg, picker)
         return
@@ -2690,6 +2977,7 @@ export class FeishuService {
       routeCount: this.routes.size(),
       liveAgentCount: this.sessions.liveCount(),
       inflightTurnCount,
+      outbox: this.outbox.health(),
     })
   }
 
@@ -2832,75 +3120,6 @@ export class FeishuService {
    * segment is re-delivered as a plain-text message so the content is never
    * lost — text messages carry no card constraints.
    */
-  /** Authorized Session-level `/model` view/switch operation. */
-  private async runModelCommand(
-    invocation: CommandInvocation,
-    rawInput: string,
-    admission: ModelAdmission,
-  ): Promise<CommandResult> {
-    if (admission.live.agent !== invocation.agent) {
-      return { kind: 'error', text: '/model 只能通过已授权的飞书话题执行。' }
-    }
-    const { provider: currentProvider, model: currentModel } = currentModelRoute(admission.live, admission.controller)
-
-    if (rawInput === '') {
-      const lines = [currentModelLine(admission.live, admission.controller)]
-      const models = await this.listModels(currentProvider)
-      if (models.length > 0) {
-        lines.push(`**可选模型（${models.length}）**：${models.slice(0, 20).map(id => `\`${id}\``).join('、')}`
-          + (models.length > 20 ? ' …' : ''))
-      } else if (currentProvider === undefined) {
-        lines.push('当前还没有模型请求记录；可先用 `/model <provider>/<model>` 指定，或先发一条普通消息。')
-      }
-      lines.push('用法：`/model <模型-id>`（沿用当前 provider）· `/model <provider>/<model>` · `/model reset`')
-      return { kind: 'success', text: lines.join('\n') }
-    }
-
-    if (rawInput === 'reset') {
-      return { kind: 'success', text: '已恢复部署默认模型（下一条消息生效）。' }
-    }
-
-    const slash = rawInput.indexOf('/')
-    const provider = slash === -1 ? currentProvider : rawInput.slice(0, slash)
-    const model = slash === -1 ? rawInput : rawInput.slice(slash + 1)
-    if (model === '' || (slash !== -1 && (provider === undefined || provider === ''))) {
-      return { kind: 'error', text: '用法错误：/model [模型-id|provider/model|reset]。' }
-    }
-    // Validate against the advertised catalog when the deployment exposes one;
-    // an unsupported value would otherwise only fail at the next request.
-    if (provider !== undefined) {
-      const models = await this.listModels(provider)
-      if (models.length > 0 && !models.includes(model)) {
-        return {
-          kind: 'error',
-          text: `provider \`${provider}\` 未提供模型 \`${model}\`。可选：${models.slice(0, 20).map(id => `\`${id}\``).join('、')}`,
-        }
-      }
-    }
-    const label = provider === undefined ? model : `${provider}/${model}`
-    return { kind: 'success', text: `当前 Session 模型已切换为 \`${label}\`（下一条消息生效）。` }
-  }
-
-  /** `/model` picker: the provider's advertised models, or undefined when none are listed. */
-  private async modelPicker(
-    current: RouteRecord,
-    live: LiveAgent,
-    admission: ModelAdmission,
-  ): Promise<object | undefined> {
-    const route = currentModelRoute(live, admission.controller)
-    const models = await this.listModels(route.provider)
-    if (models.length === 0) return undefined
-    return buildPickerCard({
-      title: '🧠 模型',
-      command: 'model',
-      text: `${currentModelLine(live, admission.controller)}\n切换在下一条消息生效。`,
-      sessionId: current.sessionId,
-      options: models.map(id => ({ label: id, arg: id })),
-      ...(route.model === undefined ? {} : { current: route.model }),
-      reset: true,
-    })
-  }
-
   /**
    * `/effort` picker: the efforts the current model route advertises, or
    * undefined when the route is unknown or advertises none.
@@ -2932,18 +3151,6 @@ export class FeishuService {
       ...(active === undefined ? {} : { current: active }),
       reset: true,
     })
-  }
-
-  /** Model ids advertised for one provider route (empty when unavailable). */
-  private async listModels(provider: string | undefined): Promise<string[]> {
-    if (provider === undefined) return []
-    try {
-      const llm = this.ctx.get?.('llm') as LlmService | undefined
-      const models = await llm?.listModels?.(provider)
-      return (models ?? []).map(entry => entry.id ?? entry.name ?? '').filter(id => id !== '')
-    } catch {
-      return []
-    }
   }
 
   /**
@@ -3084,19 +3291,9 @@ function currentModelRoute(
   const selected = live.agent.model?.current()
   const header = live.agent.session.requestHeader?.()?.config
   return {
-    provider: state.effectiveModel?.provider ?? selected?.provider
+    provider: state.configuredModel?.provider ?? selected?.provider
       ?? (typeof header?.provider === 'string' && header.provider !== '' ? header.provider : undefined),
-    model: state.effectiveModel?.model ?? selected?.model
+    model: state.configuredModel?.model ?? selected?.model
       ?? (typeof header?.model === 'string' && header.model !== '' ? header.model : undefined),
   }
-}
-
-/** `**当前模型**：…` line shared by the `/model` text answer and its picker. */
-function currentModelLine(live: LiveAgent, controller: RequestPolicyController): string {
-  const { provider, model } = currentModelRoute(live, controller)
-  const source = controller.state.modelSource === 'session'
-    ? 'Session 覆盖'
-    : controller.state.modelSource === 'config' ? '配置默认' : '部署默认'
-  return `**当前模型**：${model === undefined ? '尚无模型请求记录' : `\`${model}\``}`
-    + `${provider === undefined ? '' : `（provider \`${provider}\`）`} · ${source}`
 }

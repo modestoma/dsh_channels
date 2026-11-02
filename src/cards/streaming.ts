@@ -5,17 +5,18 @@
  *
  * Composition, main card:
  *
- *   [fold panel] [activity status] [activity tool] [body]
+ *   [origin] [headline] [reasoning fold panel] [delegation status] [body]
  *   [hr] [model · session · reasoning time]
  *   [context share · input · output · cache hit]
  *
- * - The panel shows the reasoning behind its own window. While the turn is
- *   still thinking it doubles as the phase indicator; once the turn settles
- *   without any reasoning content (non-reasoning models) it is omitted
- *   entirely instead of leaving an empty bordered box.
- * - The two activity lines are transient: the streamer only passes them for
- *   the card that is currently streaming, so frozen segment cards never repeat
- *   a stale "正在调用工具" line.
+ * - The headline is the one place the turn's state shows: what it is doing
+ *   while it runs, its outcome once settled.
+ * - The panel (`思考过程`) folds the reasoning behind its own window and
+ *   renders only when there is reasoning; it never indicates state.
+ * - The headline and the delegation line are transient: the streamer only
+ *   passes them for the card that is currently streaming, so frozen segment
+ *   cards never repeat a stale status. A live turn without answer text shows
+ *   no body placeholder.
  * - The settled footer is a divider plus two notation lines and renders
  *   exactly once: on the main card, only after the turn settles. It carries
  *   the model/effort, session id and the turn's accumulated reasoning time
@@ -47,13 +48,24 @@ import { card, divider, foldPanel, markdown, note, textButton } from './primitiv
 
 export type PanelPhase = 'thinking' | 'replying' | 'done' | 'stopped' | 'error'
 
-export const PANEL_TITLES: Record<PanelPhase, string> = {
-  thinking: '推理中',
-  replying: '回复中',
-  done: '回复结束',
-  stopped: '已停止',
-  error: '回复失败',
+/**
+ * Headline per phase, used when the caller passes none (first frames and
+ * terminal cards built outside the streamer). The streamer passes a precise
+ * headline mapped from the live DSH events.
+ */
+export const TURN_HEADLINES: Record<PanelPhase, string> = {
+  thinking: '⚙️ 进行中',
+  replying: '✍️ 输出中',
+  done: '✅ 已完成',
+  stopped: '⏹ 已停止',
+  error: '❌ 失败',
 }
+
+/** Title of the fold panel holding the turn's reasoning. */
+export const REASONING_PANEL_TITLE = '思考过程'
+
+/** `decision` carried by the interrupted card's continue button. */
+export const RESUME_ACTION = 'turn-resume'
 
 /** `decision` carried by the streaming card's stop button. */
 export const STOP_ACTION = 'turn-stop'
@@ -135,12 +147,17 @@ export interface CardState {
    */
   status?: string
   /**
-   * The parent agent's in-flight tool call, rendered as a notation line below
-   * the status line. Independent of `status`: neither ever supersedes the
-   * other. Same rule as `status` — only the actively streaming card renders it.
-   * Empty/undefined → omitted.
+   * What the turn is doing, rendered as the card's first line. Undefined →
+   * the phase's {@link TURN_HEADLINES} entry on the main card (none on a
+   * continuation card); '' → omitted (the streamer passes it only for the
+   * card that is currently streaming, and the outcome only for the main card).
    */
-  tool?: string
+  headline?: string
+  /**
+   * The queued message left the agent inbox unclaimed: the main card renders
+   * only the removed-from-queue notice.
+   */
+  dropped?: boolean
   /**
    * Stop control for the actively streaming card. Same rule as `status`: the
    * streamer passes it only for the current card of an unsettled turn.
@@ -157,6 +174,11 @@ export interface CardState {
   queued?: boolean
   /** Add the owner-only notice under the steer button (a non-owner clicked it). */
   queuedDenied?: boolean
+  /**
+   * Why a turn no Feishu message started is running (e.g. a subagent woke the
+   * Agent), rendered as the first notation line of the main card.
+   */
+  origin?: string
   stats: CardStats
 }
 
@@ -339,28 +361,24 @@ function buildUsageLine(stats: CardStats): string {
     + ` · 📩 输入 ${fmt(stats.inputTokens)} · 📨 输出 ${fmt(stats.outputTokens)} · ⚡ 缓存命中 ${fmtCacheHit(stats.cacheHitPct)}`
 }
 
-function reasoningPlaceholder(phase: PanelPhase): string {
-  return phase === 'thinking' ? '*等待模型输出…*' : '*（本次无推理内容）*'
+/** Body of a settled turn that wrote no answer text. */
+const EMPTY_BODY = '*（本次无正文输出）*'
+
+/** The panel's markdown: the reasoning stripped of tables. */
+function panelContent(reasoning: string): string {
+  return stripTables(reasoning)
 }
 
-function bodyPlaceholder(phase: PanelPhase): string {
-  return isSettled(phase) ? '*（本次无正文输出）*' : '*正在生成…*'
+/** Whether the fold panel renders: only when there is reasoning to fold away. */
+function panelShown(reasoning: string): boolean {
+  return stripTables(reasoning).trim() !== ''
 }
 
-/** The panel's markdown: stripped of tables, with a placeholder when empty. */
-function panelContent(phase: PanelPhase, reasoning: string): string {
-  const stripped = stripTables(reasoning)
-  return stripped.trim() === '' ? reasoningPlaceholder(phase) : stripped
-}
-
-/**
- * Whether the fold panel renders. `thinking` always does (it carries the
- * phase indicator while the card is otherwise empty); every later phase only
- * when there is actual reasoning to fold away — a settled non-reasoning turn
- * gets no empty bordered box.
- */
-function panelShown(phase: PanelPhase, reasoning: string): boolean {
-  return phase === 'thinking' || stripTables(reasoning).trim() !== ''
+/** `思考过程`, plus the reasoning time once the turn settled. */
+function panelTitle(state: CardState): string {
+  return isSettled(state.phase) && state.stats.reasoningMs !== undefined
+    ? `${REASONING_PANEL_TITLE} · ${fmtReasoningTime(state.stats.reasoningMs)}`
+    : REASONING_PANEL_TITLE
 }
 
 /** Continuation header: `📄 回复分段 {n}`. */
@@ -384,17 +402,13 @@ function isSettled(phase: PanelPhase): boolean {
  */
 const ACTIVITY_LINE_MAX_CHARS = 512
 
-/** One caller-supplied notation line, defensively capped; undefined when empty. */
-function activityNote(text: string | undefined): object | undefined {
+/** One caller-supplied status line, defensively capped; undefined when empty. */
+function activityLine(text: string | undefined): string | undefined {
   if (text === undefined || text === '') return undefined
-  const clipped = text.length <= ACTIVITY_LINE_MAX_CHARS
+  return text.length <= ACTIVITY_LINE_MAX_CHARS
     ? text
     : `${text.slice(0, ACTIVITY_LINE_MAX_CHARS - 1)}…`
-  return note(clipped)
 }
-
-/** Main-card line of a turn that ended through a stop request. */
-export const STOPPED_NOTICE = '⏹ 已按请求停止本轮回复'
 
 /** The stop button plus its optional owner-only notice. */
 function stopElements(stop: StopControl, denied: boolean): object[] {
@@ -418,6 +432,9 @@ export const STEER_LABEL = '⚡ 立即补充到当前回复'
 
 /** Body of a queued card after its message moved into the running turn. */
 export const MERGED_NOTICE = '↪️ 已补充到当前回复：当前这一步结束后模型就会读到这条消息，回复继续在上一张卡片中输出'
+
+/** Body of a queued card whose message was removed from the agent inbox before any turn claimed it. */
+export const DROPPED_NOTICE = '↩️ 这条消息已从队列中移除，没有处理'
 
 /** The queued card: notice, steer button and the optional owner-only notice. */
 function queuedElements(denied: boolean): object[] {
@@ -446,31 +463,27 @@ function renderCard(
 ): object {
   const segment = options.segment
   const main = segment === undefined
+  if (main && state.dropped === true) return card([markdown(DROPPED_NOTICE)])
   if (main && state.queued === true) return card(queuedElements(state.queuedDenied === true))
   const elements: object[] = []
 
-  if (main) {
-    if (panelShown(state.phase, reasoning)) {
-      elements.push(foldPanel(
-        PANEL_TITLES[state.phase],
-        panelContent(state.phase, reasoning),
-        PANEL_CHEVRON_TOKEN,
-      ))
-    }
-  } else {
-    elements.push(note(segmentHeader(segment)))
+  if (main && state.origin !== undefined && state.origin !== '') elements.push(note(state.origin))
+  if (!main) elements.push(note(segmentHeader(segment)))
+  const headline = state.headline ?? (main ? TURN_HEADLINES[state.phase] : '')
+  const headlineLine = activityLine(headline)
+  if (headlineLine !== undefined) elements.push(markdown(headlineLine))
+  if (main && panelShown(reasoning)) {
+    elements.push(foldPanel(panelTitle(state), panelContent(reasoning), PANEL_CHEVRON_TOKEN))
   }
 
-  const statusNote = activityNote(state.status)
-  if (statusNote !== undefined) elements.push(statusNote)
-  const toolNote = activityNote(state.tool)
-  if (toolNote !== undefined) elements.push(toolNote)
+  const statusLine = activityLine(state.status)
+  if (statusLine !== undefined) elements.push(note(statusLine))
 
-  elements.push(markdown(body.trim() === '' ? bodyPlaceholder(state.phase) : body))
+  // A live turn without answer text yet shows only its headline.
+  if (body.trim() !== '') elements.push(markdown(body))
+  else if (main && isSettled(state.phase)) elements.push(markdown(EMPTY_BODY))
 
   if (state.stop !== undefined) elements.push(...stopElements(state.stop, state.stopDenied === true))
-
-  if (main && state.phase === 'stopped') elements.push(note(STOPPED_NOTICE))
 
   if (main && isSettled(state.phase)) {
     // The divider separates the answer from the turn's metadata; the two
@@ -514,7 +527,7 @@ function budgetReasoning(state: CardState): string {
   return fitPrefix(
     state.reasoning,
     REASONING_MAX_BYTES,
-    content => jsonBytes(panelContent(state.phase, content)),
+    content => jsonBytes(panelContent(content)),
     TRUNCATION_SUFFIX,
   )
 }
@@ -548,6 +561,9 @@ export function buildCard(state: CardState, options: CardOptions = {}): object {
  */
 const PANEL_PROBE_MARKDOWN = 'r'.repeat(REASONING_MAX_BYTES - 2)
 
+/** Worst-case status line: the streamer's 64-character cap, in 3-byte CJK characters. */
+const LINE_PROBE = '状'.repeat(64)
+
 /**
  * Split a body so one card fits: `head` re-renders within `CARD_TARGET_BYTES`
  * and `tail` flows into the next segment card ('' when everything fits).
@@ -556,8 +572,9 @@ const PANEL_PROBE_MARKDOWN = 'r'.repeat(REASONING_MAX_BYTES - 2)
  * always budgets the panel's full window (reasoning may keep growing after the
  * split) and its settled footer, while continuation cards have neither. Every
  * card also budgets the stop button with its notice, since the newest card
- * carries it while streaming. The `error` phase is probed because it has the
- * longest panel title.
+ * carries it while streaming. The headline and the delegation line are
+ * probed at the streamer's 64-character cap in CJK text, and the settled panel
+ * title with its reasoning time.
  */
 export function segmentCardContent(state: CardState, options: CardOptions = {}): BodySplit {
   const main = options.segment === undefined
@@ -565,8 +582,11 @@ export function segmentCardContent(state: CardState, options: CardOptions = {}):
     ...state,
     phase: 'error',
     reasoning: main ? PANEL_PROBE_MARKDOWN : '',
+    headline: LINE_PROBE,
+    status: LINE_PROBE,
     stop: 'stopping',
     stopDenied: true,
+    stats: { ...state.stats, reasoningMs: state.stats.reasoningMs ?? 0 },
   }
   const limit = fitPrefix(
     state.body,
@@ -584,6 +604,21 @@ export function segmentCardOptions(index: number): CardOptions {
 /** Interruption notice body for cards repaired after a restart mid-turn. */
 export const INTERRUPTION_NOTICE = '⚠️ 服务已重启，本次回复中断，请重新发送消息。'
 
+/** Interruption notice on a main card that offers to continue the turn. */
+export const RESUMABLE_INTERRUPTION_NOTICE = '⚠️ 服务已重启，本轮回复中断。点击「继续」让它从中断处接着完成，或重新发送消息。'
+
+/** Label of the interrupted card's continue button. */
+export const RESUME_LABEL = '▶️ 继续'
+
+/**
+ * What the continue button resumes: the interrupted turn's Session, and the
+ * message whose reaction the continued turn settles (absent for a host turn).
+ */
+export interface ResumeTarget {
+  sessionId: string
+  triggerMessageId?: string
+}
+
 /**
  * Terminal "interrupted" card used by the restart repair pass (`repairInflight`).
  *
@@ -591,13 +626,89 @@ export const INTERRUPTION_NOTICE = '⚠️ 服务已重启，本次回复中断�
  * the partial body/reasoning the card previously streamed (patch is full
  * replacement), and fabricating zero-valued token stats would be misleading.
  * The card is therefore minimal — a plain notice (+ segment header on
- * continuation cards) — and always far inside the size budget.
+ * continuation cards) — and always far inside the size budget. With `resume`,
+ * the main card carries the continue button (`RESUME_ACTION`).
  */
-export function buildInterruptionCard(options: CardOptions = {}): object {
+export function buildInterruptionCard(options: CardOptions = {}, resume?: ResumeTarget): object {
   const elements: object[] = []
   if (options.segment !== undefined) elements.push(note(interruptionHeader(options.segment)))
-  elements.push(markdown(INTERRUPTION_NOTICE))
+  if (resume === undefined || options.segment !== undefined) {
+    elements.push(markdown(INTERRUPTION_NOTICE))
+    return card(elements)
+  }
+  elements.push(markdown(RESUMABLE_INTERRUPTION_NOTICE), textButton({
+    label: RESUME_LABEL,
+    type: 'primary',
+    width: 'default',
+    margin: '8px 0 0 0',
+    value: {
+      decision: RESUME_ACTION,
+      sessionId: resume.sessionId,
+      ...(resume.triggerMessageId === undefined ? {} : { trigger: resume.triggerMessageId }),
+    },
+  }))
   return card(elements)
+}
+
+/**
+ * Parse a continue-button click value.
+ * @param value - `action.value` of a card click.
+ * @returns the resume target, or undefined for any other click.
+ */
+export function parseResumeAction(value: unknown): ResumeTarget | undefined {
+  if (typeof value !== 'object' || value === null) return undefined
+  const record = value as Record<string, unknown>
+  if (record.decision !== RESUME_ACTION || typeof record.sessionId !== 'string' || record.sessionId === '') return undefined
+  return typeof record.trigger === 'string' && record.trigger !== ''
+    ? { sessionId: record.sessionId, triggerMessageId: record.trigger }
+    : { sessionId: record.sessionId }
+}
+
+/** Main-card line of a reply recovered from the Session log after a restart. */
+export const RECOVERED_REPLY_NOTICE = '♻️ 这轮回复在服务重启前已完成，以下是最终回复'
+
+/** Suffix of a recovered reply that did not fit the cards the turn had. */
+export const RECOVERED_REPLY_CLIPPED = '\n\n…（回复较长，完整内容请在 dsh 客户端查看）'
+
+function recoveredCard(body: string, options: CardOptions): object {
+  const elements: object[] = []
+  if (options.segment === undefined) elements.push(note(RECOVERED_REPLY_NOTICE))
+  else elements.push(note(segmentHeader(options.segment)))
+  elements.push(markdown(body))
+  return card(elements)
+}
+
+/**
+ * Settled cards for a turn that completed while its cards were not being
+ * patched (the process restarted first): the final reply text, re-read from
+ * the Session log, spread over the turn's existing cards in order. Text that
+ * does not fit those cards is clipped with a pointer to the dsh client.
+ * @param text - the turn's final reply text.
+ * @param count - how many cards the turn has (≥ 1).
+ * @returns one card per existing card, main card first.
+ */
+export function buildRecoveredReplyCards(text: string, count: number): object[] {
+  const cards: object[] = []
+  let remaining = text.trim() === '' ? '（本轮没有文字回复）' : text
+  for (let index = 0; index < count; index++) {
+    const options = segmentCardOptions(index)
+    const last = index === count - 1
+    const limit = fitPrefix(
+      remaining,
+      CARD_TARGET_BYTES,
+      content => cardJsonBytes(recoveredCard(last ? `${content}${RECOVERED_REPLY_CLIPPED}` : content, options)),
+    ).length
+    const split = splitBodyForCard(remaining, limit)
+    const body = last && split.tail !== '' ? `${split.head}${RECOVERED_REPLY_CLIPPED}` : split.head
+    cards.push(recoveredCard(body, options))
+    remaining = split.tail
+    if (remaining === '') {
+      // Later cards keep their place in the topic with an empty segment.
+      for (let rest = index + 1; rest < count; rest++) cards.push(recoveredCard('（续片内容已合并到上一张卡片）', segmentCardOptions(rest)))
+      break
+    }
+  }
+  return cards
 }
 
 /**

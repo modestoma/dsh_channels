@@ -14,6 +14,7 @@ import type { KeyboardEvent } from 'react'
 import { PANEL_COPY, PANEL_TABS, TAB_FIELD_GROUPS } from '../../settings/contract.ts'
 import type {
   AccessMutationResponse,
+  AccessPermissionWire,
   AccessWire,
   CatalogWire,
   ChannelStatusWire,
@@ -26,9 +27,7 @@ import type {
   PanelWire,
 } from '../../settings/contract.ts'
 import {
-  addAccessGroup,
   addAccessUser,
-  addWikiUser,
   clearConfig,
   clearCredential,
   fetchCatalog,
@@ -36,10 +35,11 @@ import {
   fetchStatus,
   pickDirectory as requestDirectoryPicker,
   reconnect,
-  removeAccessGroup,
+  takeover,
   removeAccessUser,
-  removeWikiUser,
   resolveAccessRequest,
+  setAccessGitEmail,
+  setAccessPermission,
   saveConfig,
   saveCredentials,
 } from '../api.ts'
@@ -60,13 +60,15 @@ import {
   validateDraft,
 } from './shared.tsx'
 import type {
-  AnalyzeTokenView,
   BusyAction,
   CredentialsView,
   FormView,
   LoadState,
   Notice,
 } from './shared.tsx'
+import { FeishuChannelsIcon } from '../icon.tsx'
+import { RefreshIcon } from './records-icons.tsx'
+import { RecordsTab } from './records-tab.tsx'
 import { WikiTab } from './wiki-tab.tsx'
 
 /**
@@ -95,7 +97,6 @@ function FeishuChannelsPanel(): JSX.Element | null {
   const [pollError, setPollError] = useState<string | null>(null)
   const [appIdInput, setAppIdInput] = useState('')
   const [appSecretInput, setAppSecretInput] = useState('')
-  const [analyzeTokenInput, setAnalyzeTokenInput] = useState('')
   const [catalog, setCatalog] = useState<CatalogWire | null>(null)
   const [catalogBusy, setCatalogBusy] = useState(false)
   const [accessNotice, setAccessNotice] = useState<string | null>(null)
@@ -122,7 +123,6 @@ function FeishuChannelsPanel(): JSX.Element | null {
       setDraft({})
       setAppIdInput('')
       setAppSecretInput('')
-      setAnalyzeTokenInput('')
     } catch (error) {
       setLoad({ phase: 'error', message: messageOf(error) })
     }
@@ -417,25 +417,76 @@ function FeishuChannelsPanel(): JSX.Element | null {
     }
   }, [refreshStatus, running])
 
-  /** Replace the embedded access snapshot after a whitelist mutation. */
+  /** Take the connection over from the other dsh process; it interrupts that process's replies. */
+  const onTakeover = useCallback(async (): Promise<void> => {
+    const confirmed = typeof window.confirm === 'function'
+      ? window.confirm(PANEL_COPY.takeoverWarning)
+      : true
+    if (!confirmed) return
+    setBusy('takeover')
+    setNotice(null)
+    try {
+      const result = await takeover()
+      if (!result.ok) {
+        setNotice({ kind: 'error', text: result.error })
+        if (result.unconfigured === true) setActiveTab('connection')
+        await refreshStatus()
+        return
+      }
+      setLoad({ phase: 'ready', panel: result.panel })
+      setStatus(result.panel.status)
+      setNotice({ kind: 'ok', text: PANEL_COPY.takeoverDone })
+    } catch (error) {
+      setNotice({ kind: 'error', text: messageOf(error) })
+      await refreshStatus()
+    } finally {
+      setBusy(null)
+    }
+  }, [refreshStatus])
+
+  /** Replace the embedded access snapshot after a user-table mutation. */
   const applyAccess = useCallback((access: AccessWire): void => {
     setLoad(previous => previous.phase === 'ready'
       ? { phase: 'ready', panel: { ...previous.panel, access } }
       : previous)
   }, [])
 
-  const onAddAccessGroup = useCallback(async (chatId: string, name: string): Promise<boolean> => {
+  const onTogglePermission = useCallback(async (
+    userId: string,
+    permission: AccessPermissionWire,
+    enabled: boolean,
+  ): Promise<void> => {
     setBusy('access')
     setAccessError(null)
     setAccessNotice(null)
     try {
-      const result = await addAccessGroup(chatId, name)
+      const result = await setAccessPermission(userId, permission, enabled)
+      if (!result.ok) {
+        setAccessError(result.error)
+        return
+      }
+      applyAccess(result.access)
+      setAccessNotice(PANEL_COPY.accessPermissionChanged)
+    } catch (error) {
+      setAccessError(messageOf(error))
+    } finally {
+      setBusy(null)
+    }
+  }, [applyAccess])
+
+  /** Set or clear one user's git email; resolves true when the editor should close. */
+  const onSetGitEmail = useCallback(async (userId: string, gitEmail: string): Promise<boolean> => {
+    setBusy('access')
+    setAccessError(null)
+    setAccessNotice(null)
+    try {
+      const result = await setAccessGitEmail(userId, gitEmail)
       if (!result.ok) {
         setAccessError(result.error)
         return false
       }
       applyAccess(result.access)
-      setAccessNotice(PANEL_COPY.accessGroupAdded)
+      setAccessNotice(PANEL_COPY.accessGitEmailChanged)
       return true
     } catch (error) {
       setAccessError(messageOf(error))
@@ -445,26 +496,7 @@ function FeishuChannelsPanel(): JSX.Element | null {
     }
   }, [applyAccess])
 
-  const onRemoveAccessGroup = useCallback(async (chatId: string): Promise<void> => {
-    setBusy('access')
-    setAccessError(null)
-    setAccessNotice(null)
-    try {
-      const result = await removeAccessGroup(chatId)
-      if (!result.ok) {
-        setAccessError(result.error)
-        return
-      }
-      applyAccess(result.access)
-      setAccessNotice(PANEL_COPY.accessGroupRemoved)
-    } catch (error) {
-      setAccessError(messageOf(error))
-    } finally {
-      setBusy(null)
-    }
-  }, [applyAccess])
-
-  /** Add one user to a whitelist; resolves true when the input should clear. */
+  /** Add one user to the user table; resolves true when the input should clear. */
   const addUser = useCallback(async (
     add: (userId: string, name: string) => Promise<AccessMutationResponse>,
     userId: string,
@@ -573,28 +605,6 @@ function FeishuChannelsPanel(): JSX.Element | null {
     }
   }, [appIdInput, appSecretInput])
 
-  /** Save the analyze API token; it applies to the next request, no reconnect. */
-  const onSaveAnalyzeToken = useCallback(async (): Promise<void> => {
-    if (analyzeTokenInput.trim() === '') return
-    setBusy('credentials')
-    setNotice(null)
-    try {
-      const result = await saveCredentials({ analyzeToken: analyzeTokenInput })
-      if (!result.ok) {
-        setNotice({ kind: 'error', text: result.error, issues: result.issues })
-        return
-      }
-      setLoad({ phase: 'ready', panel: result.panel })
-      setStatus(result.panel.status)
-      setAnalyzeTokenInput('')
-      setNotice({ kind: 'ok', text: PANEL_COPY.analyzeTokenSaved })
-    } catch (error) {
-      setNotice({ kind: 'error', text: messageOf(error) })
-    } finally {
-      setBusy(null)
-    }
-  }, [analyzeTokenInput])
-
   const onClearCredential = useCallback(async (field: CredentialField): Promise<void> => {
     const confirmed = typeof window.confirm === 'function'
       ? window.confirm(PANEL_COPY.credentialRemoveConfirm)
@@ -612,9 +622,7 @@ function FeishuChannelsPanel(): JSX.Element | null {
       setStatus(result.panel.status)
       setNotice({
         kind: 'ok',
-        text: field === 'analyzeToken'
-          ? PANEL_COPY.analyzeTokenRemoved
-          : result.reconnect === 'pending' ? PANEL_COPY.credentialRemovedPending : PANEL_COPY.credentialRemoved,
+        text: result.reconnect === 'pending' ? PANEL_COPY.credentialRemovedPending : PANEL_COPY.credentialRemoved,
       })
     } catch (error) {
       setNotice({ kind: 'error', text: messageOf(error) })
@@ -676,16 +684,6 @@ function FeishuChannelsPanel(): JSX.Element | null {
     onClear: (field: CredentialField) => { void onClearCredential(field) },
   }), [appIdInput, appSecretInput, busy, hostBusy, issues, onClearCredential, onSaveCredentials])
 
-  const analyzeToken = useMemo<AnalyzeTokenView>(() => ({
-    value: analyzeTokenInput,
-    issues,
-    busy,
-    locked: hostBusy,
-    onChange: setAnalyzeTokenInput,
-    onSave: () => { void onSaveAnalyzeToken() },
-    onClear: () => { void onClearCredential('analyzeToken') },
-  }), [analyzeTokenInput, busy, hostBusy, issues, onClearCredential, onSaveAnalyzeToken])
-
   if (load.phase === 'loading') {
     return (
       <div className="dsh-channels-cfg">
@@ -741,10 +739,12 @@ function FeishuChannelsPanel(): JSX.Element | null {
                 busy={busy}
                 credentials={credentials}
                 onReconnect={() => { void onReconnect() }}
+                onTakeover={() => { void onTakeover() }}
               />
             )
           : null}
         {activeTab === 'sessions' ? <FieldsTab form={form} tab="sessions" /> : null}
+        {activeTab === 'records' ? <RecordsTab /> : null}
         {activeTab === 'model'
           ? <FieldsTab form={form} tab="model" note={catalogBusy ? PANEL_COPY.catalogLoading : undefined} />
           : null}
@@ -756,28 +756,21 @@ function FeishuChannelsPanel(): JSX.Element | null {
                 profiles={profiles}
                 accessNotice={accessNotice}
                 accessError={accessError}
-                onAddGroup={onAddAccessGroup}
-                onRemoveGroup={chatId => { void onRemoveAccessGroup(chatId) }}
                 onAddUser={(userId, name) => addUser(addAccessUser, userId, name, PANEL_COPY.accessUserAdded)}
                 onRemoveUser={userId => { void removeUser(removeAccessUser, userId, PANEL_COPY.accessUserRemoved) }}
+                onTogglePermission={(userId, permission, enabled) => { void onTogglePermission(userId, permission, enabled) }}
+                onSetGitEmail={onSetGitEmail}
                 onResolveRequest={(token, decision) => { void onResolveAccessRequest(token, decision) }}
               />
             )
           : null}
         {activeTab === 'wiki'
           ? (
-              <WikiTab
-                form={form}
-                profiles={profiles}
-                accessNotice={accessNotice}
-                accessError={accessError}
-                onAddUser={(userId, name) => addUser(addWikiUser, userId, name, PANEL_COPY.wikiUserAdded)}
-                onRemoveUser={userId => { void removeUser(removeWikiUser, userId, PANEL_COPY.wikiUserRemoved) }}
-              />
+              <WikiTab form={form} profiles={profiles} />
             )
           : null}
         {activeTab === 'advanced'
-          ? <AdvancedTab form={form} analyzeToken={analyzeToken} onClear={() => { void onClear() }} />
+          ? <AdvancedTab form={form} onClear={() => { void onClear() }} />
           : null}
       </div>
       <SaveBar
@@ -805,6 +798,7 @@ function PanelHeader(props: {
   return (
     <header className="dsh-channels-cfg__panelHead">
       <div className="dsh-channels-cfg__headRow">
+        <span className="dsh-channels-cfg__logo"><FeishuChannelsIcon size={18} active={false} /></span>
         <h1 className="dsh-channels-cfg__title">{PANEL_COPY.title}</h1>
         <Pill tone={badge.tone} dot>{badge.text}</Pill>
         <span className="dsh-channels-cfg__meta dsh-channels-cfg__mono">v{status.version}</span>
@@ -818,6 +812,7 @@ function PanelHeader(props: {
           onClick={onRefresh}
           disabled={busy !== null || locked}
         >
+          <RefreshIcon />
           {PANEL_COPY.refresh}
         </button>
       </div>

@@ -3,22 +3,21 @@
  * routes, and FeishuService config hot-apply / reconnect integration.
  */
 
-import { mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import { resolveConfig } from '../src/config.ts'
 import type { FeishuConfig } from '../src/config.ts'
 import type { AgentPreset, HostContext, LlmModelInfo, LlmService } from '../src/dsh-types.ts'
-import { FeishuService } from '../src/service.ts'
+import { makeInstanceLocks, TestFeishuService as FeishuService } from './helpers.ts'
+import type { LockHolderInfo } from '../src/instance-lock.ts'
 import { HEALTH_DEPENDENCY_NAMES } from '../src/health.ts'
 import type { HealthSnapshot } from '../src/health.ts'
 import type { FeishuChannel } from '../src/feishu-channel.ts'
 import {
   ACCESS_ROUTE,
-  ADD_ACCESS_GROUP_ROUTE,
   ADD_ACCESS_USER_ROUTE,
-  ADD_WIKI_USER_ROUTE,
   BYTES_UNIT,
   CATALOG_ROUTE,
   CLEAR_CONFIG_ROUTE,
@@ -32,13 +31,18 @@ import {
   PROFILES_MAX_IDS,
   PROFILES_ROUTE,
   SESSION_ORIGIN_ROUTE,
+  SESSION_RECORDS_ROUTE,
+  WORKSPACE_FILE_DOWNLOAD_ROUTE,
+  WORKSPACE_FILE_PREVIEW_ROUTE,
+  WORKSPACE_FILES_ROUTE,
   PANEL_TABS,
   TAB_FIELD_GROUPS,
   RECONNECT_ROUTE,
-  REMOVE_ACCESS_GROUP_ROUTE,
+  TAKEOVER_ROUTE,
   REMOVE_ACCESS_USER_ROUTE,
-  REMOVE_WIKI_USER_ROUTE,
   RESOLVE_ACCESS_REQUEST_ROUTE,
+  SET_ACCESS_GIT_EMAIL_ROUTE,
+  SET_ACCESS_PERMISSION_ROUTE,
   RESTART_KEYS,
   SAVE_CONFIG_ROUTE,
   SAVE_CREDENTIALS_ROUTE,
@@ -46,6 +50,7 @@ import {
 } from '../src/settings/contract.ts'
 import type {
   AccessMutationResponse,
+  AccessPermissionWire,
   AccessWire,
   CatalogWire,
   CredentialField,
@@ -53,7 +58,10 @@ import type {
   ScopeCheckWire,
   FeishuProfilesWire,
   SessionOriginWire,
+  SessionRecordsWire,
   SlashCommandSyncWire,
+  WorkspaceListingWire,
+  WorkspacePreviewWire,
 } from '../src/settings/contract.ts'
 import {
   OverlayStore,
@@ -83,6 +91,8 @@ import type { SettingsDirectoryPicker } from '../src/settings/directory-picker.t
 import { mountSettingsRoutes, registerSettingsRoutes } from '../src/settings/routes.ts'
 import type { HostConnection, HostFetchRoute } from '../src/settings/routes.ts'
 import { normalizeWorkspaceBaseDir, prepareWorkspaceBaseDir } from '../src/workspaces.ts'
+import { listWorkspaceDirectory, previewWorkspaceFile, readWorkspaceFile, WorkspaceFileError } from '../src/workspace-files.ts'
+import type { WorkspaceDownload } from '../src/workspace-files.ts'
 import { makeChannel, makeHostContext } from './helpers.ts'
 
 function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
@@ -125,7 +135,6 @@ class FakeTarget implements SettingsTarget {
   credentialInfo: Record<CredentialField, { configured: boolean; writable: boolean; source?: string }> = {
     appId: { configured: true, writable: true, source: 'file' },
     appSecret: { configured: true, writable: true, source: 'file' },
-    analyzeToken: { configured: false, writable: true },
   }
   credentialCalls: Array<{ field: string; value?: string }> = []
   applied: OverlayPatch | undefined
@@ -144,14 +153,11 @@ class FakeTarget implements SettingsTarget {
   /** Admission snapshot handed to the panel (the real service keeps it in memory). */
   accessState: AccessWire = {
     mode: 'guarded',
-    admin: { configured: false },
     loaded: true,
-    groups: [],
     users: [],
-    wikiUsers: [],
     requests: [],
   }
-  /** Every whitelist mutation the surface forwarded (asserted by the tests). */
+  /** Every user-table mutation the surface forwarded (asserted by the tests). */
   accessCalls: Array<Record<string, unknown>> = []
   /** Return one failed wire result instead of mutating (storage error path). */
   failAccess: string | undefined
@@ -202,6 +208,21 @@ class FakeTarget implements SettingsTarget {
     this.running = { ...this.config }
   }
 
+  occupiedState: { holder: LockHolderInfo | undefined } | undefined
+  takeoverCalls = 0
+  failTakeover: string | undefined
+
+  occupiedBy(): { holder: LockHolderInfo | undefined } | undefined {
+    return this.runningFlag ? undefined : this.occupiedState
+  }
+
+  async takeover(): Promise<void> {
+    this.takeoverCalls++
+    if (this.failTakeover !== undefined) throw new Error(this.failTakeover)
+    this.occupiedState = undefined
+    await this.connect()
+  }
+
   async connect(): Promise<void> {
     this.connectCalls++
     if (this.failConnect !== undefined) throw new Error(this.failConnect)
@@ -229,29 +250,6 @@ class FakeTarget implements SettingsTarget {
     return structuredClone(this.accessState)
   }
 
-  async addAccessGroup(chatId: string, name?: string): Promise<AccessMutationResponse> {
-    this.accessCalls.push({ op: 'add-group', chatId, name })
-    const failed = this.accessFailure()
-    if (failed !== undefined) return failed
-    if (!this.accessState.groups.some(group => group.chatId === chatId)) {
-      this.accessState.groups.push({
-        chatId,
-        ...(name === undefined ? {} : { name }),
-        source: 'panel',
-        addedAt: 1_700_000_000_000,
-      })
-    }
-    return { ok: true, access: this.accessSnapshot() }
-  }
-
-  async removeAccessGroup(chatId: string): Promise<AccessMutationResponse> {
-    this.accessCalls.push({ op: 'remove-group', chatId })
-    const failed = this.accessFailure()
-    if (failed !== undefined) return failed
-    this.accessState.groups = this.accessState.groups.filter(group => group.chatId !== chatId)
-    return { ok: true, access: this.accessSnapshot() }
-  }
-
   async addAccessUser(userId: string, name?: string): Promise<AccessMutationResponse> {
     this.accessCalls.push({ op: 'add-user', userId, name })
     const failed = this.accessFailure()
@@ -262,6 +260,11 @@ class FakeTarget implements SettingsTarget {
         ...(name === undefined ? {} : { name }),
         source: 'panel',
         addedAt: 1_700_000_000_000,
+        admin: false,
+        chat: true,
+        wikiRead: false,
+        wikiWrite: false,
+        codeWrite: false,
       })
     }
     return { ok: true, access: this.accessSnapshot() }
@@ -275,32 +278,55 @@ class FakeTarget implements SettingsTarget {
     return { ok: true, access: this.accessSnapshot() }
   }
 
-  async addWikiUser(userId: string, name?: string): Promise<AccessMutationResponse> {
-    this.accessCalls.push({ op: 'add-wiki-user', userId, name })
+  async setAccessPermission(userId: string, permission: AccessPermissionWire, enabled: boolean): Promise<AccessMutationResponse> {
+    this.accessCalls.push({ op: 'set', userId, permission, enabled })
     const failed = this.accessFailure()
     if (failed !== undefined) return failed
-    if (!this.accessState.wikiUsers.some(user => user.userId === userId)) {
-      this.accessState.wikiUsers.push({
-        userId,
-        ...(name === undefined ? {} : { name }),
-        source: 'panel',
-        addedAt: 1_700_000_000_000,
-      })
-    }
+    const user = this.accessState.users.find(item => item.userId === userId)
+    if (user === undefined) return { ok: false, error: '用户不在用户表里' }
+    user[permission] = enabled
     return { ok: true, access: this.accessSnapshot() }
   }
 
-  async removeWikiUser(userId: string): Promise<AccessMutationResponse> {
-    this.accessCalls.push({ op: 'remove-wiki-user', userId })
+  async setAccessGitEmail(userId: string, gitEmail: string | undefined): Promise<AccessMutationResponse> {
+    this.accessCalls.push({ op: 'git-email', userId, gitEmail })
     const failed = this.accessFailure()
     if (failed !== undefined) return failed
-    this.accessState.wikiUsers = this.accessState.wikiUsers.filter(user => user.userId !== userId)
+    const user = this.accessState.users.find(item => item.userId === userId)
+    if (user === undefined) return { ok: false, error: '用户不在用户表里' }
+    if (gitEmail === undefined) delete user.gitEmail
+    else user.gitEmail = gitEmail
     return { ok: true, access: this.accessSnapshot() }
   }
 
   async sessionOrigin(sessionId: string): Promise<SessionOriginWire | null> {
     this.originCalls.push(sessionId)
     return this.origins.get(sessionId) ?? null
+  }
+
+  records: SessionRecordsWire = { groups: [], directs: [] }
+  /** The only root the fake file routes serve. */
+  workspaceRoot: string | undefined
+
+  async sessionRecords(): Promise<SessionRecordsWire> {
+    return this.records
+  }
+
+  private allowed(workspace: string): string {
+    if (workspace !== this.workspaceRoot) throw new WorkspaceFileError(403, '该目录不是飞书会话的工作区')
+    return workspace
+  }
+
+  async workspaceFiles(workspace: string, path: string | undefined): Promise<WorkspaceListingWire> {
+    return listWorkspaceDirectory(this.allowed(workspace), path)
+  }
+
+  async workspaceFilePreview(workspace: string, path: string | undefined): Promise<WorkspacePreviewWire> {
+    return previewWorkspaceFile(this.allowed(workspace), path)
+  }
+
+  async workspaceFileDownload(workspace: string, path: string | undefined): Promise<WorkspaceDownload> {
+    return readWorkspaceFile(this.allowed(workspace), path)
   }
 
   async feishuProfiles(userIds: readonly string[], chatIds: readonly string[]): Promise<FeishuProfilesWire> {
@@ -319,21 +345,17 @@ class FakeTarget implements SettingsTarget {
     if (request === undefined) return { ok: false, error: '申请不存在或已结算' }
     this.accessState.requests = this.accessState.requests.filter(item => item.token !== token)
     if (decision === 'allow') {
-      if (request.kind === 'group') {
-        this.accessState.groups.push({
-          chatId: request.targetId,
-          ...(request.name === undefined ? {} : { name: request.name }),
-          source: 'card',
-          addedAt: 1_700_000_000_000,
-        })
-      } else {
-        this.accessState.users.push({
-          userId: request.targetId,
-          ...(request.name === undefined ? {} : { name: request.name }),
-          source: 'card',
-          addedAt: 1_700_000_000_000,
-        })
-      }
+      this.accessState.users.push({
+        userId: request.targetId,
+        ...(request.name === undefined ? {} : { name: request.name }),
+        source: 'card',
+        addedAt: 1_700_000_000_000,
+        admin: false,
+        chat: true,
+        wikiRead: false,
+        wikiWrite: false,
+        codeWrite: false,
+      })
     }
     return { ok: true, access: this.accessSnapshot() }
   }
@@ -444,13 +466,13 @@ describe('overlay paths and validation', () => {
   it('validates nested feishuTools keys and stores only the edited sub-fields', () => {
     const ok = parseOverlay({
       dmMode: 'disabled',
-      feishuTools: { attachmentFetch: false, attachmentFetchTimeoutMs: 60_000 },
+      feishuTools: { sendFile: false, attachmentFetchTimeoutMs: 60_000 },
     })
     expect(ok.ok).toBe(true)
     if (!ok.ok) return
     expect(ok.patch).toEqual({
       dmMode: 'disabled',
-      feishuTools: { attachmentFetch: false, attachmentFetchTimeoutMs: 60_000 },
+      feishuTools: { sendFile: false, attachmentFetchTimeoutMs: 60_000 },
     })
 
     // Canonical schema defaults must not leak into the overlay.
@@ -476,38 +498,45 @@ describe('overlay paths and validation', () => {
   })
 
   it('merges nested feishuTools over the profile config without dropping sibling keys', () => {
-    const base = makeConfig({ attachmentStore: 'native' })
-    const merged = mergeOverlay(base, { feishuTools: { attachmentFetch: false } })
-    expect(merged.feishuTools.attachmentFetch).toBe(false)
+    const base = makeConfig()
+    const merged = mergeOverlay(base, { feishuTools: { sendFile: false } })
+    expect(merged.feishuTools.sendFile).toBe(false)
     expect(merged.feishuTools.topicMessages).toBe(true)
     expect(merged.feishuTools.attachmentFetchMaxBytes).toBe(base.feishuTools.attachmentFetchMaxBytes)
-    expect(configValueOf(merged, 'feishuTools.attachmentFetch')).toBe(false)
-    expect(configValueOf(merged, 'attachmentStore')).toBe('native')
+    expect(configValueOf(merged, 'feishuTools.sendFile')).toBe(false)
 
     // A pre-v2 overlay (flat keys only) still validates, keys of removed
-    // settings (workspace retention) are dropped, and every new key falls back
-    // to the profile/default layer.
-    const old = normalizeOverlay({ requireMention: false, workspaceRetention: '30d', workspaceRetentionAuto: true })
+    // settings (workspace retention, the archive attachment backend and its
+    // fetch-tool switch) are dropped, and every new key falls back to the
+    // profile/default layer.
+    const old = normalizeOverlay({
+      requireMention: false,
+      workspaceRetention: '30d',
+      workspaceRetentionAuto: true,
+      attachmentStore: 'archive',
+      feishuTools: { attachmentFetch: false },
+    })
     expect(old).toEqual({ requireMention: false })
+    const parsed = parseOverlay({ attachmentStore: 'archive', feishuTools: { attachmentFetch: false } })
+    expect(parsed).toEqual({ ok: true, patch: {} })
     const migrated = mergeOverlay(base, old)
     expect(migrated.requireMention).toBe(false)
-    expect(migrated.attachmentStore).toBe('native')
     expect(migrated.prefetchImages).toBe(true)
-    expect(migrated.feishuTools.attachmentFetch).toBe(true)
+    expect(migrated.feishuTools.sendFile).toBe(true)
   })
 
   it('deep-merges and clears nested overlay keys', () => {
-    const first = normalizeOverlay({ feishuTools: { attachmentFetch: false, topicMessages: false } })
-    const second = normalizeOverlay({ feishuTools: { attachmentFetch: true } })
+    const first = normalizeOverlay({ feishuTools: { sendFile: false, topicMessages: false } })
+    const second = normalizeOverlay({ feishuTools: { sendFile: true } })
     const merged = mergeOverlayPatch(first, second)
-    expect(merged.feishuTools).toEqual({ attachmentFetch: true, topicMessages: false })
+    expect(merged.feishuTools).toEqual({ sendFile: true, topicMessages: false })
     deleteOverlayKey(merged, 'feishuTools.topicMessages')
-    expect(merged.feishuTools).toEqual({ attachmentFetch: true })
-    deleteOverlayKey(merged, 'feishuTools.attachmentFetch')
+    expect(merged.feishuTools).toEqual({ sendFile: true })
+    deleteOverlayKey(merged, 'feishuTools.sendFile')
     expect(merged.feishuTools).toBeUndefined()
     // Wire projection uses the flat dotted key space the form renders.
     expect(overlayValues(first)).toEqual({
-      'feishuTools.attachmentFetch': false,
+      'feishuTools.sendFile': false,
       'feishuTools.topicMessages': false,
     })
   })
@@ -530,13 +559,13 @@ describe('OverlayStore', () => {
   it('round-trips nested feishuTools overrides in the hand-editable nested shape', async () => {
     const file = tempOverlayFile()
     const store = new OverlayStore(file)
-    await store.save({ feishuTools: { attachmentFetch: false, attachmentFetchMaxBytes: 2048 } })
+    await store.save({ feishuTools: { sendFile: false, attachmentFetchMaxBytes: 2048 } })
     await expect(store.load()).resolves.toEqual({
-      feishuTools: { attachmentFetch: false, attachmentFetchMaxBytes: 2048 },
+      feishuTools: { sendFile: false, attachmentFetchMaxBytes: 2048 },
     })
     // The file mirrors the profile config shape, so an operator can edit it by hand.
     expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({
-      feishuTools: { attachmentFetch: false, attachmentFetchMaxBytes: 2048 },
+      feishuTools: { sendFile: false, attachmentFetchMaxBytes: 2048 },
     })
   })
 
@@ -571,7 +600,8 @@ describe('field descriptors', () => {
       expect(byKey.get(key)).toMatchObject({ kind: 'boolean', group: 'wiki', restartRequired: false })
     }
     expect(byKey.get('feishuTools.wikiRead')?.help).toContain('feishu_wiki_read')
-    expect(byKey.get('feishuTools.wikiRead')?.help).toContain('/auth wiki add')
+    expect(byKey.get('feishuTools.wikiRead')?.help).toContain('/auth set wiki-read on')
+    expect(byKey.get('feishuTools.wikiWrite')?.help).toContain('/auth set wiki-write on')
     expect(byKey.get('feishuTools.wikiWrite')?.help).toContain('feishu_wiki_edit')
     const roots = byKey.get('wikiRoots')
     expect(roots).toMatchObject({
@@ -616,7 +646,6 @@ describe('field descriptors', () => {
     expect(toggles).toEqual({
       dmMode: { on: 'open', off: 'disabled' },
       threadFallback: { on: 'degrade', off: 'strict' },
-      attachmentStore: { on: 'native', off: 'archive' },
       accessMode: { on: 'open', off: 'guarded' },
     })
     for (const field of FIELD_DESCRIPTORS) {
@@ -657,16 +686,11 @@ describe('field descriptors', () => {
 
   it('describes the access-control fields without restarting the channel', () => {
     const byKey = new Map(FIELD_DESCRIPTORS.map(field => [field.key, field]))
-    for (const key of ['adminUserId', 'accessMode', 'dmAllowWhitelist', 'authRequestTtlDays'] as const) {
+    for (const key of ['accessMode', 'authRequestTtlDays'] as const) {
       expect(EDITABLE_KEYS).toContain(key)
       expect(byKey.get(key)).toMatchObject({ group: 'access', restartRequired: false })
     }
-
-    const admin = byKey.get('adminUserId')
-    expect(admin).toMatchObject({ kind: 'text' })
-    expect(admin?.label).toContain('管理员')
-    expect(admin?.summary).toContain('/userid')
-    expect(admin?.help).toContain('ou_')
+    expect(byKey.has('adminUserId' as never)).toBe(false)
 
     const mode = byKey.get('accessMode')
     expect(mode).toMatchObject({ kind: 'select', toggle: { on: 'open', off: 'guarded' } })
@@ -674,7 +698,7 @@ describe('field descriptors', () => {
     expect(mode?.options?.map(option => option.value)).toEqual(['guarded', 'open'])
     expect(mode?.summary).toContain('不安全')
 
-    expect(byKey.get('dmAllowWhitelist')).toMatchObject({ kind: 'boolean', label: '白名单用户可私聊' })
+    expect(byKey.has('dmAllowWhitelist' as never)).toBe(false)
 
     const ttl = byKey.get('authRequestTtlDays')
     expect(ttl).toMatchObject({ kind: 'number', min: 1, max: 30, step: 1 })
@@ -699,11 +723,10 @@ describe('field descriptors', () => {
 
   it('describes the v2 attachment pipeline and model-tool fields with bounds', () => {
     const byKey = new Map(FIELD_DESCRIPTORS.map(field => [field.key, field]))
-    const store = byKey.get('attachmentStore')
-    expect(store).toMatchObject({ kind: 'select', group: 'attachments', restartRequired: false })
-    expect(store?.options?.map(option => option.value)).toEqual(['native', 'archive'])
-    expect(store?.label).toContain('原生附件库')
-    expect(store?.help).toContain('不可变')
+    const keys: readonly string[] = FIELD_DESCRIPTORS.map(field => field.key)
+    expect(keys).not.toContain('attachmentStore')
+    expect(keys).not.toContain('feishuTools.attachmentFetch')
+    expect(byKey.get('acceptAttachments')?.help).toContain('原生附件库')
 
     expect(byKey.get('prefetchImages')).toMatchObject({ kind: 'boolean', group: 'attachments' })
     expect(byKey.get('prefetchTimeoutMs')).toMatchObject({
@@ -713,7 +736,7 @@ describe('field descriptors', () => {
     expect(byKey.get('prefetchTotalMaxBytes')).toMatchObject({ kind: 'number', min: 1 })
     expect(byKey.get('historyBootstrapLimit')).toMatchObject({ kind: 'number', min: 0, max: 20 })
     expect(byKey.get('promptContextTimeoutMs')).toMatchObject({ kind: 'number', group: 'limits' })
-    expect(byKey.get('feishuTools.attachmentFetch')).toMatchObject({
+    expect(byKey.get('feishuTools.sendFile')).toMatchObject({
       kind: 'boolean', group: 'tools', restartRequired: false,
     })
     expect(byKey.get('feishuTools.attachmentFetchMaxResources')).toMatchObject({
@@ -729,8 +752,8 @@ describe('field descriptors', () => {
     })
     // The attachment pipeline and model tools render under「附件与工具」.
     const attachmentsTab = new Set([
-      'attachmentStore', 'prefetchImages', 'prefetchTimeoutMs',
-      'historyBootstrapLimit', 'feishuTools.attachmentFetch', 'feishuTools.topicMessages',
+      'acceptAttachments', 'prefetchImages', 'prefetchTimeoutMs',
+      'historyBootstrapLimit', 'feishuTools.sendFile', 'feishuTools.topicMessages',
     ])
     for (const field of FIELD_DESCRIPTORS) {
       if (!attachmentsTab.has(field.key)) continue
@@ -1156,14 +1179,13 @@ describe('SettingsSurface', () => {
   it('saves the v2 attachment pipeline fields, including nested feishuTools keys', async () => {
     const { surface, target, store } = makeSurface()
     const result = await surface.save({
-      attachmentStore: 'archive',
       prefetchImages: false,
       prefetchTimeoutMs: 5_000,
       prefetchImageMaxBytes: 1024,
       prefetchTotalMaxBytes: 4096,
       historyBootstrapLimit: 3,
       promptContextTimeoutMs: 1_500,
-      'feishuTools.attachmentFetch': false,
+      'feishuTools.sendFile': false,
       'feishuTools.attachmentFetchMaxResources': 4,
       'feishuTools.attachmentFetchMaxBytes': 2048,
       'feishuTools.attachmentFetchTimeoutMs': 30_000,
@@ -1174,7 +1196,6 @@ describe('SettingsSurface', () => {
     if (!result.ok) return
     // The overlay file keeps the nested profile shape; untouched siblings stay out.
     await expect(store.load()).resolves.toEqual({
-      attachmentStore: 'archive',
       prefetchImages: false,
       prefetchTimeoutMs: 5_000,
       prefetchImageMaxBytes: 1024,
@@ -1182,7 +1203,7 @@ describe('SettingsSurface', () => {
       historyBootstrapLimit: 3,
       promptContextTimeoutMs: 1_500,
       feishuTools: {
-        attachmentFetch: false,
+        sendFile: false,
         attachmentFetchMaxResources: 4,
         attachmentFetchMaxBytes: 2048,
         attachmentFetchTimeoutMs: 30_000,
@@ -1190,10 +1211,9 @@ describe('SettingsSurface', () => {
         topicMessagesTimeoutMs: 15_000,
       },
     })
-    expect(result.panel.config.effective.attachmentStore).toBe('archive')
-    expect(result.panel.config.effective['feishuTools.attachmentFetch']).toBe(false)
-    expect(target.applied?.feishuTools?.attachmentFetch).toBe(false)
-    expect(result.panel.config.overriddenKeys).toContain('feishuTools.attachmentFetch')
+    expect(result.panel.config.effective['feishuTools.sendFile']).toBe(false)
+    expect(target.applied?.feishuTools?.sendFile).toBe(false)
+    expect(result.panel.config.overriddenKeys).toContain('feishuTools.sendFile')
     // The wire projection uses the same dotted keys as the form.
     expect(result.panel.config.overlay['feishuTools.topicMessages']).toBe(false)
 
@@ -1202,7 +1222,7 @@ describe('SettingsSurface', () => {
     expect(later.ok).toBe(true)
     const overlay = await store.load()
     expect(overlay.feishuTools).toMatchObject({
-      attachmentFetch: false,
+      sendFile: false,
       topicMessages: true,
       attachmentFetchTimeoutMs: 30_000,
     })
@@ -1344,32 +1364,20 @@ describe('SettingsSurface', () => {
     await expect(store.load()).resolves.toEqual({})
   })
 
-  it('saves the access-control config and clears the administrator override', async () => {
+  it('saves the access-control config live and rejects an invalid request lifetime', async () => {
     const { surface, store } = makeSurface()
-    const saved = await surface.save({ adminUserId: 'u_admin', accessMode: 'open', authRequestTtlDays: 14 })
+    const saved = await surface.save({ accessMode: 'open', authRequestTtlDays: 14 })
     expect(saved.ok).toBe(true)
     if (!saved.ok) return
-    await expect(store.load()).resolves.toEqual({
-      adminUserId: 'u_admin',
-      accessMode: 'open',
-      authRequestTtlDays: 14,
-    })
-    expect(saved.panel.config.effective.adminUserId).toBe('u_admin')
+    await expect(store.load()).resolves.toEqual({ accessMode: 'open', authRequestTtlDays: 14 })
     expect(saved.panel.config.effective.accessMode).toBe('open')
     expect(saved.panel.config.effective.authRequestTtlDays).toBe(14)
     expect(saved.panel.config.restartPendingKeys).toEqual([])
 
-    const invalid = await surface.save({ adminUserId: 'ou_alice', authRequestTtlDays: 0 })
+    const invalid = await surface.save({ authRequestTtlDays: 0 })
     expect(invalid.ok).toBe(false)
     if (invalid.ok) return
-    expect(invalid.issues?.map(issue => issue.key))
-      .toEqual(expect.arrayContaining(['adminUserId', 'authRequestTtlDays']))
-
-    const cleared = await surface.save({ adminUserId: '' })
-    expect(cleared.ok).toBe(true)
-    const overlay = await store.load()
-    expect(overlay.adminUserId).toBeUndefined()
-    expect(overlay.accessMode).toBe('open')
+    expect(invalid.issues?.map(issue => issue.key)).toEqual(['authRequestTtlDays'])
   })
 
   it('saves the newly editable session and model fields live and clears maxTokens on empty', async () => {
@@ -1493,17 +1501,24 @@ describe('SettingsSurface', () => {
 describe('SettingsSurface access control', () => {
   const SAMPLE_ACCESS: AccessWire = {
     mode: 'guarded',
-    admin: { userId: 'u_admin', configured: true },
     loaded: true,
-    groups: [{ chatId: 'oc_team', name: '研发群', source: 'card', addedAt: 1_700_000_000_000 }],
-    users: [{ userId: 'u_alice', name: 'Alice', source: 'command', addedAt: 1_700_000_100_000 }],
-    wikiUsers: [{ userId: 'u_wiki', source: 'command', addedAt: 1_700_000_000_000 }],
+    users: [{
+      userId: 'u_alice',
+      name: 'Alice',
+      source: 'command',
+      addedAt: 1_700_000_100_000,
+      admin: false,
+      chat: true,
+      wikiRead: true,
+      wikiWrite: false,
+      codeWrite: false,
+    }],
     requests: [{
       token: 'tok_1',
-      kind: 'group',
-      targetId: 'oc_new',
-      name: '新群',
-      chatId: 'oc_new',
+      targetId: 'u_bob',
+      name: 'Bob',
+      chatId: 'oc_team',
+      groupName: '研发群',
       createdAt: 1_700_000_200_000,
       expiresAt: 1_700_000_800_000,
     }],
@@ -1523,28 +1538,15 @@ describe('SettingsSurface access control', () => {
     const panel = await surface.panel()
     expect(panel.access).toEqual({
       mode: 'open',
-      admin: { configured: false },
       loaded: false,
-      groups: [],
       users: [],
-      wikiUsers: [],
       requests: [],
     })
     await expect(surface.access()).rejects.toThrow('access store down')
   })
 
-  it('validates and saves group and user authorizations', async () => {
+  it('validates and saves users, then flips their permission switches', async () => {
     const { surface, target } = makeSurface()
-    const group = await surface.saveAccessGroup(' oc_team ', ' 研发群 ')
-    expect(group.ok).toBe(true)
-    if (!group.ok) return
-    expect(group.access.groups).toEqual([{
-      chatId: 'oc_team',
-      name: '研发群',
-      source: 'panel',
-      addedAt: 1_700_000_000_000,
-    }])
-
     const user = await surface.saveAccessUser(' u_alice ', ' Alice ')
     expect(user.ok).toBe(true)
     if (!user.ok) return
@@ -1553,19 +1555,52 @@ describe('SettingsSurface access control', () => {
       name: 'Alice',
       source: 'panel',
       addedAt: 1_700_000_000_000,
+      admin: false,
+      chat: true,
+      wikiRead: false,
+      wikiWrite: false,
+      codeWrite: false,
     }])
+
+    const admin = await surface.setAccessPermission('u_alice', 'admin', true)
+    expect(admin.ok && admin.access.users[0]?.admin).toBe(true)
+    const code = await surface.setAccessPermission(' u_alice ', 'codeWrite', true)
+    expect(code.ok).toBe(true)
+    if (!code.ok) return
+    expect(code.access.users[0]).toMatchObject({ chat: true, codeWrite: true })
+    const suspended = await surface.setAccessPermission('u_alice', 'chat', false)
+    expect(suspended.ok).toBe(true)
+    if (!suspended.ok) return
+    expect(suspended.access.users[0]).toMatchObject({ chat: false, codeWrite: true })
     expect(target.accessCalls).toEqual([
-      { op: 'add-group', chatId: 'oc_team', name: '研发群' },
       { op: 'add-user', userId: 'u_alice', name: 'Alice' },
+      { op: 'set', userId: 'u_alice', permission: 'admin', enabled: true },
+      { op: 'set', userId: 'u_alice', permission: 'codeWrite', enabled: true },
+      { op: 'set', userId: 'u_alice', permission: 'chat', enabled: false },
     ])
   })
 
-  it('rejects invalid identifiers before writing anything', async () => {
+  it('sets, trims, and clears a git email, rejecting malformed ones before writing', async () => {
     const { surface, target } = makeSurface()
-    for (const chatId of ['', '   ', 'x'.repeat(129), 'oc_\u0001bad', 42]) {
-      const result = await surface.saveAccessGroup(chatId)
-      expect(result.ok).toBe(false)
+    await surface.saveAccessUser('u_alice', 'Alice')
+    const set = await surface.setAccessGitEmail(' u_alice ', ' alice@example.com ')
+    expect(set.ok && set.access.users[0]?.gitEmail).toBe('alice@example.com')
+    for (const bad of ['alice', 'a b@example.com', 'Alice <a@example.com>', 'a@b@c', `${'x'.repeat(250)}@example.com`, 42]) {
+      expect((await surface.setAccessGitEmail('u_alice', bad)).ok).toBe(false)
     }
+    expect((await surface.setAccessGitEmail('ou_alice', 'a@example.com')).ok).toBe(false)
+    const cleared = await surface.setAccessGitEmail('u_alice', '  ')
+    expect(cleared.ok && cleared.access.users[0]).not.toHaveProperty('gitEmail')
+    expect((await surface.setAccessGitEmail('u_alice', null)).ok).toBe(true)
+    expect(target.accessCalls.filter(call => call.op === 'git-email')).toEqual([
+      { op: 'git-email', userId: 'u_alice', gitEmail: 'alice@example.com' },
+      { op: 'git-email', userId: 'u_alice', gitEmail: undefined },
+      { op: 'git-email', userId: 'u_alice', gitEmail: undefined },
+    ])
+  })
+
+  it('rejects invalid identifiers, switches, and values before writing anything', async () => {
+    const { surface, target } = makeSurface()
     for (const userId of ['ou_alice', 'on_alice', 'user@example.com', 'bad id']) {
       const result = await surface.saveAccessUser(userId)
       expect(result.ok).toBe(false)
@@ -1574,33 +1609,32 @@ describe('SettingsSurface access control', () => {
     }
     const badName = await surface.saveAccessUser('u_bob', 'x'.repeat(129))
     expect(badName.ok).toBe(false)
-    expect((await surface.saveWikiUser('ou_bob')).ok).toBe(false)
-    expect((await surface.saveWikiUser('u_bob', 'x'.repeat(129))).ok).toBe(false)
-    expect((await surface.removeWikiUser('bad id')).ok).toBe(false)
+    expect((await surface.removeAccessUser('bad id')).ok).toBe(false)
+    expect((await surface.setAccessPermission('ou_bob', 'chat', true)).ok).toBe(false)
+    const badSwitch = await surface.setAccessPermission('u_bob', 'owner', true)
+    expect(badSwitch).toEqual({ ok: false, error: '权限开关只能是 admin、chat、wikiRead、wikiWrite 或 codeWrite' })
+    const badValue = await surface.setAccessPermission('u_bob', 'chat', 'yes')
+    expect(badValue).toEqual({ ok: false, error: 'enabled 必须是 true 或 false' })
     expect(target.accessCalls).toEqual([])
   })
 
-  it('removes authorizations and resolves pending requests', async () => {
+  it('removes users and resolves pending requests into a chat-only user', async () => {
     const { surface, target } = makeSurface()
     target.accessState = structuredClone(SAMPLE_ACCESS)
 
-    const removedGroup = await surface.removeAccessGroup('oc_team')
-    expect(removedGroup.ok).toBe(true)
     const removedUser = await surface.removeAccessUser('u_alice')
     expect(removedUser.ok).toBe(true)
-    const removedWiki = await surface.removeWikiUser('u_wiki')
-    expect(removedWiki.ok).toBe(true)
-    if (!removedWiki.ok) return
-    expect(removedWiki.access.wikiUsers).toEqual([])
+    if (!removedUser.ok) return
+    expect(removedUser.access.users).toEqual([])
     const allowed = await surface.resolveAccessRequest('tok_1', 'allow')
     expect(allowed.ok).toBe(true)
     if (!allowed.ok) return
     expect(allowed.access.requests).toEqual([])
-    expect(allowed.access.groups.map(group => group.chatId)).toEqual(['oc_new'])
+    expect(allowed.access.users).toEqual([expect.objectContaining({
+      userId: 'u_bob', chat: true, wikiRead: false, wikiWrite: false, codeWrite: false,
+    })])
     expect(target.accessCalls).toEqual([
-      { op: 'remove-group', chatId: 'oc_team' },
       { op: 'remove-user', userId: 'u_alice' },
-      { op: 'remove-wiki-user', userId: 'u_wiki' },
       { op: 'resolve', token: 'tok_1', decision: 'allow' },
     ])
   })
@@ -1608,7 +1642,8 @@ describe('SettingsSurface access control', () => {
   it('folds target failures, thrown errors, and invalid decisions into the wire', async () => {
     const { surface, target } = makeSurface()
     target.failAccess = 'store unavailable'
-    await expect(surface.saveAccessGroup('oc_x')).resolves.toEqual({ ok: false, error: 'store unavailable' })
+    await expect(surface.saveAccessUser('u_x')).resolves.toEqual({ ok: false, error: 'store unavailable' })
+    await expect(surface.setAccessPermission('u_x', 'wikiWrite', true)).resolves.toEqual({ ok: false, error: 'store unavailable' })
 
     target.failAccess = undefined
     target.throwAccess = 'domain not open'
@@ -1710,25 +1745,6 @@ describe('SettingsSurface credentials', () => {
     expect(stopped.target.restartCalls).toBe(0)
   })
 
-  it('stores and removes the analyze API token without touching the Feishu connection', async () => {
-    for (const running of [true, false]) {
-      const { surface, target } = makeSurface()
-      target.runningFlag = running
-      const saved = await surface.saveCredentials({ analyzeToken: ' tok_new ' })
-      expect(saved.ok).toBe(true)
-      if (!saved.ok) return
-      expect(saved.reconnect).toBe('not-needed')
-      expect(saved.panel.config.credentials.analyzeToken).toMatchObject({ ref: 'DSH_CHANNELS_ANALYZE_TOKEN', configured: true })
-      const cleared = await surface.clearCredential('analyzeToken')
-      expect(cleared.ok).toBe(true)
-      if (!cleared.ok) return
-      expect(cleared.reconnect).toBe('not-needed')
-      expect(cleared.panel.config.credentials.analyzeToken.configured).toBe(false)
-      expect(target.credentialCalls).toEqual([{ field: 'analyzeToken', value: 'tok_new' }, { field: 'analyzeToken' }])
-      expect(target.connectCalls + target.restartCalls).toBe(0)
-    }
-  })
-
   it('refuses unknown credential fields', async () => {
     const result = await makeSurface().surface.clearCredential('nope' as 'appId')
     expect(result.ok).toBe(false)
@@ -1795,18 +1811,21 @@ describe('settings routes', () => {
       [SESSION_ORIGIN_ROUTE]: 'GET',
       [PROFILES_ROUTE]: 'GET',
       [ACCESS_ROUTE]: 'GET',
+      [SESSION_RECORDS_ROUTE]: 'GET',
+      [WORKSPACE_FILES_ROUTE]: 'GET',
+      [WORKSPACE_FILE_PREVIEW_ROUTE]: 'GET',
+      [WORKSPACE_FILE_DOWNLOAD_ROUTE]: 'GET',
       [SAVE_CONFIG_ROUTE]: 'POST',
       [CLEAR_CONFIG_ROUTE]: 'POST',
       [SAVE_CREDENTIALS_ROUTE]: 'POST',
       [CLEAR_CREDENTIAL_ROUTE]: 'POST',
       [RECONNECT_ROUTE]: 'POST',
+      [TAKEOVER_ROUTE]: 'POST',
       [PICK_DIRECTORY_ROUTE]: 'POST',
-      [ADD_ACCESS_GROUP_ROUTE]: 'POST',
-      [REMOVE_ACCESS_GROUP_ROUTE]: 'POST',
       [ADD_ACCESS_USER_ROUTE]: 'POST',
       [REMOVE_ACCESS_USER_ROUTE]: 'POST',
-      [ADD_WIKI_USER_ROUTE]: 'POST',
-      [REMOVE_WIKI_USER_ROUTE]: 'POST',
+      [SET_ACCESS_PERMISSION_ROUTE]: 'POST',
+      [SET_ACCESS_GIT_EMAIL_ROUTE]: 'POST',
       [RESOLVE_ACCESS_REQUEST_ROUTE]: 'POST',
     })
     for (const route of routes.values()) {
@@ -1860,6 +1879,56 @@ describe('settings routes', () => {
     const missing = await call(routes, SESSION_ORIGIN_ROUTE, { query: 'sessionId=%20' })
     expect(missing.status).toBe(400)
     expect(target.originCalls).toEqual(['s_feishu', 's_web'])
+  })
+
+  it('serves the Session records over GET', async () => {
+    const { surface, target } = makeSurface()
+    target.records = {
+      groups: [{ chatId: 'oc_1', chatName: '研发群', users: [{ userId: 'u_1', name: '张三', workspaces: ['/ws'], sessions: [] }] }],
+      directs: [],
+    }
+    const { connection, routes } = makeConnection()
+    registerSettingsRoutes(connection, surface)
+    const response = await call(routes, SESSION_RECORDS_ROUTE)
+    expect(response.status).toBe(200)
+    expect(JSON.parse(response.body)).toEqual(target.records)
+  })
+
+  it('serves workspace listings, previews and downloads, mapping refusals to their HTTP status', async () => {
+    const { surface, target } = makeSurface()
+    const root = mkdtempSync(path.join(tmpdir(), 'dsh-channels-files-'))
+    mkdirSync(path.join(root, 'topics', 't1'), { recursive: true })
+    writeFileSync(path.join(root, 'topics', 't1', '报告.md'), '# 标题\n')
+    target.workspaceRoot = root
+    const { connection, routes } = makeConnection()
+    registerSettingsRoutes(connection, surface)
+    const query = (workspace: string, file?: string): string => new URLSearchParams({
+      workspace, ...(file === undefined ? {} : { path: file }),
+    }).toString()
+
+    const listing = await call(routes, WORKSPACE_FILES_ROUTE, { query: query(root, 'topics') })
+    expect(listing.status).toBe(200)
+    expect(JSON.parse(listing.body)).toEqual({ path: 'topics', entries: [{ name: 't1', kind: 'dir' }], truncated: false })
+
+    const preview = await call(routes, WORKSPACE_FILE_PREVIEW_ROUTE, { query: query(root, 'topics/t1/报告.md') })
+    expect(JSON.parse(preview.body)).toMatchObject({ kind: 'text', path: 'topics/t1/报告.md', content: '# 标题\n', truncated: false })
+
+    const download = await routes.get(WORKSPACE_FILE_DOWNLOAD_ROUTE)!.fetch(
+      new Request(`http://127.0.0.1:3080${WORKSPACE_FILE_DOWNLOAD_ROUTE}?${query(root, 'topics/t1/报告.md')}`),
+    )
+    expect(download.status).toBe(200)
+    expect(download.headers.get('content-type')).toBe('application/octet-stream')
+    expect(download.headers.get('content-disposition')).toBe(`attachment; filename="__.md"; filename*=UTF-8''${encodeURIComponent('报告.md')}`)
+    expect(await download.text()).toBe('# 标题\n')
+
+    const escape = await call(routes, WORKSPACE_FILES_ROUTE, { query: query(root, '../') })
+    expect(escape.status).toBe(400)
+    const foreign = await call(routes, WORKSPACE_FILES_ROUTE, { query: query('/etc') })
+    expect(foreign.status).toBe(403)
+    const missingWorkspace = await call(routes, WORKSPACE_FILES_ROUTE, { query: 'path=topics' })
+    expect(JSON.parse(missingWorkspace.body)).toEqual({ ok: false, error: '缺少 workspace 参数' })
+    const missingFile = await call(routes, WORKSPACE_FILE_PREVIEW_ROUTE, { query: query(root, 'nope.txt') })
+    expect(missingFile.status).toBe(404)
   })
 
   it('serves Feishu profiles for comma-separated ids over GET and bounds the id count', async () => {
@@ -2007,20 +2076,16 @@ describe('settings routes', () => {
     expect(JSON.parse(unavailable.body).error).toContain(PANEL_COPY.directoryPickFailed)
   })
 
-  it('serves the access snapshot and every whitelist write', async () => {
+  it('serves the access snapshot and every user-table write', async () => {
     const { surface, target } = makeSurface()
     target.accessState = {
       mode: 'guarded',
-      admin: { userId: 'u_admin', configured: true },
       loaded: true,
-      groups: [{ chatId: 'oc_team', name: '研发群', source: 'card', addedAt: 1_700_000_000_000 }],
       users: [],
-      wikiUsers: [],
       requests: [{
         token: 'tok_1',
-        kind: 'group',
-        targetId: 'oc_new',
-        chatId: 'oc_new',
+        targetId: 'u_bob',
+        chatId: 'oc_team',
         createdAt: 1_700_000_200_000,
         expiresAt: 1_700_000_800_000,
       }],
@@ -2031,43 +2096,44 @@ describe('settings routes', () => {
     const read = await call(routes, ACCESS_ROUTE)
     expect(read.status).toBe(200)
     const snapshot = JSON.parse(read.body) as AccessWire
-    expect(snapshot.admin).toEqual({ userId: 'u_admin', configured: true })
-    expect(snapshot.groups).toEqual(target.accessState.groups)
-
-    const addedGroup = await call(routes, ADD_ACCESS_GROUP_ROUTE, post({ chatId: 'oc_team', name: '研发群' }))
-    expect(addedGroup.status).toBe(200)
-    expect(JSON.parse(addedGroup.body).ok).toBe(true)
-    expect(JSON.parse(addedGroup.body).access.groups.map((group: { chatId: string }) => group.chatId))
-      .toContain('oc_team')
+    expect(snapshot.mode).toBe('guarded')
+    expect(snapshot.requests).toEqual(target.accessState.requests)
 
     const invalidUser = await call(routes, ADD_ACCESS_USER_ROUTE, post({ userId: 'ou_alice' }))
     expect(invalidUser.status).toBe(400)
     expect(JSON.parse(invalidUser.body).error).toContain('ou_')
 
-    const addedUser = await call(routes, ADD_ACCESS_USER_ROUTE, post({ userId: 'u_alice' }))
+    const addedUser = await call(routes, ADD_ACCESS_USER_ROUTE, post({ userId: 'u_alice', name: 'Alice' }))
+    expect(addedUser.status).toBe(200)
     expect(JSON.parse(addedUser.body).access.users.map((user: { userId: string }) => user.userId)).toEqual(['u_alice'])
+
+    const wiki = await call(routes, SET_ACCESS_PERMISSION_ROUTE, post({ userId: 'u_alice', permission: 'wikiWrite', enabled: true }))
+    expect(wiki.status).toBe(200)
+    expect(JSON.parse(wiki.body).access.users[0]).toMatchObject({ userId: 'u_alice', wikiWrite: true })
+    const badSwitch = await call(routes, SET_ACCESS_PERMISSION_ROUTE, post({ userId: 'u_alice', permission: 'root', enabled: true }))
+    expect(badSwitch.status).toBe(400)
+    const badValue = await call(routes, SET_ACCESS_PERMISSION_ROUTE, post({ userId: 'u_alice', permission: 'chat' }))
+    expect(badValue.status).toBe(400)
+
+    const email = await call(routes, SET_ACCESS_GIT_EMAIL_ROUTE, post({ userId: 'u_alice', gitEmail: ' alice@example.com ' }))
+    expect(email.status).toBe(200)
+    expect(JSON.parse(email.body).access.users[0]).toMatchObject({ userId: 'u_alice', gitEmail: 'alice@example.com' })
+    const badEmail = await call(routes, SET_ACCESS_GIT_EMAIL_ROUTE, post({ userId: 'u_alice', gitEmail: 'Alice <a@example.com>' }))
+    expect(badEmail.status).toBe(400)
+    const clearedEmail = await call(routes, SET_ACCESS_GIT_EMAIL_ROUTE, post({ userId: 'u_alice', gitEmail: '' }))
+    expect(JSON.parse(clearedEmail.body).access.users[0]).not.toHaveProperty('gitEmail')
+
     const removedUser = await call(routes, REMOVE_ACCESS_USER_ROUTE, post({ userId: 'u_alice' }))
     expect(JSON.parse(removedUser.body).access.users).toEqual([])
-
-    const removed = await call(routes, REMOVE_ACCESS_GROUP_ROUTE, post({ chatId: 'oc_team' }))
-    expect(removed.status).toBe(200)
-
-    const addedWiki = await call(routes, ADD_WIKI_USER_ROUTE, post({ userId: 'u_wiki', name: 'Wiki' }))
-    expect(addedWiki.status).toBe(200)
-    expect(JSON.parse(addedWiki.body).access.wikiUsers.map((user: { userId: string }) => user.userId)).toEqual(['u_wiki'])
-    const removedWiki = await call(routes, REMOVE_WIKI_USER_ROUTE, post({ userId: 'u_wiki' }))
-    expect(JSON.parse(removedWiki.body).access.wikiUsers).toEqual([])
-    const invalidWiki = await call(routes, ADD_WIKI_USER_ROUTE, post({ userId: 'ou_wiki' }))
-    expect(invalidWiki.status).toBe(400)
 
     const resolved = await call(routes, RESOLVE_ACCESS_REQUEST_ROUTE, post({ token: 'tok_1', decision: 'allow' }))
     expect(resolved.status).toBe(200)
     expect(JSON.parse(resolved.body).access.requests).toEqual([])
 
-    const missing = await call(routes, ADD_ACCESS_GROUP_ROUTE, post({}))
+    const missing = await call(routes, ADD_ACCESS_USER_ROUTE, post({}))
     expect(missing.status).toBe(400)
 
-    expect((await call(routes, ADD_ACCESS_GROUP_ROUTE)).status).toBe(404)
+    expect((await call(routes, SET_ACCESS_PERMISSION_ROUTE)).status).toBe(404)
   })
 
   it('writes and removes credentials over POST', async () => {
@@ -2088,13 +2154,6 @@ describe('settings routes', () => {
     const removed = await call(routes, CLEAR_CREDENTIAL_ROUTE, post({ field: 'appSecret' }))
     expect(removed.status).toBe(200)
     expect(JSON.parse(removed.body).ok).toBe(true)
-
-    const token = await call(routes, SAVE_CREDENTIALS_ROUTE, post({ analyzeToken: 'tok_new' }))
-    expect(token.status).toBe(200)
-    expect(JSON.parse(token.body).reconnect).toBe('not-needed')
-
-    const tokenRemoved = await call(routes, CLEAR_CREDENTIAL_ROUTE, post({ field: 'analyzeToken' }))
-    expect(tokenRemoved.status).toBe(200)
 
     expect((await call(routes, SAVE_CREDENTIALS_ROUTE)).status).toBe(404)
   })
@@ -2139,7 +2198,7 @@ describe('apply() web wiring', () => {
     })
 
     expect(injected).toContainEqual(['connection'])
-    expect(routes.size).toBe(19)
+    expect(routes.size).toBe(22)
 
     const panel = await call(routes, PANEL_ROUTE)
     expect(panel.status).toBe(200)
@@ -2153,7 +2212,7 @@ describe('apply() web wiring', () => {
 
     await vi.waitFor(async () => {
       const status = await call(routes, STATUS_ROUTE)
-      expect(JSON.parse(status.body).running).toBe(true)
+      expect(JSON.parse(status.body)).toMatchObject({ running: true, busy: false })
     })
 
     const saved = await call(routes, SAVE_CONFIG_ROUTE, post({ values: { requireMention: false } }))
@@ -2232,21 +2291,21 @@ describe('FeishuService settings integration', () => {
   })
 
   it('deep-merges a nested feishuTools overlay over the profile config', async () => {
-    const h = harness({ feishuTools: { attachmentFetch: false } })
+    const h = harness({ feishuTools: { sendFile: false } })
     const service = new FeishuService(h.ctx, h.config, () => h.channel, undefined, h.store)
     await service.boot()
     const config = service.configSnapshot()
-    expect(config.feishuTools.attachmentFetch).toBe(false)
+    expect(config.feishuTools.sendFile).toBe(false)
     // Sibling tool settings keep their profile/default values.
     expect(config.feishuTools.topicMessages).toBe(true)
     expect(config.feishuTools.attachmentFetchMaxBytes).toBe(h.config.feishuTools.attachmentFetchMaxBytes)
-    expect(service.runningConfigSnapshot()?.feishuTools.attachmentFetch).toBe(false)
+    expect(service.runningConfigSnapshot()?.feishuTools.sendFile).toBe(false)
 
     // A live panel write starts from the profile base (not from the previous
     // overlay) and applies only the sub-fields it carries.
     service.applyOverlay({ feishuTools: { topicMessages: false } })
     expect(service.configSnapshot().feishuTools.topicMessages).toBe(false)
-    expect(service.configSnapshot().feishuTools.attachmentFetch).toBe(true)
+    expect(service.configSnapshot().feishuTools.sendFile).toBe(true)
     await service.shutdown()
   })
 
@@ -2303,6 +2362,34 @@ describe('FeishuService settings integration', () => {
     expect(panel.status.running).toBe(false)
     expect(panel.status.phase).toBe('error')
     expect(panel.status.lastStartError).toContain('ws handshake failed')
+  })
+
+  it('shows the occupied phase with the owner and takes the connection over through the panel', async () => {
+    const h = harness()
+    const locks = makeInstanceLocks()
+    const owner = new FeishuService(h.ctx, h.config, () => makeChannel(), undefined, h.store, locks)
+    await owner.boot()
+    expect(owner.isRunning()).toBe(true)
+
+    const service = new FeishuService(h.ctx, h.config, () => makeChannel(), undefined, h.store, locks)
+    await service.boot()
+    expect(service.isRunning()).toBe(false)
+    const surface = new SettingsSurface(service, h.store)
+    const panel = await surface.panel()
+    expect(panel.status.phase).toBe('occupied')
+    expect(panel.status.occupiedBy).toEqual({
+      holder: { pid: process.pid, home: expect.any(String), version: expect.any(String) },
+    })
+
+    const taken = await surface.takeover()
+    expect(taken.ok).toBe(true)
+    if (taken.ok) {
+      expect(taken.panel.status.phase).toBe('connected')
+      expect(taken.panel.status.occupiedBy).toBeUndefined()
+    }
+    await vi.waitFor(() => expect(owner.isRunning()).toBe(false))
+    expect((await new SettingsSurface(owner, h.store).panel()).status.phase).toBe('occupied')
+    await service.shutdown()
   })
 
   it('stays loaded and unconnected while the credentials are incomplete', async () => {
@@ -2402,20 +2489,6 @@ describe('FeishuService settings integration', () => {
     if (!cleared.ok) return
     expect(cleared.reconnect).toBe('pending')
     expect(h.credentials.values.FEISHU_APP_SECRET).toBeUndefined()
-    await service.shutdown()
-  })
-
-  it('writes the analyze API token to its credential ref through the real service', async () => {
-    const h = harness({}, {})
-    const service = new FeishuService(h.ctx, h.config, () => h.channel, undefined, h.store)
-    const surface = new SettingsSurface(service, h.store)
-    await service.boot()
-    const saved = await surface.saveCredentials({ analyzeToken: 'tok_secret' })
-    expect(saved.ok).toBe(true)
-    expect(h.credentials.values.DSH_CHANNELS_ANALYZE_TOKEN).toBe('tok_secret')
-    expect(service.isRunning()).toBe(false)
-    await surface.clearCredential('analyzeToken')
-    expect(h.credentials.values.DSH_CHANNELS_ANALYZE_TOKEN).toBeUndefined()
     await service.shutdown()
   })
 

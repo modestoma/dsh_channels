@@ -7,7 +7,7 @@
  * cookie 鉴权，只有通过的 owner 请求才会到达这里，未通过时由 DSH 直接返回
  * 401 / 403。凭据值只走写路径，响应永远不包含它们。`catalog` 只读宿主
  * LLM / preset roster 的枚举结果，用于面板的 provider → model → 推理档位
- * 级联选择。`access` 提供准入快照与白名单/授权申请的写入口（与飞书卡片共用
+ * 级联选择。`access` 提供准入快照与用户表/授权申请的写入口（与飞书卡片共用
  * 同一结算函数）。
  *
  * @module dsh-channels/settings/routes
@@ -16,9 +16,7 @@
 import type { HostContext } from '../dsh-types.ts'
 import {
   ACCESS_ROUTE,
-  ADD_ACCESS_GROUP_ROUTE,
   ADD_ACCESS_USER_ROUTE,
-  ADD_WIKI_USER_ROUTE,
   CATALOG_ROUTE,
   CLEAR_CONFIG_ROUTE,
   CLEAR_CREDENTIAL_ROUTE,
@@ -27,14 +25,19 @@ import {
   PROFILES_MAX_IDS,
   PROFILES_ROUTE,
   RECONNECT_ROUTE,
-  REMOVE_ACCESS_GROUP_ROUTE,
+  TAKEOVER_ROUTE,
   REMOVE_ACCESS_USER_ROUTE,
-  REMOVE_WIKI_USER_ROUTE,
   RESOLVE_ACCESS_REQUEST_ROUTE,
+  SET_ACCESS_GIT_EMAIL_ROUTE,
+  SET_ACCESS_PERMISSION_ROUTE,
   SAVE_CONFIG_ROUTE,
   SAVE_CREDENTIALS_ROUTE,
   SESSION_ORIGIN_ROUTE,
+  SESSION_RECORDS_ROUTE,
   STATUS_ROUTE,
+  WORKSPACE_FILE_DOWNLOAD_ROUTE,
+  WORKSPACE_FILE_PREVIEW_ROUTE,
+  WORKSPACE_FILES_ROUTE,
 } from './contract.ts'
 import type {
   CredentialField,
@@ -43,6 +46,7 @@ import type {
   SaveCredentialsRequest,
 } from './contract.ts'
 import type { SettingsSurface } from './surface.ts'
+import { WorkspaceFileError } from '../workspace-files.ts'
 
 /** One exact route on DSH's authenticated `/api` channel. */
 export interface HostFetchRoute {
@@ -111,6 +115,19 @@ function idList(raw: string | null): string[] {
   return [...new Set(raw.split(',').map(id => id.trim()).filter(id => id !== ''))]
 }
 
+/** The required absolute `workspace` query parameter of the file routes. */
+function workspaceParam(url: URL): string {
+  const workspace = url.searchParams.get('workspace')
+  if (workspace === null || workspace === '') throw new HttpError(400, '缺少 workspace 参数')
+  return workspace
+}
+
+/** `Content-Disposition` for one download name (RFC 6266 with an RFC 5987 UTF-8 name). */
+function attachmentDisposition(name: string): string {
+  const fallback = name.replace(/[^\x20-\x7e]|["\\]/g, '_')
+  return `attachment; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(name)}`
+}
+
 /** A write's answer: 200 on success, 400 for a refusal the body explains. */
 function result(outcome: { ok: boolean }): Response {
   return json(outcome.ok ? 200 : 400, outcome)
@@ -122,7 +139,9 @@ function answered(handler: (request: Request) => Promise<Response>): (request: R
     try {
       return await handler(request)
     } catch (error) {
-      if (error instanceof HttpError) return json(error.status, { ok: false, error: error.message })
+      if (error instanceof HttpError || error instanceof WorkspaceFileError) {
+        return json(error.status, { ok: false, error: error.message })
+      }
       return json(500, { ok: false, error: `内部错误：${messageOf(error)}` })
     }
   }
@@ -162,6 +181,26 @@ export function registerSettingsRoutes(connection: HostConnection, surface: Sett
       return json(200, await surface.feishuProfiles(userIds, chatIds))
     }),
     get(ACCESS_ROUTE, async () => json(200, await surface.access())),
+    get(SESSION_RECORDS_ROUTE, async () => json(200, await surface.sessionRecords())),
+    get(WORKSPACE_FILES_ROUTE, async url => json(200, await surface.workspaceFiles(
+      workspaceParam(url), url.searchParams.get('path') ?? undefined,
+    ))),
+    get(WORKSPACE_FILE_PREVIEW_ROUTE, async url => json(200, await surface.workspaceFilePreview(
+      workspaceParam(url), url.searchParams.get('path') ?? undefined,
+    ))),
+    get(WORKSPACE_FILE_DOWNLOAD_ROUTE, async (url) => {
+      const file = await surface.workspaceFileDownload(workspaceParam(url), url.searchParams.get('path') ?? undefined)
+      return new Response(file.bytes, {
+        status: 200,
+        headers: {
+          'content-type': 'application/octet-stream',
+          'content-length': String(file.size),
+          'content-disposition': attachmentDisposition(file.name),
+          'cache-control': 'no-store',
+          'x-content-type-options': 'nosniff',
+        },
+      })
+    }),
     post(SAVE_CONFIG_ROUTE, async (request) => {
       const values = (await readJsonObject(request)).values
       if (typeof values !== 'object' || values === null || Array.isArray(values)) {
@@ -175,13 +214,12 @@ export function registerSettingsRoutes(connection: HostConnection, surface: Sett
       const values: SaveCredentialsRequest = {}
       if (payload.appId !== undefined) values.appId = payload.appId as string
       if (payload.appSecret !== undefined) values.appSecret = payload.appSecret as string
-      if (payload.analyzeToken !== undefined) values.analyzeToken = payload.analyzeToken as string
       return result(await surface.saveCredentials(values))
     }),
     post(CLEAR_CREDENTIAL_ROUTE, async (request) => {
       const field = (await readJsonObject(request)).field
-      if (field !== 'appId' && field !== 'appSecret' && field !== 'analyzeToken') {
-        return json(400, { ok: false, error: 'field 必须是 appId、appSecret 或 analyzeToken' })
+      if (field !== 'appId' && field !== 'appSecret') {
+        return json(400, { ok: false, error: 'field 必须是 appId 或 appSecret' })
       }
       return result(await surface.clearCredential(field as CredentialField))
     }),
@@ -189,6 +227,10 @@ export function registerSettingsRoutes(connection: HostConnection, surface: Sett
       const outcome = await surface.reconnect()
       // An incomplete configuration is a client-side state (the panel routes
       // the user to the credentials form), not a server failure.
+      return json(outcome.ok ? 200 : (outcome.unconfigured === true ? 400 : 500), outcome)
+    }),
+    post(TAKEOVER_ROUTE, async () => {
+      const outcome = await surface.takeover()
       return json(outcome.ok ? 200 : (outcome.unconfigured === true ? 400 : 500), outcome)
     }),
     post(PICK_DIRECTORY_ROUTE, async (request) => {
@@ -199,21 +241,19 @@ export function registerSettingsRoutes(connection: HostConnection, surface: Sett
       const payload: PickDirectoryResponse = path === null ? { ok: true, canceled: true } : { ok: true, path }
       return json(200, payload)
     }),
-    post(ADD_ACCESS_GROUP_ROUTE, async (request) => {
-      const payload = await readJsonObject(request)
-      return result(await surface.saveAccessGroup(payload.chatId, payload.name))
-    }),
-    post(REMOVE_ACCESS_GROUP_ROUTE, async request => result(await surface.removeAccessGroup((await readJsonObject(request)).chatId))),
     post(ADD_ACCESS_USER_ROUTE, async (request) => {
       const payload = await readJsonObject(request)
       return result(await surface.saveAccessUser(payload.userId, payload.name))
     }),
     post(REMOVE_ACCESS_USER_ROUTE, async request => result(await surface.removeAccessUser((await readJsonObject(request)).userId))),
-    post(ADD_WIKI_USER_ROUTE, async (request) => {
+    post(SET_ACCESS_PERMISSION_ROUTE, async (request) => {
       const payload = await readJsonObject(request)
-      return result(await surface.saveWikiUser(payload.userId, payload.name))
+      return result(await surface.setAccessPermission(payload.userId, payload.permission, payload.enabled))
     }),
-    post(REMOVE_WIKI_USER_ROUTE, async request => result(await surface.removeWikiUser((await readJsonObject(request)).userId))),
+    post(SET_ACCESS_GIT_EMAIL_ROUTE, async (request) => {
+      const payload = await readJsonObject(request)
+      return result(await surface.setAccessGitEmail(payload.userId, payload.gitEmail))
+    }),
     post(RESOLVE_ACCESS_REQUEST_ROUTE, async (request) => {
       const payload = await readJsonObject(request)
       return result(await surface.resolveAccessRequest(payload.token, payload.decision))

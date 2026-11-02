@@ -5,7 +5,7 @@
  * - p2p:   workspace `<baseDir>/p2p/<user_id>/`
  * - group: workspace `<baseDir>/groups/<chat_id>/<user_id>/`
  * - topic: `<workspace>/topics/<topic-token>/` (the Session's effective cwd)
- * - log-platform analysis: workspace `<baseDir>/analyze/<app>/<errorCode>/`
+ * - `feishuTopics` launch: workspace `<baseDir>/<caller segments…>/`
  *
  * The workspace root is the Session header cwd: it keeps the Session grouped
  * under the user's project in the GUI and stays the sandbox write boundary.
@@ -16,13 +16,8 @@
  * The plugin never deletes workspace or topic directories; operators remove
  * stale ones by hand (a missing topic directory is recreated on the next turn).
  *
- * Attachments received before a topic exists were staged by older plugin
- * versions below `<baseDir>/_staging/<chatType>/<chat_id>/<user_id>/` and
- * adopted into the topic directory once its first Session is created. The v2
- * pipeline stores inbound attachments in the DSH native attachment library and
- * never writes staging, so this is a one-release compatibility path only: it is
- * scheduled for removal in the release cycle after attachment_pipeline_v2 ships
- * (see Roadmap decisions D12 and docs/attachment-pipeline-v2.md).
+ * Inbound attachments never land in these directories: they are stored in
+ * the DSH native attachment library (see `./feishu/native-attachments.ts`).
  *
  * Feishu ids (`user_id`, `oc_…`) are safe path segments, but they are validated
  * anyway so a hostile id can never escape `baseDir`.
@@ -170,39 +165,6 @@ export function topicDirFor(workspacePath: string, topicToken: string): string {
   return path.join(workspacePath, 'topics', safeSegment(topicToken, 'topic token'))
 }
 
-/**
- * Legacy pre-topic attachment staging root.
- *
- * Only older plugin versions wrote here; the v2 native pipeline never does.
- * Scheduled for removal together with
- * the one-time adoption in the release cycle after attachment_pipeline_v2
- * (decisions D12).
- *
- * @deprecated legacy archive-upload path, kept for one release cycle only.
- */
-export function stagingRoot(baseDir: string): string {
-  return path.join(baseDir, '_staging')
-}
-
-/**
- * Staging directory for attachments that arrive before their topic (and so
- * its topic directory) exists. Not a registered workspace: files move into the
- * real topic directory as soon as the first Session of that topic is created.
- *
- * @deprecated v2 never writes staging; kept for one-time adoption of legacy
- * files for one release cycle (decisions D12).
- */
-export function stagingPathFor(
-  baseDir: string,
-  chatType: 'p2p' | 'group',
-  chatId: string,
-  senderUserId: string,
-): string {
-  const chat = safeSegment(chatId, 'chatId')
-  const user = safeSegment(senderUserId, 'senderUserId')
-  return path.join(stagingRoot(baseDir), chatType, chat, user)
-}
-
 /** Human-friendly workspace title shown in the DSH workspace list. */
 export function workspaceTitleFor(
   chatType: 'p2p' | 'group',
@@ -235,31 +197,37 @@ export async function ensureWorkspace(
 }
 
 /**
- * Workspace directory of one log-platform analysis subject:
- * `<baseDir>/analyze/<app>/<errorCode>/`. Every analysis of the same
- * application and error code is grouped there, each in its own topic
- * directory.
+ * First path segments this module lays out itself; a `feishuTopics` launch
+ * workspace may not start with one of them.
  */
-export function analyzeWorkspacePathFor(baseDir: string, app: string, errorCode: string): string {
-  return path.join(baseDir, 'analyze', safeSegment(app, 'app'), safeSegment(errorCode, 'errorCode'))
-}
+export const RESERVED_WORKSPACE_ROOTS: readonly string[] = ['p2p', 'groups', 'topics', '_staging']
 
-/** Workspace title of one analysis subject in the DSH workspace list. */
-export function analyzeWorkspaceTitleFor(app: string, errorCode: string): string {
-  return `日志分析 · ${app} · ${errorCode}`
+/**
+ * Workspace directory of one `feishuTopics` launch:
+ * `<baseDir>/<segments…>/`. Launches with the same segments share it, each in
+ * its own topic directory.
+ * @throws when a segment is unsafe or the first one is reserved.
+ */
+export function launchWorkspacePathFor(baseDir: string, segments: readonly string[]): string {
+  if (segments.length === 0) throw new Error('dsh-channels: a launch workspace needs at least one path segment')
+  const safe = segments.map(segment => safeSegment(segment, 'launch workspace segment'))
+  if (RESERVED_WORKSPACE_ROOTS.includes(safe[0]!)) {
+    throw new Error(`dsh-channels: launch workspace may not start with reserved segment ${JSON.stringify(safe[0])}`)
+  }
+  return path.join(baseDir, ...safe)
 }
 
 /**
- * Ensure one analysis subject's workspace exists and is registered (idempotent
- * like {@link ensureWorkspace}).
+ * Ensure one launch workspace exists and is registered (idempotent like
+ * {@link ensureWorkspace}).
  */
-export async function ensureAnalyzeWorkspace(
+export async function ensureLaunchWorkspace(
   ctx: HostContext,
   baseDir: string,
-  app: string,
-  errorCode: string,
+  segments: readonly string[],
+  title: string,
 ): Promise<Workspace> {
-  const dir = analyzeWorkspacePathFor(baseDir, app, errorCode)
+  const dir = launchWorkspacePathFor(baseDir, segments)
   await mkdir(dir, { recursive: true })
-  return ctx.workspaceRegistry.create(dir, analyzeWorkspaceTitleFor(app, errorCode))
+  return ctx.workspaceRegistry.create(dir, title)
 }

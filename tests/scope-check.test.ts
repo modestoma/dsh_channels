@@ -5,10 +5,10 @@
 
 import { describe, expect, it, vi } from 'vitest'
 import type { FeishuConfig } from '../src/config.ts'
-import { AppOwnerLookupError, FeishuApiError } from '../src/feishu-channel.ts'
+import { FeishuApiError } from '../src/feishu-channel.ts'
 import { checkScopes, scopeConsoleUrl, scopeRequirements } from '../src/feishu/scopes.ts'
 import type { ScopeGrant } from '../src/feishu/scopes.ts'
-import { FeishuService } from '../src/service.ts'
+import { TestFeishuService as FeishuService } from './helpers.ts'
 import { makeAccessConfig } from './access-fixtures.ts'
 import { makeChannel, makeHostContext, makeTempBaseDir } from './helpers.ts'
 
@@ -25,16 +25,16 @@ const ALL_GRANTED: readonly ScopeGrant[] = [
   'im:resource',
 ].map(name => ({ name, granted: true, type: 'tenant' as const }))
 
-const NO_OWNER_FALLBACK = { dmEnabled: true, requireMention: true, ownerLookupFailed: false, slashCommandPanel: true, sendFile: true, wikiRead: false, wikiWrite: false }
+const CONTEXT = { dmEnabled: true, requireMention: true, slashCommandPanel: true, sendFile: true, wikiRead: false, wikiWrite: false }
 
 describe('checkScopes', () => {
   it('reports nothing when every applicable need is granted', () => {
-    expect(checkScopes(ALL_GRANTED, 'cli_x', NO_OWNER_FALLBACK)).toEqual({ missing: [] })
+    expect(checkScopes(ALL_GRANTED, 'cli_x', CONTEXT)).toEqual({ missing: [] })
   })
 
   it('lists required needs before optional ones with per-scope and aggregate console links', () => {
     const grants = ALL_GRANTED.filter(grant => grant.name !== 'contact:user.employee_id:readonly' && grant.name !== 'im:chat:readonly')
-    const result = checkScopes(grants, 'cli_x', NO_OWNER_FALLBACK)
+    const result = checkScopes(grants, 'cli_x', CONTEXT)
     expect(result.missing.map(item => [item.level, item.anyOf[0]])).toEqual([
       ['required', 'contact:user.employee_id:readonly'],
       ['optional', 'im:chat:readonly'],
@@ -47,13 +47,13 @@ describe('checkScopes', () => {
     const grants = ALL_GRANTED.map(grant => grant.name === 'im:message.p2p_msg:readonly'
       ? { ...grant, granted: false }
       : grant.name === 'contact:user.employee_id:readonly' ? { ...grant, type: 'user' as const } : grant)
-    const names = checkScopes(grants, 'cli_x', NO_OWNER_FALLBACK).missing.map(item => item.anyOf[0])
+    const names = checkScopes(grants, 'cli_x', CONTEXT).missing.map(item => item.anyOf[0])
     expect(names).toEqual(['im:message.p2p_msg:readonly', 'contact:user.employee_id:readonly'])
   })
 
   it('lists the contact profile scope as optional for real names and avatars', () => {
     const grants = ALL_GRANTED.filter(grant => grant.name !== 'contact:user.base:readonly')
-    expect(checkScopes(grants, 'cli_x', NO_OWNER_FALLBACK).missing).toEqual([
+    expect(checkScopes(grants, 'cli_x', CONTEXT).missing).toEqual([
       expect.objectContaining({ anyOf: ['contact:user.base:readonly'], level: 'optional' }),
     ])
   })
@@ -63,34 +63,33 @@ describe('checkScopes', () => {
       .filter(grant => grant.name !== 'im:message' && grant.name !== 'im:message.group_at_msg:readonly')
       .concat([{ name: 'im:message:send_as_bot', granted: true }, { name: 'im:message:update', granted: true },
         { name: 'im:message:readonly', granted: true }, { name: 'im:message.reactions:write_only', granted: true }])
-    expect(checkScopes(grants, 'cli_x', NO_OWNER_FALLBACK).missing).toEqual([])
+    expect(checkScopes(grants, 'cli_x', CONTEXT).missing).toEqual([])
   })
 
-  it('skips the DM scope when DMs are disabled and adds the app-info need when the owner lookup was rejected', () => {
+  it('skips the DM scope when DMs are disabled', () => {
     const grants = ALL_GRANTED.filter(grant => grant.name !== 'im:message.p2p_msg:readonly')
-    expect(scopeRequirements({ ...NO_OWNER_FALLBACK, dmEnabled: false }).some(item => item.anyOf.includes('im:message.p2p_msg:readonly'))).toBe(false)
-    const result = checkScopes(grants, 'cli_x', { ...NO_OWNER_FALLBACK, dmEnabled: false, ownerLookupFailed: true })
-    expect(result.missing.map(item => [item.level, item.anyOf[0]])).toEqual([['optional', 'admin:app.info:readonly']])
+    expect(scopeRequirements({ ...CONTEXT, dmEnabled: false }).some(item => item.anyOf.includes('im:message.p2p_msg:readonly'))).toBe(false)
+    expect(checkScopes(grants, 'cli_x', { ...CONTEXT, dmEnabled: false }).missing).toEqual([])
   })
 
   it('lists the slash-command scopes only while the panel sync is enabled', () => {
     const grants = ALL_GRANTED.filter(grant => !grant.name.startsWith('application:app_slash_command'))
-    expect(checkScopes(grants, 'cli_x', NO_OWNER_FALLBACK).missing.map(item => item.anyOf[0]))
+    expect(checkScopes(grants, 'cli_x', CONTEXT).missing.map(item => item.anyOf[0]))
       .toEqual(['application:app_slash_command:read', 'application:app_slash_command:write'])
-    expect(checkScopes(grants, 'cli_x', { ...NO_OWNER_FALLBACK, slashCommandPanel: false }).missing).toEqual([])
+    expect(checkScopes(grants, 'cli_x', { ...CONTEXT, slashCommandPanel: false }).missing).toEqual([])
   })
 
   it('lists the upload scope only while feishu_send_file is enabled and accepts im:resource:upload', () => {
     const grants = ALL_GRANTED.filter(grant => grant.name !== 'im:resource')
-    expect(checkScopes(grants, 'cli_x', NO_OWNER_FALLBACK).missing.map(item => [item.level, item.anyOf.join('|')]))
+    expect(checkScopes(grants, 'cli_x', CONTEXT).missing.map(item => [item.level, item.anyOf.join('|')]))
       .toEqual([['optional', 'im:resource|im:resource:upload']])
-    expect(checkScopes(grants, 'cli_x', { ...NO_OWNER_FALLBACK, sendFile: false }).missing).toEqual([])
-    expect(checkScopes(grants.concat([{ name: 'im:resource:upload', granted: true }]), 'cli_x', NO_OWNER_FALLBACK).missing).toEqual([])
+    expect(checkScopes(grants, 'cli_x', { ...CONTEXT, sendFile: false }).missing).toEqual([])
+    expect(checkScopes(grants.concat([{ name: 'im:resource:upload', granted: true }]), 'cli_x', CONTEXT).missing).toEqual([])
   })
 
   it('lists the wiki scopes only while a wiki tool set is enabled, read accepting readonly scopes', () => {
-    expect(checkScopes(ALL_GRANTED, 'cli_x', NO_OWNER_FALLBACK).missing).toEqual([])
-    const read = { ...NO_OWNER_FALLBACK, wikiRead: true }
+    expect(checkScopes(ALL_GRANTED, 'cli_x', CONTEXT).missing).toEqual([])
+    const read = { ...CONTEXT, wikiRead: true }
     expect(checkScopes(ALL_GRANTED, 'cli_x', read).missing.map(item => item.anyOf.join('|'))).toEqual([
       'wiki:wiki|wiki:wiki:readonly',
       'docx:document|docx:document:readonly',
@@ -108,10 +107,10 @@ describe('checkScopes', () => {
 
   it('requires group_msg when unmentioned group messages are answered', () => {
     const grants = ALL_GRANTED.filter(grant => grant.name !== 'im:message.group_msg')
-    const noMention = { ...NO_OWNER_FALLBACK, requireMention: false }
+    const noMention = { ...CONTEXT, requireMention: false }
     expect(checkScopes(grants, 'cli_x', noMention).missing.map(item => [item.level, item.anyOf.join('|')]))
       .toEqual([['required', 'im:message.group_msg']])
-    expect(checkScopes(grants, 'cli_x', NO_OWNER_FALLBACK).missing.map(item => [item.level, item.anyOf.join('|')]))
+    expect(checkScopes(grants, 'cli_x', CONTEXT).missing.map(item => [item.level, item.anyOf.join('|')]))
       .toEqual([['optional', 'im:message.group_msg']])
     expect(checkScopes(ALL_GRANTED, 'cli_x', noMention).missing).toEqual([])
   })
@@ -158,21 +157,6 @@ describe('FeishuService scope self-check', () => {
     expect(warn?.[1]).toBe(1)
     expect(warn?.[3]).toContain('必需 contact:user.employee_id:readonly')
     await service.shutdown()
-  })
-
-  it('lists the app-info need only when the owner fallback was rejected by Feishu', async () => {
-    const rejected = await boot({ adminUserId: undefined }, {
-      grantedScopes: async () => ALL_GRANTED,
-      appOwnerUserId: async () => { throw new AppOwnerLookupError('code=99991672 Access denied', 99991672) },
-    })
-    await vi.waitFor(() => expect(rejected.service.scopeCheck()?.state).toBe('missing'))
-    const check = rejected.service.scopeCheck()
-    expect(check?.state === 'missing' ? check.missing.map(item => item.scopes[0]) : []).toEqual(['admin:app.info:readonly'])
-    await rejected.service.shutdown()
-
-    const notMember = await boot({ adminUserId: undefined }, { grantedScopes: async () => ALL_GRANTED, appOwnerUserId: async () => undefined })
-    await vi.waitFor(() => expect(notMember.service.scopeCheck()?.state).toBe('ok'))
-    await notMember.service.shutdown()
   })
 
   it.each([

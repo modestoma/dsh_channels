@@ -6,9 +6,11 @@ import { describe, expect, it } from 'vitest'
 import {
   CARD_MAX_BYTES,
   CARD_TARGET_BYTES,
+  DROPPED_NOTICE,
   INTERRUPTION_NOTICE,
   PANEL_CHEVRON_TOKEN,
-  PANEL_TITLES,
+  REASONING_PANEL_TITLE,
+  TURN_HEADLINES,
   REASONING_MAX_BYTES,
   TRUNCATION_SUFFIX,
   buildApprovalCard,
@@ -41,11 +43,13 @@ function escapedJsonBytes(text: string): number {
   return new TextEncoder().encode(JSON.stringify(text)).length
 }
 
+/** A card state without a headline, so element positions start at the panel or the body. */
 function baseState(partial: Partial<CardState> = {}): CardState {
   return {
     phase: 'thinking',
     reasoning: '',
     body: '',
+    headline: '',
     stats: { sessionId: 'sess-1', inputTokens: 100, outputTokens: 50 },
     ...partial,
   }
@@ -80,18 +84,30 @@ const fullStats = {
 
 describe('buildCard', () => {
   it('emits the 2.0 structure: schema + config.width_mode + body.elements', () => {
-    const card = buildCard(baseState()) as unknown as CardShape
+    const card = buildCard(baseState({ headline: undefined })) as unknown as CardShape
     expect(card.schema).toBe('2.0')
     expect(card.config.width_mode).toBe('fill')
-    // A live first frame: the reasoning panel (phase indicator) + body placeholder.
-    expect(tags(card.body.elements)).toEqual(['collapsible_panel', 'markdown'])
+    // A live first frame is only its headline: no empty panel, no body placeholder.
+    expect(card.body.elements).toEqual([{ tag: 'markdown', content: TURN_HEADLINES.thinking }])
+  })
+
+  it('renders the headline first, defaulting to the phase on the main card only', () => {
+    for (const phase of ['thinking', 'replying', 'done', 'stopped', 'error'] as const) {
+      expect(elements({ phase, headline: undefined, body: '答案' })[0]).toEqual({ tag: 'markdown', content: TURN_HEADLINES[phase] })
+    }
+    const list = elements({ headline: '🔧 调用工具：bash · 已运行 3s', reasoning: '想过', origin: '⏰ 定时跟进' })
+    expect(tags(list)).toEqual(['markdown', 'markdown', 'collapsible_panel'])
+    expect(list[0]).toMatchObject({ content: '⏰ 定时跟进', text_size: 'notation' })
+    expect(list[1]).toEqual({ tag: 'markdown', content: '🔧 调用工具：bash · 已运行 3s' })
+    // Continuation cards get no default headline.
+    expect(tags(elements({ headline: undefined, body: '续' }, { segment: 2 }))).toEqual(['markdown', 'markdown'])
   })
 
   it('renders the fold panel: default collapsed, bordered, right-aligned built-in chevron', () => {
-    const panel = elements()[0]
+    const panel = elements({ reasoning: '想过' })[0]
     expect(panel?.expanded).toBe(false)
     expect(panel?.border).toEqual({ color: 'grey', corner_radius: '8px' })
-    expect(panel?.header.title.content).toBe('推理中')
+    expect(panel?.header.title.content).toBe(REASONING_PANEL_TITLE)
     expect(panel?.header.icon_position).toBe('right')
     expect(panel?.header.icon_expanded_angle).toBe(180)
     expect(panel?.header.icon).toEqual({
@@ -100,17 +116,15 @@ describe('buildCard', () => {
     })
   })
 
-  it('switches the panel title by phase', () => {
-    for (const phase of ['thinking', 'replying', 'done', 'error'] as const) {
-      const panel = elements({ phase, reasoning: '想过' })[0]
-      expect(panel?.header.title.content).toBe(PANEL_TITLES[phase])
-    }
+  it('adds the reasoning time to the panel title once the turn settles', () => {
+    const title = (partial: Partial<CardState>): string => elements({ reasoning: '想过', ...partial })[0]?.header.title.content
+    expect(title({ phase: 'thinking', stats: { ...fullStats, reasoningMs: 1_500 } })).toBe('思考过程')
+    expect(title({ phase: 'done', stats: { ...fullStats, reasoningMs: 1_500 } })).toBe('思考过程 · 1.5s')
+    expect(title({ phase: 'error' })).toBe('思考过程')
   })
 
-  it('uses placeholders for empty reasoning and body', () => {
-    const list = elements({ phase: 'thinking' })
-    expect(list[0]?.elements[0]?.content).toContain('等待模型输出')
-    expect(list[1]?.content).toContain('正在生成')
+  it('shows no body placeholder while live and a note for a settled empty body', () => {
+    expect(elements({ phase: 'thinking' })).toEqual([])
     expect(elements({ phase: 'done' })[0]?.content).toContain('本次无正文输出')
   })
 
@@ -122,8 +136,8 @@ describe('buildCard', () => {
       .toEqual(['markdown', 'hr', 'markdown', 'markdown'])
     // Reasoning content keeps it.
     expect(tags(elements({ phase: 'done', reasoning: '想过', body: '答案' }))[0]).toBe('collapsible_panel')
-    // While thinking the panel is the phase indicator, even with no reasoning yet.
-    expect(tags(elements({ phase: 'thinking' }))[0]).toBe('collapsible_panel')
+    // A live turn without reasoning has no panel either.
+    expect(tags(elements({ phase: 'thinking', body: '答案' }))).toEqual(['markdown'])
   })
 
   it('renders the settled footer under a divider: model/session/reasoning + usage', () => {
@@ -189,34 +203,26 @@ describe('buildCard', () => {
     expect(usage({ contextTokens: 64_000, contextWindow: 0 })).toContain('上下文 64,000 tokens')
   })
 
-  it('renders the two activity lines (status + tool) between the panel and the body, omitted when empty', () => {
-    const list = elements({
-      status: '🧵 工作流 audit 结束（完成）',
-      tool: '🔧 调用工具：bash · 已运行 12s',
-    })
-    expect(tags(list)).toEqual(['collapsible_panel', 'markdown', 'markdown', 'markdown'])
+  it('renders the delegation line between the panel and the body, omitted when empty', () => {
+    const list = elements({ reasoning: '想过', status: '🧵 工作流 audit 结束（完成）', body: '答案' })
+    expect(tags(list)).toEqual(['collapsible_panel', 'markdown', 'markdown'])
     expect(list[1]?.content).toBe('🧵 工作流 audit 结束（完成）')
     expect(list[1]?.text_size).toBe('notation')
-    expect(list[2]?.content).toBe('🔧 调用工具：bash · 已运行 12s')
-    expect(list[2]?.text_size).toBe('notation')
-    // Only the tool line.
-    expect(tags(elements({ tool: '🔧 调用工具：bash' }))).toEqual(['collapsible_panel', 'markdown', 'markdown'])
-    // Empty / undefined activity keeps the compact layout.
-    expect(tags(elements({ status: '', tool: '' }))).toEqual(['collapsible_panel', 'markdown'])
+    expect(tags(elements({ status: '', body: '答案' }))).toEqual(['markdown'])
   })
 
-  it('renders both activity lines on continuation cards too (after the segment header)', () => {
+  it('renders the headline and the delegation line on continuation cards too (after the segment header)', () => {
     const list = elements(
-      { status: '🧵 工作流 audit · 3/8 子代理完成 · 已运行 1分2s', tool: '🔧 调用工具：grep' },
+      { headline: '🔧 调用工具：grep · 已运行 2s', status: '🧵 工作流 audit · 3/8 子代理完成 · 已运行 1分2s', body: '续' },
       { segment: 2 },
     )
     expect(tags(list)).toEqual(['markdown', 'markdown', 'markdown', 'markdown'])
     expect(list[0]?.content).toBe('📄 回复分段 2')
     expect(list[0]?.text_size).toBe('notation')
-    expect(list[1]?.content).toContain('工作流 audit')
-    expect(list[1]?.text_size).toBe('notation')
-    expect(list[2]?.content).toContain('调用工具：grep')
+    expect(list[1]?.content).toContain('调用工具：grep')
+    expect(list[2]?.content).toContain('工作流 audit')
     expect(list[2]?.text_size).toBe('notation')
+    expect(list[3]?.content).toBe('续')
   })
 })
 
@@ -247,15 +253,15 @@ describe('card budget (28 KB target, 30 KB cap)', () => {
 
   it('caps pathological caller-supplied activity lines so the hard cap still holds', () => {
     const card = buildCard(baseState({
+      headline: 't'.repeat(40_000),
       status: 's'.repeat(40_000),
-      tool: 't'.repeat(40_000),
       body: '答案',
     }))
     const list = (card as unknown as CardShape).body.elements
-    // panel, status, tool, body — the activity lines are defensively clipped.
+    // headline, status, body — the caller-supplied lines are defensively clipped.
     expect(list[1]?.text_size).toBe('notation')
+    expect((list[0]?.content ?? '').length).toBeLessThan(1_000)
     expect((list[1]?.content ?? '').length).toBeLessThan(1_000)
-    expect((list[2]?.content ?? '').length).toBeLessThan(1_000)
     expect(cardJsonBytes(card)).toBeLessThanOrEqual(CARD_MAX_BYTES)
   })
 
@@ -531,7 +537,7 @@ describe('approval decision cards', () => {
   }
 
   function buttonsOf(card: object): Array<Record<string, any>> {
-    const row = approvalElements(card).find(element => element.tag === 'column_set')
+    const row = approvalElements(card).find(element => element.tag === 'column_set' && element.flex_mode === 'bisect')
     return row?.columns.flatMap((column: Record<string, any>) =>
       column.elements.filter((element: Record<string, any>) => element.tag === 'button')) ?? []
   }
@@ -547,22 +553,21 @@ describe('approval decision cards', () => {
     expect(card.schema).toBe('2.0')
     expect(card.config.width_mode).toBe('fill')
     expect(approvalElements(card).map(element => element.tag)).toEqual([
-      'markdown', 'markdown', 'markdown', 'hr', 'markdown', 'markdown', 'markdown', 'column_set', 'button', 'markdown',
+      'markdown', 'div', 'hr', 'markdown', 'markdown', 'markdown', 'column_set', 'button', 'markdown',
     ])
 
     const markdowns = markdownsOf(card)
-    expect(markdowns[0]).toContain('需要你的审批')
-    expect(markdowns[1]).toContain('bash')
-    // The reason renders as its own blockquote markdown line.
-    expect(markdowns[2]).toBe('> 需要写入工作区外的文件')
-    expect(markdowns[3]).toContain('5 分钟')
-    expect(markdowns[3]).toContain('超时自动拒绝')
-    expect(markdowns[4]).toContain('回复其他内容视为拒绝')
-    expect(markdowns[5]).toContain('sess-1')
-    expect(markdowns[6]).toContain('本话题内 `bash` 都自动允许')
-    expect(markdowns[6]).toContain('/renew')
+    expect(markdowns[0]).toBe('**⚠️ 需要你的审批 · `bash`**')
+    // The reason is plain text, never read as markdown.
+    expect(approvalElements(card)[1]).toEqual({ tag: 'div', text: { tag: 'plain_text', content: '需要写入工作区外的文件' } })
+    expect(markdowns[1]).toContain('5 分钟')
+    expect(markdowns[1]).toContain('超时自动拒绝')
+    expect(markdowns[2]).toContain('回复其他内容视为拒绝')
+    expect(markdowns[3]).toContain('sess-1')
+    expect(markdowns[4]).toContain('本话题内 `bash` 都自动允许')
+    expect(markdowns[4]).toContain('/renew')
 
-    const actionRow = approvalElements(card).find(element => element.tag === 'column_set')!
+    const actionRow = approvalElements(card).find(element => element.tag === 'column_set' && element.flex_mode === 'bisect')!
     expect(actionRow.flex_mode).toBe('bisect')
     expect(actionRow.horizontal_spacing).toBe('medium')
     expect(actionRow.columns).toHaveLength(2)
@@ -585,7 +590,7 @@ describe('approval decision cards', () => {
     expect(always.type).toBe('default')
     expect(always.behaviors).toEqual([{ type: 'callback', value: { decision: 'always', token: 'tok-1' } }])
 
-    expect(notationMarkdownsOf(card)).toContain(markdowns[3]!)
+    expect(notationMarkdownsOf(card)).toContain(markdowns[1]!)
   })
 
   it('shows the command, the escalation target, and a danger grant for full access', () => {
@@ -607,9 +612,54 @@ describe('approval decision cards', () => {
   it('clips a long command and says how much was hidden', () => {
     const card = buildApprovalCard({ ...question, command: 'a'.repeat(700) })
     const markdowns = markdownsOf(card)
-    expect(markdowns[2]).toContain('a'.repeat(600))
-    expect(markdowns[2]).not.toContain('a'.repeat(601))
-    expect(markdowns[3]).toContain('已截断 100 个字符')
+    expect(markdowns[1]).toContain('a'.repeat(600))
+    expect(markdowns[1]).not.toContain('a'.repeat(601))
+    expect(markdowns[2]).toContain('已截断 100 个字符')
+  })
+
+  function textsOf(element: Record<string, any>): string[] {
+    if (element.tag === 'div') return [element.text.content as string]
+    return (element.columns ?? []).flatMap((column: Record<string, any>) => column.elements.flatMap(textsOf))
+  }
+
+  it('renders a structured reason as label rows and a list, with the arguments folded away', () => {
+    const card = buildApprovalCard({
+      token: 'tok-1',
+      toolName: 'repo_workspace_push',
+      reason: '推送工作区改动到新分支 fix/a_b\n仓库：https://git.example.com/a/b.git\n提交说明：fix: a*b\n  修改 src/a_b.ts  +3 −1\n  新增 logo.png（二进制）',
+      arguments: 'branch: fix/a_b\nmessage: fix: a*b',
+      timeoutMs: 300_000,
+    })
+    const elements = approvalElements(card)
+    expect(markdownsOf(card)[0]).toBe('**⚠️ 需要你的审批 · `repo_workspace_push`**')
+    // No generic "tool asks" sentence when the asker described the call.
+    expect(markdownsOf(card).join('\n')).not.toContain('请求执行一个需要授权的操作')
+    expect(elements.slice(1, 6).map(element => element.tag)).toEqual(['div', 'column_set', 'column_set', 'div', 'collapsible_panel'])
+    expect(textsOf(elements[1]!)).toEqual(['推送工作区改动到新分支 fix/a_b'])
+    expect(textsOf(elements[2]!)).toEqual(['仓库', 'https://git.example.com/a/b.git'])
+    expect(textsOf(elements[3]!)).toEqual(['提交说明', 'fix: a*b'])
+    expect(textsOf(elements[4]!)).toEqual(['· 修改 src/a_b.ts  +3 −1\n· 新增 logo.png（二进制）'])
+    const panel = elements[5]!
+    expect(panel.expanded).toBe(false)
+    expect(panel.header.title.content).toBe('调用参数')
+    expect(panel.elements[0].text.content).toBe('branch: fix/a_b\nmessage: fix: a*b')
+  })
+
+  it('shows the arguments unfolded when nothing else describes the call', () => {
+    const card = buildApprovalCard({ token: 'tok-1', toolName: 'edit', arguments: 'path: a.txt', timeoutMs: 60_000 })
+    const elements = approvalElements(card)
+    expect(markdownsOf(card)[1]).toContain('请求执行一个需要授权的操作')
+    expect(markdownsOf(card)[2]).toBe('**调用参数**')
+    expect(elements.some(element => element.tag === 'collapsible_panel')).toBe(false)
+    expect(JSON.stringify(card)).toContain('path: a.txt')
+  })
+
+  it('says how many reason lines were left out', () => {
+    const reason = Array.from({ length: 35 }, (_, index) => `line ${index}`).join('\n')
+    const card = buildApprovalCard({ ...question, reason })
+    expect(JSON.stringify(card)).toContain('line 29')
+    expect(JSON.stringify(card)).not.toContain('line 30')
+    expect(notationMarkdownsOf(card)).toContain('另有 5 行未显示')
   })
 
   it('omits the reason blockquote and session line when absent', () => {
@@ -639,7 +689,7 @@ describe('approval decision cards', () => {
       timeoutMs: 300_000,
     })
     expect(cardJsonBytes(huge)).toBeLessThanOrEqual(CARD_MAX_BYTES)
-    expect(cardJsonBytes(huge)).toBeLessThan(5_000)
+    expect(cardJsonBytes(huge)).toBeLessThan(8_000)
   })
 
   it.each([
@@ -694,7 +744,13 @@ describe('queued streaming card', () => {
     expect(elements[0]).toMatchObject({ content: QUEUED_NOTICE })
     expect(buttonLabel(elements[1]!)).toBe(STEER_LABEL)
     expect(buttonValue(elements[1]!)).toEqual({ decision: STEER_ACTION })
-    expect(JSON.stringify(queuedStreamingCard('sess-1'))).not.toContain(PANEL_TITLES.thinking)
+    expect(JSON.stringify(queuedStreamingCard('sess-1'))).not.toContain(TURN_HEADLINES.thinking)
+  })
+
+  it('renders only the removed-from-queue notice for a dropped message', () => {
+    expect(elementsOf(buildCard(baseState({ phase: 'stopped', dropped: true, body: 'x', stop: 'ready' })))).toEqual([
+      { tag: 'markdown', content: DROPPED_NOTICE },
+    ])
   })
 
   it('adds the owner-only notice when a non-owner clicked', () => {
@@ -741,11 +797,10 @@ describe('streaming card stop button', () => {
     expect(buttonsOf(initialStreamingCard('sess-1'))).toHaveLength(0)
   })
 
-  it('settles a stopped turn with its own panel title and the footer', () => {
-    const card = buildCard(baseState({ phase: 'stopped', reasoning: '想了想', body: '' }))
+  it('settles a stopped turn with its headline and the footer', () => {
+    const card = buildCard(baseState({ phase: 'stopped', headline: undefined, reasoning: '想了想', body: '' }))
     const json = JSON.stringify(card)
-    expect(json).toContain(PANEL_TITLES.stopped)
-    expect(json).toContain('已按请求停止本轮回复')
+    expect(json).toContain(TURN_HEADLINES.stopped)
     expect(json).toContain('本次无正文输出')
     expect(json).toContain('缓存命中')
   })
@@ -761,9 +816,9 @@ describe('streaming card stop button', () => {
 
 describe('command picker cards', () => {
   const input = {
-    title: '🧠 模型',
-    command: 'model' as const,
-    text: '**当前模型**：`a`',
+    title: '💭 推理强度',
+    command: 'effort' as const,
+    text: '**当前推理强度**：`a`',
     sessionId: 'sess-pick',
     options: [{ label: 'a', arg: 'a' }, { label: 'b', arg: 'b' }, { label: 'c', arg: 'c' }],
     current: 'a',
@@ -776,7 +831,7 @@ describe('command picker cards', () => {
     expect(buttons.every(button => button.width === 'fill')).toBe(true)
     expect(buttons.map(buttonLabel)).toEqual(['✅ a', 'b', 'c'])
     expect(buttons[0]!.type).toBe('primary')
-    expect(buttonValue(buttons[1]!)).toEqual({ decision: PICK_ACTION, command: 'model', arg: 'b', sessionId: 'sess-pick' })
+    expect(buttonValue(buttons[1]!)).toEqual({ decision: PICK_ACTION, command: 'effort', arg: 'b', sessionId: 'sess-pick' })
     expect(JSON.stringify(card)).toContain('仅发起该会话的用户可操作')
   })
 

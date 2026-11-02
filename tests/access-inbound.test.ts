@@ -1,20 +1,17 @@
 /**
  * Guarded-mode end-to-end tests over the real FeishuService with fake host and
- * channel: admission before any side effect, authorization commands, the
- * bot-added card, topic ownership, revocation, persistence across restarts,
- * and the legacy `open` behavior.
+ * channel: admission before any side effect, the user table and its `/auth`
+ * commands, the bot-added card, topic ownership, revocation, the code-write
+ * gate, persistence across restarts, and the legacy `open` behavior.
  */
 
-import { existsSync } from 'node:fs'
-import path from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import type { FeishuConfig } from '../src/config.ts'
-import { AppOwnerLookupError } from '../src/feishu-channel.ts'
 import type { ChannelFactory, NormalizedMessage } from '../src/feishu-channel.ts'
 import type { RouteRecord } from '../src/domain.ts'
-import { ATTACHMENTS_DIR } from '../src/feishu/inbound-attachments.ts'
-import { FeishuService } from '../src/service.ts'
-import { makeAccessConfig } from './access-fixtures.ts'
+import type { Agent } from '../src/dsh-types.ts'
+import { TestFeishuService as FeishuService } from './helpers.ts'
+import { adminRecord, makeAccessConfig } from './access-fixtures.ts'
 import { makeChannel, makeHostContext, makeMessage, makeTempBaseDir } from './helpers.ts'
 
 const ADMIN = 'u_admin'
@@ -65,11 +62,18 @@ async function boot(
 async function setup(
   partial: Partial<FeishuConfig> = {},
   channelOptions: HarnessInput = {},
+  admins: readonly string[] = [ADMIN],
 ): Promise<Harness> {
   const config = makeConfig(partial)
   const ctxState = makeHostContext()
+  for (const admin of admins) ctxState.domain.raw.table('access_users').put(admin, adminRecord(admin))
   const channel = makeChannel(channelOptions)
   return await boot(config, ctxState, channel)
+}
+
+/** User-table rows other than the administrators. */
+function members(service: FeishuService): ReturnType<FeishuService['accessSnapshot']>['users'] {
+  return service.accessSnapshot().users.filter(user => !user.admin)
 }
 
 const flush = () => new Promise<void>(resolve => setTimeout(resolve, 0))
@@ -115,7 +119,7 @@ function followupsOf(harness: Harness, index = 0): number {
 }
 
 describe('guarded 模式：准入零副作用', () => {
-  it('非管理员私聊：固定提示，不建 Session/工作区，也不调模型', async () => {
+  it('不在用户表的人私聊：固定提示，不建 Session/工作区，也不调模型', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
       chatType: 'p2p', chatId: 'oc_p2p_alice', senderId: 'u_alice',
@@ -123,14 +127,14 @@ describe('guarded 模式：准入零副作用', () => {
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
 
-    expect(sentJson(h.channel.sent[0]!)).toContain('非管理员禁用私聊功能')
+    expect(sentJson(h.channel.sent[0]!)).toContain('你还没有对话权限')
     expect(h.ctxState.agents.created).toHaveLength(0)
     expect(h.ctxState.agents.resumed).toHaveLength(0)
     expect(h.ctxState.workspaces.workspaces.size).toBe(0)
     await h.service.shutdown()
   })
 
-  it('非管理员私聊 /userid 例外：只回自己的 open_id，不建 Session', async () => {
+  it('无权限者私聊 /userid 例外：只回自己的 user_id，不建 Session', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
       chatType: 'p2p', chatId: 'oc_p2p_alice', senderId: 'u_alice',
@@ -146,8 +150,8 @@ describe('guarded 模式：准入零副作用', () => {
     await h.service.shutdown()
   })
 
-  it('dmAllowWhitelist：白名单用户私聊可建会话、用命令；非白名单收到白名单提示；撤销立即生效', async () => {
-    const h = await setup({ dmAllowWhitelist: true })
+  it('用户表：对话准入打开的用户可私聊、用命令；其他人收到提示；关闭或移除立即生效', async () => {
+    const h = await setup()
     await h.service.addAccessUser('u_bob')
 
     await h.onMessage(makeMessage({
@@ -155,7 +159,7 @@ describe('guarded 模式：准入零副作用', () => {
       mentionedBot: false, messageId: 'om_dm_bob', content: '你好',
     }))
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
-    expect(h.channel.sent.some(entry => sentJson(entry).includes('非管理员禁用私聊'))).toBe(false)
+    expect(h.channel.sent.some(entry => sentJson(entry).includes('你还没有对话权限'))).toBe(false)
 
     const before = h.channel.sent.length
     await h.onMessage(makeMessage({
@@ -163,34 +167,46 @@ describe('guarded 模式：准入零副作用', () => {
       mentionedBot: false, messageId: 'om_dm_bob_help', content: '/help',
     }))
     await waitUntil(() => expect(h.channel.sent.length).toBeGreaterThan(before))
-    expect(sentJson(h.channel.sent.at(-1)!)).not.toContain('白名单')
+    expect(sentJson(h.channel.sent.at(-1)!)).not.toContain('你还没有对话权限')
 
     await h.onMessage(makeMessage({
       chatType: 'p2p', chatId: 'oc_p2p_carol', senderId: 'u_carol',
       mentionedBot: false, messageId: 'om_dm_carol', content: '你好',
     }))
-    await waitUntil(() => expect(h.channel.sent.some(entry => sentJson(entry).includes('你还不在白名单里'))).toBe(true))
+    const denied = () => h.channel.sent.filter(entry => sentJson(entry).includes('你还没有对话权限'))
+    await waitUntil(() => expect(denied()).toHaveLength(1))
 
+    // Chat off suspends the user without dropping the record.
+    expect(await h.service.setAccessPermission('u_bob', 'chat', false)).toMatchObject({ ok: true })
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_p2p_bob', senderId: 'u_bob',
+      mentionedBot: false, messageId: 'om_dm_bob_suspended', content: '还在吗',
+    }))
+    await waitUntil(() => expect(denied()).toHaveLength(2))
+    expect(members(h.service).map(user => user.userId)).toEqual(['u_bob'])
+
+    expect(await h.service.setAccessPermission('u_bob', 'chat', true)).toMatchObject({ ok: true })
     expect(await h.service.removeAccessUser('u_bob')).toMatchObject({ ok: true })
     await h.onMessage(makeMessage({
       chatType: 'p2p', chatId: 'oc_p2p_bob', senderId: 'u_bob',
-      mentionedBot: false, messageId: 'om_dm_bob_revoked', content: '还在吗',
+      mentionedBot: false, messageId: 'om_dm_bob_revoked', content: '现在呢',
     }))
-    await waitUntil(() => expect(
-      h.channel.sent.filter(entry => sentJson(entry).includes('你还不在白名单里')),
-    ).toHaveLength(2))
+    await flush()
+    // The repeated notice is on a per-sender cooldown; the message still never reaches the agent.
+    expect(denied()).toHaveLength(2)
     expect(h.ctxState.agents.created).toHaveLength(1)
+    expect(followupsOf(h, 0)).toBe(1)
     await h.service.shutdown()
   })
 
-  it('管理员未配置时 fail closed：私聊固定引导、群聊静默、/userid 仍可用', async () => {
-    const h = await setup({ adminUserId: undefined })
+  it('用户表没有管理员时 fail closed：私聊固定引导、群聊静默、/userid 仍可用', async () => {
+    const h = await setup({}, {}, [])
     await h.onMessage(makeMessage({
       chatType: 'p2p', chatId: 'oc_p2p_alice', senderId: 'u_alice',
       mentionedBot: false, messageId: 'om_missing_dm', content: '你好',
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
-    expect(sentJson(h.channel.sent[0]!)).toContain('尚未配置管理员')
+    expect(sentJson(h.channel.sent[0]!)).toContain('还没有管理员')
     expect(h.ctxState.agents.created).toHaveLength(0)
 
     await h.onMessage(makeMessage({
@@ -210,86 +226,50 @@ describe('guarded 模式：准入零副作用', () => {
     await h.service.shutdown()
   })
 
-  it('管理员未配置时使用应用所有者兜底：所有者可私聊，面板与 /auth status 标注来源', async () => {
-    const h = await setup({ adminUserId: undefined }, { appOwnerUserId: async () => 'u_owner' })
-    expect(h.service.accessSnapshot().admin).toEqual({ userId: 'u_owner', source: 'owner', configured: true })
-    await h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_p2p_owner', senderId: 'u_owner',
-      mentionedBot: false, messageId: 'om_owner_status', content: '/auth status',
-    }))
-    await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
-    expect(sentJson(h.channel.sent[0]!)).toContain('应用所有者，自动')
+  it('管理员只在面板设置：打开即可对话和用 /auth，可以有多位；飞书 /auth 不能设置或移除管理员', async () => {
+    const h = await setup({}, {}, [])
+    expect(await h.service.addAccessUser('u_alice', 'Alice')).toMatchObject({ ok: true })
+    expect(await h.service.addAccessUser('u_bob', 'Bob')).toMatchObject({ ok: true })
+    expect(await h.service.setAccessPermission('u_alice', 'admin', true)).toMatchObject({ ok: true })
+    expect(await h.service.setAccessPermission('u_bob', 'admin', true)).toMatchObject({ ok: true })
+    expect(h.service.accessSnapshot().users.filter(user => user.admin).map(user => user.userId)).toEqual(['u_alice', 'u_bob'])
+
     await h.onMessage(makeMessage({
       chatType: 'p2p', chatId: 'oc_p2p_alice', senderId: 'u_alice',
-      mentionedBot: false, messageId: 'om_owner_other', content: '你好',
+      mentionedBot: false, messageId: 'om_admin_status', content: '/auth status',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
+    expect(sentJson(h.channel.sent[0]!)).toContain('管理员（2）')
+
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_p2p_alice', senderId: 'u_alice',
+      mentionedBot: false, messageId: 'om_admin_set', content: '/auth set admin off u_bob',
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
-    expect(sentJson(h.channel.sent[1]!)).toContain('非管理员禁用私聊')
-    await h.service.shutdown()
-  })
-
-  it('显式配置的管理员优先于应用所有者；清空后回落到所有者', async () => {
-    const h = await setup({ adminUserId: ADMIN }, { appOwnerUserId: async () => 'u_owner' })
-    expect(h.service.accessSnapshot().admin).toEqual({ userId: ADMIN, source: 'config', configured: true })
-    await flush()
-    h.config.adminUserId = undefined
-    expect(h.service.accessSnapshot().admin).toEqual({ userId: 'u_owner', source: 'owner', configured: true })
-    await h.service.shutdown()
-  })
-
-  it('已配置管理员时所有者查询不阻塞连接，连接断开后迟到的结果被丢弃', async () => {
-    let settle: (userId: string | undefined) => void = () => {}
-    const h = await setup({ adminUserId: ADMIN }, {
-      appOwnerUserId: () => new Promise<string | undefined>(resolve => { settle = resolve }),
-    })
-    expect(h.channel.connect).toHaveBeenCalledOnce()
-    await h.service.shutdown()
-    settle('u_owner')
-    await flush()
-    h.config.adminUserId = undefined
-    expect(h.service.accessSnapshot().admin).toEqual({ configured: false })
-  })
-
-  it.each([
-    ['接口报错', async (): Promise<string | undefined> => { throw new AppOwnerLookupError('code=99991672 Access denied', 99991672) }, 'code=99991672 Access denied'],
-    ['非 AppOwnerLookupError', async (): Promise<string | undefined> => { throw new Error('boom') }, 'boom'],
-    ['所有者非企业成员', async (): Promise<string | undefined> => undefined, '不是企业内成员'],
-    ['返回 open_id', async (): Promise<string | undefined> => 'ou_owner', '不是企业内成员'],
-  ])('应用所有者查询失败（%s）时 fail closed 并给出原因', async (_name, lookup, reason) => {
-    const h = await setup({ adminUserId: undefined }, { appOwnerUserId: lookup })
-    const admin = h.service.accessSnapshot().admin
-    expect(admin.configured).toBe(false)
-    expect(admin.ownerLookupError).toContain(reason)
-    expect(mock(h.ctxState.ctx.logger?.warn).mock.calls)
-      .toContainEqual(['dsh-channels: app owner fallback unavailable: %s', expect.stringContaining(reason)])
+    expect(sentJson(h.channel.sent[1]!)).toContain('用法')
     await h.onMessage(makeMessage({
       chatType: 'p2p', chatId: 'oc_p2p_alice', senderId: 'u_alice',
-      mentionedBot: false, messageId: 'om_owner_failed', content: '你好',
+      mentionedBot: false, messageId: 'om_admin_remove', content: '/auth remove u_bob',
     }))
-    await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
-    expect(sentJson(h.channel.sent[0]!)).toContain('尚未配置管理员')
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(3))
+    expect(sentJson(h.channel.sent[2]!)).toContain('只能在 Web 设置面板')
+    expect(h.service.accessSnapshot().users.find(user => user.userId === 'u_bob')).toMatchObject({ admin: true })
+
+    // The panel may take the flag away, even from the last administrator.
+    expect(await h.service.setAccessPermission('u_bob', 'admin', false)).toMatchObject({ ok: true })
+    expect(await h.service.setAccessPermission('u_alice', 'admin', false)).toMatchObject({ ok: true })
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_p2p_alice', senderId: 'u_alice',
+      mentionedBot: false, messageId: 'om_no_admin', content: '/auth status',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(4))
+    expect(sentJson(h.channel.sent[3]!)).toContain('还没有管理员')
     await h.service.shutdown()
   })
 
-  it('应用所有者查询超时后按未配置处理', async () => {
-    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
-    try {
-      const config = makeConfig({ adminUserId: undefined })
-      const channel = makeChannel({ appOwnerUserId: () => new Promise<string | undefined>(() => {}) })
-      const service = new FeishuService(makeHostContext().ctx, config, () => channel)
-      const started = service.start()
-      await vi.advanceTimersByTimeAsync(10_000)
-      await started
-      expect(service.accessSnapshot().admin.ownerLookupError).toContain('超时')
-      await service.shutdown()
-    } finally {
-      vi.useRealTimers()
-    }
-  })
-
-  it('未授权群 @（非管理员）：群内静默、不建 Session，管理员 DM 收到群信息/授权卡', async () => {
+  it('无权限者在群里 @：群内静默、不建 Session，管理员 DM 收到用户授权申请卡', async () => {
     const h = await setup()
-    const chatId = 'oc_unauthorized_alice'
+    const chatId = 'oc_any_group'
     await h.onMessage(makeMessage({
       chatType: 'group', chatId, senderId: 'u_alice', mentionedBot: true,
       messageId: 'om_group_alice', content: '@机器人 你好',
@@ -298,24 +278,33 @@ describe('guarded 模式：准入零副作用', () => {
 
     const [entry] = h.channel.sent
     expect(entry?.chatId).toBe(ADMIN)
-    expect(sentJson(entry!)).toContain('群信息')
+    expect(sentJson(entry!)).toContain('用户授权申请')
+    expect(sentJson(entry!)).toContain('u_alice')
     expect(sentJson(entry!)).toContain(chatId)
     expect(sentTo(h.channel, chatId)).toHaveLength(0)
     expect(h.ctxState.agents.created).toHaveLength(0)
     expect(h.ctxState.workspaces.workspaces.size).toBe(0)
+
+    // A second mention while the request is pending sends no second card.
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId, senderId: 'u_alice', mentionedBot: true,
+      messageId: 'om_group_alice_2', content: '@机器人 在吗',
+    }))
+    await flush()
+    expect(h.channel.sent).toHaveLength(1)
     await h.service.shutdown()
   })
 
-  it('未授权群 @（管理员）：直接建 Session（管理员不受白名单限制）', async () => {
+  it('管理员在任何群 @：直接建 Session，不产生申请', async () => {
     const h = await setup()
-    const chatId = 'oc_unauthorized_admin'
+    const chatId = 'oc_admin_group'
     await h.onMessage(makeMessage({
       chatType: 'group', chatId, senderId: ADMIN, mentionedBot: true,
       messageId: 'om_group_admin', content: '@机器人 你好',
     }))
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
     await waitUntil(() => expect(followupsOf(h, 0)).toBe(1))
-    expect(h.service.accessSnapshot().groups).toEqual([])
+    expect(h.service.accessSnapshot().requests).toEqual([])
     await h.service.shutdown()
   })
 
@@ -332,10 +321,9 @@ describe('guarded 模式：准入零副作用', () => {
   })
 })
 
-describe('guarded 模式：已授权群', () => {
-  it('管理员与用户白名单放行，未授权用户静默拒绝并给管理员推用户授权卡', async () => {
+describe('guarded 模式：群聊', () => {
+  it('管理员与用户表里的用户在任何群放行，其他人静默拒绝并给管理员推用户授权卡', async () => {
     const h = await setup()
-    expect(await h.service.addAccessGroup('oc_group')).toMatchObject({ ok: true })
     expect(await h.service.addAccessUser('u_bob')).toMatchObject({ ok: true })
 
     await h.onMessage(makeMessage({
@@ -345,12 +333,15 @@ describe('guarded 模式：已授权群', () => {
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
     await waitUntil(() => expect(followupsOf(h, 0)).toBe(1))
 
-    await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_group', senderId: 'u_bob',
-      mentionedBot: true, messageId: 'om_bob_open', content: '白名单用户来了',
-    }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
-    await waitUntil(() => expect(followupsOf(h, 1)).toBe(1))
+    // Two groups nobody ever authorized: a table user may talk in both.
+    for (const [index, chatId] of ['oc_group', 'oc_other_group'].entries()) {
+      await h.onMessage(makeMessage({
+        chatType: 'group', chatId, senderId: 'u_bob',
+        mentionedBot: true, messageId: `om_bob_open_${index}`, content: '用户表里的用户来了',
+      }))
+      await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2 + index))
+      await waitUntil(() => expect(followupsOf(h, 1 + index)).toBe(1))
+    }
 
     const groupSendsBefore = sentTo(h.channel, 'oc_group').length
     await h.onMessage(makeMessage({
@@ -359,54 +350,18 @@ describe('guarded 模式：已授权群', () => {
     }))
     await waitUntil(() => expect(h.channel.sent.some(entry => sentJson(entry).includes('用户授权申请'))).toBe(true))
 
-    expect(h.ctxState.agents.created).toHaveLength(2)
+    expect(h.ctxState.agents.created).toHaveLength(3)
     expect(sentTo(h.channel, 'oc_group').length).toBe(groupSendsBefore)
     const requestCard = h.channel.sent.find(entry => sentJson(entry).includes('用户授权申请'))
     expect(requestCard?.chatId).toBe(ADMIN)
     expect(sentJson(requestCard!)).toContain('u_carol')
-    // 用户申请进入管理员的待处理队列。
-    expect(h.service.accessSnapshot().requests.map(request => request.targetId)).toContain('u_carol')
+    expect(h.service.accessSnapshot().requests.map(request => request.targetId)).toEqual(['u_carol'])
     await h.service.shutdown()
   })
 
-  it('管理员在未授权群可直接对话；/auth allow 后白名单用户也可用', async () => {
+  it('无权限者的 /groupid、/auth 与普通命令在群里静默拒绝', async () => {
     const h = await setup()
-    await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_new_group', senderId: ADMIN,
-      mentionedBot: true, messageId: 'om_admin_unauth', content: '先聊一下',
-    }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
-    await waitUntil(() => expect(followupsOf(h, 0)).toBe(1))
-
-    expect(await h.service.addAccessUser('u_bob')).toMatchObject({ ok: true })
-    // 群未授权：白名单用户仍不能对话。
-    await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_new_group', senderId: 'u_bob',
-      mentionedBot: true, messageId: 'om_bob_before_auth', content: '@机器人 你好',
-    }))
-    await flush()
-    expect(h.ctxState.agents.created).toHaveLength(1)
-
-    await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_new_group', senderId: ADMIN,
-      mentionedBot: true, messageId: 'om_auth_allow', content: '/auth allow',
-    }))
-    await waitUntil(() => expect(sentTo(h.channel, 'oc_new_group').some(entry =>
-      sentJson(entry).includes('已授权本群'))).toBe(true))
-    expect(h.service.accessSnapshot().groups.map(group => group.chatId)).toContain('oc_new_group')
-
-    await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_new_group', senderId: 'u_bob',
-      mentionedBot: true, messageId: 'om_bob_after_auth', content: '@机器人 你好',
-    }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
-    await waitUntil(() => expect(followupsOf(h, 1)).toBe(1))
-    await h.service.shutdown()
-  })
-
-  it('非管理员的 /groupid、/auth 与普通命令在未授权群静默拒绝', async () => {
-    const h = await setup()
-    for (const [index, content] of ['/groupid', '/auth allow', '/auth status', '/help'].entries()) {
+    for (const [index, content] of ['/groupid', '/auth add u_alice', '/auth status', '/help'].entries()) {
       await h.onMessage(makeMessage({
         chatType: 'group', chatId: 'oc_new_group', senderId: 'u_alice',
         mentionedBot: true, messageId: `om_denied_cmd_${index}`, content,
@@ -415,54 +370,50 @@ describe('guarded 模式：已授权群', () => {
     await flush()
     expect(h.channel.sent).toEqual([])
     expect(h.ctxState.agents.created).toHaveLength(0)
-    expect(h.service.accessSnapshot().groups).toEqual([])
+    expect(members(h.service)).toEqual([])
     await h.service.shutdown()
   })
 })
 
 describe('guarded 模式：/auth 用户管理', () => {
-  it('/auth user add/remove/list/status 生效，重启后白名单仍在', async () => {
+  it('/auth add/remove/list/status 生效，重启后用户表仍在', async () => {
     const h = await setup()
-
-    await h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_p2p_admin', senderId: ADMIN,
-      mentionedBot: false, messageId: 'om_auth_status', content: '/auth status',
+    const admin = (messageId: string, content: string) => h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_p2p_admin', senderId: ADMIN, mentionedBot: false, messageId, content,
     }))
+
+    await admin('om_auth_status', '/auth status')
     await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
     const statusJson = sentJson(h.channel.sent[0]!)
     expect(statusJson).toContain('访问授权状态')
     expect(statusJson).toContain('guarded')
     expect(statusJson).toContain(ADMIN)
 
-    await h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_p2p_admin', senderId: ADMIN,
-      mentionedBot: false, messageId: 'om_auth_add_user', content: '/auth user add u_bob',
-    }))
+    await admin('om_auth_add_user', '/auth add u_bob')
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
-    expect(sentJson(h.channel.sent[1]!)).toContain('已授权用户')
-    expect(h.service.accessSnapshot().users.map(user => user.userId)).toEqual(['u_bob'])
+    expect(sentJson(h.channel.sent[1]!)).toContain('加入用户表并打开对话准入')
+    expect(members(h.service)).toMatchObject([
+      { userId: 'u_bob', source: 'command', chat: true, wikiRead: false, wikiWrite: false, codeWrite: false },
+    ])
 
-    await h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_p2p_admin', senderId: ADMIN,
-      mentionedBot: false, messageId: 'om_auth_list', content: '/auth list',
-    }))
+    await admin('om_auth_list', '/auth list')
     await waitUntil(() => expect(h.channel.sent).toHaveLength(3))
     expect(sentJson(h.channel.sent[2]!)).toContain('u_bob')
+    expect(sentJson(h.channel.sent[2]!)).toContain('对话准入')
 
-    await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_group', senderId: ADMIN,
-      mentionedBot: true, messageId: 'om_auth_allow_group', content: '/auth allow',
-    }))
-    await waitUntil(() => expect(h.service.accessSnapshot().groups.map(group => group.chatId))
-      .toContain('oc_group'))
+    await admin('om_auth_remove_missing', '/auth remove u_nobody')
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(4))
+    expect(sentJson(h.channel.sent[3]!)).toContain('不在用户表中')
+
+    await admin('om_auth_bad', '/auth grant u_bob')
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(5))
+    expect(sentJson(h.channel.sent[4]!)).toContain('/auth set <chat|wiki-read|wiki-write|code>')
 
     await h.service.shutdown()
 
-    // Restart over the same durable domain: both grants must reload.
+    // Restart over the same durable domain: the grant must reload.
     const restarted = await boot(h.config, h.ctxState, makeChannel())
-    const snapshot = restarted.service.accessSnapshot()
-    expect(snapshot.users.map(user => user.userId)).toEqual(['u_bob'])
-    expect(snapshot.groups.map(group => group.chatId)).toEqual(['oc_group'])
+    expect(members(restarted.service).map(user => user.userId)).toEqual(['u_bob'])
 
     await restarted.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_group', senderId: 'u_bob',
@@ -473,93 +424,101 @@ describe('guarded 模式：/auth 用户管理', () => {
     await restarted.service.shutdown()
   })
 
-  it('/auth user add|remove @成员：取被 @ 用户的 user_id 并记下姓名，拒绝没有 user_id 的用户', async () => {
+  it('/auth add|remove @成员：取被 @ 用户的 user_id 并记下姓名，拒绝没有 user_id 的用户', async () => {
     const h = await setup()
     const bot = { key: '@_user_1', openId: 'bot-open-id', name: 'DSH', isBot: true }
     const carol = { key: '@_user_2', openId: 'ou_carol', userId: 'u_carol', name: 'Carol' }
 
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_group', senderId: ADMIN, mentionedBot: true,
-      mentions: [bot, carol], messageId: 'om_auth_add_mention', content: '/auth user add @Carol',
+      mentions: [bot, carol], messageId: 'om_auth_add_mention', content: '/auth add @Carol',
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
-    expect(sentJson(h.channel.sent[0]!)).toContain('已授权用户 Carol')
-    expect(h.service.accessSnapshot().users).toMatchObject([{ userId: 'u_carol', name: 'Carol' }])
+    expect(sentJson(h.channel.sent[0]!)).toMatch(/已把 Carol（`u_carol`）\s*加入用户表/u)
+    expect(members(h.service)).toMatchObject([{ userId: 'u_carol', name: 'Carol' }])
 
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_group', senderId: ADMIN, mentionedBot: true,
       mentions: [bot, { key: '@_user_3', openId: 'ou_guest', name: 'Guest' }],
-      messageId: 'om_auth_add_external', content: '/auth user add @Guest',
+      messageId: 'om_auth_add_external', content: '/auth add @Guest',
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
     expect(sentJson(h.channel.sent[1]!)).toContain('没有 user_id')
-    expect(h.service.accessSnapshot().users).toHaveLength(1)
+    expect(members(h.service)).toHaveLength(1)
 
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_group', senderId: ADMIN, mentionedBot: true,
-      mentions: [bot, carol], messageId: 'om_auth_remove_mention', content: '/auth user remove @Carol',
+      mentions: [bot, carol], messageId: 'om_auth_remove_mention', content: '/auth remove @Carol',
     }))
-    await waitUntil(() => expect(h.service.accessSnapshot().users).toEqual([]))
+    await waitUntil(() => expect(members(h.service)).toEqual([]))
     await h.service.shutdown()
   })
 
-  it('/auth wiki add|remove 管理独立的知识库白名单，重启后仍在', async () => {
+  it('/auth set 打开与关闭各个开关，开关互相独立，重启后仍在', async () => {
     const h = await setup()
     const bot = { key: '@_user_1', openId: 'bot-open-id', name: 'DSH', isBot: true }
     const carol = { key: '@_user_2', openId: 'ou_carol', userId: 'u_carol', name: 'Carol' }
-
-    await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_group', senderId: ADMIN, mentionedBot: true,
-      mentions: [bot, carol], messageId: 'om_wiki_add', content: '/auth wiki add @Carol',
+    const inGroup = (messageId: string, content: string) => h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_group', senderId: ADMIN, mentionedBot: true, mentions: [bot, carol], messageId, content,
     }))
+
+    await inGroup('om_set_missing', '/auth set wiki-read on @Carol')
     await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
-    expect(sentJson(h.channel.sent[0]!)).toContain('加入知识库白名单')
-    // The wiki grant does not admit the user to conversations.
-    expect(h.service.accessSnapshot().users).toEqual([])
+    expect(sentJson(h.channel.sent[0]!)).toContain('不在用户表中，请先 /auth add')
+    expect(members(h.service)).toEqual([])
 
-    await h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_p2p_admin', senderId: ADMIN,
-      mentionedBot: false, messageId: 'om_wiki_usage', content: '/auth wiki',
-    }))
-    await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
-    expect(sentJson(h.channel.sent[1]!)).toContain('/auth wiki add')
+    await inGroup('om_set_add', '/auth add @Carol')
+    await inGroup('om_set_read', '/auth set wiki-read on @Carol')
+    await inGroup('om_set_code', '/auth set code on @Carol')
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(4))
+    expect(sentJson(h.channel.sent[3]!)).toMatch(/已打开 Carol（`u_carol`）\s*的「代码改动」/u)
+    expect(sentJson(h.channel.sent[3]!)).toContain('当前：对话准入 · 知识库读取 · 代码改动')
+
+    await inGroup('om_set_chat_off', '/auth set chat off @Carol')
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(5))
+    expect(members(h.service)).toMatchObject([
+      { userId: 'u_carol', chat: false, wikiRead: true, wikiWrite: false, codeWrite: true },
+    ])
+
+    for (const [index, content] of ['/auth set admin on @Carol', '/auth set code maybe @Carol', '/auth set code on'].entries()) {
+      await inGroup(`om_set_bad_${index}`, content)
+    }
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(8))
+    for (const entry of h.channel.sent.slice(5)) expect(sentJson(entry)).toContain('/auth set')
     await h.service.shutdown()
 
     const restarted = await boot(h.config, h.ctxState, makeChannel())
-    await restarted.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_p2p_admin', senderId: ADMIN,
-      mentionedBot: false, messageId: 'om_wiki_list', content: '/auth list',
-    }))
-    await waitUntil(() => expect(restarted.channel.sent).toHaveLength(1))
-    expect(sentJson(restarted.channel.sent[0]!)).toContain('知识库白名单（1）')
-    expect(sentJson(restarted.channel.sent[0]!)).toContain('u_carol')
-
-    await restarted.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_p2p_admin', senderId: ADMIN,
-      mentionedBot: false, messageId: 'om_wiki_remove', content: '/auth wiki remove u_carol',
-    }))
-    await waitUntil(() => expect(restarted.channel.sent).toHaveLength(2))
-    expect(sentJson(restarted.channel.sent[1]!)).toContain('移出知识库白名单')
+    expect(members(restarted.service)).toMatchObject([
+      { userId: 'u_carol', name: 'Carol', chat: false, wikiRead: true, wikiWrite: false, codeWrite: true },
+    ])
     await restarted.service.shutdown()
   })
 
-  it('设置面板增删知识库白名单，与用户白名单互不影响', async () => {
+  it('设置面板打开与关闭开关；拒绝不合法的 user_id 和不在表里的用户', async () => {
     const h = await setup()
-    const added = await h.service.addWikiUser(' u_dave ', ' Dave ')
+    const added = await h.service.addAccessUser(' u_dave ', ' Dave ')
     expect(added).toMatchObject({ ok: true })
     if (!added.ok) return
-    expect(added.access.wikiUsers).toEqual([{ userId: 'u_dave', name: 'Dave', source: 'panel', addedAt: expect.any(Number) }])
-    expect(added.access.users).toEqual([])
-    expect(await h.service.addWikiUser('u_dave')).toMatchObject({ ok: true, access: { wikiUsers: [{ name: 'Dave' }] } })
-    expect(await h.service.addWikiUser('ou_dave')).toMatchObject({ ok: false })
-    expect(await h.service.removeWikiUser('u_dave')).toMatchObject({ ok: true, access: { wikiUsers: [] } })
-    expect(await h.service.removeWikiUser('bad id')).toMatchObject({ ok: false })
+    expect(added.access.users.filter(user => !user.admin)).toEqual([{
+      userId: 'u_dave', name: 'Dave', source: 'panel', addedAt: expect.any(Number),
+      admin: false, chat: true, wikiRead: false, wikiWrite: false, codeWrite: false,
+    }])
+    expect(await h.service.setAccessPermission('u_dave', 'wikiWrite', true))
+      .toMatchObject({ ok: true, access: { users: [{ admin: true }, { wikiRead: false, wikiWrite: true }] } })
+    // Adding again keeps the switches and turns chat back on.
+    await h.service.setAccessPermission('u_dave', 'chat', false)
+    expect(await h.service.addAccessUser('u_dave'))
+      .toMatchObject({ ok: true, access: { users: [{ admin: true }, { name: 'Dave', chat: true, wikiWrite: true }] } })
+    expect(await h.service.addAccessUser('ou_dave')).toMatchObject({ ok: false })
+    expect(await h.service.setAccessPermission('u_nobody', 'codeWrite', true))
+      .toEqual({ ok: false, error: '该用户不在用户表中，请先添加' })
+    expect(await h.service.setAccessPermission('bad id', 'codeWrite', true)).toMatchObject({ ok: false })
+    expect(await h.service.removeAccessUser('bad id')).toMatchObject({ ok: false })
     await h.service.shutdown()
   })
 
-  it('撤销用户与撤销群立即生效（非管理员被拒；管理员仍直通）', async () => {
+  it('移除用户立即生效（非管理员被拒；管理员仍直通）', async () => {
     const h = await setup()
-    await h.service.addAccessGroup('oc_group')
     await h.service.addAccessUser('u_bob')
 
     await h.onMessage(makeMessage({
@@ -570,44 +529,28 @@ describe('guarded 模式：/auth 用户管理', () => {
 
     await h.onMessage(makeMessage({
       chatType: 'p2p', chatId: 'oc_p2p_admin', senderId: ADMIN,
-      mentionedBot: false, messageId: 'om_auth_remove_user', content: '/auth user remove u_bob',
+      mentionedBot: false, messageId: 'om_auth_remove_user', content: '/auth remove u_bob',
     }))
-    await waitUntil(() => expect(h.service.accessSnapshot().users).toEqual([]))
+    await waitUntil(() => expect(members(h.service)).toEqual([]))
 
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_group', senderId: 'u_bob',
       mentionedBot: true, messageId: 'om_bob_after_revoke', content: '撤销后',
     }))
+    await flush()
     expect(h.ctxState.agents.created).toHaveLength(1)
 
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_group', senderId: ADMIN,
-      mentionedBot: true, messageId: 'om_admin_after_group_revoke', content: '群还在吗',
+      mentionedBot: true, messageId: 'om_admin_after_revoke', content: '管理员还在',
     }))
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
-
-    expect(await h.service.removeAccessGroup('oc_group')).toMatchObject({ ok: true })
-
-    // 群撤销后管理员仍然直通（白名单只约束非管理员）。
-    await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_group', senderId: ADMIN,
-      mentionedBot: true, messageId: 'om_admin_after_group_revoke_2', content: '现在呢',
-    }))
-    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(3))
-
-    // 非管理员（用户白名单已撤销 + 群未授权）仍被拒绝。
-    await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_group', senderId: 'u_bob',
-      mentionedBot: true, messageId: 'om_bob_after_group_revoke', content: '我还能说话吗',
-    }))
-    await flush()
-    expect(h.ctxState.agents.created).toHaveLength(3)
     await h.service.shutdown()
   })
 })
 
-describe('guarded 模式：botAdded 群信息卡', () => {
-  it('管理员已配置：未授权群 DM 授权卡，已授权群只发标注已授权的信息卡', async () => {
+describe('guarded 模式：botAdded', () => {
+  it('无权限者拉群：管理员收到用户授权申请卡；有权限者拉群：只发信息卡', async () => {
     const h = await setup({}, {
       chatInfo: async chatId => ({ chatId, chatType: 'group', name: `群-${chatId}`, memberCount: 8, ownerId: 'u_owner' }),
     })
@@ -617,18 +560,25 @@ describe('guarded 模式：botAdded 群信息卡', () => {
     const addedEntry = h.channel.sent[0]!
     expect(addedEntry.chatId).toBe(ADMIN)
     const addedJson = sentJson(addedEntry)
-    expect(addedJson).toContain('群-oc_added')
+    expect(addedJson).toContain('用户授权申请')
     expect(addedJson).toContain('u_inviter')
-    expect(addedJson).toContain('授权本群')
-    expect(h.service.accessSnapshot().requests.map(request => request.targetId)).toContain('oc_added')
-    expect(h.service.accessSnapshot().groups).toEqual([])
+    expect(addedJson).toContain('把我拉进了群')
+    expect(addedJson).toContain('群-oc_added')
+    expect(h.service.accessSnapshot().requests.map(request => request.targetId)).toEqual(['u_inviter'])
 
-    expect(await h.service.addAccessGroup('oc_existing', '老群')).toMatchObject({ ok: true })
-    await h.channel.fireBotAdded({ chatId: 'oc_existing', operator: { openId: 'ou_operator', userId: ADMIN } })
+    expect(await h.service.addAccessUser('u_bob')).toMatchObject({ ok: true })
+    await h.channel.fireBotAdded({ chatId: 'oc_bob', operator: { openId: 'ou_bob', userId: 'u_bob' } })
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
-    const existingJson = sentJson(h.channel.sent[1]!)
-    expect(existingJson).toContain('该群已授权')
-    expect(existingJson).not.toContain('授权本群')
+    const bobJson = sentJson(h.channel.sent[1]!)
+    expect(bobJson).toContain('群信息')
+    expect(bobJson).toContain('群-oc_bob')
+    expect(bobJson).not.toContain('用户授权申请')
+    expect(bobJson).not.toContain('"callback"')
+
+    await h.channel.fireBotAdded({ chatId: 'oc_admin_added', operator: { openId: 'ou_operator', userId: ADMIN } })
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(3))
+    expect(sentJson(h.channel.sent[2]!)).toContain('群信息')
+    expect(h.service.accessSnapshot().requests).toHaveLength(1)
     await h.service.shutdown()
   })
 })
@@ -636,8 +586,7 @@ describe('guarded 模式：botAdded 群信息卡', () => {
 describe('guarded 模式：话题所有权', () => {
   it('非发起人无法续写话题、不落附件，话题 followup 不再调用', async () => {
     const h = await setup()
-    await h.service.addAccessGroup('oc_group')
-    // 两个用户都在白名单里：B 被拦下只能是因为话题所有权，而不是准入。
+    // 两个用户都在用户表里：B 被拦下只能是因为话题所有权，而不是准入。
     await h.service.addAccessUser('u_alice')
     await h.service.addAccessUser('u_bob')
 
@@ -650,7 +599,7 @@ describe('guarded 模式：话题所有权', () => {
     expect(aliceRoute.kind).toBe('thread')
     expect(threadKey.length).toBeGreaterThan(0)
 
-    // 同群白名单用户（准入通过）进入别人的话题：所有权校验必须拦下。
+    // 同群有对话准入的用户进入别人的话题：所有权校验必须拦下。
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_group', senderId: 'u_bob', threadId: threadKey,
       mentionedBot: false, messageId: 'om_bob_intrude', content: '我也要聊',
@@ -661,13 +610,12 @@ describe('guarded 模式：话题所有权', () => {
     expect(h.ctxState.agents.created).toHaveLength(1)
     await waitUntil(() => expect(followupsOf(h, 0)).toBe(1))
     expect(h.ctxState.workspaces.workspaces.size).toBe(1)
-    expect(existsSync(path.join(aliceRoute.workspacePath, ATTACHMENTS_DIR))).toBe(false)
+    expect(h.channel.downloadResource).not.toHaveBeenCalled()
     await h.service.shutdown()
   })
 
   it('非发起人回答不了别人的 pending question', async () => {
     const h = await setup()
-    await h.service.addAccessGroup('oc_group')
     await h.service.addAccessUser('u_alice')
     await h.service.addAccessUser('u_bob')
 
@@ -688,7 +636,7 @@ describe('guarded 模式：话题所有权', () => {
     await waitUntil(() => expect(h.channel.sent.some(entry =>
       sentJson(entry).includes('需要你的回答'))).toBe(true))
 
-    // 所有者 Alice 的 pending question 不能被同群其他白名单用户回答。
+    // 所有者 Alice 的 pending question 不能被同群其他有对话准入的用户回答。
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_group', senderId: 'u_bob', threadId: threadKey,
       mentionedBot: false, messageId: 'om_bob_answer', content: '继续',
@@ -703,6 +651,137 @@ describe('guarded 模式：话题所有权', () => {
   })
 })
 
+describe('guarded 模式：代码改动开关', () => {
+  it('飞书会话调用代码改动工具前检查当前发言人的「代码改动」开关，打开后立即放行', async () => {
+    const h = await setup()
+    await h.service.addAccessUser('u_alice')
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_group', senderId: 'u_alice',
+      mentionedBot: true, messageId: 'om_alice_code', content: '帮我改一下代码',
+    }))
+    await waitUntil(() => expect(followupsOf(h, 0)).toBe(1))
+    await waitForRoute(h, 'u_alice')
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    const [listener] = h.ctxState.preExecuteListeners
+    const next = vi.fn(async () => ({ kind: 'allow' as const }))
+
+    const denied = await listener!({ name: 'repo_workspace_push', agent }, next)
+    expect(denied).toMatchObject({ kind: 'deny', reason: expect.stringContaining('飞书用户 u_alice 没有代码改动权限') })
+    expect(next).not.toHaveBeenCalled()
+    // Ungated tools and Sessions outside Feishu pass through.
+    expect(await listener!({ name: 'read_file', agent }, next)).toEqual({ kind: 'allow' })
+    expect(await listener!({ name: 'repo_workspace_push' }, next)).toEqual({ kind: 'allow' })
+
+    expect(await h.service.setAccessPermission('u_alice', 'codeWrite', true)).toMatchObject({ ok: true })
+    expect(await listener!({ name: 'repo_workspace_push', agent }, next)).toEqual({ kind: 'allow' })
+    // Chat off suspends every other switch.
+    expect(await h.service.setAccessPermission('u_alice', 'chat', false)).toMatchObject({ ok: true })
+    expect(await listener!({ name: 'repo_mr_create', agent }, next)).toMatchObject({ kind: 'deny' })
+    await h.service.shutdown()
+  })
+
+  it('推送的提交带上当前发言人的 Feishu-User 尾注；名字取通讯录，读不到时取用户表；非飞书会话不加', async () => {
+    const userProfiles = vi.fn(async (ids: readonly string[]) => new Map(ids.map(id => [id, id === 'u_alice' ? { name: 'Alice <A>\n李' } : {}])))
+    const h = await setup({}, { userProfiles })
+    await h.service.addAccessUser('u_alice')
+    await h.service.addAccessUser('u_bob', 'Bob')
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_group', senderId: 'u_alice',
+      mentionedBot: true, messageId: 'om_alice_push', content: '改完推上去',
+    }))
+    await waitUntil(() => expect(followupsOf(h, 0)).toBe(1))
+    const [, route] = await waitForRoute(h, 'u_alice')
+    const [listener] = h.ctxState.commitTrailerListeners
+    const trailersFor = async (session: string) => {
+      const added: Array<[string, string]> = []
+      await listener!({ session, dir: '/ws', add: (token, value) => { added.push([token, value]) } })
+      return added
+    }
+
+    expect(await trailersFor(route.sessionId)).toEqual([['Feishu-User', 'Alice A 李 <u_alice>']])
+    expect(await trailersFor('s_not_feishu')).toEqual([])
+
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_p2p_bob', senderId: 'u_bob',
+      mentionedBot: false, messageId: 'om_bob_push', content: '我也推一下',
+    }))
+    const [, bobRoute] = await waitForRoute(h, 'u_bob')
+    expect(await trailersFor(bobRoute.sessionId)).toEqual([['Feishu-User', 'Bob <u_bob>']])
+    await h.service.shutdown()
+  })
+
+  it('PR/MR 动态唤醒飞书会话时由本插件取会话，其他会话交给下一个处理者', async () => {
+    const h = await setup()
+    await h.service.addAccessUser('u_alice')
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_group', senderId: 'u_alice',
+      mentionedBot: true, messageId: 'om_alice_watch', content: '开个 MR',
+    }))
+    const [, route] = await waitForRoute(h, 'u_alice')
+    const [registered] = h.ctxState.resolveAgentListeners
+    expect(registered?.options).toEqual({ prepend: true })
+    const other = { session: { id: 's_web' } } as unknown as Agent
+    const next = vi.fn(async () => other)
+
+    const agent = await registered!.listener(route.sessionId, next)
+    expect(agent.session.id).toBe(route.sessionId)
+    expect(next).not.toHaveBeenCalled()
+    expect(await registered!.listener('s_web', next)).toBe(other)
+    expect(next).toHaveBeenCalledTimes(1)
+    await h.service.shutdown()
+  })
+
+  it('用户设置了 Git 邮箱时，推送的提交以本人为作者，同时保留 Feishu-User 尾注', async () => {
+    const userProfiles = vi.fn(async (ids: readonly string[]) => new Map(ids.map(id => [id, id === 'u_alice' ? { name: 'Alice <A>' } : {}])))
+    const h = await setup({}, { userProfiles })
+    await h.service.addAccessUser('u_alice')
+    await h.service.addAccessUser('u_carol')
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_group', senderId: 'u_alice',
+      mentionedBot: true, messageId: 'om_alice_author', content: '改完推上去',
+    }))
+    const [, route] = await waitForRoute(h, 'u_alice')
+    const [listener] = h.ctxState.commitTrailerListeners
+    const detailsFor = async (session: string, withSetAuthor = true) => {
+      const trailers: Array<[string, string]> = []
+      const authors: Array<[string, string]> = []
+      await listener!({
+        session,
+        dir: '/ws',
+        add: (token, value) => { trailers.push([token, value]) },
+        ...withSetAuthor ? { setAuthor: (name: string, email: string) => { authors.push([name, email]) } } : {},
+      })
+      return { trailers, authors }
+    }
+
+    // No email yet: trailer only.
+    expect(await detailsFor(route.sessionId)).toEqual({ trailers: [['Feishu-User', 'Alice A <u_alice>']], authors: [] })
+
+    expect(await h.service.setAccessGitEmail('u_alice', 'alice@example.com')).toMatchObject({ ok: true })
+    expect(h.service.accessSnapshot().users.find(user => user.userId === 'u_alice')).toMatchObject({ gitEmail: 'alice@example.com' })
+    expect(await detailsFor(route.sessionId)).toEqual({
+      trailers: [['Feishu-User', 'Alice A <u_alice>']],
+      authors: [['Alice A', 'alice@example.com']],
+    })
+    // dsh-repo versions without setAuthor still get the trailer.
+    expect(await detailsFor(route.sessionId, false)).toEqual({ trailers: [['Feishu-User', 'Alice A <u_alice>']], authors: [] })
+
+    // A user without a Feishu or table name is named by user_id.
+    expect(await h.service.setAccessGitEmail('u_carol', 'carol@example.com')).toMatchObject({ ok: true })
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_p2p_carol', senderId: 'u_carol',
+      mentionedBot: false, messageId: 'om_carol_author', content: '推一下',
+    }))
+    const [, carolRoute] = await waitForRoute(h, 'u_carol')
+    expect(await detailsFor(carolRoute.sessionId)).toEqual({ trailers: [['Feishu-User', 'u_carol']], authors: [['u_carol', 'carol@example.com']] })
+
+    expect(await h.service.setAccessGitEmail('u_alice', undefined)).toMatchObject({ ok: true })
+    expect(await detailsFor(route.sessionId)).toEqual({ trailers: [['Feishu-User', 'Alice A <u_alice>']], authors: [] })
+    expect(await h.service.setAccessGitEmail('u_nobody', 'x@example.com')).toMatchObject({ ok: false, error: expect.stringContaining('不在用户表') })
+    await h.service.shutdown()
+  })
+})
+
 describe('open 模式：兼容旧行为', () => {
   it('非管理员私聊与未授权群一样可以建会话、调模型', async () => {
     const h = await setup({ accessMode: 'open' })
@@ -713,7 +792,7 @@ describe('open 模式：兼容旧行为', () => {
     }))
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
     await waitUntil(() => expect(followupsOf(h, 0)).toBe(1))
-    expect(h.channel.sent.some(entry => sentJson(entry).includes('非管理员禁用私聊功能'))).toBe(false)
+    expect(h.channel.sent.some(entry => sentJson(entry).includes('你还没有对话权限'))).toBe(false)
 
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_any_group', senderId: 'u_stranger',

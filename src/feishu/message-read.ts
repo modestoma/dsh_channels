@@ -748,7 +748,7 @@ export function buildQuoteContextBlock(
   if (container === undefined) return ''
   const maxChars = options.maxChars ?? MAX_EXCERPT_CHARS
   const maxBlock = options.maxBlockChars ?? MAX_QUOTE_BLOCK_CHARS
-  // Archive deployments have no fetch tool: do not advertise one there.
+  // Without `acceptAttachments` there is no fetch tool: do not advertise one.
   const fetchHint = options.attachmentFetchAvailable === false
     ? ''
     : ' Fetch an attachment of the quoted message with feishu_attachment_fetch using its message_id; a merged-forward quote is fetched with the container message_id.'

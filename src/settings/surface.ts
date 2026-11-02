@@ -16,6 +16,7 @@ import { MAX_TIMER_DELAY_MS } from '../config.ts'
 import { FEISHU_USER_ID_PATTERN } from '../domain.ts'
 import { parseWikiRootLink, WIKI_ROOT_LINK_ERRORS } from '../feishu/wiki/links.ts'
 import type { HealthSnapshot } from '../health.ts'
+import type { LockHolderInfo } from '../instance-lock.ts'
 import { prepareWorkspaceBaseDir } from '../workspaces.ts'
 import {
   BYTES_UNIT,
@@ -25,6 +26,7 @@ import {
 } from './contract.ts'
 import type {
   AccessMutationResponse,
+  AccessPermissionWire,
   AccessWire,
   CatalogWire,
   ChannelPhaseWire,
@@ -51,9 +53,13 @@ import type {
   ScopeCheckWire,
   SessionOriginResponse,
   SessionOriginWire,
+  SessionRecordsWire,
   SlashCommandSyncWire,
   StringListItemFormat,
+  WorkspaceListingWire,
+  WorkspacePreviewWire,
 } from './contract.ts'
+import type { WorkspaceDownload } from '../workspace-files.ts'
 import {
   configValueOf,
   deleteOverlayKey,
@@ -95,6 +101,10 @@ export interface SettingsTarget {
   refreshReadiness(): Promise<void>
   /** Connect with the current config; throws when credentials are incomplete or the handshake fails. */
   connect(): Promise<void>
+  /** Ask the process owning this bot's connection to yield, then connect; throws like `connect()`. */
+  takeover(): Promise<void>
+  /** The process keeping this one from connecting, or undefined. */
+  occupiedBy(): { holder: LockHolderInfo | undefined } | undefined
   configSnapshot(): FeishuConfig
   baseConfigSnapshot(): FeishuConfig
   runningConfigSnapshot(): FeishuConfig | undefined
@@ -103,26 +113,31 @@ export interface SettingsTarget {
   credentialStates(): Promise<Record<CredentialField, CredentialInfo>>
   setCredential(field: CredentialField, value: string): Promise<void>
   clearCredential(field: CredentialField): Promise<void>
-  /** Current admission snapshot: mode, administrator, whitelists, pending requests. */
+  /** Current admission snapshot: mode, administrator, user table, pending requests. */
   accessSnapshot(): AccessWire
-  /** Authorize one group (panel entry); resolves with the refreshed snapshot. */
-  addAccessGroup(chatId: string, name?: string): Promise<AccessMutationResponse>
-  /** Revoke one group authorization (takes effect on the next message). */
-  removeAccessGroup(chatId: string): Promise<AccessMutationResponse>
-  /** Authorize one user `user_id` (global across authorized groups). */
+  /** Add one user `user_id` with only `chat` on (or turn `chat` back on). */
   addAccessUser(userId: string, name?: string): Promise<AccessMutationResponse>
-  /** Revoke one user authorization (takes effect on the next message). */
+  /** Remove one user from the table (takes effect on the next message). */
   removeAccessUser(userId: string): Promise<AccessMutationResponse>
-  /** Add one user `user_id` to the wiki whitelist. */
-  addWikiUser(userId: string, name?: string): Promise<AccessMutationResponse>
-  /** Remove one user from the wiki whitelist (takes effect on the next wiki tool call). */
-  removeWikiUser(userId: string): Promise<AccessMutationResponse>
+  /** Set the administrator flag or one permission switch of a user already in the table (takes effect on the next check). */
+  setAccessPermission(userId: string, permission: AccessPermissionWire, enabled: boolean): Promise<AccessMutationResponse>
+  /** Set or clear the git email of a user already in the table (used by the next push). */
+  setAccessGitEmail(userId: string, gitEmail: string | undefined): Promise<AccessMutationResponse>
   /** Settle one pending request (panel shares this path with the Feishu DM card). */
   resolveAccessRequest(token: string, decision: 'allow' | 'deny'): Promise<AccessMutationResponse>
   /** Feishu origin of one Session, or null when Feishu never routed it. */
   sessionOrigin(sessionId: string): Promise<SessionOriginWire | null>
   /** Live Feishu names and avatars of the given users and chats. */
   feishuProfiles(userIds: readonly string[], chatIds: readonly string[]): Promise<FeishuProfilesWire>
+  /** Every Feishu-routed Session grouped by group chat → user and private-chat user. */
+  sessionRecords(): Promise<SessionRecordsWire>
+  /**
+   * File routes: `workspace` must be the root of a Feishu-routed Session and
+   * `path` is relative to it; refusals throw `WorkspaceFileError`.
+   */
+  workspaceFiles(workspace: string, path: string | undefined): Promise<WorkspaceListingWire>
+  workspaceFilePreview(workspace: string, path: string | undefined): Promise<WorkspacePreviewWire>
+  workspaceFileDownload(workspace: string, path: string | undefined): Promise<WorkspaceDownload>
 }
 
 /** Presence/source/writability facts returned by the credentials seam. */
@@ -135,7 +150,7 @@ export interface CredentialInfo {
 const RESTART_SET = new Set<string>(RESTART_KEYS)
 
 /** Every credential slot the panel writes, in form order. */
-const CREDENTIAL_FIELDS: readonly CredentialField[] = ['appId', 'appSecret', 'analyzeToken']
+const CREDENTIAL_FIELDS: readonly CredentialField[] = ['appId', 'appSecret']
 
 /** Optional fields: an empty string in the panel clears the override. */
 const OPTIONAL_TEXT_KEYS = new Set<EditableKey>([
@@ -144,23 +159,21 @@ const OPTIONAL_TEXT_KEYS = new Set<EditableKey>([
   'reasoningEffort',
   'agentPreset',
   'maxTokens',
-  'adminUserId',
 ])
 
 const BOOLEAN_KEYS = new Set<EditableKey>([
   'requireMention',
   'welcomeOnboarding',
+  'hostTurnCards',
+  'replyGuidance',
   'slashCommandPanel',
   'allowPermissionSwitch',
-  'dmAllowWhitelist',
   'acceptAttachments',
   'prefetchImages',
-  'feishuTools.attachmentFetch',
   'feishuTools.topicMessages',
   'feishuTools.sendFile',
   'feishuTools.wikiRead',
   'feishuTools.wikiWrite',
-  'analyzeEnabled',
 ])
 
 /** Bounds and entry format of one `string-list` field. */
@@ -244,10 +257,6 @@ const SELECT_OPTIONS: Partial<Record<EditableKey, ReadonlyArray<{ value: string;
     { value: 'subdir', label: '普通子目录' },
     { value: 'worktree', label: 'Git worktree' },
   ],
-  attachmentStore: [
-    { value: 'native', label: 'DSH 原生附件库' },
-    { value: 'archive', label: '话题目录 attachments/' },
-  ],
   accessMode: [
     { value: 'guarded', label: '关闭（管理员与白名单）' },
     { value: 'open', label: '打开（所有人可聊）' },
@@ -264,7 +273,6 @@ const SELECT_OPTIONS: Partial<Record<EditableKey, ReadonlyArray<{ value: string;
 const TOGGLES: Partial<Record<EditableKey, FieldToggleWire>> = {
   dmMode: { on: 'open', off: 'disabled' },
   threadFallback: { on: 'degrade', off: 'strict' },
-  attachmentStore: { on: 'native', off: 'archive' },
   accessMode: { on: 'open', off: 'guarded' },
 }
 
@@ -337,6 +345,18 @@ const FIELD_META: Record<EditableKey, FieldMeta> = {
   refreshMs: { label: '流式刷新间隔', group: 'cards', summary: '回复卡片多久更新一次', min: 200, max: 10_000, step: 100, unit: 'ms' },
   statusRefreshMs: { label: '状态行保活间隔', group: 'cards', summary: '没有文字输出时，计时多久刷新一次', min: 1_000, max: 60_000, step: 500, unit: 'ms' },
   welcomeOnboarding: { label: '首次私聊发引导卡', group: 'features', summary: '每个私聊只发一次' },
+  hostTurnCards: {
+    label: '后台继续时发新卡片',
+    group: 'features',
+    summary: '子代理、后台任务、定时跟进唤醒会话时，在话题里新发一张回复卡',
+    help: '这些回合不是飞书消息触发的。关闭后它们不在飞书显示，但仍会照常运行，在 dsh 客户端里可以看到。',
+  },
+  replyGuidance: {
+    label: '回复写法规范',
+    group: 'features',
+    summary: '要求模型最终回复先给结果、保持简短，技术细节放进 MR 或文件',
+    help: '在飞书会话的系统提示词里加一段回复写法说明，只影响最终回复的文字，流式卡片的状态和思考过程不变。修改后从下一次模型请求开始生效。',
+  },
   slashCommandPanel: {
     label: '同步斜杠指令面板',
     group: 'features',
@@ -353,13 +373,7 @@ const FIELD_META: Record<EditableKey, FieldMeta> = {
     label: '接收图片和文件',
     group: 'attachments',
     summary: '关闭后附件消息不保存、不触发模型',
-    help: '纯附件消息不回复；需要时引用该消息再提问，多个文件可以合并转发后引用。也接收合并转发的聊天记录。',
-  },
-  attachmentStore: {
-    label: '使用 DSH 原生附件库',
-    group: 'attachments',
-    summary: '推荐开启；关闭则下载到话题目录 attachments/',
-    help: '原生附件库：不可变、内容寻址去重、随 Session 回放，不自动清理。话题目录：旧版行为，可以手动清理，但下载会阻塞会话。宿主没有附件服务时自动退回话题目录。',
+    help: '附件存入 DSH 原生附件库（不可变、内容寻址去重、随 Session 回放，不自动清理），模型用 feishu_attachment_fetch 按需读取。纯附件消息不回复；需要时引用该消息再提问，多个文件可以合并转发后引用。也接收合并转发的聊天记录。',
   },
   prefetchImages: { label: '预取触发消息里的图片', group: 'attachments', summary: '首轮直接带图，失败的留给模型按需取' },
   historyBootstrapLimit: {
@@ -371,12 +385,6 @@ const FIELD_META: Record<EditableKey, FieldMeta> = {
     max: 20,
     step: 1,
     unit: '条',
-  },
-  'feishuTools.attachmentFetch': {
-    label: '读取附件',
-    group: 'tools',
-    summary: '按需下载已授权消息里的图片和文件',
-    help: '工具名 feishu_attachment_fetch。关闭后文件无法按需读取，入站文件直接下载到话题目录。对新会话生效。',
   },
   'feishuTools.topicMessages': {
     label: '读取话题消息',
@@ -402,33 +410,20 @@ const FIELD_META: Record<EditableKey, FieldMeta> = {
     label: '调试模式',
     group: 'access',
     summary: '打开后所有人都能聊，不安全，只在调试时用',
-    help: '关闭时（默认）：管理员随时可用；非管理员私聊会被拒绝（打开「白名单用户可私聊」后白名单用户也可以）；群聊要同时满足群已授权、发言人在用户白名单里。授权入口有三个：群里 /auth 命令、授权卡、本页。撤销立即生效。',
-  },
-  dmAllowWhitelist: {
-    label: '白名单用户可私聊',
-    group: 'access',
-    summary: '关闭时私聊仅管理员可用',
-    help: '打开后「已授权用户」里的人也可以私聊机器人，各自使用独立的私聊工作区，能力与群聊相同；不在白名单的人仍收到固定提示。撤销用户立即生效。',
-  },
-  adminUserId: {
-    label: '管理员 user_id',
-    group: 'access',
-    summary: '私聊机器人发送 /userid 获取；留空使用应用所有者',
-    help: '不是 ou_ 开头的 open_id，也不是邮箱。私聊关闭时 /userid 不可用，可以在飞书管理后台的成员详情里查看。自动使用应用所有者需要可选的「获取应用信息」权限。',
-    placeholder: 'user_id',
+    help: '关闭时（默认）：用户表里的管理员随时可用；其他人要在用户表里并打开「对话准入」，才能私聊或在任何群里 @ 机器人。授权入口有三个：飞书 /auth 命令、授权卡、本页。撤销立即生效。打开后知识库与代码改动开关仍然生效。',
   },
   authRequestTtlDays: { label: '申请有效期', group: 'access', summary: '授权申请卡多久内可以处理', min: 1, max: 30, step: 1, unit: '天' },
   'feishuTools.wikiRead': {
     label: '读取知识库',
     group: 'wiki',
     summary: '浏览节点，读取文档、电子表格、多维表格',
-    help: '以应用身份访问，工具 feishu_wiki_list / feishu_wiki_read / feishu_wiki_sheet_read / feishu_wiki_base_read。打开文档前在授权卡上征得话题发起人同意，每个话题一次。只有管理员或下方「可使用的人」发起的话题能用（/auth wiki add @成员）。需要权限 wiki:wiki、docx:document（或只读）、sheets:spreadsheet:read、base:table:read、base:field:read、base:record:read；旧版 sheets:spreadsheet、bitable:app 不生效。对新会话生效。',
+    help: '以应用身份访问，工具 feishu_wiki_list / feishu_wiki_read / feishu_wiki_sheet_read / feishu_wiki_base_read。打开文档前在授权卡上征得话题发起人同意，每个话题一次。只有管理员或用户表里打开「读知识库」的人发起的话题能用（/auth set wiki-read on @成员）。需要权限 wiki:wiki、docx:document（或只读）、sheets:spreadsheet:read、base:table:read、base:field:read、base:record:read；旧版 sheets:spreadsheet、bitable:app 不生效。对新会话生效。',
   },
   'feishuTools.wikiWrite': {
     label: '编辑知识库',
     group: 'wiki',
     summary: '新建和修改文档、表格，每次都需审批',
-    help: '工具 feishu_wiki_create / feishu_wiki_edit / feishu_wiki_sheet_edit / feishu_wiki_base_edit。只能编辑本应用拥有的文档和表格；其他多维表格只能新增记录。需要读取工具的权限，以及 sheets:spreadsheet:write_only、base:record:create、base:record:update、base:record:delete。对新会话生效。',
+    help: '工具 feishu_wiki_create / feishu_wiki_edit / feishu_wiki_sheet_edit / feishu_wiki_base_edit。只有管理员或打开「写知识库」的人发起的话题能用（/auth set wiki-write on @成员）。只能编辑本应用拥有的文档和表格；其他多维表格只能新增记录。需要读取工具的权限，以及 sheets:spreadsheet:write_only、base:record:create、base:record:update、base:record:delete。对新会话生效。',
   },
   wikiRoots: {
     label: '可访问范围',
@@ -437,12 +432,6 @@ const FIELD_META: Record<EditableKey, FieldMeta> = {
     help: '整个知识空间 https://<租户>.feishu.cn/wiki/space/<space_id>，或节点 https://<租户>.feishu.cn/wiki/<node_token>（含其下所有节点）。最多 20 项，空行保存时忽略。对新会话生效。',
     placeholder: 'https://<租户>.feishu.cn/wiki/space/<space_id>',
     wide: true,
-  },
-  analyzeEnabled: {
-    label: '日志分析接口',
-    group: 'analyze',
-    summary: '关闭时接口返回 404',
-    help: '接口挂在 DSH Web 端口上：POST /open-api/logalyze，请求需带 Authorization: Bearer <访问令牌>。只有带 Web 的 profile 才有这个接口。改后立即生效，不需要重连。',
   },
   loggerLevel: { label: 'SDK 日志级别', group: 'logging' },
 }
@@ -589,7 +578,7 @@ export function normalizeCredentialValue(raw: unknown): { ok: true; value: strin
 const MAX_ACCESS_VALUE_LENGTH = 128
 
 
-/** Format reason for a rejected user `user_id` (shared by the user and wiki whitelists). */
+/** Format reason for a rejected user `user_id`. */
 const USER_ID_FORMAT = '用户 user_id 只能包含字母、数字、_ 和 -（不是 ou_ 开头的 open_id，也不是邮箱）'
 
 /** Trim one whitelist identifier, rejecting empty, oversized, or hostile input. */
@@ -609,6 +598,28 @@ export function normalizeAccessId(
   if (invalidFormat !== undefined && !FEISHU_USER_ID_PATTERN.test(value)) {
     return { ok: false, message: invalidFormat }
   }
+  return { ok: true, value }
+}
+
+/** Longest accepted git email (RFC 5321 path limit). */
+const MAX_GIT_EMAIL_LENGTH = 254
+
+/**
+ * Optional git email: trimmed; empty or null clears it. It must be one
+ * `local@domain` without whitespace, `<`, or `>`, so it fits a git
+ * `Name <email>` identity.
+ * @param raw - value from the request body.
+ * @returns the email, undefined to clear, or the rejection.
+ */
+export function normalizeGitEmail(
+  raw: unknown,
+): { ok: true; value: string | undefined } | { ok: false; message: string } {
+  if (raw === undefined || raw === null) return { ok: true, value: undefined }
+  if (typeof raw !== 'string') return { ok: false, message: 'Git 邮箱必须是字符串' }
+  const value = raw.trim()
+  if (value === '') return { ok: true, value: undefined }
+  if (value.length > MAX_GIT_EMAIL_LENGTH) return { ok: false, message: `Git 邮箱长度不得超过 ${MAX_GIT_EMAIL_LENGTH}` }
+  if (!/^[^\s<>@]+@[^\s<>@]+$/u.test(value)) return { ok: false, message: 'Git 邮箱格式不对：应为 name@example.com，不能含空白、< 或 >' }
   return { ok: true, value }
 }
 
@@ -643,6 +654,7 @@ function phaseOf(target: SettingsTarget): ChannelPhaseWire {
   if (target.isConnecting()) return target.isConfigured() ? 'connecting' : 'unconfigured'
   if (target.isRunning()) return 'connected'
   if (!target.isConfigured()) return 'unconfigured'
+  if (target.occupiedBy() !== undefined) return 'occupied'
   if (target.startError() !== undefined) return 'error'
   return 'idle'
 }
@@ -653,6 +665,7 @@ function buildStatus(target: SettingsTarget, overlayPath: string): ChannelStatus
   const connection = health.connection
   const scopeCheck = target.isRunning() ? target.scopeCheck() : undefined
   const slashCommandSync = target.isRunning() ? target.slashCommandSync() : undefined
+  const occupied = target.occupiedBy()
   return {
     running: target.isRunning(),
     configured: target.isConfigured(),
@@ -674,6 +687,11 @@ function buildStatus(target: SettingsTarget, overlayPath: string): ChannelStatus
     liveAgentCount: health.liveAgentCount,
     inflightTurnCount: health.inflightTurnCount,
     ...(target.startError() === undefined ? {} : { lastStartError: target.startError() }),
+    ...(occupied === undefined ? {} : {
+      occupiedBy: occupied.holder === undefined ? {} : {
+        holder: { pid: occupied.holder.pid, home: occupied.holder.home, version: occupied.holder.version },
+      },
+    }),
     reasons: health.reasons,
     version: DSH_CHANNELS_VERSION,
     overlayPath,
@@ -748,6 +766,26 @@ export class SettingsSurface {
     return this.target.feishuProfiles(userIds, chatIds)
   }
 
+  /** Feishu-routed Sessions for the 「会话记录」 tab. */
+  async sessionRecords(): Promise<SessionRecordsWire> {
+    return this.target.sessionRecords()
+  }
+
+  /** One directory listing of a Feishu workspace. */
+  async workspaceFiles(workspace: string, path: string | undefined): Promise<WorkspaceListingWire> {
+    return this.target.workspaceFiles(workspace, path)
+  }
+
+  /** One file preview of a Feishu workspace. */
+  async workspaceFilePreview(workspace: string, path: string | undefined): Promise<WorkspacePreviewWire> {
+    return this.target.workspaceFilePreview(workspace, path)
+  }
+
+  /** One file of a Feishu workspace for download. */
+  async workspaceFileDownload(workspace: string, path: string | undefined): Promise<WorkspaceDownload> {
+    return this.target.workspaceFileDownload(workspace, path)
+  }
+
   async catalogFor(provider?: string, model?: string): Promise<CatalogWire> {
     if (this.catalog === undefined) return emptyCatalog()
     try {
@@ -785,7 +823,6 @@ export class SettingsSurface {
     let credentialStates: Record<CredentialField, CredentialInfo> = {
       appId: { configured: false, writable: false },
       appSecret: { configured: false, writable: false },
-      analyzeToken: { configured: false, writable: false },
     }
     try {
       credentialStates = await this.target.credentialStates()
@@ -801,7 +838,6 @@ export class SettingsSurface {
     const credentials: PanelConfigWire['credentials'] = {
       appId: toWire(effective.appId, credentialStates.appId),
       appSecret: toWire(effective.appSecret, credentialStates.appSecret),
-      analyzeToken: toWire(effective.analyzeToken, credentialStates.analyzeToken),
     }
 
     // The access snapshot comes from in-memory maps, but a broken seam must
@@ -814,11 +850,8 @@ export class SettingsSurface {
       this.logger?.warn?.('dsh-channels: 访问授权快照读取失败：%s', messageOf(error))
       access = {
         mode: effective.accessMode,
-        admin: { configured: false },
         loaded: false,
-        groups: [],
         users: [],
-        wikiUsers: [],
         requests: [],
       }
     }
@@ -939,6 +972,30 @@ export class SettingsSurface {
     return { ok: true, panel: await this.panel() }
   }
 
+  /**
+   * Panel action: take this bot's connection over from the other dsh process
+   * on this machine that owns it.
+   */
+  async takeover(): Promise<ReconnectResponse> {
+    await this.syncReadiness()
+    if (!this.target.isConfigured()) {
+      return {
+        ok: false,
+        error: '飞书应用凭据尚未配置完整，请先填写 App ID 与 App Secret 并保存',
+        unconfigured: true,
+      }
+    }
+    try {
+      await this.target.takeover()
+    } catch (error) {
+      return { ok: false, error: `接管失败：${messageOf(error)}` }
+    }
+    if (!this.target.isRunning()) {
+      return { ok: false, error: this.target.startError() ?? '飞书连接未建立' }
+    }
+    return { ok: true, panel: await this.panel() }
+  }
+
   /** Write provided credential values through the host seam (never echoed back). */
   async saveCredentials(values: SaveCredentialsRequest): Promise<SaveCredentialsResponse> {
     const busy = this.writeBusy()
@@ -963,9 +1020,6 @@ export class SettingsSurface {
     } catch (error) {
       return { ok: false, error: messageOf(error) }
     }
-    if (writes.every(write => write.field === 'analyzeToken')) {
-      return { ok: true, panel: await this.panel(), reconnect: 'not-needed' }
-    }
     return this.finishCredentialChange('save')
   }
 
@@ -981,7 +1035,6 @@ export class SettingsSurface {
     } catch (error) {
       return { ok: false, error: messageOf(error) }
     }
-    if (field === 'analyzeToken') return { ok: true, panel: await this.panel(), reconnect: 'not-needed' }
     return this.finishCredentialChange('clear')
   }
 
@@ -1051,45 +1104,50 @@ export class SettingsSurface {
     return { ok: true, panel: await this.panel() }
   }
 
-  /** Read the current admission snapshot (mode, administrator, whitelists, requests). */
+  /** Read the current admission snapshot (mode, administrator, user table, requests). */
   async access(): Promise<AccessWire> {
     return this.target.accessSnapshot()
   }
 
-  /** Authorize one group from the panel. Validation happens before the write. */
-  async saveAccessGroup(chatId: unknown, name?: unknown): Promise<AccessMutationResponse> {
-    const id = normalizeAccessId(chatId, '群 chat_id')
-    if (!id.ok) return { ok: false, error: id.message }
-    const label = normalizeAccessName(name)
-    if (!label.ok) return { ok: false, error: label.message }
-    return this.mutateAccess(() => this.target.addAccessGroup(id.value, label.value))
-  }
-
-  /** Revoke one group authorization (immediate: the next message re-evaluates). */
-  async removeAccessGroup(chatId: unknown): Promise<AccessMutationResponse> {
-    const id = normalizeAccessId(chatId, '群 chat_id')
-    if (!id.ok) return { ok: false, error: id.message }
-    return this.mutateAccess(() => this.target.removeAccessGroup(id.value))
-  }
-
-  /** Authorize one user `user_id` (not an open_id or email). */
+  /** Add one user `user_id` (not an open_id or email) with only `chat` on. */
   async saveAccessUser(userId: unknown, name?: unknown): Promise<AccessMutationResponse> {
     return this.saveUser(userId, name, (id, label) => this.target.addAccessUser(id, label))
   }
 
-  /** Revoke one user authorization (immediate: the next message re-evaluates). */
+  /** Remove one user from the table (immediate: the next message re-evaluates). */
   async removeAccessUser(userId: unknown): Promise<AccessMutationResponse> {
     return this.removeUser(userId, id => this.target.removeAccessUser(id))
   }
 
-  /** Add one user `user_id` to the wiki whitelist. */
-  async saveWikiUser(userId: unknown, name?: unknown): Promise<AccessMutationResponse> {
-    return this.saveUser(userId, name, (id, label) => this.target.addWikiUser(id, label))
+  /**
+   * Set one permission switch from the panel. Validation happens before the write.
+   * @param userId - raw `user_id` from the request body.
+   * @param permission - raw switch name.
+   * @param enabled - raw new value.
+   * @returns the refreshed snapshot, or the validation/write failure.
+   */
+  async setAccessPermission(userId: unknown, permission: unknown, enabled: unknown): Promise<AccessMutationResponse> {
+    const id = normalizeAccessId(userId, '用户 user_id', USER_ID_FORMAT)
+    if (!id.ok) return { ok: false, error: id.message }
+    if (permission !== 'admin' && permission !== 'chat' && permission !== 'wikiRead' && permission !== 'wikiWrite' && permission !== 'codeWrite') {
+      return { ok: false, error: '权限开关只能是 admin、chat、wikiRead、wikiWrite 或 codeWrite' }
+    }
+    if (typeof enabled !== 'boolean') return { ok: false, error: 'enabled 必须是 true 或 false' }
+    return this.mutateAccess(() => this.target.setAccessPermission(id.value, permission, enabled))
   }
 
-  /** Remove one user from the wiki whitelist (immediate: the next wiki tool call re-evaluates). */
-  async removeWikiUser(userId: unknown): Promise<AccessMutationResponse> {
-    return this.removeUser(userId, id => this.target.removeWikiUser(id))
+  /**
+   * Set or clear one user's git email from the panel. Validation happens before the write.
+   * @param userId - raw `user_id` from the request body.
+   * @param gitEmail - raw email; empty string or null clears it.
+   * @returns the refreshed snapshot, or the validation/write failure.
+   */
+  async setAccessGitEmail(userId: unknown, gitEmail: unknown): Promise<AccessMutationResponse> {
+    const id = normalizeAccessId(userId, '用户 user_id', USER_ID_FORMAT)
+    if (!id.ok) return { ok: false, error: id.message }
+    const email = normalizeGitEmail(gitEmail)
+    if (!email.ok) return { ok: false, error: email.message }
+    return this.mutateAccess(() => this.target.setAccessGitEmail(id.value, email.value))
   }
 
   private async saveUser(
@@ -1126,7 +1184,7 @@ export class SettingsSurface {
     return this.mutateAccess(() => this.target.resolveAccessRequest(normalized.value, decision))
   }
 
-  /** Run one whitelist mutation, folding thrown seam errors into the wire type. */
+  /** Run one access mutation, folding thrown seam errors into the wire type. */
   private async mutateAccess(
     mutation: () => Promise<AccessMutationResponse>,
   ): Promise<AccessMutationResponse> {

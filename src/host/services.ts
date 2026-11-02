@@ -6,9 +6,11 @@
  * @module dsh-channels/host/services
  */
 
-import type { AgentRegistry } from './agent.ts'
+import type { Agent, AgentRegistry } from './agent.ts'
+import type { AttachmentStore } from './attachments.ts'
 import type { CommandRuntime } from './commands.ts'
-import type { AssistantStreamPayload, Session, SessionEvent, SessionId } from './core.ts'
+import type { TopicLaunchState } from '../topics/contract.ts'
+import type { AssistantStreamPayload, CommitTrailersEvent, InboxClaimedPayload, InboxDiscardedPayload, PreToolDecision, PreToolExecution, Session, SessionEvent, SessionId } from './core.ts'
 import type { ApprovalAnswererListener, UserQuestionAnswererListener } from './interaction.ts'
 
 // ---- Workspace surface --------------------------------------------------
@@ -187,6 +189,8 @@ export interface SessionTitleSnapshot {
 export interface SessionTitleObservation {
   /** Absent when the observed log has no title event. */
   title?: SessionTitleSnapshot
+  /** Header of the observed Session; `cwd` is its workspace root. */
+  session?: { cwd?: string }
 }
 
 /** One ordered result from a batch title observation. */
@@ -283,15 +287,26 @@ export interface HostContext {
   credentials: CredentialProvider
   tokenMeter: TokenMeter
   llm: LlmService
+  /** DSH native attachment library (`@deepseek-ai/dsh-attachment-local`). */
+  attachments: AttachmentStore
   /** Built-in Cordis plugin registry used for aggregate health diagnostics. */
   registry: CordisRegistry
   logger?: HostLogger
   /** Safe service lookup (returns undefined for absent services). */
   get?(name: string): unknown
+  /**
+   * Provide a service owned by this plugin's fiber; it is withdrawn when the
+   * plugin unloads. Optional so test contexts may omit it.
+   */
+  provide?(name: string, value: unknown): () => void
   /** Host events this plugin subscribes to (overloads per event). */
   on(name: 'session/event', listener: (session: Session, event: SessionEvent) => void): () => boolean
   /** Live (transient) model stream for every agent; replaces the removed `assistant/chunk` events. */
   on(name: 'agent/assistant-stream', listener: (payload: AssistantStreamPayload) => void): () => boolean
+  /** A turn claimed an inbox message; binds Feishu cards to the turn their prompt starts. */
+  on(name: 'agent/inbox/claimed', listener: (payload: InboxClaimedPayload) => void): () => boolean
+  /** A message left an agent inbox unclaimed; settles the queued Feishu card it belongs to. */
+  on(name: 'agent/inbox/discarded', listener: (payload: InboxDiscardedPayload) => void): () => boolean
   /**
    * The host's structured-question waterfall (`ask_user_question`). Same
    * shape as `approval/request`: return an answer to claim, or delegate with
@@ -316,5 +331,36 @@ export interface HostContext {
     listener: ApprovalAnswererListener,
     options?: { prepend?: boolean },
   ): () => boolean
+  /**
+   * The host's pre-dispatch tool policy waterfall. Untagged plugin contexts
+   * receive every agent's calls; a listener returns a decision or delegates
+   * with `next()`.
+   */
+  on(
+    name: 'tools/pre-execute',
+    listener: (exec: PreToolExecution, next: () => Promise<PreToolDecision>) => Promise<PreToolDecision>,
+  ): () => boolean
+  /**
+   * dsh-repo's `repo/commit-trailers` event, dispatched with `ctx.parallel`
+   * before `repo_workspace_push` commits for a Session. Never fires without
+   * dsh-repo.
+   */
+  on(name: 'repo/commit-trailers', listener: (event: CommitTrailersEvent) => void | Promise<void>): () => boolean
+  /**
+   * dsh-repo's `repo/resolve-agent` waterfall: the live Agent a PR/MR watch
+   * wakes for a Session. A listener returns the Agent of a Session it owns or
+   * delegates with `next()`, whose last step is the host's
+   * `sessionController`. Never fires without dsh-repo.
+   */
+  on(
+    name: 'repo/resolve-agent',
+    listener: (sessionId: string, next: () => Promise<Agent>) => Promise<Agent>,
+    options?: { prepend?: boolean },
+  ): () => boolean
   effect(callback: () => (() => void | Promise<void>) | void, label?: string): void
+  /**
+   * Emit this plugin's `feishu-topics/status` event to every listener.
+   * Optional so test contexts may omit it.
+   */
+  emit?(name: 'feishu-topics/status', state: TopicLaunchState): void
 }

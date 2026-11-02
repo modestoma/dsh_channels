@@ -63,6 +63,23 @@ describe('health snapshot', () => {
     expect(snapshot.inactiveTotal).toBe(1)
   })
 
+  it('degrades and explains when stored Feishu updates keep failing', () => {
+    const input = {
+      fibers: [],
+      dependencies: dependencies(),
+      connection: { state: 'connected', reconnectAttempts: 0 } as const,
+      started: true,
+      routeCount: 0,
+      liveAgentCount: 0,
+      inflightTurnCount: 0,
+    }
+    expect(foldHealthSnapshot({ ...input, outbox: { pending: 2, failing: 0 } }).level).toBe('healthy')
+    const snapshot = foldHealthSnapshot({ ...input, outbox: { pending: 2, failing: 1 } })
+    expect(snapshot.level).toBe('degraded')
+    expect(snapshot.reasons).toEqual(['2 条飞书消息更新待重发，其中 1 条已连续失败 3 次以上'])
+    expect(JSON.stringify(buildHealthCard(snapshot))).toContain('待重发 2')
+  })
+
   it('keeps healthy snapshots reason-free and caps the listed inactive fibers', () => {
     const healthy = foldHealthSnapshot({
       fibers: [{ state: CordisFiberState.ACTIVE, name: 'channels' }],
