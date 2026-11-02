@@ -61,11 +61,10 @@ import type {
   MessageReadFailureCode, TopicMessageResourceView, TopicMessageView,
 } from './message-read.ts'
 import {
-  attachmentFailureReason, FALLBACK_MAX_IMAGE_BYTES, nativeAttachmentStoreOf,
-  resolveAttachmentService,
+  attachmentFailureReason, FALLBACK_MAX_IMAGE_BYTES, NativeAttachmentStore,
 } from './native-attachments.ts'
 import type {
-  AttachmentFailureCode, AttachmentResult, NativeAttachmentStore, StoredFile, StoredImage,
+  AttachmentFailureCode, AttachmentResult, StoredFile, StoredImage,
 } from './native-attachments.ts'
 
 // ---- Public identity ----------------------------------------------------
@@ -81,7 +80,7 @@ export const ATTACHMENT_FETCH_TOOL_NAME = 'feishu_attachment_fetch'
 export const DEFAULT_KNOWN_MESSAGES_PER_ROUTE = 128
 
 /**
- * Maximum time agent setup waits for the host `tools`/`attachments` services
+ * Maximum time agent setup waits for the host `tools` service
  * before degrading to "tool not mounted". A deployment without those services
  * must not block session creation; if they appear later the pending injection
  * still registers the tool.
@@ -414,6 +413,8 @@ export interface AttachmentFetchRuntimeDeps {
   channel(): FeishuChannel | undefined
   /** Resolve the route currently bound to one session. */
   routeOfSession(sessionId: string): AttachmentFetchRoute | undefined
+  /** Host DSH native attachment library (injected plugin dependency). */
+  attachments(): AttachmentStore
   /** Structured warning sink (mount degradation, unexpected failures). */
   warn(message: string, ...args: unknown[]): void
   /** Clock seam for whitelist recency (tests). */
@@ -448,7 +449,6 @@ export class AttachmentFetchToolRuntime {
   /** Agent scope → its one mount attempt (cordis callbacks get distinct ctx objects). */
   private readonly mountAttempts = new WeakMap<AgentContext, Promise<void>>()
   private warnedMissingTools = false
-  private warnedMissingAttachments = false
   private warnedMountFailure = false
   private warnedUnavailable = false
 
@@ -463,7 +463,7 @@ export class AttachmentFetchToolRuntime {
    */
   enabled(): boolean {
     const config = this.deps.config()
-    return config.feishuTools.attachmentFetch && config.acceptAttachments
+    return config.acceptAttachments
   }
 
   /**
@@ -495,11 +495,12 @@ export class AttachmentFetchToolRuntime {
    * Register the tool inside one Agent scope.
    *
    * Called from the agent-preset `setup` after the preset is mounted (the host
-   * composes tools inside presets). `inject(['tools', 'attachments'])` is the
-   * P0-proven registration path; the callback re-checks both services because
-   * a host may resolve the injection with a partially mounted scope. Missing
-   * services are a no-op with one warning; a mount failure never fails the
-   * session.
+   * composes tools inside presets). `inject(['tools'])` is the P0-proven
+   * registration path; the callback re-checks the service because a host may
+   * resolve the injection with a partially mounted scope. A missing service is
+   * a no-op with one warning; a mount failure never fails the session. The
+   * attachment library is a plugin-level dependency, so it needs no Agent-scope
+   * injection.
    */
   async mount(agentCtx: AgentContext, sessionId: string): Promise<void> {
     if (!this.enabled()) return
@@ -515,7 +516,7 @@ export class AttachmentFetchToolRuntime {
   private async mountAttempt(agentCtx: AgentContext, sessionId: string): Promise<void> {
     let injected = false
     const outcome = await waitForAvailability(
-      Promise.resolve(agentCtx.inject(['tools', 'attachments'], (ctx) => {
+      Promise.resolve(agentCtx.inject(['tools'], (ctx) => {
         injected = true
         this.registerInScope(ctx, sessionId)
       })),
@@ -534,7 +535,7 @@ export class AttachmentFetchToolRuntime {
     if (!injected && !this.warnedUnavailable) {
       this.warnedUnavailable = true
       this.deps.warn(
-        'dsh-channels: %s 未挂载：宿主 tools/attachments 服务不可用（会话继续）',
+        'dsh-channels: %s 未挂载：宿主 tools 服务不可用（会话继续）',
         ATTACHMENT_FETCH_TOOL_NAME,
       )
     }
@@ -583,19 +584,8 @@ export class AttachmentFetchToolRuntime {
       }
       return
     }
-    const service = resolveAttachmentService(agentCtx)
-    if (service === undefined) {
-      if (!this.warnedMissingAttachments) {
-        this.warnedMissingAttachments = true
-        this.deps.warn(
-          'dsh-channels: %s 未注册：宿主 attachments 服务不可用（附件工具已禁用）',
-          ATTACHMENT_FETCH_TOOL_NAME,
-        )
-      }
-      return
-    }
     try {
-      tools.register(this.definitionFor(agentCtx, sessionId))
+      tools.register(this.definitionFor(sessionId))
     } catch (error) {
       this.warnMountFailure(
         `dsh-channels: registering ${ATTACHMENT_FETCH_TOOL_NAME} failed: ${String(error)}`,
@@ -615,7 +605,7 @@ export class AttachmentFetchToolRuntime {
 
   // ---- Tool definition --------------------------------------------------
 
-  private definitionFor(agentCtx: AgentContext, sessionId: string): ToolDefinition {
+  private definitionFor(sessionId: string): ToolDefinition {
     return {
       name: ATTACHMENT_FETCH_TOOL_NAME,
       description:
@@ -629,7 +619,7 @@ export class AttachmentFetchToolRuntime {
         schema: ATTACHMENT_FETCH_OUTPUT_SCHEMA,
         render: (_args, value) => renderAttachmentFetchResult(value),
       },
-      execute: async (rawArgs, exec) => await this.execute(agentCtx, sessionId, rawArgs, exec),
+      execute: async (rawArgs, exec) => await this.execute(sessionId, rawArgs, exec),
       presentCall: args => presentAttachmentFetchCall(args),
       presentResult: (_args, value) => presentAttachmentFetchResult(value),
       isConcurrencySafe: () => false,
@@ -639,7 +629,6 @@ export class AttachmentFetchToolRuntime {
   // ---- Execution --------------------------------------------------------
 
   private async execute(
-    agentCtx: AgentContext,
     sessionId: string,
     rawArgs: Record<string, unknown>,
     exec: ToolExecution,
@@ -673,8 +662,8 @@ export class AttachmentFetchToolRuntime {
       limits: {
         maxResources: config.attachmentFetchMaxResources,
       },
-      native: nativeAttachmentStoreOf(agentCtx),
-      imageCap: imageByteCapOf(agentCtx),
+      native: new NativeAttachmentStore({ service: () => this.deps.attachments() }),
+      imageCap: imageByteCap(this.deps.attachments()),
       channel: this.deps.channel(),
     }
     try {
@@ -1107,8 +1096,8 @@ class ImageTooLargeError extends Error {
 }
 
 /** Byte cap for one image: the host's own limit is authoritative. */
-function imageByteCap(service: AttachmentStore | undefined): number {
-  const max = service?.imageLimits?.maxImageBytes
+function imageByteCap(service: AttachmentStore): number {
+  const max = service.imageLimits?.maxImageBytes
   if (typeof max === 'number' && Number.isFinite(max) && max > 0) return max
   return FALLBACK_MAX_IMAGE_BYTES
 }
@@ -1577,17 +1566,6 @@ export function presentAttachmentFetchResult(value: unknown): string {
   return typeof result.summary === 'string' ? result.summary : ATTACHMENT_FETCH_TOOL_NAME
 }
 
-// ---- Exposed helper for the image-cap resolution ------------------------
-
-/**
- * Resolve the live image byte cap of one Agent scope (the service may unmount
- * between registration and execution; a missing service keeps the fallback cap
- * so the caller can still report a structured "unmounted" failure).
- */
-function imageByteCapOf(agentCtx: AgentContext): number {
-  return imageByteCap(resolveAttachmentService(agentCtx))
-}
-
 // ---- Topic messages tool ------------------------------------------------
 
 /** Model-facing tool name; stable across releases (session history references it). */
@@ -1609,7 +1587,7 @@ const TOPIC_MESSAGES_DESCRIPTION =
   + 'limit (default 10, maximum 50) and cursor to continue. Merged-forward child message ids are NOT '
   + 'downloadable; fetch their attachments with the top-level container message_id shown for the container row.'
 
-/** Extra model guidance appended when this deployment cannot fetch attachments (archive backend). */
+/** Extra model guidance appended when this deployment cannot fetch attachments (`acceptAttachments` off). */
 const TOPIC_MESSAGES_FETCH_UNAVAILABLE_DESCRIPTION =
   ' In this deployment feishu_attachment_fetch is unavailable; report attachment metadata to the user '
   + 'instead of fetching.'
@@ -1937,8 +1915,8 @@ export class TopicMessagesToolRuntime {
   }
 
   /**
-   * Whether the deployment cannot fetch attachments (archive backend / fetch
-   * tool disabled). A probe failure keeps the model guidance unchanged (the
+   * Whether the deployment cannot fetch attachments (`acceptAttachments`
+   * off). A probe failure keeps the model guidance unchanged (the
    * tool still works; a fetch attempt returns its own readable failure).
    */
   private isFetchUnavailable(): boolean {

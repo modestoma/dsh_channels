@@ -2,7 +2,7 @@
 
 > 状态：已确认并实现（v1）。目标：工作区数量随「人」增长而不是随「话题」增长，同时话题之间不互相踩文件。
 >
-> 附件说明（v2 更新）：入站图片/文件默认存入 **DSH 原生附件库**（不写入话题目录），仅 `attachmentStore: 'archive'` 降级路径才写 `<话题目录>/attachments/` 与旧版 `_staging/`；详见 [attachment-pipeline-v2.md](attachment-pipeline-v2.md)。下文目录布局中的 `attachments/` 与 `_staging/` 均为 archive / 旧版兼容语义。
+> 附件说明：入站图片/文件只存入 **DSH 原生附件库**（不写入话题目录）；详见 [attachment-pipeline-v2.md](attachment-pipeline-v2.md)。旧版本写下的 `<话题目录>/attachments/` 与 `<baseDir>/_staging/` 不再被插件读写。
 
 ## 1. 问题
 
@@ -25,18 +25,15 @@ DSH 本身允许这两个维度解耦，见下。
 <baseDir>/
   p2p/<user_id>/                    # 私聊用户工作区（注册 workspace，header.cwd）
     topics/<topic-token>/           # 话题目录（会话实际工作目录）
-      attachments/                  # 仅 archive 后端：该话题的入站附件（v2 native 默认不写）
   groups/<chat_id>/<user_id>/       # 群聊中某成员的工作区（注册 workspace）
     topics/<topic-token>/
-      attachments/                  # 同上
   topics/...                        # 旧版「话题=工作区」目录，原样保留，不自动迁移
-  _staging/<chatType>/<chatId>/<userId>/   # 仅旧版：话题建立前的附件暂存（v2 不再写入）
 ```
 
 - 私聊一个用户一个工作区；群聊**一个群 × 一个用户**一个工作区（不能做成「用户全局一个」：否则同一个人在不同群之间会串文件，A 群会话可能把 B 群的文件内容贴给 A 群成员）。
 - `<baseDir>/p2p/...`、`<baseDir>/groups/...` 与旧版「用户 × 聊天」共享工作区路径一致，升级后旧会话仍归属同一个项目。
 - 话题 token：真实话题用 `thread_id`；降级 chat-scoped 会话用其 session id。目录名经过安全字符校验。
-- 入站附件（v2 native）：存 DSH 原生附件库（宿主管理、不可变、内容寻址去重），不占话题目录；archive 降级才落 `attachments/`。
+- 入站附件：存 DSH 原生附件库（宿主管理、不可变、内容寻址去重），不占话题目录。
 
 ## 4. 隔离档位（`topicIsolation`）
 
@@ -64,9 +61,9 @@ DSH 本身允许这两个维度解耦，见下。
 
 - **隔离强度**：话题子目录/worktree 只保证「工具默认在话题目录工作」。同一用户工作区内的绝对路径访问仍然可行；沙箱写边界仍是用户工作区。
 - **硬隔离**（不采用）：把 header.cwd 指向话题目录，会话在 GUI 中不再归属工作区。只有当话题来源不可信、必须防互相读取时才值得。
-- **附件**：v2 默认（`attachmentStore: 'native'`）入站图片/文件存 DSH 原生附件库，**不写话题目录**；显式 archive 后端（或宿主缺原生附件库）才落当前话题目录的 `attachments/`，话题建立前收到的附件先暂存 `_staging/`，首个 Session 创建时一次性迁入。v2 主路径不再写 staging；`_staging` 仅作旧版兼容（成功迁入时 warn），v2 发布后的下一个 minor 版本移除（D12）。
+- **附件**：入站图片/文件只存 DSH 原生附件库，**不写话题目录**。旧版的 archive 后端与 `_staging/` 一次性迁入已移除（D12），遗留目录由运维手动清理；`_staging` 仍保留为工作区根路径的保留名，避免与遗留目录冲突。
 - **`/renew`**：同一话题内新建 Session，复用同一话题目录（worktree 也复用）。
-- **清理**：插件不删除工作区、话题目录、`_staging/` 或 Session 日志。运维可手动删除不再需要的话题目录：续聊时 `restoreTopicDir` 会重建空目录（worktree 模式下新建 worktree 分支），Session 不会回落到共享工作区根目录。手动删除 worktree checkout 后，Git 记录可用 `git worktree prune` / `branch -D` 回收。
+- **清理**：插件不删除工作区、话题目录或 Session 日志。运维可手动删除不再需要的话题目录：续聊时 `restoreTopicDir` 会重建空目录（worktree 模式下新建 worktree 分支），Session 不会回落到共享工作区根目录。手动删除 worktree checkout 后，Git 记录可用 `git worktree prune` / `branch -D` 回收。
 - **迁移**：不做自动迁移。旧版 `topics/...` 工作区继续服务旧路由；旧版「用户 × 聊天」共享工作区即新的用户工作区，直接复用。
 
 ## 7. 实现位置
@@ -75,6 +72,6 @@ DSH 本身允许这两个维度解耦，见下。
 |---|---|
 | `src/workspaces.ts` | 用户工作区 / 话题目录 / 标题 / 暂存目录解析 |
 | `src/session/isolation.ts` | 隔离档位判定、工作目录进入、worktree 创建与降级恢复 |
-| `src/routing/inbound.ts` | 建会话与续聊时的目录编排、旧版 `_staging` 一次性迁入、路由写入 |
+| `src/routing/inbound.ts` | 建会话与续聊时的目录编排、路由写入 |
 | `src/session/manager.ts` | 会话创建/恢复/`/renew` 的目录挂载与附件 guidance |
 | `src/domain.ts` | 路由记录 v1 兼容扩展（`sessionDir` / `worktreeBranch`） |

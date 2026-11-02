@@ -2,7 +2,7 @@
  * Inbound admission controller.
  *
  * Every inbound Feishu message passes this gate *before* any side effect
- * (Session creation, workspace, attachment archive, model call). The pure
+ * (Session creation, workspace, attachment download, model call). The pure
  * matrix lives in `policy.ts`; this module owns the user-facing behavior on
  * denial:
  *

@@ -14,6 +14,11 @@ type ConfigRuntime = Parameters<typeof resolveConfig>[0]
 const runtime = { Config } as unknown as ConfigRuntime
 
 describe('plugin composition', () => {
+  it('requires the DSH native attachment library', () => {
+    // Inbound images and files are stored only there; the loader waits for it.
+    expect(inject).toContain('attachments')
+  })
+
   it('stays PENDING when commands is absent even if every other dependency is available', async () => {
     expect(inject).toContain('commands')
 

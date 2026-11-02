@@ -14,7 +14,7 @@ import { resolveConfig } from '../src/config.ts'
 import type { FeishuConfig } from '../src/config.ts'
 import type { RouteRecord } from '../src/domain.ts'
 import type {
-  AdmittedPromptContentPart, AttachmentAdmissionPart, AttachmentStore, FileAttachmentRef,
+  AttachmentStore, FileAttachmentRef,
   ImageAttachmentRef, ImageAttachmentLimits,
 } from '../src/host/attachments.ts'
 import type { AgentContext, ToolDefinition, ToolRuntime } from '../src/host/agent.ts'
@@ -150,9 +150,6 @@ function makeAttachmentStore(options: FakeStoreOptions = {}): FakeStore {
       ?? (ref => `/host/attachments/files/${ref.attachmentId}.bin`),
     imageHostPath: options.imageHostPath
       ?? (ref => `/host/attachments/images/${ref.attachmentId}`),
-    async admitPromptContent(parts: readonly AttachmentAdmissionPart[]): Promise<AdmittedPromptContentPart[]> {
-      return parts as unknown as AdmittedPromptContentPart[]
-    },
   }
   return store
 }
@@ -246,7 +243,6 @@ interface SetupOptions {
   /** Simulate a session that has no durable route binding (unbound agent). */
   unbound?: boolean
   includeTools?: boolean
-  includeAttachments?: boolean
   /** Whether the deployment offers `feishu_attachment_fetch` (topic tool hint). */
   fetchAvailable?: () => boolean
 }
@@ -266,11 +262,11 @@ function setupRuntime(options: SetupOptions = {}): RuntimeHarness {
     return () => { definitions.delete(definition.name) }
   })
   if (options.includeTools !== false) ctx.tools = { register } as unknown as ToolRuntime
-  if (options.includeAttachments !== false) ctx.attachments = store
   const runtime = new AttachmentFetchToolRuntime({
     config: () => config,
     channel: () => configuredChannel ?? undefined,
     routeOfSession: id => (options.unbound === true || id !== sessionId ? undefined : route),
+    attachments: () => store,
     warn,
     now: () => 1_700_000_000_000,
   })
@@ -425,17 +421,8 @@ describe('feishu attachment-fetch registration', () => {
     expect(second.definitions.size).toBe(0)
   })
 
-  it('warns once and skips registration when the attachments service is missing', async () => {
-    const harness = setupRuntime({ includeAttachments: false })
-    await harness.mount().catch(() => undefined)
-    expect(harness.definitions.size).toBe(0)
-    expect(harness.register).not.toHaveBeenCalled()
-    expect(harness.warn).toHaveBeenCalledTimes(1)
-    expect(String(harness.warn.mock.calls[0]?.[0])).toContain('attachments')
-  })
-
-  it('does not inject or register when the feature switch is off', async () => {
-    const harness = setupRuntime({ config: makeConfig({}, { attachmentFetch: false }) })
+  it('does not inject or register when attachments are not accepted', async () => {
+    const harness = setupRuntime({ config: makeConfig({ acceptAttachments: false }) })
     const inject = vi.spyOn(harness.ctx, 'inject')
     await harness.runtime.mount(harness.ctx, 'session-tools')
     expect(inject).not.toHaveBeenCalled()
@@ -446,8 +433,8 @@ describe('feishu attachment-fetch registration', () => {
     const harness = setupRuntime()
     const definition = await harness.mount()
     const messageId = knownFile(harness)
-    const config = harness.config as FeishuConfig & { feishuTools: FeishuConfig['feishuTools'] }
-    config.feishuTools = { ...config.feishuTools, attachmentFetch: false }
+    const config = harness.config as FeishuConfig & { acceptAttachments: boolean }
+    config.acceptAttachments = false
 
     const value = await runTool(definition, { message_id: messageId })
     expect(value.ok).toBe(false)
@@ -476,7 +463,6 @@ describe('feishu attachment-fetch registration', () => {
     const harness = setupRuntime()
     const callbackCtx = makeAgentContext()
     callbackCtx.tools = { register: harness.register } as unknown as ToolRuntime
-    callbackCtx.attachments = harness.store
     const inject = vi.spyOn(harness.ctx, 'inject').mockImplementation((((
       _deps: readonly string[],
       callback: (ctx: AgentContext) => void,
@@ -505,7 +491,6 @@ describe('feishu attachment-fetch registration', () => {
       return dispose
     })
     callbackCtx.tools = { register } as unknown as ToolRuntime
-    callbackCtx.attachments = harness.store
     let callback: ((ctx: AgentContext) => void) | undefined
     vi.spyOn(harness.ctx, 'inject').mockImplementation((((
       _deps: readonly string[],
@@ -1056,18 +1041,6 @@ describe('feishu attachment-fetch files', () => {
     expect(value.results[0]?.reason).not.toContain('\n')
     const text = String((definition.output.render({}, value)[0] as { text?: unknown }).text)
     expect(text).not.toContain('\n- 伪造的失败行')
-  })
-
-  it('reports a structured failure when the attachment service unmounts before execution', async () => {
-    const harness = setupRuntime()
-    const definition = await harness.mount()
-    const messageId = knownFile(harness)
-    delete (harness.ctx as { attachments?: unknown }).attachments
-
-    const value = await runTool(definition, { message_id: messageId })
-    expect(value.ok).toBe(false)
-    expect(value.results[0]?.code).toBe('ATTACHMENT_SERVICE_UNMOUNTED')
-    expect(harness.store.files).toEqual([])
   })
 
   it('hands the download stream to the store incrementally (no whole-file buffering)', async () => {
@@ -2588,10 +2561,9 @@ describe('feishu attachment-fetch presentation and configuration', () => {
     expect(harness.register).not.toHaveBeenCalled()
   })
 
-  it('defaults the feature switch, limits and timeout', () => {
+  it('defaults the limits and timeout', () => {
     const config = resolveConfig({})
     expect(config.feishuTools).toEqual({
-      attachmentFetch: true,
       attachmentFetchMaxResources: 10,
       attachmentFetchMaxBytes: 100 * 1024 * 1024,
       attachmentFetchTimeoutMs: 120_000,
@@ -2606,14 +2578,12 @@ describe('feishu attachment-fetch presentation and configuration', () => {
   it('accepts nested overrides and rejects out-of-range limits', () => {
     const config = resolveConfig({
       feishuTools: {
-        attachmentFetch: false,
         attachmentFetchMaxResources: 3,
         attachmentFetchMaxBytes: 1024,
         attachmentFetchTimeoutMs: 5_000,
       },
     })
     expect(config.feishuTools).toMatchObject({
-      attachmentFetch: false,
       attachmentFetchMaxResources: 3,
       attachmentFetchMaxBytes: 1024,
       attachmentFetchTimeoutMs: 5_000,

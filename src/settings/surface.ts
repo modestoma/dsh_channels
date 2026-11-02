@@ -170,7 +170,6 @@ const BOOLEAN_KEYS = new Set<EditableKey>([
   'allowPermissionSwitch',
   'acceptAttachments',
   'prefetchImages',
-  'feishuTools.attachmentFetch',
   'feishuTools.topicMessages',
   'feishuTools.sendFile',
   'feishuTools.wikiRead',
@@ -258,10 +257,6 @@ const SELECT_OPTIONS: Partial<Record<EditableKey, ReadonlyArray<{ value: string;
     { value: 'subdir', label: '普通子目录' },
     { value: 'worktree', label: 'Git worktree' },
   ],
-  attachmentStore: [
-    { value: 'native', label: 'DSH 原生附件库' },
-    { value: 'archive', label: '话题目录 attachments/' },
-  ],
   accessMode: [
     { value: 'guarded', label: '关闭（管理员与白名单）' },
     { value: 'open', label: '打开（所有人可聊）' },
@@ -278,7 +273,6 @@ const SELECT_OPTIONS: Partial<Record<EditableKey, ReadonlyArray<{ value: string;
 const TOGGLES: Partial<Record<EditableKey, FieldToggleWire>> = {
   dmMode: { on: 'open', off: 'disabled' },
   threadFallback: { on: 'degrade', off: 'strict' },
-  attachmentStore: { on: 'native', off: 'archive' },
   accessMode: { on: 'open', off: 'guarded' },
 }
 
@@ -379,13 +373,7 @@ const FIELD_META: Record<EditableKey, FieldMeta> = {
     label: '接收图片和文件',
     group: 'attachments',
     summary: '关闭后附件消息不保存、不触发模型',
-    help: '纯附件消息不回复；需要时引用该消息再提问，多个文件可以合并转发后引用。也接收合并转发的聊天记录。',
-  },
-  attachmentStore: {
-    label: '使用 DSH 原生附件库',
-    group: 'attachments',
-    summary: '推荐开启；关闭则下载到话题目录 attachments/',
-    help: '原生附件库：不可变、内容寻址去重、随 Session 回放，不自动清理。话题目录：旧版行为，可以手动清理，但下载会阻塞会话。宿主没有附件服务时自动退回话题目录。',
+    help: '附件存入 DSH 原生附件库（不可变、内容寻址去重、随 Session 回放，不自动清理），模型用 feishu_attachment_fetch 按需读取。纯附件消息不回复；需要时引用该消息再提问，多个文件可以合并转发后引用。也接收合并转发的聊天记录。',
   },
   prefetchImages: { label: '预取触发消息里的图片', group: 'attachments', summary: '首轮直接带图，失败的留给模型按需取' },
   historyBootstrapLimit: {
@@ -397,12 +385,6 @@ const FIELD_META: Record<EditableKey, FieldMeta> = {
     max: 20,
     step: 1,
     unit: '条',
-  },
-  'feishuTools.attachmentFetch': {
-    label: '读取附件',
-    group: 'tools',
-    summary: '按需下载已授权消息里的图片和文件',
-    help: '工具名 feishu_attachment_fetch。关闭后文件无法按需读取，入站文件直接下载到话题目录。对新会话生效。',
   },
   'feishuTools.topicMessages': {
     label: '读取话题消息',

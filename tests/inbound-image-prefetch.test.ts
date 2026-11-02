@@ -13,7 +13,7 @@ import type {
   AttachmentResource, ImagePrefetchInput, ImagePrefetchSaveResult,
 } from '../src/feishu/inbound-attachments.ts'
 import {
-  attachmentResources, hasAttachmentPayload, inboundAttachmentState, prefetchImageAttachments,
+  attachmentResources, inboundAttachmentState, prefetchImageAttachments,
 } from '../src/feishu/inbound-attachments.ts'
 import type { ImageAttachmentRef, ImageBlock } from '../src/host/attachments.ts'
 import type { FeishuChannel } from '../src/feishu-channel.ts'
@@ -158,7 +158,7 @@ describe('inboundAttachmentState', () => {
     expect(fileOnly.attachmentOnly).toBe(true)
   })
 
-  it('agrees with attachmentResources and hasAttachmentPayload on payload detection', () => {
+  it('agrees with attachmentResources on payload detection', () => {
     const samples = [
       imageMessage(), captionMessage(), fileMessage(), forwardedMessage(),
       makeMessage({ messageId: 'om_plain', content: '纯文本' }), postMessage(),
@@ -168,8 +168,7 @@ describe('inboundAttachmentState', () => {
       expect(state.resources).toEqual(attachmentResources(msg))
       const payload = attachmentResources(msg).length > 0 || msg.rawContentType === 'merge_forward'
       expect(state.hasPayload).toBe(payload)
-      if (payload) expect(hasAttachmentPayload(msg)).toBe(true)
-      else expect(state.text).toBe(msg.content ?? '')
+      if (!payload) expect(state.text).toBe(msg.content ?? '')
     }
     // Untracked resource kinds are not a payload in either classification.
     const audio = makeMessage({

@@ -3,7 +3,7 @@
  * topic replies, degradation, and lazy resume.
  */
 
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
@@ -22,7 +22,7 @@ import type { Agent, AgentHandle, ApprovalOutcome, CordisPluginRuntime, MessageI
 import { RESUME_ACTION } from '../src/cards.ts'
 import type { RouteRecord } from '../src/domain.ts'
 import { sessionDirOf } from '../src/domain.ts'
-import { FEISHU_ATTACHMENTS_SECTION, FEISHU_REPLIES_GUIDANCE, FEISHU_REPLIES_SECTION } from '../src/feishu/agent-context.ts'
+import { FEISHU_ATTACHMENTS_GUIDANCE, FEISHU_ATTACHMENTS_SECTION, FEISHU_REPLIES_GUIDANCE, FEISHU_REPLIES_SECTION } from '../src/feishu/agent-context.ts'
 import { ATTACHMENT_FETCH_TOOL_NAME, TOPIC_MESSAGES_TOOL_NAME } from '../src/feishu/tools.ts'
 import { SEND_FILE_TOOL_NAME } from '../src/feishu/send-file.ts'
 import type { SessionExportBuilder } from '../src/session-export.ts'
@@ -70,7 +70,6 @@ function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
     missed: { enabled: false, windowMs: 30 * 60_000, heartbeatMs: 60_000, maxMessages: 200 },
     slashCommandPanel: false,
     acceptAttachments: true,
-    attachmentStore: 'native',
     prefetchImages: true,
     prefetchImageMaxBytes: 20 * 1024 * 1024,
     prefetchTotalMaxBytes: 50 * 1024 * 1024,
@@ -79,7 +78,6 @@ function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
     historyBootstrapLimit: 10,
     promptContextTimeoutMs: 3_000,
     feishuTools: {
-      attachmentFetch: true,
       attachmentFetchMaxResources: 10,
       attachmentFetchMaxBytes: 100 * 1024 * 1024,
       attachmentFetchTimeoutMs: 120_000,
@@ -4040,127 +4038,20 @@ describe('reply guidance', () => {
 })
 
 describe('inbound attachments', () => {
-  it('registers the attachment guidance with the session workspace path', async () => {
+  it('registers the native attachment guidance for every Session', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_guide', senderId: 'u_owner',
       messageId: 'om_guide', content: '开始',
     }))
     await waitForEstablishedSession(h)
-    const record = [...(h.ctxState.domain.raw.table('routes').entries() as Iterable<[string, RouteRecord]>)]
-      .map(([, value]) => value)[0]!
     const sections = promptSectionsOf(h.ctxState.agents.created[0]!.setupCtx)
     const guidance = sections.find(section => section.name === FEISHU_ATTACHMENTS_SECTION)
-    expect(guidance?.text).toContain(`${sessionDirOf(record)}/attachments`)
+    expect(guidance?.text).toBe(FEISHU_ATTACHMENTS_GUIDANCE)
     await h.service.shutdown()
   })
 
-  it('archives an image-only message into the workspace without starting a turn', async () => {
-    const h = await setup({}, {
-      downloadResource: () => [new Uint8Array([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])],
-    })
-    await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_image', senderId: 'u_owner', messageId: 'om_image',
-      content: '![image](img_1)',
-      resources: [{ type: 'image', fileKey: 'img_1' }] as never,
-    }))
-
-    const dir = path.join(h.config.baseDir, '_staging', 'group', 'oc_image', 'u_owner')
-    const finalFiles = () => readdirSync(dir).filter(name => !name.startsWith('.tmp-'))
-    await waitUntil(() => expect(finalFiles()).toHaveLength(1))
-    const [name] = finalFiles()
-    expect(name).toMatch(/\.png$/)
-    expect(h.ctxState.agents.created).toHaveLength(0)
-    await waitUntil(() => expect(h.channel.reactions).toEqual([{ messageId: 'om_image', emojiType: 'DONE' }]))
-    await h.service.shutdown()
-  })
-
-  it('archives a file message and keeps a following caption as the only prompt text', async () => {
-    const h = await setup({}, {
-      downloadResource: (_messageId, fileKey) => [new TextEncoder().encode(`bytes:${fileKey}`)],
-    })
-    const chatId = 'oc_file_chat'
-    const senderId = 'u_owner'
-    await h.onMessage(makeMessage({
-      chatType: 'group', chatId, senderId, messageId: 'om_file',
-      content: '<file key="file_1" name="report.pdf"/>',
-      resources: [{ type: 'file', fileKey: 'file_1', fileName: 'report.pdf' }] as never,
-    }))
-    const staging = path.join(h.config.baseDir, '_staging', 'group', chatId, senderId)
-    await waitUntil(() => expect(readdirSync(staging).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1))
-    expect(readdirSync(staging).filter(name => !name.startsWith('.tmp-'))[0]).toMatch(/report\.pdf$/)
-    expect(h.ctxState.agents.created).toHaveLength(0)
-
-    await h.onMessage(makeMessage({
-      chatType: 'group', chatId, senderId, messageId: 'om_prompt',
-      content: '看 report.pdf 的第一页',
-    }))
-    await waitForEstablishedSession(h)
-    const record = [...(h.ctxState.domain.raw.table('routes').entries() as Iterable<[string, RouteRecord]>)]
-      .map(([, value]) => value)[0]!
-    const workspaceAttachments = path.join(sessionDirOf(record), 'attachments')
-    await waitUntil(() => expect(readdirSync(workspaceAttachments).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1))
-    expect(readdirSync(workspaceAttachments).filter(name => !name.startsWith('.tmp-'))[0]).toMatch(/report\.pdf$/)
-    expect(readdirSync(staging)).toEqual([])
-    // The one-time legacy adoption announces its own removal window (D12).
-    expect(mock(h.ctxState.ctx.logger!.warn!).mock.calls.map(call => String(call[0])).join(' '))
-      .toContain('_staging migration is deprecated')
-    const agent = h.ctxState.agents.created[0]!.handle.agent
-    const message = mock(agent.followup).mock.calls[0]![0] as { content: Array<{ type: string; text?: string }> }
-    expect(message.content).toEqual([{ type: 'text', text: '看 report.pdf 的第一页' }])
-    await h.service.shutdown()
-  })
-
-  it('archives an expanded merged-forward record as text', async () => {
-    const h = await setup()
-    await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_forward', senderId: 'u_owner', messageId: 'om_forward',
-      content: '<forwarded_messages>\n[alice] 明天评审\n</forwarded_messages>',
-      rawContentType: 'merge_forward',
-    }))
-    const dir = path.join(h.config.baseDir, '_staging', 'group', 'oc_forward', 'u_owner')
-    // The record file appears before its text is flushed: wait for the content.
-    await waitUntil(() => {
-      expect(readdirSync(dir)).toHaveLength(1)
-      expect(readFileSync(path.join(dir, readdirSync(dir)[0]!), 'utf8')).toContain('明天评审')
-    })
-    const [name] = readdirSync(dir)
-    expect(name).toMatch(/-forwarded-record\.txt$/)
-    expect(h.ctxState.agents.created).toHaveLength(0)
-    await h.service.shutdown()
-  })
-
-  it('archives a file attached to a rich-text post and then processes its caption', async () => {
-    const h = await setup({}, {
-      downloadResource: () => [new TextEncoder().encode('zip-bytes')],
-    })
-    const raw = {
-      message: {
-        message_type: 'post',
-        content: JSON.stringify({
-          title: '',
-          content: [[{ tag: 'text', text: '看一下这个文件的内容', style: [] }]],
-          files: [{ file_key: 'file_v3_bugreport', file_name: 'bugreport-2025-11-04-141749.zip', is_folder: false }],
-        }),
-      },
-    }
-    await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_post_file', senderId: 'u_owner', messageId: 'om_post_file',
-      rawContentType: 'post', content: '看一下这个文件的内容', raw,
-    }))
-    await waitForEstablishedSession(h)
-    const record = [...(h.ctxState.domain.raw.table('routes').entries() as Iterable<[string, RouteRecord]>)]
-      .map(([, value]) => value)[0]!
-    const dir = path.join(sessionDirOf(record), 'attachments')
-    await waitUntil(() => expect(readdirSync(dir).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1))
-    expect(readdirSync(dir)[0]).toMatch(/-bugreport-2025-11-04-141749\.zip$/)
-    const agent = h.ctxState.agents.created[0]!.handle.agent
-    const message = mock(agent.followup).mock.calls[0]![0] as { content: Array<{ type: string; text?: string }> }
-    expect(message.content).toEqual([{ type: 'text', text: '看一下这个文件的内容' }])
-    await h.service.shutdown()
-  })
-
-  it('gives every new topic its own workspace and attachments directory', async () => {
+  it('gives every new topic its own working directory', async () => {
     const h = await setup()
     const chatId = 'oc_iso'
     const senderId = 'u_owner'
@@ -4172,13 +4063,6 @@ describe('inbound attachments', () => {
     }))
     await waitForEstablishedSession(h)
     const routeA = routes()[0]!
-    await h.onMessage(makeMessage({
-      chatType: 'group', chatId, senderId, threadId: routeA.key, mentionedBot: false,
-      messageId: 'om_iso_a_img', content: '![image](img_a)',
-      resources: [{ type: 'image', fileKey: 'img_a' }] as never,
-    }))
-    const dirA = path.join(sessionDirOf(routeA), 'attachments')
-    await waitUntil(() => expect(readdirSync(dirA).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1))
 
     await h.onMessage(makeMessage({
       chatType: 'group', chatId, senderId, messageId: 'om_iso_b', content: '开始 B',
@@ -4187,13 +4071,6 @@ describe('inbound attachments', () => {
     // The route record commits after the Agent is created.
     await waitUntil(() => expect(routes().some(route => route.sessionId !== routeA.sessionId)).toBe(true))
     const routeB = routes().find(route => route.sessionId !== routeA.sessionId)!
-    await h.onMessage(makeMessage({
-      chatType: 'group', chatId, senderId, threadId: routeB.key, mentionedBot: false,
-      messageId: 'om_iso_b_img', content: '![image](img_b)',
-      resources: [{ type: 'image', fileKey: 'img_b' }] as never,
-    }))
-    const dirB = path.join(sessionDirOf(routeB), 'attachments')
-    await waitUntil(() => expect(readdirSync(dirB).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1))
 
     // Both topics share the user workspace but own distinct working
     // directories named after their thread ids.
@@ -4201,13 +4078,6 @@ describe('inbound attachments', () => {
     expect(sessionDirOf(routeB)).not.toBe(sessionDirOf(routeA))
     expect(path.basename(sessionDirOf(routeA))).toBe(routeA.key)
     expect(path.basename(sessionDirOf(routeB))).toBe(routeB.key)
-    expect(readdirSync(dirA).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1)
-    expect(readdirSync(dirB).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1)
-
-    const guidanceB = promptSectionsOf(h.ctxState.agents.created[1]!.setupCtx)
-      .find(section => section.name === FEISHU_ATTACHMENTS_SECTION)?.text ?? ''
-    expect(guidanceB).toContain(dirB)
-    expect(guidanceB).not.toContain(dirA)
     await h.service.shutdown()
   })
 
@@ -4282,35 +4152,6 @@ describe('inbound attachments', () => {
     await h.service.shutdown()
   })
 
-  it('tells the user why an attachment could not be archived', async () => {
-    const h = await setup({}, {
-      downloadResource: () => {
-        throw new Error('Request failed with status code 400')
-      },
-    })
-    await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_post_fail', senderId: 'u_owner', messageId: 'om_post_fail',
-      rawContentType: 'post', content: '看一下这个文件的内容',
-      raw: {
-        message: {
-          message_type: 'post',
-          content: JSON.stringify({
-            title: '',
-            content: [[{ tag: 'text', text: '看一下这个文件的内容', style: [] }]],
-            files: [{ file_key: 'file_v3_big', file_name: 'bugreport-2025-11-04-141749.zip', is_folder: false }],
-          }),
-        },
-      },
-    }))
-    await waitUntil(() => {
-      const texts = (h.channel.sent as Array<{ input: { text?: string } }>)
-        .map(entry => entry.input.text)
-        .filter((text): text is string => text !== undefined)
-      expect(texts.some(text => text.includes('附件保存失败') && text.includes('bugreport'))).toBe(true)
-    })
-    await h.service.shutdown()
-  })
-
   it('turns an image with a caption into one prompt carrying only the caption', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
@@ -4321,11 +4162,7 @@ describe('inbound attachments', () => {
     await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
     const message = mock(agent.followup).mock.calls[0]![0] as { content: Array<{ type: string; text?: string }> }
-    expect(message.content).toEqual([{ type: 'text', text: '看这张图 里有什么' }])
-    const record = [...(h.ctxState.domain.raw.table('routes').entries() as Iterable<[string, RouteRecord]>)]
-      .map(([, value]) => value)[0]!
-    const dir = path.join(sessionDirOf(record), 'attachments')
-    await waitUntil(() => expect(readdirSync(dir).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1))
+    expect(message.content[0]).toEqual({ type: 'text', text: '看这张图 里有什么' })
     await h.service.shutdown()
   })
 })
@@ -4355,7 +4192,7 @@ describe('native attachment pipeline', () => {
       partial,
       channelOptions,
       undefined,
-      { agentExtras: { attachments, tools } },
+      { agentExtras: { tools } },
       undefined,
       undefined,
       { attachments },
@@ -4662,55 +4499,6 @@ describe('native attachment pipeline', () => {
     await h.service.shutdown()
   })
 
-  it('keeps the legacy archive behavior for explicit archive and missing-service deployments (AC7)', async () => {
-    // Explicit archive wins even when the native library is mounted.
-    const attachments = makeAttachmentStore()
-    const archiveTools = makeToolsRuntime()
-    const archived = await setup(
-      { attachmentStore: 'archive' },
-      { downloadResource: () => [PNG] },
-      undefined,
-      { agentExtras: { attachments, tools: archiveTools } },
-      undefined,
-      undefined,
-      { attachments },
-    )
-    await archived.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_archive', senderId: 'u_alice', mentionedBot: false,
-      messageId: 'om_archive_image', content: '![image](img_1)', resources: pngResources,
-    }))
-    const staging = path.join(archived.config.baseDir, '_staging', 'p2p', 'oc_archive', 'u_alice')
-    await waitUntil(() => expect(readdirSync(staging).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1))
-    expect(mock(archived.channel.downloadResource)).toHaveBeenCalled()
-    expect(archived.ctxState.agents.created).toHaveLength(0)
-    // A text turn in archive mode must not advertise the lazy fetch tool.
-    await archived.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_archive', senderId: 'u_alice', mentionedBot: false,
-      messageId: 'om_archive_text', content: '开始',
-    }))
-    await waitForEstablishedSession(archived)
-    expect(archiveTools.definitions.has(ATTACHMENT_FETCH_TOOL_NAME)).toBe(false)
-    expect(archiveTools.definitions.has(TOPIC_MESSAGES_TOOL_NAME)).toBe(true)
-    await archived.service.shutdown()
-
-    // Native configuration without the host service falls back to the legacy
-    // synchronous download for the triggering message.
-    const fallback = await setup({}, { downloadResource: () => [PNG] })
-    await fallback.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_fallback', senderId: 'u_alice', mentionedBot: false,
-      messageId: 'om_fallback_image', content: '看图 ![image](img_1)', resources: pngResources,
-    }))
-    await waitForEstablishedSession(fallback)
-    expect(mock(fallback.channel.downloadResource)).toHaveBeenCalled()
-    expect(firstPromptOf(fallback)).toEqual([{ type: 'text', text: '看图' }])
-    const record = routesOf(fallback)[0]!
-    const dir = path.join(sessionDirOf(record), 'attachments')
-    await waitUntil(() => expect(readdirSync(dir).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1))
-    const fallbackWarnings = mock(fallback.ctxState.ctx.logger?.warn).mock.calls.flat().join(' ')
-    expect(fallbackWarnings).toContain('宿主未挂载 ctx.attachments')
-    await fallback.service.shutdown()
-  })
-
   it('delivers the first topic turn before a message arriving during its prefetch (ordering)', async () => {
     let release!: (chunks: Uint8Array[]) => void
     const gate = new Promise<Uint8Array[]>(resolve => { release = resolve })
@@ -4811,56 +4599,7 @@ describe('native attachment pipeline', () => {
     await h.service.shutdown()
   })
 
-  it('falls back to the archive backend when the fetch tool is disabled (AC7)', async () => {
-    const attachments = makeAttachmentStore()
-    const tools = makeToolsRuntime()
-    const h = await setup(
-      {
-        feishuTools: {
-          attachmentFetch: false,
-          attachmentFetchMaxResources: 10,
-          attachmentFetchMaxBytes: 100 * 1024 * 1024,
-          attachmentFetchTimeoutMs: 120_000,
-          topicMessages: true,
-          topicMessagesTimeoutMs: 20_000,
-          sendFile: true,
-          wikiRead: false,
-          wikiWrite: false,
-        },
-      },
-      { downloadResource: () => [PNG] },
-      undefined,
-      { agentExtras: { attachments, tools } },
-      undefined,
-      undefined,
-      { attachments },
-    )
-    await h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_tool_off', senderId: 'u_alice', mentionedBot: false,
-      messageId: 'om_tool_off', rawContentType: 'image', content: '看图 ![image](img_1)',
-      resources: pngResources,
-    }))
-    await waitForEstablishedSession(h)
-
-    expect(mock(h.channel.downloadResource)).toHaveBeenCalled()
-    expect(firstPromptOf(h)).toEqual([{ type: 'text', text: '看图' }])
-    // The bytes land in the legacy workspace archive, not the native library:
-    // the archive guidance tells the model to read exactly that directory.
-    const record = routesOf(h)[0]!
-    const dir = path.join(sessionDirOf(record), 'attachments')
-    await waitUntil(() => expect(readdirSync(dir).filter(name => !name.startsWith('.tmp-'))).toHaveLength(1))
-    expect(attachments.savedImages).toHaveLength(0)
-    // The lazy pipeline (and its fetch tool) is not advertised to the model.
-    expect(tools.definitions.has(ATTACHMENT_FETCH_TOOL_NAME)).toBe(false)
-    expect(tools.definitions.has(TOPIC_MESSAGES_TOOL_NAME)).toBe(true)
-    const guidance = promptSectionsOf(h.ctxState.agents.created[0]!.setupCtx)
-      .find(section => section.name === FEISHU_ATTACHMENTS_SECTION)?.text ?? ''
-    expect(guidance).toContain('attachments/')
-    expect(guidance).not.toContain('native attachment library')
-    await h.service.shutdown()
-  })
-
-  it('mounts the native guidance only when the native library is effective (AC2/AC7)', async () => {
+  it('mounts the native guidance without a workspace attachments directory (AC2)', async () => {
     const { h } = await setupNative()
     await h.onMessage(makeMessage({
       chatType: 'p2p', chatId: 'oc_guidance', senderId: 'u_alice', mentionedBot: false,
@@ -4903,7 +4642,7 @@ describe('quote excerpts and first-turn topic history', () => {
       partial,
       channelOptions,
       undefined,
-      { agentExtras: { attachments, tools } },
+      { agentExtras: { tools } },
       undefined,
       undefined,
       { attachments },
@@ -5539,36 +5278,6 @@ describe('quote excerpts and first-turn topic history', () => {
     await h.service.shutdown()
   })
 
-  it('injects quote and history text blocks in the archive backend too (AC1/AC4)', async () => {
-    // No host attachments library mounted → effective backend is `archive`.
-    const h = await setup({}, {
-      messageGet: async messageId => messageId === 'om_arch_quote'
-        ? makeMessageGetResponse([makeRawMessage({
-          message_id: 'om_arch_quote', msg_type: 'text', chat_id: 'oc_archive_quote',
-          content: { text: '归档模式引用' },
-        })])
-        : makeMessageGetResponse([]),
-      messageList: async () => makeMessageListResponse([makeRawMessage({
-        message_id: 'om_arch_hist', msg_type: 'text', create_time: Date.now(),
-        chat_id: 'oc_archive_quote', content: { text: '归档模式历史' },
-      })]),
-    })
-    await h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_archive_quote', senderId: 'u_alice', mentionedBot: false,
-      messageId: 'om_arch_trigger', replyToMessageId: 'om_arch_quote', content: '归档模式',
-    }))
-    await waitForEstablishedSession(h)
-    const blocks = textBlocksOf(promptOf(h))
-    expect(blocks).toHaveLength(3)
-    expect(blocks[0]).toBe('归档模式')
-    expect(blocks[1]).toContain('<feishu_quote>')
-    expect(blocks[2]).toContain('<feishu_history>')
-    // Archive deployments mount no fetch tool: the passive blocks must not
-    // advertise an operation that cannot work there.
-    expect(blocks[1]).not.toContain('feishu_attachment_fetch')
-    expect(blocks[2]).not.toContain('feishu_attachment_fetch')
-    await h.service.shutdown()
-  })
 })
 
 describe('/history enrichment', () => {

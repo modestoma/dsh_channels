@@ -48,7 +48,7 @@ export function isNestedEditableKey(key: EditableKey): key is NestedEditableKey 
   return key.startsWith(FEISHU_TOOLS_PREFIX)
 }
 
-/** `attachmentFetch` for the panel key `feishuTools.attachmentFetch`. */
+/** `sendFile` for the panel key `feishuTools.sendFile`. */
 function nestedFieldOf(key: NestedEditableKey): keyof FeishuConfig['feishuTools'] {
   return key.slice(FEISHU_TOOLS_PREFIX.length) as keyof FeishuConfig['feishuTools']
 }

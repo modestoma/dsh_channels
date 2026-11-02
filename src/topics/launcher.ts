@@ -290,7 +290,7 @@ export class TopicLauncher implements FeishuTopicService {
           warn('dsh-channels: attaching topic session %s to workspace failed: %s', sessionId, String(error))
         })
       }
-      await this.deps.sessions.mountGuidance(handle.agent, placement.sessionDir)
+      await this.deps.sessions.mountGuidance(handle.agent)
       this.assertStarted()
 
       const createdAt = handle.agent.session.header.createdAt

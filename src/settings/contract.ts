@@ -250,11 +250,9 @@ export const EDITABLE_KEYS = [
   'agentPreset',
   // 附件（v2 管线）
   'acceptAttachments',
-  'attachmentStore',
   'prefetchImages',
   'historyBootstrapLimit',
   // 模型工具（`feishuTools.*` 是嵌套配置，覆盖层仍写成嵌套对象）
-  'feishuTools.attachmentFetch',
   'feishuTools.topicMessages',
   'feishuTools.sendFile',
   // 限额与超时

@@ -32,7 +32,7 @@
 
    > 卡片更新接口本身支持 `im:message` 一项即可，但建议把 `im:message:update` 也加上，避免组合差异。
    >
-   > **入站附件（v2）的权限**：图片/文件下载与合并转发容器子资源读取走消息资源接口，随消息收发/读取 scope（`im:message`，必要时 `im:message:readonly`；以控制台该接口的要求为准）。缺下载权限时不会静默丢文件：`feishu_attachment_fetch` 逐资源返回可读失败（如 `DOWNLOAD_FAILED` / 403 文案），archive 后端则加 `No` 表情并回一条纯文字失败提示。**native 主路径（默认）不新增附件专用权限**——下载仍走上面的消息资源 scope，存入 DSH 原生附件库后由宿主管理。
+   > **入站附件（v2）的权限**：图片/文件下载与合并转发容器子资源读取走消息资源接口，随消息收发/读取 scope（`im:message`，必要时 `im:message:readonly`；以控制台该接口的要求为准）。缺下载权限时不会静默丢文件：`feishu_attachment_fetch` 逐资源返回可读失败（如 `DOWNLOAD_FAILED` / 403 文案）。**不新增附件专用权限**：下载仍走上面的消息资源 scope，存入 DSH 原生附件库后由宿主管理。
    >
    > **引用与话题历史（P2）的权限降级**：`feishu_topic_messages`、引用摘录、新会话首轮话题历史都依赖消息读取 scope。若权限未随版本发布或 `im:message.group_msg` 审批未通过，普通对话**不受影响**：引用/历史块静默省略，模型仍会正常回答；显式调用 `feishu_topic_messages` 时返回可读的 `PERMISSION_DENIED`（缺失 `im:message:readonly` 一类权限），不会报死错。被动引用/历史读取使用 **默认 3 秒**的短预算（`promptContextTimeoutMs`，不复用工具超时），首次降级会输出一条 **warn** 级日志（含原因与 scope 提示，之后同类降级仅 debug 级；`/status` 不报告读取 scope 状态）。控制台若提示“读取群消息需要敏感权限”，先申请并审批 `im:message.group_msg` 后再验证入群前历史。
 4. **事件与回调** → 事件订阅方式选择 **使用长连接接收事件**（WebSocket，免公网 IP）。
@@ -119,7 +119,6 @@ chmod 600 $DSH_HOME/.credentials.yaml
     threadFallback: 'degrade'           # 话题被拒时降级为会话级路由
     topicIsolation: 'auto'              # 话题目录隔离：auto（Git 仓库用 worktree，否则子目录）/ subdir / worktree
     acceptAttachments: true             # 接收飞书附件：native 下图片预取、文件懒取、纯附件静默不回复
-    attachmentStore: 'native'           # 入站附件后端：native（DSH 原生附件库）/ archive（旧版工作区 attachments/）
     prefetchImages: true                # 触发消息图片预取为首轮 ImageBlock
     prefetchImageMaxBytes: 20971520     # 单张预取图片上限（20 MiB）
     prefetchTotalMaxBytes: 52428800     # 单次预取总字节预算（50 MiB）
@@ -127,7 +126,6 @@ chmod 600 $DSH_HOME/.credentials.yaml
     historyBootstrapLimit: 10           # 新会话首轮话题历史条数（0 关闭，上限 20）
     promptContextTimeoutMs: 3000        # 被动引用/历史读取预算（3 s）
     feishuTools:                        # 模型工具（Web 面板按子键合并，不写空未改子键）
-      attachmentFetch: true             # feishu_attachment_fetch：按需懒取已知消息的图片/文件
       attachmentFetchMaxResources: 10   # 单次最多取回资源数（1–50）
       attachmentFetchMaxBytes: 104857600 # 单次总字节预算（100 MiB）
       attachmentFetchTimeoutMs: 120000  # 单次调用整段超时（120 s）
@@ -159,14 +157,12 @@ chmod 600 $DSH_HOME/.credentials.yaml
 | `codeWriteTools` | dsh-repo 写操作与观象 SKILL 提交 | 飞书会话调用这些工具前检查当前发言人的「代码改动」开关（管理员始终放行） |
 | `authRequestTtlDays` | `7` | 入群/用户授权申请卡有效期（1–30 天） |
 | `acceptAttachments` | `true` | 接收飞书图片/文件/合并转发记录。native 下触发消息图片预取、文件懒取、纯附件静默不回复（引用该消息再提问时列入清单）；`false` 时附件消息完全惰性（不保存、不触发、不列入清单） |
-| `attachmentStore` | `native` | 入站附件后端：`native`（DSH 原生附件库，默认；不可变、内容寻址去重、随 Session 回放、不自动清理）/ `archive`（旧版下载到话题工作区 `attachments/`，会阻塞会话建立） |
 | `prefetchImages` | `true` | native 下把触发消息图片预取为首轮 `ImageBlock`；失败/超限/超时降级为清单懒取项。关闭后图片也需 `feishu_attachment_fetch` |
 | `prefetchImageMaxBytes` | `20971520` | 单张预取图片字节上限（20 MiB，1 B–200 MiB） |
 | `prefetchTotalMaxBytes` | `52428800` | 一次触发消息预取的总字节预算（50 MiB，1 B–1 GiB）；用尽后剩余图片降级清单 |
 | `prefetchTimeoutMs` | `10000` | 图片预取整段超时（100–120000 ms）；到期保留已取回图片、其余降级清单。注意配置键是 `prefetchTimeoutMs`（早期 Issue 草稿写作 `prefetchImageTimeoutMs`） |
 | `historyBootstrapLimit` | `10` | 新会话首轮自动附带本话题最近 N 条消息摘要（0 关闭，上限 20；失败静默降级）；更早的消息用 `feishu_topic_messages` 翻页 |
 | `promptContextTimeoutMs` | `3000` | 被动引用/首轮历史读取的整段预算（100–10000 ms）；超时即省略对应块、回合照跑。模型主动调用工具的读取超时另由 `feishuTools.topicMessagesTimeoutMs` 控制 |
-| `feishuTools.attachmentFetch` | `true` | 是否挂载 `feishu_attachment_fetch`；关闭后文件无法懒取，插件**整体回退 archive 后端** |
 | `feishuTools.attachmentFetchMaxResources` | `10` | 单次工具调用最多取回的附件数（1–50）；超出返回可读原因，可按 `file_key` 拆分重试 |
 | `feishuTools.attachmentFetchMaxBytes` | `104857600` | 单次工具调用的总下载字节预算（100 MiB，≥ 1 B，无上限）；文件流式写入、不整文件缓冲 |
 | `feishuTools.attachmentFetchTimeoutMs` | `120000` | 单次 `feishu_attachment_fetch` 整段超时（1000–2147483647 ms）；到期取消并逐项报告；大文件需同步调大 |
@@ -174,7 +170,7 @@ chmod 600 $DSH_HOME/.credentials.yaml
 | `feishuTools.topicMessagesTimeoutMs` | `20000` | 单次 `feishu_topic_messages` 整段超时（1000–120000 ms） |
 | `loggerLevel` | `info` | 官方 SDK 日志级别 |
 
-> **面板与配置位置**：v2 附件配置在 Web 面板「左侧栏 → 飞书渠道 → 附件与工具」：`acceptAttachments` / `attachmentStore` / `prefetchImages` / `historyBootstrapLimit` 在「入站附件」组，`feishuTools.*` 开关在「工具」组，各项字节上限与超时在「限额与超时」组；保存写入同一 Web 覆盖文件，`feishuTools.*` 按子键合并（不会把未修改子键写空）。直接写 profile 补丁层同样生效，面板覆盖优先。其中 `feishuTools.topicMessages=false` 只关闭模型工具，被动的引用/历史 prompt 摘录仍生效；要完全关闭首轮历史请设 `historyBootstrapLimit: 0`。archive 后端下 `feishu_attachment_fetch` 不挂载，`feishu_topic_messages` 仍可读取历史文本，但工具描述会提示附件不可取。
+> **面板与配置位置**：v2 附件配置在 Web 面板「左侧栏 → 飞书渠道 → 附件与工具」：`acceptAttachments` / `prefetchImages` / `historyBootstrapLimit` 在「入站附件」组，`feishuTools.*` 开关在「工具」组，各项字节上限与超时在「限额与超时」组；保存写入同一 Web 覆盖文件，`feishuTools.*` 按子键合并（不会把未修改子键写空）。直接写 profile 补丁层同样生效，面板覆盖优先。其中 `feishuTools.topicMessages=false` 只关闭模型工具，被动的引用/历史 prompt 摘录仍生效；要完全关闭首轮历史请设 `historyBootstrapLimit: 0`。`feishu_attachment_fetch` 只在 `acceptAttachments` 打开时挂载；关闭时 `feishu_topic_messages` 仍可读取历史文本，但工具描述会提示附件不可取。
 
 ### 3.3 初始化管理员与授权（默认准入）
 
@@ -230,10 +226,8 @@ DSH_HOME=$DSH_HOME pnpm dsh web        # 默认 http://127.0.0.1:3080
 
 | 日志 | 含义 |
 |------|------|
-| `attachmentStore=native 但宿主未挂载 ctx.attachments，入站附件回退话题 attachments/ 工作区落盘` | 宿主没有 DSH 原生附件库：入站附件按旧 archive 行为处理；如需 native 请确认 web profile 启用 `dsh-attachment-local` |
 | `feishu_attachment_fetch 未挂载：宿主 tools/attachments 服务不可用（会话继续）` | 缺 `tools` 或 `attachments` 服务：该工具不注册，会话照常建立 |
 | `feishu_topic_messages 未挂载：宿主 tools 服务不可用（会话继续）` | 缺 `tools` 服务：话题读取工具不注册 |
-| `adopted N legacy staged attachment(s) into …; the one-time _staging migration is deprecated and will be removed after one release cycle` | 旧版 `_staging` 遗留文件被一次性迁入话题目录；按 D12，该兼容路径在 v2 发布后的下一个 minor 版本移除，可据此清理旧数据 |
 
 **未配置凭据（不是启动失败）**：日志会提示 `飞书应用凭据未配置完整（缺少 FEISHU_APP_…）`，插件照常加载但**不连接**；打开 Web 左侧栏 **飞书渠道 → 连接**，按三步引导填写 App ID / App Secret 并保存后自动连接。
 
@@ -300,7 +294,7 @@ DSH_HOME=$DSH_HOME pnpm dsh web        # 默认 http://127.0.0.1:3080
 
 每个新话题在该工作区内创建独立的话题工作目录 `<工作区>/topics/<话题 id>/`，会话列表仍归属该项目；同一话题内 `/renew` 复用同一话题目录。也可在飞书里用 `/workspace` 查看当前会话的实际工作目录。
 
-**附件落点（v2）**：默认 `attachmentStore: 'native'` 下入站图片/文件存入 **DSH 原生附件库**（`$DSH_HOME/attachments/v1` 一类宿主目录，由宿主管理），**话题目录下不会出现 `attachments/`**；只有显式 archive 后端或宿主缺原生附件库时才会看到 `<工作区>/topics/<话题>/attachments/`。v2 主路径也不再写 `<baseDir>/_staging/`：该目录只保留旧版遗留文件的一次性迁入（成功时一条 warn），按 D12 在 v2 发布后的下一个 minor 版本移除。插件不会自动删除工作区或话题目录。
+**附件落点**：入站图片/文件只存入 **DSH 原生附件库**（`$DSH_HOME/attachments/v1` 一类宿主目录，由宿主管理），**话题目录下不会出现 `attachments/`**，插件也不再读写 `<baseDir>/_staging/`。原生附件库是插件的必需依赖：组合里没有 `dsh-attachment-local` 时插件不会启动。旧版本留下的 `attachments/` 与 `_staging/` 可手动删除。插件不会自动删除工作区或话题目录。
 
 ### 5.3 引用与话题历史（P2）验证点
 
@@ -317,7 +311,7 @@ DSH_HOME=$DSH_HOME pnpm dsh web        # 默认 http://127.0.0.1:3080
 
 > 自动测试已覆盖以下行为（见 [docs/attachment-pipeline-v2.md](attachment-pipeline-v2.md) §12.1），但**插件链路与飞书权限/历史范围仍需真机确认**。表中「状态」一列区分：**已真机** = 对应 Issue 已记录的真实设备结果；**待手测** = 尚无插件链路真机记录（自动测试覆盖）；**API 已验** = 同应用 bot 身份只读 API 探针已验，但插件端到端待手测。执行后把结论写回 `.agents/roadmaps/attachment_pipeline_v2/acceptance.md`，未通过项如实记录，不要用 mock 结果冒充。
 
-**准备**：`pnpm build` 后用新构建启动（或 HMR 重载插件）；准备好 p2p、普通群、话题群各一个，聊天里发一个 ≥100 MB 的大文件附件（飞书允许范围内）；确认 `attachmentStore: 'native'`、`feishuTools.attachmentFetch/topicMessages` 为默认开启。
+**准备**：`pnpm build` 后用新构建启动（或 HMR 重载插件）；准备好 p2p、普通群、话题群各一个，聊天里发一个 ≥100 MB 的大文件附件（飞书允许范围内）；确认 `acceptAttachments`、`feishuTools.topicMessages` 为默认开启。
 
 | # | 场景 | 操作 | 预期 | 状态 |
 | --- | --- | --- | --- | --- |
@@ -337,12 +331,10 @@ DSH_HOME=$DSH_HOME pnpm dsh web        # 默认 http://127.0.0.1:3080
 | C2 | 话题群·纯附件静默 | 已绑定话题内不 @ 只发文件 | 完全静默；thread scope 登记；该话题后续触发消息的清单可列出 | ⏳ 待手测（群未 @ 静默已真机；话题内纯附件由自动测试覆盖，未单独真机） |
 | C3 | 话题群·历史 | 话题内先发 A/B/C（不 @），再 @ 机器人提问 | 新 Session 首轮含 `<feishu_history>` A/B/C（带 message_id）；`feishu_topic_messages` 可翻页，续聊轮不重复注入历史；工具渲染含 `- 下一页 cursor:` | ✅ 已真机（P2 步骤 5/6R） |
 | C4 | 话题群·入群前历史 | 选择一个入群前就有消息的群，重复 C3 | 能看到机器人可见范围内早于入群的消息；看不到时属权限/可见范围限制，历史块静默省略（不报错） | ⏳ 待手测（API 探针显示可见早约 1 个月历史，但“入群时间”不可查询、不同租户可能不同） |
-| D1 | archive 降级 | 面板把存储后端改为 `archive`（或临时把 `feishuTools.attachmentFetch` 设为 `false`），发图片/文件 | 旧行为：图片/文件下载到话题 `attachments/`（或 `_staging/` 后迁入），纯附件消息加 `DONE` 表情、不触发模型；不挂 fetch 工具；清单不出现 | ✅ 已真机（P1 步骤 7 显式 archive）；⏳ `attachmentFetch=false` 组合待手测（自动测试覆盖） |
-| D2 | 缺原生附件库 | 在无 `ctx.attachments` 的部署（如 headless/旧宿主）启动并发附件 | 自动回退 archive 旧行为；日志一条 warn：`attachmentStore=native 但宿主未挂载 ctx.attachments…`；不崩溃 | ⏳ 待手测（自动测试覆盖） |
 | D3 | 关闭预取 | 面板关闭 `prefetchImages` 后重启/重载，新会话发图片 + 文字 | 快速出现卡片，首轮**无** ImageBlock；图片出现在清单，模型用 `feishu_attachment_fetch` 取回后回答 | ⏳ 待手测（自动测试覆盖） |
 | D4 | 关闭附件接收 | 面板关闭 `acceptAttachments` 后发纯附件 / 文件+文字 | 纯附件：无回复/无登记/无下载；文件+文字：只以文字触发，附件不保存不登记 | ⏳ 待手测（自动测试覆盖） |
 | E1 | 权限缺失·读取 | 临时移除 `im:message:readonly`（或让 `im:message.group_msg` 未审批）后发布版本，发引用消息/在群内 @ | 普通对话正常；引用/历史块静默省略；首次降级一条 warn；显式 `feishu_topic_messages` 返回可读 `PERMISSION_DENIED`；恢复权限并重发版本后恢复 | ⏳ 待手测（用户已决定跳过；自动测试覆盖 throw/resolved 两种降级） |
-| E2 | 权限缺失·下载 | 临时移除消息资源读取相关 scope，让模型 fetch 一个文件 | 工具逐资源返回可读失败（403/权限说明），回合不崩；archive 下则加 `No` 并回纯文字失败提示 | ⏳ 待手测（自动测试覆盖） |
+| E2 | 权限缺失·下载 | 临时移除消息资源读取相关 scope，让模型 fetch 一个文件 | 工具逐资源返回可读失败（403/权限说明），回合不崩 | ⏳ 待手测（自动测试覆盖） |
 | F1 | 面板配置 | 在 Web 「附件与工具」依次修改存储后端、预取开关/上限、登记 TTL/容量、两个工具开关与上限并保存，新建会话验证生效 | 面板读写与帮助文案正确；嵌套 `feishuTools.*` 只改被改子键；旧值不丢；保存后入站行为即时按新配置判定、工具挂载对新会话生效；非法值被拒 | ⏳ 待手测 + 自动测试（settings 覆盖） |
 
 **记录要求**：每个「待手测」项执行后，在 `acceptance.md` 对应 AC 下写「操作 / 实际结果 / 结论 / 环境（构建 SHA、profile、日期）」；失败的项保留原文与日志摘录，修复后复测再更新。`historyBootstrapLimit: 0`、非本 route 负向、`acceptAttachments=false` 等用户已决定跳过真机的项，标注「自动测试覆盖，用户决定跳过真机」，不要写成已验证。
@@ -359,12 +351,12 @@ DSH_HOME=$DSH_HOME pnpm dsh web        # 默认 http://127.0.0.1:3080
 | 推送代码或提交 MR 时提示“没有代码改动权限” | 发这条消息的用户没有打开「代码改动」：管理员发 `/auth set code on @用户` 或在面板用户表里打开；管理员本人始终放行 |
 | 群聊 @ 无响应 | 事件订阅是否勾选“接收群聊中 @ 机器人消息”；机器人是否在群内且未被群主禁言 |
 | 模型说看不到刚发的文件 / 文件没有自动出现 | 属 v2 设计：文件默认不加载，只在 `<feishu_context>` 清单里声明；模型需调用 `feishu_attachment_fetch`。可明确要求“用 feishu_attachment_fetch 取清单里 message_id=… 的附件”；若工具没注册，检查启动日志 `feishu_attachment_fetch 未挂载` 与宿主 `tools`/`attachments` 服务 |
-| 只发附件（不带文字）机器人毫无反应 | native 后端下的**预期行为**：纯附件消息静默，不回复、不建会话、不下载；随后引用这条附件消息发文字提问，附件即列入清单；不引用时模型看不到它。若引用后仍没有，检查消息读取权限（群聊需 `im:message.group_msg`）。archive 后端下会看到 `DONE` 表情且附件落到话题目录 |
-| 模型没有调用 feishu_attachment_fetch | 检查 `<feishu_context>` 清单是否出现在 prompt（有未加载附件时才有）；确认工具开关 `feishuTools.attachmentFetch` 与 native 后端；必要时在消息里点明“用附件工具取一下”。漏调风险由清单措辞 / 工具描述 / guidance 收敛，没有预下载兜底（决定 D4） |
+| 只发附件（不带文字）机器人毫无反应 | native 后端下的**预期行为**：纯附件消息静默，不回复、不建会话、不下载；随后引用这条附件消息发文字提问，附件即列入清单；不引用时模型看不到它。若引用后仍没有，检查消息读取权限（群聊需 `im:message.group_msg`） |
+| 模型没有调用 feishu_attachment_fetch | 检查 `<feishu_context>` 清单是否出现在 prompt（有未加载附件时才有）；确认 `acceptAttachments` 已打开（它同时决定是否挂载该工具）；必要时在消息里点明“用附件工具取一下”。漏调风险由清单措辞 / 工具描述 / guidance 收敛，没有预下载兜底（决定 D4） |
 | 引用或话题历史内容缺失 | 缺消息读取 scope（`im:message:readonly` / 敏感的 `im:message.group_msg`）：引用/历史块静默省略、普通对话不受影响；启动后首次降级有一条 warn，之后 debug 级。按 §1 申请权限并重新发布版本；显式调用 `feishu_topic_messages` 会返回可读 `PERMISSION_DENIED` |
 | `feishu_attachment_fetch` 超时 / 报字节超限 | 大文件受 `feishuTools.attachmentFetchTimeoutMs`（默认 120 s）与 `attachmentFetchMaxBytes`（默认 100 MiB）限制：可调大上限/超时，或用 `file_key` 分批取；资源过期/被撤回时逐资源返回可读失败，可直接重试或让用户重发 |
-| 升级到 v2 后在旧话题里“找不到以前的附件” | 旧 archive 部署的附件仍在旧话题 `attachments/`，但新会话不再枚举该目录；Session 历史里的只读路径仍可读。需要长期保留请勿手动删除该话题目录，或从历史消息重新发送/引用 |
-| 话题目录里出现 `attachments/` | 当前生效的是 archive 后端：检查 `attachmentStore`（是否显式设为 `archive`）、宿主是否挂载 `ctx.attachments`、`feishuTools.attachmentFetch` 是否为 `false`。native 后端不会写话题 `attachments/` |
+| 升级后在旧话题里“找不到以前的附件” | 旧版本下载的附件仍在旧话题 `attachments/`，但新会话不再枚举该目录；Session 历史里的只读路径仍可读。需要长期保留请勿手动删除该话题目录，或从历史消息重新发送/引用 |
+| 话题目录里出现 `attachments/` | 这是旧版本 archive 后端留下的目录，当前版本不再写入，可手动删除 |
 | 有 Typing 但无卡片 | 权限 `im:message` / `im:message:update`；卡片 2.0 需要较新的飞书客户端（升级客户端后重试） |
 | 卡片正文只到某长度 | 旧版行为；新版单卡目标 28 KB（`CARD_TARGET_BYTES`，飞书上限 30 KB 留 2 KB 冗余），超长正文自动分段为多张续卡（「📄 回复分段 n」，每卡 ≤ 5 个表格，断点避开代码围栏与表格），续卡无面板/页脚、可用满 28 KB，全文保留；推理面板独立 5 KB 上限，超出的推理只保留开头并追加「已截断」提示 |
 | 报错 230099 / `ErrCode: 11310 card table number over limit` | 飞书单卡表格数量超限（真机验证上限 5 个）；新版已按“每卡最多 5 个表格”自动切分，不再触发；历史版本请重装插件并重启 dsh |

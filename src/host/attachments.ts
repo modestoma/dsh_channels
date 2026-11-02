@@ -1,16 +1,16 @@
 /**
  * Host bridge, attachment surface: the minimal `ctx.attachments` face this
- * plugin consumes (durable image/file storage) plus the content-block and
- * prompt-part shapes it produces.
+ * plugin consumes (durable image/file storage) plus the content blocks it
+ * produces.
  *
  * Everything here is declared locally and structurally. The DSH attachment
  * packages are never imported at runtime and are not runtime dependencies of
  * this plugin, so these types mirror their published shapes by convention:
- * only the members this plugin actually reads or calls are modeled, and every
- * service lookup tolerates a deployment without the service. The exact
- * upstream package (`@deepseek-ai/dsh-attachment`, DSH 0.2.1-rc.2) has more
- * operations (batches, request projection, encoded uploads); add them here
- * only when a task needs them.
+ * only the members this plugin actually reads or calls are modeled. The
+ * service itself is a required plugin dependency (`inject` in `src/index.ts`).
+ * The exact upstream package (`@deepseek-ai/dsh-attachment`, DSH 0.2.1-rc.2)
+ * has more operations (batches, prompt admission, request projection, encoded
+ * uploads); add them here only when a task needs them.
  *
  * @module dsh-channels/host/attachments
  */
@@ -92,35 +92,6 @@ export interface SaveFileStreamAttachment {
   name?: string
 }
 
-/** One text/image part of host prompt content whose images still need admission. */
-export type PromptContentPart = {
-  readonly type: 'text'
-  readonly text: string
-} | {
-  readonly type: 'image'
-  readonly mediaType: ImageMediaType
-  readonly data: string
-  readonly name?: string
-}
-
-/** Host prompt content whose file receipts are resolved and whose image bytes await admission. */
-export type AttachmentAdmissionPart = PromptContentPart | {
-  readonly type: 'file'
-  readonly attachment: FileAttachmentRef
-}
-
-/** Host-admitted prompt content with every attachment represented by its durable reference. */
-export type AdmittedPromptContentPart = {
-  readonly type: 'text'
-  readonly text: string
-} | {
-  readonly type: 'image'
-  readonly attachment: ImageAttachmentRef
-} | {
-  readonly type: 'file'
-  readonly attachment: FileAttachmentRef
-}
-
 // ---- Content blocks -----------------------------------------------------
 
 /**
@@ -176,10 +147,10 @@ export type AttachmentErrorCode =
 // ---- Service surface ----------------------------------------------------
 
 /**
- * The narrow `ctx.attachments` service face. Every method mirrors the
- * upstream contract; callers must go through a module that tolerates absence
- * (for example `src/feishu/native-attachments.ts`) rather than branching on
- * this type themselves, so the degradation path exists in exactly one place.
+ * The narrow `ctx.attachments` service face (a required plugin dependency).
+ * Every method mirrors the upstream contract; callers go through
+ * `src/feishu/native-attachments.ts`, which turns thrown failures into
+ * structured values.
  */
 export interface AttachmentStore {
   /** Deployment-resolved image policy; absent on minimal embedding hosts. */
@@ -203,8 +174,6 @@ export interface AttachmentStore {
    * @throws an attachment error when the durable reference is invalid.
    */
   imageHostPath(ref: ImageAttachmentRef): string | undefined
-  /** Replace every uploaded image in one host prompt with its durable reference. */
-  admitPromptContent(content: readonly AttachmentAdmissionPart[]): Promise<AdmittedPromptContentPart[]>
   /** Optional host-provided classifier for attachment failures (cross-install safe). */
   isAttachmentError?(error: unknown): boolean
 }

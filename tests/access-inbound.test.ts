@@ -5,14 +5,11 @@
  * gate, persistence across restarts, and the legacy `open` behavior.
  */
 
-import { existsSync } from 'node:fs'
-import path from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import type { FeishuConfig } from '../src/config.ts'
 import type { ChannelFactory, NormalizedMessage } from '../src/feishu-channel.ts'
 import type { RouteRecord } from '../src/domain.ts'
 import type { Agent } from '../src/dsh-types.ts'
-import { ATTACHMENTS_DIR } from '../src/feishu/inbound-attachments.ts'
 import { TestFeishuService as FeishuService } from './helpers.ts'
 import { adminRecord, makeAccessConfig } from './access-fixtures.ts'
 import { makeChannel, makeHostContext, makeMessage, makeTempBaseDir } from './helpers.ts'
@@ -613,7 +610,7 @@ describe('guarded 模式：话题所有权', () => {
     expect(h.ctxState.agents.created).toHaveLength(1)
     await waitUntil(() => expect(followupsOf(h, 0)).toBe(1))
     expect(h.ctxState.workspaces.workspaces.size).toBe(1)
-    expect(existsSync(path.join(aliceRoute.workspacePath, ATTACHMENTS_DIR))).toBe(false)
+    expect(h.channel.downloadResource).not.toHaveBeenCalled()
     await h.service.shutdown()
   })
 
