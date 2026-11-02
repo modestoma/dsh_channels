@@ -430,7 +430,7 @@ FEISHU_APP_SECRET: xxxxxxxx
 DSH 的沙箱只限制写，读不受限：不加处理时，飞书用户的会话可以读到 DSH 的凭据、其他人的会话日志和其他用户的工作区。插件分两层收紧：
 
 - **文件工具读围栏**（插件内，默认开启）：飞书会话及其子代理调用 `readFence.tools` 里的工具时，路径参数（解析符号链接之后）必须落在本路由的工作区、话题目录或 `readFence.readableRoots` 里，否则在 `tools/pre-execute` 直接拒绝并告诉模型原因。相对路径按会话的实际工作目录解析，`~` 按 Host 用户的主目录解析；glob 的 `pattern` 按第一个通配段之前的目录判断，含 `..` 段的一律拒绝。PTC 里的子调用同样经过这道检查。非飞书会话不受影响。管理员的会话同样受围栏限制；需要读工作区以外的文件时在 Web 里操作，或把目录加进 `readableRoots`。
-- **进程读隔离**（部署配置，强烈建议）：bash、终端、PTC 这类工具启动子进程，读围栏管不到。插件附带一个沙箱 runner 包装 `lib/confine.js`，配到 DSH `@deepseek-ai/dsh-sandbox-local` 的 `runnerCommand` 后，所有受沙箱约束的命令（所有会话，不只飞书）都经过它：在 DSH 的 bwrap 配置上叠加 `--tmpfs` 遮住 `--hide` 目录；命令的工作区位于某个 `--fence` 目录里时遮住整个 `--fence` 目录，只把自己的工作区重新挂回来；再只读挂回 `--expose` 目录；并在启动前删掉匹配的环境变量。DSH 的 bwrap 配置自带独立 PID 命名空间和新的 `/proc`，命令看不到 Host 进程的环境变量。只支持 Linux + bwrap。
+- **进程读隔离**（部署配置，强烈建议）：bash、终端、PTC 这类工具启动子进程，读围栏管不到。插件附带一个沙箱 runner 包装 `lib/confine.js`，配到 DSH `@deepseek-ai/dsh-sandbox-local` 的 `runnerCommand` 后，所有受沙箱约束的命令（所有会话，不只飞书）都经过它：在 DSH 的 bwrap 配置上叠加 `--tmpfs` 遮住 `--hide` 目录；命令的可写根或工作目录位于某个 `--fence` 目录里时遮住整个 `--fence` 目录，只把 DSH 授予这次调用的可写根重新挂回来（工作目录可以被会话移到任何地方，不作为授权依据：工作目录被遮住又不在可写根内的命令直接拒绝，只读模式下在隔离目录内运行命令也会被拒绝）；再只读挂回 `--expose` 目录；并在启动前删掉匹配的环境变量。DSH 的 bwrap 配置自带独立 PID 命名空间和新的 `/proc`，命令看不到 Host 进程的环境变量。只支持 Linux + bwrap。
 
 ```yaml
 # DSH profile 的 cordis.yml（示例路径按实际部署修改）

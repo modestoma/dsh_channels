@@ -15,6 +15,9 @@
  *   same way.
  * - A glob `pattern` is checked by its leading directories up to the first
  *   wildcard segment; a pattern with a `..` segment is denied.
+ * - An omitted path argument is checked as the effective working directory,
+ *   which tools search by default and a Session can move outside its
+ *   workspace.
  * - The check runs in `tools/pre-execute`, so it holds for PTC sub-dispatches
  *   too. It does not cover tools that spawn processes (shell, terminal, code
  *   execution): their reads are confined by the sandbox runner.
@@ -66,9 +69,14 @@ export class ReadFence {
     const args = isRecord(exec.arguments) ? exec.arguments : {}
     const base = this.deps.workingDirectory(agent.session) ?? agent.session.header.cwd ?? route.workspacePath
     const allowed = await Promise.all(allowedRootsOf(route, fence.readableRoots).map(resolveReal))
+    const resolvedBase = await resolveReal(path.resolve(expandHome(base)))
     for (const name of argumentNames) {
       const value = args[name]
-      if (typeof value !== 'string' || value === '') continue
+      if (typeof value !== 'string' || value === '') {
+        // An omitted path argument defaults to the effective working directory, which a Session can move.
+        if (!allowed.some(rootPath => isInside(resolvedBase, rootPath))) return deny(exec.name, base, route)
+        continue
+      }
       const target = name === 'pattern' ? globBase(value, typeof args.path === 'string' && args.path !== '' ? args.path : base) : value
       if (target === undefined) return deny(exec.name, value, route)
       const resolved = await resolveReal(path.resolve(base, expandHome(target)))

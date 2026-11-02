@@ -96,6 +96,16 @@ describe('ReadFence', () => {
     expect(await fence.decide(call('grep', { pattern: 'token' }))).toBeUndefined()
   })
 
+  it('checks an omitted path argument as the effective working directory', async () => {
+    const { fence, cwd, alice, secret } = setup()
+    cwd.set('s_alice', path.join(alice, 'sub'))
+    expect(await fence.decide(call('grep', { pattern: 'token' }))).toBeUndefined()
+    cwd.set('s_alice', secret)
+    expect(await fence.decide(call('grep', { pattern: 'token' }))).toMatchObject(denied)
+    expect(await fence.decide(call('glob', { pattern: '*' }))).toMatchObject(denied)
+    expect(await fence.decide(call('grep', { pattern: 'token', path: alice }))).toBeUndefined()
+  })
+
   it('fences subagents of a routed Session, including nested ones, and ignores Sessions it does not route', async () => {
     const { fence, bob } = setup()
     const outside = { file_path: path.join(bob, 'notes.md') }

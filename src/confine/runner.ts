@@ -8,14 +8,20 @@
  * mount and before the writable binds:
  *
  * 1. `--tmpfs` over each `--hide` directory (credentials, Session logs, keys);
- * 2. `--tmpfs` over each `--fence` directory that contains the call's
- *    workspace (a writable root, or the working directory in read-only mode),
- *    so one Feishu user's command cannot list or read another user's
- *    workspace under the channel's base directory;
- * 3. a read-only bind of each workspace candidate a hide or fence covered, so
- *    the call still sees its own workspace (the profile's later writable bind
+ * 2. `--tmpfs` over each `--fence` directory that contains a writable root
+ *    or the working directory of the call, so one Feishu user's command
+ *    cannot list or read another user's workspace under the channel's base
+ *    directory;
+ * 3. a read-only bind of each writable root a hide or fence covered, so the
+ *    call still sees its own workspace (the profile's later writable bind
  *    makes it writable again);
  * 4. a read-only bind of each `--expose` directory (shared skills).
+ *
+ * Only the profile's writable roots are restored: they are the workspace DSH
+ * authorized for the call. The working directory is not an authorization (a
+ * Session can move it anywhere), so a call whose working directory a hide or
+ * fence covers outside every writable root is refused, which also refuses
+ * read-only calls inside a fenced or hidden directory.
  *
  * Environment variables named by `--unset-env` or matching
  * `--unset-env-matching` are removed before bwrap starts.
@@ -111,15 +117,16 @@ export interface ConfineHost {
  * @param invocation - the parsed wrapper invocation.
  * @param host - filesystem facts of this call.
  * @returns bwrap's arguments, ending with `--` and the command.
- * @throws ConfineUsageError when the profile does not start with DSH's read-only root mount.
+ * @throws ConfineUsageError when the profile does not start with DSH's read-only
+ *   root mount, or the working directory is covered outside every writable root.
  */
 export function bwrapArgsOf(invocation: ConfineInvocation, host: ConfineHost): string[] {
   const { options, profile, command } = invocation
   if (profile[0] !== '--ro-bind' || profile[1] !== '/' || profile[2] !== '/') {
     throw new ConfineUsageError('the sandbox profile must start with --ro-bind / / (DSH sandbox-local bwrap profile)')
   }
-  const writable = writableRootsOf(profile)
-  const candidates = unique([...writable, host.cwd])
+  const writable = unique(writableRootsOf(profile))
+  const triggers = [...writable, host.cwd]
   const masked: string[] = []
   for (const dir of options.hide) {
     const real = host.realDir(dir)
@@ -127,11 +134,14 @@ export function bwrapArgsOf(invocation: ConfineInvocation, host: ConfineHost): s
   }
   for (const dir of options.fence) {
     const real = host.realDir(dir)
-    if (real !== undefined && candidates.some(candidate => isInside(candidate, real))) masked.push(real)
+    if (real !== undefined && triggers.some(trigger => isInside(trigger, real))) masked.push(real)
+  }
+  if (masked.some(dir => isInside(host.cwd, dir)) && !writable.some(root => isInside(host.cwd, root))) {
+    throw new ConfineUsageError(`working directory ${host.cwd} is hidden by the confinement and is not inside a writable root of this call`)
   }
   const inserted = unique(masked).flatMap(dir => ['--tmpfs', dir])
-  for (const candidate of candidates) {
-    if (masked.some(dir => isInside(candidate, dir))) inserted.push('--ro-bind', candidate, candidate)
+  for (const root of writable) {
+    if (masked.some(dir => isInside(root, dir))) inserted.push('--ro-bind', root, root)
   }
   for (const dir of options.expose) {
     const real = host.realDir(dir)

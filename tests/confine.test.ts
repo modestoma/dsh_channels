@@ -26,19 +26,26 @@ describe('confine runner', () => {
     expect(args).toEqual([
       '--ro-bind', '/', '/',
       '--tmpfs', '/srv/dsh', '--tmpfs', '/home/ops/.ssh', '--tmpfs', '/srv/feishu',
-      '--ro-bind', ws, ws, '--ro-bind', `${ws}/topics/t1`, `${ws}/topics/t1`,
+      '--ro-bind', ws, ws,
       '--ro-bind', '/srv/dsh/skills', '/srv/dsh/skills',
       ...ROOT.slice(3), ...WRITE(ws),
       '--', 'sh', '-c', 'ls',
     ])
   })
 
-  it('leaves a fence alone when the call works outside it, and fences by working directory in read-only mode', () => {
+  it('leaves a fence alone when the call works outside it', () => {
     expect(argsOf(['--fence', '/srv/feishu'], [...ROOT, ...WRITE('/home/ops/project')], '/home/ops/project'))
       .toEqual([...ROOT, ...WRITE('/home/ops/project'), '--', 'sh', '-c', 'ls'])
-    const cwd = '/srv/feishu/groups/oc_1/u_bob'
-    expect(argsOf(['--fence', '/srv/feishu'], ROOT, cwd))
-      .toEqual(['--ro-bind', '/', '/', '--tmpfs', '/srv/feishu', '--ro-bind', cwd, cwd, ...ROOT.slice(3), '--', 'sh', '-c', 'ls'])
+  })
+
+  it('never restores a working directory: one covered outside every writable root is refused', () => {
+    const ws = '/srv/feishu/p2p/u_alice'
+    expect(() => argsOf(['--fence', '/srv/feishu'], [...ROOT, ...WRITE(ws)], '/srv/feishu'))
+      .toThrow('working directory /srv/feishu is hidden')
+    expect(() => argsOf(['--hide', '/srv/dsh', '--fence', '/srv/feishu'], [...ROOT, ...WRITE(ws)], '/srv/dsh'))
+      .toThrow(ConfineUsageError)
+    expect(() => argsOf(['--fence', '/srv/feishu'], ROOT, '/srv/feishu/groups/oc_1/u_bob'))
+      .toThrow('working directory /srv/feishu/groups/oc_1/u_bob is hidden')
   })
 
   it('re-exposes a workspace that lies inside a hidden directory', () => {
