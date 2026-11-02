@@ -59,6 +59,7 @@ function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
     // Tests exercise routing/hitl behavior; access control has its own tests.
     accessMode: 'open',
     codeWriteTools: [],
+    readFence: { enabled: true, readableRoots: [], tools: { read: ['file_path'] } },
     authRequestTtlDays: 7,
     // Onboarding is opt-in per test: it adds a card that would shift send counts.
     welcomeOnboarding: false,
@@ -3777,7 +3778,7 @@ describe('/permissions and /status extras', () => {
     await h.service.shutdown()
   })
 
-  it('switches the permission preset when the deployment opts in', async () => {
+  it('switches the permission preset when the deployment opts in, for administrators only', async () => {
     const h = await setup({ allowPermissionSwitch: true })
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_perm_on', senderId: 'u_owner', content: '开始',
@@ -3787,11 +3788,35 @@ describe('/permissions and /status extras', () => {
 
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_perm_on', senderId: 'u_owner', threadId: 'omt_1',
-      mentionedBot: false, messageId: 'om_perm_switch', content: '/permissions read-only',
+      mentionedBot: false, messageId: 'om_perm_refused', content: '/permissions danger',
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
+    expect(JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)).toContain('只有管理员可以在飞书里切换权限预设')
+    expect(h.ctxState.permissions.set).not.toHaveBeenCalled()
+
+    await makeAdmin(h, 'u_owner')
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_perm_on', senderId: 'u_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_perm_switch', content: '/permissions read-only',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(3))
     expect(h.ctxState.permissions.set).toHaveBeenCalledWith(agent.session, 'read-only')
     expect(JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)).toContain('权限预设已切换')
+    await h.service.shutdown()
+  })
+
+  it('fences file reads of a Feishu Session to its workspace before other pre-execute listeners run', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({ chatType: 'group', chatId: 'oc_fence', senderId: 'u_owner', content: '开始' }))
+    await waitForEstablishedSession(h)
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    const route = h.ctxState.domain.raw.table('routes').get('omt_1') as RouteRecord
+    const listener = h.ctxState.preExecuteListeners.at(-1)!
+    const next = vi.fn(async () => ({ kind: 'allow' as const }))
+    expect(await listener({ name: 'read', arguments: { file_path: path.join(route.workspacePath, 'a.md') }, agent }, next)).toEqual({ kind: 'allow' })
+    expect(await listener({ name: 'read', arguments: { file_path: path.join(h.config.baseDir, 'other', 'b.md') }, agent }, next))
+      .toMatchObject({ kind: 'deny', reason: expect.stringContaining('飞书会话只能读取自己的工作区') })
+    expect(next).toHaveBeenCalledTimes(1)
     await h.service.shutdown()
   })
 
@@ -3972,6 +3997,16 @@ describe('command picker cards', () => {
     await h.onMessage(makeMessage({ chatType: 'group', chatId: 'oc_pick_perm', senderId: 'u_owner', content: '开始' }))
     await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
+    // A non-administrator sees the current preset without buttons.
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_pick_perm', senderId: 'u_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_view_perm', content: '/permissions',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
+    expect(buttonValues(lastCard(h))).toHaveLength(0)
+    expect(JSON.stringify(lastCard(h))).toContain('只有管理员可以在飞书里切换权限预设')
+    h.channel.sent.pop()
+    await makeAdmin(h, 'u_owner')
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_pick_perm', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_pick_perm', content: '/permissions',

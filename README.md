@@ -34,7 +34,7 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 - `/compact`：调用 Harness 原生命令压缩当前 Session 上下文
 - `/renew`：在当前话题创建并绑定新 Session
 - `/stop`：中断当前正在运行的回合（不冷恢复 Session；排队中的后续消息保留并接着运行；没有运行中的回合时明确提示）。流式卡片上的「⏹ 停止」按钮效果相同
-- `/permissions`：查看当前 Session 的权限预设（沙箱 + 审批策略）与可选清单；仅在 `allowPermissionSwitch: true` 时支持 `/permissions <name>` 切换，此时回复卡附预设按钮
+- `/permissions`：查看当前 Session 的权限预设（沙箱 + 审批策略）与可选清单；仅在 `allowPermissionSwitch: true` 时支持 `/permissions <name>` 切换，且只有管理员能切换（预设可以放宽沙箱、关掉审批），此时管理员的回复卡附预设按钮
 - `/auth`：**仅管理员**。`/auth status` 查看准入状态和各开关人数；`/auth add @用户` 把人加入用户表并打开对话准入（已在表里的人只重新打开对话准入，其他开关不变）；`/auth remove @用户` 移出用户表；`/auth set <chat|wiki-read|wiki-write|code> <on|off> @用户` 打开或关闭某个开关（人必须已在表里）；`/auth list` 列出用户表与待处理申请。都可以直接写 `user_id` 代替 @，@ 时自动取被 @ 成员的 user_id、忽略对机器人的 @；外部用户没有 user_id，无法授权
 - `/history`：显示当前话题的 Session 历史（含 `ctx.sessionQuery` 折叠出的会话标题与 live 标记）
 - `/export`：导出当前 Session 的逻辑日志
@@ -331,7 +331,17 @@ npm 发行包已包含构建产物：Host 入口是 `lib/index.js`（profile 直
       heartbeatMs: 60000                # 多久记录一次「最后在线时间」，崩溃重启时从这里往回读
       maxMessages: 200                  # 每次补偿最多读多少条
     slashCommandPanel: false            # 连接时把命令同步到飞书原生 / 面板（需 app_slash_command 读写权限；改后需重连）
-    allowPermissionSwitch: false        # 是否允许 /permissions <name> 从飞书侧切换权限预设（安全敏感）
+    allowPermissionSwitch: false        # 是否允许管理员用 /permissions <name> 从飞书侧切换权限预设（安全敏感；非管理员只能查看）
+    readFence:                          # 文件工具读围栏（见「工作区与会话隔离 → 读权限与执行隔离」）
+      enabled: true
+      readableRoots: []                 # 所有飞书会话都能读的共享目录（绝对路径，例如共享 SKILL 目录）
+      tools:                            # 工具名 → 路径参数名（默认如下）
+        read: [file_path]
+        read_image: [file_path]
+        grep: [path]
+        glob: [path, pattern]
+        str_replace_editor: [path]
+        lsp: [file_path]
     accessMode: 'guarded'               # 准入模式：guarded（默认，仅管理员 + 用户表里对话准入打开的人）| open（任何人可对话，不安全；知识库与代码改动开关仍生效）
     codeWriteTools:                     # 需要「代码改动」开关的工具名（默认如下；飞书会话之外的调用不受影响）
       - repo_workspace_push
@@ -415,6 +425,42 @@ FEISHU_APP_SECRET: xxxxxxxx
 - 旧版本「一个话题一个工作区」（`<baseDir>/topics/...`）不会自动迁移：旧话题继续用原目录；旧版「用户 × 聊天」共享工作区正好作为新的用户工作区复用。
 - 设计取舍与约束详见 [docs/workspace-isolation-design.md](docs/workspace-isolation-design.md)。
 
+### 读权限与执行隔离
+
+DSH 的沙箱只限制写，读不受限：不加处理时，飞书用户的会话可以读到 DSH 的凭据、其他人的会话日志和其他用户的工作区。插件分两层收紧：
+
+- **文件工具读围栏**（插件内，默认开启）：飞书会话及其子代理调用 `readFence.tools` 里的工具时，路径参数（解析符号链接之后）必须落在本路由的工作区、话题目录或 `readFence.readableRoots` 里，否则在 `tools/pre-execute` 直接拒绝并告诉模型原因。相对路径按会话的实际工作目录解析，`~` 按 Host 用户的主目录解析；glob 的 `pattern` 按第一个通配段之前的目录判断，含 `..` 段的一律拒绝。PTC 里的子调用同样经过这道检查。非飞书会话不受影响。管理员的会话同样受围栏限制；需要读工作区以外的文件时在 Web 里操作，或把目录加进 `readableRoots`。
+- **进程读隔离**（部署配置，强烈建议）：bash、终端、PTC 这类工具启动子进程，读围栏管不到。插件附带一个沙箱 runner 包装 `lib/confine.js`，配到 DSH `@deepseek-ai/dsh-sandbox-local` 的 `runnerCommand` 后，所有受沙箱约束的命令（所有会话，不只飞书）都经过它：在 DSH 的 bwrap 配置上叠加 `--tmpfs` 遮住 `--hide` 目录；命令的工作区位于某个 `--fence` 目录里时遮住整个 `--fence` 目录，只把自己的工作区重新挂回来；再只读挂回 `--expose` 目录；并在启动前删掉匹配的环境变量。DSH 的 bwrap 配置自带独立 PID 命名空间和新的 `/proc`，命令看不到 Host 进程的环境变量。只支持 Linux + bwrap。
+
+```yaml
+# DSH profile 的 cordis.yml（示例路径按实际部署修改）
+- name: '@deepseek-ai/dsh-sandbox-local'
+  config:
+    runnerCommand:
+      - node
+      - /root/.dsh/profiles/web/node_modules/@modesto_ma/dsh-channels/lib/confine.js
+      - --hide
+      - /root/.dsh                      # DSH 凭据、会话日志、插件存储
+      - --hide
+      - /root/.ssh
+      - --fence
+      - /data/feishu                    # 本插件的 baseDir：飞书用户之间互相看不到工作区
+      - --expose
+      - /data/shared-skills             # 共享 SKILL 目录（如果在被遮住的目录里）
+      - --unset-env-matching
+      - '(_KEY|_TOKEN|_SECRET|PASSWORD)$'
+      - --bwrap                         # 必须是最后一个；DSH 在后面追加 bwrap 配置和命令
+    runnerFailureSignatures:
+      - 'dsh-channels-confine:'
+      - 'bwrap:'
+```
+
+- `--hide` / `--fence` / `--expose` 必须是绝对路径，可重复；每次调用时检查目录是否存在，不存在的跳过。`--unset-env NAME` 删掉指定变量，`--bwrap-path` 指定 bwrap 位置（默认从 PATH 找）。参数写错时包装直接失败，DSH 报告沙箱 runner 失败，不会不加隔离地运行命令。
+- 只读模式（`read-only`）下 DSH 不挂可写目录，包装按命令的工作目录判断它属于哪个工作区，只挂回这个目录。
+- 被遮住的目录里如果有命令运行需要的东西（例如 `node_modules`、工具链），用 `--expose` 挂回来；改完配置后在飞书里让机器人执行 `ls /root/.dsh` 和 `ls <baseDir>/p2p` 检查效果。
+- `runnerCommand` 会跳过 DSH 对 bwrap 的自动探测，按 DSH 的说明这是运维方的保证：包装本身由 Node 启动，启动过程不在沙箱里。
+- `danger-full-access` 模式的命令完全不经过沙箱和这个包装，因此单次提升只有管理员能批准（见「行为与降级 → HITL 审批」），`/permissions` 也只有管理员能切换；`@deepseek-ai/dsh-sandbox-policy` 的部署默认 `mode` 也不能设为 `danger-full-access`，否则以上隔离都不生效。
+
 ## 群话题服务（feishuTopics）
 
 插件向其他 DSH 插件提供 Cordis 服务 `feishuTopics`：调用方给出目标群、发起人、根卡片内容、工作区和 prompt，插件在群里发一张根卡片，在卡片下开话题，把 prompt 原样交给一个新 Session（prompt 开头的斜杠命令由 DSH 展开成对应 skill），过程在话题内流式输出，和用户自己发起的会话一样。首轮结束后根卡片的状态标签随之更新。群里通过准入的成员都可以在该话题内追问。
@@ -478,7 +524,7 @@ const result = await topics?.launch({
 - **消息去重（WS 重投幂等）**：飞书长连接重连会重投未 ack 的事件；每条消息在任何副作用之前先落一条 `processed` 记录（键 = message id，飞书全局唯一），重投消息被直接丢弃——同进程靠内存守卫、跨重启靠持久化记录，每条消息至多处理一次。记录保留 24 小时后由 GC 清扫。
 - **路由表 GC 与过期话题拒绝**：超过 `routeTtlMs`（默认 30 天）无活动的真实话题路由会先写入最小持久化墓碑，再删除活动路由；此后该话题中的普通消息和 Session 命令会收到「话题已过期」提示，插件不会恢复旧 Session，也不会在可见历史仍属于旧 Session 的话题里新建 Session（`/help`、`/userid`、`/groupid`、`/health` 仍可用）。墓碑跨重启保留，仅含 thread/chat/owner/工作区路径/会话目录/最后活动时间；旧 DSH Session、日志与话题目录都不删除。降级的 chat-scoped 路由没有独立话题边界，仍直接清理。陈年 in-flight 快照同时在启动时及每 6 小时清扫。`routeTtlMs: 0` 关闭后续路由过期处理，已产生的墓碑仍保持拒绝语义。
 - **准入与授权**：`accessMode: 'guarded'`（默认）下，入站先过频道准入：**用户表里打开「管理员」的人**私聊/任意群聊都可直接开会话；**其他人**必须在用户表里且对话准入打开，私聊和群聊同一规则（`/auth` 仍仅管理员）。未通过的消息不建 Session、不建话题目录、不落附件、不调模型；私聊回固定文案（`/userid` 例外），群里静默，被 @ 时每位管理员都收到用户授权申请卡（任一管理员处理后，其他管理员的卡片同步更新）（含昵称/user_id/所在群，同一人有未处理申请时不重复发）。机器人被拉进任意群时（订阅 `im.chat.member.bot.added_v1`），邀请人没有对话权限则管理员收到用户授权申请卡（标注“把我拉进了群”），否则只收到群信息卡（群名/`chat_id`/成员数/邀请人）。用户表持久化在 `channels_routes_v2` 域的 `access_users` 表（每条记录带 `admin` 和四个开关），申请在 `access_requests` 表，撤销与开关切换立即生效。用户表里没有管理员时 `guarded` 拒绝所有对话（fail closed）。普通用户的增删和开关切换可走 `/auth` 命令、授权卡、面板三种入口；管理员只能在面板设置。
-- **HITL 审批**：插件以 `prepend: true` 注册为宿主 `approval/request` 瀑布的应答者——本频道路由的 session 的审批请求**优先于** Web 网关的通用应答（其面板对飞书用户不可见），非本频道的请求原样 `next()` 交给其他应答者。审批卡是**独立消息**（锚定到该 session 最新流式卡、同话题），绝不嵌入流式卡（其全量替换 patch 会冲掉按钮）。宿主请求不带工具参数，插件在 `session/event` 中按会话记录**当前回合**的 `tool/call`（回合结束即清空，不回读历史），按 `callId` 取出命令显示在卡上（超过 600 字截断并注明）。决策仅在会话发起人操作时生效：允许 → `allowed-once`；本话题不再询问 → `allowed-once`，并在内存里记下「工具名 + 提权目标」，该 session 之后的同类请求直接 `allowed-once`、不再发卡，同 session 里其他被覆盖的待审批卡一并允许（`/renew` 换 session 或重启后失效，提升到 `danger-full-access` 时按钮标红）；拒绝 → `rejected`；文字回复中「允许 / 同意 / 好 / y」等、「拒绝 / 不行 / n」等、「全部允许」等关键词作用于该 session 最新一张待审批卡，其他文字把该 session 所有待审批卡按 `rejected` 结算后照常作为下一条消息交给 Agent；超时 → `rejected`（fail-closed，卡面显示「已超时」）、请求被撤回（abort）→ `cancelled`、卡片发送失败 → `unavailable`（fail-closed）；每次决策后卡片更新为终态（注明按钮 / 文字回复 / 不再询问 / 被新消息取代）并移除按钮。审批记录（`approval/asked`/`decided`）由宿主会话日志负责，插件不做持久化——重启后遗留问题随 turn 消亡，与 Web 网关一致。需要飞书应用订阅 **card.action.trigger** 回调（见「飞书侧准备」）；启动日志 `HITL 审批应答已就绪` 表示生效，`主机未挂载 approval 服务` 表示该部署未启用 HITL。
+- **HITL 审批**：插件以 `prepend: true` 注册为宿主 `approval/request` 瀑布的应答者——本频道路由的 session 的审批请求**优先于** Web 网关的通用应答（其面板对飞书用户不可见），非本频道的请求原样 `next()` 交给其他应答者。审批卡是**独立消息**（锚定到该 session 最新流式卡、同话题），绝不嵌入流式卡（其全量替换 patch 会冲掉按钮）。宿主请求不带工具参数，插件在 `session/event` 中按会话记录**当前回合**的 `tool/call`（回合结束即清空，不回读历史），按 `callId` 取出命令显示在卡上（超过 600 字截断并注明）。决策仅在会话发起人操作时生效；请求提升到 `danger-full-access` 的卡只有**管理员**能允许（按钮或文字回复，管理员不是发起人也可以点），发起人只能拒绝，非管理员点「允许」不生效并在卡上提示一次。允许 → `allowed-once`；本话题不再询问 → `allowed-once`，并在内存里记下「工具名 + 提权目标」，该 session 之后的同类请求直接 `allowed-once`、不再发卡，同 session 里其他被覆盖的待审批卡一并允许（`/renew` 换 session 或重启后失效，提升到 `danger-full-access` 时按钮标红）；拒绝 → `rejected`；文字回复中「允许 / 同意 / 好 / y」等、「拒绝 / 不行 / n」等、「全部允许」等关键词作用于该 session 最新一张待审批卡，其他文字把该 session 所有待审批卡按 `rejected` 结算后照常作为下一条消息交给 Agent；超时 → `rejected`（fail-closed，卡面显示「已超时」）、请求被撤回（abort）→ `cancelled`、卡片发送失败 → `unavailable`（fail-closed）；每次决策后卡片更新为终态（注明按钮 / 文字回复 / 不再询问 / 被新消息取代）并移除按钮。审批记录（`approval/asked`/`decided`）由宿主会话日志负责，插件不做持久化——重启后遗留问题随 turn 消亡，与 Web 网关一致。需要飞书应用订阅 **card.action.trigger** 回调（见「飞书侧准备」）；启动日志 `HITL 审批应答已就绪` 表示生效，`主机未挂载 approval 服务` 表示该部署未启用 HITL。
 - **终态与表情**：成功轮的状态行变为「✅ 已完成」，并把 `Typing` 换成 `DONE`；`turn/end.kind = error` 时状态行为「❌ 失败」，错误只在正文出现一次（`❌ **本轮运行失败**` + 结构化错误消息与错误码），并把 `Typing` 换成 `No`。模型/推理强度/本轮缓存样本不会继承上一轮。
 - **限频**：卡片更新单条消息 5 QPS、应用级 1000 次/分钟；500ms（2 QPS）默认安全，`refreshMs` 下限 200ms；活动状态行的保活心跳默认 5s（`statusRefreshMs` 下限 1s），远低于限频。
 - **卡片体积**：预算常量收敛为三个——`CARD_TARGET_BYTES`（28 KB，分段目标）、`CARD_MAX_BYTES`（30 KB，飞书硬上限，仅作 `buildCard` 的绝对兜底）、`REASONING_MAX_BYTES`（5 KB，推理面板内容窗口）；**不再有面板预留**（原 5.5 KB 的 `CARD_PANEL_RESERVE_BYTES` 已删除），分段改为按整卡真实渲染测量：主卡探测面板最大窗口 + 完成态页脚，续卡无面板/页脚、可用满 28 KB（约 27.8 K ASCII 字符，100 KB ASCII 正文约 4 张卡）。正文超长自动分段为多张续卡，断点统一避开代码围栏与表格（段落/标题/行断点；单个代码块/表格小于单卡预算时整体换卡，超过单卡预算时只能硬切、内容不丢；每卡 ≤ 5 个表格，全文保留）。推理面板超出 5 KB 时保留头部并追加「…（内容过长，已截断）」（可见窗口约 4.96 K ASCII 字 / 1.65 K 中文字 / 1.24 K emoji），面板内表格省略；窗口长度与正文长短无关，不占用也不被正文挤占。

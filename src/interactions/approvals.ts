@@ -23,7 +23,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { buildApprovalCard, buildApprovalSettledCard } from '../cards/approval.ts'
+import { buildApprovalCard, buildApprovalSettledCard, UNCONFINED_MODE } from '../cards/approval.ts'
 import type { ApprovalCardState, ApprovalQuestion } from '../cards/approval.ts'
 import type { ApprovalOutcome, ApprovalRequest, SessionEvent } from '../dsh-types.ts'
 import type { CardActionEvent, FeishuChannel } from '../feishu-channel.ts'
@@ -41,6 +41,8 @@ export interface ApprovalHooks {
   routeFor(sessionId: string): ApprovalRoute | undefined
   /** Log a non-fatal error (delivery/update failures). */
   onError(sessionId: string, error: unknown): void
+  /** Whether a user is an administrator: only administrators may allow an escalation to unconfined access. */
+  isAdmin(userId: string): boolean
   /**
    * The tool names a session is currently waiting on for approval (empty when
    * none), called on every open and settle so the streaming card can show it.
@@ -57,9 +59,11 @@ export interface ApprovalHooks {
  * How one typed topic reply was consumed by {@link ApprovalAnswerer.submitText}:
  * a keyword decision (`allowed`, `remembered`, `denied`), or any other text
  * that rejected every pending request of the session (`superseded`) and must
- * still be delivered as the next instruction.
+ * still be delivered as the next instruction. `admin-required`: a
+ * non-administrator tried to allow a request only an administrator may allow;
+ * nothing was decided.
  */
-export type ApprovalTextResult = 'allowed' | 'remembered' | 'denied' | 'superseded'
+export type ApprovalTextResult = 'allowed' | 'remembered' | 'denied' | 'superseded' | 'admin-required'
 
 /** One in-flight approval question: its card content and its resolver. */
 interface Pending extends PendingCardEntry {
@@ -68,6 +72,8 @@ interface Pending extends PendingCardEntry {
   grantKey: string
   /** Open order, so a typed reply answers the newest card. */
   openedAt: number
+  /** The administrator-only notice was already added to the card. */
+  adminNoted: boolean
   resolve(outcome: ApprovalOutcome): void
 }
 
@@ -77,6 +83,9 @@ interface RecordedCall {
   name: string
   arguments: string
 }
+
+/** Start of the audit reason DSH's sandbox escalation asks carry, followed by the target mode and `:`. */
+const ESCALATION_REASON_PREFIX = 'escalate sandbox to '
 
 const ALLOW_WORDS = new Set(['允许', '同意', '可以', '好', '好的', '行', '确认', 'y', 'yes', 'ok', 'allow', 'approve'])
 const DENY_WORDS = new Set(['拒绝', '不允许', '不行', '不', '否', '不同意', 'n', 'no', 'deny', 'reject'])
@@ -189,7 +198,12 @@ export class ApprovalAnswerer {
     if (req.signal?.aborted === true) return Promise.resolve('cancelled')
 
     const call = req.callId === undefined ? undefined : this.calls.get(sessionId)?.get(req.callId)
-    const described = describeCall(call)
+    const recorded = describeCall(call)
+    // DSH's escalation asks state the target mode in their audit reason, which
+    // also covers a call this answerer did not record (a PTC sub-dispatch).
+    const asksUnconfined = req.reason?.startsWith(`${ESCALATION_REASON_PREFIX}${UNCONFINED_MODE}:`) === true
+    const described = asksUnconfined ? { ...recorded, escalateTo: UNCONFINED_MODE } : recorded
+    const adminOnly = described.escalateTo === UNCONFINED_MODE
     const grantKey = `${req.toolName}\u0000${described.escalateTo ?? ''}`
     if (this.grants.get(sessionId)?.has(grantKey) === true) return Promise.resolve('allowed-once')
 
@@ -202,6 +216,7 @@ export class ApprovalAnswerer {
       toolName: req.toolName,
       ...(displayReason === undefined ? {} : { reason: displayReason }),
       ...described,
+      ...(adminOnly ? { adminOnly } : {}),
       timeoutMs: this.timeoutMs,
       sessionId,
     }
@@ -216,6 +231,7 @@ export class ApprovalAnswerer {
         signal: req.signal,
         onAbort: undefined,
         unauthorizedNoted: false,
+        adminNoted: false,
         question,
         grantKey,
         openedAt: ++this.opened,
@@ -258,10 +274,17 @@ export class ApprovalAnswerer {
     const entry = this.table.resolveAction(event, candidate => {
       if (candidate.unauthorizedNoted) return
       candidate.unauthorizedNoted = true
-      this.table.patch(candidate, buildApprovalCard(candidate.question, { unauthorizedNote: true }))
-    })
+      this.patchPending(candidate)
+    }, (candidate, operator) => candidate.question.adminOnly === true && this.hooks.isAdmin(operator))
     if (entry === undefined) return
     const decision = (event.action.value as { decision?: unknown } | undefined)?.decision
+    if ((decision === 'allow' || decision === 'always') && !this.mayAllow(entry, event.operator.userId)) {
+      if (!entry.adminNoted) {
+        entry.adminNoted = true
+        this.patchPending(entry)
+      }
+      return
+    }
     if (decision === 'allow') this.settle(entry, 'allowed-once', 'allowed')
     else if (decision === 'always') this.remember(entry)
     else if (decision === 'deny') this.settle(entry, 'rejected', 'denied')
@@ -272,15 +295,20 @@ export class ApprovalAnswerer {
    * caller has already checked that the sender owns the topic. A keyword
    * decides the newest card; any other text rejects every pending card of the
    * session and is reported as `superseded` so the caller still delivers it.
+   * A keyword allowing an admin-only card from a non-administrator decides
+   * nothing and is reported as `admin-required`.
    * @param sessionId - the session the reply was routed to.
    * @param text - the reply text.
+   * @param senderUserId - Feishu user_id of the reply's sender.
    * @returns How the reply was consumed, or `undefined` when nothing is pending.
    */
-  submitText(sessionId: string, text: string): ApprovalTextResult | undefined {
+  submitText(sessionId: string, text: string, senderUserId: string): ApprovalTextResult | undefined {
     const pending = this.pendingOf(sessionId)
     const newest = pending.at(-1)
     if (newest === undefined) return undefined
-    switch (classifyApprovalReply(text)) {
+    const keyword = classifyApprovalReply(text)
+    if ((keyword === 'allow' || keyword === 'always') && !this.mayAllow(newest, senderUserId)) return 'admin-required'
+    switch (keyword) {
       case 'allow':
         this.settle(newest, 'allowed-once', 'allowed-text')
         return 'allowed'
@@ -324,6 +352,19 @@ export class ApprovalAnswerer {
     for (const candidate of this.pendingOf(entry.sessionId)) {
       if (candidate.grantKey === entry.grantKey) this.settle(candidate, 'allowed-once', 'remembered')
     }
+  }
+
+  /** Whether a user may allow one entry: anyone who may decide it, or only an administrator for an admin-only entry. */
+  private mayAllow(entry: Pending, userId: string | undefined): boolean {
+    return entry.question.adminOnly !== true || (userId !== undefined && this.hooks.isAdmin(userId))
+  }
+
+  /** Re-render a pending card with the notices it has earned. */
+  private patchPending(entry: Pending): void {
+    this.table.patch(entry, buildApprovalCard(entry.question, {
+      unauthorizedNote: entry.unauthorizedNoted,
+      adminOnlyNote: entry.adminNoted,
+    }))
   }
 
   /** Report the session's remaining waits to the streaming card. */

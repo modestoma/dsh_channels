@@ -97,8 +97,16 @@ export class PendingCardTable<E extends PendingCardEntry> {
    * Owner-gated lookup for one card action, containing the owner-only notice.
    * Returns `undefined` for unknown cards, settled entries, and non-owner
    * clicks (which call `onUnauthorized` once).
+   * @param event - the card action.
+   * @param onUnauthorized - called for a click by an operator who may not decide.
+   * @param alsoAllowed - admits an operator the route's own check refuses.
+   * @returns the entry the operator may decide, if any.
    */
-  resolveAction(event: CardActionEvent, onUnauthorized: (entry: E) => void): E | undefined {
+  resolveAction(
+    event: CardActionEvent,
+    onUnauthorized: (entry: E) => void,
+    alsoAllowed?: (entry: E, operator: string) => boolean,
+  ): E | undefined {
     let entry: E | undefined
     for (const candidate of this.entries.values()) {
       if (candidate.messageId === event.messageId) {
@@ -108,9 +116,9 @@ export class PendingCardTable<E extends PendingCardEntry> {
     }
     if (entry === undefined || entry.settled) return undefined
     const operator = event.operator.userId
-    const allowed = operator !== undefined && (entry.route.mayDecide === undefined
+    const allowed = operator !== undefined && ((entry.route.mayDecide === undefined
       ? operator === entry.route.senderUserId
-      : entry.route.mayDecide(operator))
+      : entry.route.mayDecide(operator)) || alsoAllowed?.(entry, operator) === true)
     if (!allowed) {
       onUnauthorized(entry)
       return undefined

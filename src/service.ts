@@ -19,6 +19,8 @@
  */
 
 import { CodeWriteGate } from './access/code-write.ts'
+import { ReadFence } from './access/read-fence.ts'
+import { placementServices } from './session/isolation.ts'
 import { AccessController } from './access/controller.ts'
 import { AccessRequests } from './access/requests.ts'
 import { AccessStore } from './access/store.ts'
@@ -448,6 +450,7 @@ export class FeishuService {
   private unlistenCardAction: (() => void) | undefined
   /** Code-write tool gate for Feishu Sessions (in-memory turn drivers). */
   private readonly codeWriteGate: CodeWriteGate
+  private readonly readFence: ReadFence
   /** Durable access-control user table and authorization requests. */
   private readonly accessStore: AccessStore
   /** Channel-plane admission gate (administrator / group / user). */
@@ -629,6 +632,11 @@ export class FeishuService {
       config: () => this.config,
       routeOf: sessionId => this.routes.findBySession(sessionId),
       mayUse: (userId, permission) => this.accessController.mayUse(userId, permission),
+    })
+    this.readFence = new ReadFence({
+      config: () => this.config,
+      routeOf: sessionId => this.routes.findBySession(sessionId),
+      workingDirectory: session => placementServices(this.ctx).workingDirectory?.get(session),
     })
     this.accessController = new AccessController({
       config: () => this.config,
@@ -1860,6 +1868,7 @@ export class FeishuService {
       onWaitingChange: (sessionId, toolNames) => {
         this.streamer?.setAwaitingApproval(sessionId, toolNames)
       },
+      isAdmin: userId => this.accessController.isAdmin(userId),
       patchCard: (messageId, card) => this.outbox.patch(messageId, card),
     }, this.config.approvalTimeoutMs)
     this.approvalAnswerer = answerer
@@ -1932,7 +1941,8 @@ export class FeishuService {
     this.unlistenHost.push(this.ctx.on('agent/inbox/discarded', ({ agent, message }) => {
       this.streamer?.onInboxDiscarded(agent.session, message)
     }))
-    this.unlistenHost.push(this.ctx.on('tools/pre-execute', async (exec, next) => this.codeWriteGate.decide(exec) ?? await next()))
+    this.unlistenHost.push(this.ctx.on('tools/pre-execute', async (exec, next) =>
+      this.codeWriteGate.decide(exec) ?? await this.readFence.decide(exec) ?? await next()))
     this.unlistenHost.push(this.ctx.on('repo/commit-trailers', async (event) => {
       const userId = this.codeWriteGate.driverOf(event.session)
       if (userId === undefined) return
@@ -2074,6 +2084,7 @@ export class FeishuService {
     this.accessRequests = undefined
     this.accessController.clear()
     this.codeWriteGate.clear()
+    this.readFence.clear()
     this.unlistenApproval?.()
     this.unlistenApproval = undefined
     this.unlistenQuestions?.()
@@ -2611,7 +2622,9 @@ export class FeishuService {
       active = undefined
     }
     const requested = parsed.rawInput.trim()
-    if (requested === '' && this.config.allowPermissionSwitch && choices.length > 0) {
+    // Presets can lift the sandbox and the approval prompts, which only an administrator may grant.
+    const maySwitch = this.config.allowPermissionSwitch && this.accessController.isAdmin(msg.senderId)
+    if (requested === '' && maySwitch && choices.length > 0) {
       await this.delivery.standaloneReply(msg, buildPickerCard({
         title: '🔐 权限预设',
         command: 'permissions',
@@ -2626,9 +2639,11 @@ export class FeishuService {
       const lines = [
         `**当前权限预设**：${active === undefined ? '暂无数据' : `\`${active}\``}`,
         ...(catalogLine === '' ? [] : [`**可选预设**：${catalogLine}`]),
-        ...(this.config.allowPermissionSwitch
+        ...(maySwitch
           ? ['使用 `/permissions <name>` 切换；切换会同时调整沙箱与审批策略。']
-          : ['当前部署未开启飞书侧切换（`allowPermissionSwitch: false`），仅支持查看。']),
+          : this.config.allowPermissionSwitch
+            ? ['只有管理员可以在飞书里切换权限预设，你可以查看。']
+            : ['当前部署未开启飞书侧切换（`allowPermissionSwitch: false`），仅支持查看。']),
       ]
       await this.delivery.standaloneReply(msg, standaloneInfoCard('**🔐 权限预设**', lines))
       return
@@ -2637,6 +2652,13 @@ export class FeishuService {
       await this.delivery.commandCard(msg, {
         kind: 'unavailable', command: 'permissions', sessionId: current.sessionId,
         text: '当前部署未开启飞书侧权限切换，仅支持 /permissions 查看。',
+      })
+      return
+    }
+    if (!maySwitch) {
+      await this.delivery.commandCard(msg, {
+        kind: 'unavailable', command: 'permissions', sessionId: current.sessionId,
+        text: '只有管理员可以在飞书里切换权限预设（它会放宽沙箱和审批），你可以用 /permissions 查看。',
       })
       return
     }

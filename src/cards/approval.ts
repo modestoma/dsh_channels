@@ -47,6 +47,8 @@ export interface ApprovalQuestion {
   arguments?: string
   /** The sandbox mode the call asks to be raised to, when it asks. */
   escalateTo?: string
+  /** Only an administrator may allow it (an escalation to unconfined access); anyone who may decide can still reject it. */
+  adminOnly?: boolean
   /** Timeout window shown on the card (milliseconds). */
   timeoutMs: number
   /** Session id trace line (omitted when absent). */
@@ -57,6 +59,8 @@ export interface ApprovalQuestion {
 export interface ApprovalCardOptions {
   /** Add the owner-only notice (a non-owner clicked and was ignored). */
   unauthorizedNote?: boolean
+  /** Add the administrator-only notice (a non-administrator tried to allow an admin-only request). */
+  adminOnlyNote?: boolean
 }
 
 /** Cap on the rendered command so the card stays readable on a phone. */
@@ -73,7 +77,7 @@ const APPROVAL_ARGUMENTS_MAX_CHARS = 4_000
 const LABEL_LINE = /^([^\s:：]{1,16})(?:：|: )(.*)$/u
 
 /** The sandbox mode whose standing grant removes all confinement. */
-const UNCONFINED_MODE = 'danger-full-access'
+export const UNCONFINED_MODE = 'danger-full-access'
 
 /** `⏱ 5 分钟内有效…` — human timeout label (whole minutes, min 1). */
 function approvalTimeoutLabel(timeoutMs: number): string {
@@ -221,8 +225,14 @@ export function buildApprovalCard(question: ApprovalQuestion, options: ApprovalC
     note(`⏱ ${approvalTimeoutLabel(question.timeoutMs)}内有效，超时自动拒绝 · 「允许」仅对本次生效`),
     note('💬 也可直接回复「允许」「拒绝」「全部允许」；回复其他内容视为拒绝，并作为下一条指令'),
   ]
+  if (question.adminOnly === true) {
+    elements.push(note('🛡 提升到完全访问只能由管理员批准；发起人可以拒绝'))
+  }
   if (options.unauthorizedNote === true) {
     elements.push(note('ℹ️ 仅发起该会话的用户可操作此卡片'))
+  }
+  if (options.adminOnlyNote === true) {
+    elements.push(note('ℹ️ 只有管理员能批准完全访问，非管理员的「允许」不生效'))
   }
   if (question.sessionId !== undefined) {
     elements.push(note(`🔑 ${question.sessionId}`))
