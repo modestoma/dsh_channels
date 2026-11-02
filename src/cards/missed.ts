@@ -19,7 +19,7 @@ export interface MissedBatch {
   chatType: 'p2p' | 'group'
   /** Message ids, oldest first. */
   messageIds: string[]
-  /** `user_id`s of the senders: who may decide besides the administrator. */
+  /** `user_id`s of the senders: who may decide besides the administrators. */
   senders: string[]
 }
 

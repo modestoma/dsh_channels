@@ -83,7 +83,7 @@ export interface TopicLaunchSpec {
   readonly chatId: string
   /**
    * Feishu `user_id` of the person the launch is for: @-mentioned on the root
-   * card and recorded as the route's requester. It must be the administrator
+   * card and recorded as the route's requester. It must be an administrator
    * or a user whose `chat` switch is on, unless the channel runs in `open`
    * access mode.
    */
@@ -115,7 +115,7 @@ export type TopicLaunchFailureCode =
   /** The Feishu connection is not established, or the channel is shutting down. */
   | 'not-connected'
   /**
-   * The requester may not talk to the bot (not the administrator and no
+   * The requester may not talk to the bot (not an administrator and no
    * `chat` switch). The code name predates the user table and is kept for
    * existing callers.
    */

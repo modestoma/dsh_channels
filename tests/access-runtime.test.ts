@@ -17,12 +17,13 @@ import type { FeishuConfig } from '../src/config.ts'
 import type { RouteRecord } from '../src/domain.ts'
 import type { CardActionEvent } from '../src/feishu-channel.ts'
 import {
-  makeAccessConfig, makeAccessDomain, requestRecord, userRecord,
+  adminRecord, makeAccessConfig, makeAccessDomain, requestRecord, userRecord,
 } from './access-fixtures.ts'
 import { makeChannel, makeMessage } from './helpers.ts'
 import type { FakeChannelOptions } from './helpers.ts'
 
 const ADMIN = 'u_admin'
+const AS_ADMIN = { kind: 'admin', userId: ADMIN } as const
 const DAY_MS = 86_400_000
 
 type FakeChannel = ReturnType<typeof makeChannel>
@@ -34,6 +35,8 @@ interface RuntimeOptions {
   /** Simulate the pre-startup window (no live channel). */
   noChannel?: boolean
   clock?: { now: number }
+  /** Administrators seeded into the user table; default `u_admin`. */
+  admins?: readonly string[]
 }
 
 /** One controller + requests pair over fresh fakes. */
@@ -44,6 +47,7 @@ function setup(options: RuntimeOptions = {}) {
   const channel = makeChannel(options.channel)
   const liveChannel: FakeChannel | undefined = options.noChannel === true ? undefined : channel
   const domain = makeAccessDomain()
+  for (const admin of options.admins ?? [ADMIN]) void domain.handle.accessUsers.put(admin, adminRecord(admin))
   const warn = vi.fn()
   const store = new AccessStore({ domain: () => domain.handle, warn })
   store.load()
@@ -200,7 +204,7 @@ describe('AccessController.admit：私聊', () => {
 
   it('未配置管理员时私聊回引导文案（仍不建会话，且受同一冷却）', async () => {
     const clock = { now: 1_000_000 }
-    const runtime = setup({ config: { adminUserId: undefined }, clock })
+    const runtime = setup({ admins: [], clock })
     const msg = () => makeMessage({
       chatType: 'p2p', chatId: 'oc_p2p_alice', senderId: 'u_alice', mentionedBot: false, content: '你好',
     })
@@ -297,8 +301,8 @@ describe('AccessController.admit：群聊', () => {
 
 describe('AccessController.admitCommand', () => {
   it('私聊 /userid 对所有发送者放行（含管理员未配置时）', async () => {
-    for (const config of [{}, { adminUserId: undefined }] as Partial<FeishuConfig>[]) {
-      const runtime = setup({ config })
+    for (const admins of [[ADMIN], []]) {
+      const runtime = setup({ admins })
       const msg = makeMessage({
         chatType: 'p2p', chatId: 'oc_p2p_alice', senderId: 'u_alice', mentionedBot: false, content: '/userid',
       })
@@ -308,7 +312,7 @@ describe('AccessController.admitCommand', () => {
   })
 
   it('管理员未配置时私聊命令回配置引导文案', async () => {
-    const runtime = setup({ config: { adminUserId: undefined } })
+    const runtime = setup({ admins: [] })
     const msg = makeMessage({
       chatType: 'p2p', chatId: 'oc_p2p_alice', senderId: 'u_alice', mentionedBot: false, content: '/help',
     })
@@ -369,11 +373,13 @@ describe('AccessController.ownsRoute / isAdmin / mayUse / mayLaunchFor', () => {
     }), record)).toBe(false)
   })
 
-  it('isAdmin 会裁剪配置与输入两侧的空白', () => {
-    const runtime = setup({ config: { adminUserId: '  u_admin  ' } })
+  it('isAdmin 只认用户表里 admin 打开的用户', async () => {
+    const runtime = setup({ admins: [ADMIN, 'u_admin2'] })
+    await runtime.store.putUser(userRecord({ userId: 'u_alice', codeWrite: true }))
     expect(runtime.controller.isAdmin('u_admin')).toBe(true)
-    expect(runtime.controller.isAdmin(' u_admin ')).toBe(true)
-    expect(runtime.controller.isAdmin('u_other')).toBe(false)
+    expect(runtime.controller.isAdmin('u_admin2')).toBe(true)
+    expect(runtime.controller.isAdmin('u_alice')).toBe(false)
+    expect(runtime.controller.isAdmin(' u_admin ')).toBe(false)
     expect(runtime.controller.isAdmin(undefined)).toBe(false)
   })
 
@@ -417,7 +423,7 @@ describe('AccessRequests.handleBotAdded', () => {
     expect(json).toContain('u_inviter')
     expect(buttonValue(sentCard(entry!), '授权用户')).toBeDefined()
     expect(runtime.store.pendingRequestFor('u_inviter')).toMatchObject({
-      kind: 'user', targetId: 'u_inviter', chatId: 'oc_new', groupName: '产品群', status: 'pending', messageId: 'om_1',
+      kind: 'user', targetId: 'u_inviter', chatId: 'oc_new', groupName: '产品群', status: 'pending', messageIds: ['om_1'],
     })
     expect(runtime.store.hasUser('u_inviter')).toBe(false)
   })
@@ -451,7 +457,7 @@ describe('AccessRequests.handleBotAdded', () => {
   })
 
   it('管理员未配置时只 warn：不发卡、不建申请', async () => {
-    const runtime = setup({ config: { adminUserId: undefined } })
+    const runtime = setup({ admins: [] })
     await runtime.requests.handleBotAdded(botAdded('oc_new', 'u_inviter'))
 
     expect(runtime.channel.sent).toEqual([])
@@ -514,7 +520,7 @@ describe('AccessRequests.ensureUserRequest', () => {
     const msg = makeMessage({ chatType: 'group', chatId: 'oc_group', senderId: 'u_bob', mentionedBot: true, content: '@机器人' })
     await runtime.requests.ensureUserRequest(msg)
     const token = runtime.store.pendingRequestFor('u_bob')!.token
-    await runtime.requests.resolve(token, 'deny', ADMIN)
+    await runtime.requests.resolve(token, 'deny', AS_ADMIN)
     runtime.clock.now += 60_000
     await runtime.requests.ensureUserRequest(msg)
     expect(runtime.channel.sent).toHaveLength(1)
@@ -603,16 +609,45 @@ describe('AccessRequests.onCardAction', () => {
   })
 })
 
+describe('AccessRequests：多位管理员', () => {
+  it('申请卡发给每位管理员；任一位处理后所有卡都更新，其他人再点只看到已处理', async () => {
+    const runtime = setup({ admins: [ADMIN, 'u_admin2'] })
+    const { token } = await pendingUserCard(runtime)
+    expect(runtime.channel.sent.map(entry => entry.chatId)).toEqual([ADMIN, 'u_admin2'])
+    const ids = runtime.store.getRequest(token)?.messageIds ?? []
+    expect(ids).toHaveLength(2)
+
+    await runtime.requests.onCardAction(cardAction(ids[1]!, { token, action: 'allow' }, 'u_admin2'))
+    expect(runtime.store.getUser('u_bob')).toMatchObject({ chat: true, addedBy: 'u_admin2' })
+    expect(runtime.channel.updated.map(entry => entry.messageId)).toEqual(ids)
+
+    await runtime.requests.onCardAction(cardAction(ids[0]!, { token, action: 'deny' }))
+    expect(runtime.store.getRequest(token)?.status).toBe('approved')
+    expect(runtime.channel.updated.map(entry => entry.messageId)).toEqual([...ids, ...ids])
+  })
+
+  it('入群通知发给每位管理员；面板处理申请记为 panel', async () => {
+    const runtime = setup({ admins: [ADMIN, 'u_admin2'] })
+    await runtime.requests.handleBotAdded(botAdded('oc_new', ADMIN))
+    expect(runtime.channel.sent.map(entry => entry.chatId)).toEqual([ADMIN, 'u_admin2'])
+
+    const other = setup({ admins: [ADMIN, 'u_admin2'] })
+    const { token } = await pendingUserCard(other)
+    await expect(other.requests.resolve(token, 'allow', { kind: 'panel' })).resolves.toEqual({ ok: true })
+    expect(other.store.getUser('u_bob')).toMatchObject({ addedBy: 'panel' })
+  })
+})
+
 describe('AccessRequests.resolve（面板与卡片共用路径）', () => {
   it('allow 写入用户表并 patch 卡片；deny 只记录状态', async () => {
     const runtime = setup()
     const { token } = await pendingUserCard(runtime)
-    await expect(runtime.requests.resolve(token, 'allow', ADMIN)).resolves.toEqual({ ok: true })
+    await expect(runtime.requests.resolve(token, 'allow', AS_ADMIN)).resolves.toEqual({ ok: true })
     expect(runtime.store.allows('u_bob', 'chat')).toBe(true)
 
     const other = setup()
     const pending = await pendingUserCard(other)
-    await expect(other.requests.resolve(pending.token, 'deny', ADMIN)).resolves.toEqual({ ok: true })
+    await expect(other.requests.resolve(pending.token, 'deny', AS_ADMIN)).resolves.toEqual({ ok: true })
     expect(other.store.hasUser('u_bob')).toBe(false)
   })
 
@@ -620,11 +655,11 @@ describe('AccessRequests.resolve（面板与卡片共用路径）', () => {
     const runtime = setup()
     const { token } = await pendingUserCard(runtime)
 
-    const foreign = await runtime.requests.resolve(token, 'allow', 'u_alice')
+    const foreign = await runtime.requests.resolve(token, 'allow', { kind: 'admin', userId: 'u_alice' })
     expect(foreign.ok ? '' : foreign.error).toContain('仅管理员')
-    expect(await runtime.requests.resolve('tok-unknown', 'allow', ADMIN)).toMatchObject({ ok: false, error: expect.stringContaining('不存在') })
-    await runtime.requests.resolve(token, 'allow', ADMIN)
-    expect(await runtime.requests.resolve(token, 'deny', ADMIN)).toMatchObject({ ok: false, error: expect.stringContaining('已处理') })
+    expect(await runtime.requests.resolve('tok-unknown', 'allow', AS_ADMIN)).toMatchObject({ ok: false, error: expect.stringContaining('不存在') })
+    await runtime.requests.resolve(token, 'allow', AS_ADMIN)
+    expect(await runtime.requests.resolve(token, 'deny', AS_ADMIN)).toMatchObject({ ok: false, error: expect.stringContaining('已处理') })
   })
 
   it('过期 token 返回 ok:false 并落 expired', async () => {
@@ -632,7 +667,7 @@ describe('AccessRequests.resolve（面板与卡片共用路径）', () => {
     await runtime.store.putRequest(requestRecord({
       token: 'tok-expired', targetId: 'u_bob', createdAt: 0, expiresAt: runtime.clock.now - 1, messageId: 'om_1',
     }))
-    const result = await runtime.requests.resolve('tok-expired', 'allow', ADMIN)
+    const result = await runtime.requests.resolve('tok-expired', 'allow', AS_ADMIN)
     expect(result).toMatchObject({ ok: false, error: expect.stringContaining('已过期') })
     expect(runtime.store.getRequest('tok-expired')?.status).toBe('expired')
   })
@@ -643,7 +678,7 @@ describe('AccessRequests.resolve（面板与卡片共用路径）', () => {
     runtime.store.clear()
     runtime.store.load()
     expect(runtime.store.getRequest(token)?.status).toBe('pending')
-    await expect(runtime.requests.resolve(token, 'allow', ADMIN)).resolves.toEqual({ ok: true })
+    await expect(runtime.requests.resolve(token, 'allow', AS_ADMIN)).resolves.toEqual({ ok: true })
     expect(runtime.store.hasUser('u_bob')).toBe(true)
   })
 })

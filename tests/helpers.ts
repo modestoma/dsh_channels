@@ -889,8 +889,6 @@ export interface FakeChannelOptions {
   chatProfile?: (chatId: string) => Promise<FeishuProfile>
   /** Chat-member name stub; omitted = the channel has no member-list lookup. */
   memberName?: (userId: string, chatId: string) => Promise<string | undefined>
-  /** App-owner lookup stub; omitted = the channel has no owner lookup. */
-  appOwnerUserId?: () => Promise<string | undefined>
   /** Scope-grant stub; omitted = the channel has no scope self-check. */
   grantedScopes?: () => Promise<readonly ScopeGrant[]>
   /** Slash-command panel stub; omitted = the channel has no panel sync. */
@@ -1036,7 +1034,6 @@ export function makeChannel(options: FakeChannelOptions = {}): FeishuChannel & {
       removedReactions.push({ messageId, reactionId })
     }),
     threadIdOfMessage: options.threadIdOfMessage ?? (async () => `omt_${serial}`),
-    ...(options.appOwnerUserId === undefined ? {} : { appOwnerUserId: options.appOwnerUserId }),
     ...(options.grantedScopes === undefined ? {} : { grantedScopes: options.grantedScopes }),
     ...(options.slashCommands === undefined ? {} : { slashCommands: options.slashCommands }),
     ...(options.messageGet === undefined

@@ -9,13 +9,12 @@ import { existsSync } from 'node:fs'
 import path from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import type { FeishuConfig } from '../src/config.ts'
-import { AppOwnerLookupError } from '../src/feishu-channel.ts'
 import type { ChannelFactory, NormalizedMessage } from '../src/feishu-channel.ts'
 import type { RouteRecord } from '../src/domain.ts'
 import type { Agent } from '../src/dsh-types.ts'
 import { ATTACHMENTS_DIR } from '../src/feishu/inbound-attachments.ts'
 import { TestFeishuService as FeishuService } from './helpers.ts'
-import { makeAccessConfig } from './access-fixtures.ts'
+import { adminRecord, makeAccessConfig } from './access-fixtures.ts'
 import { makeChannel, makeHostContext, makeMessage, makeTempBaseDir } from './helpers.ts'
 
 const ADMIN = 'u_admin'
@@ -66,11 +65,18 @@ async function boot(
 async function setup(
   partial: Partial<FeishuConfig> = {},
   channelOptions: HarnessInput = {},
+  admins: readonly string[] = [ADMIN],
 ): Promise<Harness> {
   const config = makeConfig(partial)
   const ctxState = makeHostContext()
+  for (const admin of admins) ctxState.domain.raw.table('access_users').put(admin, adminRecord(admin))
   const channel = makeChannel(channelOptions)
   return await boot(config, ctxState, channel)
+}
+
+/** User-table rows other than the administrators. */
+function members(service: FeishuService): ReturnType<FeishuService['accessSnapshot']>['users'] {
+  return service.accessSnapshot().users.filter(user => !user.admin)
 }
 
 const flush = () => new Promise<void>(resolve => setTimeout(resolve, 0))
@@ -180,7 +186,7 @@ describe('guarded 模式：准入零副作用', () => {
       mentionedBot: false, messageId: 'om_dm_bob_suspended', content: '还在吗',
     }))
     await waitUntil(() => expect(denied()).toHaveLength(2))
-    expect(h.service.accessSnapshot().users.map(user => user.userId)).toEqual(['u_bob'])
+    expect(members(h.service).map(user => user.userId)).toEqual(['u_bob'])
 
     expect(await h.service.setAccessPermission('u_bob', 'chat', true)).toMatchObject({ ok: true })
     expect(await h.service.removeAccessUser('u_bob')).toMatchObject({ ok: true })
@@ -196,14 +202,14 @@ describe('guarded 模式：准入零副作用', () => {
     await h.service.shutdown()
   })
 
-  it('管理员未配置时 fail closed：私聊固定引导、群聊静默、/userid 仍可用', async () => {
-    const h = await setup({ adminUserId: undefined })
+  it('用户表没有管理员时 fail closed：私聊固定引导、群聊静默、/userid 仍可用', async () => {
+    const h = await setup({}, {}, [])
     await h.onMessage(makeMessage({
       chatType: 'p2p', chatId: 'oc_p2p_alice', senderId: 'u_alice',
       mentionedBot: false, messageId: 'om_missing_dm', content: '你好',
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
-    expect(sentJson(h.channel.sent[0]!)).toContain('尚未配置管理员')
+    expect(sentJson(h.channel.sent[0]!)).toContain('还没有管理员')
     expect(h.ctxState.agents.created).toHaveLength(0)
 
     await h.onMessage(makeMessage({
@@ -223,81 +229,45 @@ describe('guarded 模式：准入零副作用', () => {
     await h.service.shutdown()
   })
 
-  it('管理员未配置时使用应用所有者兜底：所有者可私聊，面板与 /auth status 标注来源', async () => {
-    const h = await setup({ adminUserId: undefined }, { appOwnerUserId: async () => 'u_owner' })
-    expect(h.service.accessSnapshot().admin).toEqual({ userId: 'u_owner', source: 'owner', configured: true })
-    await h.onMessage(makeMessage({
-      chatType: 'p2p', chatId: 'oc_p2p_owner', senderId: 'u_owner',
-      mentionedBot: false, messageId: 'om_owner_status', content: '/auth status',
-    }))
-    await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
-    expect(sentJson(h.channel.sent[0]!)).toContain('应用所有者，自动')
+  it('管理员只在面板设置：打开即可对话和用 /auth，可以有多位；飞书 /auth 不能设置或移除管理员', async () => {
+    const h = await setup({}, {}, [])
+    expect(await h.service.addAccessUser('u_alice', 'Alice')).toMatchObject({ ok: true })
+    expect(await h.service.addAccessUser('u_bob', 'Bob')).toMatchObject({ ok: true })
+    expect(await h.service.setAccessPermission('u_alice', 'admin', true)).toMatchObject({ ok: true })
+    expect(await h.service.setAccessPermission('u_bob', 'admin', true)).toMatchObject({ ok: true })
+    expect(h.service.accessSnapshot().users.filter(user => user.admin).map(user => user.userId)).toEqual(['u_alice', 'u_bob'])
+
     await h.onMessage(makeMessage({
       chatType: 'p2p', chatId: 'oc_p2p_alice', senderId: 'u_alice',
-      mentionedBot: false, messageId: 'om_owner_other', content: '你好',
+      mentionedBot: false, messageId: 'om_admin_status', content: '/auth status',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
+    expect(sentJson(h.channel.sent[0]!)).toContain('管理员（2）')
+
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_p2p_alice', senderId: 'u_alice',
+      mentionedBot: false, messageId: 'om_admin_set', content: '/auth set admin off u_bob',
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
-    expect(sentJson(h.channel.sent[1]!)).toContain('你还没有对话权限')
-    await h.service.shutdown()
-  })
-
-  it('显式配置的管理员优先于应用所有者；清空后回落到所有者', async () => {
-    const h = await setup({ adminUserId: ADMIN }, { appOwnerUserId: async () => 'u_owner' })
-    expect(h.service.accessSnapshot().admin).toEqual({ userId: ADMIN, source: 'config', configured: true })
-    await flush()
-    h.config.adminUserId = undefined
-    expect(h.service.accessSnapshot().admin).toEqual({ userId: 'u_owner', source: 'owner', configured: true })
-    await h.service.shutdown()
-  })
-
-  it('已配置管理员时所有者查询不阻塞连接，连接断开后迟到的结果被丢弃', async () => {
-    let settle: (userId: string | undefined) => void = () => {}
-    const h = await setup({ adminUserId: ADMIN }, {
-      appOwnerUserId: () => new Promise<string | undefined>(resolve => { settle = resolve }),
-    })
-    expect(h.channel.connect).toHaveBeenCalledOnce()
-    await h.service.shutdown()
-    settle('u_owner')
-    await flush()
-    h.config.adminUserId = undefined
-    expect(h.service.accessSnapshot().admin).toEqual({ configured: false })
-  })
-
-  it.each([
-    ['接口报错', async (): Promise<string | undefined> => { throw new AppOwnerLookupError('code=99991672 Access denied', 99991672) }, 'code=99991672 Access denied'],
-    ['非 AppOwnerLookupError', async (): Promise<string | undefined> => { throw new Error('boom') }, 'boom'],
-    ['所有者非企业成员', async (): Promise<string | undefined> => undefined, '不是企业内成员'],
-    ['返回 open_id', async (): Promise<string | undefined> => 'ou_owner', '不是企业内成员'],
-  ])('应用所有者查询失败（%s）时 fail closed 并给出原因', async (_name, lookup, reason) => {
-    const h = await setup({ adminUserId: undefined }, { appOwnerUserId: lookup })
-    const admin = h.service.accessSnapshot().admin
-    expect(admin.configured).toBe(false)
-    expect(admin.ownerLookupError).toContain(reason)
-    expect(mock(h.ctxState.ctx.logger?.warn).mock.calls)
-      .toContainEqual(['dsh-channels: app owner fallback unavailable: %s', expect.stringContaining(reason)])
+    expect(sentJson(h.channel.sent[1]!)).toContain('用法')
     await h.onMessage(makeMessage({
       chatType: 'p2p', chatId: 'oc_p2p_alice', senderId: 'u_alice',
-      mentionedBot: false, messageId: 'om_owner_failed', content: '你好',
+      mentionedBot: false, messageId: 'om_admin_remove', content: '/auth remove u_bob',
     }))
-    await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
-    expect(sentJson(h.channel.sent[0]!)).toContain('尚未配置管理员')
-    await h.service.shutdown()
-  })
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(3))
+    expect(sentJson(h.channel.sent[2]!)).toContain('只能在 Web 设置面板')
+    expect(h.service.accessSnapshot().users.find(user => user.userId === 'u_bob')).toMatchObject({ admin: true })
 
-  it('应用所有者查询超时后按未配置处理', async () => {
-    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
-    try {
-      const config = makeConfig({ adminUserId: undefined })
-      const channel = makeChannel({ appOwnerUserId: () => new Promise<string | undefined>(() => {}) })
-      const service = new FeishuService(makeHostContext().ctx, config, () => channel)
-      const started = service.start()
-      await vi.advanceTimersByTimeAsync(10_000)
-      await started
-      expect(service.accessSnapshot().admin.ownerLookupError).toContain('超时')
-      await service.shutdown()
-    } finally {
-      vi.useRealTimers()
-    }
+    // The panel may take the flag away, even from the last administrator.
+    expect(await h.service.setAccessPermission('u_bob', 'admin', false)).toMatchObject({ ok: true })
+    expect(await h.service.setAccessPermission('u_alice', 'admin', false)).toMatchObject({ ok: true })
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_p2p_alice', senderId: 'u_alice',
+      mentionedBot: false, messageId: 'om_no_admin', content: '/auth status',
+    }))
+    await waitUntil(() => expect(h.channel.sent).toHaveLength(4))
+    expect(sentJson(h.channel.sent[3]!)).toContain('还没有管理员')
+    await h.service.shutdown()
   })
 
   it('无权限者在群里 @：群内静默、不建 Session，管理员 DM 收到用户授权申请卡', async () => {
@@ -403,7 +373,7 @@ describe('guarded 模式：群聊', () => {
     await flush()
     expect(h.channel.sent).toEqual([])
     expect(h.ctxState.agents.created).toHaveLength(0)
-    expect(h.service.accessSnapshot().users).toEqual([])
+    expect(members(h.service)).toEqual([])
     await h.service.shutdown()
   })
 })
@@ -425,7 +395,7 @@ describe('guarded 模式：/auth 用户管理', () => {
     await admin('om_auth_add_user', '/auth add u_bob')
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
     expect(sentJson(h.channel.sent[1]!)).toContain('加入用户表并打开对话准入')
-    expect(h.service.accessSnapshot().users).toMatchObject([
+    expect(members(h.service)).toMatchObject([
       { userId: 'u_bob', source: 'command', chat: true, wikiRead: false, wikiWrite: false, codeWrite: false },
     ])
 
@@ -446,7 +416,7 @@ describe('guarded 模式：/auth 用户管理', () => {
 
     // Restart over the same durable domain: the grant must reload.
     const restarted = await boot(h.config, h.ctxState, makeChannel())
-    expect(restarted.service.accessSnapshot().users.map(user => user.userId)).toEqual(['u_bob'])
+    expect(members(restarted.service).map(user => user.userId)).toEqual(['u_bob'])
 
     await restarted.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_group', senderId: 'u_bob',
@@ -468,7 +438,7 @@ describe('guarded 模式：/auth 用户管理', () => {
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
     expect(sentJson(h.channel.sent[0]!)).toMatch(/已把 Carol（`u_carol`）\s*加入用户表/u)
-    expect(h.service.accessSnapshot().users).toMatchObject([{ userId: 'u_carol', name: 'Carol' }])
+    expect(members(h.service)).toMatchObject([{ userId: 'u_carol', name: 'Carol' }])
 
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_group', senderId: ADMIN, mentionedBot: true,
@@ -477,13 +447,13 @@ describe('guarded 模式：/auth 用户管理', () => {
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
     expect(sentJson(h.channel.sent[1]!)).toContain('没有 user_id')
-    expect(h.service.accessSnapshot().users).toHaveLength(1)
+    expect(members(h.service)).toHaveLength(1)
 
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_group', senderId: ADMIN, mentionedBot: true,
       mentions: [bot, carol], messageId: 'om_auth_remove_mention', content: '/auth remove @Carol',
     }))
-    await waitUntil(() => expect(h.service.accessSnapshot().users).toEqual([]))
+    await waitUntil(() => expect(members(h.service)).toEqual([]))
     await h.service.shutdown()
   })
 
@@ -498,7 +468,7 @@ describe('guarded 模式：/auth 用户管理', () => {
     await inGroup('om_set_missing', '/auth set wiki-read on @Carol')
     await waitUntil(() => expect(h.channel.sent).toHaveLength(1))
     expect(sentJson(h.channel.sent[0]!)).toContain('不在用户表中，请先 /auth add')
-    expect(h.service.accessSnapshot().users).toEqual([])
+    expect(members(h.service)).toEqual([])
 
     await inGroup('om_set_add', '/auth add @Carol')
     await inGroup('om_set_read', '/auth set wiki-read on @Carol')
@@ -509,7 +479,7 @@ describe('guarded 模式：/auth 用户管理', () => {
 
     await inGroup('om_set_chat_off', '/auth set chat off @Carol')
     await waitUntil(() => expect(h.channel.sent).toHaveLength(5))
-    expect(h.service.accessSnapshot().users).toMatchObject([
+    expect(members(h.service)).toMatchObject([
       { userId: 'u_carol', chat: false, wikiRead: true, wikiWrite: false, codeWrite: true },
     ])
 
@@ -521,7 +491,7 @@ describe('guarded 模式：/auth 用户管理', () => {
     await h.service.shutdown()
 
     const restarted = await boot(h.config, h.ctxState, makeChannel())
-    expect(restarted.service.accessSnapshot().users).toMatchObject([
+    expect(members(restarted.service)).toMatchObject([
       { userId: 'u_carol', name: 'Carol', chat: false, wikiRead: true, wikiWrite: false, codeWrite: true },
     ])
     await restarted.service.shutdown()
@@ -532,16 +502,16 @@ describe('guarded 模式：/auth 用户管理', () => {
     const added = await h.service.addAccessUser(' u_dave ', ' Dave ')
     expect(added).toMatchObject({ ok: true })
     if (!added.ok) return
-    expect(added.access.users).toEqual([{
+    expect(added.access.users.filter(user => !user.admin)).toEqual([{
       userId: 'u_dave', name: 'Dave', source: 'panel', addedAt: expect.any(Number),
-      chat: true, wikiRead: false, wikiWrite: false, codeWrite: false,
+      admin: false, chat: true, wikiRead: false, wikiWrite: false, codeWrite: false,
     }])
     expect(await h.service.setAccessPermission('u_dave', 'wikiWrite', true))
-      .toMatchObject({ ok: true, access: { users: [{ wikiRead: false, wikiWrite: true }] } })
+      .toMatchObject({ ok: true, access: { users: [{ admin: true }, { wikiRead: false, wikiWrite: true }] } })
     // Adding again keeps the switches and turns chat back on.
     await h.service.setAccessPermission('u_dave', 'chat', false)
     expect(await h.service.addAccessUser('u_dave'))
-      .toMatchObject({ ok: true, access: { users: [{ name: 'Dave', chat: true, wikiWrite: true }] } })
+      .toMatchObject({ ok: true, access: { users: [{ admin: true }, { name: 'Dave', chat: true, wikiWrite: true }] } })
     expect(await h.service.addAccessUser('ou_dave')).toMatchObject({ ok: false })
     expect(await h.service.setAccessPermission('u_nobody', 'codeWrite', true))
       .toEqual({ ok: false, error: '该用户不在用户表中，请先添加' })
@@ -564,7 +534,7 @@ describe('guarded 模式：/auth 用户管理', () => {
       chatType: 'p2p', chatId: 'oc_p2p_admin', senderId: ADMIN,
       mentionedBot: false, messageId: 'om_auth_remove_user', content: '/auth remove u_bob',
     }))
-    await waitUntil(() => expect(h.service.accessSnapshot().users).toEqual([]))
+    await waitUntil(() => expect(members(h.service)).toEqual([]))
 
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_group', senderId: 'u_bob',

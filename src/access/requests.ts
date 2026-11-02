@@ -1,15 +1,16 @@
 /**
  * Authorization request lifecycle.
  *
- * Two fixed events can ask the administrator to add a user to the user
+ * Two fixed events can ask the administrators to add a user to the user
  * table: a user without the conversation permission adding the bot to a
  * group, and such a user mentioning the bot in any group. Users already in
  * the table (including suspended ones whose `chat` switch is off) never
  * trigger a request. Each request is one durable `AccessRequestRecord`
  * (opaque token, TTL from `authRequestTtlDays`), delivered as a DM card
- * carrying that token, and settles exactly once from the card or the Web
- * panel through the same `resolve()` path. An approval writes the user with
- * only `chat` on. Every network/persistence
+ * carrying that token to every administrator, and settles exactly once from
+ * any of those cards or the Web panel through the same `resolve()` path;
+ * every card of the request is then patched to the outcome. An approval
+ * writes the user with only `chat` on. Every network/persistence
  * failure degrades to a warning: admission must never throw because a card
  * could not be delivered.
  *
@@ -28,7 +29,6 @@ import type {
 } from '../feishu-channel.ts'
 import { buildGroupInfoCard, buildRequestSettledCard, buildUserRequestCard } from './cards.ts'
 import type { SettledRequestStatus } from './cards.ts'
-import { isAdminUserId } from './policy.ts'
 import type { AccessStore } from './store.ts'
 
 /** Same-target re-notification cooldown after a request was denied (24 h). */
@@ -38,7 +38,7 @@ const MS_PER_DAY = 86_400_000
 
 /** Collaborators the request lifecycle needs, injected so tests stay offline. */
 export interface AccessRequestsDeps {
-  /** Current plugin configuration (administrator id + request TTL). */
+  /** Current plugin configuration (request TTL). */
   config(): FeishuConfig
   /** Durable user-table/request store. */
   store: AccessStore
@@ -49,6 +49,9 @@ export interface AccessRequestsDeps {
   /** Clock seam for tests. */
   now?(): number
 }
+
+/** Who settles a request: an administrator (card or `/auth`) or the Web settings panel. */
+export type RequestActor = { readonly kind: 'admin'; readonly userId: string } | { readonly kind: 'panel' }
 
 /** One decoded card callback value (the token is the only trusted input). */
 interface CardDecisionValue {
@@ -110,9 +113,8 @@ export class AccessRequests {
     return this.deps.config()
   }
 
-  private adminUserId(): string | undefined {
-    const admin = this.config().adminUserId?.trim()
-    return admin === undefined || admin === '' ? undefined : admin
+  private admins(): string[] {
+    return this.deps.store.adminIds()
   }
 
   private ttlMs(): number {
@@ -122,15 +124,15 @@ export class AccessRequests {
   /**
    * Bot added to a group (`im.chat.member.bot.added_v1`). An inviter without
    * the conversation permission (and not yet in the user table) gets a user
-   * request card to the administrator (deduplicated, 24 h deny cooldown);
-   * otherwise the administrator receives the group information card.
+   * request card to the administrators (deduplicated, 24 h deny cooldown);
+   * otherwise every administrator receives the group information card.
    */
   async handleBotAdded(event: BotAddedEvent): Promise<void> {
     try {
-      const admin = this.adminUserId()
-      if (admin === undefined) {
+      const admins = this.admins()
+      if (admins.length === 0) {
         this.deps.warn(
-          'dsh-channels: bot added to %s but no administrator user_id is configured; group card skipped',
+          'dsh-channels: bot added to %s but the user table has no administrator; group card skipped',
           event.chatId,
         )
         return
@@ -139,7 +141,7 @@ export class AccessRequests {
       const inviter = event.operator.userId
       const info = await this.chatInfo(event.chatId)
       const inviterMayChat = inviter !== undefined
-        && (isAdminUserId(this.config(), inviter) || this.deps.store.snapshot().users.has(inviter))
+        && (this.deps.store.isAdmin(inviter) || this.deps.store.snapshot().users.has(inviter))
       if (inviter !== undefined && !inviterMayChat && !this.deps.store.hasUser(inviter)) {
         await this.beginUserRequest({
           userId: inviter,
@@ -149,7 +151,7 @@ export class AccessRequests {
         }, now)
         return
       }
-      await this.sendCard(admin, buildGroupInfoCard({
+      const card = buildGroupInfoCard({
         chatId: event.chatId,
         ...(info?.name === undefined ? {} : { name: info.name }),
         ...(info?.memberCount === undefined ? {} : { memberCount: info.memberCount }),
@@ -157,7 +159,8 @@ export class AccessRequests {
         ...(inviter === undefined ? {} : { inviterUserId: inviter }),
         inviterMayChat,
         now,
-      }))
+      })
+      for (const admin of admins) await this.deliverCard(admin, card, '(group info)')
     } catch (error) {
       this.deps.warn('dsh-channels: bot-added group notice failed: %s', String(error))
     }
@@ -165,17 +168,16 @@ export class AccessRequests {
 
   /**
    * Lazy trigger for a user without the conversation permission who
-   * addressed the bot in a group: DM the administrator a user request card
+   * addressed the bot in a group: DM the administrators a user request card
    * (deduplicated, 24 h deny cooldown). Users already in the table are never
    * requested again.
    */
   async ensureUserRequest(msg: NormalizedMessage): Promise<void> {
     if (!addressedToBot(msg) || msg.chatType !== 'group') return
     try {
-      const admin = this.adminUserId()
-      if (admin === undefined) {
+      if (this.admins().length === 0) {
         this.deps.warn(
-          'dsh-channels: user %s needs authorization but no administrator user_id is configured',
+          'dsh-channels: user %s needs authorization but the user table has no administrator',
           msg.senderId,
         )
         return
@@ -210,7 +212,7 @@ export class AccessRequests {
       const record = this.deps.store.getRequest(decision.token)
       if (record === undefined) return
       const actor = event.operator.userId
-      if (actor === undefined || !isAdminUserId(this.config(), actor)) {
+      if (actor === undefined || !this.deps.store.isAdmin(actor)) {
         await this.notifyUnauthorized(event)
         return
       }
@@ -222,7 +224,7 @@ export class AccessRequests {
         await this.settleExpired(record)
         return
       }
-      const result = await this.resolve(decision.token, decision.action, actor)
+      const result = await this.resolve(decision.token, decision.action, { kind: 'admin', userId: actor })
       if (!result.ok) {
         this.deps.warn('dsh-channels: settling access request %s failed: %s', decision.token, result.error)
       }
@@ -233,15 +235,19 @@ export class AccessRequests {
 
   /**
    * Settle one pending request: `allow` adds the user with only `chat` on
-   * (source `card`), `deny` only records the decision. Shared by the DM card and the
+   * (source `card`), `deny` only records the decision. Shared by the DM cards and the
    * Web panel; every failure is reported in the return value, never thrown.
+   * @param token - the request token.
+   * @param decision - allow or deny.
+   * @param actor - an administrator, who must still be one, or the Web panel.
+   * @returns success, or the reason nothing was settled.
    */
   async resolve(
     token: string,
     decision: 'allow' | 'deny',
-    actorUserId: string,
+    actor: RequestActor,
   ): Promise<{ ok: true } | { ok: false; error: string }> {
-    if (!isAdminUserId(this.config(), actorUserId)) return { ok: false, error: '仅管理员可处理授权申请' }
+    if (actor.kind === 'admin' && !this.deps.store.isAdmin(actor.userId)) return { ok: false, error: '仅管理员可处理授权申请' }
     const record = this.deps.store.getRequest(token)
     if (record === undefined) return { ok: false, error: '授权申请不存在' }
     if (record.status !== 'pending') {
@@ -254,7 +260,7 @@ export class AccessRequests {
     }
     const status = decision === 'allow' ? 'approved' : 'denied'
     try {
-      if (decision === 'allow') await this.grant(record, actorUserId, now)
+      if (decision === 'allow') await this.grant(record, actor.kind === 'admin' ? actor.userId : 'panel', now)
       await this.deps.store.putRequest({ ...record, status })
     } catch (error) {
       this.deps.warn('dsh-channels: persisting access request %s settlement failed: %s', token, String(error))
@@ -274,7 +280,7 @@ export class AccessRequests {
     }
   }
 
-  /** Pending, not-yet-expired requests (the administrator's queue). */
+  /** Pending, not-yet-expired requests (the administrators' queue). */
   pending(): AccessRequestRecord[] {
     return this.deps.store.pendingRequests(this.now())
   }
@@ -292,7 +298,7 @@ export class AccessRequests {
     return !this.creating.has(userId) && !this.deps.store.recentlyDenied(userId, DENIED_COOLDOWN_MS, now)
   }
 
-  /** Create + DM one user request unless deduplicated/cooling down. */
+  /** Create one user request and DM it to every administrator unless deduplicated/cooling down. */
   private async beginUserRequest(input: {
     userId: string
     name?: string
@@ -300,15 +306,15 @@ export class AccessRequests {
     groupName?: string
     trigger: 'mention' | 'invite'
   }, now: number): Promise<boolean> {
-    const admin = this.adminUserId()
-    if (admin === undefined) return false
+    const admins = this.admins()
+    if (admins.length === 0) return false
     if (await this.hasLivePending(input.userId, now)) return false
     if (!this.mayBegin(input.userId, now)) return false
     this.creating.add(input.userId)
     try {
       const record = this.newRecord(input)
       if (!(await this.persist(record))) return false
-      await this.sendCard(admin, buildUserRequestCard({
+      const card = buildUserRequestCard({
         userId: input.userId,
         ...(input.name === undefined ? {} : { name: input.name }),
         chatId: input.chatId,
@@ -316,7 +322,13 @@ export class AccessRequests {
         trigger: input.trigger,
         token: record.token,
         now,
-      }), record)
+      })
+      const messageIds: string[] = []
+      for (const admin of admins) {
+        const messageId = await this.deliverCard(admin, card, record.token)
+        if (messageId !== undefined) messageIds.push(messageId)
+      }
+      await this.rememberCards(record.token, messageIds)
       return true
     } finally {
       this.creating.delete(input.userId)
@@ -369,27 +381,43 @@ export class AccessRequests {
     }
   }
 
-  /** DM one card to the administrator and remember its message id. */
-  private async sendCard(to: string, card: object, record?: AccessRequestRecord): Promise<void> {
-    if (to === '') return
+  /**
+   * DM one card to one administrator; failures only warn.
+   * @param to - administrator user_id.
+   * @param card - the card.
+   * @param label - request token or `(group info)` for diagnostics.
+   * @returns the delivered message id, when Feishu returned one.
+   */
+  private async deliverCard(to: string, card: object, label: string): Promise<string | undefined> {
     const channel = this.deps.channel()
     if (channel === undefined) {
-      this.deps.warn('dsh-channels: channel unavailable; access card %s not delivered', record?.token ?? '(group info)')
-      return
+      this.deps.warn('dsh-channels: channel unavailable; access card %s not delivered', label)
+      return undefined
     }
     try {
-      const result = await channel.send(to, { card })
-      if (record === undefined) return
-      const messageId = result?.messageId
-      if (typeof messageId !== 'string' || messageId === '') return
-      try {
-        await this.deps.store.putRequest({ ...record, messageId })
-      } catch (error) {
-        this.deps.warn('dsh-channels: persisting card message id for %s failed: %s', record.token, String(error))
-      }
+      const messageId = (await channel.send(to, { card }))?.messageId
+      return typeof messageId === 'string' && messageId !== '' ? messageId : undefined
     } catch (error) {
-      this.deps.warn('dsh-channels: delivering access card %s failed: %s', record?.token ?? '(group info)', String(error))
+      this.deps.warn('dsh-channels: delivering access card %s to %s failed: %s', label, to, String(error))
+      return undefined
     }
+  }
+
+  /**
+   * Store the delivered cards' message ids on the current record. A request
+   * settled while the cards were being delivered gets them patched right away.
+   */
+  private async rememberCards(token: string, messageIds: readonly string[]): Promise<void> {
+    if (messageIds.length === 0) return
+    const current = this.deps.store.getRequest(token)
+    if (current === undefined) return
+    const updated: AccessRequestRecord = { ...current, messageIds: [...current.messageIds ?? [], ...messageIds] }
+    try {
+      await this.deps.store.putRequest(updated)
+    } catch (error) {
+      this.deps.warn('dsh-channels: persisting card message ids for %s failed: %s', token, String(error))
+    }
+    if (current.status !== 'pending') await this.patchCard(updated)
   }
 
   /** Group name/owner/member count, best-effort (missing permission → warn). */
@@ -412,6 +440,7 @@ export class AccessRequests {
       source: 'card',
       addedBy: actorUserId,
       addedAt: now,
+      admin: false,
       chat: true,
       wikiRead: false,
       wikiWrite: false,
@@ -430,21 +459,25 @@ export class AccessRequests {
     await this.patchCard(expired)
   }
 
-  /** Replace the DM card with its terminal state; delivery failures only warn. */
+  /** Replace every DM card of the request with its terminal state; delivery failures only warn. */
   private async patchCard(record: AccessRequestRecord): Promise<void> {
     const status = settledStatus(record.status)
-    if (status === undefined || record.messageId === undefined) return
+    const messageIds = [...record.messageId === undefined ? [] : [record.messageId], ...record.messageIds ?? []]
+    if (status === undefined || messageIds.length === 0) return
     const channel = this.deps.channel()
     if (channel === undefined) return
-    try {
-      await channel.updateCard(record.messageId, buildRequestSettledCard({
-        targetId: record.targetId,
-        ...(record.requesterName === undefined ? {} : { targetName: record.requesterName }),
-        status,
-        now: this.now(),
-      }))
-    } catch (error) {
-      this.deps.warn('dsh-channels: patching access card %s failed: %s', record.messageId, String(error))
+    const card = buildRequestSettledCard({
+      targetId: record.targetId,
+      ...(record.requesterName === undefined ? {} : { targetName: record.requesterName }),
+      status,
+      now: this.now(),
+    })
+    for (const messageId of messageIds) {
+      try {
+        await channel.updateCard(messageId, card)
+      } catch (error) {
+        this.deps.warn('dsh-channels: patching access card %s failed: %s', messageId, String(error))
+      }
     }
   }
 

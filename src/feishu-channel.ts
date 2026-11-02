@@ -97,14 +97,6 @@ export interface FeishuChannel {
   /** Bot open_id, available after `connect()` resolves. */
   botOpenId(): string | undefined
   /**
-   * The app owner's `user_id` (`application.v6.application.get`), used as the
-   * administrator when none is configured. Resolves `undefined` when the owner
-   * is not a tenant member; rejects with an {@link AppOwnerLookupError} when
-   * the API call fails (typically a missing app-info scope). Optional so stubs
-   * and older channels can omit it; absence means no owner fallback.
-   */
-  appOwnerUserId?(): Promise<string | undefined>
-  /**
    * Scopes the app requested from the tenant and their grant state
    * (`application.v6.scope.list`). Rejects with a {@link FeishuApiError} when
    * the call fails. Optional so stubs can omit it; absence skips the check.
@@ -277,9 +269,6 @@ export async function* downloadResourceInRanges(
   }
 }
 
-/** Owner type `2` = tenant member; `0`/`1` are Feishu itself or an ISV partner. */
-const APP_OWNER_TYPE_TENANT_MEMBER = 2
-
 /** Failed Feishu OpenAPI call, carrying the Feishu `code`/`msg` when present. */
 export class FeishuApiError extends Error {
   /**
@@ -292,19 +281,6 @@ export class FeishuApiError extends Error {
   }
 }
 
-/** Failed app-owner lookup, carrying the Feishu `code`/`msg` when present. */
-export class AppOwnerLookupError extends FeishuApiError {
-  /**
-   * @param detail Feishu `code=<n> <msg>` or the transport error text.
-   * @param code Feishu API error code, when the response carried one.
-   */
-  constructor(detail: string, code?: number) {
-    super(detail, code)
-    this.message = `app owner lookup failed: ${detail}`
-    this.name = 'AppOwnerLookupError'
-  }
-}
-
 /** `detail`/`code` of a thrown SDK/Axios error, preferring the Feishu error body. */
 function thrownErrorFields(error: unknown): { detail: string; code?: number } {
   const data = (error as { response?: { data?: { code?: unknown; msg?: unknown } } } | undefined)?.response?.data
@@ -314,7 +290,6 @@ function thrownErrorFields(error: unknown): { detail: string; code?: number } {
   return { detail: [code === undefined ? undefined : `code=${code}`, msg].filter(Boolean).join(' '), code }
 }
 
-/** Normalize a thrown SDK/Axios error into an {@link AppOwnerLookupError}. */
 /** Throw a {@link FeishuApiError} for a non-zero Feishu `code`. */
 function assertFeishuOk(response: { code?: number; msg?: string }): void {
   if (response.code !== undefined && response.code !== 0) {
@@ -422,12 +397,6 @@ function slashCommandApi(request: RawRequest): SlashCommandApi {
       await feishuCall(() => request<{ code?: number; msg?: string }>({ method: 'DELETE', url: commandUrl(id) }))
     },
   }
-}
-
-function appOwnerLookupError(error: unknown): AppOwnerLookupError {
-  if (error instanceof AppOwnerLookupError) return error
-  const { detail, code } = thrownErrorFields(error)
-  return new AppOwnerLookupError(detail, code)
 }
 
 export interface ChannelConnectOptions {
@@ -566,25 +535,6 @@ class LarkChannelAdapter implements FeishuChannel {
 
   getConnectionStatus(): FeishuConnectionStatus | undefined {
     return this.channel.getConnectionStatus()
-  }
-
-  async appOwnerUserId(): Promise<string | undefined> {
-    let response
-    try {
-      response = await this.channel.rawClient.application.v6.application.get({
-        path: { app_id: this.appId },
-        params: { lang: 'zh_cn', user_id_type: 'user_id' },
-      })
-    } catch (error) {
-      throw appOwnerLookupError(error)
-    }
-    if (response.code !== undefined && response.code !== 0) {
-      throw new AppOwnerLookupError(`code=${response.code}${response.msg === undefined ? '' : ` ${response.msg}`}`, response.code)
-    }
-    const owner = response.data?.app?.owner
-    if (owner?.type !== APP_OWNER_TYPE_TENANT_MEMBER) return undefined
-    const userId = owner.owner_id?.trim()
-    return userId === undefined || userId === '' ? undefined : userId
   }
 
   async grantedScopes(): Promise<readonly ScopeGrant[]> {

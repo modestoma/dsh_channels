@@ -112,7 +112,6 @@ describe('topic launch flow', () => {
       baseDir: mkdtempSync(path.join(tmpdir(), 'dsh-topics-ws-')),
       statusRefreshMs: 60_000,
       accessMode: 'guarded',
-      adminUserId: 'u_admin',
       welcomeOnboarding: false,
       topicIsolation: 'subdir',
       ...partial,
@@ -126,6 +125,8 @@ describe('topic launch flow', () => {
     const factory: ChannelFactory = () => channel
     const service = new FeishuService(ctxState.ctx, config, factory)
     await service.start()
+    await service.addAccessUser('u_admin')
+    await service.setAccessPermission('u_admin', 'admin', true)
     const handler = (channel.onMessage as unknown as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0] as
       (msg: NormalizedMessage) => Promise<void>
     const launcher = service.topics()

@@ -44,7 +44,7 @@ export interface CodeWriteGateDeps {
   config(): Pick<FeishuConfig, 'codeWriteTools'>
   /** The route that names a Session, if any. */
   routeOf(sessionId: string): RouteRecord | undefined
-  /** Whether a user holds a permission switch (the administrator holds all). */
+  /** Whether a user holds a permission switch (an administrator holds all). */
   mayUse(userId: string, permission: AccessPermission): boolean
 }
 

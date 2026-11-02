@@ -13,7 +13,6 @@
  */
 
 import { z } from 'zod'
-import { FEISHU_USER_ID_PATTERN } from './domain.ts'
 import { parseWikiRootLink, WIKI_ROOT_LINK_ERRORS } from './feishu/wiki/links.ts'
 
 export const FEISHU_LOGGER_LEVELS = ['debug', 'info', 'warn', 'error'] as const
@@ -313,7 +312,7 @@ export const configSchema = z.object({
    *
    * The wiki tools act with the app identity and are mounted only while
    * `wikiRoots` is non-empty. Each read call is limited to topics whose owner
-   * is the administrator or has the user table's `wikiRead` switch on, and
+   * is an administrator or has the user table's `wikiRead` switch on, and
    * each create or edit call to owners with `wikiWrite` on
    * (`/auth set wiki-read|wiki-write on`); opening a
    * document, creating one, and editing one each need the topic owner's
@@ -420,7 +419,7 @@ export const configSchema = z.object({
   /**
    * Admission policy for inbound Feishu traffic.
    *
-   * - `guarded` (default): the administrator, and users of the access table
+   * - `guarded` (default): administrators, and users of the access table
    *   whose `chat` switch is on, may talk in private chats and in any group;
    *   everyone else is refused.
    * - `open`: any user inside the app's availability scope can start a
@@ -431,7 +430,7 @@ export const configSchema = z.object({
   /**
    * Tools that write to a remote repository (push, merge requests, issues).
    * In a Feishu Session a call is refused unless the user who drives the
-   * current turn is the administrator or holds the `codeWrite` switch. Names
+   * current turn is an administrator or holds the `codeWrite` switch. Names
    * are matched exactly; an empty list turns the check off.
    */
   codeWriteTools: z.array(z.string().trim().min(1)).default([
@@ -447,21 +446,8 @@ export const configSchema = z.object({
     'logalyze_submit_init',
   ]),
   /**
-   * The unique administrator's Feishu `user_id`. Set it in the Web
-   * settings panel (or the profile config). Get it by sending `/userid` to the
-   * bot in a private chat. When unset, the Feishu app owner (looked up via
-   * `application.v6.application.get` at connect; needs an app-info read scope)
-   * is the administrator. While `accessMode` is `guarded` and neither is
-   * available, every conversation is refused (fail closed); `/userid` and a
-   * fixed notice stay available so the deployment can be bootstrapped.
-   */
-  adminUserId: z.string().regex(
-    FEISHU_USER_ID_PATTERN,
-    'must be a Feishu user_id, not an open_id (send /userid to the bot in a private chat to see it)',
-  ).optional(),
-  /**
    * Lifetime of one pending authorization request and of the DM card that asks
-   * the administrator to add a user to the access table. Expired requests stay in
+   * the administrators to add a user to the access table. Expired requests stay in
    * the store as an audit trail but can no longer be decided.
    */
   authRequestTtlDays: z.number().int().min(1).max(30).default(7),

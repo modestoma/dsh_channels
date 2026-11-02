@@ -5,7 +5,7 @@
  *
  * Every call acts with the app identity and is gated, in order, by:
  * - the switch and a non-empty `wikiRoots` (otherwise nothing is mounted);
- * - the topic owner being the administrator or holding the knowledge-base
+ * - the topic owner being an administrator or holding the knowledge-base
  *   read switch (list/read tools) or write switch (create/edit tools)
  *   (`/auth set wiki-read|wiki-write`), checked per call so revocation
  *   applies at once;
