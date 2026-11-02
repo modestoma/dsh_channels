@@ -33,6 +33,23 @@ describe('confine runner', () => {
     ])
   })
 
+  it('applies every fence in read-only mode, whatever the working directory', () => {
+    expect(argsOf(['--fence', '/srv/feishu'], ROOT, '/tmp'))
+      .toEqual(['--ro-bind', '/', '/', '--tmpfs', '/srv/feishu', ...ROOT.slice(3), '--', 'sh', '-c', 'ls'])
+  })
+
+  it('mounts a hide inside a writable root after the writable binds', () => {
+    const args = argsOf(['--hide', '/home/ops/.ssh', '--expose', '/srv/dsh/skills'], [...ROOT, ...WRITE('/home/ops')], '/home/ops')
+    expect(args).toEqual([
+      '--ro-bind', '/', '/',
+      '--ro-bind', '/srv/dsh/skills', '/srv/dsh/skills',
+      ...ROOT.slice(3), ...WRITE('/home/ops'),
+      '--tmpfs', '/home/ops/.ssh',
+      '--', 'sh', '-c', 'ls',
+    ])
+    expect(() => argsOf(['--hide', '/home/ops/.ssh'], [...ROOT, ...WRITE('/home/ops')], '/home/ops/.ssh')).toThrow('is hidden')
+  })
+
   it('leaves a fence alone when the call works outside it', () => {
     expect(argsOf(['--fence', '/srv/feishu'], [...ROOT, ...WRITE('/home/ops/project')], '/home/ops/project'))
       .toEqual([...ROOT, ...WRITE('/home/ops/project'), '--', 'sh', '-c', 'ls'])

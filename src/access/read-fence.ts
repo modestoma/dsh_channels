@@ -11,8 +11,9 @@
  *   working directory (header cwd when the host has no working-directory
  *   service), `~` against the Host user's home. The deepest existing ancestor
  *   of each path is resolved through symlinks, so a link planted inside the
- *   workspace cannot point the tool elsewhere. Allowed roots are resolved the
- *   same way.
+ *   workspace cannot point the tool elsewhere. The route's workspace and
+ *   topic directories are allowed only as real directories: one replaced by a
+ *   symlink grants nothing.
  * - A glob `pattern` is checked by its leading directories up to the first
  *   wildcard segment; a pattern with a `..` segment is denied.
  * - An omitted path argument is checked as the effective working directory,
@@ -25,7 +26,7 @@
  * @module dsh-channels/access/read-fence
  */
 
-import { realpath } from 'node:fs/promises'
+import { lstat, realpath } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import path from 'node:path'
 import type { FeishuConfig } from '../config.ts'
@@ -68,7 +69,7 @@ export class ReadFence {
     if (route === undefined) return undefined
     const args = isRecord(exec.arguments) ? exec.arguments : {}
     const base = this.deps.workingDirectory(agent.session) ?? agent.session.header.cwd ?? route.workspacePath
-    const allowed = await Promise.all(allowedRootsOf(route, fence.readableRoots).map(resolveReal))
+    const allowed = await allowedRootsOf(route, fence.readableRoots)
     const resolvedBase = await resolveReal(path.resolve(expandHome(base)))
     for (const name of argumentNames) {
       const value = args[name]
@@ -102,9 +103,37 @@ export class ReadFence {
   }
 }
 
-/** The directories one route's Sessions may read. */
-function allowedRootsOf(route: RouteRecord, readableRoots: readonly string[]): string[] {
-  return [route.workspacePath, ...(route.sessionDir === undefined ? [] : [route.sessionDir]), ...readableRoots]
+/**
+ * The canonical directories one route's Sessions may read.
+ *
+ * The workspace and topic directories are judged without following a symlink
+ * at their own path, because a Session that can write their parent could
+ * replace them with a link to anywhere; a topic directory inside the
+ * workspace adds nothing and is skipped. The deployment's `readableRoots`
+ * are followed through symlinks.
+ */
+async function allowedRootsOf(route: RouteRecord, readableRoots: readonly string[]): Promise<string[]> {
+  const owned = [route.workspacePath]
+  if (route.sessionDir !== undefined && !isInside(path.resolve(route.sessionDir), path.resolve(route.workspacePath))) owned.push(route.sessionDir)
+  const roots = await Promise.all([...owned.map(ownedRoot), ...readableRoots.map(async root => await resolveReal(root))])
+  return roots.filter((root): root is string => root !== undefined)
+}
+
+/**
+ * Canonical path of a plugin-created directory: its parent resolved through
+ * symlinks plus its own name.
+ * @returns undefined when the directory itself is a symlink.
+ */
+async function ownedRoot(dir: string): Promise<string | undefined> {
+  const absolute = path.resolve(dir)
+  const canonical = path.join(await resolveReal(path.dirname(absolute)), path.basename(absolute))
+  try {
+    if ((await lstat(canonical)).isSymbolicLink()) return undefined
+  } catch (error) {
+    // A directory that does not exist yet cannot redirect anything; keep its canonical path.
+    if (!isMissing(error)) return undefined
+  }
+  return canonical
 }
 
 function deny(toolName: string, value: string, route: RouteRecord): PreToolDecision {

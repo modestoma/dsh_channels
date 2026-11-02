@@ -9,13 +9,19 @@
  *
  * 1. `--tmpfs` over each `--hide` directory (credentials, Session logs, keys);
  * 2. `--tmpfs` over each `--fence` directory that contains a writable root
- *    or the working directory of the call, so one Feishu user's command
- *    cannot list or read another user's workspace under the channel's base
- *    directory;
+ *    or the working directory of the call, and over every `--fence`
+ *    directory when the call has no writable root (read-only mode), so one
+ *    Feishu user's command cannot list or read another user's workspace
+ *    under the channel's base directory;
  * 3. a read-only bind of each writable root a hide or fence covered, so the
  *    call still sees its own workspace (the profile's later writable bind
  *    makes it writable again);
  * 4. a read-only bind of each `--expose` directory (shared skills).
+ *
+ * A hide or fence that lies strictly inside a writable root is mounted after
+ * the profile's writable binds instead, since the later bind of its ancestor
+ * would otherwise uncover it; an `--expose` directory inside such a mask is
+ * bound back after it.
  *
  * Only the profile's writable roots are restored: they are the workspace DSH
  * authorized for the call. The working directory is not an authorization (a
@@ -134,20 +140,28 @@ export function bwrapArgsOf(invocation: ConfineInvocation, host: ConfineHost): s
   }
   for (const dir of options.fence) {
     const real = host.realDir(dir)
-    if (real !== undefined && triggers.some(trigger => isInside(trigger, real))) masked.push(real)
+    // Without a writable root nothing names the call's workspace, so every fence applies.
+    if (real !== undefined && (writable.length === 0 || triggers.some(trigger => isInside(trigger, real)))) masked.push(real)
   }
-  if (masked.some(dir => isInside(host.cwd, dir)) && !writable.some(root => isInside(host.cwd, root))) {
+  const masks = unique(masked)
+  // A mask strictly inside a writable root goes after the profile's binds, which would otherwise uncover it.
+  const late = masks.filter(dir => writable.some(root => dir !== root && isInside(dir, root)))
+  const early = masks.filter(dir => !late.includes(dir))
+  const coveredCwd = early.some(dir => isInside(host.cwd, dir)) && !writable.some(root => isInside(host.cwd, root))
+  if (coveredCwd || late.some(dir => isInside(host.cwd, dir))) {
     throw new ConfineUsageError(`working directory ${host.cwd} is hidden by the confinement and is not inside a writable root of this call`)
   }
-  const inserted = unique(masked).flatMap(dir => ['--tmpfs', dir])
+  const exposes = options.expose.map(dir => host.realDir(dir)).filter((dir): dir is string => dir !== undefined)
+  const before = early.flatMap(dir => ['--tmpfs', dir])
   for (const root of writable) {
-    if (masked.some(dir => isInside(root, dir))) inserted.push('--ro-bind', root, root)
+    if (early.some(dir => isInside(root, dir))) before.push('--ro-bind', root, root)
   }
-  for (const dir of options.expose) {
-    const real = host.realDir(dir)
-    if (real !== undefined) inserted.push('--ro-bind', real, real)
+  for (const dir of exposes) before.push('--ro-bind', dir, dir)
+  const after = late.flatMap(dir => ['--tmpfs', dir])
+  for (const dir of exposes) {
+    if (late.some(mask => isInside(dir, mask))) after.push('--ro-bind', dir, dir)
   }
-  return [...profile.slice(0, 3), ...inserted, ...profile.slice(3), '--', ...command]
+  return [...profile.slice(0, 3), ...before, ...profile.slice(3), ...after, '--', ...command]
 }
 
 /**

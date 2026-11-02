@@ -96,6 +96,21 @@ describe('ReadFence', () => {
     expect(await fence.decide(call('grep', { pattern: 'token' }))).toBeUndefined()
   })
 
+  it('grants nothing through a topic directory replaced by a symlink', async () => {
+    const { fence, routes, alice, base, secret } = setup()
+    const outside = path.join(base, 'topics-outside')
+    mkdirSync(outside, { recursive: true })
+    const linked = path.join(outside, 't1')
+    symlinkSync(secret, linked)
+    routes.set('s_alice', { workspacePath: alice, sessionDir: linked } as RouteRecord)
+    expect(await fence.decide(call('read', { file_path: path.join(secret, 'token') }))).toMatchObject(denied)
+    const inside = path.join(alice, 'topics', 't2')
+    mkdirSync(path.dirname(inside), { recursive: true })
+    symlinkSync(secret, inside)
+    routes.set('s_alice', { workspacePath: alice, sessionDir: inside } as RouteRecord)
+    expect(await fence.decide(call('read', { file_path: path.join(secret, 'token') }))).toMatchObject(denied)
+  })
+
   it('checks an omitted path argument as the effective working directory', async () => {
     const { fence, cwd, alice, secret } = setup()
     cwd.set('s_alice', path.join(alice, 'sub'))
