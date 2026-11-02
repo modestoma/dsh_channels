@@ -19,6 +19,7 @@ import type { CardActionEvent, ChannelFactory, NormalizedMessage } from '../src/
 import { apply, inject, name } from '../src/index.ts'
 import { TestFeishuService as FeishuService } from './helpers.ts'
 import type { SessionManager } from '../src/session/manager.ts'
+import type { RouteStore } from '../src/session/routes.ts'
 import type { FeishuTopicService, TopicLaunchSpec } from '../src/topics/contract.ts'
 import { FEISHU_TOPICS_SERVICE, TopicLauncher } from '../src/topics/launcher.ts'
 import { followupMessagesOf, makeChannel, makeHostContext, makeMessage } from './helpers.ts'
@@ -243,6 +244,11 @@ describe('topic launch flow', () => {
     h.ctxState.sessionListeners[0]!(agent.session, { type: 'turn/end', seq: 1, data: { turn: 1, reason: 'stop' } })
     await waitUntil(() => expect(emit).toHaveBeenCalledWith('feishu-topics/status', { ...running, status: 'done' }))
     expect(h.launcher.state('key-1')).toEqual({ ...running, status: 'done' })
+    // A retired route is not reported, even when its row survived a failed delete.
+    const routes = (h.launcher as unknown as { deps: { routes: RouteStore } }).deps.routes
+    await routes.retire(route.key)
+    await h.ctxState.domain.raw.table('routes').put(route.key, route)
+    expect(h.launcher.state('key-1')).toEqual({ key: 'key-1', status: 'done' })
   })
 
   it('marks analyses a previous instance never finished as interrupted at start', async () => {

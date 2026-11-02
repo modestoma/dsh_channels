@@ -156,7 +156,10 @@ export class TopicLauncher implements FeishuTopicService {
   state(key: string): TopicLaunchState | undefined {
     const record = this.deps.domain()?.topicLaunches.get(key)
     if (record === undefined) return undefined
-    const route = record.threadId === undefined ? undefined : this.deps.routes.get(record.threadId)
+    // A retired route's tombstone wins over a leftover row whose delete failed.
+    const route = record.threadId === undefined || this.deps.routes.expiredRoute(record.threadId) !== undefined
+      ? undefined
+      : this.deps.routes.get(record.threadId)
     return {
       key,
       status: record.status,
