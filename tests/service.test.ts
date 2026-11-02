@@ -2542,34 +2542,56 @@ describe('FeishuService', () => {
     await service2.shutdown()
   })
 
-  it('replays a prompt with its stored Feishu sender as the code-write driver, and denies when none was stored', async () => {
+  it('replays a prompt whose source names its Feishu sender as the code-write driver, filling older snapshots from the stored sender', async () => {
     const gatedPush = async (h: Harness) => {
       h.config.codeWriteTools = ['repo_workspace_push']
       await waitUntil(() => expect(h.ctxState.agents.resumed).toHaveLength(1))
       const resumed = h.ctxState.agents.resumed[0]!.handle.agent
       // The fake inbox claims the replayed prompt as soon as it is submitted.
       await waitUntil(() => expect(mock(resumed.followup)).toHaveBeenCalledTimes(1))
-      return { resumed, claimed: h.ctxState.preExecuteListeners.at(-1)! }
+      const decision = await h.ctxState.preExecuteListeners.at(-1)!({ name: 'repo_workspace_push', agent: resumed }, async () => ({ kind: 'allow' }))
+      return { resumed, decision }
     }
+    /** Rewrite every stored inflight snapshot after the first process shut down. */
+    const rewriteSnapshots = (edit: (value: Record<string, unknown>) => Record<string, unknown>) => (h: Harness) => {
+      const table = h.ctxState.domain.raw.table('inflight')
+      for (const [key, value] of [...(table.entries() as IterableIterator<[string, Record<string, unknown>]>)]) table.put(key, edit(value))
+    }
+    /** A snapshot written before prompts carried a principal. */
+    const withoutPrincipal = (value: Record<string, unknown>): Record<string, unknown> => {
+      const message = value.message as { source: Record<string, unknown> }
+      return { ...value, message: { ...message, source: { kind: 'user' } } }
+    }
+    const denied = (reason: string) => ({ kind: 'deny', reason: expect.stringContaining(reason) })
+
     const stored = await restartMidTurn(() => {})
-    expect(inflightEntries(stored.h)).toEqual([['om_1', expect.objectContaining({ senderUserId: 'u_alice' })]])
-    const first = await gatedPush(stored.h)
-    expect(await first.claimed({ name: 'repo_workspace_push', agent: first.resumed }, async () => ({ kind: 'allow' })))
-      .toMatchObject({ kind: 'deny', reason: expect.stringContaining('飞书用户 u_alice 没有代码改动权限') })
+    expect(inflightEntries(stored.h)).toEqual([['om_1', expect.objectContaining({
+      senderUserId: 'u_alice',
+      message: expect.objectContaining({ source: expect.objectContaining({ principal: { kind: 'feishu-user', userId: 'u_alice' } }) }),
+    })]])
+    expect((await gatedPush(stored.h)).decision).toMatchObject(denied('飞书用户 u_alice 没有代码改动权限'))
     await stored.service2.shutdown()
 
-    const legacy = await restartMidTurn(() => {}, {
-      afterShutdown: (h) => {
-        const table = h.ctxState.domain.raw.table('inflight')
-        for (const [key, value] of [...(table.entries() as IterableIterator<[string, Record<string, unknown>]>)]) {
-          const { senderUserId: _dropped, ...rest } = value
-          table.put(key, rest)
-        }
-      },
+    // The principal travels with the prompt; the separately stored sender is not needed.
+    const principalOnly = await restartMidTurn(() => {}, {
+      afterShutdown: rewriteSnapshots(({ senderUserId: _dropped, ...rest }) => rest),
     })
-    const second = await gatedPush(legacy.h)
-    expect(await second.claimed({ name: 'repo_workspace_push', agent: second.resumed }, async () => ({ kind: 'allow' })))
-      .toMatchObject({ kind: 'deny', reason: expect.stringContaining('无法确认这一轮的飞书发言人') })
+    expect((await gatedPush(principalOnly.h)).decision).toMatchObject(denied('飞书用户 u_alice 没有代码改动权限'))
+    await principalOnly.service2.shutdown()
+
+    const older = await restartMidTurn(() => {}, { afterShutdown: rewriteSnapshots(withoutPrincipal) })
+    const replayed = await gatedPush(older.h)
+    expect(replayed.decision).toMatchObject(denied('飞书用户 u_alice 没有代码改动权限'))
+    expect(mock(replayed.resumed.followup).mock.calls[0]![0]).toMatchObject({ source: { kind: 'user', principal: { kind: 'feishu-user', userId: 'u_alice' } } })
+    await older.service2.shutdown()
+
+    const legacy = await restartMidTurn(() => {}, {
+      afterShutdown: rewriteSnapshots(value => {
+        const { senderUserId: _dropped, ...rest } = withoutPrincipal(value)
+        return rest
+      }),
+    })
+    expect((await gatedPush(legacy.h)).decision).toMatchObject(denied('无法确认这一轮的飞书发言人'))
     await legacy.service2.shutdown()
   })
 
