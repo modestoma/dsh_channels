@@ -36,6 +36,7 @@ import type { TurnStreamer } from '../streamer.ts'
 import {
   enterTopic, placementServices, planTopic, restoreTopicDir,
 } from '../session/isolation.ts'
+import { feishuUserMessage } from '../access/principal.ts'
 import type { PlacementServices, TopicPlacement, TopicPlan } from '../session/isolation.ts'
 import { ensureWorkspace, topicTokenFor } from '../workspaces.ts'
 
@@ -127,11 +128,6 @@ export interface InboundDeps {
     source?: KnownAttachmentSource,
   ): void
   /**
-   * Record the Feishu sender of the prompt one DSH user message carries
-   * (feeds the code-write gate's turn driver).
-   */
-  noteTurnSender(sessionId: string, messageId: string, userId: string): void
-  /**
    * Read-only message access: quoted-message excerpt, first-turn topic
    * history, and recent attachment messages. Failures degrade silently to an
    * absent value (never a throw into the turn).
@@ -155,16 +151,6 @@ const APPROVAL_TEXT_REPLIES: Record<Exclude<ApprovalTextResult, 'superseded'>, s
   remembered: '已允许，本话题内同类操作不再询问。',
   denied: '已拒绝本次操作。',
   'admin-required': '提升到完全访问只能由管理员批准，你的回复没有生效；可以回复「拒绝」，或请管理员在卡片上点「允许」。',
-}
-
-/** Build one durable user message from inbound Feishu text. */
-export function feishuUserMessage(text: string): UserMessage {
-  return {
-    id: randomUUID(),
-    role: 'user',
-    content: [{ type: 'text', text }],
-    source: { kind: 'user' },
-  } as unknown as UserMessage
 }
 
 /**
@@ -534,7 +520,7 @@ export class InboundRouter {
     content: string,
     options: TurnDeliveryOptions,
   ): Promise<UserMessage> {
-    const message = feishuUserMessage(content)
+    const message = feishuUserMessage(content, msg.senderId)
     const blocks: ContentBlock[] = content === '' ? [] : [{ type: 'text', text: content }]
     const state = inboundAttachmentState(msg)
     const attachmentPipeline = this.config.acceptAttachments
@@ -625,18 +611,6 @@ export class InboundRouter {
     content: string,
     options: TurnDeliveryOptions = {},
   ): Promise<UserMessage> {
-    const message = await this.assembleTurnMessage(msg, record, content, options)
-    this.deps.noteTurnSender(record.sessionId, message.id, msg.senderId)
-    return message
-  }
-
-  /** Build the prompt of one turn; see {@link deliverTurnMessage}. */
-  private async assembleTurnMessage(
-    msg: NormalizedMessage,
-    record: RouteRecord,
-    content: string,
-    options: TurnDeliveryOptions,
-  ): Promise<UserMessage> {
     try {
       return await this.nativeTurnMessage(msg, record, content, options)
     } catch (error) {
@@ -644,7 +618,7 @@ export class InboundRouter {
         'dsh-channels: assembling the attachment manifest for %s failed: %s',
         msg.messageId, String(error),
       )
-      return feishuUserMessage(content)
+      return feishuUserMessage(content, msg.senderId)
     }
   }
 

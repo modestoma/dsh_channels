@@ -189,6 +189,7 @@ describe('topic launch flow', () => {
     })
     const agent = h.ctxState.agents.created[0]!.handle.agent
     expect(followupMessagesOf(agent).map(message => message.content[0]!.text)).toEqual([PROMPT])
+    expect(followupMessagesOf(agent)[0]!.source).toMatchObject({ kind: 'user', principal: { kind: 'feishu-user', userId: 'u_alice' } })
     // Restart recovery replays the first prompt on behalf of the requester.
     expect(h.ctxState.domain.raw.table('inflight').get('om_2')).toMatchObject({ senderUserId: 'u_alice' })
   })
@@ -412,6 +413,11 @@ describe('topic launch flow', () => {
     held.release()
     await waitUntil(() => expect(followupMessagesOf(agent)).toHaveLength(2))
     expect(followupMessagesOf(agent).map(message => message.content[0]!.text)).toEqual([PROMPT, '顺便看下内存'])
+    // Each prompt on the shared route names its own sender.
+    expect(followupMessagesOf(agent).map(message => message.source.principal)).toEqual([
+      { kind: 'feishu-user', userId: 'u_alice' },
+      { kind: 'feishu-user', userId: 'u_bob' },
+    ])
   })
 
   it('removes the published route when the first prompt cannot be delivered', async () => {

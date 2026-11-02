@@ -303,9 +303,15 @@ export function makeAttachmentStore(options: FakeAttachmentStoreOptions = {}): A
   return store as unknown as AttachmentStore & { savedImages: FakeSavedImage[]; savedFiles: FakeSavedFile[] }
 }
 
+/** The parts of a submitted prompt tests read. */
+interface FollowupMessage {
+  content: Array<{ type: string; text?: string; attachment?: unknown }>
+  source: { kind: string; principal?: unknown }
+}
+
 /** Snapshot every followup prompt handed to a fake agent. */
-export function followupMessagesOf(agent: Agent): Array<{ content: Array<{ type: string; text?: string; attachment?: unknown }> }> {
-  return mockCallsOf(agent.followup).map(call => call[0] as { content: Array<{ type: string; text?: string; attachment?: unknown }> })
+export function followupMessagesOf(agent: Agent): FollowupMessage[] {
+  return mockCallsOf(agent.followup).map(call => call[0] as FollowupMessage)
 }
 
 function mockCallsOf(fn: unknown): unknown[][] {

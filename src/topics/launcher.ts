@@ -37,7 +37,7 @@ import type { RouteOperationQueue } from '../commands.ts'
 import { FEISHU_USER_ID_PATTERN, rootCardOf, sessionDirOf } from '../domain.ts'
 import type { FeishuDomainHandle, RouteRecord, TopicLaunchRecord } from '../domain.ts'
 import type { FeishuChannel } from '../feishu-channel.ts'
-import { feishuUserMessage } from '../routing/inbound.ts'
+import { feishuUserMessage } from '../access/principal.ts'
 import { enterTopic, placementServices, planTopic } from '../session/isolation.ts'
 import type { TopicPlacement } from '../session/isolation.ts'
 import type { SessionManager } from '../session/manager.ts'
@@ -342,7 +342,7 @@ export class TopicLauncher implements FeishuTopicService {
         sessionHistory: [{ sessionId, createdAt }],
         shared: true,
       }
-      const message = feishuUserMessage(spec.prompt)
+      const message = feishuUserMessage(spec.prompt, spec.requesterUserId)
       const stored = storableMessage(message)
       await this.deps.repair.write({
         key: cardId,

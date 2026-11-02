@@ -79,7 +79,8 @@ import {
   readQuoteItems,
 } from './feishu/message-read.ts'
 import type { MessageReadRoute, RawMessageItem } from './feishu/message-read.ts'
-import { feishuUserMessage, InboundRouter } from './routing/inbound.ts'
+import { InboundRouter } from './routing/inbound.ts'
+import { feishuUserMessage, promptCallerOf, withFeishuSender } from './access/principal.ts'
 import { MissedMessages } from './routing/missed.ts'
 import type { RequestPolicyController } from './session/request-policy.ts'
 import type { CardActionEvent, ChannelFactory, FeishuChannel, NormalizedMessage } from './feishu-channel.ts'
@@ -499,8 +500,7 @@ export class FeishuService {
         replay: (agent, snapshot, message, submit) => {
           this.streamer?.attach(agent.session, snapshot.cards[0]!.messageId, snapshot.triggerMessageId, snapshot.reactionId, { message })
           if (!submit) return
-          this.codeWriteGate.noteMessage(snapshot.sessionId, message.id, snapshot.senderUserId)
-          agent.followup(message)
+          agent.followup(this.replayedPrompt(snapshot, message))
         },
       },
     })
@@ -662,7 +662,6 @@ export class FeishuService {
       noteKnownAttachments: (record, message, source) => {
         this.noteKnownAttachmentMessage(record, message, source ?? 'trigger')
       },
-      noteTurnSender: (sessionId, messageId, userId) => this.codeWriteGate.noteMessage(sessionId, messageId, userId),
       messageRead: {
         quote: input => this.readQuoteContext(input),
         history: input => this.readHistoryContext(input),
@@ -1935,7 +1934,7 @@ export class FeishuService {
     }))
     // Binds each card to the turn its own prompt opens (see `TurnStreamer`).
     this.unlistenHost.push(this.ctx.on('agent/inbox/claimed', ({ agent, message, turn }) => {
-      this.codeWriteGate.onClaimed(agent.session.id, message.id)
+      this.codeWriteGate.onClaimed(agent.session.id, message)
       this.streamer?.onInboxClaimed(agent.session, message, turn)
     }))
     this.unlistenHost.push(this.ctx.on('agent/inbox/discarded', ({ agent, message }) => {
@@ -2491,6 +2490,17 @@ export class FeishuService {
   }
 
   /**
+   * The prompt restart recovery replays. A prompt stored before prompts
+   * carried a principal gets the sender stored beside it; with no stored
+   * sender, the code-write gate denies the replayed turn's gated calls.
+   */
+  private replayedPrompt(snapshot: InflightSnapshot, message: UserMessage): UserMessage {
+    if (snapshot.senderUserId !== undefined) return withFeishuSender(message, snapshot.senderUserId)
+    if (promptCallerOf(message.source).kind === 'none') this.codeWriteGate.markSenderUnknown(snapshot.sessionId)
+    return message
+  }
+
+  /**
    * The live Agent of an interrupted turn's route, cold-resumed when needed;
    * undefined when the route is gone, was renewed to another Session, or the
    * resume failed.
@@ -2532,13 +2542,12 @@ export class FeishuService {
     if (target === undefined || this.resumedCards.has(event.messageId)) return
     const route = this.routes.findBySession(target.sessionId)
     if (route === undefined) return
-    if (!this.accessController.mayActOnRoute(event.operator.userId, event.chatId, route)) return
+    const operator = event.operator.userId
+    if (operator === undefined || !this.accessController.mayActOnRoute(operator, event.chatId, route)) return
     this.resumedCards.add(event.messageId)
     try {
       const live = await this.sessions.ensureLive(route)
-      const message = feishuUserMessage(RESUME_PROMPT)
-      const operator = event.operator.userId
-      if (operator !== undefined) this.codeWriteGate.noteMessage(route.sessionId, message.id, operator)
+      const message = feishuUserMessage(RESUME_PROMPT, operator)
       const stored = storableMessage(message)
       await this.repair.write({
         key: event.messageId,
@@ -2547,7 +2556,7 @@ export class FeishuService {
         ...(target.triggerMessageId === undefined ? {} : { triggerMessageId: target.triggerMessageId }),
         routeKey: route.key,
         ...(stored === undefined ? {} : { message: stored }),
-        ...(operator === undefined ? {} : { senderUserId: operator }),
+        senderUserId: operator,
         cards: [{ messageId: event.messageId, mode: 'card' }],
         startedAt: Date.now(),
         attempts: 0,
