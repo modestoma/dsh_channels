@@ -223,6 +223,28 @@ describe('topic launch flow', () => {
     expect(lastCard(h, 'om_2')).toContain('model down')
   })
 
+  it('reports the launch state with the topic Session and emits every recorded status', async () => {
+    const h = await setup()
+    const emit = vi.fn()
+    h.ctxState.ctx.emit = emit
+    await h.service.addAccessUser('u_alice')
+    expect(h.launcher.state('key-1')).toBeUndefined()
+    await h.launcher.launch(spec())
+    await waitUntil(() => expect(h.routes()).toHaveLength(1))
+    const route = h.routes()[0]!
+    expect(route.sessionDir).toBeDefined()
+    const running = { key: 'key-1', status: 'running', sessionId: route.sessionId, workDir: route.sessionDir }
+    expect(h.launcher.state('key-1')).toEqual(running)
+    expect(h.record('key-1')?.threadId).toBe(route.key)
+    expect(h.launcher.launchKeyOf(route.sessionId)).toBe('key-1')
+    expect(h.launcher.launchKeyOf('other-session')).toBeUndefined()
+
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    h.ctxState.sessionListeners[0]!(agent.session, { type: 'turn/end', seq: 1, data: { turn: 1, reason: 'stop' } })
+    await waitUntil(() => expect(emit).toHaveBeenCalledWith('feishu-topics/status', { ...running, status: 'done' }))
+    expect(h.launcher.state('key-1')).toEqual({ ...running, status: 'done' })
+  })
+
   it('marks analyses a previous instance never finished as interrupted at start', async () => {
     const h = await setup()
     await h.service.addAccessUser('u_alice')
@@ -351,9 +373,13 @@ describe('topic launch flow', () => {
   it('ends on a failure card without a route when setup fails', async () => {
     const h = await setup()
     await h.service.addAccessUser('u_alice')
+    const emit = vi.fn()
+    h.ctxState.ctx.emit = emit
     sessionsOf(h.launcher).mountGuidance = async () => { throw new Error('mount failed') }
     await h.launcher.launch(spec())
     await waitUntil(() => expect(h.record('key-1')?.status).toBe('failed'))
+    expect(h.launcher.state('key-1')).toEqual({ key: 'key-1', status: 'failed', reason: 'mount failed' })
+    expect(emit).toHaveBeenCalledWith('feishu-topics/status', { key: 'key-1', status: 'failed', reason: 'mount failed' })
     expect(lastCard(h, 'om_1')).toContain('分析未能开始：mount failed')
     expect(lastCard(h, 'om_1')).toContain('"template":"red"')
     expect(lastCard(h, 'om_2')).toContain('分析未能开始：mount failed')

@@ -12,7 +12,9 @@
  * (已完成 / 已停止 / 失败), and the launch record keeps the same status. At
  * channel start, records still `running` belong to topics a previous instance
  * never finished; {@link TopicLauncher.markInterrupted} marks their cards
- * 已中断.
+ * 已中断. Every recorded status is emitted as the `feishu-topics/status`
+ * event. {@link TopicLauncher.state} and {@link TopicLauncher.launchKeyOf}
+ * read the record together with the topic's current route.
  *
  * The topic is reserved in the inbound router from its creation until the
  * route and the first prompt are published, so replies posted meanwhile queue
@@ -32,7 +34,7 @@ import type { FeishuConfig } from '../config.ts'
 import { buildCard, buildTopicRootCard, initialStreamingCard } from '../cards.ts'
 import type { TopicStatus } from '../cards.ts'
 import type { RouteOperationQueue } from '../commands.ts'
-import { FEISHU_USER_ID_PATTERN, rootCardOf } from '../domain.ts'
+import { FEISHU_USER_ID_PATTERN, rootCardOf, sessionDirOf } from '../domain.ts'
 import type { FeishuDomainHandle, RouteRecord, TopicLaunchRecord } from '../domain.ts'
 import type { FeishuChannel } from '../feishu-channel.ts'
 import { feishuUserMessage } from '../routing/inbound.ts'
@@ -45,8 +47,8 @@ import type { RouteStore } from '../session/routes.ts'
 import type { TurnStreamer } from '../streamer.ts'
 import { ensureLaunchWorkspace, RESERVED_WORKSPACE_ROOTS, topicTokenFor } from '../workspaces.ts'
 import type {
-  FeishuTopicService, FeishuTopicsServiceName, FeishuTopicsVersion, TopicLaunchFailureCode,
-  TopicLaunchResult, TopicLaunchSpec, TopicRootCard,
+  FeishuTopicService, FeishuTopicsServiceName, FeishuTopicsStatusEvent, FeishuTopicsVersion,
+  TopicLaunchFailureCode, TopicLaunchResult, TopicLaunchSpec, TopicLaunchState, TopicRootCard,
 } from './contract.ts'
 
 /** Name the launcher is provided under. */
@@ -54,6 +56,9 @@ export const FEISHU_TOPICS_SERVICE: FeishuTopicsServiceName = 'feishuTopics'
 
 /** Contract version the launcher implements. */
 export const FEISHU_TOPICS_VERSION: FeishuTopicsVersion = 1
+
+/** Event emitted after a launch status is recorded. */
+export const FEISHU_TOPICS_STATUS_EVENT: FeishuTopicsStatusEvent = 'feishu-topics/status'
 
 const text = (max: number) => z.string().min(1).max(max).refine(value => value.trim() !== '', 'must not be blank')
 
@@ -146,6 +151,29 @@ export class TopicLauncher implements FeishuTopicService {
   /** Refuse launches (`not-connected`) ahead of shutdown. */
   close(): void {
     this.admitting = false
+  }
+
+  state(key: string): TopicLaunchState | undefined {
+    const record = this.deps.domain()?.topicLaunches.get(key)
+    if (record === undefined) return undefined
+    const route = record.threadId === undefined ? undefined : this.deps.routes.get(record.threadId)
+    return {
+      key,
+      status: record.status,
+      ...(record.status === 'failed' && record.reason !== undefined ? { reason: record.reason } : {}),
+      ...(route === undefined ? {} : { sessionId: route.sessionId, workDir: sessionDirOf(route) }),
+    }
+  }
+
+  launchKeyOf(sessionId: string): string | undefined {
+    const route = this.deps.routes.findBySession(sessionId)
+    if (route?.kind !== 'thread' || route.shared !== true) return undefined
+    const domain = this.deps.domain()
+    if (domain === undefined) return undefined
+    for (const [key, record] of domain.topicLaunches.entries()) {
+      if (record.threadId === route.key) return key
+    }
+    return undefined
   }
 
   async launch(spec: TopicLaunchSpec): Promise<TopicLaunchResult> {
@@ -261,7 +289,7 @@ export class TopicLauncher implements FeishuTopicService {
       await channel.updateCard(rootId, buildTopicRootCard(spec.requesterUserId, card, status)).catch((error: unknown) => {
         warn('dsh-channels: updating topic card %s failed: %s', rootId, String(error))
       })
-      await this.recordStatus(spec.key, status.kind)
+      await this.recordStatus(spec.key, status.kind, status.kind === 'failed' ? status.reason : undefined)
     }
     const sessionId = randomUUID() as SessionId
     let handle: AgentHandle | undefined
@@ -274,6 +302,7 @@ export class TopicLauncher implements FeishuTopicService {
       cardId = topic.cardId
       threadId = topic.threadId
       releaseTopic = this.deps.reserveTopic(threadId)
+      await this.recordThread(spec.key, threadId)
       const services = placementServices(this.deps.ctx)
       const workspace = await ensureLaunchWorkspace(
         this.deps.ctx, this.deps.config.baseDir, spec.workspace.segments, spec.workspace.title,
@@ -391,15 +420,41 @@ export class TopicLauncher implements FeishuTopicService {
     return { cardId: sent.messageId, threadId }
   }
 
-  /** Store a root card status in the launch record (best-effort; the card already shows it). */
-  private async recordStatus(key: string, status: TopicLaunchRecord['status']): Promise<void> {
+  /**
+   * Store a root card status in the launch record (best-effort; the card
+   * already shows it), then emit the launch state.
+   */
+  private async recordStatus(key: string, status: TopicLaunchRecord['status'], reason?: string): Promise<void> {
+    const domain = this.deps.domain()
+    const record = domain?.topicLaunches.get(key)
+    if (domain === undefined || record === undefined) return
+    const next: TopicLaunchRecord = { ...record, status }
+    if (reason === undefined) delete next.reason
+    else next.reason = reason
+    try {
+      await domain.topicLaunches.put(key, next)
+    } catch (error) {
+      this.deps.ctx.logger?.warn?.('dsh-channels: recording topic %s status failed: %s', key, String(error))
+      return
+    }
+    const state = this.state(key)
+    if (state === undefined) return
+    try {
+      this.deps.ctx.emit?.(FEISHU_TOPICS_STATUS_EVENT, state)
+    } catch (error) {
+      this.deps.ctx.logger?.warn?.('dsh-channels: a %s listener failed for topic %s: %s', FEISHU_TOPICS_STATUS_EVENT, key, String(error))
+    }
+  }
+
+  /** Store the opened topic's id in the launch record, so its route can be found (best-effort). */
+  private async recordThread(key: string, threadId: string): Promise<void> {
     const domain = this.deps.domain()
     const record = domain?.topicLaunches.get(key)
     if (domain === undefined || record === undefined) return
     try {
-      await domain.topicLaunches.put(key, { ...record, status })
+      await domain.topicLaunches.put(key, { ...record, threadId })
     } catch (error) {
-      this.deps.ctx.logger?.warn?.('dsh-channels: recording topic %s status failed: %s', key, String(error))
+      this.deps.ctx.logger?.warn?.('dsh-channels: recording topic %s thread failed: %s', key, String(error))
     }
   }
 

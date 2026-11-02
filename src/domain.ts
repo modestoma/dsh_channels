@@ -409,6 +409,10 @@ export const topicLaunchRecordSchema = z.object({
    * instance never finished, and becomes `interrupted`.
    */
   status: z.enum(['running', 'done', 'stopped', 'error', 'failed', 'interrupted']),
+  /** Why the topic could not be started (status `failed`); absent on older records. */
+  reason: z.string().optional(),
+  /** Topic id (the route key) once the topic is opened; absent on older records. */
+  threadId: z.string().min(1).optional(),
 })
 
 export type TopicLaunchRecord = z.infer<typeof topicLaunchRecordSchema>

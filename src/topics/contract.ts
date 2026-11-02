@@ -142,7 +142,47 @@ export type TopicLaunchResult =
     readonly message: string
   }
 
-/** The `feishuTopics` service. */
+/**
+ * Root card status of a launch: `running` until the first turn settles, then
+ * `done`, `stopped`, or `error` (the first turn failed); `failed` when the
+ * topic or Session could not be started; `interrupted` when DSH restarted
+ * before the first turn settled.
+ */
+export type TopicLaunchStatus = 'running' | 'done' | 'stopped' | 'error' | 'failed' | 'interrupted'
+
+/** What one accepted launch has become. */
+export interface TopicLaunchState {
+  /** The launch's idempotency key. */
+  readonly key: string
+  readonly status: TopicLaunchStatus
+  /** Why the topic could not be started; only with status `failed`. */
+  readonly reason?: string
+  /**
+   * Session the topic's route currently names (`/renew` moves it to the new
+   * Session). Absent before the route is published, after setup failed, and
+   * after the route retired.
+   */
+  readonly sessionId?: string
+  /**
+   * Directory the topic's tools work in (its per-topic directory or Git
+   * worktree checkout); present exactly when {@link sessionId} is.
+   */
+  readonly workDir?: string
+}
+
+/**
+ * Cordis event emitted with `ctx.emit` after a launch's status is recorded
+ * (first turn settled, setup failed, or marked interrupted at channel start).
+ * Listeners receive the new {@link TopicLaunchState}; a listener that throws
+ * is logged and does not affect the topic.
+ */
+export type FeishuTopicsStatusEvent = 'feishu-topics/status'
+
+/**
+ * The `feishuTopics` service. {@link FeishuTopicService.state} and
+ * {@link FeishuTopicService.launchKeyOf} were added without a version change;
+ * a consumer that must work with older providers checks that they exist.
+ */
 export interface FeishuTopicService {
   readonly version: FeishuTopicsVersion
   /**
@@ -154,4 +194,18 @@ export interface FeishuTopicService {
    * @returns the root card, or why nothing was started.
    */
   launch(spec: TopicLaunchSpec): Promise<TopicLaunchResult>
+  /**
+   * Read what one launch has become.
+   * @param key - the launch's idempotency key.
+   * @returns the launch state, or undefined when no launch was accepted
+   * under the key or the channel is not connected.
+   */
+  state(key: string): TopicLaunchState | undefined
+  /**
+   * Find the launch whose topic route currently names a Session.
+   * @param sessionId - DSH session id.
+   * @returns the launch's idempotency key, or undefined when the Session is
+   * not the current Session of a launched topic.
+   */
+  launchKeyOf(sessionId: string): string | undefined
 }

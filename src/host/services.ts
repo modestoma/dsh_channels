@@ -9,6 +9,7 @@
 import type { Agent, AgentRegistry } from './agent.ts'
 import type { AttachmentStore } from './attachments.ts'
 import type { CommandRuntime } from './commands.ts'
+import type { TopicLaunchState } from '../topics/contract.ts'
 import type { AssistantStreamPayload, CommitTrailersEvent, InboxClaimedPayload, InboxDiscardedPayload, PreToolDecision, PreToolExecution, Session, SessionEvent, SessionId } from './core.ts'
 import type { ApprovalAnswererListener, UserQuestionAnswererListener } from './interaction.ts'
 
@@ -357,4 +358,9 @@ export interface HostContext {
     options?: { prepend?: boolean },
   ): () => boolean
   effect(callback: () => (() => void | Promise<void>) | void, label?: string): void
+  /**
+   * Emit this plugin's `feishu-topics/status` event to every listener.
+   * Optional so test contexts may omit it.
+   */
+  emit?(name: 'feishu-topics/status', state: TopicLaunchState): void
 }
