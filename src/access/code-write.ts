@@ -8,22 +8,22 @@
  *   Every call remembers its Session's routed root, which covers nested
  *   subagents because a child must call a tool to spawn its own child. Calls
  *   of Sessions the channel does not route are never touched.
- * - Driver: the Feishu sender of the message the current turn claimed. Turns
- *   no Feishu message started (subagent results, jobs, schedules) keep the
- *   previous driver; before any claimed message the route owner drives. A
- *   prompt replayed after a restart carries the sender stored with it; when
- *   none was stored, every gated call of that turn is denied.
- * - Remembered senders are bounded. When a pending message's sender is
- *   dropped, its Session fails closed: a turn there that claims a message
- *   without a remembered sender denies every gated call, until a message
- *   with a remembered sender is claimed in that Session.
+ * - Driver: the Feishu user the claimed message's source names as its
+ *   principal (see `./principal.ts`). The source is part of the durable
+ *   message, so a prompt replayed after a restart still names its sender. A
+ *   claimed message with no principal (the Host owner, slash-command
+ *   expansions, subagent results, jobs, schedules) keeps the previous driver;
+ *   before any claimed message the route owner drives. A message naming a
+ *   principal other than a Feishu user, or a replayed prompt whose sender was
+ *   never recorded, makes the driver unknown: every gated call is denied until
+ *   a message naming a Feishu user is claimed.
  * - The check runs in `tools/pre-execute`, before the tool's own approval, so
  *   it holds whatever approval mode the tool's plugin uses.
  *
  * The same driver names the Feishu user in the `Feishu-User:` trailer of
  * commits the Session pushes (see {@link CodeWriteGate.driverOf}).
  *
- * State is in memory only and ends with the process.
+ * Drivers and descendants are kept in memory and end with the process.
  *
  * @module dsh-channels/access/code-write
  */
@@ -31,11 +31,10 @@
 import type { FeishuConfig } from '../config.ts'
 import type { AccessPermission, RouteRecord } from '../domain.ts'
 import type { PreToolDecision, PreToolExecution } from '../dsh-types.ts'
+import type { UserMessage } from '../host/core.ts'
+import { promptCallerOf } from './principal.ts'
 
-/** Remembered message senders (bounded; oldest dropped first). */
-const MAX_NOTED_MESSAGES = 2_000
-
-/** Driver of a turn whose Feishu sender cannot be established (an older replayed snapshot, or a dropped sender). */
+/** Driver of a turn whose Feishu sender cannot be established. */
 const UNKNOWN_SENDER = Symbol('unknown sender')
 type Driver = string | typeof UNKNOWN_SENDER
 
@@ -48,17 +47,7 @@ export interface CodeWriteGateDeps {
   mayUse(userId: string, permission: AccessPermission): boolean
 }
 
-/** One remembered sender of a message not yet claimed. */
-interface NotedSender {
-  readonly sessionId: string
-  readonly driver: Driver
-}
-
 export class CodeWriteGate {
-  /** DSH `UserMessage.id` → its Session and Feishu sender, until claimed. */
-  private readonly senders = new Map<string, NotedSender>()
-  /** Sessions with a pending message whose sender was dropped. */
-  private readonly droppedSenders = new Set<string>()
   /** Routed Session id → user_id that drives its current turn. */
   private readonly drivers = new Map<string, Driver>()
   /** Descendant Session id → routed ancestor Session id. */
@@ -67,39 +56,35 @@ export class CodeWriteGate {
   constructor(private readonly deps: CodeWriteGateDeps) {}
 
   /**
-   * Record who sent the prompt carried by one DSH user message.
-   * @param sessionId - the routed Session the message is submitted to.
-   * @param messageId - the `UserMessage.id` submitted to the Agent.
-   * @param userId - Feishu user_id of the sender; undefined when it cannot be
-   *   established, which denies every gated call of the turn it starts.
+   * A turn claimed an inbox message: the Feishu user its source names drives
+   * the turn; a message without a principal keeps the previous driver; any
+   * other principal makes the driver unknown.
+   * @param sessionId - the claiming Session.
+   * @param message - the claimed message.
    */
-  noteMessage(sessionId: string, messageId: string, userId: string | undefined): void {
-    this.senders.set(messageId, { sessionId, driver: userId ?? UNKNOWN_SENDER })
-    if (this.senders.size <= MAX_NOTED_MESSAGES) return
-    const [oldest] = this.senders
-    if (oldest === undefined) return
-    this.senders.delete(oldest[0])
-    this.droppedSenders.add(oldest[1].sessionId)
+  onClaimed(sessionId: string, message: Pick<UserMessage, 'source'>): void {
+    const caller = promptCallerOf(message.source)
+    switch (caller.kind) {
+      case 'feishu-user':
+        this.drivers.set(sessionId, caller.userId)
+        return
+      case 'other-principal':
+        this.drivers.set(sessionId, UNKNOWN_SENDER)
+        return
+      case 'none':
+        return
+      default:
+        assertNever(caller)
+    }
   }
 
   /**
-   * A turn claimed an inbox message: its sender, when known, drives the turn.
-   * A message without a remembered sender keeps the previous driver, unless
-   * the Session has a dropped sender pending; then the driver is unknown.
-   * @param sessionId - the claiming Session.
-   * @param messageId - the claimed `UserMessage.id`.
+   * Restart recovery replays a prompt whose sender was never recorded: deny
+   * every gated call until a message naming a Feishu user is claimed.
+   * @param sessionId - the routed Session the prompt is replayed into.
    */
-  onClaimed(sessionId: string, messageId: string): void {
-    const sender = this.senders.get(messageId)
-    if (sender === undefined) {
-      if (this.droppedSenders.has(sessionId)) this.drivers.set(sessionId, UNKNOWN_SENDER)
-      return
-    }
-    this.senders.delete(messageId)
-    // Inbox messages are claimed in submission order, so the dropped ones
-    // were claimed before this later-noted message.
-    this.droppedSenders.delete(sessionId)
-    this.drivers.set(sessionId, sender.driver)
+  markSenderUnknown(sessionId: string): void {
+    this.drivers.set(sessionId, UNKNOWN_SENDER)
   }
 
   /**
@@ -119,7 +104,7 @@ export class CodeWriteGate {
     if (driver === UNKNOWN_SENDER) {
       return {
         kind: 'deny',
-        reason: `无法确认这一轮的飞书发言人（重启后恢复的消息，或排队的消息过多），不能调用 ${exec.name}。请告诉用户：重新发送一条消息后再试。`,
+        reason: `无法确认这一轮的飞书发言人（重启后恢复的旧消息，或不是飞书用户发起的消息），不能调用 ${exec.name}。请告诉用户：重新发送一条消息后再试。`,
       }
     }
     if (this.deps.mayUse(driver, 'codeWrite')) return undefined
@@ -147,10 +132,8 @@ export class CodeWriteGate {
     return route === undefined ? undefined : this.drivers.get(root) ?? route.senderUserId
   }
 
-  /** Drop every remembered sender, driver, and descendant (shutdown). */
+  /** Drop every driver and descendant (shutdown). */
   clear(): void {
-    this.senders.clear()
-    this.droppedSenders.clear()
     this.drivers.clear()
     this.roots.clear()
   }
@@ -165,4 +148,8 @@ export class CodeWriteGate {
     if (root !== undefined) this.roots.set(sessionId, root)
     return root
   }
+}
+
+function assertNever(value: never): never {
+  throw new Error(`unexpected prompt caller: ${JSON.stringify(value)}`)
 }

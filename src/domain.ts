@@ -208,10 +208,10 @@ export const inflightSnapshotSchema = z.object({
   /**
    * Feishu user_id the turn of `message` acts for: the sender of an inbound
    * message, the requester of a launched topic, the operator of a continue
-   * button, or the Session's driver when a host turn started. Restart
-   * recovery hands it to the code-write gate with the replayed prompt. Absent
-   * in snapshots written before it was recorded, and for a host turn whose
-   * driver was unknown.
+   * button, or the Session's driver when a host turn started. A prompt stored
+   * before prompts carried a principal gets this user as its principal when
+   * restart recovery replays it. Absent in snapshots written before it was
+   * recorded, and for a host turn whose driver was unknown.
    */
   senderUserId: z.string().min(1).optional(),
   /** How often restart recovery already replayed `message` (cap: 1). */
