@@ -406,7 +406,8 @@ export const configSchema = z.object({
    */
   accessMode: z.enum(['open', 'guarded']).default('guarded'),
   /**
-   * Tools that write to a remote repository (push, merge requests, issues).
+   * Tools that write to a remote repository (push, merge requests, issues,
+   * branch deletion, CI retry and cancel).
    * In a Feishu Session a call is refused unless the user who drives the
    * current turn is an administrator or holds the `codeWrite` switch. Names
    * are matched exactly; an empty list turns the check off.
@@ -420,6 +421,9 @@ export const configSchema = z.object({
     'repo_issue_create',
     'repo_issue_update',
     'repo_issue_comment',
+    'repo_branch_delete',
+    'repo_ci_retry',
+    'repo_ci_cancel',
     'logalyze_improve_skill',
     'logalyze_submit_init',
   ]),
