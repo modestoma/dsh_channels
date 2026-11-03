@@ -133,7 +133,7 @@ chmod 600 $DSH_HOME/.credentials.yaml
       topicMessagesTimeoutMs: 20000     # 单次话题读取整段超时（20 s）
     approvalTimeoutMs: 300000           # HITL 审批决策卡等待时长（默认 5 分钟）
     accessMode: 'guarded'               # 准入模式：guarded（默认）| open（旧行为，不安全）
-    # codeWriteTools: [...]             # 需要「代码改动」开关的工具名，默认是 dsh-repo 推送/MR/Issue 写操作与观象的 SKILL 提交
+    # codeWriteTools: [...]             # 需要「代码改动」开关的工具名，默认是 dsh-repo 推送/MR/Issue 写操作、删分支、重跑/取消 CI 与观象的 SKILL 提交
     authRequestTtlDays: 7               # 入群/用户授权申请卡有效期（天）
     loggerLevel: 'info'
 ```
@@ -154,7 +154,7 @@ chmod 600 $DSH_HOME/.credentials.yaml
 | `topicIsolation` | `auto` | 话题工作目录形式：`auto`（工作区含 `.git` 时用 Git worktree，否则普通子目录）/ `subdir` / `worktree`（失败回退子目录） |
 | `approvalTimeoutMs` | `300000` | HITL 审批决策卡等待时长（10s–1h）；超时自动拒绝 |
 | `accessMode` | `guarded` | 准入模式：`guarded` 仅管理员 + 用户表里对话准入打开的人；`open` 保留旧行为（任何可用范围用户可对话，不安全；知识库与代码改动开关仍生效） |
-| `codeWriteTools` | dsh-repo 写操作与观象 SKILL 提交 | 飞书会话调用这些工具前检查当前发言人的「代码改动」开关（管理员始终放行） |
+| `codeWriteTools` | dsh-repo 写操作（推送、MR、Issue、删分支、CI 重跑/取消）与观象 SKILL 提交 | 飞书会话调用这些工具前检查当前发言人的「代码改动」开关（管理员始终放行） |
 | `authRequestTtlDays` | `7` | 入群/用户授权申请卡有效期（1–30 天） |
 | `acceptAttachments` | `true` | 接收飞书图片/文件/合并转发记录。native 下触发消息图片预取、文件懒取、纯附件静默不回复（引用该消息再提问时列入清单）；`false` 时附件消息完全惰性（不保存、不触发、不列入清单） |
 | `prefetchImages` | `true` | native 下把触发消息图片预取为首轮 `ImageBlock`；失败/超限/超时降级为清单懒取项。关闭后图片也需 `feishu_attachment_fetch` |

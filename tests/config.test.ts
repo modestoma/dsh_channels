@@ -32,6 +32,15 @@ describe('resolveConfig', () => {
     expect(config.reasoningEffort).toBeUndefined()
   })
 
+  it('gates every remote-writing dsh-repo tool by default, including branch deletion and CI control', () => {
+    const config = resolveConfig(undefined)
+    expect(config.codeWriteTools).toEqual(expect.arrayContaining([
+      'repo_workspace_push', 'repo_mr_create', 'repo_mr_update', 'repo_mr_comment', 'repo_mr_merge',
+      'repo_issue_create', 'repo_issue_update', 'repo_issue_comment',
+      'repo_branch_delete', 'repo_ci_retry', 'repo_ci_cancel',
+    ]))
+  })
+
 
   it('ignores the removed workspace-retention keys in older profiles', () => {
     const config = resolveConfig({ workspaceRetention: '30d', workspaceRetentionAuto: true })
