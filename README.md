@@ -389,7 +389,7 @@ FEISHU_APP_SECRET: xxxxxxxx
 
 启动成功标志（控制台）：`[dsh-channels] feishu long connection established, bot open_id: ou_xxx`；凭据不完整时不会连接，日志会提示缺少的凭据引用（如 `飞书应用凭据未配置完整（缺少 FEISHU_APP_SECRET…）`），打开 Web 左侧栏 **飞书渠道 → 连接** 补齐即可。
 
-宿主 profile 已内置所需服务（agent-loop、llm-deepseek、session 持久化、storage-domain、workspace、working-directory）；web profile 默认组合还包含 DSH 原生附件库 `dsh-attachment-local` 与 `dsh-tools`（`ctx.attachments` / `ctx.tools`）。原生附件库是插件的必需依赖（`inject` 含 `attachments`）：组合里缺少它时插件不会启动。**提示提交需要 DSH Web 组合**：插件以飞书用户身份经 `session/prompt` 提交提示，依赖 `connection`（Peer）、`typertGateway`、`remoteAccess`、`fileUploads` 四个宿主服务，它们来自 web-app bundle；启动时缺少任一服务即报错退出（日志写明缺哪一个），不会退回为所有者身份提交。推荐确认 `dsh-token-meter` 已启用（卡片上下文占用显示）。Git worktree 隔离模式额外依赖可选的 `@deepseek-ai/dsh-experimental-worktree` 实验插件，缺失时自动回退为普通话题子目录。
+宿主 profile 已内置所需服务（agent-loop、llm-deepseek、session 持久化、storage-domain、workspace、working-directory）；web profile 默认组合还包含 DSH 原生附件库 `dsh-attachment-local` 与 `dsh-tools`（`ctx.attachments` / `ctx.tools`）。原生附件库是插件的必需依赖（`inject` 含 `attachments`）：组合里缺少它时插件不会启动。**提示提交需要 DSH Web 组合**：插件以飞书用户身份经 `session/prompt` 提交提示，依赖 `connection`（Peer）、`typertGateway`、`remoteAccess`、`fileUploads` 四个宿主服务，它们来自 web-app bundle，并且都在 `inject` 里：加载器等它们就绪后才启动插件，组合里没有它们时插件不会启动（与 `attachments` 相同），不会退回为所有者身份提交。推荐确认 `dsh-token-meter` 已启用（卡片上下文占用显示）。Git worktree 隔离模式额外依赖可选的 `@deepseek-ai/dsh-experimental-worktree` 实验插件，缺失时自动回退为普通话题子目录。
 
 **工具与 agent preset（web profile）**：web profile 把 bash/fs/todo 等工具行全部标为 `disabled: true`，工具只存在于 agent preset 里，且 `agents.create()` 不会自动应用 preset——插件因此在创建/恢复会话时通过 `setup` 回调挂载 preset（默认 `standard`，可用 `agentPreset` 指定更精简的 preset，如只含 bash/fs 的自定义项），并把 preset id 记录进会话头。附件管线的两个模型工具在 preset `setup` 之后挂载：`feishu_attachment_fetch` 在 `acceptAttachments` 打开时挂载，`feishu_topic_messages` 总是挂载（均为 `inject(['tools'])`）；宿主缺 `tools` 服务时工具 no-op + 一次性告警，不阻塞会话（详见 [docs/attachment-pipeline-v2.md](docs/attachment-pipeline-v2.md)）。若机器人回复把 `<tool_calls>…` 当纯文本吐出，即该会话没挂上 preset；修好后再看会话的 `request/header` 应带 `tools` 字段、日志出现 `tool/call` 事件。无 preset roster 的部署（如 headless）不做此步骤，工具本就位于宿主层。
 
@@ -552,7 +552,7 @@ const result = await topics?.launch({
 - **v2 附件（升级连续性）**：archive 后端已移除，旧配置里的 `attachmentStore` 与 `feishuTools.attachmentFetch` 会被忽略。历史话题里已有的 `attachments/` 不会被新会话枚举；Session 历史仍可按原路径读取，旧目录可手动删除。
 - **准入（升级连续性）**：升级到用户表后，原用户白名单里的人变成只打开对话准入的用户，**从此可以私聊、也可以在任何群里使用机器人**（以前私聊要开 `dmAllowWhitelist`、群聊要群已授权）。原群白名单和知识库白名单不迁移：数据留在存储里但不再读取，原来知识库白名单里的人需要管理员逐个打开「知识库读取」或「知识库写入」。待处理的群授权申请不再显示，旧卡片点了也不生效。`dmAllowWhitelist` 配置项和 `/auth allow|revoke`、`/auth user …`、`/auth wiki …` 命令已删除，旧配置里的 `dmAllowWhitelist` 会被忽略。代码改动开关默认关闭，非管理员需要管理员打开后才能在飞书里推送代码或提交 MR。
 - **代码改动开关的范围**：只拦 `codeWriteTools` 里列出的工具，不拦本地文件编辑和 shell 命令；发言人从被认领消息的 `principal` 读，在途快照存的是提示的请求 id、调用方和内容，重启后以同一个调用方、同一个请求 id 重新提交，DSH 按请求 id 去重，所以重放的消息仍认得发送者。被认领消息的 `principal` 不是合法的飞书用户或群（例如其他接入方的调用者）时拒绝，直到认领到一条飞书用户的消息。重启后还没有新消息时按路由所有者判断。共享话题里谁都可以点代码类工具的审批卡，但工具本身只认发言人的开关。
-- **发言人身份（升级连续性）**：升级前写下的在途快照里只有插件自己拼的消息、没有调用方，重启后不重放，卡片改为「服务已重启」并提供「继续」按钮（点击人成为这一轮的调用方）。升级后的部署必须使用 DSH Web 组合（见「宿主侧准备」），headless 等没有 `typertGateway` 的组合里插件启动即报错。
+- **发言人身份（升级连续性）**：升级前写下的在途快照里只有插件自己拼的消息、没有调用方，重启后不重放，卡片改为「服务已重启」并提供「继续」按钮（点击人成为这一轮的调用方）。升级后的部署必须使用 DSH Web 组合（见「宿主侧准备」），headless 等没有 `typertGateway` 的组合里插件不会启动。
 - **`/renew` 的会话语义**：同一话题内新建 Session 沿用话题目录、复用附件；但新 Session 首轮不注入 `<feishu_history>`（仅 `startSession` 路径注入首轮历史，当前语义保留，若产品期望“新会话即带话题历史”需另行确认）。
 - **degraded 群会话的读取容器**：话题创建失败降级为 chat 路由后，其容器是整群主时间线——同群他人主时间线消息可被读取/登记（topic 消息已明确拒绝）；是否按 sender 进一步收紧待产品确认。
 - **合并转发读取有界**：单条读取子消息超过 50 条时截断（summary 标注数量）、无翻页；工具输出渲染上限 50 行 / 12k 字符。
