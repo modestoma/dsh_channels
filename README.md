@@ -12,9 +12,10 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 - **HITL 审批**：当模型请求需要授权的动作（如 bash 沙箱升级 `sandbox_permissions`）时，插件监听主机 `approval/request` 事件，在同一话题里**新发一张独立审批决策卡**：卡片标题带工具名；工具在审批请求里给了说明时，说明按行显示为卡片主体（`标签：值` 行显示成标签和值，缩进行显示成列表，不按 markdown 解析），bash 等带 `command` 参数的工具另外显示将执行的命令，其余参数按 `名称: 值` 收进默认折叠的「调用参数」，没有说明和命令时直接展开显示；提权时写明提权目标。提供 ✅ 允许 / ❌ 拒绝 / ♾️ 本话题不再询问 三个按钮；也可以在话题里直接回复「允许」「拒绝」「全部允许」，回复其他内容视为拒绝并作为下一条指令。等待期间流式卡片状态行显示「✋ 等待审批：工具名」。超时（`approvalTimeoutMs`，默认 5 分钟）自动拒绝（fail-closed）；私聊话题只认本人，群话题里通过准入的成员都可以点或回复，其他人无效
 - **结构化提问**：模型调用 `ask_user_question` 时，插件监听主机 `user-questions/request` 瀑布并发一张问答卡（每个问题一组选项按钮，多选先勾选再「提交本题选择」），答案回填给模型；主机自带的应答者只有 Web 客户端，没有本插件时纯飞书会话会以 `NO_PROVIDER` 失败。超时（`questionTimeoutMs`，默认 5 分钟）或回合取消时本轮提问失败（fail-closed）；没有可选项的问题直接提示用文字作答，**阻塞期间普通文本回复即作为该问题的自由文本答案**（同时支持多选后的自定义文本）
 - **准入与授权（默认开启）**：准入只看一张扁平的**用户表**，每人有四个独立开关：**对话准入**、**知识库读取**、**知识库写入**、**代码改动**。**管理员也是用户表里的一行**：打开「管理员」开关的人拥有全部权限（其他开关对他不起作用），可以有多个，只能在 Web 设置面板设置。对话准入打开的人可以私聊机器人，也可以在任何群里 @ 它（包括自己把机器人拉进的群），不再有群白名单；对话准入关闭等于停用，其他开关一并失效。新加入的人只打开对话准入。不在表里的人私聊只收到一条固定提示（`/userid` 例外），在群里 @ 机器人或把它拉进群时，管理员私聊收到**用户授权申请卡**。授权入口：飞书 `/auth` 命令、授权卡、Web 设置面板；**管理员只能在面板用户表里设置**（私聊 `/userid` 获取 user_id），飞书里不能授予或移除管理员。用户表里没有管理员时 `guarded` 拒绝所有对话
-- **代码改动开关**：飞书会话（含它派生的子代理）调用 `codeWriteTools` 里的工具（默认是 dsh-repo 的推送、MR 与 Issue 写操作、删除远端分支、重跑与取消 CI，以及观象的 SKILL 提交）之前，插件按**会话所在位置**检查：私聊话题要求本人是管理员或打开了「代码改动」开关，群话题要求设置面板「群权限」里该群的「代码改动」开关打开；没有时工具直接返回拒绝原因，模型会转告用户。本地工作区里的修改不受影响。检查在工具自己的审批之前进行，所以不管 dsh-repo 的 `tools.writes` 设为 `ask` 还是 `allow` 都生效
+- **代码改动开关**：飞书会话（含它派生的子代理）调用 `codeWriteTools` 里的工具（默认是 dsh-repo 的推送、MR 与 Issue 写操作、删除远端分支、重跑与取消 CI）之前，插件按**会话所在位置**检查：私聊话题要求本人是管理员或打开了「代码改动」开关，群话题要求设置面板「群权限」里该群的「代码改动」开关打开；没有时工具直接返回拒绝原因，模型会转告用户。本地工作区里的修改不受影响。检查在工具自己的审批之前进行，所以不管 dsh-repo 的 `tools.writes` 设为 `ask` 还是 `allow` 都生效
+- **授权事件**：其他插件在写操作之前用 `ctx.parallel('access/authorize', { session, level, action, summary })` 发问时（dsh-repo 的写工具和带会话的服务调用问 `code-write`，日志分析插件加仓库问 `admin`），本插件对飞书会话（含子代理，顺着 `parentSession` 找到所属话题）按同样的位置规则回答：`code-write`、`wiki-read`、`wiki-write` 看私聊本人或群的对应开关；`admin` 要求私聊本人是管理员，群会话一律拒绝；不认识的级别拒绝。拒绝时抛出中文原因，发问的插件据此不问用户、不执行；非飞书会话不回答。通过这个事件发问的插件的工具不必再列进 `codeWriteTools`
 - **发言人身份由 DSH 写进会话日志**：插件不再自己拼用户消息交给 Agent，而是为每个调用方建一个进程内 Peer，经 DSH 的 `session/prompt` 提交每条飞书提示（入站消息、群话题里的追问、启动话题的首条提示、「继续」按钮）。DSH 据此在消息来源里写下调用方：`source: { kind: 'user', rpcId, principal }`，其中 `rpcId` 是插件生成的请求 id，`principal` 是两种之一——私聊代表本人 `{ kind: 'feishu-user', userId }`，群聊代表群并记下发言人 `{ kind: 'feishu-group', chatId, userId }`。会话日志因此能区分 Host 所有者、不同的飞书用户和不同的群；`Feishu-User:` 尾注从被认领消息的 `principal` 读发言人，其他插件（例如记忆插件）也可以按它区分用户或群。`principal` 只含飞书 id，不含名字和凭据。提交前 DSH 按插件注册的访问策略检查调用方对该会话的权限（私聊会话只允许本人，群话题只允许同一个群的成员），策略直接从路由表给出，路由变化即失效缓存；被拒绝、附件被拒（模型不支持图片）或会话不存在时，卡片写明原因
-- **提交记录飞书发言人**：飞书会话（含子代理）通过 dsh-repo 推送工作区时，插件监听 dsh-repo 的 `repo/commit-trailers` 事件，在提交说明的 `DSH-Session:` 之后加一行 `Feishu-User: 名字 <user_id>`，记录的是上面同一位发言人。名字取通讯录（需 `contact:user.base:readonly`），读不到时取用户表里记下的名字，都没有时只写 user_id。需要 dsh-repo 支持该事件，旧版本 dsh-repo 不加这一行
+- **提交记录飞书发言人**：飞书会话（含子代理）通过 dsh-repo 推送工作区时（工具调用或其他插件带会话的服务调用），插件监听 dsh-repo 的 `repo/commit-trailers` 事件，按会话所在位置写提交身份：私聊话题在提交说明的 `DSH-Session:` 之后加一行 `Feishu-User: 名字 <user_id>`，记录的是上面同一位发言人，本人在用户表里有 Git 邮箱时还成为提交作者；群话题的提交由令牌账号署名，加 `Feishu-Chat: 群名 <chat_id>` 和 `Feishu-User: 名字 <user_id>` 两行尾注，不改作者。名字取通讯录（需 `contact:user.base:readonly`），读不到时取用户表里记下的名字，都没有时只写 user_id；群名读不到时只写 chat_id。需要 dsh-repo 支持该事件，旧版本 dsh-repo 不加这些行
 - **提交作者显示为发言人**：管理员在设置面板「访问授权」用户表里点用户行的「未设 Git 邮箱」，给这位用户填 Git 邮箱（填本人 GitHub/GitLab 账号已验证的邮箱，留空清除）。之后这位用户在飞书里让机器人推送代码时，插件通过同一事件的 `setAuthor` 把提交作者设为「名字 <Git 邮箱>」，提交者仍是 dsh-repo 的令牌账号，`Feishu-User:` 尾注照常保留；平台按作者邮箱显示本人的头像和链接。没设 Git 邮箱的用户作者仍是令牌账号；管理员同样在自己那一行填 Git 邮箱。dsh-repo 不支持 `setAuthor` 时只加尾注
 - **PR/MR 动态唤醒飞书会话**：dsh-repo 跟踪的 PR/MR 有 CI 结果、评论、评审或合并时会唤醒发起它的会话。插件以 `prepend: true` 监听 dsh-repo 的 `repo/resolve-agent` 瀑布：飞书会话已经不在内存里时，由插件按飞书的组合恢复（带飞书工具和回复规范），其他会话原样 `next()`。没有 dsh-repo 时这个事件不会触发
 - 全部基于飞书官方 SDK [`@larksuiteoapi/node-sdk`](https://www.npmjs.com/package/@larksuiteoapi/node-sdk)（WebSocket 长连接，免公网）
@@ -351,7 +352,7 @@ npm 发行包已包含构建产物：Host 入口是 `lib/index.js`（profile 直
         str_replace_editor: [path]
         lsp: [file_path]
     accessMode: 'guarded'               # 准入模式：guarded（默认，仅管理员 + 用户表里对话准入打开的人）| open（任何人可对话，不安全；知识库与代码改动开关仍生效）
-    codeWriteTools:                     # 需要「代码改动」开关的工具名（默认如下；飞书会话之外的调用不受影响）
+    codeWriteTools:                     # 需要「代码改动」开关的工具名（默认如下；飞书会话之外的调用不受影响；经 access/authorize 发问的插件不用列）
       - repo_workspace_push
       - repo_mr_create
       - repo_mr_update
@@ -363,8 +364,6 @@ npm 发行包已包含构建产物：Host 入口是 `lib/index.js`（profile 直
       - repo_branch_delete
       - repo_ci_retry
       - repo_ci_cancel
-      - logalyze_improve_skill
-      - logalyze_submit_init
     authRequestTtlDays: 7               # 入群/用户授权申请卡有效期（天，1–30）
     loggerLevel: 'info'
 ```
@@ -468,6 +467,7 @@ DSH 的沙箱只限制写，读不受限：不加处理时，飞书用户的会�
 - `--hide` / `--fence` / `--expose` 必须是绝对路径，可重复；每次调用时检查目录是否存在，不存在的跳过。`--unset-env NAME` 删掉指定变量，`--bwrap-path` 指定 bwrap 位置（默认从 PATH 找）。参数写错时包装直接失败，DSH 报告沙箱 runner 失败，不会不加隔离地运行命令。
 - 只读模式（`read-only`）下 DSH 不挂可写目录，包装按命令的工作目录判断它属于哪个工作区，只挂回这个目录。
 - 被遮住的目录里如果有命令运行需要的东西（例如 `node_modules`、工具链），用 `--expose` 挂回来；改完配置后在飞书里让机器人执行 `ls /root/.dsh` 和 `ls <baseDir>/p2p` 检查效果。
+- 和 dsh-repo 一起部署时：dsh-repo 的镜像目录不能放在本插件的 `baseDir` 下（否则被当成别人的工作区遮住），也不能在 DSH 主目录下；要让飞书会话（例如日志分析的子 Agent）读到代码快照，把 `<镜像目录>/.snapshots` 加进 `readFence.readableRoots`，并在这里用 `--expose` 挂回来（镜像本身只读）。
 - `runnerCommand` 会跳过 DSH 对 bwrap 的自动探测，按 DSH 的说明这是运维方的保证：包装本身由 Node 启动，启动过程不在沙箱里。
 - `danger-full-access` 模式的命令完全不经过沙箱和这个包装，因此单次提升只有管理员能批准（见「行为与降级 → HITL 审批」），`/permissions` 也只有管理员能切换；`@deepseek-ai/dsh-sandbox-policy` 的部署默认 `mode` 也不能设为 `danger-full-access`，否则以上隔离都不生效。
 
@@ -549,7 +549,7 @@ const result = await topics?.launch({
 - **v2 附件（权限降级）**：缺 `im:message:readonly` / `im:message.group_msg` 时引用摘录与首轮历史静默省略（首次一条 warn），显式调用 `feishu_topic_messages` 返回可读 `PERMISSION_DENIED`；普通对话不受影响。入群前历史只保证“机器人可见范围”。
 - **v2 附件（升级连续性）**：archive 后端已移除，旧配置里的 `attachmentStore` 与 `feishuTools.attachmentFetch` 会被忽略。历史话题里已有的 `attachments/` 不会被新会话枚举；Session 历史仍可按原路径读取，旧目录可手动删除。
 - **准入（升级连续性）**：升级到用户表后，原用户白名单里的人变成只打开对话准入的用户，**从此可以私聊、也可以在任何群里使用机器人**（以前私聊要开 `dmAllowWhitelist`、群聊要群已授权）。原群白名单和知识库白名单不迁移：数据留在存储里但不再读取，原来知识库白名单里的人需要管理员逐个打开「知识库读取」或「知识库写入」。待处理的群授权申请不再显示，旧卡片点了也不生效。`dmAllowWhitelist` 配置项和 `/auth allow|revoke`、`/auth user …`、`/auth wiki …` 命令已删除，旧配置里的 `dmAllowWhitelist` 会被忽略。代码改动开关默认关闭，非管理员需要管理员打开后才能在飞书里推送代码或提交 MR。
-- **代码改动开关的范围**：只拦 `codeWriteTools` 里列出的工具，不拦本地文件编辑和 shell 命令；按会话所在位置判权——私聊话题看本人的「代码改动」开关（管理员直通），群话题看设置面板「群权限」里该群的「代码改动」开关（默认关，与发言人是谁无关），旧版本开的群话题沿用发起人的开关。发言人只用于提交尾注：从被认领消息的 `principal` 读，群话题的路由记录同时记下最近发言人（`lastSpeakerUserId`），重启后还没有新消息时按它、再按发起人判断；在途快照存的是提示的请求 id、调用方和内容，重启后以同一个调用方、同一个请求 id 重新提交，DSH 按请求 id 去重，所以重放的消息仍认得发送者。
+- **代码改动开关的范围**：只拦 `codeWriteTools` 里列出的工具和经 `access/authorize` 发问的写操作，不拦本地文件编辑和 shell 命令；按会话所在位置判权——私聊话题看本人的「代码改动」开关（管理员直通），群话题看设置面板「群权限」里该群的「代码改动」开关（默认关，与发言人是谁无关），旧版本开的群话题沿用发起人的开关。发言人只用于提交尾注：从被认领消息的 `principal` 读，群话题的路由记录同时记下最近发言人（`lastSpeakerUserId`），重启后还没有新消息时按它、再按发起人判断；在途快照存的是提示的请求 id、调用方和内容，重启后以同一个调用方、同一个请求 id 重新提交，DSH 按请求 id 去重，所以重放的消息仍认得发送者。
 - **发言人身份（升级连续性）**：升级前写下的在途快照里只有插件自己拼的消息、没有调用方，重启后不重放，卡片改为「服务已重启」并提供「继续」按钮（点击人成为这一轮的调用方）。升级后的部署必须使用 DSH Web 组合（见「宿主侧准备」），headless 等没有 `typertGateway` 的组合里插件不会启动。
 - **`/renew` 的会话语义**：同一话题内新建 Session 沿用话题目录、复用附件；但新 Session 首轮不注入 `<feishu_history>`（仅 `startSession` 路径注入首轮历史，当前语义保留，若产品期望“新会话即带话题历史”需另行确认）。
 - **degraded 群会话的读取容器**：话题创建失败降级为 chat 路由后，其容器是整群主时间线——同群他人主时间线消息可被读取/登记（topic 消息已明确拒绝）；是否按 sender 进一步收紧待产品确认。

@@ -390,10 +390,10 @@ export const configSchema = z.object({
   accessMode: z.enum(['open', 'guarded']).default('guarded'),
   /**
    * Tools that write to a remote repository (push, merge requests, issues,
-   * branch deletion, CI retry and cancel).
-   * In a Feishu Session a call is refused unless the user who drives the
-   * current turn is an administrator or holds the `codeWrite` switch. Names
-   * are matched exactly; an empty list turns the check off.
+   * branch deletion, CI retry and cancel). In a Feishu Session a call is
+   * refused unless the Session's location holds the `codeWrite` switch.
+   * Names are matched exactly; an empty list turns the check off. Tools of
+   * plugins that ask through `access/authorize` need no entry here.
    */
   codeWriteTools: z.array(z.string().trim().min(1)).default([
     'repo_workspace_push',
@@ -407,8 +407,6 @@ export const configSchema = z.object({
     'repo_branch_delete',
     'repo_ci_retry',
     'repo_ci_cancel',
-    'logalyze_improve_skill',
-    'logalyze_submit_init',
   ]),
   /**
    * Read fence for in-process file tools in Feishu Sessions (and the

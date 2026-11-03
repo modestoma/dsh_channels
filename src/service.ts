@@ -29,6 +29,7 @@ import type { ApprovalRoute } from './approvals.ts'
 import { QuestionAnswerer } from './questions.ts'
 import type {
   Agent,
+  AuthorizeEvent,
   CommandInvocation,
   CommandResult,
   CredentialInfo,
@@ -1639,6 +1640,58 @@ export class FeishuService {
    * Lookup failures only lose the name.
    */
   /**
+   * The route of the Feishu Session a Session belongs to: itself, or the
+   * routed ancestor on its `parentSession` chain through the live agent
+   * registry (see `CodeWriteGate.resolveRoot`).
+   * @param sessionId - the Session an event names.
+   * @returns the route, or undefined when the chain holds no Feishu Session.
+   */
+  private routedRouteOf(sessionId: string): RouteRecord | undefined {
+    const root = this.codeWriteGate.resolveRoot(sessionId, id => this.ctx.agents.get(id as SessionId)?.session.header.parentSession)
+    return root === undefined ? undefined : this.routes.findBySession(root)
+  }
+
+  /**
+   * Why a write asked through `access/authorize` is refused for a routed
+   * Session, by where it lives: `code-write`, `wiki-read`, and `wiki-write`
+   * follow the location's switches (a private chat's person, a group's
+   * permission record); `admin` needs the person of a private chat to be an
+   * administrator and is never granted to a group; unknown levels are refused.
+   * @param route - the Session's route.
+   * @param event - the write.
+   * @returns the refusal text for the model, or undefined when allowed.
+   */
+  private authorizeRefusal(route: RouteRecord, event: AuthorizeEvent): string | undefined {
+    const group = route.chatType === 'group'
+    const where = group ? '本群' : `飞书用户 ${route.senderUserId} `
+    switch (event.level) {
+      case 'code-write':
+        return this.accessController.mayUseOnRoute(route, 'codeWrite') ? undefined : `${where}没有代码改动权限，不能执行 ${event.action}${group ? '；需要管理员在设置面板「群权限」里打开本群的「改代码」' : '；需要管理员在设置面板「访问授权」里打开该用户的「改代码」'}`
+      case 'wiki-read':
+        return this.accessController.mayUseOnRoute(route, 'wikiRead') ? undefined : `${where}没有知识库读取权限，不能执行 ${event.action}`
+      case 'wiki-write':
+        return this.accessController.mayUseOnRoute(route, 'wikiWrite') ? undefined : `${where}没有知识库写入权限，不能执行 ${event.action}`
+      case 'admin':
+        if (group) return `${event.action} 是管理操作，不能在群会话里执行；请管理员在私聊里操作`
+        return this.accessController.isAdmin(route.senderUserId) ? undefined : `${where}不是管理员，不能执行 ${event.action}`
+      default:
+        return `飞书会话不允许未知的授权级别 ${event.level}，不能执行 ${event.action}`
+    }
+  }
+
+  /**
+   * Name of a group as commits record it: the chat profile's name without
+   * `<`, `>`, or control characters, cut to 80 characters.
+   * @param chatId - Feishu chat_id.
+   * @returns the name, or undefined when the profile has none.
+   */
+  private async commitChatName(chatId: string): Promise<string | undefined> {
+    const raw = (await this.feishuProfiles([], [chatId])).chats[chatId]?.name ?? ''
+    const name = raw.replace(/[<>]/gu, '').replace(/[\s\u0000-\u001f\u007f]+/gu, ' ').trim().slice(0, 80)
+    return name === '' ? undefined : name
+  }
+
+  /**
    * Name of a Feishu user as commits record it: the contact name, else the
    * name in the user table, without `<`, `>`, or control characters.
    * @param userId - Feishu user_id.
@@ -2055,10 +2108,28 @@ export class FeishuService {
     }))
     this.unlistenHost.push(this.ctx.on('tools/pre-execute', async (exec, next) =>
       this.codeWriteGate.decide(exec) ?? await this.readFence.decide(exec) ?? await next()))
+    // Writes made for a Feishu Session are answered by where it lives, before
+    // the writing plugin asks the user; Sessions this channel does not route
+    // are left to other listeners.
+    this.unlistenHost.push(this.ctx.on('access/authorize', (event) => {
+      const route = this.routedRouteOf(event.session)
+      if (route === undefined) return
+      const refusal = this.authorizeRefusal(route, event)
+      if (refusal !== undefined) throw new Error(refusal)
+    }))
     this.unlistenHost.push(this.ctx.on('repo/commit-trailers', async (event) => {
+      const route = this.routedRouteOf(event.session)
       const userId = this.codeWriteGate.speakerOf(event.session)
-      if (userId === undefined) return
+      if (route === undefined || userId === undefined) return
       const name = await this.commitName(userId)
+      if (route.chatType === 'group') {
+        // A group's commits belong to the group: the token account authors
+        // them, the group and the speaker are recorded as trailers.
+        const chatName = await this.commitChatName(route.chatId)
+        event.add('Feishu-Chat', chatName === undefined ? route.chatId : `${chatName} <${route.chatId}>`)
+        event.add('Feishu-User', name === undefined ? userId : `${name} <${userId}>`)
+        return
+      }
       event.add('Feishu-User', name === undefined ? userId : `${name} <${userId}>`)
       const gitEmail = this.accessStore.getUser(userId)?.gitEmail
       if (gitEmail !== undefined) event.setAuthor?.(name ?? userId, gitEmail)

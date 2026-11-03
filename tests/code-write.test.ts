@@ -101,6 +101,20 @@ describe('CodeWriteGate', () => {
     expect(gate.decide(call('s_grandchild', 's_child'))?.kind).toBe('deny')
   })
 
+  it('resolves the routed root of a Session through the live parent chain and remembers it', () => {
+    const { gate } = setup()
+    const parents = new Map([['s_child', 's_root'], ['s_grandchild', 's_child'], ['s_loop', 's_loop'], ['s_web_child', 's_web']])
+    const parentOf = (id: string) => parents.get(id)
+    expect(gate.resolveRoot('s_root', parentOf)).toBe('s_root')
+    expect(gate.resolveRoot('s_grandchild', parentOf)).toBe('s_root')
+    // Remembered: the chain is not walked again, and the speaker follows.
+    expect(gate.resolveRoot('s_grandchild', () => undefined)).toBe('s_root')
+    expect(gate.speakerOf('s_child')).toBe('u_owner')
+    expect(gate.resolveRoot('s_web_child', parentOf)).toBeUndefined()
+    expect(gate.resolveRoot('s_loop', parentOf)).toBeUndefined()
+    expect(gate.resolveRoot('s_orphan', () => undefined)).toBeUndefined()
+  })
+
   it('names the speaker of routed Sessions and of descendants it has seen', () => {
     const { gate } = setup()
     expect(gate.speakerOf('s_root')).toBe('u_owner')

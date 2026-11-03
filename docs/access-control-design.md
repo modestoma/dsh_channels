@@ -42,9 +42,10 @@
 - **发言人**（只用于提交尾注和作者，不参与判权）：`agent/inbox/claimed` 认领的那条用户消息在来源里写明的飞书用户。插件的每条飞书提示都由调用方自己的进程内 Peer 经 DSH `session/prompt` 提交，DSH 写下 `source: { kind: 'user', rpcId, principal }`：私聊 `{ kind: 'feishu-user', userId }`，群聊 `{ kind: 'feishu-group', chatId, userId }`（共享话题里的追问、启动话题的首条提示、恢复按钮的点击人都写各自的 user_id），见 `src/access/principal.ts`。来源是消息的一部分，随会话日志持久保存；在途快照存请求 id、调用方和内容，重放时以同一调用方重新提交，插件不在内存里另记消息与发送者的对应。没有 `principal` 的消息（Host 所有者、斜杠命令展开、子代理结果、后台任务、定时任务）沿用上一位；`principal` 不是合法飞书用户或群时发言人不明；从未认领过时按路由记录的 `lastSpeakerUserId`，再按开话题的人。升级前写下、没有调用方的快照不重放，只提供「继续」按钮。
 - 路由所在位置没有 `codeWrite` 时返回 `deny`：私聊写明用户和开通方式，群话题写明到「群权限」打开；模型据此转告用户。检查在工具自身审批之前，所以 dsh-repo 的 `tools.writes` 设为 `allow` 时也生效。
 - 只拦列出的工具，不拦本地文件编辑与 shell。状态只在内存里，关闭时清空。
-- 发言人写进提交：插件监听 dsh-repo 的 `repo/commit-trailers` 事件（事件类型在本插件 `src/host/core.ts` 里自行声明，不依赖 dsh-repo 的包），对飞书会话及其已见过的子代理追加 `Feishu-User: 名字 <user_id>`。名字取通讯录，其次用户表，去掉 `<` `>`、空白和控制字符合并为一个空格、最多 80 个字符；读不到名字时只写 user_id。
-- 发言人也可以是提交作者：用户表记录有可选的 `gitEmail`，只能由管理员在设置面板填写（`/api/dsh-channels.setAccessGitEmail`，去掉首尾空白，必须是一个不含空白、`<`、`>` 的 `local@domain`，最长 254 个字符，空值清除）。发言人有 `gitEmail` 时，监听者在追加尾注之外调用事件的 `setAuthor(名字, gitEmail)`，名字同尾注，读不到时用 user_id；提交者仍是 dsh-repo 的令牌账号。用户不能自己登记邮箱，避免以同事的名义提交。事件没有 `setAuthor`（旧版 dsh-repo）时只加尾注。
-- 默认 `codeWriteTools`：`repo_workspace_push`、`repo_mr_create|update|comment|merge`、`repo_issue_create|update|comment`、`repo_branch_delete`、`repo_ci_retry`、`repo_ci_cancel`、`logalyze_improve_skill`、`logalyze_submit_init`。dsh_channels 不依赖这些插件，只按工具名匹配。
+- 写操作先问权限：其他插件在写之前发 `access/authorize` 事件（`session`、`level`、`action`、`summary`；类型同样在 `src/host/core.ts` 自行声明），插件把会话顺着 `parentSession` 解析到所属话题后按位置回答：`code-write` / `wiki-read` / `wiki-write` 看本人或群的对应开关，`admin` 只给私聊里的管理员，群会话和未知级别一律拒绝；非飞书会话不回答。拒绝以中文原因抛出，发问方不再问用户。
+- 发言人写进提交：插件监听 dsh-repo 的 `repo/commit-trailers` 事件（事件类型在本插件 `src/host/core.ts` 里自行声明，不依赖 dsh-repo 的包），对飞书会话及其子代理（已见过调用的，或经 `parentSession` 找到所属话题的）追加 `Feishu-User: 名字 <user_id>`；群话题先追加 `Feishu-Chat: 群名 <chat_id>`，提交由令牌账号署名，不设作者。名字取通讯录，其次用户表，去掉 `<` `>`、空白和控制字符合并为一个空格、最多 80 个字符；读不到名字时只写 user_id。
+- 私聊的发言人也可以是提交作者：用户表记录有可选的 `gitEmail`，只能由管理员在设置面板填写（`/api/dsh-channels.setAccessGitEmail`，去掉首尾空白，必须是一个不含空白、`<`、`>` 的 `local@domain`，最长 254 个字符，空值清除）。发言人有 `gitEmail` 时，监听者在追加尾注之外调用事件的 `setAuthor(名字, gitEmail)`，名字同尾注，读不到时用 user_id；提交者仍是 dsh-repo 的令牌账号。用户不能自己登记邮箱，避免以同事的名义提交。事件没有 `setAuthor`（旧版 dsh-repo）时只加尾注。
+- 默认 `codeWriteTools`：`repo_workspace_push`、`repo_mr_create|update|comment|merge`、`repo_issue_create|update|comment`、`repo_branch_delete`、`repo_ci_retry`、`repo_ci_cancel`。dsh_channels 不依赖 dsh-repo，只按工具名匹配；经 `access/authorize` 发问的插件的工具不用列。
 
 ### A.4 存储与升级
 
