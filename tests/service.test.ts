@@ -1040,8 +1040,9 @@ describe('FeishuService', () => {
 
     const origins = h.ctxState.domain.raw.table('session_origins')
     expect(origins.get(old.options.sessionId)).toMatchObject({
-      routeKey: 'omt_1', kind: 'thread', chatId: 'oc_origin', chatType: 'group', senderUserId: 'u_owner',
+      routeKey: 'omt_1', kind: 'thread', chatId: 'oc_origin', chatType: 'group', senderUserId: 'u_owner', mode: 'group',
     })
+    // A group topic belongs to the group, so its origin reads as shared.
     expect(await h.service.sessionOrigin(renewed.options.sessionId)).toMatchObject({
       sessionId: renewed.options.sessionId,
       chatType: 'group',
@@ -1051,7 +1052,7 @@ describe('FeishuService', () => {
       senderUserId: 'u_owner',
       senderName: '张三',
       senderAvatarUrl: 'https://cdn.example/u.png',
-      shared: false,
+      shared: true,
       bound: true,
       chatLink: 'https://applink.feishu.cn/client/chat/open?openChatId=oc_origin',
     })
@@ -1970,6 +1971,9 @@ describe('FeishuService', () => {
     await waitUntil(() => expect(h.ctxState.domain.raw.table('routes').get('omt_2')).toBeDefined())
     expect(h.ctxState.domain.raw.table('routes').get('omt_1')).toMatchObject({ mode: 'group', senderUserId: 'u_alice', workspacePath: topicA })
     expect(h.ctxState.domain.raw.table('routes').get('omt_2')).toMatchObject({ mode: 'group', senderUserId: 'u_bob', workspacePath: topicB })
+    // The origin carries the group marker, so the records panel and the origin tab show the topic as group-shared.
+    const originA = h.ctxState.domain.raw.table('routes').get('omt_1') as RouteRecord
+    expect(h.ctxState.domain.raw.table('session_origins').get(originA.sessionId)).toMatchObject({ mode: 'group', senderUserId: 'u_alice' })
     // The group is registered with every switch off the first time a topic opens in it.
     expect(h.ctxState.domain.raw.table('group_permissions').get('oc_grp')).toMatchObject({
       chatId: 'oc_grp', wikiRead: false, wikiWrite: false, codeWrite: false,

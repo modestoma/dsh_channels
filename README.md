@@ -432,7 +432,7 @@ FEISHU_APP_SECRET: xxxxxxxx
 - 话题目录就是 Session 的 cwd，也是沙箱的写边界，bash / fs / 终端都从它出发；没有额外的子目录或 Git worktree 层。需要在话题里操作代码仓库时，由代码仓库插件在话题目录下 checkout。
 - **入站附件**：图片/文件只存入 DSH 原生附件库，**不写入话题目录**，因此话题目录只承载 Agent 产物。旧版本写下的 `<话题目录>/attachments/` 与 `<baseDir>/_staging/` 不会被迁移或删除，前者仍是普通工作区文件，后者已无人读取，可手动清理。`/renew` 复用同一话题目录。
 - **插件不删除任何话题目录**。需要回收磁盘时手动删除不再需要的话题目录即可：该话题下次对话时会重建一个空目录继续使用。
-- 旧版本按人建立的工作区（`<baseDir>/p2p/<user_id>/`、`<baseDir>/groups/<chat_id>/<user_id>/`，话题在其下的 `topics/<话题 id>/` 或 worktree）不会自动迁移：旧话题继续用路由记录里的目录（`/renew` 也沿用），新话题一律按上表建立。不再需要的旧目录可手动删除。
+- 旧版本按人建立的工作区（`<baseDir>/p2p/<user_id>/`、`<baseDir>/groups/<chat_id>/<user_id>/`，话题在其下的 `topics/<话题 id>/` 或 worktree）不会自动迁移：旧话题继续用路由记录里的目录（`/renew` 也沿用），新话题一律按上表建立。旧的 worktree 话题目录被删除后，下次对话只重建一个普通空目录，不再重建 worktree（路由记录里的 `worktreeBranch` 只作历史记录；仓库里的分支可用 `git worktree prune` / `git branch -D` 回收）。不再需要的旧目录可手动删除。
 - 演进历史与取舍详见 [docs/workspace-isolation-design.md](docs/workspace-isolation-design.md)。
 
 ### 读权限与执行隔离

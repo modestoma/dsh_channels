@@ -150,6 +150,7 @@ export class RouteStore {
         chatType: record.chatType,
         senderUserId: record.senderUserId,
         createdAt: entry.createdAt,
+        ...(record.mode === undefined ? {} : { mode: record.mode }),
         ...(record.shared === true ? { shared: true as const } : {}),
       }
       try {
