@@ -37,7 +37,7 @@
 
 - 插件在宿主 `tools/pre-execute` 瀑布注册监听；工具名在 `codeWriteTools` 里、且调用方 Session 属于飞书路由时检查，否则直接交给下一个监听。
 - **归属**：Session 本身有路由，或沿 `parentSession` 追溯到有路由的 Session（子代理、嵌套子代理）。每次调用都记下 Session 到路由根的对应关系。
-- **发言人**：`agent/inbox/claimed` 认领的那条用户消息在来源里写明的飞书用户。插件交给 Agent 的每条飞书提示都带 `source: { kind: 'user', rpcId, principal: { kind: 'feishu-user', userId } }`（共享话题里的追问、启动话题的首条提示、恢复按钮的点击人都写各自的 user_id），字段与 DSH 为非所有者调用 `session/prompt` 写下的相同，见 `src/access/principal.ts`。来源是消息的一部分，随会话日志和在途快照持久保存，插件不在内存里另记消息与发送者的对应。没有 `principal` 的消息（Host 所有者、斜杠命令展开、子代理结果、后台任务、定时任务）沿用上一位；`principal` 不是合法飞书用户时发言人不明；从未认领过时按路由所有者。重启后重放的快照消息若是升级前写下、没有 `principal`，用快照里的 `inflight.senderUserId` 补上；两者都没有时，那一轮的受控工具一律拒绝。
+- **发言人**：`agent/inbox/claimed` 认领的那条用户消息在来源里写明的飞书用户。插件的每条飞书提示都由调用方自己的进程内 Peer 经 DSH `session/prompt` 提交，DSH 写下 `source: { kind: 'user', rpcId, principal }`：私聊 `{ kind: 'feishu-user', userId }`，群聊 `{ kind: 'feishu-group', chatId, userId }`（共享话题里的追问、启动话题的首条提示、恢复按钮的点击人都写各自的 user_id），见 `src/access/principal.ts`。来源是消息的一部分，随会话日志持久保存；在途快照存请求 id、调用方和内容，重放时以同一调用方重新提交，插件不在内存里另记消息与发送者的对应。没有 `principal` 的消息（Host 所有者、斜杠命令展开、子代理结果、后台任务、定时任务）沿用上一位；`principal` 不是合法飞书用户或群时发言人不明，那一轮的受控工具一律拒绝；从未认领过时按路由所有者。升级前写下、没有调用方的快照不重放，只提供「继续」按钮。
 - 发言人不是管理员、也没有打开 `codeWrite` 时返回 `deny`，原因写明用户和开通方式，模型据此转告用户。检查在工具自身审批之前，所以 dsh-repo 的 `tools.writes` 设为 `allow` 时也生效。
 - 只拦列出的工具，不拦本地文件编辑与 shell。状态只在内存里，关闭时清空。
 - 同一个发言人也写进提交：插件监听 dsh-repo 的 `repo/commit-trailers` 事件（事件类型在本插件 `src/host/core.ts` 里自行声明，不依赖 dsh-repo 的包），对飞书会话及其已见过的子代理追加 `Feishu-User: 名字 <user_id>`。名字取通讯录，其次用户表，去掉 `<` `>`、空白和控制字符合并为一个空格、最多 80 个字符；读不到名字时只写 user_id。

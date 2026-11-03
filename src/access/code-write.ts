@@ -9,14 +9,14 @@
  *   subagents because a child must call a tool to spawn its own child. Calls
  *   of Sessions the channel does not route are never touched.
  * - Driver: the Feishu user the claimed message's source names as its
- *   principal (see `./principal.ts`). The source is part of the durable
+ *   principal (see `./principal.ts`): the user of a private-chat principal, or
+ *   the speaker of a group principal. The source is part of the durable
  *   message, so a prompt replayed after a restart still names its sender. A
  *   claimed message with no principal (the Host owner, slash-command
  *   expansions, subagent results, jobs, schedules) keeps the previous driver;
  *   before any claimed message the route owner drives. A message naming a
- *   principal other than a Feishu user, or a replayed prompt whose sender was
- *   never recorded, makes the driver unknown: every gated call is denied until
- *   a message naming a Feishu user is claimed.
+ *   principal other than a Feishu one makes the driver unknown: every gated
+ *   call is denied until a message naming a Feishu principal is claimed.
  * - The check runs in `tools/pre-execute`, before the tool's own approval, so
  *   it holds whatever approval mode the tool's plugin uses.
  *
@@ -66,6 +66,7 @@ export class CodeWriteGate {
     const caller = promptCallerOf(message.source)
     switch (caller.kind) {
       case 'feishu-user':
+      case 'feishu-group':
         this.drivers.set(sessionId, caller.userId)
         return
       case 'other-principal':
@@ -76,15 +77,6 @@ export class CodeWriteGate {
       default:
         assertNever(caller)
     }
-  }
-
-  /**
-   * Restart recovery replays a prompt whose sender was never recorded: deny
-   * every gated call until a message naming a Feishu user is claimed.
-   * @param sessionId - the routed Session the prompt is replayed into.
-   */
-  markSenderUnknown(sessionId: string): void {
-    this.drivers.set(sessionId, UNKNOWN_SENDER)
   }
 
   /**
@@ -104,7 +96,7 @@ export class CodeWriteGate {
     if (driver === UNKNOWN_SENDER) {
       return {
         kind: 'deny',
-        reason: `无法确认这一轮的飞书发言人（重启后恢复的旧消息，或不是飞书用户发起的消息），不能调用 ${exec.name}。请告诉用户：重新发送一条消息后再试。`,
+        reason: `无法确认这一轮的飞书发言人（不是飞书用户发起的消息），不能调用 ${exec.name}。请告诉用户：重新发送一条消息后再试。`,
       }
     }
     if (this.deps.mayUse(driver, 'codeWrite')) return undefined

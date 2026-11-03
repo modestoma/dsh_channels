@@ -65,6 +65,14 @@ import type { OutboxEntry } from './outbox.ts'
 import { RouteStore } from './session/routes.ts'
 import { TopicLauncher } from './topics/launcher.ts'
 import { InflightRepair, storableMessage } from './session/repair.ts'
+import { channelPrompt, storablePrompt } from './session/prompt.ts'
+import type { ChannelPrompt } from './session/prompt.ts'
+import { PromptSubmitter, steerQueued, submissionFailureText } from './session/submit.ts'
+import type { SubmissionOutcome, TurnCard, TurnSubmission } from './session/submit.ts'
+import { PeerRegistry } from './access/peers.ts'
+import { registerChannelAccessPolicies } from './access/remote-policy.ts'
+import { requireRemoteServices } from './host/remote.ts'
+import type { RemoteServices } from './host/remote.ts'
 import { SessionManager } from './session/manager.ts'
 import type { LiveAgent, RenewCommit } from './session/manager.ts'
 import { CardDelivery } from './feishu/delivery.ts'
@@ -80,7 +88,7 @@ import {
 } from './feishu/message-read.ts'
 import type { MessageReadRoute, RawMessageItem } from './feishu/message-read.ts'
 import { InboundRouter } from './routing/inbound.ts'
-import { feishuUserMessage, promptCallerOf, withFeishuSender } from './access/principal.ts'
+import { principalOnRoute } from './access/principal.ts'
 import { MissedMessages } from './routing/missed.ts'
 import type { RequestPolicyController } from './session/request-policy.ts'
 import type { CardActionEvent, ChannelFactory, FeishuChannel, NormalizedMessage } from './feishu-channel.ts'
@@ -451,6 +459,14 @@ export class FeishuService {
   private unlistenCardAction: (() => void) | undefined
   /** Code-write tool gate for Feishu Sessions (in-memory turn drivers). */
   private readonly codeWriteGate: CodeWriteGate
+  /** One in-process Peer per Feishu principal (prompts are submitted through them). */
+  private readonly peers: PeerRegistry
+  /** `session/prompt` submission as the sender's principal. */
+  private readonly submitter: PromptSubmitter
+  /** The host's Remote-side services, read when the channel starts. */
+  private remote: RemoteServices | undefined
+  /** Disposer of this channel's `remoteAccess` policies (registered per start). */
+  private unlistenAccessPolicy: (() => void) | undefined
   private readonly readFence: ReadFence
   /** Durable access-control user table and authorization requests. */
   private readonly accessStore: AccessStore
@@ -487,6 +503,8 @@ export class FeishuService {
       domain: () => this.domain,
       ttlMs: () => this.config.routeTtlMs,
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
+      // Bindings derive from the route table; tell snapshot readers it moved.
+      changed: () => this.remote?.remoteAccess.invalidate(),
     })
     this.repair = new InflightRepair({
       domain: () => this.domain,
@@ -497,10 +515,19 @@ export class FeishuService {
       recovery: {
         policy: () => this.config.replay,
         liveAgent: snapshot => this.recoveryAgent(snapshot),
-        replay: (agent, snapshot, message, submit) => {
-          this.streamer?.attach(agent.session, snapshot.cards[0]!.messageId, snapshot.triggerMessageId, snapshot.reactionId, { message })
-          if (!submit) return
-          agent.followup(this.replayedPrompt(snapshot, message))
+        replay: (agent, snapshot, prompt, submit) => {
+          const card: TurnCard = {
+            cardMessageId: snapshot.cards[0]!.messageId,
+            ...(snapshot.triggerMessageId === undefined ? {} : { triggerMessageId: snapshot.triggerMessageId }),
+            ...(snapshot.reactionId === undefined ? {} : { reactionId: snapshot.reactionId }),
+          }
+          if (!submit) {
+            this.streamer?.attach(agent.session, card.cardMessageId, card.triggerMessageId, card.reactionId, { prompt })
+            return
+          }
+          // The same request id as before the restart: `session/prompt`
+          // deduplicates against the inbox and the log.
+          void this.runTurn(agent, prompt, card)
         },
       },
     })
@@ -649,6 +676,21 @@ export class FeishuService {
         })
       },
     })
+    this.peers = new PeerRegistry({
+      connection: () => this.requireRemote().connection,
+      warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
+    })
+    this.submitter = new PromptSubmitter({
+      gateway: () => this.requireRemote().gateway,
+      fileUploads: () => this.requireRemote().fileUploads,
+      attachments: () => this.ctx.attachments,
+      peers: this.peers,
+      warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
+    })
+    const prompts: TurnSubmission = {
+      stageImage: (agent, bytes, name) => this.submitter.stageImage(agent, bytes, name),
+      run: (agent, prompt, card) => this.runTurn(agent, prompt, card),
+    }
     this.inbound = new InboundRouter({
       ctx: this.ctx,
       config: this.config,
@@ -659,6 +701,7 @@ export class FeishuService {
       delivery: this.delivery,
       sessions: this.sessions,
       nativeAttachments: () => this.ctx.attachments,
+      prompts,
       noteKnownAttachments: (record, message, source) => {
         this.noteKnownAttachmentMessage(record, message, source ?? 'trigger')
       },
@@ -694,7 +737,7 @@ export class FeishuService {
       routes: this.routes,
       repair: this.repair,
       sessions: this.sessions,
-      streamer: () => this.streamer,
+      prompts,
       queue: this.routeOperations,
       reserveTopic: threadId => this.inbound.reserveTopic(threadId),
       mayLaunchFor: requesterUserId => this.accessController.mayLaunchFor(requesterUserId),
@@ -1779,6 +1822,10 @@ export class FeishuService {
       if (this.lifecycle !== lifecycle) throw new StartSupersededError()
     }
 
+    // 0. The prompt path needs the host's Remote-side services (DSH Web
+    //    composition); a composition without them cannot run this channel.
+    this.remote = requireRemoteServices(this.ctx)
+
     // 1. Resolve credentials through the host seam (env > .credentials.yaml > .env).
     const appId = await resolveCredentialRef(this.ctx, this.config.appId)
     const appSecret = await resolveCredentialRef(this.ctx, this.config.appSecret)
@@ -1804,6 +1851,13 @@ export class FeishuService {
     }
     this.lock = acquired.lock
     this.occupied = undefined
+    // The access policies of this channel's principals, for the lifetime of
+    // the connection (disposed by `shutdown`, which a takeover yield runs too).
+    this.unlistenAccessPolicy?.()
+    this.unlistenAccessPolicy = registerChannelAccessPolicies(this.remote.remoteAccess, {
+      routes: () => this.routes.records(),
+      mayActOnRoute: (userId, chatId, record) => this.accessController.mayActOnRoute(userId, chatId, record),
+    })
 
     // 3. Build the channel with the resolved secrets.
     const channel = this.channelFactory({
@@ -2084,6 +2138,8 @@ export class FeishuService {
     this.accessController.clear()
     this.codeWriteGate.clear()
     this.readFence.clear()
+    this.unlistenAccessPolicy?.()
+    this.unlistenAccessPolicy = undefined
     this.unlistenApproval?.()
     this.unlistenApproval = undefined
     this.unlistenQuestions?.()
@@ -2103,6 +2159,7 @@ export class FeishuService {
       this.gcTimer = undefined
     }
     await this.sessions.disposeAll()
+    await this.peers.clear()
     this.attachmentFetchTools.clear()
     this.routeOperations.clear()
     this.inbound.clear()
@@ -2480,24 +2537,9 @@ export class FeishuService {
     const agent = this.sessions.get(target.sessionId)?.agent
       ?? this.ctx.agents.get(target.sessionId as SessionId)
     if (agent?.status !== 'running') return
-    const merged = this.streamer?.mergeQueued(event.messageId, (_sessionId, message) => {
-      if (!agent.inbox.remove(message.id)) return false
-      agent.steer(message)
-      return true
-    }) === true
+    const merged = this.streamer?.mergeQueued(event.messageId, (_sessionId, prompt) => steerQueued(agent, prompt.requestId)) === true
     // The queued card no longer owns a turn: retire its restart-repair snapshot.
     if (merged) void this.repair.clear(event.messageId)
-  }
-
-  /**
-   * The prompt restart recovery replays. A prompt stored before prompts
-   * carried a principal gets the sender stored beside it; with no stored
-   * sender, the code-write gate denies the replayed turn's gated calls.
-   */
-  private replayedPrompt(snapshot: InflightSnapshot, message: UserMessage): UserMessage {
-    if (snapshot.senderUserId !== undefined) return withFeishuSender(message, snapshot.senderUserId)
-    if (promptCallerOf(message.source).kind === 'none') this.codeWriteGate.markSenderUnknown(snapshot.sessionId)
-    return message
   }
 
   /**
@@ -2518,16 +2560,38 @@ export class FeishuService {
     }
   }
 
-  /** Stream a new turn running `message` into an existing card. */
-  private runIntoCard(
-    agent: Agent,
-    cardMessageId: string,
-    triggerMessageId: string | undefined,
-    reactionId: string | undefined,
-    message: UserMessage,
-  ): void {
-    this.streamer?.attach(agent.session, cardMessageId, triggerMessageId, reactionId, { message })
-    agent.followup(message)
+  /** The Remote-side services; the channel never submits before `start()` read them. */
+  private requireRemote(): RemoteServices {
+    if (this.remote === undefined) throw new Error('dsh-channels: channel not started')
+    return this.remote
+  }
+
+  /**
+   * Bind `card` to the turn `prompt` starts and submit the prompt as its
+   * principal (see `TurnSubmission.run`). The card is bound before the
+   * submission so the claim the fake-free Agent loop emits while the prompt
+   * enters the inbox finds its turn state. A refused or failed submission
+   * settles the card with the reason; the snapshot is retired with the card.
+   */
+  private async runTurn(agent: Agent, prompt: ChannelPrompt, card: TurnCard): Promise<SubmissionOutcome> {
+    const streamer = this.streamer
+    if (streamer === undefined) throw new Error('dsh-channels: channel not started')
+    streamer.attach(agent.session, card.cardMessageId, card.triggerMessageId, card.reactionId, {
+      prompt,
+      ...(card.onSettled === undefined ? {} : { onSettled: card.onSettled }),
+    })
+    try {
+      await this.submitter.submit(agent, prompt, 'queue')
+      return { accepted: true }
+    } catch (error) {
+      this.ctx.logger?.warn?.(
+        'dsh-channels: submitting prompt %s to session %s as %s failed: %s',
+        prompt.requestId, agent.id, JSON.stringify(prompt.principal), String(error),
+      )
+      const reason = submissionFailureText(error)
+      streamer.rejectQueued(agent.id, prompt.requestId, reason)
+      return { accepted: false, reason }
+    }
   }
 
   /**
@@ -2547,21 +2611,23 @@ export class FeishuService {
     this.resumedCards.add(event.messageId)
     try {
       const live = await this.sessions.ensureLive(route)
-      const message = feishuUserMessage(RESUME_PROMPT, operator)
-      const stored = storableMessage(message)
+      const prompt = channelPrompt(RESUME_PROMPT, principalOnRoute(route, operator))
+      const stored = storablePrompt(prompt)
       await this.repair.write({
         key: event.messageId,
         sessionId: route.sessionId,
         chatId: route.chatId,
         ...(target.triggerMessageId === undefined ? {} : { triggerMessageId: target.triggerMessageId }),
         routeKey: route.key,
-        ...(stored === undefined ? {} : { message: stored }),
-        senderUserId: operator,
+        ...(stored === undefined ? {} : { prompt: stored }),
         cards: [{ messageId: event.messageId, mode: 'card' }],
         startedAt: Date.now(),
         attempts: 0,
       })
-      this.runIntoCard(live.agent, event.messageId, target.triggerMessageId, undefined, message)
+      await this.runTurn(live.agent, prompt, {
+        cardMessageId: event.messageId,
+        ...(target.triggerMessageId === undefined ? {} : { triggerMessageId: target.triggerMessageId }),
+      })
     } catch (error) {
       this.resumedCards.delete(event.messageId)
       throw error

@@ -9,9 +9,16 @@ import {
 } from '../src/cards.ts'
 import type { MessageId, SessionEvent, TurnEndReason, UserMessage } from '../src/dsh-types.ts'
 import { classifyTurn, storableMessage } from '../src/session/repair.ts'
+import { promptOfSnapshot, storablePrompt } from '../src/session/prompt.ts'
+import type { ChannelPrompt } from '../src/session/prompt.ts'
 
 function prompt(id: string, text = 'hi'): UserMessage {
   return { id: id as MessageId, role: 'user', content: [{ type: 'text', text }], source: { kind: 'user' } }
+}
+
+/** A message DSH created for the channel prompt with request id `rpcId`. */
+function submitted(rpcId: string, id = `msg-${rpcId}`): UserMessage {
+  return { id: id as MessageId, role: 'user', content: [{ type: 'text', text: 'hi' }], source: { kind: 'user', rpcId, principal: { kind: 'feishu-user', userId: 'u' } } }
 }
 
 function reply(text: string, seq: number): SessionEvent {
@@ -20,7 +27,20 @@ function reply(text: string, seq: number): SessionEvent {
 
 describe('classifyTurn', () => {
   it('reports a prompt missing from the log as pending', () => {
-    expect(classifyTurn([{ type: 'user/message', seq: 0, data: prompt('other') }], 'm1')).toEqual({ kind: 'pending' })
+    expect(classifyTurn([{ type: 'user/message', seq: 0, data: prompt('other') }], { messageId: 'm1' })).toEqual({ kind: 'pending' })
+    expect(classifyTurn([{ type: 'user/message', seq: 0, data: submitted('r-other') }], { requestId: 'r1' })).toEqual({ kind: 'pending' })
+    // A message id never matches a request id, and vice versa.
+    expect(classifyTurn([{ type: 'user/message', seq: 0, data: submitted('r1', 'm1') }], { messageId: 'r1' })).toEqual({ kind: 'pending' })
+    expect(classifyTurn([{ type: 'user/message', seq: 0, data: prompt('r1') }], { requestId: 'r1' })).toEqual({ kind: 'pending' })
+  })
+
+  it('finds a channel prompt by the request id DSH recorded on it', () => {
+    const events: SessionEvent[] = [
+      { type: 'user/message', seq: 0, data: submitted('r1') },
+      reply('回答', 1),
+      { type: 'turn/end', seq: 2, data: { turn: 1, reason: { kind: 'completed' } } },
+    ]
+    expect(classifyTurn(events, { requestId: 'r1' })).toEqual({ kind: 'completed', text: '回答' })
   })
 
   it('joins the reply text of a completed turn across steps', () => {
@@ -31,7 +51,7 @@ describe('classifyTurn', () => {
       { type: 'turn/end', seq: 3, data: { turn: 1, reason: { kind: 'completed' } } },
       reply('下一轮', 4),
     ]
-    expect(classifyTurn(events, 'm1')).toEqual({ kind: 'completed', text: '第一步\n\n第二步' })
+    expect(classifyTurn(events, { messageId: 'm1' })).toEqual({ kind: 'completed', text: '第一步\n\n第二步' })
   })
 
   it.each<[TurnEndReason]>([
@@ -44,18 +64,45 @@ describe('classifyTurn', () => {
       { type: 'user/message', seq: 0, data: prompt('m1') },
       { type: 'turn/end', seq: 1, data: { turn: 1, reason } },
     ]
-    expect(classifyTurn(events, 'm1')).toEqual({ kind: 'interrupted' })
+    expect(classifyTurn(events, { messageId: 'm1' })).toEqual({ kind: 'interrupted' })
   })
 
   it('treats a turn without turn/end as interrupted', () => {
-    expect(classifyTurn([{ type: 'user/message', seq: 0, data: prompt('m1') }, reply('半截', 1)], 'm1')).toEqual({ kind: 'interrupted' })
+    expect(classifyTurn([{ type: 'user/message', seq: 0, data: prompt('m1') }, reply('半截', 1)], { messageId: 'm1' })).toEqual({ kind: 'interrupted' })
   })
 })
 
 describe('storableMessage', () => {
-  it('keeps a prompt within the cap and drops a larger one', () => {
+  it('keeps a message within the cap and drops a larger one', () => {
     expect(storableMessage(prompt('m1'))).toEqual({ id: 'm1', role: 'user', content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } })
     expect(storableMessage(prompt('m2', 'x'.repeat(300 * 1024)))).toBeUndefined()
+  })
+})
+
+describe('storablePrompt', () => {
+  const image = { attachmentId: 'sha256:abc', mediaType: 'image/png' as const, bytes: 3, width: 1, height: 1 }
+  const channelPrompt: ChannelPrompt = {
+    requestId: 'r1',
+    principal: { kind: 'feishu-group', chatId: 'oc_1', userId: 'u_1' },
+    content: [{ type: 'text', text: 'hi' }, { type: 'image', attachment: image, receiptId: 'receipt-1' }],
+  }
+
+  it('stores the request id, principal and durable blocks, never a receipt', () => {
+    expect(storablePrompt(channelPrompt)).toEqual({
+      requestId: 'r1',
+      principal: { kind: 'feishu-group', chatId: 'oc_1', userId: 'u_1' },
+      content: [{ type: 'text', text: 'hi' }, { type: 'image', attachment: image }],
+    })
+    expect(storablePrompt({ ...channelPrompt, content: [{ type: 'text', text: 'x'.repeat(300 * 1024) }] })).toBeUndefined()
+  })
+
+  it('rebuilds the prompt from a snapshot, dropping blocks of an unknown type', () => {
+    const stored = storablePrompt(channelPrompt)!
+    expect(promptOfSnapshot({ ...stored, content: [...stored.content, { type: 'audio', data: 'x' }] })).toEqual({
+      requestId: 'r1',
+      principal: { kind: 'feishu-group', chatId: 'oc_1', userId: 'u_1' },
+      content: [{ type: 'text', text: 'hi' }, { type: 'image', attachment: image }],
+    })
   })
 })
 

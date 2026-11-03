@@ -8,7 +8,6 @@ import { CodeWriteGate } from '../src/access/code-write.ts'
 import type { AccessPermission, RouteRecord } from '../src/domain.ts'
 import type { Agent, PreToolExecution } from '../src/dsh-types.ts'
 import type { UserMessage } from '../src/host/core.ts'
-import { feishuUserMessage } from '../src/access/principal.ts'
 
 const PUSH = 'repo_workspace_push'
 
@@ -30,9 +29,14 @@ function call(sessionId: string, parentSession?: string, name = PUSH): PreToolEx
   return { name, agent }
 }
 
-/** A claimed prompt sent by one Feishu user. */
+/** A claimed prompt DSH created for one Feishu user's private-chat submission. */
 function from(userId: string): Pick<UserMessage, 'source'> {
-  return feishuUserMessage('prompt', userId)
+  return { source: { kind: 'user', rpcId: 'r', principal: { kind: 'feishu-user', userId } } }
+}
+
+/** A claimed prompt DSH created for one member's submission in a group. */
+function fromGroup(chatId: string, userId: string): Pick<UserMessage, 'source'> {
+  return { source: { kind: 'user', rpcId: 'r', principal: { kind: 'feishu-group', chatId, userId } } }
 }
 
 describe('CodeWriteGate', () => {
@@ -108,7 +112,7 @@ describe('CodeWriteGate', () => {
 
   it('denies every gated call of a turn whose sender is unknown, and names no driver for it', () => {
     const { gate } = setup({ u_owner: ['codeWrite'] })
-    gate.markSenderUnknown('s_root')
+    gate.onClaimed('s_root', { source: { kind: 'user', rpcId: 'r', principal: { kind: 'share-viewer', shareId: 's' } } })
     const decision = gate.decide(call('s_root'))
     expect(decision).toMatchObject({ kind: 'deny', reason: expect.stringContaining('无法确认这一轮的飞书发言人') })
     expect(gate.decide(call('s_root', undefined, 'read_file'))).toBeUndefined()
@@ -119,12 +123,22 @@ describe('CodeWriteGate', () => {
 
   it('reads the driver from the durable principal, so it needs no record of submitted messages', () => {
     const { gate } = setup({ u_bob: ['codeWrite'] })
-    const prompt = feishuUserMessage('ship it', 'u_bob')
-    expect(prompt.source).toMatchObject({ kind: 'user', principal: { kind: 'feishu-user', userId: 'u_bob' } })
-    // The same message read back from a restart snapshot.
-    gate.onClaimed('s_root', JSON.parse(JSON.stringify(prompt)) as UserMessage)
+    // The same message read back from the Session log.
+    gate.onClaimed('s_root', JSON.parse(JSON.stringify(from('u_bob'))) as UserMessage)
     expect(gate.decide(call('s_root'))).toBeUndefined()
     expect(gate.driverOf('s_root')).toBe('u_bob')
+  })
+
+  it('takes the speaker of a group principal as the driver', () => {
+    const { gate } = setup({ u_bob: ['codeWrite'] })
+    gate.onClaimed('s_root', fromGroup('oc_group', 'u_bob'))
+    expect(gate.decide(call('s_root'))).toBeUndefined()
+    expect(gate.driverOf('s_root')).toBe('u_bob')
+    gate.onClaimed('s_root', fromGroup('oc_group', 'u_carol'))
+    expect(gate.decide(call('s_root'))).toMatchObject({ kind: 'deny', reason: expect.stringContaining('飞书用户 u_carol 没有代码改动权限') })
+    // A group principal without its chat is malformed.
+    gate.onClaimed('s_root', { source: { kind: 'user', rpcId: 'r', principal: { kind: 'feishu-group', userId: 'u_bob' } } })
+    expect(gate.decide(call('s_root'))).toMatchObject({ kind: 'deny', reason: expect.stringContaining('无法确认这一轮的飞书发言人') })
   })
 
   it('fails closed on a principal that is not a well-formed Feishu user, until a Feishu user is claimed', () => {

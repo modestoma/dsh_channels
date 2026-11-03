@@ -214,12 +214,12 @@ function truncateUtf8(value: string, maxBytes: number): string {
 // ---- Trigger-message image prefetch -------------------------------------
 
 /** Outcome of storing one prefetched image in the DSH native attachment library. */
-export type ImagePrefetchSaveResult =
-  | { readonly ok: true; readonly block: ImageBlock }
+export type ImagePrefetchSaveResult<B extends ImageBlock = ImageBlock> =
+  | { readonly ok: true; readonly block: B }
   | { readonly ok: false; readonly reason: string }
 
 /** Dependency-injected input of one trigger-message image prefetch. */
-export interface ImagePrefetchInput {
+export interface ImagePrefetchInput<B extends ImageBlock = ImageBlock> {
   /** Triggering message; its id addresses every resource download. */
   readonly msg: NormalizedMessage
   /** Candidate resources in prompt order (non-image and folder entries are skipped). */
@@ -230,7 +230,7 @@ export interface ImagePrefetchInput {
    * Persist one downloaded image in the native attachment library. Failures
    * are returned as values; a thrown error is contained per image as well.
    */
-  saveImage(bytes: Uint8Array, name?: string): Promise<ImagePrefetchSaveResult>
+  saveImage(bytes: Uint8Array, name?: string): Promise<ImagePrefetchSaveResult<B>>
   /** Per-image byte cap. */
   readonly maxImageBytes: number
   /** Total byte budget of this whole prefetch. */
@@ -242,9 +242,9 @@ export interface ImagePrefetchInput {
 }
 
 /** Result of one trigger-message image prefetch; failures are values. */
-export interface PrefetchedImages {
+export interface PrefetchedImages<B extends ImageBlock = ImageBlock> {
   /** Successfully stored image blocks, in input order (skipped entries excluded). */
-  readonly blocks: readonly ImageBlock[]
+  readonly blocks: readonly B[]
   /** `file_key`s whose images were stored (the manifest must omit these). */
   readonly loadedFileKeys: ReadonlySet<string>
   /** One readable reason per image that was not stored, in processing order. */
@@ -293,12 +293,12 @@ function totalLimitReason(readBytes: number, cap: number): string {
  * `saveImage` call that is already in flight cannot be recalled; the deadline
  * only guarantees that the prefetch returns without waiting for it.
  */
-export async function prefetchImageAttachments(input: ImagePrefetchInput): Promise<PrefetchedImages> {
+export async function prefetchImageAttachments<B extends ImageBlock = ImageBlock>(input: ImagePrefetchInput<B>): Promise<PrefetchedImages<B>> {
   const images = input.resources.filter(resource => resource.type === 'image' && resource.folder !== true)
-  const blocks: ImageBlock[] = []
+  const blocks: B[] = []
   const loadedFileKeys = new Set<string>()
   const failures: AttachmentFailure[] = []
-  const result = (): PrefetchedImages => ({ blocks, loadedFileKeys, failures })
+  const result = (): PrefetchedImages<B> => ({ blocks, loadedFileKeys, failures })
   if (images.length === 0) return result()
 
   const channel = input.channel
@@ -325,12 +325,12 @@ export async function prefetchImageAttachments(input: ImagePrefetchInput): Promi
 }
 
 /** Sequential image loop: order, stop-on-cap, and the shared deadline live here. */
-async function prefetchImagesSequentially(
-  input: ImagePrefetchInput,
+async function prefetchImagesSequentially<B extends ImageBlock>(
+  input: ImagePrefetchInput<B>,
   channel: FeishuChannel,
   images: readonly AttachmentResource[],
   deadline: PrefetchDeadline,
-  blocks: ImageBlock[],
+  blocks: B[],
   loadedFileKeys: Set<string>,
   failures: AttachmentFailure[],
 ): Promise<void> {
@@ -377,13 +377,13 @@ async function prefetchImagesSequentially(
 }
 
 /** One image's download + bounded collection + storage; never rejects. */
-async function prefetchOneImage(
-  input: ImagePrefetchInput,
+async function prefetchOneImage<B extends ImageBlock>(
+  input: ImagePrefetchInput<B>,
   channel: FeishuChannel,
   resource: AttachmentResource,
   signal: AbortSignal,
   usedBytes: number,
-): Promise<PrefetchOutcome> {
+): Promise<PrefetchOutcome<B>> {
   let stream: ResourceChunkStream
   try {
     stream = await channel.downloadResource(input.msg.messageId, resource.fileKey, 'image')
@@ -416,7 +416,7 @@ async function prefetchOneImage(
     return { kind: 'failed', reason: prefetchTimeoutReason(input.timeoutMs), bytes: collected.bytes }
   }
 
-  let saved: ImagePrefetchSaveResult
+  let saved: ImagePrefetchSaveResult<B>
   try {
     saved = await input.saveImage(collected.data, resource.fileName)
   } catch (error) {
@@ -439,8 +439,8 @@ async function prefetchOneImage(
 }
 
 /** Result of reading one image stream under both byte caps. */
-type PrefetchOutcome =
-  | { readonly kind: 'saved'; readonly block: ImageBlock; readonly bytes: number }
+type PrefetchOutcome<B extends ImageBlock> =
+  | { readonly kind: 'saved'; readonly block: B; readonly bytes: number }
   | { readonly kind: 'failed'; readonly reason: string; readonly bytes: number }
   | { readonly kind: 'stopped'; readonly reason: string; readonly skipReason: string }
 

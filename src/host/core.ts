@@ -48,7 +48,12 @@ export interface UserMessage {
   id: MessageId
   role: 'user'
   content: ContentBlock[]
-  source: { kind: string }
+  /**
+   * Where the message came from. A prompt submitted through `session/prompt`
+   * has `kind: 'user'`, `rpcId` (the caller's request id) and, for a
+   * non-owner caller, `principal`; see `src/access/principal.ts`.
+   */
+  source: { kind: string; [key: string]: unknown }
 }
 
 /** The chunk vocabulary consumed from live assistant-stream frames. */

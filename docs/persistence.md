@@ -63,8 +63,9 @@
   triggerMessageId?: string      // Typing/DONE 表情锚点（用户触发消息）；后台唤醒卡片没有
   reactionId?: string            // Typing 表情的 reaction id（add 失败时缺省）
   routeKey?: string              // 这一轮所在的路由，恢复时据此找回 Session
-  message?: UserMessage          // 交给 followup() 的消息（序列化 ≤ 256 KB，超出不存）
-  senderUserId?: string          // 这一轮代表的飞书用户：入站消息的发送者、发起话题的请求者、点「继续」的人，或宿主回合开始时会话的当前驱动者；重放时交给代码改动闸门（旧快照没有，重放的回合拒绝代码改动工具）
+  prompt?: { requestId, principal, content }  // 飞书提示：session/prompt 的请求 id、调用方（feishu-user / feishu-group）、内容块（图片块只存附件引用；序列化 ≤ 256 KB，超出不存）
+  message?: UserMessage          // 宿主回合（后台唤醒等）认领的消息，只用来在会话日志里定位这一轮；升级前的快照也只有它，不重放
+  senderUserId?: string          // 宿主回合开始时会话的当前驱动者（升级前的快照：这一轮的飞书发送者，已不再读取）
   replays?: number               // 已重放次数（上限 1）
   cards: Array<{ messageId: string; mode: 'card' | 'text' }>  // 段卡列表，[0] = 主卡
   startedAt: number              // 附加时间（TTL 清理用）
@@ -72,15 +73,15 @@
 }
 ```
 
-新增字段都是可选的，不升域版本：旧快照没有 `routeKey` 时按 `sessionId` 找路由，没有 `message` 时按「被打断」处理。
+新增字段都是可选的，不升域版本：旧快照没有 `routeKey` 时按 `sessionId` 找路由，没有 `prompt` 时按「被打断」处理（有 `message` 时按它的 id 定位这一轮，但不重放）。
 
 ## 生命周期
 
-1. **写入**（`routing/inbound.ts` `startSession` / `continueSession`、`topics/launcher.ts`）：回复卡发出、Typing 结果就绪后**先写快照、再写路由**（快照优先：崩溃窗口更偏安全侧——最多产生孤儿快照，修复无害）。消息组装完成后、`followup()` 之前经 `recordMessage()` 补写 `message`。后台唤醒卡片在主卡送达时经 `onHostCardDelivered` 写快照（没有 trigger）。
+1. **写入**（`routing/inbound.ts` `startSession` / `continueSession`、`topics/launcher.ts`）：回复卡发出、Typing 结果就绪后**先写快照、再写路由**（快照优先：崩溃窗口更偏安全侧——最多产生孤儿快照，修复无害）。提示组装完成后、提交 `session/prompt` 之前经 `recordPrompt()` 补写 `prompt`；宿主回合经 `recordMessage()` 补写 `message`。后台唤醒卡片在主卡送达时经 `onHostCardDelivered` 写快照（没有 trigger）。
 2. **段卡更新**（`streamer.ts`）：续卡发送成功、message id 解析后经钩子 `onSegmentDelivered(mainCardMessageId, index, messageId, mode)` 上报；服务端通过 `table.update()`（宿主原子 read-modify-write）合并进快照。
 3. **清除**（`streamer.ts` `finalize`）：turn 结束即经 `onTurnFinalized(sessionId, turn, mainCardMessageId)` 删除快照。会话创建失败路径（卡片已落「会话创建失败」终态）同样主动清除。
 4. **恢复**（`session/repair.ts` `repairAll()`，长连接建立后后台执行）：对每条快照恢复它的 Session（不在线时冷恢复），用 `classifyTurn()` 读会话日志：
-   - 日志里没有 `message.id` 对应的 `user/message`（还在排队）且 `replay.pending` 开启、未重放过：`replays + 1` 后把消息重新 `followup()` 进主卡，快照保留到新一轮结束。
+   - 日志里没有 `prompt.requestId` 对应的 `user/message`（来源 `rpcId`，还在排队）且 `replay.pending` 开启、未重放过：`replays + 1` 后以快照里的调用方、同一个请求 id 重新提交 `session/prompt` 进主卡（DSH 按请求 id 去重；图片块按附件引用从附件库重新暂存回执，暂存不了的降级为一段说明文字），快照保留到新一轮结束。只在 live Agent 的 inbox 里的提示只重新挂接卡片。
    - 这条消息之后的 `turn/end` 是正常结束（`completed` / `max-tokens`）：用其后各步 `assistant/message` 的文字重画全部卡片（`buildRecoveredReplyCards`），补 DONE。
    - 其余情况（冷恢复补写的 `interrupted`、出错、停止、没有 `turn/end`）：所有 `mode: 'card'` 的卡 patch 为中断卡；`replay.interrupted: 'ask'` 时主卡带「▶️ 继续」按钮（`RESUME_ACTION`，值里带 sessionId 和 trigger），点击后在同一张卡片里新开一轮，并为这一轮写新快照。
    - 路由已失效、Session 已换或恢复失败时，按「被打断」处理且不带按钮。
