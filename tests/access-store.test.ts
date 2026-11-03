@@ -29,7 +29,7 @@ function makeStore(options: { open?: boolean } = {}) {
 /** Read one raw access table back from the fake durable storage. */
 function durableEntries(
   domain: ReturnType<typeof makeAccessDomain>,
-  table: 'access_users' | 'access_requests',
+  table: 'access_users' | 'access_requests' | 'group_permissions',
 ): Array<[string, unknown]> {
   const handle = domain.raw.table(table)
   return [...handle.entries()]
@@ -199,6 +199,78 @@ describe('AccessStore 用户表写穿', () => {
     expect(durableEntries(domain, 'access_users')).toHaveLength(1)
     store.load()
     expect(store.hasUser('u_a')).toBe(true)
+  })
+})
+
+describe('AccessStore 群权限表', () => {
+  it('ensureGroup 首次登记：三个开关全关并持久化；重复登记只更新群名', async () => {
+    const { store, domain } = makeStore()
+    store.load()
+    const created = await store.ensureGroup('oc_a', '研发群', 100)
+    expect(created).toEqual({ chatId: 'oc_a', name: '研发群', addedAt: 100, wikiRead: false, wikiWrite: false, codeWrite: false })
+    expect(durableEntries(domain, 'group_permissions')).toEqual([['oc_a', created]])
+
+    await store.setGroupPermission('oc_a', 'wikiRead', true)
+    const same = await store.ensureGroup('oc_a', undefined, 200)
+    expect(same).toMatchObject({ addedAt: 100, wikiRead: true, name: '研发群' })
+    const renamed = await store.ensureGroup('oc_a', '研发群（新）', 300)
+    expect(renamed).toMatchObject({ addedAt: 100, wikiRead: true, name: '研发群（新）' })
+    expect(store.getGroup('oc_a')).toEqual(renamed)
+  })
+
+  it('groupAllows：没有记录的群一律视为关闭；setGroupPermission 只改一个开关', async () => {
+    const { store } = makeStore()
+    store.load()
+    expect(store.groupAllows('oc_none', 'codeWrite')).toBe(false)
+    expect(await store.setGroupPermission('oc_none', 'codeWrite', true)).toBeUndefined()
+
+    await store.ensureGroup('oc_a', undefined, 100)
+    expect(store.groupAllows('oc_a', 'codeWrite')).toBe(false)
+    await store.setGroupPermission('oc_a', 'codeWrite', true)
+    expect(store.groupAllows('oc_a', 'codeWrite')).toBe(true)
+    expect(store.groupAllows('oc_a', 'wikiRead')).toBe(false)
+    expect(store.groupAllows('oc_a', 'wikiWrite')).toBe(false)
+    await store.setGroupPermission('oc_a', 'codeWrite', false)
+    expect(store.groupAllows('oc_a', 'codeWrite')).toBe(false)
+  })
+
+  it('removeGroup 持久删除并即时关闭开关；不存在时返回 false', async () => {
+    const { store, domain } = makeStore()
+    store.load()
+    await store.ensureGroup('oc_a', undefined, 100)
+    await store.setGroupPermission('oc_a', 'wikiWrite', true)
+    expect(await store.removeGroup('oc_a')).toBe(true)
+    expect(store.getGroup('oc_a')).toBeUndefined()
+    expect(store.groupAllows('oc_a', 'wikiWrite')).toBe(false)
+    expect(durableEntries(domain, 'group_permissions')).toEqual([])
+    expect(await store.removeGroup('oc_a')).toBe(false)
+  })
+
+  it('load 从 durable 表读入群记录并按 addedAt 排序；clear 后 load 恢复', async () => {
+    const { store, domain } = makeStore()
+    void domain.handle.groupPermissions.put('oc_new', { chatId: 'oc_new', addedAt: 300, wikiRead: false, wikiWrite: false, codeWrite: true })
+    void domain.handle.groupPermissions.put('oc_old', { chatId: 'oc_old', name: '老群', addedAt: 100, wikiRead: true, wikiWrite: false, codeWrite: false })
+    store.load()
+    expect(store.groupRecords().map(record => record.chatId)).toEqual(['oc_old', 'oc_new'])
+    expect(store.groupAllows('oc_new', 'codeWrite')).toBe(true)
+    expect(store.groupAllows('oc_old', 'wikiRead')).toBe(true)
+    store.clear()
+    expect(store.groupAllows('oc_new', 'codeWrite')).toBe(false)
+    store.load()
+    expect(store.groupAllows('oc_new', 'codeWrite')).toBe(true)
+  })
+
+  it('同一群的并发开关修改依次生效；domain 缺失时写操作报错', async () => {
+    const { store, state } = makeStore()
+    store.load()
+    await store.ensureGroup('oc_a', undefined, 100)
+    await Promise.all([
+      store.setGroupPermission('oc_a', 'wikiRead', true),
+      store.setGroupPermission('oc_a', 'codeWrite', true),
+    ])
+    expect(store.getGroup('oc_a')).toMatchObject({ wikiRead: true, codeWrite: true })
+    state.handle = undefined
+    await expect(store.ensureGroup('oc_b', undefined, 1)).rejects.toThrow(/access domain not open/)
   })
 })
 

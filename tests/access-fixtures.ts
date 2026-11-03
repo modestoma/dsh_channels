@@ -9,7 +9,7 @@
 import { resolveConfig } from '../src/config.ts'
 import type { FeishuConfig } from '../src/config.ts'
 import type {
-  AccessRequestRecord, AccessUserRecord, FeishuDomainHandle,
+  AccessRequestRecord, AccessUserRecord, FeishuDomainHandle, GroupPermissionRecord,
 } from '../src/domain.ts'
 import { makeDomain } from './helpers.ts'
 
@@ -46,6 +46,7 @@ export function makeAccessDomain(): {
   const handle = {
     accessUsers: tableOf<AccessUserRecord>(raw, 'access_users'),
     accessRequests: tableOf<AccessRequestRecord>(raw, 'access_requests'),
+    groupPermissions: tableOf<GroupPermissionRecord>(raw, 'group_permissions'),
   } as unknown as FeishuDomainHandle
   return { handle, raw }
 }

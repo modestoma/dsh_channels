@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
-  appendSessionHistory, expiredRouteRecordSchema, feishuDomain, normalizeRouteRecord, normalizeSessionHistory,
-  routeRecordSchema, sessionDirOf,
+  GROUP_PERMISSIONS, appendSessionHistory, expiredRouteRecordSchema, feishuDomain, groupPermissionRecordSchema,
+  isGroupRoute, normalizeRouteRecord, normalizeSessionHistory, routeRecordSchema, sessionDirOf,
 } from '../src/domain.ts'
 import type { RouteRecord } from '../src/domain.ts'
 
@@ -158,6 +158,43 @@ describe('expired route tombstone', () => {
       sessionDir: '/workspace/owner/topics/omt_expired',
       worktreeBranch: 'feishu-omt_expired',
     })
+  })
+})
+
+describe('group routes', () => {
+  it('reads mode: group and the legacy shared flag as a group route; anything else is owner-only', () => {
+    expect(isGroupRoute({ mode: 'group' })).toBe(true)
+    expect(isGroupRoute({ shared: true })).toBe(true)
+    expect(isGroupRoute({})).toBe(false)
+  })
+
+  it('accepts mode and lastSpeakerUserId on a route record and rejects other values', () => {
+    const parsed = routeRecordSchema.parse(route({ mode: 'group', lastSpeakerUserId: 'u_bob' }))
+    expect(parsed.mode).toBe('group')
+    expect(parsed.lastSpeakerUserId).toBe('u_bob')
+    expect(routeRecordSchema.parse(route()).mode).toBeUndefined()
+    expect(() => routeRecordSchema.parse({ ...route(), mode: 'personal' })).toThrow()
+    expect(() => routeRecordSchema.parse(route({ lastSpeakerUserId: '' }))).toThrow()
+  })
+})
+
+describe('group permission records', () => {
+  it('lists the three switches a group can hold', () => {
+    expect(GROUP_PERMISSIONS).toEqual(['wikiRead', 'wikiWrite', 'codeWrite'])
+  })
+
+  it('requires a chat id, defaults a missing switch to off, and keeps the name optional', () => {
+    const record = { chatId: 'oc_a', addedAt: 1, wikiRead: false, wikiWrite: true, codeWrite: false }
+    expect(groupPermissionRecordSchema.parse(record)).toEqual(record)
+    expect(groupPermissionRecordSchema.parse({ ...record, name: '研发群' }).name).toBe('研发群')
+    expect(() => groupPermissionRecordSchema.parse({ ...record, chatId: '' })).toThrow()
+    expect(() => groupPermissionRecordSchema.parse({ ...record, addedAt: -1 })).toThrow()
+    const { codeWrite: _codeWrite, ...missing } = record
+    expect(groupPermissionRecordSchema.parse(missing).codeWrite).toBe(false)
+  })
+
+  it('is stored in its own table', () => {
+    expect(Object.keys(feishuDomain.tables)).toContain('group_permissions')
   })
 })
 

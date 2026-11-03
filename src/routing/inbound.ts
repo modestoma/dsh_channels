@@ -10,13 +10,14 @@
  */
 
 import { randomUUID } from 'node:crypto'
+import { mkdir } from 'node:fs/promises'
 import type {
   Agent, AgentHandle, AttachmentStore, HostContext, SessionId, Workspace,
 } from '../dsh-types.ts'
 import type { FeishuConfig } from '../config.ts'
 import { buildCard, buildOnboardingCard, initialStreamingCard, queuedStreamingCard } from '../cards.ts'
 import { RouteOperationQueue } from '../commands.ts'
-import { chatRouteKey, sessionDirOf } from '../domain.ts'
+import { chatRouteKey, isGroupRoute, sessionDirOf } from '../domain.ts'
 import type { FeishuDomainHandle, RouteRecord } from '../domain.ts'
 import type { CardDelivery } from '../feishu/delivery.ts'
 import {
@@ -32,14 +33,11 @@ import type { InflightRepair } from '../session/repair.ts'
 import type { SessionManager } from '../session/manager.ts'
 import type { RouteStore } from '../session/routes.ts'
 import type { TurnStreamer } from '../streamer.ts'
-import {
-  enterTopic, placementServices, planTopic, restoreTopicDir,
-} from '../session/isolation.ts'
 import { principalOnRoute } from '../access/principal.ts'
 import { channelPrompt, type ChannelPrompt, type PromptBlock, type PromptImageBlock } from '../session/prompt.ts'
 import type { TurnSubmission } from '../session/submit.ts'
-import type { PlacementServices, TopicPlacement, TopicPlan } from '../session/isolation.ts'
-import { ensureWorkspace, topicTokenFor } from '../workspaces.ts'
+import { ensureTopicWorkspace, topicTitleOf, topicTokenFor, topicWorkspacePathFor, workspaceTitleFor } from '../workspaces.ts'
+import type { TopicLocationPort } from '../workspaces.ts'
 
 /** The command plane the inbound router delegates admission-time work to. */
 export interface CommandPlanePort {
@@ -62,7 +60,14 @@ export interface InboundAccessPort {
   /** Full admission for a non-slash message; false = handled (deny/notice). */
   admit(msg: NormalizedMessage): Promise<boolean>
   /**
-   * Route ownership: only the sender who created a topic may continue it.
+   * The admission matrix alone, with no side effect: re-read right before a
+   * queued turn is submitted, so a sender whose chat access was turned off
+   * while their message waited is refused with a notice instead of served.
+   */
+  allows(msg: NormalizedMessage): boolean
+  /**
+   * Whether the sender may continue the route: anyone the matrix admits on a
+   * group route without a single owner, else only the user who opened it.
    * Also guards against cross-chat id confusion.
    */
   ownsRoute(msg: NormalizedMessage, record: RouteRecord): boolean
@@ -140,6 +145,8 @@ export interface InboundDeps {
   prefetchImages(): AttachmentPrefetchPolicy
   /** Channel-plane access control (administrator + user table). */
   access: InboundAccessPort
+  /** Names of the places topics open in, and group registration. */
+  location: TopicLocationPort
   /** Shared per-route FIFO admission (commands and turns must not interleave). */
   queue: RouteOperationQueue
   streamer(): TurnStreamer | undefined
@@ -180,6 +187,9 @@ export function knownAttachmentMessageOf(msg: NormalizedMessage): KnownAttachmen
     senderUserId: msg.senderId,
   }
 }
+
+/** Notice for a queued message whose sender lost chat access before it was served. */
+export const CHAT_ACCESS_REVOKED_TEXT = '你的对话权限已被关闭，这条消息没有发送给会话。'
 
 /** Feishu message-id shape accepted for quote resolution (`om_...`). */
 const QUOTE_MESSAGE_ID = /^om_[A-Za-z0-9_-]{1,128}$/u
@@ -824,17 +834,13 @@ export class InboundRouter {
 
     // 2. First card frame — also creates the topic (reply_in_thread). The
     //    topic identity is only known after Feishu answers, and it names the
-    //    topic's private working directory inside the user's workspace.
+    //    topic's workspace directory.
     const sent = await this.delivery.replyFirstCard(msg, initialStreamingCard(sessionId))
     const typingId = await typingPromise
     const key = sent.degraded || sent.threadId === undefined ? chatKey : sent.threadId
     const kind = sent.degraded || sent.threadId === undefined ? 'chat' : 'thread'
 
     const topicToken = topicTokenFor(key, kind, sessionId)
-    const services: PlacementServices = placementServices(this.ctx)
-    const warn = (message: string, ...args: unknown[]): void => {
-      this.ctx.logger?.warn?.(message, ...args)
-    }
     /** Patch the streaming card to its terminal creation-failure state. */
     const failCreation = async (error: unknown): Promise<void> => {
       void this.repair.clear(sent.messageId)
@@ -846,16 +852,21 @@ export class InboundRouter {
       })).catch(() => {})
     }
 
-    // 3. User workspace (the durable project this Session is grouped under)
-    //    plus the per-topic placement plan. No Agent exists yet; the plan
-    //    materializes anything that must exist before creation.
+    // 3. The topic's own workspace (its directory is the Session header cwd:
+    //    the sandbox root and the project the Session is grouped under),
+    //    titled after the group or person and the opening message. A group
+    //    gets its permission record (every switch off) when its first topic
+    //    opens. No Agent exists yet.
     let workspace: Workspace
-    let plan: TopicPlan
     try {
-      workspace = await ensureWorkspace(
-        this.ctx, this.config.baseDir, msg.chatType, msg.chatId, msg.senderId,
+      const group = msg.chatType === 'group'
+      const ownerName = group ? await this.deps.location.groupName(msg.chatId) : await this.deps.location.userName(msg.senderId)
+      workspace = await ensureTopicWorkspace(
+        this.ctx,
+        topicWorkspacePathFor(this.config.baseDir, msg.chatType, msg.chatId, msg.senderId, topicToken),
+        workspaceTitleFor(ownerName ?? (group ? msg.chatId : msg.senderId), topicTitleOf(content)),
       )
-      plan = await planTopic(services, this.config, workspace.path, topicToken, warn)
+      if (group) await this.deps.location.registerGroup(msg.chatId, ownerName)
     } catch (error) {
       await failCreation(error)
       throw error
@@ -877,21 +888,10 @@ export class InboundRouter {
       attempts: 0,
     })
 
-    // 4. Create the Session (header cwd = user workspace when directories can
-    //    be switched), then enter its own topic directory / worktree.
+    // 4. Create the Session in the topic directory (its header cwd).
     let handle: AgentHandle | undefined
-    let placement: TopicPlacement | undefined
     try {
-      handle = await this.sessions.createSession(sessionId, plan.cwd)
-      placement = await enterTopic(services, handle.agent, plan, workspace.path, topicToken, warn)
-      // A workspace attachment only validates when the header cwd is the
-      // workspace itself; the hard fallback (no workingDirectory service) must
-      // skip it instead of logging a guaranteed failure.
-      if (plan.cwd === workspace.path) {
-        void Promise.resolve(workspace.attachSession(sessionId)).catch((error: unknown) => {
-          warn('dsh-channels: attaching initial session %s to workspace failed: %s', sessionId, String(error))
-        })
-      }
+      handle = await this.sessions.createSession(sessionId, workspace.path)
       await this.sessions.mountGuidance(handle.agent)
     } catch (error) {
       // The card lands in a final failure state — no repair needed later. A
@@ -900,7 +900,7 @@ export class InboundRouter {
       await failCreation(error)
       throw error
     }
-    if (handle === undefined || placement === undefined) {
+    if (handle === undefined) {
       throw new Error('dsh-channels: session creation completed without a handle')
     }
 
@@ -914,8 +914,9 @@ export class InboundRouter {
       chatType: msg.chatType,
       senderUserId: msg.senderId,
       workspacePath: workspace.path,
-      sessionDir: placement.sessionDir,
-      ...(placement.worktreeBranch === undefined ? {} : { worktreeBranch: placement.worktreeBranch }),
+      // A group topic has no single owner; a degraded chat-scoped group route
+      // is keyed per sender and stays that sender's.
+      ...(msg.chatType === 'group' && kind === 'thread' ? { mode: 'group' as const } : {}),
       cardMessageId: sent.messageId,
       createdAt,
       lastActivityAt: createdAt,
@@ -954,26 +955,24 @@ export class InboundRouter {
     // Defence in depth: every current caller checks this first, but a future
     // call path must not be able to continue another user's Session.
     if (!this.access.ownsRoute(msg, record)) return
-    const services = placementServices(this.ctx)
-    const warn = (message: string, ...args: unknown[]): void => {
-      this.ctx.logger?.warn?.(message, ...args)
+    // The message may have waited behind a running turn; chat access turned
+    // off meanwhile refuses it here, before anything reaches the Session.
+    if (!this.access.allows(msg)) {
+      await this.delivery.noticeText(msg, CHAT_ACCESS_REVOKED_TEXT)
+      return
     }
     const typingPromise = this.delivery.requireChannel().addReaction(msg.messageId, 'Typing').catch(() => undefined)
     const live = await this.sessions.ensureLive(record)
     // The topic directory can disappear independently of the Session (manual
-    // deletion, external cleanup). Recreate it and re-align the effective
-    // working directory so the turn never leaks into the shared workspace root.
-    const placement = await restoreTopicDir(services, live.agent, {
-      workspacePath: record.workspacePath,
-      sessionDir: sessionDirOf(record),
-      ...(record.worktreeBranch === undefined ? {} : { worktreeBranch: record.worktreeBranch }),
-    }, warn)
-    let current: RouteRecord = record
-    if (placement.sessionDir !== sessionDirOf(record) || placement.worktreeBranch !== record.worktreeBranch) {
-      current = { ...record, sessionDir: placement.sessionDir }
-      delete current.worktreeBranch
-      if (placement.worktreeBranch !== undefined) current = { ...current, worktreeBranch: placement.worktreeBranch }
-    }
+    // deletion, external cleanup); recreate it so the turn has its directory.
+    await mkdir(sessionDirOf(record), { recursive: true }).catch((error: unknown) => {
+      this.ctx.logger?.warn?.('dsh-channels: recreating topic directory %s failed: %s', sessionDirOf(record), String(error))
+    })
+    // A group route remembers its latest speaker for the commit trailer a
+    // restart would otherwise attribute to the initiator.
+    const current: RouteRecord = isGroupRoute(record) && record.lastSpeakerUserId !== msg.senderId
+      ? { ...record, lastSpeakerUserId: msg.senderId }
+      : record
 
     // A message behind a running turn opens as a queued card whose button can
     // move it into that turn instead (see `TurnStreamer.mergeQueued`).

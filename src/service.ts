@@ -20,7 +20,6 @@
 
 import { CodeWriteGate } from './access/code-write.ts'
 import { ReadFence } from './access/read-fence.ts'
-import { placementServices } from './session/isolation.ts'
 import { AccessController } from './access/controller.ts'
 import { AccessRequests } from './access/requests.ts'
 import { AccessStore } from './access/store.ts'
@@ -53,17 +52,19 @@ import {
 import type { EffortCommandAction, ParsedSlashCommand } from './commands.ts'
 import { commandSpec } from './commands/registry.ts'
 import type { ChannelCommandSpec } from './commands/registry.ts'
+import { workingDirectoryService } from './dsh-types.ts'
 import type { PermissionPresets, SessionQuery } from './dsh-types.ts'
-import { ACCESS_PERMISSIONS, FEISHU_USER_ID_PATTERN, feishuDomain, PROCESSED_RETENTION_MS, sessionDirOf } from './domain.ts'
+import { ACCESS_PERMISSIONS, FEISHU_USER_ID_PATTERN, feishuDomain, isGroupRoute, PROCESSED_RETENTION_MS, sessionDirOf } from './domain.ts'
 import type {
   AccessPermission, AccessRequestRecord, AccessSwitch, AccessUserRecord,
-  ExpiredRouteRecord, FeishuDomainGlobal, FeishuDomainHandle, InflightSnapshot,
+  ExpiredRouteRecord, FeishuDomainGlobal, FeishuDomainHandle, GroupPermission, GroupPermissionRecord, InflightSnapshot,
   ProcessedRecord, RawDomainHandle, RouteRecord, SessionOriginRecord, TopicLaunchRecord,
 } from './domain.ts'
 import { Outbox } from './outbox.ts'
 import type { OutboxEntry } from './outbox.ts'
 import { RouteStore } from './session/routes.ts'
 import { TopicLauncher } from './topics/launcher.ts'
+import type { TopicLocationPort } from './workspaces.ts'
 import { InflightRepair, storableMessage } from './session/repair.ts'
 import { channelPrompt, storablePrompt } from './session/prompt.ts'
 import type { ChannelPrompt } from './session/prompt.ts'
@@ -168,6 +169,7 @@ async function openFeishuDomain(ctx: HostContext): Promise<FeishuDomainHandle> {
   const expiredRoutesRaw = domain.table('expired_routes')
   const accessUsersRaw = domain.table('access_users')
   const accessRequestsRaw = domain.table('access_requests')
+  const groupPermissionsRaw = domain.table('group_permissions')
   const topicLaunchesRaw = domain.table('analyze_requests')
   const sessionOriginsRaw = domain.table('session_origins')
   const outboxRaw = domain.table('outbox')
@@ -207,6 +209,12 @@ async function openFeishuDomain(ctx: HostContext): Promise<FeishuDomainHandle> {
       put: (key, value) => accessRequestsRaw.put(key, value),
       delete: key => accessRequestsRaw.delete(key),
       entries: () => accessRequestsRaw.entries() as IterableIterator<[string, AccessRequestRecord]>,
+    },
+    groupPermissions: {
+      get: key => groupPermissionsRaw.get(key) as GroupPermissionRecord | undefined,
+      put: (key, value) => groupPermissionsRaw.put(key, value),
+      delete: key => groupPermissionsRaw.delete(key),
+      entries: () => groupPermissionsRaw.entries() as IterableIterator<[string, GroupPermissionRecord]>,
     },
     topicLaunches: {
       get: key => topicLaunchesRaw.get(key) as TopicLaunchRecord | undefined,
@@ -580,7 +588,7 @@ export class FeishuService {
           chatId: record.chatId,
           chatType: record.chatType,
           senderUserId: record.senderUserId,
-          ...(record.shared === true ? { shared: true } : {}),
+          ...(isGroupRoute(record) ? { shared: true } : {}),
         }
       },
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
@@ -597,7 +605,7 @@ export class FeishuService {
           chatId: record.chatId,
           chatType: record.chatType,
           senderUserId: record.senderUserId,
-          ...(record.shared === true ? { shared: true } : {}),
+          ...(isGroupRoute(record) ? { shared: true } : {}),
         }
       },
       noteKnownMessage: (route, message, source) => {
@@ -627,7 +635,10 @@ export class FeishuService {
       config: () => this.config,
       channel: () => (this.started ? this.channel : undefined),
       routeOfSession: sessionId => this.approvalRouteFor(sessionId),
-      mayUseWiki: (userId, access) => this.accessController.mayUse(userId, access === 'read' ? 'wikiRead' : 'wikiWrite'),
+      mayUseWiki: (sessionId, access) => {
+        const record = this.routes.findBySession(sessionId)
+        return record !== undefined && this.accessController.mayUseOnRoute(record, access === 'read' ? 'wikiRead' : 'wikiWrite')
+      },
       consent: this.wikiConsent,
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
     })
@@ -658,12 +669,12 @@ export class FeishuService {
     this.codeWriteGate = new CodeWriteGate({
       config: () => this.config,
       routeOf: sessionId => this.routes.findBySession(sessionId),
-      mayUse: (userId, permission) => this.accessController.mayUse(userId, permission),
+      mayWrite: route => this.accessController.mayUseOnRoute(route, 'codeWrite'),
     })
     this.readFence = new ReadFence({
       config: () => this.config,
       routeOf: sessionId => this.routes.findBySession(sessionId),
-      workingDirectory: session => placementServices(this.ctx).workingDirectory?.get(session),
+      workingDirectory: session => workingDirectoryService(this.ctx)?.get(session),
     })
     this.accessController = new AccessController({
       config: () => this.config,
@@ -716,6 +727,7 @@ export class FeishuService {
         timeoutMs: this.config.prefetchTimeoutMs,
       }),
       access: this.accessController,
+      location: this.topicLocation,
       queue: this.routeOperations,
       streamer: () => this.streamer,
       questionAnswerer: () => this.questionAnswerer,
@@ -740,8 +752,16 @@ export class FeishuService {
       prompts,
       queue: this.routeOperations,
       reserveTopic: threadId => this.inbound.reserveTopic(threadId),
+      location: this.topicLocation,
       mayLaunchFor: requesterUserId => this.accessController.mayLaunchFor(requesterUserId),
     })
+  }
+
+  /** Names of the places topics open in (Feishu profiles) and group registration (access store). */
+  private readonly topicLocation: TopicLocationPort = {
+    groupName: async chatId => (await this.feishuProfiles([], [chatId])).chats[chatId]?.name,
+    userName: async userId => (await this.feishuProfiles([userId], [])).users[userId]?.name,
+    registerGroup: async (chatId, name) => { await this.accessStore.ensureGroup(chatId, name) },
   }
 
   /**
@@ -1159,8 +1179,8 @@ export class FeishuService {
     const route = this.routes.findBySession(sessionId)
     if (route === undefined) return
     const stored = storableMessage(message)
-    // A host turn acts for the Session's current driver; replay restores it.
-    const driver = this.codeWriteGate.driverOf(sessionId)
+    // A host turn acts for the Session's current speaker (diagnostics only).
+    const driver = this.codeWriteGate.speakerOf(sessionId)
     try {
       await this.repair.write({
         key: messageId,
@@ -1209,6 +1229,14 @@ export class FeishuService {
       // channel runs; an unconnected panel must not present them as empty.
       loaded: this.domain !== undefined,
       users: this.accessStore.userRecords().map(userWire),
+      groups: this.accessStore.groupRecords().map(record => ({
+        chatId: record.chatId,
+        ...(record.name === undefined ? {} : { name: record.name }),
+        addedAt: record.addedAt,
+        wikiRead: record.wikiRead,
+        wikiWrite: record.wikiWrite,
+        codeWrite: record.codeWrite,
+      })),
       requests: this.accessStore.pendingRequests().map(record => {
         const wire: AccessRequestWire = {
           token: record.token,
@@ -1297,6 +1325,37 @@ export class FeishuService {
     }
   }
 
+  /**
+   * Panel: set one permission switch of a registered group.
+   * @param chatId - Feishu chat_id.
+   * @param permission - the switch.
+   * @param enabled - new value.
+   * @returns the refreshed access snapshot, or the failure.
+   */
+  async setGroupPermission(chatId: string, permission: GroupPermission, enabled: boolean): Promise<AccessMutationResponse> {
+    try {
+      const updated = await this.accessStore.setGroupPermission(chatId, permission, enabled)
+      if (updated === undefined) return { ok: false, error: '该群还没有登记（机器人在群里开过话题后自动登记）' }
+      return { ok: true, access: this.accessSnapshot() }
+    } catch (error) {
+      return { ok: false, error: `写入群权限失败：${messageOf(error)}` }
+    }
+  }
+
+  /**
+   * Panel: delete one group's permission record.
+   * @param chatId - Feishu chat_id.
+   * @returns the refreshed access snapshot, or the failure.
+   */
+  async removeAccessGroup(chatId: string): Promise<AccessMutationResponse> {
+    try {
+      await this.accessStore.removeGroup(chatId)
+      return { ok: true, access: this.accessSnapshot() }
+    } catch (error) {
+      return { ok: false, error: `移除群失败：${messageOf(error)}` }
+    }
+  }
+
   /** Add a user with only `chat` on, or turn `chat` on for an existing record. */
   private async grantChat(userId: string, name: string | undefined, source: AccessUserRecord['source'], admin: string): Promise<void> {
     await this.accessStore.grantChat({
@@ -1351,7 +1410,7 @@ export class FeishuService {
       senderUserId: origin.senderUserId,
       ...(senderName === undefined ? {} : { senderName }),
       ...(sender.avatarUrl === undefined ? {} : { senderAvatarUrl: sender.avatarUrl }),
-      shared: origin.shared === true,
+      shared: isGroupRoute(origin),
       createdAt: origin.createdAt,
       bound,
       ...(bound ? { lastActivityAt: route.lastActivityAt } : {}),
@@ -1456,7 +1515,7 @@ export class FeishuService {
         sessionId: id,
         ...(title === undefined ? {} : { title }),
         kind: origin.kind,
-        shared: origin.shared === true,
+        shared: isGroupRoute(origin),
         createdAt: origin.createdAt,
         bound: route !== undefined,
         ...(route === undefined ? {} : { lastActivityAt: route.lastActivityAt }),
@@ -1997,7 +2056,7 @@ export class FeishuService {
     this.unlistenHost.push(this.ctx.on('tools/pre-execute', async (exec, next) =>
       this.codeWriteGate.decide(exec) ?? await this.readFence.decide(exec) ?? await next()))
     this.unlistenHost.push(this.ctx.on('repo/commit-trailers', async (event) => {
-      const userId = this.codeWriteGate.driverOf(event.session)
+      const userId = this.codeWriteGate.speakerOf(event.session)
       if (userId === undefined) return
       const name = await this.commitName(userId)
       event.add('Feishu-User', name === undefined ? userId : `${name} <${userId}>`)
@@ -3204,7 +3263,7 @@ export class FeishuService {
       cardMessageId: record.cardMessageId,
       inThread: record.kind === 'thread',
       senderUserId: record.senderUserId,
-      ...(record.shared === true
+      ...(isGroupRoute(record)
         ? { mayDecide: (userId: string) => this.accessController.mayActOnRoute(userId, record.chatId, record) }
         : {}),
     }

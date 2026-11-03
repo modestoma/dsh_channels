@@ -17,12 +17,14 @@ import type { OutboxTable } from './outbox.ts'
  * Route key kinds. `thread` = real Feishu topic; `chat` = degraded chat-scoped
  * fallback.
  *
- * Version 2 adds the optional `sessionDir` / `worktreeBranch` fields (the
- * Session's effective working directory). Version-1 records stay readable: an
- * absent `sessionDir` means the workspace path itself is the working directory
- * (the pre-v2 model).
+ * Version 3 routes own one workspace per topic (`workspacePath` is the topic
+ * directory and the Session header cwd) and carry `mode: 'group'` on group
+ * routes without a single owner. Version-2 records (per-user workspaces with
+ * an optional per-topic `sessionDir` / `worktreeBranch`) and version-1 records
+ * (an absent `sessionDir` means the workspace path is the working directory)
+ * stay readable and keep their directories; they are never rewritten.
  */
-export const ROUTE_RECORD_VERSION = 2
+export const ROUTE_RECORD_VERSION = 3
 
 export const sessionHistoryEntrySchema = z.object({
   /** One Session that has been bound to this route. */
@@ -44,18 +46,43 @@ export const routeRecordSchema = z.object({
   chatId: z.string().min(1),
   /** `p2p` or `group`. */
   chatType: z.enum(['p2p', 'group']),
-  /** Workspace owner (sender user_id). */
+  /**
+   * The user who opened the route. In a private chat the person the topic
+   * belongs to, whose switches gate its tools. On a `mode: 'group'` route the
+   * initiator, shown on cards and records only: group permissions gate the
+   * tools and anyone with chat access may continue. On older group routes
+   * without `mode` the only user who may continue (and whose switches apply).
+   */
   senderUserId: z.string().min(1),
-  /** Workspace root owning this route: the Session header cwd / sandbox root. */
+  /**
+   * The Session header cwd: the sandbox root and the workspace the Session is
+   * grouped under. Version-3 routes: the topic directory. Older routes: the
+   * per-user workspace root (see `sessionDir`).
+   */
   workspacePath: z.string().min(1),
   /**
-   * Effective working directory of the bound Session (the per-topic directory
-   * or Git worktree checkout). Absent on records written before per-topic
-   * directories existed: `workspacePath` is then the working directory too.
+   * Older routes only: the per-topic directory or Git worktree checkout the
+   * Session works in inside `workspacePath`. Absent on version-3 routes and on
+   * records written before per-topic directories existed; `workspacePath` is
+   * then the working directory too. Never written by this version.
    */
   sessionDir: z.string().min(1).optional(),
-  /** Git branch owning `sessionDir` when it is a worktree checkout. */
+  /** Older routes only: Git branch owning `sessionDir` when it is a worktree checkout. */
   worktreeBranch: z.string().min(1).optional(),
+  /**
+   * `group`: a group route without a single owner, written by version 3 for
+   * every topic opened in a group (by a message or a `feishuTopics` launch).
+   * Anyone with chat access may continue it; the group's permission record
+   * gates its tools. Absent on private-chat routes and on older group routes.
+   */
+  mode: z.literal('group').optional(),
+  /**
+   * The user whose message most recently continued a `mode: 'group'` route
+   * (the resume click after a restart counts). Restores the speaker a
+   * commit trailer names after a restart; absent until someone other than
+   * the initiator speaks.
+   */
+  lastSpeakerUserId: z.string().min(1).optional(),
   /** Message id of the latest streaming card (updated per turn). */
   cardMessageId: z.string().min(1),
   /** Epoch ms when the record was created. */
@@ -65,14 +92,27 @@ export const routeRecordSchema = z.object({
   /** Sessions this topic has pointed at, oldest first. Optional for v1 compatibility. */
   sessionHistory: z.array(sessionHistoryEntrySchema).optional(),
   /**
-   * Group-shared route (topics started through `feishuTopics`): every member admitted
-   * in `chatId` may continue the Session and decide its cards, not only
-   * `senderUserId` (who then names the requester). Absent = owner-only.
+   * Older group routes started through `feishuTopics` before `mode` existed:
+   * read exactly like `mode: 'group'` (see {@link isGroupRoute}). Never
+   * written by this version.
    */
   shared: z.literal(true).optional(),
 })
 
 export type RouteRecord = z.infer<typeof routeRecordSchema>
+
+/**
+ * Whether a route is a group route without a single owner: anyone with chat
+ * access in its chat may continue it, decide its cards, and run its session
+ * commands, and the group's permission record gates its tools. True for
+ * `mode: 'group'` routes and for older `shared` routes; false for private
+ * chats and for older group routes that only their initiator continues.
+ * @param record - the route (any record carrying the two markers).
+ * @returns true for a group route without a single owner.
+ */
+export function isGroupRoute(record: Pick<RouteRecord, 'mode' | 'shared'>): boolean {
+  return record.mode === 'group' || record.shared === true
+}
 
 /**
  * Minimal persistent tombstone for a thread route retired by route TTL.
@@ -147,9 +187,9 @@ export function appendSessionHistory(
 }
 
 /**
- * Effective working directory of one route's Session. Records written before
- * per-topic directories have no `sessionDir`; their workspace path is the
- * directory the Session really works in.
+ * Effective working directory of one route's Session: the topic directory of
+ * a version-3 route, the per-topic `sessionDir` of a version-2 route, or the
+ * workspace path of a record written before per-topic directories existed.
  */
 export function sessionDirOf(record: Pick<RouteRecord, 'workspacePath' | 'sessionDir'>): string {
   return record.sessionDir ?? record.workspacePath
@@ -314,6 +354,38 @@ export type AccessSwitch = 'admin' | AccessPermission
 export const ACCESS_PERMISSIONS: readonly AccessPermission[] = ['chat', 'wikiRead', 'wikiWrite', 'codeWrite']
 
 export type AccessUserRecord = z.infer<typeof accessUserRecordSchema>
+
+/** The three permission switches of one group record (groups have no chat switch). */
+export type GroupPermission = Exclude<AccessPermission, 'chat'>
+
+/** Every group permission switch, in display order. */
+export const GROUP_PERMISSIONS: readonly GroupPermission[] = ['wikiRead', 'wikiWrite', 'codeWrite']
+
+/**
+ * The permissions of one group chat (`chat_id`), added without a domain
+ * version bump like the user table. A record is created the first time an
+ * admitted message opens a topic in the group, with every switch off; only
+ * the settings panel changes the switches. The switches gate the tools of
+ * every `mode: 'group'` route in the chat: knowledge-base read, knowledge-base
+ * create/edit, and the configured code-write tools. Who may talk in the group
+ * is decided per user by the user table, never here.
+ */
+export const groupPermissionRecordSchema = z.object({
+  /** Feishu `chat_id` — also the table key. */
+  chatId: z.string().min(1),
+  /** Group name captured when the record was last written (optional). */
+  name: z.string().optional(),
+  /** Epoch ms when the record was created. */
+  addedAt: z.number().int().nonnegative(),
+  /** Topics in the group may use the knowledge-base read tools. */
+  wikiRead: z.boolean().default(false),
+  /** Topics in the group may use the knowledge-base create/edit tools. */
+  wikiWrite: z.boolean().default(false),
+  /** Topics in the group may call the configured code-write tools. */
+  codeWrite: z.boolean().default(false),
+})
+
+export type GroupPermissionRecord = z.infer<typeof groupPermissionRecordSchema>
 
 /**
  * One authorization request the administrators have been (or should be) asked
@@ -492,8 +564,10 @@ export const sessionOriginRecordSchema = z.object({
   senderUserId: z.string().min(1),
   /** Epoch ms when the Session was bound to the route. */
   createdAt: z.number().int().nonnegative(),
-  /** Group-shared route (topic started through `feishuTopics`). */
+  /** Older origins of group routes started through `feishuTopics`: read like `mode: 'group'`. */
   shared: z.literal(true).optional(),
+  /** `group`: the Session belongs to a group route without a single owner (see `RouteRecord.mode`). */
+  mode: z.literal('group').optional(),
 })
 
 export type SessionOriginRecord = z.infer<typeof sessionOriginRecordSchema>
@@ -536,6 +610,10 @@ export interface FeishuDomainSpecShape {
     }
     access_wiki_users: {
       valueSchema: typeof accessUserRecordSchema
+      __key?: string
+    }
+    group_permissions: {
+      valueSchema: typeof groupPermissionRecordSchema
       __key?: string
     }
     analyze_requests: {
@@ -594,6 +672,8 @@ export const feishuDomain: FeishuDomainSpecShape = {
     // Retired wiki whitelist (knowledge-base access now lives on `access_users`):
     // declared so the stored records survive, never read.
     access_wiki_users: { valueSchema: accessUserRecordSchema },
+    // Per-group permission switches (key = chat_id); a missing table loads empty.
+    group_permissions: { valueSchema: groupPermissionRecordSchema },
     // `feishuTopics` launch records (historical name); a missing table loads empty.
     analyze_requests: { valueSchema: topicLaunchRecordSchema },
     // Session id → Feishu origin; a missing table loads empty.
@@ -650,6 +730,14 @@ export interface AccessUsersTable {
   entries(): IterableIterator<[string, AccessUserRecord]>
 }
 
+/** Normalized table handle for the group permission records (key = `chat_id`). */
+export interface GroupPermissionsTable {
+  get(key: string): GroupPermissionRecord | undefined
+  put(key: string, value: GroupPermissionRecord): Promise<unknown> | void
+  delete(key: string): Promise<unknown> | void
+  entries(): IterableIterator<[string, GroupPermissionRecord]>
+}
+
 /** Normalized table handle for authorization requests (key = opaque token). */
 export interface AccessRequestsTable {
   get(key: string): AccessRequestRecord | undefined
@@ -680,6 +768,8 @@ export interface FeishuDomainHandle {
   expiredRoutes: ExpiredRoutesTable
   accessUsers: AccessUsersTable
   accessRequests: AccessRequestsTable
+  /** Per-group permission switches. */
+  groupPermissions: GroupPermissionsTable
   /** `feishuTopics` launch records. */
   topicLaunches: TopicLaunchesTable
   /** Feishu origin of every Session a route ever named. */

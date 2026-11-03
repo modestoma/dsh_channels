@@ -1,26 +1,27 @@
 /**
- * Workspace directory resolution: one DSH workspace per user, one working
- * directory per Feishu topic.
+ * Workspace directory resolution: one DSH workspace per Feishu topic.
  *
- * - p2p:   workspace `<baseDir>/p2p/<user_id>/`
- * - group: workspace `<baseDir>/groups/<chat_id>/<user_id>/`
- * - topic: `<workspace>/topics/<topic-token>/` (the Session's effective cwd)
- * - `feishuTopics` launch: workspace `<baseDir>/<caller segments…>/`
+ * - p2p:   `<baseDir>/p2p/<user_id>/<topic>/`
+ * - group: `<baseDir>/groups/<chat_id>/<topic>/`
  *
- * The workspace root is the Session header cwd: it keeps the Session grouped
- * under the user's project in the GUI and stays the sandbox write boundary.
- * The per-topic directory is where the tools actually work (see
- * `./session/isolation.ts`), so files produced by different topics never mix.
- * Older versions registered one workspace per topic under `<baseDir>/topics/`;
- * those directories are kept verbatim for legacy routes and never migrated.
- * The plugin never deletes workspace or topic directories; operators remove
- * stale ones by hand (a missing topic directory is recreated on the next turn).
+ * The topic directory is the Session header cwd: the sandbox write boundary,
+ * the read fence, the confine runner's writable root, and the workspace the
+ * Session is grouped under in the GUI are all this one directory, so topics
+ * of the same person or group never see each other's files and no working
+ * directory is ever switched. The GUI lists topics flat; the records tab
+ * groups them by group and person.
+ *
+ * Older versions placed topics inside one shared workspace per user
+ * (`<baseDir>/p2p/<user_id>/topics/<topic>/`, `<baseDir>/groups/<chat_id>/<user_id>/…`)
+ * or registered one workspace per topic under `<baseDir>/topics/`; those
+ * directories are kept verbatim for their routes and never migrated. The plugin
+ * never deletes topic directories; operators remove stale ones by hand.
  *
  * Inbound attachments never land in these directories: they are stored in
  * the DSH native attachment library (see `./feishu/native-attachments.ts`).
  *
- * Feishu ids (`user_id`, `oc_…`) are safe path segments, but they are validated
- * anyway so a hostile id can never escape `baseDir`.
+ * Feishu ids (`user_id`, `oc_…`, `omt_…`) are safe path segments, but they
+ * are validated anyway so a hostile id can never escape `baseDir`.
  *
  * @module dsh-channels/workspaces
  */
@@ -33,8 +34,28 @@ import type { HostContext, Workspace } from './dsh-types.ts'
 
 const SAFE_SEGMENT = /^[A-Za-z0-9._-]+$/
 
+/**
+ * Names and registration of the places topics open in, resolved by the
+ * service (Feishu profiles, the access store). Every name read is best
+ * effort: `undefined` when Feishu cannot name the id.
+ */
+export interface TopicLocationPort {
+  /** Display name of a group chat. */
+  groupName(chatId: string): Promise<string | undefined>
+  /** Display name of a person (contact profile). */
+  userName(userId: string): Promise<string | undefined>
+  /**
+   * Register a group's permission record the first time a topic opens in it
+   * (every switch off; an existing record is kept, its name refreshed).
+   */
+  registerGroup(chatId: string, name: string | undefined): Promise<void>
+}
+
 /** Upper bound for a panel-supplied workspace root (filesystem path limit headroom). */
 const MAX_BASE_DIR_LENGTH = 4096
+
+/** Longest topic title kept in a workspace title. */
+const TOPIC_TITLE_MAX = 40
 
 /** Lexical validation result for a workspace root. */
 export type BaseDirCheck =
@@ -133,101 +154,67 @@ export function topicTokenFor(
   return kind === 'thread' ? safeSegment(routeKey, 'route key') : safeSegment(sessionId, 'session id')
 }
 
-/** Git branch (and worktree directory) name for one topic token. */
-export function worktreeBranchFor(topicToken: string): string {
-  return `feishu-${safeSegment(topicToken, 'topic token')}`
-}
-
 /**
- * Deterministic workspace directory for one user in one chat context: the
- * durable project the user's Sessions are grouped under.
+ * The workspace directory of one topic: the private chat's person or the
+ * group, then the topic token.
  *
- * - p2p:   `<baseDir>/p2p/<user_id>/`
- * - group: `<baseDir>/groups/<chat_id>/<user_id>/`
+ * - p2p:   `<baseDir>/p2p/<user_id>/<topic>/`
+ * - group: `<baseDir>/groups/<chat_id>/<topic>/`
  *
- * These are the same paths older versions used as their shared (user × chat)
- * workspaces, so an upgraded deployment reuses the existing registry record
- * instead of creating a second project for the same user.
+ * @param baseDir - the channel's workspace root.
+ * @param chatType - `p2p` or `group`.
+ * @param chatId - Feishu chat id (used for groups).
+ * @param userId - Feishu user_id (used for private chats).
+ * @param topicToken - {@link topicTokenFor} of the topic.
+ * @returns the absolute topic directory.
  */
-export function workspacePathFor(
+export function topicWorkspacePathFor(
   baseDir: string,
   chatType: 'p2p' | 'group',
   chatId: string,
-  senderUserId: string,
+  userId: string,
+  topicToken: string,
 ): string {
-  const user = safeSegment(senderUserId, 'senderUserId')
-  if (chatType === 'p2p') return path.join(baseDir, 'p2p', user)
-  return path.join(baseDir, 'groups', safeSegment(chatId, 'chatId'), user)
-}
-
-/** Per-topic working directory inside one user workspace. */
-export function topicDirFor(workspacePath: string, topicToken: string): string {
-  return path.join(workspacePath, 'topics', safeSegment(topicToken, 'topic token'))
-}
-
-/** Human-friendly workspace title shown in the DSH workspace list. */
-export function workspaceTitleFor(
-  chatType: 'p2p' | 'group',
-  chatId: string,
-  senderUserId: string,
-): string {
-  return chatType === 'p2p'
-    ? `飞书私聊 · ${senderUserId}`
-    : `飞书群聊 · ${chatId} · ${senderUserId}`
+  const topic = safeSegment(topicToken, 'topic token')
+  if (chatType === 'p2p') return path.join(baseDir, 'p2p', safeSegment(userId, 'user id'), topic)
+  return path.join(baseDir, 'groups', safeSegment(chatId, 'chatId'), topic)
 }
 
 /**
- * Ensure one user's workspace directory exists and is registered with the
- * host's workspace registry. Idempotent: repeated calls return the same record,
- * and an existing record keeps its (possibly renamed) title.
+ * The topic title shown in a workspace title: the first non-empty line of the
+ * text that opened the topic, trimmed to {@link TOPIC_TITLE_MAX} characters.
+ * @param text - the opening message, launch card title, or undefined.
+ * @returns the title, or `话题` when nothing usable is given.
  */
-export async function ensureWorkspace(
-  ctx: HostContext,
-  baseDir: string,
-  chatType: 'p2p' | 'group',
-  chatId: string,
-  senderUserId: string,
-): Promise<Workspace> {
-  const dir = workspacePathFor(baseDir, chatType, chatId, senderUserId)
-  await mkdir(dir, { recursive: true })
-  return ctx.workspaceRegistry.create(
-    dir,
-    workspaceTitleFor(chatType, chatId, senderUserId),
-  )
+export function topicTitleOf(text: string | undefined): string {
+  const line = text?.split(/\r?\n/u).map(part => part.trim()).find(part => part !== '')
+  if (line === undefined) return '话题'
+  const chars = [...line.replace(/\s+/gu, ' ')]
+  return chars.length > TOPIC_TITLE_MAX ? `${chars.slice(0, TOPIC_TITLE_MAX).join('')}…` : line
 }
 
 /**
- * First path segments this module lays out itself; a `feishuTopics` launch
- * workspace may not start with one of them.
+ * Workspace title shown in the DSH workspace list: `<owner> · <topic>`, where
+ * the owner is the group's name or the person's name (their id when the name
+ * cannot be read).
+ * @param ownerName - group name, person name, or id.
+ * @param topicTitle - {@link topicTitleOf} of the topic.
+ * @returns the title.
  */
-export const RESERVED_WORKSPACE_ROOTS: readonly string[] = ['p2p', 'groups', 'topics', '_staging']
-
-/**
- * Workspace directory of one `feishuTopics` launch:
- * `<baseDir>/<segments…>/`. Launches with the same segments share it, each in
- * its own topic directory.
- * @throws when a segment is unsafe or the first one is reserved.
- */
-export function launchWorkspacePathFor(baseDir: string, segments: readonly string[]): string {
-  if (segments.length === 0) throw new Error('dsh-channels: a launch workspace needs at least one path segment')
-  const safe = segments.map(segment => safeSegment(segment, 'launch workspace segment'))
-  if (RESERVED_WORKSPACE_ROOTS.includes(safe[0]!)) {
-    throw new Error(`dsh-channels: launch workspace may not start with reserved segment ${JSON.stringify(safe[0])}`)
-  }
-  return path.join(baseDir, ...safe)
+export function workspaceTitleFor(ownerName: string, topicTitle: string): string {
+  return `${ownerName} · ${topicTitle}`
 }
 
 /**
- * Ensure one launch workspace exists and is registered (idempotent like
- * {@link ensureWorkspace}).
+ * Ensure one topic directory exists and is registered with the host's
+ * workspace registry. Idempotent: repeated calls return the same record, and
+ * an existing record keeps its title (retitle it with `Workspace.setTitle`).
+ * @param ctx - host context (workspace registry).
+ * @param dir - the topic directory ({@link topicWorkspacePathFor}).
+ * @param title - title for a newly registered workspace.
+ * @returns the registered workspace.
  */
-export async function ensureLaunchWorkspace(
-  ctx: HostContext,
-  baseDir: string,
-  segments: readonly string[],
-  title: string,
-): Promise<Workspace> {
-  const dir = launchWorkspacePathFor(baseDir, segments)
+export async function ensureTopicWorkspace(ctx: HostContext, dir: string, title: string): Promise<Workspace> {
   await mkdir(dir, { recursive: true })
   return ctx.workspaceRegistry.create(dir, title)
 }

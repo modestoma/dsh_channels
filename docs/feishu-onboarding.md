@@ -117,7 +117,6 @@ chmod 600 $DSH_HOME/.credentials.yaml
     requireMention: true                # 普通群需 @ 机器人
     dmMode: 'open'                      # 私聊通道开关
     threadFallback: 'degrade'           # 话题被拒时降级为会话级路由
-    topicIsolation: 'auto'              # 话题目录隔离：auto（Git 仓库用 worktree，否则子目录）/ subdir / worktree
     acceptAttachments: true             # 接收飞书附件：native 下图片预取、文件懒取、纯附件静默不回复
     prefetchImages: true                # 触发消息图片预取为首轮 ImageBlock
     prefetchImageMaxBytes: 20971520     # 单张预取图片上限（20 MiB）
@@ -143,7 +142,7 @@ chmod 600 $DSH_HOME/.credentials.yaml
 | 配置项 | 默认 | 说明 |
 |--------|------|------|
 | `appId` / `appSecret` | `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | 凭据引用名（shell 标识符），经 `ctx.credentials` 解析；仅当凭据库使用其它变量名时才需要覆盖。明文密钥会被拒绝 |
-| `baseDir` | `./channels-data` | 工作区目录树根：每个用户一个工作区（私聊 `p2p/<user_id>/`，群聊 `groups/<chat_id>/<user_id>/`），每个话题的工作目录为 `<工作区>/topics/<话题>/`（模型/工具产生文件的落点）；Web 面板可覆盖，只接受绝对路径，`~` 展开，保存时创建并校验目录，只影响之后新建的会话 |
+| `baseDir` | `./channels-data` | 话题目录树根：每个话题一个目录（私聊 `p2p/<user_id>/<话题>/`，群聊 `groups/<chat_id>/<话题>/`），同时登记为 DSH 工作区（模型/工具产生文件的落点）；Web 面板可覆盖，只接受绝对路径，`~` 展开，保存时创建并校验目录，只影响之后新建的会话 |
 | `provider` / `model` | 部署默认 | 新建 session 的路由；省略时继承部署默认 |
 | `reasoningEffort` | 适配器/provider 默认 | Session 初始/重置推理档位；可在话题内用 `/effort` 覆盖 |
 | `maxTokens` | 适配器默认 | 每次模型请求输出上限 |
@@ -151,7 +150,6 @@ chmod 600 $DSH_HOME/.credentials.yaml
 | `dmMode` | `open` | 私聊开关 |
 | `requireMention` | `true` | 普通群是否需要 @ 机器人（话题内续聊不受影响） |
 | `threadFallback` | `degrade` | 话题回复被拒时：`degrade` 降级为会话级延续 / `strict` 直接失败 |
-| `topicIsolation` | `auto` | 话题工作目录形式：`auto`（工作区含 `.git` 时用 Git worktree，否则普通子目录）/ `subdir` / `worktree`（失败回退子目录） |
 | `approvalTimeoutMs` | `300000` | HITL 审批决策卡等待时长（10s–1h）；超时自动拒绝 |
 | `accessMode` | `guarded` | 准入模式：`guarded` 仅管理员 + 用户表里对话准入打开的人；`open` 保留旧行为（任何可用范围用户可对话，不安全；知识库与代码改动开关仍生效） |
 | `codeWriteTools` | dsh-repo 写操作（推送、MR、Issue、删分支、CI 重跑/取消）与观象 SKILL 提交 | 飞书会话调用这些工具前检查当前发言人的「代码改动」开关（管理员始终放行） |
@@ -254,7 +252,7 @@ DSH_HOME=$DSH_HOME pnpm dsh web        # 默认 http://127.0.0.1:3080
 | 2 | 私聊续聊 | 在刚建的话题里直接再发消息（**不 @**） | 继续同一 session：完成后主卡结算页脚第一行的 session id 不变，input/output token 累计增长 |
 | 3 | 群聊 @ | 在普通群 @ 机器人发消息 | 同 #1；该消息成为新话题根 |
 | 4 | 群聊话题内 | 在上一步的话题里直接发消息（不 @） | 延续该 session，不再要求 @ |
-| 5 | 同群第二个用户 | 换另一个人 @ 机器人 | 新话题 + 新 session；dsh 工作区列表中出现**该用户的独立工作区**（`groups/<chat_id>/<用户 user_id>/`），会话实际工作在它自己的 `topics/<话题>/` 下，与原用户的话题目录互不可见 |
+| 5 | 同群第二个用户 | 换另一个人 @ 机器人 | 新话题 + 新 session；dsh 工作区列表中出现**该话题自己的工作区**（`groups/<chat_id>/<话题 id>/`，标题「群名 · 话题标题」），与第一个话题的目录互不可见；在第一个话题里直接回复则延续第一个 session |
 | 6 | 话题群 | 在话题群某话题中 @ 机器人 | 机器人直接在该话题内回复卡片（不新建话题） |
 | 7 | 折叠面板 | 点面板标题 | 展开推理内容，右侧箭头翻转向上；再点收起 |
 | 8 | 重启恢复 | 重启 dsh 后在旧话题里发消息 | 机器人懒恢复原 session，token 统计继续累计 |
@@ -285,14 +283,14 @@ DSH_HOME=$DSH_HOME pnpm dsh web        # 默认 http://127.0.0.1:3080
 
 ### 5.2 验证工作区与话题目录
 
-打开 dsh Web GUI → 工作区列表，应看到**每人一个**项目：
+打开 dsh Web GUI → 工作区列表，应看到**每个话题一个**项目：
 
 ```
-飞书私聊 · <user_id>          （对应 <baseDir>/p2p/<user_id>/）
-飞书群聊 · oc_yyy · <user_id> （对应 <baseDir>/groups/oc_yyy/<user_id>/）
+<人名> · <话题标题>   （对应 <baseDir>/p2p/<user_id>/<话题 id>/）
+<群名> · <话题标题>   （对应 <baseDir>/groups/oc_yyy/<话题 id>/）
 ```
 
-每个新话题在该工作区内创建独立的话题工作目录 `<工作区>/topics/<话题 id>/`，会话列表仍归属该项目；同一话题内 `/renew` 复用同一话题目录。也可在飞书里用 `/workspace` 查看当前会话的实际工作目录。
+话题标题取首条消息第一行（最长 40 字）；同一话题内 `/renew` 复用同一目录。也可在飞书里用 `/workspace` 查看当前会话的工作目录。
 
 **附件落点**：入站图片/文件只存入 **DSH 原生附件库**（`$DSH_HOME/attachments/v1` 一类宿主目录，由宿主管理），**话题目录下不会出现 `attachments/`**，插件也不再读写 `<baseDir>/_staging/`。原生附件库是插件的必需依赖：组合里没有 `dsh-attachment-local` 时插件不会启动。旧版本留下的 `attachments/` 与 `_staging/` 可手动删除。插件不会自动删除工作区或话题目录。
 

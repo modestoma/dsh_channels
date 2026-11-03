@@ -358,7 +358,7 @@ describe('AccessController.admitCommand', () => {
   })
 })
 
-describe('AccessController.ownsRoute / isAdmin / mayUse / mayLaunchFor', () => {
+describe('AccessController.ownsRoute / isAdmin / mayUse / mayUseOnRoute', () => {
   it('chatId 与 sender 双匹配才算话题拥有者', () => {
     const runtime = setup()
     const record = routeRecord({ senderUserId: 'u_alice', chatId: 'oc_group' })
@@ -402,6 +402,42 @@ describe('AccessController.ownsRoute / isAdmin / mayUse / mayLaunchFor', () => {
     expect(runtime.controller.mayLaunchFor(ADMIN)).toBe(true)
     expect(runtime.controller.mayLaunchFor('u_stranger')).toBe(false)
     expect(setup({ config: { accessMode: 'open' } }).controller.mayLaunchFor('u_stranger')).toBe(true)
+  })
+
+  it('群路由（mode group 或旧 shared）：有对话权限的人都能继续；allows 只看准入矩阵', async () => {
+    const runtime = setup()
+    await runtime.store.putUser(userRecord({ userId: 'u_alice' }))
+    await runtime.store.putUser(userRecord({ userId: 'u_bob' }))
+    for (const record of [routeRecord({ mode: 'group' }), routeRecord({ shared: true })]) {
+      expect(runtime.controller.mayActOnRoute('u_bob', 'oc_group', record)).toBe(true)
+      expect(runtime.controller.mayActOnRoute(ADMIN, 'oc_group', record)).toBe(true)
+      expect(runtime.controller.mayActOnRoute('u_stranger', 'oc_group', record)).toBe(false)
+      expect(runtime.controller.mayActOnRoute('u_bob', 'oc_other', record)).toBe(false)
+    }
+    const msg = makeMessage({ chatType: 'group', chatId: 'oc_group', senderId: 'u_bob', content: 'x' })
+    expect(runtime.controller.allows(msg)).toBe(true)
+    await runtime.store.setPermission('u_bob', 'chat', false)
+    expect(runtime.controller.allows(msg)).toBe(false)
+    expect(runtime.controller.mayActOnRoute('u_bob', 'oc_group', routeRecord({ mode: 'group' }))).toBe(false)
+  })
+
+  it('mayUseOnRoute：群路由按群权限表判权（未登记即无权限），其他路由按发起人开关', async () => {
+    const runtime = setup()
+    await runtime.store.putUser(userRecord({ userId: 'u_alice', codeWrite: true }))
+    const legacy = routeRecord({ senderUserId: 'u_alice' })
+    expect(runtime.controller.mayUseOnRoute(legacy, 'codeWrite')).toBe(true)
+    expect(runtime.controller.mayUseOnRoute(legacy, 'wikiRead')).toBe(false)
+    expect(runtime.controller.mayUseOnRoute(routeRecord({ chatType: 'p2p', chatId: 'oc_p2p', senderUserId: ADMIN }), 'wikiWrite')).toBe(true)
+    const group = routeRecord({ mode: 'group', senderUserId: 'u_alice' })
+    expect(runtime.controller.mayUseOnRoute(group, 'codeWrite')).toBe(false)
+    await runtime.store.ensureGroup('oc_group', '研发群', 5)
+    expect(runtime.controller.mayUseOnRoute(group, 'codeWrite')).toBe(false)
+    await runtime.store.setGroupPermission('oc_group', 'codeWrite', true)
+    expect(runtime.controller.mayUseOnRoute(group, 'codeWrite')).toBe(true)
+    expect(runtime.controller.mayUseOnRoute(group, 'wikiRead')).toBe(false)
+    expect(runtime.controller.mayUseOnRoute(routeRecord({ shared: true }), 'codeWrite')).toBe(true)
+    await runtime.store.removeGroup('oc_group')
+    expect(runtime.controller.mayUseOnRoute(group, 'codeWrite')).toBe(false)
   })
 })
 

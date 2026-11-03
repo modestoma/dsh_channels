@@ -1,13 +1,15 @@
 /**
- * Types of the `feishuTopics` service: another DSH plugin starts a
- * group-shared Feishu topic Session from an external trigger.
+ * Types of the `feishuTopics` service: another DSH plugin starts a Feishu
+ * group topic Session from an external trigger.
  *
  * One launch posts a root card into a group the bot is in, opens a topic below
- * it, creates the Session in a workspace below the channel's `baseDir`, and
- * streams the first turn (the prompt, verbatim) in that topic. The root card's
- * status tag follows the first turn (进行中 → 已完成 / 已停止 / 失败) and turns
- * 已中断 when DSH restarts before it settles. Every member admitted in the
- * group may continue the topic.
+ * it, creates the Session in the topic's own workspace under the group's
+ * directory below the channel's `baseDir`, and streams the first turn (the
+ * prompt, verbatim) in that topic. The root card's status tag follows the
+ * first turn (进行中 → 已完成 / 已停止 / 失败) and turns 已中断 when DSH
+ * restarts before it settles. Anyone with chat access in the group may
+ * continue the topic; the group's permission switches (set in the channel's
+ * settings panel) gate its knowledge-base and code-write tools.
  *
  * This module has no runtime exports, and the package subpath
  * `@modesto_ma/dsh-channels/topics` exposes only its types. A consumer imports
@@ -24,9 +26,10 @@ export type FeishuTopicsServiceName = 'feishuTopics'
 /**
  * Version of this contract. It changes only when a change would make an older
  * consumer misbehave; a consumer refuses a provider whose version it does not
- * know.
+ * know. Version 2 removed `TopicLaunchSpec.workspace`: the topic's workspace
+ * is derived from the group.
  */
-export type FeishuTopicsVersion = 1
+export type FeishuTopicsVersion = 2
 
 /** One run of the root card's lead sentence. */
 export interface TopicCardText {
@@ -83,23 +86,13 @@ export interface TopicLaunchSpec {
   readonly chatId: string
   /**
    * Feishu `user_id` of the person the launch is for: @-mentioned on the root
-   * card and recorded as the route's requester. It must be an administrator
-   * or a user whose `chat` switch is on, unless the channel runs in `open`
-   * access mode.
+   * card, the speaker of the first turn (the prompt is submitted as them),
+   * and recorded as the topic's initiator, which grants nothing on the topic
+   * (it belongs to the group). They must be an administrator or a user whose
+   * `chat` switch is on, unless the channel runs in `open` access mode.
    */
   readonly requesterUserId: string
   readonly card: TopicRootCard
-  /**
-   * Workspace of the Session: directory segments below the channel's
-   * `baseDir` (1–8 segments of `A-Z a-z 0-9 . _ -`, the first not one of the
-   * channel's own `p2p`, `groups`, `topics`, `_staging`), and its title in
-   * the DSH workspace list. Launches with the same segments share the
-   * workspace, each in its own topic directory.
-   */
-  readonly workspace: {
-    readonly segments: readonly string[]
-    readonly title: string
-  }
   /** First user message of the Session, sent verbatim (at most 100 000 characters). */
   readonly prompt: string
 }
@@ -164,8 +157,8 @@ export interface TopicLaunchState {
    */
   readonly sessionId?: string
   /**
-   * Directory the topic's tools work in (its per-topic directory or Git
-   * worktree checkout); present exactly when {@link sessionId} is.
+   * Directory the topic's tools work in (its workspace directory); present
+   * exactly when {@link sessionId} is.
    */
   readonly workDir?: string
 }

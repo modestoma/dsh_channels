@@ -1,14 +1,15 @@
 /**
- * The `feishuTopics` service: other plugins start group-shared topics (see
+ * The `feishuTopics` service: other plugins start group topics (see
  * `./contract.ts`).
  *
  * Synchronously (before {@link TopicLauncher.launch} settles): spec
- * validation, service state, requester permission, idempotency replay, and
- * the root card (进行中). In the background: the topic (opened by the first
- * streaming card, replied in thread below the root card), the launch workspace
- * and its per-topic directory, the Session, the group-shared route, and the
- * first turn: the prompt verbatim, streamed into that card like any topic
- * turn. When the first turn settles, the root card's status follows it
+ * validation, service state, requester chat access, idempotency replay, and
+ * the root card (进行中).
+ * In the background: the topic (opened by the first streaming card, replied
+ * in thread below the root card), the topic's own workspace under the
+ * group's directory, the group's permission record, the Session, the group
+ * route, and the first turn: the prompt verbatim, streamed into that card
+ * like any topic turn. When the first turn settles, the root card's status follows it
  * (已完成 / 已停止 / 失败), and the launch record keeps the same status. At
  * channel start, records still `running` belong to topics a previous instance
  * never finished; {@link TopicLauncher.markInterrupted} marks their cards
@@ -19,7 +20,8 @@
  * The topic is reserved in the inbound router from its creation until the
  * route and the first prompt are published, so replies posted meanwhile queue
  * behind the first turn. Follow-ups then use the ordinary topic routing: the
- * route is `shared`, so every member admitted in the group may continue it. A
+ * route is a group route (`mode: 'group'`), so anyone with chat access in the
+ * group may continue it, and the group's permission record gates its tools. A
  * failure before the first turn (including a disconnect meanwhile) marks the
  * root card failed with the reason, closes the streaming card, and leaves no
  * route.
@@ -34,19 +36,18 @@ import type { FeishuConfig } from '../config.ts'
 import { buildCard, buildTopicRootCard, initialStreamingCard } from '../cards.ts'
 import type { TopicStatus } from '../cards.ts'
 import type { RouteOperationQueue } from '../commands.ts'
-import { FEISHU_USER_ID_PATTERN, rootCardOf, sessionDirOf } from '../domain.ts'
+import { FEISHU_USER_ID_PATTERN, isGroupRoute, rootCardOf, sessionDirOf } from '../domain.ts'
 import type { FeishuDomainHandle, RouteRecord, TopicLaunchRecord } from '../domain.ts'
 import type { FeishuChannel } from '../feishu-channel.ts'
 import { feishuGroupPrincipal } from '../access/principal.ts'
-import { enterTopic, placementServices, planTopic } from '../session/isolation.ts'
-import type { TopicPlacement } from '../session/isolation.ts'
 import type { SessionManager } from '../session/manager.ts'
 import type { InflightRepair } from '../session/repair.ts'
 import { channelPrompt, storablePrompt } from '../session/prompt.ts'
 import type { TurnSubmission } from '../session/submit.ts'
 import type { RouteStore } from '../session/routes.ts'
 import type { TurnStreamer } from '../streamer.ts'
-import { ensureLaunchWorkspace, RESERVED_WORKSPACE_ROOTS, topicTokenFor } from '../workspaces.ts'
+import { ensureTopicWorkspace, topicTitleOf, topicTokenFor, topicWorkspacePathFor, workspaceTitleFor } from '../workspaces.ts'
+import type { TopicLocationPort } from '../workspaces.ts'
 import type {
   FeishuTopicService, FeishuTopicsServiceName, FeishuTopicsStatusEvent, FeishuTopicsVersion,
   TopicLaunchFailureCode, TopicLaunchResult, TopicLaunchSpec, TopicLaunchState, TopicRootCard,
@@ -56,15 +57,12 @@ import type {
 export const FEISHU_TOPICS_SERVICE: FeishuTopicsServiceName = 'feishuTopics'
 
 /** Contract version the launcher implements. */
-export const FEISHU_TOPICS_VERSION: FeishuTopicsVersion = 1
+export const FEISHU_TOPICS_VERSION: FeishuTopicsVersion = 2
 
 /** Event emitted after a launch status is recorded. */
 export const FEISHU_TOPICS_STATUS_EVENT: FeishuTopicsStatusEvent = 'feishu-topics/status'
 
 const text = (max: number) => z.string().min(1).max(max).refine(value => value.trim() !== '', 'must not be blank')
-
-/** Workspace path segment: path-safe, never `.` or `..`. */
-const WORKSPACE_SEGMENT = /^(?!\.{1,2}$)[A-Za-z0-9._-]{1,128}$/u
 
 /** Feishu group chat id (`oc_…`). */
 const CHAT_ID = /^oc_[A-Za-z0-9_-]{1,128}$/u
@@ -87,11 +85,6 @@ const topicLaunchSpecSchema = z.object({
         url: z.url({ protocol: /^https?$/u, error: 'must be an http(s) URL' }).max(2048),
       }).strict()).max(50),
     }).strict().optional(),
-  }).strict(),
-  workspace: z.object({
-    segments: z.array(z.string().regex(WORKSPACE_SEGMENT, 'must be 1-128 of A-Z a-z 0-9 . _ -')).min(1).max(8)
-      .refine(segments => !RESERVED_WORKSPACE_ROOTS.includes(segments[0] ?? ''), `must not start with ${RESERVED_WORKSPACE_ROOTS.join(', ')}`),
-    title: text(200),
   }).strict(),
   prompt: text(100_000),
 }).strict()
@@ -116,7 +109,9 @@ export interface TopicLauncherDeps {
    * The returned closer is called exactly once.
    */
   reserveTopic(threadId: string): () => void
-  /** Whether a launch may start a topic for this requester (`user_id`). */
+  /** Group names and group registration. */
+  location: TopicLocationPort
+  /** Whether the requester (`user_id`) may speak: the first turn is submitted as them. */
   mayLaunchFor(requesterUserId: string): boolean
 }
 
@@ -172,7 +167,7 @@ export class TopicLauncher implements FeishuTopicService {
 
   launchKeyOf(sessionId: string): string | undefined {
     const route = this.deps.routes.findBySession(sessionId)
-    if (route?.kind !== 'thread' || route.shared !== true) return undefined
+    if (route?.kind !== 'thread' || !isGroupRoute(route)) return undefined
     const domain = this.deps.domain()
     if (domain === undefined) return undefined
     for (const [key, record] of domain.topicLaunches.entries()) {
@@ -308,22 +303,15 @@ export class TopicLauncher implements FeishuTopicService {
       threadId = topic.threadId
       releaseTopic = this.deps.reserveTopic(threadId)
       await this.recordThread(spec.key, threadId)
-      const services = placementServices(this.deps.ctx)
-      const workspace = await ensureLaunchWorkspace(
-        this.deps.ctx, this.deps.config.baseDir, spec.workspace.segments, spec.workspace.title,
+      const groupName = await this.deps.location.groupName(spec.chatId)
+      const workspace = await ensureTopicWorkspace(
+        this.deps.ctx,
+        topicWorkspacePathFor(this.deps.config.baseDir, 'group', spec.chatId, spec.requesterUserId, topicTokenFor(threadId, 'thread', sessionId)),
+        workspaceTitleFor(groupName ?? spec.chatId, topicTitleOf(card.title)),
       )
-      const topicToken = topicTokenFor(threadId, 'thread', sessionId)
-      const plan = await planTopic(services, this.deps.config, workspace.path, topicToken, warn)
+      await this.deps.location.registerGroup(spec.chatId, groupName)
       this.assertStarted()
-      handle = await this.deps.sessions.createSession(sessionId, plan.cwd)
-      const placement: TopicPlacement = await enterTopic(
-        services, handle.agent, plan, workspace.path, topicToken, warn,
-      )
-      if (plan.cwd === workspace.path) {
-        void Promise.resolve(workspace.attachSession(sessionId)).catch((error: unknown) => {
-          warn('dsh-channels: attaching topic session %s to workspace failed: %s', sessionId, String(error))
-        })
-      }
+      handle = await this.deps.sessions.createSession(sessionId, workspace.path)
       await this.deps.sessions.mountGuidance(handle.agent)
       this.assertStarted()
 
@@ -336,13 +324,11 @@ export class TopicLauncher implements FeishuTopicService {
         chatType: 'group',
         senderUserId: spec.requesterUserId,
         workspacePath: workspace.path,
-        sessionDir: placement.sessionDir,
-        ...(placement.worktreeBranch === undefined ? {} : { worktreeBranch: placement.worktreeBranch }),
+        mode: 'group',
         cardMessageId: cardId,
         createdAt,
         lastActivityAt: createdAt,
         sessionHistory: [{ sessionId, createdAt }],
-        shared: true,
       }
       // The topic belongs to the group: its first prompt is submitted as the
       // group, with the requester as the speaker.

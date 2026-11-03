@@ -44,7 +44,6 @@ function spec(partial: Partial<TopicLaunchSpec> = {}): TopicLaunchSpec {
       ],
       links: { nameHeader: '日志', linkHeader: '详情页', rows: [{ name: '设备 A 崩溃日志', url: 'https://logs.example/detail/1' }] },
     },
-    workspace: { segments: ['analyze', 'camera', 'E1001'], title: '日志分析 · camera · E1001' },
     prompt: PROMPT,
     ...partial,
   }
@@ -98,7 +97,7 @@ describe('feishuTopics service provision', () => {
     await vi.waitFor(() => expect(ctx.get(FEISHU_TOPICS_SERVICE)).toBeDefined())
     const service = ctx.get(FEISHU_TOPICS_SERVICE) as FeishuTopicService
     expect(service).toBeInstanceOf(TopicLauncher)
-    expect(service.version).toBe(1)
+    expect(service.version).toBe(2)
     expect(await service.launch(spec())).toMatchObject({ ok: false, code: 'not-connected' })
     await fiber.dispose()
     expect(ctx.get(FEISHU_TOPICS_SERVICE)).toBeUndefined()
@@ -184,9 +183,12 @@ describe('topic launch flow', () => {
     expect(JSON.stringify(streaming.input)).toContain('⚙️ 进行中')
     expect(h.routes()[0]).toMatchObject({
       key: 'omt_2', kind: 'thread', chatId: 'oc_group', senderUserId: 'u_alice',
-      cardMessageId: 'om_2', shared: true,
-      workspacePath: path.join(h.config.baseDir, 'analyze', 'camera', 'E1001'),
+      cardMessageId: 'om_2', mode: 'group',
+      workspacePath: path.join(h.config.baseDir, 'groups', 'oc_group', 'omt_2'),
     })
+    expect(h.routes()[0]).not.toHaveProperty('shared')
+    expect(h.ctxState.workspaces.workspaces.get(path.join(h.config.baseDir, 'groups', 'oc_group', 'omt_2'))).toMatchObject({ title: 'oc_group · 日志分析' })
+    expect(h.ctxState.domain.raw.table('group_permissions').get('oc_group')).toMatchObject({ chatId: 'oc_group', codeWrite: false })
     const agent = h.ctxState.agents.created[0]!.handle.agent
     expect(followupMessagesOf(agent).map(message => message.content[0]!.text)).toEqual([PROMPT])
     // The topic belongs to the group; the requester is its first speaker.
@@ -237,8 +239,7 @@ describe('topic launch flow', () => {
     await h.launcher.launch(spec())
     await waitUntil(() => expect(h.routes()).toHaveLength(1))
     const route = h.routes()[0]!
-    expect(route.sessionDir).toBeDefined()
-    const running = { key: 'key-1', status: 'running', sessionId: route.sessionId, workDir: route.sessionDir }
+    const running = { key: 'key-1', status: 'running', sessionId: route.sessionId, workDir: route.workspacePath }
     expect(h.launcher.state('key-1')).toEqual(running)
     expect(h.record('key-1')?.threadId).toBe(route.key)
     expect(h.launcher.launchKeyOf(route.sessionId)).toBe('key-1')
@@ -289,7 +290,7 @@ describe('topic launch flow', () => {
     expect(await h.launcher.launch(spec({ fingerprint: 'fp-other', prompt: 'other' }))).toMatchObject({ ok: false, code: 'key-conflict' })
   })
 
-  it('refuses requesters without chat permission', async () => {
+  it('refuses requesters without chat permission (the first turn is submitted as them)', async () => {
     const h = await setup()
     expect(await h.launcher.launch(spec())).toMatchObject({ ok: false, code: 'forbidden-chat' })
     await h.service.addAccessUser('u_alice')
@@ -337,9 +338,6 @@ describe('topic launch flow', () => {
     const h = await setup()
     await h.service.addAccessUser('u_alice')
     const invalid: Array<[string, TopicLaunchSpec]> = [
-      ['workspace.segments', spec({ workspace: { segments: ['..'], title: 't' } })],
-      ['workspace.segments', spec({ workspace: { segments: ['p2p', 'u_alice'], title: 't' } })],
-      ['workspace.segments', spec({ workspace: { segments: [], title: 't' } })],
       ['chatId', spec({ chatId: 'ou_user' })],
       ['requesterUserId', spec({ requesterUserId: 'ou_open_id' })],
       ['key', spec({ key: 'has space' })],
