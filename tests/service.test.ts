@@ -32,6 +32,8 @@ import {
   followupMessagesOf, makeAttachmentStore, makeInstanceLocks, makeToolsRuntime,
 } from './helpers.ts'
 import { MissedMessages } from '../src/routing/missed.ts'
+import { ROUTE_NOT_PERMITTED } from '../src/access/remote-policy.ts'
+import { remoteError } from './helpers.ts'
 import type { FakeAgentPresets, FakeAgentPresetsOptions, FakeAgentsOptions } from './helpers.ts'
 
 function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
@@ -2489,6 +2491,11 @@ describe('FeishuService', () => {
 
   const recoveryConfig = { replay: { pending: true, interrupted: 'ask' as const } }
 
+  /** The message DSH created for a channel prompt (its request id is `source.rpcId`). */
+  type SubmittedPrompt = UserMessage & { source: { rpcId: string } }
+  /** The request id of a submitted prompt. */
+  const requestIdOf = (message: unknown): string => (message as SubmittedPrompt).source.rpcId
+
   /** Every prompt any fake Agent received, serialized. */
   function allFollowups(h: Harness): string {
     return JSON.stringify([...h.ctxState.agents.created, ...h.ctxState.agents.resumed].map(entry => mock(entry.handle.agent.followup).mock.calls))
@@ -2496,16 +2503,16 @@ describe('FeishuService', () => {
 
   /** Establish one p2p session, then restart with its turn left unfinished. */
   async function restartMidTurn(
-    prepareLog: (session: Session, prompt: { id: string }, agent: Agent) => void,
+    prepareLog: (session: Session, prompt: SubmittedPrompt, agent: Agent) => void,
     options: { live?: boolean; beforeStart?: (channel: ReturnType<typeof makeChannel>) => void; afterShutdown?: (h: Harness) => void } = {},
-  ): Promise<{ h: Harness; channel2: ReturnType<typeof makeChannel>; service2: FeishuService; original: Agent; prompt: { id: string }; trigger: string }> {
+  ): Promise<{ h: Harness; channel2: ReturnType<typeof makeChannel>; service2: FeishuService; original: Agent; prompt: SubmittedPrompt; trigger: string }> {
     const agentsOptions: FakeAgentsOptions = {}
     const h = await setup(recoveryConfig, {}, undefined, agentsOptions)
     const msg = makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'u_alice', content: 'hi' })
     await h.onMessage(msg)
     await waitForEstablishedSession(h)
     const original = h.ctxState.agents.created[0]!.handle.agent
-    const prompt = mock(original.followup).mock.calls[0]![0] as { id: string }
+    const prompt = mock(original.followup).mock.calls[0]![0] as SubmittedPrompt
     prepareLog(original.session, prompt, original)
     await h.service.shutdown()
     options.afterShutdown?.(h)
@@ -2530,7 +2537,9 @@ describe('FeishuService', () => {
     await waitUntil(() => expect(h.ctxState.agents.resumed).toHaveLength(1))
     const resumed = h.ctxState.agents.resumed[0]!.handle.agent
     await waitUntil(() => expect(mock(resumed.followup)).toHaveBeenCalledTimes(1))
-    expect((mock(resumed.followup).mock.calls[0]![0] as { id: string }).id).toBe(prompt.id)
+    // The same request id as before the restart, submitted as the same principal.
+    expect(requestIdOf(mock(resumed.followup).mock.calls[0]![0])).toBe(prompt.source.rpcId)
+    expect(mock(resumed.followup).mock.calls[0]![0]).toMatchObject({ source: { principal: { kind: 'feishu-user', userId: 'u_alice' } } })
     expect(inflightEntries(h)).toEqual([['om_1', expect.objectContaining({ replays: 1 })]])
 
     // The replayed turn streams into the original card and settles it.
@@ -2543,56 +2552,39 @@ describe('FeishuService', () => {
     await service2.shutdown()
   })
 
-  it('replays a prompt whose source names its Feishu sender as the code-write driver, filling older snapshots from the stored sender', async () => {
-    const gatedPush = async (h: Harness) => {
-      h.config.codeWriteTools = ['repo_workspace_push']
-      await waitUntil(() => expect(h.ctxState.agents.resumed).toHaveLength(1))
-      const resumed = h.ctxState.agents.resumed[0]!.handle.agent
-      // The fake inbox claims the replayed prompt as soon as it is submitted.
-      await waitUntil(() => expect(mock(resumed.followup)).toHaveBeenCalledTimes(1))
-      const decision = await h.ctxState.preExecuteListeners.at(-1)!({ name: 'repo_workspace_push', agent: resumed }, async () => ({ kind: 'allow' }))
-      return { resumed, decision }
-    }
-    /** Rewrite every stored inflight snapshot after the first process shut down. */
-    const rewriteSnapshots = (edit: (value: Record<string, unknown>) => Record<string, unknown>) => (h: Harness) => {
-      const table = h.ctxState.domain.raw.table('inflight')
-      for (const [key, value] of [...(table.entries() as IterableIterator<[string, Record<string, unknown>]>)]) table.put(key, edit(value))
-    }
-    /** A snapshot written before prompts carried a principal. */
-    const withoutPrincipal = (value: Record<string, unknown>): Record<string, unknown> => {
-      const message = value.message as { source: Record<string, unknown> }
-      return { ...value, message: { ...message, source: { kind: 'user' } } }
-    }
-    const denied = (reason: string) => ({ kind: 'deny', reason: expect.stringContaining(reason) })
-
+  it('replays a prompt as the principal stored with it, which the code-write gate then reads as the driver', async () => {
     const stored = await restartMidTurn(() => {})
     expect(inflightEntries(stored.h)).toEqual([['om_1', expect.objectContaining({
-      senderUserId: 'u_alice',
-      message: expect.objectContaining({ source: expect.objectContaining({ principal: { kind: 'feishu-user', userId: 'u_alice' } }) }),
+      prompt: expect.objectContaining({ requestId: stored.prompt.source.rpcId, principal: { kind: 'feishu-user', userId: 'u_alice' } }),
     })]])
-    expect((await gatedPush(stored.h)).decision).toMatchObject(denied('飞书用户 u_alice 没有代码改动权限'))
+    expect(inflightEntries(stored.h)[0]![1]).not.toHaveProperty('senderUserId')
+    stored.h.config.codeWriteTools = ['repo_workspace_push']
+    await waitUntil(() => expect(stored.h.ctxState.agents.resumed).toHaveLength(1))
+    const resumed = stored.h.ctxState.agents.resumed[0]!.handle.agent
+    // The fake inbox claims the replayed prompt as soon as it is submitted.
+    await waitUntil(() => expect(mock(resumed.followup)).toHaveBeenCalledTimes(1))
+    const decision = await stored.h.ctxState.preExecuteListeners.at(-1)!({ name: 'repo_workspace_push', agent: resumed }, async () => ({ kind: 'allow' }))
+    expect(decision).toMatchObject({ kind: 'deny', reason: expect.stringContaining('飞书用户 u_alice 没有代码改动权限') })
     await stored.service2.shutdown()
+  })
 
-    // The principal travels with the prompt; the separately stored sender is not needed.
-    const principalOnly = await restartMidTurn(() => {}, {
-      afterShutdown: rewriteSnapshots(({ senderUserId: _dropped, ...rest }) => rest),
-    })
-    expect((await gatedPush(principalOnly.h)).decision).toMatchObject(denied('飞书用户 u_alice 没有代码改动权限'))
-    await principalOnly.service2.shutdown()
-
-    const older = await restartMidTurn(() => {}, { afterShutdown: rewriteSnapshots(withoutPrincipal) })
-    const replayed = await gatedPush(older.h)
-    expect(replayed.decision).toMatchObject(denied('飞书用户 u_alice 没有代码改动权限'))
-    expect(mock(replayed.resumed.followup).mock.calls[0]![0]).toMatchObject({ source: { kind: 'user', principal: { kind: 'feishu-user', userId: 'u_alice' } } })
-    await older.service2.shutdown()
-
+  it('never replays a snapshot written before prompts went through session/prompt; its card offers to continue instead', async () => {
     const legacy = await restartMidTurn(() => {}, {
-      afterShutdown: rewriteSnapshots(value => {
-        const { senderUserId: _dropped, ...rest } = withoutPrincipal(value)
-        return rest
-      }),
+      afterShutdown: h => {
+        // The shape older versions wrote: the message this channel built itself, plus its sender.
+        const table = h.ctxState.domain.raw.table('inflight')
+        for (const [key, value] of [...(table.entries() as IterableIterator<[string, Record<string, unknown>]>)]) {
+          const { prompt, ...rest } = value as { prompt: { content: unknown[] } } & Record<string, unknown>
+          table.put(key, { ...rest, message: { id: 'legacy-1', role: 'user', content: prompt.content, source: { kind: 'user' } }, senderUserId: 'u_alice' })
+        }
+      },
     })
-    expect((await gatedPush(legacy.h)).decision).toMatchObject(denied('无法确认这一轮的飞书发言人'))
+    await waitUntil(() => expect(legacy.channel2.updated.length).toBeGreaterThan(0))
+    const card = JSON.stringify(legacy.channel2.updated[0])
+    expect(card).toContain('服务已重启')
+    expect(card).toContain(RESUME_ACTION)
+    await waitUntil(() => expect(inflightEntries(legacy.h)).toHaveLength(0))
+    expect(mock(legacy.h.ctxState.agents.resumed[0]!.handle.agent.followup)).not.toHaveBeenCalled()
     await legacy.service2.shutdown()
   })
 
@@ -2637,7 +2629,10 @@ describe('FeishuService', () => {
     await waitUntil(() => expect(mock(resumed.followup)).toHaveBeenCalledTimes(1))
     expect(JSON.stringify(mock(resumed.followup).mock.calls[0]![0])).toContain('从中断处继续')
     expect(JSON.stringify(mock(resumed.followup).mock.calls[0]![0])).toContain('已经完成的对外操作不要重做')
-    expect(inflightEntries(h)).toEqual([['om_1', expect.objectContaining({ triggerMessageId: 'om_msg_1', routeKey: expect.any(String), senderUserId: 'u_alice' })]])
+    expect(inflightEntries(h)).toEqual([['om_1', expect.objectContaining({
+      triggerMessageId: 'om_msg_1', routeKey: expect.any(String),
+      prompt: expect.objectContaining({ principal: { kind: 'feishu-user', userId: 'u_alice' } }),
+    })]])
     await waitUntil(() => expect(JSON.stringify(channel2.updated.at(-1))).toContain('turn-stop'))
 
     // A second click does not start another turn.
@@ -2654,7 +2649,7 @@ describe('FeishuService', () => {
     await waitUntil(() => expect(mock(h.ctxState.ctx.logger!.info!).mock.calls).toContainEqual([expect.stringContaining('recovered'), 'om_1', 'replayed']))
     expect(h.ctxState.agents.resumed).toHaveLength(0)
     expect(mock(original.followup)).toHaveBeenCalledTimes(1)
-    expect((mock(original.followup).mock.calls[0]![0] as { id: string }).id).toBe(prompt.id)
+    expect(requestIdOf(mock(original.followup).mock.calls[0]![0])).toBe(prompt.source.rpcId)
     expect(inflightEntries(h).map(([key]) => key)).toEqual(['om_1'])
     expect(inflightEntries(h)[0]![1]).not.toHaveProperty('replays')
 
@@ -2703,7 +2698,7 @@ describe('FeishuService', () => {
     })
     await waitUntil(() => expect(mock(h.ctxState.ctx.logger!.info!).mock.calls).toContainEqual([expect.stringContaining('recovered'), 'om_1', 'interrupted']))
     expect(clicked).toBe(true)
-    expect(inflightEntries(h)).toEqual([['om_1', expect.objectContaining({ message: expect.objectContaining({ content: [{ type: 'text', text: expect.stringContaining('从中断处继续') }] }) })]])
+    expect(inflightEntries(h)).toEqual([['om_1', expect.objectContaining({ prompt: expect.objectContaining({ content: [{ type: 'text', text: expect.stringContaining('从中断处继续') }] }) })]])
     await service2.shutdown()
   })
 
@@ -5376,5 +5371,77 @@ describe('/history enrichment', () => {
     const warnings = mock(h.ctxState.ctx.logger?.warn).mock.calls.flat().join(' ')
     expect(warnings).toContain('session title lookup failed')
     await h.service.shutdown()
+  })
+})
+
+describe('Feishu principals through session/prompt', () => {
+  it('submits a group as the group with its speaker and a private chat as the person, each through its own Peer', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({ chatType: 'group', chatId: 'oc_grp', senderId: 'u_alice', content: '开始' }))
+    await waitForEstablishedSession(h)
+    const group = h.ctxState.agents.created[0]!.handle.agent
+    // The topic route must be durable before its thread message arrives.
+    await waitUntil(() => expect([...(h.ctxState.domain.raw.table('routes').entries() as IterableIterator<[string, unknown]>)]).toHaveLength(1))
+    await h.onMessage(makeMessage({ chatType: 'group', chatId: 'oc_grp', senderId: 'u_alice', mentionedBot: false, threadId: 'omt_1', content: '继续' }))
+    await waitUntil(() => expect(mock(group.followup)).toHaveBeenCalledTimes(2))
+    expect(mock(group.followup).mock.calls.map(call => (call[0] as UserMessage).source)).toEqual([
+      { kind: 'user', rpcId: expect.any(String), principal: { kind: 'feishu-group', chatId: 'oc_grp', userId: 'u_alice' } },
+      { kind: 'user', rpcId: expect.any(String), principal: { kind: 'feishu-group', chatId: 'oc_grp', userId: 'u_alice' } },
+    ])
+
+    await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'u_alice', content: '你好' }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
+    const dm = h.ctxState.agents.created[1]!.handle.agent
+    await waitUntil(() => expect(mock(dm.followup)).toHaveBeenCalledTimes(1))
+    expect(mock(dm.followup).mock.calls[0]![0]).toMatchObject({
+      source: { kind: 'user', rpcId: expect.any(String), principal: { kind: 'feishu-user', userId: 'u_alice' } },
+    })
+
+    // Every prompt went through the gateway as the Peer of its principal;
+    // one Peer per principal value, so the two group prompts shared theirs.
+    const remote = h.ctxState.remote
+    expect(remote.gateway.calls.map(call => [call.method, call.peer.principal])).toEqual([
+      ['prompt', { kind: 'feishu-group', chatId: 'oc_grp', userId: 'u_alice' }],
+      ['prompt', { kind: 'feishu-group', chatId: 'oc_grp', userId: 'u_alice' }],
+      ['prompt', { kind: 'feishu-user', userId: 'u_alice' }],
+    ])
+    expect(mock(remote.connection.createPeer).mock.calls.map(call => call[0].interactions)).toEqual(['none', 'none'])
+    await h.service.shutdown()
+    expect(remote.connection.peers.every(peer => peer.signal.aborted)).toBe(true)
+  })
+
+  it('registers the access policies of both principal kinds for the lifetime of the connection', async () => {
+    const h = await setup()
+    const remoteAccess = h.ctxState.remote.remoteAccess
+    expect([...remoteAccess.policies.keys()].sort()).toEqual(['feishu-group', 'feishu-user'])
+    const before = remoteAccess.invalidations
+    await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'u_alice', content: '你好' }))
+    await waitForEstablishedSession(h)
+    // The new route changed the bindings, so cached decisions were dropped.
+    expect(remoteAccess.invalidations).toBeGreaterThan(before)
+    const sessionId = h.ctxState.agents.created[0]!.options.sessionId
+    expect(remoteAccess.decide({ kind: 'feishu-user', userId: 'u_alice' }, sessionId)).toEqual({ kind: 'allow' })
+    expect(remoteAccess.decide({ kind: 'feishu-user', userId: 'u_mallory' }, sessionId)).toMatchObject({ kind: 'deny', reason: ROUTE_NOT_PERMITTED })
+    expect(remoteAccess.decide({ kind: 'feishu-group', chatId: 'oc_other', userId: 'u_alice' }, sessionId)).toMatchObject({ kind: 'deny', reason: ROUTE_NOT_PERMITTED })
+
+    await h.service.shutdown()
+    expect(remoteAccess.policies.size).toBe(0)
+  })
+
+  it('finishes the card as failed, with the reason, when session/prompt refuses the prompt', async () => {
+    const h = await setup()
+    mock(h.ctxState.remote.gateway.invoke).mockRejectedValueOnce(
+      remoteError('remote-access/denied', 'remote access: session/prompt: access denied', { action: 'session/prompt', reason: ROUTE_NOT_PERMITTED }),
+    )
+    await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_p2p', senderId: 'u_alice', messageId: 'om_denied', content: '你好' }))
+    await waitUntil(() => expect(JSON.stringify(h.channel.updated.at(-1))).toContain('你没有权限向这个会话发消息'))
+    expect(mock(h.ctxState.agents.created[0]!.handle.agent.followup)).not.toHaveBeenCalled()
+    await waitUntil(() => expect(h.channel.reactions).toContainEqual({ messageId: 'om_denied', emojiType: 'Typing' }))
+    await h.service.shutdown()
+  })
+
+  it('fails loud at start when the host lacks a Web service the submission needs', async () => {
+    await expect(setup({}, {}, undefined, {}, undefined, undefined, { typertGateway: undefined }))
+      .rejects.toThrow(/typertGateway.*web-app/s)
   })
 })

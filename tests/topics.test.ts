@@ -189,9 +189,12 @@ describe('topic launch flow', () => {
     })
     const agent = h.ctxState.agents.created[0]!.handle.agent
     expect(followupMessagesOf(agent).map(message => message.content[0]!.text)).toEqual([PROMPT])
-    expect(followupMessagesOf(agent)[0]!.source).toMatchObject({ kind: 'user', principal: { kind: 'feishu-user', userId: 'u_alice' } })
-    // Restart recovery replays the first prompt on behalf of the requester.
-    expect(h.ctxState.domain.raw.table('inflight').get('om_2')).toMatchObject({ senderUserId: 'u_alice' })
+    // The topic belongs to the group; the requester is its first speaker.
+    expect(followupMessagesOf(agent)[0]!.source).toMatchObject({ kind: 'user', principal: { kind: 'feishu-group', chatId: 'oc_group', userId: 'u_alice' } })
+    // Restart recovery replays the first prompt as the same principal.
+    expect(h.ctxState.domain.raw.table('inflight').get('om_2')).toMatchObject({
+      prompt: { requestId: followupMessagesOf(agent)[0]!.source.rpcId, principal: { kind: 'feishu-group', chatId: 'oc_group', userId: 'u_alice' } },
+    })
   })
 
   it('streams the first turn in the topic and marks the root card when it settles', async () => {
@@ -415,8 +418,8 @@ describe('topic launch flow', () => {
     expect(followupMessagesOf(agent).map(message => message.content[0]!.text)).toEqual([PROMPT, '顺便看下内存'])
     // Each prompt on the shared route names its own sender.
     expect(followupMessagesOf(agent).map(message => message.source.principal)).toEqual([
-      { kind: 'feishu-user', userId: 'u_alice' },
-      { kind: 'feishu-user', userId: 'u_bob' },
+      { kind: 'feishu-group', chatId: 'oc_group', userId: 'u_alice' },
+      { kind: 'feishu-group', chatId: 'oc_group', userId: 'u_bob' },
     ])
   })
 

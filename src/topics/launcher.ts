@@ -37,12 +37,13 @@ import type { RouteOperationQueue } from '../commands.ts'
 import { FEISHU_USER_ID_PATTERN, rootCardOf, sessionDirOf } from '../domain.ts'
 import type { FeishuDomainHandle, RouteRecord, TopicLaunchRecord } from '../domain.ts'
 import type { FeishuChannel } from '../feishu-channel.ts'
-import { feishuUserMessage } from '../access/principal.ts'
+import { feishuGroupPrincipal } from '../access/principal.ts'
 import { enterTopic, placementServices, planTopic } from '../session/isolation.ts'
 import type { TopicPlacement } from '../session/isolation.ts'
 import type { SessionManager } from '../session/manager.ts'
 import type { InflightRepair } from '../session/repair.ts'
-import { storableMessage } from '../session/repair.ts'
+import { channelPrompt, storablePrompt } from '../session/prompt.ts'
+import type { TurnSubmission } from '../session/submit.ts'
 import type { RouteStore } from '../session/routes.ts'
 import type { TurnStreamer } from '../streamer.ts'
 import { ensureLaunchWorkspace, RESERVED_WORKSPACE_ROOTS, topicTokenFor } from '../workspaces.ts'
@@ -105,7 +106,8 @@ export interface TopicLauncherDeps {
   routes: RouteStore
   repair: InflightRepair
   sessions: SessionManager
-  streamer(): TurnStreamer | undefined
+  /** Card-bound prompt submission (the service owns the streamer and the submitter). */
+  prompts: TurnSubmission
   /** Shared per-route FIFO (the first turn must precede any follow-up). */
   queue: RouteOperationQueue
   /**
@@ -342,16 +344,17 @@ export class TopicLauncher implements FeishuTopicService {
         sessionHistory: [{ sessionId, createdAt }],
         shared: true,
       }
-      const message = feishuUserMessage(spec.prompt, spec.requesterUserId)
-      const stored = storableMessage(message)
+      // The topic belongs to the group: its first prompt is submitted as the
+      // group, with the requester as the speaker.
+      const prompt = channelPrompt(spec.prompt, feishuGroupPrincipal(spec.chatId, spec.requesterUserId))
+      const stored = storablePrompt(prompt)
       await this.deps.repair.write({
         key: cardId,
         sessionId,
         chatId: spec.chatId,
         triggerMessageId: rootId,
         routeKey: threadId,
-        ...(stored === undefined ? {} : { message: stored }),
-        senderUserId: spec.requesterUserId,
+        ...(stored === undefined ? {} : { prompt: stored }),
         cards: [{ messageId: cardId, mode: 'card' }],
         startedAt: Date.now(),
         attempts: 0,
@@ -365,11 +368,12 @@ export class TopicLauncher implements FeishuTopicService {
         this.assertStarted()
         await this.deps.routes.put(routeKey, record)
         published = true
-        this.deps.streamer()?.attach(agent.session, streamCardId, rootId, undefined, {
+        const outcome = await this.deps.prompts.run(agent, prompt, {
+          cardMessageId: streamCardId,
+          triggerMessageId: rootId,
           onSettled: outcome => { void showStatus({ kind: outcome }) },
-          message,
         })
-        agent.followup(message)
+        if (!outcome.accepted) throw new Error(outcome.reason)
       })
     } catch (error) {
       const reason = messageOf(error)

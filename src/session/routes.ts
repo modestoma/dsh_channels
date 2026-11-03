@@ -20,6 +20,8 @@ export interface RouteStoreDeps {
   ttlMs(): number
   /** Structured warning sink (never throws). */
   warn(message: string, ...args: unknown[]): void
+  /** Called after the active route set changed (a put, a removal, a retirement). */
+  changed?(): void
 }
 
 export class RouteStore {
@@ -78,6 +80,7 @@ export class RouteStore {
     await this.deps.domain()?.routes.put(key, record)
     const normalized = normalizeRouteRecord(record)
     this.active.set(key, normalized)
+    this.deps.changed?.()
     await this.recordOrigins(normalized)
   }
 
@@ -96,6 +99,7 @@ export class RouteStore {
   async remove(key: string): Promise<void> {
     await this.deps.domain()?.routes.delete(key)
     this.active.delete(key)
+    this.deps.changed?.()
   }
 
   /** Drop one key from the cache only (used when a tombstone takes over). */
@@ -171,6 +175,7 @@ export class RouteStore {
     const existing = this.expiredRoute(key)
     if (existing !== undefined) {
       this.active.delete(key)
+      this.deps.changed?.()
       if (this.deps.domain()?.routes.get(key) !== undefined) {
         try {
           await this.deps.domain()?.routes.delete(key)
@@ -206,6 +211,7 @@ export class RouteStore {
     await this.deps.domain()?.expiredRoutes.put(key, tombstone)
     this.expired.set(key, tombstone)
     this.active.delete(key)
+    this.deps.changed?.()
     try {
       await this.deps.domain()?.routes.delete(key)
     } catch (error) {

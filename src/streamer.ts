@@ -35,8 +35,10 @@
  * on the card. Ownership checks and the cancellation itself belong to the
  * caller.
  *
- * Turn ownership: each `followup()` runs as its own turn. A state is bound to
- * the turn that claims its prompt (`onInboxClaimed`), never to "the next turn",
+ * Turn ownership: each queued prompt runs as its own turn. A state is bound
+ * to the turn that claims its prompt (`onInboxClaimed`, matched by the
+ * prompt's request id, which DSH records as the claimed message's
+ * `source.rpcId`), never to "the next turn",
  * because the Agent also starts turns no Feishu message triggered: a subagent
  * finishing or messaging its parent, a background job completing, a schedule
  * firing, or a prompt typed in a dsh client. Such a turn gets its own card
@@ -67,6 +69,8 @@
  */
 
 import type { AssistantStreamFrame, Session, SessionEvent, TurnEndReason, UserMessage } from './dsh-types.ts'
+import { promptRequestIdOf } from './access/principal.ts'
+import type { ChannelPrompt } from './session/prompt.ts'
 import { buildCard, buildMergedCard, segmentCardContent, segmentCardOptions } from './cards.ts'
 import type { CardState, PanelPhase, StopControl } from './cards.ts'
 import type { FeishuChannel } from './feishu-channel.ts'
@@ -224,11 +228,10 @@ export interface AttachOptions {
   /** Called once when the turn's card reaches its final state. */
   readonly onSettled?: (outcome: TurnOutcome) => void
   /**
-   * The prompt handed to `followup()` for this turn. The turn that claims it
-   * renders into this card; while queued, the card can steer it into the
-   * running turn.
+   * The prompt submitted for this turn. The turn that claims it renders into
+   * this card; while queued, the card can steer it into the running turn.
    */
-  readonly message: UserMessage
+  readonly prompt: ChannelPrompt
 }
 
 interface TurnState {
@@ -245,7 +248,9 @@ interface TurnState {
   origin: string | undefined
   /** Reaction id of the Typing reaction (undefined when the add failed). */
   reactionId: string | undefined
-  /** Prompt queued for this turn; a queued card can steer it into the running turn. */
+  /** Prompt submitted for this turn; a queued card can steer it into the running turn. Undefined for a host turn. */
+  prompt: ChannelPrompt | undefined
+  /** The claimed message of a host turn (restart snapshot); undefined for a Feishu-started turn. */
   message: UserMessage | undefined
   /** Triggers of queued messages merged into this turn (settle together). */
   mergedTriggers: TriggerReaction[]
@@ -500,7 +505,8 @@ export class TurnStreamer {
       onSettled: options.onSettled,
       triggerMessageId,
       reactionId,
-      message: options.message,
+      prompt: options.prompt,
+      message: undefined,
       origin: undefined,
       cardMessageId,
     }))
@@ -523,6 +529,7 @@ export class TurnStreamer {
     onSettled: ((outcome: TurnOutcome) => void) | undefined
     triggerMessageId: string | undefined
     reactionId: string | undefined
+    prompt: ChannelPrompt | undefined
     message: UserMessage | undefined
     origin: string | undefined
     /** The already-sent main card; undefined when the card is still to be sent. */
@@ -533,6 +540,7 @@ export class TurnStreamer {
       turn: undefined,
       triggerMessageId: init.triggerMessageId,
       reactionId: init.reactionId,
+      prompt: init.prompt,
       message: init.message,
       origin: init.origin,
       mergedTriggers: [],
@@ -608,8 +616,9 @@ export class TurnStreamer {
     const running = this.running.get(session.id)
     if (running?.turn === turn && running.batch === undefined) return
     const queue = this.bySession.get(session.id) ?? []
-    const owner = queue.find(state => !state.finalized && state.turn === undefined
-      && state.message !== undefined && state.message.id === message.id)
+    const requestId = promptRequestIdOf(message.source)
+    const owner = requestId === undefined ? undefined : queue.find(state => !state.finalized && state.turn === undefined
+      && state.prompt?.requestId === requestId)
     if (owner !== undefined) {
       owner.turn = turn
       owner.turnStartedAt = Date.now()
@@ -644,6 +653,7 @@ export class TurnStreamer {
       onSettled: undefined,
       triggerMessageId: undefined,
       reactionId: undefined,
+      prompt: undefined,
       message,
       origin,
       cardMessageId: undefined,
@@ -712,16 +722,16 @@ export class TurnStreamer {
    * @param messageId Feishu message id of a clicked card.
    * @returns The owning session id and the queued prompt.
    */
-  steerTargetOf(messageId: string): { sessionId: string; message: UserMessage } | undefined {
+  steerTargetOf(messageId: string): { sessionId: string; prompt: ChannelPrompt } | undefined {
     const queued = this.queuedState(messageId)
-    return queued === undefined ? undefined : { sessionId: queued.sessionId, message: queued.message }
+    return queued === undefined ? undefined : { sessionId: queued.sessionId, prompt: queued.prompt }
   }
 
   /** The steerable queued turn whose main card is `messageId`. */
-  private queuedState(messageId: string): { sessionId: string; state: TurnState; message: UserMessage } | undefined {
+  private queuedState(messageId: string): { sessionId: string; state: TurnState; prompt: ChannelPrompt } | undefined {
     for (const [sessionId, queue] of this.bySession) {
       const state = queue.find(entry => !entry.finalized && entry.turn === undefined && entry.cards[0]?.messageId === messageId)
-      if (state?.message !== undefined) return { sessionId, state, message: state.message }
+      if (state?.prompt !== undefined) return { sessionId, state, prompt: state.prompt }
     }
     return undefined
   }
@@ -733,11 +743,11 @@ export class TurnStreamer {
    * becomes the merged notice, and its trigger reaction settles with the
    * running turn.
    * @param messageId - the queued card the owner clicked.
-   * @param steer - moves the message in the agent inbox; returns false when
-   *   the driver already claimed it.
+   * @param steer - moves the prompt's message in the agent inbox; returns
+   *   false when the driver already claimed it.
    * @returns whether the message moved.
    */
-  mergeQueued(messageId: string, steer: (sessionId: string, message: UserMessage) => boolean): boolean {
+  mergeQueued(messageId: string, steer: (sessionId: string, prompt: ChannelPrompt) => boolean): boolean {
     const target = this.queuedState(messageId)
     if (target === undefined) return false
     const { sessionId, state } = target
@@ -746,7 +756,7 @@ export class TurnStreamer {
     const front = this.current(sessionId)
     if (front === undefined || front.stopRequested) return false
     state.merging = true
-    const moved = steer(sessionId, target.message)
+    const moved = steer(sessionId, target.prompt)
     state.merging = false
     if (!moved) return false
     const queue = this.bySession.get(sessionId)!
@@ -797,11 +807,31 @@ export class TurnStreamer {
    * @param message - the discarded message.
    */
   onInboxDiscarded(session: Session, message: UserMessage): void {
-    const state = (this.bySession.get(session.id) ?? []).find(entry => !entry.finalized && !entry.merging
-      && entry.turn === undefined && entry.message !== undefined && entry.message.id === message.id)
+    const requestId = promptRequestIdOf(message.source)
+    const state = requestId === undefined ? undefined : this.pendingState(session.id, requestId, true)
     if (state === undefined) return
     state.dropped = true
     this.finalize(session.id, state, undefined)
+  }
+
+  /**
+   * The submission of a queued prompt was refused or failed: no turn will
+   * ever claim it. Its card settles as failed with the reason, and its
+   * trigger reaction swaps to No.
+   * @param sessionId - the Agent's session.
+   * @param requestId - the prompt's request id.
+   * @param reason - the notice the card shows.
+   */
+  rejectQueued(sessionId: string, requestId: string, reason: string): void {
+    const state = this.pendingState(sessionId, requestId, false)
+    if (state === undefined) return
+    this.finalize(sessionId, state, { message: reason })
+  }
+
+  /** The unclaimed state of a request, excluding one the steer button is moving when `notMerging`. */
+  private pendingState(sessionId: string, requestId: string, notMerging: boolean): TurnState | undefined {
+    return (this.bySession.get(sessionId) ?? []).find(entry => !entry.finalized && (!notMerging || !entry.merging)
+      && entry.turn === undefined && entry.prompt?.requestId === requestId)
   }
 
   /**

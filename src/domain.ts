@@ -185,6 +185,24 @@ export const inflightMessageSchema = z.object({
   source: z.looseObject({ kind: z.string() }),
 })
 
+/** A principal this channel submits prompts as (`src/access/principal.ts`). */
+export const channelPrincipalSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('feishu-user'), userId: z.string().min(1) }),
+  z.object({ kind: z.literal('feishu-group'), chatId: z.string().min(1), userId: z.string().min(1) }),
+])
+
+/**
+ * A persisted channel prompt (`src/session/prompt.ts`): the request id DSH
+ * records as the message's `source.rpcId`, the principal it is submitted
+ * as, and its blocks (text, or durable attachment references; staged-upload
+ * receipts are never stored).
+ */
+export const inflightPromptSchema = z.object({
+  requestId: z.string().min(1),
+  principal: channelPrincipalSchema,
+  content: z.array(z.looseObject({ type: z.string() })),
+})
+
 export const inflightSnapshotSchema = z.object({
   /** Key the snapshot is stored under (= `cards[0].messageId`, the main card). */
   key: z.string().min(1),
@@ -200,21 +218,27 @@ export const inflightSnapshotSchema = z.object({
   /** Route the turn ran under; restart recovery resumes its Session. */
   routeKey: z.string().min(1).optional(),
   /**
-   * The prompt handed to `followup()` (absent while it is being assembled, for
-   * a host turn, or when it exceeded `INFLIGHT_PROMPT_MAX_BYTES`). Restart
-   * recovery replays it when the Session log shows the turn never claimed it.
+   * The prompt this channel submitted through `session/prompt` (absent while
+   * it is being assembled, for a host turn, or when it exceeded
+   * `INFLIGHT_PROMPT_MAX_BYTES`). Restart recovery replays it, as the same
+   * principal and with the same request id, when the Session log shows the
+   * turn never claimed it.
+   */
+  prompt: inflightPromptSchema.optional(),
+  /**
+   * The claimed message of a host turn (a turn no Feishu message started),
+   * kept for classifying the turn from the Session log; also the prompt of a
+   * snapshot written before this channel submitted through `session/prompt`,
+   * which restart recovery classifies but never replays.
    */
   message: inflightMessageSchema.optional(),
   /**
-   * Feishu user_id the turn of `message` acts for: the sender of an inbound
-   * message, the requester of a launched topic, the operator of a continue
-   * button, or the Session's driver when a host turn started. A prompt stored
-   * before prompts carried a principal gets this user as its principal when
-   * restart recovery replays it. Absent in snapshots written before it was
-   * recorded, and for a host turn whose driver was unknown.
+   * Feishu user_id a host turn acts for (the Session's driver when it
+   * started), restoring the code-write driver after a restart. In older
+   * snapshots, the sender of `message`.
    */
   senderUserId: z.string().min(1).optional(),
-  /** How often restart recovery already replayed `message` (cap: 1). */
+  /** How often restart recovery already replayed `prompt` (cap: 1). */
   replays: z.number().int().nonnegative().optional(),
   /** Reaction id of the Typing reaction (absent when the add failed). */
   reactionId: z.string().optional(),

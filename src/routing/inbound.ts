@@ -11,7 +11,7 @@
 
 import { randomUUID } from 'node:crypto'
 import type {
-  AgentHandle, AttachmentStore, ContentBlock, HostContext, SessionId, UserMessage, Workspace,
+  Agent, AgentHandle, AttachmentStore, HostContext, SessionId, Workspace,
 } from '../dsh-types.ts'
 import type { FeishuConfig } from '../config.ts'
 import { buildCard, buildOnboardingCard, initialStreamingCard, queuedStreamingCard } from '../cards.ts'
@@ -24,7 +24,6 @@ import {
 } from '../feishu/inbound-attachments.ts'
 import type { InboundAttachmentState } from '../feishu/inbound-attachments.ts'
 import { buildFeishuContextBlock, manifestEntriesOfKnownMessage, triggerManifestAttachments } from '../feishu/manifest.ts'
-import { NativeAttachmentStore } from '../feishu/native-attachments.ts'
 import type { KnownAttachmentMessageInput, KnownAttachmentSource } from '../feishu/tools.ts'
 import type { FeishuChannel, NormalizedMessage } from '../feishu-channel.ts'
 import type { QuestionAnswerer } from '../interactions/questions.ts'
@@ -36,7 +35,9 @@ import type { TurnStreamer } from '../streamer.ts'
 import {
   enterTopic, placementServices, planTopic, restoreTopicDir,
 } from '../session/isolation.ts'
-import { feishuUserMessage } from '../access/principal.ts'
+import { principalOnRoute } from '../access/principal.ts'
+import { channelPrompt, type ChannelPrompt, type PromptBlock, type PromptImageBlock } from '../session/prompt.ts'
+import type { TurnSubmission } from '../session/submit.ts'
 import type { PlacementServices, TopicPlacement, TopicPlan } from '../session/isolation.ts'
 import { ensureWorkspace, topicTokenFor } from '../workspaces.ts'
 
@@ -117,6 +118,8 @@ export interface InboundDeps {
   sessions: SessionManager
   /** Host-level DSH native attachment library (required plugin dependency). */
   nativeAttachments(): AttachmentStore
+  /** Image staging and card-bound prompt submission (the service owns both). */
+  prompts: TurnSubmission
   /**
    * Pre-authorize a message's attachments for `feishu_attachment_fetch`:
    * `trigger` (the triggering message) by default, `quote`/`history`/`recent`
@@ -503,25 +506,26 @@ export class InboundRouter {
   }
 
   /**
-   * Build the first-turn user message for the native pipeline: the caption
-   * text, the quoted-message excerpt, the prefetched trigger images, the
+   * Build the prompt of one turn for the native pipeline: the caption text,
+   * the quoted-message excerpt, the prefetched trigger images, the
    * `<feishu_context>` manifest block listing every attachment still unloaded,
    * and (first turn only) the `<feishu_history>` topic bootstrap. Optional
    * blocks are omitted entirely (no token cost) when empty.
    *
-   * Runs after the session/card/route exist and before `followup`; only the
-   * triggering message's images are prefetched (bounded and short-timeout),
-   * files never are. Block order is stable: text, quote, images, manifest,
-   * history.
+   * Runs after the session/card/route exist and before the submission; only
+   * the triggering message's images are prefetched (bounded and
+   * short-timeout) and staged for the live Agent, files never are. Block
+   * order is stable: text, quote, images, manifest, history.
    */
-  private async nativeTurnMessage(
+  private async nativeTurnPrompt(
     msg: NormalizedMessage,
     record: RouteRecord,
     content: string,
+    agent: Agent,
     options: TurnDeliveryOptions,
-  ): Promise<UserMessage> {
-    const message = feishuUserMessage(content, msg.senderId)
-    const blocks: ContentBlock[] = content === '' ? [] : [{ type: 'text', text: content }]
+  ): Promise<ChannelPrompt> {
+    const principal = principalOnRoute(record, msg.senderId)
+    const blocks: PromptBlock[] = content === '' ? [] : [{ type: 'text', text: content }]
     const state = inboundAttachmentState(msg)
     const attachmentPipeline = this.config.acceptAttachments
 
@@ -546,30 +550,21 @@ export class InboundRouter {
     const contextPromise = this.readTurnContext(msg, record, options)
 
     const loadedFileKeys = new Set<string>()
-    const prefetchedBlocks: ContentBlock[] = []
+    const prefetchedBlocks: PromptImageBlock[] = []
     const policy = this.deps.prefetchImages()
     const images = state.resources.filter(resource => resource.type === 'image')
     if (state.hasPayload && attachmentPipeline && policy.enabled && images.length > 0) {
-      const prefetched = await prefetchImageAttachments({
+      const prefetched = await prefetchImageAttachments<PromptImageBlock>({
         msg,
         resources: images,
         channel: this.liveChannel(),
         maxImageBytes: policy.maxImageBytes,
         maxTotalBytes: policy.maxTotalBytes,
         timeoutMs: policy.timeoutMs,
-        saveImage: async (bytes, name) => {
-          const store = new NativeAttachmentStore({ service: () => this.deps.nativeAttachments() })
-          const saved = await store.saveImage({ bytes, ...(name === undefined ? {} : { name }) })
-          return saved.ok
-            ? { ok: true, block: saved.value.block }
-            : { ok: false, reason: saved.reason }
-        },
+        saveImage: (bytes, name) => this.deps.prompts.stageImage(agent, bytes, name),
         warn: (warning, ...args) => this.ctx.logger?.warn?.(warning, ...args),
       })
-      // Spread each block into a plain object literal: the host `ContentBlock`
-      // union carries an index signature that the named `ImageBlock` interface
-      // does not declare, and the clone is structurally identical.
-      prefetchedBlocks.push(...prefetched.blocks.map(block => ({ ...block })))
+      prefetchedBlocks.push(...prefetched.blocks)
       for (const fileKey of prefetched.loadedFileKeys) loadedFileKeys.add(fileKey)
     }
     // Stable block order: text, quote, image blocks, manifest, history.
@@ -590,35 +585,35 @@ export class InboundRouter {
       : ''
     if (manifest !== '') blocks.push({ type: 'text', text: manifest })
     if (context.historyBlock !== undefined) blocks.push({ type: 'text', text: context.historyBlock })
-    // A trigger always carries caption text, but keep the message well-formed
+    // A trigger always carries caption text, but keep the prompt well-formed
     // if a future call path ever reaches here with nothing to say.
     if (blocks.length === 0) blocks.push({ type: 'text', text: '' })
-    message.content = blocks
-    return message
+    return { ...channelPrompt('', principal), content: blocks }
   }
 
   /**
-   * Deliver the prompt for one turn: caption text, quoted-message excerpt,
+   * Assemble the prompt for one turn: caption text, quoted-message excerpt,
    * prefetched images, attachment manifest, and (first turn only) the bounded
-   * topic history; see {@link nativeTurnMessage}.
+   * topic history; see {@link nativeTurnPrompt}.
    *
    * A failure in prompt assembly degrades to the plain text prompt (the turn
    * must run); a failed quote/history read degrades silently to its absence.
    */
-  private async deliverTurnMessage(
+  private async assembleTurnPrompt(
     msg: NormalizedMessage,
     record: RouteRecord,
     content: string,
+    agent: Agent,
     options: TurnDeliveryOptions = {},
-  ): Promise<UserMessage> {
+  ): Promise<ChannelPrompt> {
     try {
-      return await this.nativeTurnMessage(msg, record, content, options)
+      return await this.nativeTurnPrompt(msg, record, content, agent, options)
     } catch (error) {
       this.ctx.logger?.warn?.(
         'dsh-channels: assembling the attachment manifest for %s failed: %s',
         msg.messageId, String(error),
       )
-      return feishuUserMessage(content, msg.senderId)
+      return channelPrompt(content, principalOnRoute(record, msg.senderId))
     }
   }
 
@@ -933,20 +928,23 @@ export class InboundRouter {
     try {
       await this.routes.put(key, record)
 
-      // 6. Stream into the card and hand the message to the driver. The prompt
-      //    is assembled only now (after the route is durable and tools are
-      //    mounted): images may be prefetched, files stay lazy behind the
+      // 6. Stream into the card and submit the prompt as the sender. The
+      //    prompt is assembled only now (after the route is durable and tools
+      //    are mounted): images may be prefetched, files stay lazy behind the
       //    manifest, and the (first turn only) bounded topic history plus the
       //    quoted-message excerpt are attached as text blocks. `routes.put` and
-      //    `followup` stay synchronous with respect to other turns because
+      //    the submission stay ordered with respect to other turns because
       //    later messages wait on the delivery gate.
-      const message = await this.deliverTurnMessage(msg, record, content, {
+      const prompt = await this.assembleTurnPrompt(msg, record, content, handle.agent, {
         firstTurn: true,
         excludeMessageIds: [msg.messageId, sent.messageId],
       })
-      await this.repair.recordMessage(sent.messageId, message, msg.senderId)
-      this.streamer?.attach(handle.agent.session, sent.messageId, msg.messageId, typingId, { message })
-      handle.agent.followup(message)
+      await this.repair.recordPrompt(sent.messageId, prompt)
+      await this.deps.prompts.run(handle.agent, prompt, {
+        cardMessageId: sent.messageId,
+        triggerMessageId: msg.messageId,
+        ...(typingId === undefined ? {} : { reactionId: typingId }),
+      })
     } finally {
       closeDeliveryGate()
     }
@@ -1003,11 +1001,14 @@ export class InboundRouter {
       cardMessageId: sent.messageId,
       lastActivityAt: Date.now(),
     })
-    const message = await this.deliverTurnMessage(msg, current, content, {
+    const prompt = await this.assembleTurnPrompt(msg, current, content, live.agent, {
       excludeMessageIds: [msg.messageId, sent.messageId],
     })
-    await this.repair.recordMessage(sent.messageId, message, msg.senderId)
-    this.streamer?.attach(live.agent.session, sent.messageId, msg.messageId, typingId, { message })
-    live.agent.followup(message)
+    await this.repair.recordPrompt(sent.messageId, prompt)
+    await this.deps.prompts.run(live.agent, prompt, {
+      cardMessageId: sent.messageId,
+      triggerMessageId: msg.messageId,
+      ...(typingId === undefined ? {} : { reactionId: typingId }),
+    })
   }
 }

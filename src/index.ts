@@ -82,8 +82,14 @@ export const name = 'channels'
  * every dsh-base profile. `attachments` is the DSH native attachment library
  * (`@deepseek-ai/dsh-attachment-local`, mounted by the shipped base
  * composition): it is the only storage for inbound Feishu images and files.
+ * `connection`, `typertGateway`, `remoteAccess` and `fileUploads` come from
+ * the DSH Web composition (web-app bundle) and submit every Feishu prompt
+ * through `session/prompt` as the sender's Peer; they are listed so the
+ * loader waits for them instead of booting the channel before they exist
+ * (`boot()` does not retry a failed start). `requireRemoteServices` still
+ * fails loud for direct invocation without them.
  */
-export const inject = ['agents', 'commands', 'workspaceRegistry', 'storageDomain', 'credentials', 'llm', 'tokenMeter', 'attachments'] as const
+export const inject = ['agents', 'commands', 'workspaceRegistry', 'storageDomain', 'credentials', 'llm', 'tokenMeter', 'attachments', 'connection', 'typertGateway', 'remoteAccess', 'fileUploads'] as const
 
 /**
  * Cordis Standard Schema declaration for the plugin config.

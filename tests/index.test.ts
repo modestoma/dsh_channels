@@ -19,6 +19,11 @@ describe('plugin composition', () => {
     expect(inject).toContain('attachments')
   })
 
+  it('waits for the Web services that submit prompts as the sender', () => {
+    // Boot is not retried, so the loader must order it after these appear.
+    for (const service of ['connection', 'typertGateway', 'remoteAccess', 'fileUploads']) expect(inject).toContain(service)
+  })
+
   it('stays PENDING when commands is absent even if every other dependency is available', async () => {
     expect(inject).toContain('commands')
 
