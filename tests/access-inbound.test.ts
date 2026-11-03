@@ -612,7 +612,7 @@ describe('guarded 模式：群话题归群', () => {
       await listener!({ session, dir: '/ws', add: (token, value) => { added.push([token, value]) } })
       return added
     }
-    expect(await trailersFor(aliceRoute.sessionId)).toEqual([['Feishu-User', 'Alice <u_alice>']])
+    expect(await trailersFor(aliceRoute.sessionId)).toEqual([['Feishu-Chat', '研发群 <oc_group>'], ['Feishu-User', 'Alice <u_alice>']])
 
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_group', senderId: 'u_bob', threadId: threadKey,
@@ -624,10 +624,10 @@ describe('guarded 模式：群话题归群', () => {
     expect(h.channel.downloadResource).toHaveBeenCalled()
     await waitUntil(() => expect(routeRecords(h).find(([key]) => key === threadKey)?.[1].lastSpeakerUserId).toBe('u_bob'))
     // Alice's turn is still running: the trailer follows the claimed speaker.
-    expect(await trailersFor(aliceRoute.sessionId)).toEqual([['Feishu-User', 'Alice <u_alice>']])
+    expect(await trailersFor(aliceRoute.sessionId)).toEqual([['Feishu-Chat', '研发群 <oc_group>'], ['Feishu-User', 'Alice <u_alice>']])
     const agent = h.ctxState.agents.created[0]!.handle.agent
     h.ctxState.sessionListeners[0]!(agent.session, { type: 'turn/end', seq: 1, data: { turn: 1, reason: 'stop' } })
-    await waitUntil(async () => expect(await trailersFor(aliceRoute.sessionId)).toEqual([['Feishu-User', 'Bob <u_bob>']]))
+    await waitUntil(async () => expect(await trailersFor(aliceRoute.sessionId)).toEqual([['Feishu-Chat', '研发群 <oc_group>'], ['Feishu-User', 'Bob <u_bob>']]))
     await h.service.shutdown()
   })
 
@@ -791,7 +791,8 @@ describe('guarded 模式：代码改动开关', () => {
       return added
     }
 
-    expect(await trailersFor(route.sessionId)).toEqual([['Feishu-User', 'Alice A 李 <u_alice>']])
+    // A group whose profile cannot be read is named by chat_id.
+    expect(await trailersFor(route.sessionId)).toEqual([['Feishu-Chat', 'oc_group'], ['Feishu-User', 'Alice A 李 <u_alice>']])
     expect(await trailersFor('s_not_feishu')).toEqual([])
 
     await h.onMessage(makeMessage({
@@ -824,14 +825,14 @@ describe('guarded 模式：代码改动开关', () => {
     await h.service.shutdown()
   })
 
-  it('用户设置了 Git 邮箱时，推送的提交以本人为作者，同时保留 Feishu-User 尾注', async () => {
+  it('私聊用户设置了 Git 邮箱时，推送的提交以本人为作者，同时保留 Feishu-User 尾注', async () => {
     const userProfiles = vi.fn(async (ids: readonly string[]) => new Map(ids.map(id => [id, id === 'u_alice' ? { name: 'Alice <A>' } : {}])))
     const h = await setup({}, { userProfiles })
     await h.service.addAccessUser('u_alice')
     await h.service.addAccessUser('u_carol')
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_group', senderId: 'u_alice',
-      mentionedBot: true, messageId: 'om_alice_author', content: '改完推上去',
+      chatType: 'p2p', chatId: 'oc_p2p_alice', senderId: 'u_alice',
+      mentionedBot: false, messageId: 'om_alice_author', content: '改完推上去',
     }))
     const [, route] = await waitForRoute(h, 'u_alice')
     const [listener] = h.ctxState.commitTrailerListeners
@@ -871,6 +872,69 @@ describe('guarded 模式：代码改动开关', () => {
     expect(await h.service.setAccessGitEmail('u_alice', undefined)).toMatchObject({ ok: true })
     expect(await detailsFor(route.sessionId)).toEqual({ trailers: [['Feishu-User', 'Alice A <u_alice>']], authors: [] })
     expect(await h.service.setAccessGitEmail('u_nobody', 'x@example.com')).toMatchObject({ ok: false, error: expect.stringContaining('不在用户表') })
+    await h.service.shutdown()
+  })
+
+  it('群话题的提交由令牌账号署名：加 Feishu-Chat 和 Feishu-User 尾注，发言人的 Git 邮箱不作为作者', async () => {
+    const userProfiles = vi.fn(async (ids: readonly string[]) => new Map(ids.map(id => [id, { name: 'Alice' }])))
+    const chatProfile = vi.fn(async () => ({ name: '研发群 <核心>\n二组' }))
+    const h = await setup({}, { userProfiles, chatProfile })
+    await h.service.addAccessUser('u_alice')
+    expect(await h.service.setAccessGitEmail('u_alice', 'alice@example.com')).toMatchObject({ ok: true })
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_group', senderId: 'u_alice',
+      mentionedBot: true, messageId: 'om_alice_group_author', content: '改完推上去',
+    }))
+    const [, route] = await waitForRoute(h, 'u_alice')
+    const [listener] = h.ctxState.commitTrailerListeners
+    const trailers: Array<[string, string]> = []
+    const setAuthor = vi.fn()
+    await listener!({ session: route.sessionId, dir: '/ws', add: (token, value) => { trailers.push([token, value]) }, setAuthor })
+    expect(trailers).toEqual([['Feishu-Chat', '研发群 核心 二组 <oc_group>'], ['Feishu-User', 'Alice <u_alice>']])
+    expect(setAuthor).not.toHaveBeenCalled()
+    await h.service.shutdown()
+  })
+
+  it('access/authorize 按会话所在位置回答：私聊看本人开关和管理员身份，群看群权限且从不授予 admin，未知级别拒绝，非飞书会话放行', async () => {
+    const h = await setup()
+    await h.service.addAccessUser('u_alice')
+    await h.service.addAccessUser('u_bob')
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_p2p_alice', senderId: 'u_alice',
+      mentionedBot: false, messageId: 'om_alice_auth', content: '推一下',
+    }))
+    const [, aliceRoute] = await waitForRoute(h, 'u_alice')
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_group', senderId: 'u_bob',
+      mentionedBot: true, messageId: 'om_bob_auth', content: '推一下',
+    }))
+    const [, groupRoute] = await waitForRoute(h, 'u_bob')
+    const [authorize] = h.ctxState.authorizeListeners
+    const ask = async (session: string, level: string, action = 'repo_workspace_push') => await authorize!({ session, level, action, summary: '推送' })
+
+    // Not a Feishu Session: left to other listeners.
+    await expect(ask('s_web', 'code-write')).resolves.toBeUndefined()
+    // Private chat: the person's switches.
+    await expect(ask(aliceRoute.sessionId, 'code-write')).rejects.toThrow('飞书用户 u_alice 没有代码改动权限，不能执行 repo_workspace_push')
+    await expect(ask(aliceRoute.sessionId, 'wiki-write', 'wiki_create')).rejects.toThrow('没有知识库写入权限，不能执行 wiki_create')
+    await h.service.setAccessPermission('u_alice', 'codeWrite', true)
+    await expect(ask(aliceRoute.sessionId, 'code-write')).resolves.toBeUndefined()
+    await expect(ask(aliceRoute.sessionId, 'admin', 'logalyze_add_repo')).rejects.toThrow('飞书用户 u_alice 不是管理员，不能执行 logalyze_add_repo')
+    await h.service.setAccessPermission('u_alice', 'admin', true)
+    await expect(ask(aliceRoute.sessionId, 'admin', 'logalyze_add_repo')).resolves.toBeUndefined()
+    await expect(ask(aliceRoute.sessionId, 'wiki-read', 'wiki_read')).resolves.toBeUndefined()
+    await expect(ask(aliceRoute.sessionId, 'owner')).rejects.toThrow('未知的授权级别 owner')
+    // Group: the group's permission record, never admin.
+    await expect(ask(groupRoute.sessionId, 'code-write')).rejects.toThrow('本群没有代码改动权限，不能执行 repo_workspace_push')
+    await h.service.setGroupPermission('oc_group', 'codeWrite', true)
+    await expect(ask(groupRoute.sessionId, 'code-write')).resolves.toBeUndefined()
+    await expect(ask(groupRoute.sessionId, 'wiki-read', 'wiki_read')).rejects.toThrow('本群没有知识库读取权限')
+    await expect(ask(groupRoute.sessionId, 'admin', 'logalyze_add_repo')).rejects.toThrow('logalyze_add_repo 是管理操作，不能在群会话里执行')
+    // A subagent of the group Session is resolved through the live agent registry.
+    const child = { session: { id: 's_child', header: { id: 's_child', parentSession: groupRoute.sessionId } } }
+    h.ctxState.agents.liveAgents.set('s_child', { agent: child as never, dispose: vi.fn() })
+    await expect(ask('s_child', 'code-write')).resolves.toBeUndefined()
+    await expect(ask('s_child', 'admin', 'logalyze_add_repo')).rejects.toThrow('不能在群会话里执行')
     await h.service.shutdown()
   })
 })

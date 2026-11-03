@@ -10,7 +10,7 @@ import type { Agent, AgentRegistry } from './agent.ts'
 import type { AttachmentStore } from './attachments.ts'
 import type { CommandRuntime } from './commands.ts'
 import type { TopicLaunchState } from '../topics/contract.ts'
-import type { AssistantStreamPayload, CommitTrailersEvent, InboxClaimedPayload, InboxDiscardedPayload, PreToolDecision, PreToolExecution, Session, SessionEvent, SessionId } from './core.ts'
+import type { AssistantStreamPayload, AuthorizeEvent, CommitTrailersEvent, InboxClaimedPayload, InboxDiscardedPayload, PreToolDecision, PreToolExecution, Session, SessionEvent, SessionId } from './core.ts'
 import type { ApprovalAnswererListener, UserQuestionAnswererListener } from './interaction.ts'
 
 // ---- Workspace surface --------------------------------------------------
@@ -362,9 +362,15 @@ export interface HostContext {
     listener: (exec: PreToolExecution, next: () => Promise<PreToolDecision>) => Promise<PreToolDecision>,
   ): () => boolean
   /**
+   * The neutral `access/authorize` event, dispatched with `ctx.parallel`
+   * before a write is made for a Session; a throwing listener refuses the
+   * write with its message. Never fires without a plugin that asks.
+   */
+  on(name: 'access/authorize', listener: (event: AuthorizeEvent) => void | Promise<void>): () => boolean
+  /**
    * dsh-repo's `repo/commit-trailers` event, dispatched with `ctx.parallel`
-   * before `repo_workspace_push` commits for a Session. Never fires without
-   * dsh-repo.
+   * before a workspace is committed and pushed for a Session. Never fires
+   * without dsh-repo.
    */
   on(name: 'repo/commit-trailers', listener: (event: CommitTrailersEvent) => void | Promise<void>): () => boolean
   /**

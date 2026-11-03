@@ -38,6 +38,9 @@ import { promptCallerOf } from './principal.ts'
 
 /** Speaker of a turn whose Feishu sender cannot be established. */
 const UNKNOWN_SENDER = Symbol('unknown sender')
+
+/** Longest `parentSession` chain {@link CodeWriteGate.resolveRoot} follows. */
+const MAX_SESSION_DEPTH = 32
 type Speaker = string | typeof UNKNOWN_SENDER
 
 export interface CodeWriteGateDeps {
@@ -116,6 +119,38 @@ export class CodeWriteGate {
     if (root === undefined || route === undefined) return undefined
     const speaker = this.speakers.get(root) ?? route.lastSpeakerUserId ?? route.senderUserId
     return speaker === UNKNOWN_SENDER ? undefined : speaker
+  }
+
+  /**
+   * The routed Session a Session belongs to: itself when routed, else the
+   * routed ancestor remembered from an earlier call, else the first routed
+   * Session on its `parentSession` chain as `parentOf` reports it (the live
+   * agent registry); every Session passed on the way is remembered. Used by
+   * events that name a Session without a call, such as `access/authorize`
+   * and `repo/commit-trailers`.
+   * @param sessionId - the Session.
+   * @param parentOf - parent of a live Session, or undefined when unknown or top-level.
+   * @returns the routed Session, or undefined when Feishu routes none of the chain.
+   */
+  resolveRoot(sessionId: string, parentOf: (sessionId: string) => string | undefined): string | undefined {
+    const chain: string[] = []
+    let current = sessionId
+    let root: string | undefined
+    while (root === undefined) {
+      if (this.deps.routeOf(current) !== undefined) {
+        root = current
+        break
+      }
+      root = this.roots.get(current)
+      if (root !== undefined) break
+      if (chain.includes(current) || chain.length >= MAX_SESSION_DEPTH) return undefined
+      chain.push(current)
+      const parent = parentOf(current)
+      if (parent === undefined) return undefined
+      current = parent
+    }
+    for (const descendant of chain) this.roots.set(descendant, root)
+    return root
   }
 
   /** Drop every speaker and descendant (shutdown). */

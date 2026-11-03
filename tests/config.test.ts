@@ -38,6 +38,8 @@ describe('resolveConfig', () => {
       'repo_issue_create', 'repo_issue_update', 'repo_issue_comment',
       'repo_branch_delete', 'repo_ci_retry', 'repo_ci_cancel',
     ]))
+    // Plugins that ask through access/authorize need no entry.
+    expect(config.codeWriteTools.filter(name => name.startsWith('logalyze_'))).toEqual([])
   })
 
 
