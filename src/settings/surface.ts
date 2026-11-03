@@ -27,6 +27,7 @@ import {
 import type {
   AccessMutationResponse,
   AccessPermissionWire,
+  GroupPermissionWire,
   AccessWire,
   CatalogWire,
   ChannelPhaseWire,
@@ -125,6 +126,10 @@ export interface SettingsTarget {
   setAccessGitEmail(userId: string, gitEmail: string | undefined): Promise<AccessMutationResponse>
   /** Settle one pending request (panel shares this path with the Feishu DM card). */
   resolveAccessRequest(token: string, decision: 'allow' | 'deny'): Promise<AccessMutationResponse>
+  /** Set one permission switch of a registered group (takes effect on the next check). */
+  setGroupPermission(chatId: string, permission: GroupPermissionWire, enabled: boolean): Promise<AccessMutationResponse>
+  /** Delete one group's permission record. */
+  removeAccessGroup(chatId: string): Promise<AccessMutationResponse>
   /** Feishu origin of one Session, or null when Feishu never routed it. */
   sessionOrigin(sessionId: string): Promise<SessionOriginWire | null>
   /** Live Feishu names and avatars of the given users and chats. */
@@ -252,11 +257,6 @@ const SELECT_OPTIONS: Partial<Record<EditableKey, ReadonlyArray<{ value: string;
     { value: 'degrade', label: '降级为会话级' },
     { value: 'strict', label: '直接失败' },
   ],
-  topicIsolation: [
-    { value: 'auto', label: '自动（推荐）' },
-    { value: 'subdir', label: '普通子目录' },
-    { value: 'worktree', label: 'Git worktree' },
-  ],
   accessMode: [
     { value: 'guarded', label: '关闭（管理员与白名单）' },
     { value: 'open', label: '打开（所有人可聊）' },
@@ -302,15 +302,9 @@ const FIELD_META: Record<EditableKey, FieldMeta> = {
     label: '工作区根目录',
     group: 'workspace',
     summary: '模型和工具生成文件的位置',
-    help: '每个用户一个工作区：私聊 <根目录>/p2p/<user_id>/，群聊 <根目录>/groups/<chat_id>/<user_id>/，每个话题在里面有独立目录。必须是绝对路径（~ 按家目录展开），保存时会创建该目录。只影响之后新建的话题，旧文件不迁移。',
+    help: '每个话题一个工作区：私聊 <根目录>/p2p/<user_id>/<话题>/，群聊 <根目录>/groups/<chat_id>/<话题>/。必须是绝对路径（~ 按家目录展开），保存时会创建该目录。只影响之后新建的话题，旧目录不迁移。',
     placeholder: '/Users/you/.dsh/dsh-channels/workspaces',
     wide: true,
-  },
-  topicIsolation: {
-    label: '话题工作目录',
-    group: 'workspace',
-    summary: '每个话题在工作区里怎么隔离',
-    help: '自动：工作区是 Git 仓库时给每个话题建一个 worktree，否则用普通子目录。选 Git worktree 但宿主不支持时退回普通子目录。只影响之后新建的话题，已有话题保持原来的目录。',
   },
   routeTtlMs: {
     label: '话题过期',
@@ -601,6 +595,17 @@ export function normalizeAccessId(
   return { ok: true, value }
 }
 
+/** Feishu group chat id accepted by the group permission routes. */
+const CHAT_ID_PATTERN = /^oc_[A-Za-z0-9_-]{1,128}$/u
+
+/** Trim one group `chat_id`, rejecting anything but a Feishu group chat id. */
+function normalizeChatId(raw: unknown): { ok: true; value: string } | { ok: false; message: string } {
+  const id = normalizeAccessId(raw, '群 chat_id')
+  if (!id.ok) return id
+  if (!CHAT_ID_PATTERN.test(id.value)) return { ok: false, message: '群 chat_id 必须是 oc_ 开头的飞书群 id' }
+  return id
+}
+
 /** Longest accepted git email (RFC 5321 path limit). */
 const MAX_GIT_EMAIL_LENGTH = 254
 
@@ -852,6 +857,7 @@ export class SettingsSurface {
         mode: effective.accessMode,
         loaded: false,
         users: [],
+        groups: [],
         requests: [],
       }
     }
@@ -1182,6 +1188,30 @@ export class SettingsSurface {
       return { ok: false, error: 'decision 必须是 allow 或 deny' }
     }
     return this.mutateAccess(() => this.target.resolveAccessRequest(normalized.value, decision))
+  }
+
+  /**
+   * Set one group permission switch from the panel. Validation happens before the write.
+   * @param chatId - raw `chat_id` from the request body.
+   * @param permission - raw switch name.
+   * @param enabled - raw new value.
+   * @returns the refreshed snapshot, or the validation/write failure.
+   */
+  async setGroupPermission(chatId: unknown, permission: unknown, enabled: unknown): Promise<AccessMutationResponse> {
+    const id = normalizeChatId(chatId)
+    if (!id.ok) return { ok: false, error: id.message }
+    if (permission !== 'wikiRead' && permission !== 'wikiWrite' && permission !== 'codeWrite') {
+      return { ok: false, error: '群权限开关只能是 wikiRead、wikiWrite 或 codeWrite' }
+    }
+    if (typeof enabled !== 'boolean') return { ok: false, error: 'enabled 必须是 true 或 false' }
+    return this.mutateAccess(() => this.target.setGroupPermission(id.value, permission, enabled))
+  }
+
+  /** Remove one group's permission record from the panel. */
+  async removeAccessGroup(chatId: unknown): Promise<AccessMutationResponse> {
+    const id = normalizeChatId(chatId)
+    if (!id.ok) return { ok: false, error: id.message }
+    return this.mutateAccess(() => this.target.removeAccessGroup(id.value))
   }
 
   /** Run one access mutation, folding thrown seam errors into the wire type. */

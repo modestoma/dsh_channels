@@ -1,24 +1,25 @@
 /**
- * Code-write gate: which tool calls it inspects, who drives a turn, and how
- * subagent Sessions inherit their routed ancestor.
+ * Code-write gate: which tool calls it inspects, whose switches decide (the
+ * route's location, never the speaker), how subagent Sessions inherit their
+ * routed ancestor, and which speaker it names for commit trailers.
  */
 
 import { describe, expect, it } from 'vitest'
 import { CodeWriteGate } from '../src/access/code-write.ts'
-import type { AccessPermission, RouteRecord } from '../src/domain.ts'
+import type { RouteRecord } from '../src/domain.ts'
 import type { Agent, PreToolExecution } from '../src/dsh-types.ts'
 import type { UserMessage } from '../src/host/core.ts'
 
 const PUSH = 'repo_workspace_push'
 
-/** A gate over one routed Session `s_root` owned by `u_owner`. */
-function setup(granted: Record<string, AccessPermission[]> = {}) {
-  const routes = new Map<string, RouteRecord>([['s_root', { senderUserId: 'u_owner' } as RouteRecord]])
+/** A gate over one routed Session `s_root` opened by `u_owner` in a private chat. */
+function setup(route: Partial<RouteRecord> = {}, writable: (route: RouteRecord) => boolean = () => false) {
+  const routes = new Map<string, RouteRecord>([['s_root', { chatId: 'oc_p2p', chatType: 'p2p', senderUserId: 'u_owner', ...route } as RouteRecord]])
   const tools = [PUSH, 'repo_mr_create']
   const gate = new CodeWriteGate({
     config: () => ({ codeWriteTools: tools }),
     routeOf: sessionId => routes.get(sessionId),
-    mayUse: (userId, permission) => userId === 'u_admin' || (granted[userId] ?? []).includes(permission),
+    mayWrite: writable,
   })
   return { gate, routes, tools }
 }
@@ -40,7 +41,7 @@ function fromGroup(chatId: string, userId: string): Pick<UserMessage, 'source'> 
 }
 
 describe('CodeWriteGate', () => {
-  it('denies a gated tool when the route owner lacks codeWrite, naming the user and the fix', () => {
+  it('denies a gated tool when the private-chat person lacks codeWrite, naming the user and the fix', () => {
     const { gate } = setup()
     const decision = gate.decide(call('s_root'))
     expect(decision?.kind).toBe('deny')
@@ -48,10 +49,27 @@ describe('CodeWriteGate', () => {
     expect(decision && 'reason' in decision ? decision.reason : '').toContain('/auth set code on')
   })
 
-  it('delegates when the driver holds codeWrite or is the administrator', () => {
-    expect(setup({ u_owner: ['codeWrite'] }).gate.decide(call('s_root'))).toBeUndefined()
-    const { gate } = setup()
-    gate.onClaimed('s_root', from('u_admin'))
+  it('denies a gated tool in a group whose permission record lacks codeWrite, pointing at the group table', () => {
+    const { gate } = setup({ chatId: 'oc_group', chatType: 'group', mode: 'group' })
+    const decision = gate.decide(call('s_root'))
+    expect(decision).toMatchObject({ kind: 'deny', reason: expect.stringContaining('本群没有代码改动权限') })
+    expect(decision && 'reason' in decision ? decision.reason : '').toContain('「群权限」')
+  })
+
+  it('delegates when the route location holds codeWrite, whoever speaks', () => {
+    const { gate } = setup({}, () => true)
+    expect(gate.decide(call('s_root'))).toBeUndefined()
+    gate.onClaimed('s_root', from('u_stranger'))
+    expect(gate.decide(call('s_root'))).toBeUndefined()
+    gate.onClaimed('s_root', { source: { kind: 'user', rpcId: 'r', principal: { kind: 'share-viewer', shareId: 's' } } })
+    expect(gate.decide(call('s_root'))).toBeUndefined()
+  })
+
+  it('reads the switch live: a denied route delegates once its location is granted', () => {
+    let granted = false
+    const { gate } = setup({}, () => granted)
+    expect(gate.decide(call('s_root'))?.kind).toBe('deny')
+    granted = true
     expect(gate.decide(call('s_root'))).toBeUndefined()
   })
 
@@ -66,27 +84,10 @@ describe('CodeWriteGate', () => {
     expect(gate.decide(call('s_root'))).toBeUndefined()
   })
 
-  it('uses the sender of the claimed message as the driver, keeping it across turns no message started', () => {
-    const { gate } = setup({ u_bob: ['codeWrite'] })
-    gate.onClaimed('s_root', from('u_bob'))
-    expect(gate.decide(call('s_root'))).toBeUndefined()
-    // A turn no Feishu user started (owner, command, subagent result, job) keeps Bob.
-    gate.onClaimed('s_root', { source: { kind: 'user' } })
-    gate.onClaimed('s_root', { source: { kind: 'user', rpcId: 'r1' } as UserMessage['source'] })
-    gate.onClaimed('s_root', { source: { kind: 'subagent-settled' } })
-    expect(gate.decide(call('s_root'))).toBeUndefined()
-
-    gate.onClaimed('s_root', from('u_carol'))
-    expect(gate.decide(call('s_root'))?.kind).toBe('deny')
-  })
-
-  it('applies the routed ancestor driver to subagents, including nested ones, until cleared', () => {
+  it('applies the routed ancestor rule to subagents, including nested ones, until cleared', () => {
     const { gate, routes } = setup()
     expect(gate.decide(call('s_child', 's_root'))?.kind).toBe('deny')
     expect(gate.decide(call('s_grandchild', 's_child'))?.kind).toBe('deny')
-
-    gate.onClaimed('s_root', from('u_admin'))
-    expect(gate.decide(call('s_grandchild', 's_child'))).toBeUndefined()
 
     gate.clear()
     expect(gate.decide(call('s_grandchild', 's_child'))).toBeUndefined()
@@ -100,71 +101,56 @@ describe('CodeWriteGate', () => {
     expect(gate.decide(call('s_grandchild', 's_child'))?.kind).toBe('deny')
   })
 
-  it('names the driver of routed Sessions and of descendants it has seen', () => {
+  it('names the speaker of routed Sessions and of descendants it has seen', () => {
     const { gate } = setup()
-    expect(gate.driverOf('s_root')).toBe('u_owner')
-    expect(gate.driverOf('s_child')).toBeUndefined()
+    expect(gate.speakerOf('s_root')).toBe('u_owner')
+    expect(gate.speakerOf('s_child')).toBeUndefined()
     gate.decide(call('s_child', 's_root', 'read_file'))
     gate.onClaimed('s_root', from('u_bob'))
-    expect(gate.driverOf('s_child')).toBe('u_bob')
-    expect(gate.driverOf('s_web')).toBeUndefined()
+    expect(gate.speakerOf('s_child')).toBe('u_bob')
+    expect(gate.speakerOf('s_web')).toBeUndefined()
   })
 
-  it('denies every gated call of a turn whose sender is unknown, and names no driver for it', () => {
-    const { gate } = setup({ u_owner: ['codeWrite'] })
+  it('keeps the speaker across turns no Feishu message started', () => {
+    const { gate } = setup()
+    gate.onClaimed('s_root', from('u_bob'))
+    gate.onClaimed('s_root', { source: { kind: 'user' } })
+    gate.onClaimed('s_root', { source: { kind: 'user', rpcId: 'r1' } as UserMessage['source'] })
+    gate.onClaimed('s_root', { source: { kind: 'subagent-settled' } })
+    expect(gate.speakerOf('s_root')).toBe('u_bob')
+    gate.onClaimed('s_root', from('u_carol'))
+    expect(gate.speakerOf('s_root')).toBe('u_carol')
+  })
+
+  it('names no speaker for a turn whose sender is not a Feishu user, until a Feishu message is claimed', () => {
+    const { gate } = setup()
     gate.onClaimed('s_root', { source: { kind: 'user', rpcId: 'r', principal: { kind: 'share-viewer', shareId: 's' } } })
-    const decision = gate.decide(call('s_root'))
-    expect(decision).toMatchObject({ kind: 'deny', reason: expect.stringContaining('无法确认这一轮的飞书发言人') })
-    expect(gate.decide(call('s_root', undefined, 'read_file'))).toBeUndefined()
-    expect(gate.driverOf('s_root')).toBeUndefined()
+    expect(gate.speakerOf('s_root')).toBeUndefined()
     gate.onClaimed('s_root', from('u_owner'))
-    expect(gate.decide(call('s_root'))).toBeUndefined()
+    expect(gate.speakerOf('s_root')).toBe('u_owner')
   })
 
-  it('reads the driver from the durable principal, so it needs no record of submitted messages', () => {
-    const { gate } = setup({ u_bob: ['codeWrite'] })
+  it('falls back to the route\'s last recorded speaker before any claimed message, then to the initiator', () => {
+    const { gate, routes } = setup({ chatId: 'oc_group', chatType: 'group', mode: 'group', lastSpeakerUserId: 'u_last' })
+    expect(gate.speakerOf('s_root')).toBe('u_last')
+    routes.set('s_root', { ...routes.get('s_root')!, lastSpeakerUserId: undefined })
+    expect(gate.speakerOf('s_root')).toBe('u_owner')
+    gate.onClaimed('s_root', fromGroup('oc_group', 'u_bob'))
+    expect(gate.speakerOf('s_root')).toBe('u_bob')
+  })
+
+  it('reads the speaker from the durable principal, so it needs no record of submitted messages', () => {
+    const { gate } = setup()
     // The same message read back from the Session log.
     gate.onClaimed('s_root', JSON.parse(JSON.stringify(from('u_bob'))) as UserMessage)
-    expect(gate.decide(call('s_root'))).toBeUndefined()
-    expect(gate.driverOf('s_root')).toBe('u_bob')
+    expect(gate.speakerOf('s_root')).toBe('u_bob')
   })
 
-  it('takes the speaker of a group principal as the driver', () => {
-    const { gate } = setup({ u_bob: ['codeWrite'] })
+  it('takes the member of a group principal as the speaker; a group principal without its chat is malformed', () => {
+    const { gate } = setup({ chatId: 'oc_group', chatType: 'group', mode: 'group' })
     gate.onClaimed('s_root', fromGroup('oc_group', 'u_bob'))
-    expect(gate.decide(call('s_root'))).toBeUndefined()
-    expect(gate.driverOf('s_root')).toBe('u_bob')
-    gate.onClaimed('s_root', fromGroup('oc_group', 'u_carol'))
-    expect(gate.decide(call('s_root'))).toMatchObject({ kind: 'deny', reason: expect.stringContaining('飞书用户 u_carol 没有代码改动权限') })
-    // A group principal without its chat is malformed.
-    gate.onClaimed('s_root', { source: { kind: 'user', rpcId: 'r', principal: { kind: 'feishu-group', userId: 'u_bob' } } })
-    expect(gate.decide(call('s_root'))).toMatchObject({ kind: 'deny', reason: expect.stringContaining('无法确认这一轮的飞书发言人') })
-  })
-
-  it('fails closed on a principal that is not a well-formed Feishu user, until a Feishu user is claimed', () => {
-    const { gate } = setup({ u_owner: ['codeWrite'], u_bob: ['codeWrite'] })
-    const sources = [
-      { kind: 'user', rpcId: 'r', principal: { kind: 'share-viewer', shareId: 's' } },
-      { kind: 'user', rpcId: 'r', principal: { kind: 'feishu-user', userId: '' } },
-      { kind: 'user', rpcId: 'r', principal: { kind: 'feishu-user' } },
-      { kind: 'user', rpcId: 'r', principal: 'u_bob' },
-      { kind: 'user', rpcId: 'r', principal: null },
-    ]
-    for (const source of sources) {
-      gate.onClaimed('s_root', from('u_bob'))
-      gate.onClaimed('s_root', { source: source as UserMessage['source'] })
-      expect(gate.decide(call('s_root'))).toMatchObject({ kind: 'deny', reason: expect.stringContaining('无法确认这一轮的飞书发言人') })
-      // A message without a principal keeps the unknown driver.
-      gate.onClaimed('s_root', { source: { kind: 'tool-jobs' } })
-      expect(gate.decide(call('s_root'))?.kind).toBe('deny')
-    }
-    gate.onClaimed('s_root', from('u_bob'))
-    expect(gate.decide(call('s_root'))).toBeUndefined()
-  })
-
-  it('ignores a principal on a source that is not a user prompt', () => {
-    const { gate } = setup({ u_owner: ['codeWrite'] })
-    gate.onClaimed('s_root', { source: { kind: 'tool-jobs', principal: { kind: 'feishu-user', userId: 'u_carol' } } as UserMessage['source'] })
-    expect(gate.decide(call('s_root'))).toBeUndefined()
+    expect(gate.speakerOf('s_root')).toBe('u_bob')
+    gate.onClaimed('s_root', { source: { kind: 'user', rpcId: 'r', principal: { kind: 'feishu-group', userId: 'u_carol' } } })
+    expect(gate.speakerOf('s_root')).toBeUndefined()
   })
 })

@@ -7,10 +7,9 @@
  * 富文本正文 + 结算页脚，默认 500ms 刷新）→ 流式结束移除 Typing，成功更新为
  * “DONE”，失败显示结构化错误并更新为 “No”。
  *
- * 工作区归属：私聊一人一工作区；群聊中每个用户在该群拥有独立工作区
- * （工作区是会话 header cwd，保证 GUI 归属与沙箱边界）。每个话题在该工作区
- * 内拥有独立的工作目录（`topics/<话题>`，Git 仓库工作区可自动改用 worktree），
- * 因此话题之间的文件互不干扰，而工作区数量只随用户增长。
+ * 工作区归属：一个话题一个工作区（私聊 `p2p/<user_id>/<话题>/`，群聊
+ * `groups/<chat_id>/<话题>/`）。话题目录就是会话 header cwd，同时是 GUI 归属
+ * 与沙箱边界，因此话题之间的文件互不干扰，也不需要切换工作目录。
  *
  * @module dsh-channels
  */
@@ -42,8 +41,8 @@ export type * from './questions.ts'
 export type * from './settings/contract.ts'
 export type * from './topics/contract.ts'
 export * from './access/index.ts'
-export type { AccessPermission, AccessRequestRecord, AccessSwitch, AccessUserRecord } from './domain.ts'
-export { CATALOG_ROUTE, CLEAR_CONFIG_ROUTE, CLEAR_CREDENTIAL_ROUTE, EDITABLE_KEYS, PANEL_COPY, PANEL_ROUTE, PICK_DIRECTORY_ROUTE, RECONNECT_ROUTE, RESTART_KEYS, SAVE_CONFIG_ROUTE, SAVE_CREDENTIALS_ROUTE, STATUS_ROUTE } from './settings/contract.ts'
+export type { AccessPermission, AccessRequestRecord, AccessSwitch, AccessUserRecord, GroupPermission, GroupPermissionRecord } from './domain.ts'
+export { CATALOG_ROUTE, CLEAR_CONFIG_ROUTE, CLEAR_CREDENTIAL_ROUTE, EDITABLE_KEYS, PANEL_COPY, PANEL_ROUTE, PICK_DIRECTORY_ROUTE, RECONNECT_ROUTE, REMOVE_ACCESS_GROUP_ROUTE, RESTART_KEYS, SAVE_CONFIG_ROUTE, SAVE_CREDENTIALS_ROUTE, SET_GROUP_PERMISSION_ROUTE, STATUS_ROUTE } from './settings/contract.ts'
 export type { PickDirectoryResponse } from './settings/contract.ts'
 export { defaultOverlayPath, mergeOverlay, normalizeOverlay, OverlayStore, parseOverlay, pickEditable, resolveDshHome } from './settings/overlay.ts'
 export { applyCatalog, emptyCatalog, FIELD_DESCRIPTORS, normalizeCredentialValue, SettingsSurface, withDirectoryBrowse } from './settings/surface.ts'
@@ -67,8 +66,9 @@ export { FeishuService } from './service.ts'
 export { FEISHU_TOPICS_SERVICE, FEISHU_TOPICS_VERSION, TopicLauncher } from './topics/launcher.ts'
 export type { TopicLauncherDeps } from './topics/launcher.ts'
 export { TurnStreamer } from './streamer.ts'
-export { ensureWorkspace, topicDirFor, topicTokenFor, workspacePathFor, workspaceTitleFor, worktreeBranchFor } from './workspaces.ts'
-export { ACCESS_PERMISSIONS, accessRequestRecordSchema, accessUserRecordSchema, appendSessionHistory, chatRouteKey, expiredRouteRecordSchema, feishuDomain, normalizeRouteRecord, normalizeSessionHistory, routeRecordSchema, sessionDirOf, sessionHistoryEntrySchema, inflightSnapshotSchema, processedRecordSchema } from './domain.ts'
+export { ensureTopicWorkspace, topicTitleOf, topicTokenFor, topicWorkspacePathFor, workspaceTitleFor } from './workspaces.ts'
+export type { TopicLocationPort } from './workspaces.ts'
+export { ACCESS_PERMISSIONS, accessRequestRecordSchema, accessUserRecordSchema, appendSessionHistory, chatRouteKey, expiredRouteRecordSchema, feishuDomain, GROUP_PERMISSIONS, groupPermissionRecordSchema, isGroupRoute, normalizeRouteRecord, normalizeSessionHistory, routeRecordSchema, sessionDirOf, sessionHistoryEntrySchema, inflightSnapshotSchema, processedRecordSchema } from './domain.ts'
 
 /** Cordis function-plugin name. */
 export const name = 'channels'

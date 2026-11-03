@@ -14,8 +14,11 @@
  *  - slash commands: `/userid` stays available to every private sender,
  *    everything else must pass admission.
  *
- * It also answers the per-user permission switches (knowledge base, code
- * write) for the tool gates: an administrator holds every switch.
+ * It also answers the permission switches (knowledge base, code write) for
+ * the tool gates, by where the Session lives: a private-chat topic uses its
+ * person's switches (an administrator holds every switch); a group route
+ * without a single owner uses the group's permission record; an older group
+ * route uses its initiator's switches.
  *
  * The controller never creates a Session or a workspace.
  *
@@ -23,7 +26,8 @@
  */
 
 import type { FeishuConfig } from '../config.ts'
-import type { AccessPermission, RouteRecord } from '../domain.ts'
+import { isGroupRoute } from '../domain.ts'
+import type { AccessPermission, GroupPermission, RouteRecord } from '../domain.ts'
 import type { FeishuChannel, NormalizedMessage } from '../feishu-channel.ts'
 import { decideAccess } from './policy.ts'
 import type { AccessDecision } from './policy.ts'
@@ -86,9 +90,33 @@ export class AccessController {
     return this.isAdmin(userId) || this.deps.store.allows(userId, permission)
   }
 
+  /**
+   * Whether one route's Session holds a permission switch. A `mode: 'group'`
+   * route (or an older `shared` one) reads the group's permission record,
+   * where no record means off; any other route reads the switches of the
+   * user who opened it (see {@link mayUse}).
+   * @param record - the route the Session is bound to.
+   * @param permission - the switch to check.
+   * @returns true when allowed.
+   */
+  mayUseOnRoute(record: Pick<RouteRecord, 'chatId' | 'senderUserId' | 'mode' | 'shared'>, permission: GroupPermission): boolean {
+    if (isGroupRoute(record)) return this.deps.store.groupAllows(record.chatId, permission)
+    return this.mayUse(record.senderUserId, permission)
+  }
+
   /** Current user-table snapshot used by the pure policy. */
   snapshot(): AccessStoreSnapshot {
     return this.deps.store.snapshot()
+  }
+
+  /**
+   * Whether the admission matrix admits one message now (pure; no notice).
+   * Re-read before a queued turn is submitted.
+   * @param msg - the message.
+   * @returns true when admitted.
+   */
+  allows(msg: NormalizedMessage): boolean {
+    return this.decide(msg).kind === 'allow'
   }
 
   /** Evaluate the admission matrix for one message (pure; no side effects). */
@@ -145,18 +173,18 @@ export class AccessController {
   }
 
   /**
-   * Topic/route ownership: a route belongs to the sender (and chat) that
-   * created it. Used to reject foreign replies, attachments, and command
-   * execution inside someone else's topic.
+   * Whether the sender of `msg` may act on a route: replies, attachments, and
+   * command execution inside a topic. Delegates to {@link mayActOnRoute}.
    */
   ownsRoute(msg: NormalizedMessage, record: RouteRecord): boolean {
     return this.mayActOnRoute(msg.senderId, msg.chatId, record)
   }
 
   /**
-   * Whether `userId`, acting in `chatId`, may continue or decide for the
-   * route's Session: the route owner, or, on a group-shared route
-   * (`record.shared`), any user the admission matrix allows in that chat.
+   * Whether `userId`, acting in `chatId`, may continue the route's Session,
+   * decide its cards, and run its session commands: on a group route without
+   * a single owner ({@link isGroupRoute}) any user the admission matrix
+   * admits in that chat; on any other route only the user who opened it.
    * @param userId - Feishu user_id of the actor.
    * @param chatId - chat the action comes from (must be the route's chat).
    * @param record - the route acted on.
@@ -164,8 +192,7 @@ export class AccessController {
    */
   mayActOnRoute(userId: string | undefined, chatId: string, record: RouteRecord): boolean {
     if (userId === undefined || record.chatId !== chatId) return false
-    if (record.senderUserId === userId) return true
-    if (record.shared !== true) return false
+    if (!isGroupRoute(record)) return record.senderUserId === userId
     return decideAccess(
       { chatType: record.chatType, senderId: userId },
       this.config(),
@@ -176,7 +203,8 @@ export class AccessController {
   /**
    * Whether a `feishuTopics` launch may start a topic for `requesterUserId`:
    * an administrator or a user with the conversation permission, or anyone
-   * in `open` access mode. The target group itself is not checked.
+   * in `open` access mode. The first turn is submitted as the requester, so
+   * they need chat access like any speaker; the target group is not checked.
    * @param requesterUserId - Feishu user_id the launch is for.
    * @returns true when the launch is permitted.
    */

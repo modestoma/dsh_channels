@@ -254,8 +254,8 @@ export interface WikiToolRuntimeDeps {
   channel(): FeishuChannel | undefined
   /** Consent placement of one session (its topic and owner), re-read per call. */
   routeOfSession(sessionId: string): InteractionRoute | undefined
-  /** Whether a user (the topic owner) may use the read or the write tool family. */
-  mayUseWiki(userId: string, access: 'read' | 'write'): boolean
+  /** Whether the session's location (its person or its group) may use the read or the write tool family. */
+  mayUseWiki(sessionId: string, access: 'read' | 'write'): boolean
   /** Topic-owner consent cards. */
   consent: WikiConsent
   /** Structured warning sink. */
@@ -412,7 +412,7 @@ export class WikiToolRuntime implements WikiToolKit {
     if (!this.enabledTools().includes(tool)) return failure('TOOL_DISABLED')
     const route = this.deps.routeOfSession(sessionId)
     if (route === undefined) return failure('ROUTE_NOT_FOUND')
-    if (!this.deps.mayUseWiki(route.senderUserId, toolAccess(tool))) return failure('NOT_AUTHORIZED')
+    if (!this.deps.mayUseWiki(sessionId, toolAccess(tool))) return failure('NOT_AUTHORIZED')
     const channel = this.deps.channel()
     const api = channel?.wiki
     if (channel === undefined || api === undefined) return failure('CHANNEL_UNAVAILABLE')

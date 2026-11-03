@@ -160,7 +160,7 @@ async function setup(options: {
     config: () => config,
     channel: () => channel,
     routeOfSession: id => (id === 's1' ? { chatId: 'oc_1', cardMessageId: 'om_card', inThread: true, senderUserId: 'u_owner' } : undefined),
-    mayUseWiki: (_userId, access) => options.granted?.includes(access) ?? options.allowed ?? true,
+    mayUseWiki: (_sessionId, access) => options.granted?.includes(access) ?? options.allowed ?? true,
     consent,
     warn: vi.fn(),
   })

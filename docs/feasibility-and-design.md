@@ -15,8 +15,8 @@
 | 6 | 立刻基于该条消息创建话题 | ✅ | `im.v1.message.reply` + `reply_in_thread: true`（官方文档明示“以话题方式进行回复（即创建话题）”）；响应返回 `thread_id` |
 | 7 | 私聊也能创建话题 | ⚠️ 大概率 ✅ | `reply_in_thread` 文档未限制 chat_type；飞书客户端支持单聊话题。**需真机验证**，失败则降级为“单聊整体即话题”（见 §7 风险 R1） |
 | 8 | 基于话题创建 session，话题内后续消息延续该 session（无需再 @） | ✅ | 事件携带 `thread_id`；插件维护 `thread_id → sessionId` 映射，`thread_id` 命中即路由到既有 agent（`agent.followup()`） |
-| 9 | 私聊：工作区按人、话题按目录隔离 | ✅ | 工作区 `<baseDir>/p2p/<open_id>/`（`ctx.workspaceRegistry.create`），话题工作目录 `<工作区>/topics/<topic>/`（`ctx.workingDirectory` 切换；Git 仓库可自动用 worktree）。见 `docs/workspace-isolation-design.md` |
-| 10 | 群聊：每个群成员独立工作区，话题按目录隔离 | ✅ | 工作区 `<baseDir>/groups/<chat_id>/<open_id>/`，话题工作目录 `topics/<topic>/`；同群不同用户互不影响 |
+| 9 | 私聊：每个话题一个工作区 | ✅ | 话题目录 `<baseDir>/p2p/<open_id>/<topic>/` 直接作为 Session header cwd 并登记为工作区（`ctx.workspaceRegistry.create`）。演进见 `docs/workspace-isolation-design.md` |
+| 10 | 群聊：每个话题一个工作区，归群不归人 | ✅ | 话题目录 `<baseDir>/groups/<chat_id>/<topic>/`；同群通过准入的成员都在该话题里工作，话题之间互不影响 |
 | 11 | 流式卡片（card schema 2.0），500ms 刷新 | ✅ | `msg_type: "interactive"` 卡片 2.0 JSON；`im.v1.message.patch` 整体替换卡片。单条消息更新限频 **5 QPS**（官方文档），2 QPS（500ms）安全 |
 | 12 | 折叠面板：带边框、默认折叠、成功三态与失败终态、右侧箭头随折叠翻转 | ✅ | 卡片 2.0 原生组件 `collapsible_panel`：`border`、`expanded: false`、`header.title`、`icon` + `icon_expanded_angle: 180`（展开时箭头旋转向上） |
 | 13 | 正文富文本 | ✅ | 卡片 2.0 `markdown` 组件（lark markdown 子集） |
@@ -79,9 +79,8 @@
 
 | 概念 | 映射 | 存储 |
 |------|------|------|
-| 工作区（私聊） | `(bot, open_id)` → 目录 `<baseDir>/p2p/<open_id>/`（header cwd） | `ctx.workspaceRegistry` + 磁盘 |
-| 工作区（群聊） | `(bot, chat_id, open_id)` → 目录 `<baseDir>/groups/<chat_id>/<open_id>/` | 同上 |
-| 话题工作目录 | `<工作区>/topics/<topic>/`（实际 cwd；入站附件只进 DSH 原生附件库，不落这里） | Session 日志 `working-directory/change` + 路由记录 `sessionDir` |
+| 话题目录 = 工作区（私聊） | `(bot, open_id, topic)` → 目录 `<baseDir>/p2p/<open_id>/<topic>/`（header cwd；入站附件只进 DSH 原生附件库，不落这里） | `ctx.workspaceRegistry` + 磁盘 + 路由记录 `workspacePath` |
+| 话题目录 = 工作区（群聊） | `(bot, chat_id, topic)` → 目录 `<baseDir>/groups/<chat_id>/<topic>/` | 同上 |
 | session | `thread_id` → DSH `sessionId`（每话题一个） | 插件 `storageDomain` 域 `channels_routes` |
 | 会话延续 | 事件 `thread_id` 命中映射 → `agent.followup()` | — |
 
@@ -90,9 +89,9 @@
 **首次触发（私聊任意消息 / 群聊 @ 消息）：**
 
 1. 收到事件 → 异步 `reaction.create("Typing")`（非阻塞，记录 reaction_id）。
-2. 确保用户工作区（不存在则 mkdir + `workspaceRegistry.create`），规划话题工作目录（普通子目录或 Git worktree）。
+2. 建立话题目录（mkdir + `workspaceRegistry.create`，标题「群名 · 话题标题」或「人名 · 话题标题」）。
 3. 通过 `im.message.reply(message_id, { reply_in_thread: true, msg_type: "interactive", content: 卡片初始 JSON })` 创建话题并发出卡片第一帧（状态行“⚙️ 进行中”），拿到 `thread_id` + `message_id`。
-4. `ctx.agents.create({ sessionId: <uuid>, meta: { cwd: 用户工作区 }, ... })`，随后 `ctx.workingDirectory.set(agent, 话题目录)`（worktree 模式由 `ctx.worktrees.create` 完成切换），再投递首个 user 消息。
+4. `ctx.agents.create({ sessionId: <uuid>, meta: { cwd: 话题目录 }, ... })`，再投递首个 user 消息。
 5. 持久化 `thread_id → sessionId` 映射。
 
 **话题内续聊（无需 @）：**
@@ -192,7 +191,7 @@
 | 续聊入队 | `agent.followup(message)`（next-turn FIFO，自动唤醒驱动） |
 | 流式增量 | 订阅 `session/event`，`assistant/chunk`（`StreamChunk` 含 `text-delta` / `reasoning-delta`），`assistant/message` 锚点含 usage |
 | token / 缓存 / 上下文 | usage：`{ inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, reasoningTokens }`；上下文：`ctx.tokenMeter.measure(session)` + `ctx.llm.resolveModelInfo().context` |
-| 工作区 | `ctx.workspaceRegistry.create(path, title)`（目录存在才可注册）；`ctx.get('workingDirectory')` 切换会话实际目录；`ctx.get('worktrees')`（可选）创建 Git worktree |
+| 工作区 | `ctx.workspaceRegistry.create(path, title)`（目录存在才可注册）；`ctx.get('workingDirectory')` 只读，供读围栏取会话当前目录 |
 | 插件自身状态 | `ctx.storageDomain`（defineDomain + sqlite/json 后端） |
 | 加载方式 | 用户 cordis.yml 增加 `- name: '/path/to/plugin/src/index.ts'`（教程 07 确认本地文件路径加载，支持 HMR） |
 

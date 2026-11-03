@@ -5,23 +5,23 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 - 对话入口：私聊、群聊 @ 机器人、话题群 @ 机器人
 - 收到触发消息：立刻加 **“Typing”** 表情 → 以话题形式回复（**创建话题**）→ 绑定 DSH session → 卡片 2.0 **流式回复** → 成功时更新为 **“DONE”**，失败时更新为 **“No”**
 - 话题内后续消息**无需再 @**，自动延续该 session
-- 工作区归属：**每用户一个工作区**（私聊 = 用户；群聊 = 群 × 用户，同群不同用户互不影响）；每个话题在工作区内拥有独立工作目录（默认 `topics/<话题 id>/`，Git 仓库工作区可自动改用 worktree），因此话题之间的文件互不干扰，而工作区数量只随用户增长
+- 工作区归属：**一个话题一个工作区**：每个话题在 `<baseDir>` 下有自己的目录（私聊 `p2p/<user_id>/<话题 id>/`，群聊 `groups/<chat_id>/<话题 id>/`），这个目录就是 Session 的 header cwd，并以「群名 · 话题标题」或「人名 · 话题标题」登记为 DSH 工作区；话题之间的文件互不干扰，群话题属于群而不属于某个人
 - **入站附件（v2，零等待）**：收到消息时**会话、话题、流式卡片立即建立，不等附件下载**。触发消息中的图片自动预取为首轮原生 `ImageBlock`，模型直接可见；文件默认不下载，prompt 用 `<feishu_context>` 清单声明“附件未加载”，模型需要时调用 `feishu_attachment_fetch` 按 `message_id` 懒取；引用消息与话题历史以 `<feishu_quote>` / `<feishu_history>` 摘录，更早的消息用 `feishu_topic_messages` 翻页（发现的资源同时获得 fetch 授权）。**只发附件、不带说明的消息完全静默**：不回复、不建会话、不下载、不加表情，本地也不留任何状态；要让模型看到它，请引用那条消息再提问（多个文件可合并转发后引用），话题内的附件也可由模型用 `feishu_topic_messages` 读到。所有入站图片/文件只存入 **DSH 原生附件库**（不可变、内容寻址去重、读取校验、随 Session 回放；插件不承担入站附件清理）；插件把原生附件库列为必需依赖，不再有工作区 `attachments/` 落盘后端。完整设计见 [docs/attachment-pipeline-v2.md](docs/attachment-pipeline-v2.md)。
 - **把生成的文件发给用户**：模型在话题工作目录里生成图片、报告、表格等文件后，可调用 `feishu_send_file` 直接发回当前话题/会话（可识别图片 ≤10 MB 以图片消息发送，其余以文件消息发送，文件上限 30 MB）。只能发送**当前话题工作目录内**的普通文件（`..` 与符号链接都按真实路径校验，不能读到其他话题或系统文件）；需开通 `im:resource` 权限，缺失时工具返回可读的 `PERMISSION_DENIED`，回合不受影响。开关：`feishuTools.sendFile`（默认开）
-- **知识库读写**：开启 `feishuTools.wikiRead` / `feishuTools.wikiWrite`（默认都关）并在 `wikiRoots` 里配置知识空间链接 `https://<租户>.feishu.cn/wiki/space/<space_id>` 或节点链接 `https://<租户>.feishu.cn/wiki/<node_token>` 后，模型可用 `feishu_wiki_list` 浏览、`feishu_wiki_read` 读取飞书文档（Markdown，或带 block id 的飞书文档 XML，支持目录/章节/区间/关键词局部读取）、`feishu_wiki_create` 在范围内新建飞书文档、电子表格或多维表格（新节点也可作为子目录继续往下建）、`feishu_wiki_edit` 修改**本应用创建的**文档（追加、在块后插入、替换/删除块、文本替换、整篇重写；必须带上读取时的 `revision_id`，文档被他人改过会被拒绝）。电子表格用 `feishu_wiki_sheet_read` 按子表和 A1 范围读成 CSV（每行带 `[row=N]` 真实行号），`feishu_wiki_sheet_edit` 向**本应用创建的**表格写入单元格值或公式、在数据末尾追加行（追加位置会越过空行找到真正的最后一行，目标单元格非空时失败、不会覆盖；同样校验 `revision_id`；不改样式、图表和行列结构）。多维表格用 `feishu_wiki_base_read` 列数据表、读字段和记录（支持筛选、排序、关键词搜索、分页），`feishu_wiki_base_edit` 增改删记录：**本应用创建的**多维表格可增改删，其他多维表格**只能新增记录**（不改表和字段结构）。所有调用都用应用身份，并且：读取类工具只有**管理员或打开了「知识库读取」开关**（`/auth set wiki-read on @用户`）的人发起的话题能用，新建与修改类工具要求**「知识库写入」开关**（`/auth set wiki-write on @用户`），两个开关互相独立；`wikiRoots` 之外一律拒绝；打开某个文档或表格、每次新建、每次修改都会在话题里弹出**授权卡**，只有话题发起人能点（读取授权在本话题内对该文档持续有效，`/renew` 或重启后重新询问），超时（`approvalTimeoutMs`）自动拒绝；浏览目录不弹卡。需开通 `wiki:wiki`、`docx:document`（只读可用 `wiki:wiki:readonly` / `docx:document:readonly`），电子表格和多维表格另需细分权限 `sheets:spreadsheet:read` / `sheets:spreadsheet:write_only`、`base:table:read` / `base:field:read` / `base:record:read` / `base:record:create|update|delete`（旧版 `sheets:spreadsheet` / `bitable:app` 不生效），且应用要是目标知识空间的成员（可把包含机器人的群加为空间成员/管理员）
-- **HITL 审批**：当模型请求需要授权的动作（如 bash 沙箱升级 `sandbox_permissions`）时，插件监听主机 `approval/request` 事件，在同一话题里**新发一张独立审批决策卡**：卡片标题带工具名；工具在审批请求里给了说明时，说明按行显示为卡片主体（`标签：值` 行显示成标签和值，缩进行显示成列表，不按 markdown 解析），bash 等带 `command` 参数的工具另外显示将执行的命令，其余参数按 `名称: 值` 收进默认折叠的「调用参数」，没有说明和命令时直接展开显示；提权时写明提权目标。提供 ✅ 允许 / ❌ 拒绝 / ♾️ 本话题不再询问 三个按钮；也可以在话题里直接回复「允许」「拒绝」「全部允许」，回复其他内容视为拒绝并作为下一条指令。等待期间流式卡片状态行显示「✋ 等待审批：工具名」。超时（`approvalTimeoutMs`，默认 5 分钟）自动拒绝（fail-closed），非会话发起人点击或回复无效
+- **知识库读写**：开启 `feishuTools.wikiRead` / `feishuTools.wikiWrite`（默认都关）并在 `wikiRoots` 里配置知识空间链接 `https://<租户>.feishu.cn/wiki/space/<space_id>` 或节点链接 `https://<租户>.feishu.cn/wiki/<node_token>` 后，模型可用 `feishu_wiki_list` 浏览、`feishu_wiki_read` 读取飞书文档（Markdown，或带 block id 的飞书文档 XML，支持目录/章节/区间/关键词局部读取）、`feishu_wiki_create` 在范围内新建飞书文档、电子表格或多维表格（新节点也可作为子目录继续往下建）、`feishu_wiki_edit` 修改**本应用创建的**文档（追加、在块后插入、替换/删除块、文本替换、整篇重写；必须带上读取时的 `revision_id`，文档被他人改过会被拒绝）。电子表格用 `feishu_wiki_sheet_read` 按子表和 A1 范围读成 CSV（每行带 `[row=N]` 真实行号），`feishu_wiki_sheet_edit` 向**本应用创建的**表格写入单元格值或公式、在数据末尾追加行（追加位置会越过空行找到真正的最后一行，目标单元格非空时失败、不会覆盖；同样校验 `revision_id`；不改样式、图表和行列结构）。多维表格用 `feishu_wiki_base_read` 列数据表、读字段和记录（支持筛选、排序、关键词搜索、分页），`feishu_wiki_base_edit` 增改删记录：**本应用创建的**多维表格可增改删，其他多维表格**只能新增记录**（不改表和字段结构）。所有调用都用应用身份，并且按**会话所在位置**判权：私聊话题看本人的开关——读取类工具要求**「知识库读取」开关**（`/auth set wiki-read on @用户`），新建与修改类工具要求**「知识库写入」开关**（`/auth set wiki-write on @用户`），管理员两者都有；群话题看设置面板「群权限」里该群的开关（默认都关，只能在面板改），与发言人是谁无关；两个开关互相独立；`wikiRoots` 之外一律拒绝；打开某个文档或表格、每次新建、每次修改都会在话题里弹出**授权卡**，私聊只有本人能点，群话题里通过准入的成员都能点（读取授权在本话题内对该文档持续有效，`/renew` 或重启后重新询问），超时（`approvalTimeoutMs`）自动拒绝；浏览目录不弹卡。需开通 `wiki:wiki`、`docx:document`（只读可用 `wiki:wiki:readonly` / `docx:document:readonly`），电子表格和多维表格另需细分权限 `sheets:spreadsheet:read` / `sheets:spreadsheet:write_only`、`base:table:read` / `base:field:read` / `base:record:read` / `base:record:create|update|delete`（旧版 `sheets:spreadsheet` / `bitable:app` 不生效），且应用要是目标知识空间的成员（可把包含机器人的群加为空间成员/管理员）
+- **HITL 审批**：当模型请求需要授权的动作（如 bash 沙箱升级 `sandbox_permissions`）时，插件监听主机 `approval/request` 事件，在同一话题里**新发一张独立审批决策卡**：卡片标题带工具名；工具在审批请求里给了说明时，说明按行显示为卡片主体（`标签：值` 行显示成标签和值，缩进行显示成列表，不按 markdown 解析），bash 等带 `command` 参数的工具另外显示将执行的命令，其余参数按 `名称: 值` 收进默认折叠的「调用参数」，没有说明和命令时直接展开显示；提权时写明提权目标。提供 ✅ 允许 / ❌ 拒绝 / ♾️ 本话题不再询问 三个按钮；也可以在话题里直接回复「允许」「拒绝」「全部允许」，回复其他内容视为拒绝并作为下一条指令。等待期间流式卡片状态行显示「✋ 等待审批：工具名」。超时（`approvalTimeoutMs`，默认 5 分钟）自动拒绝（fail-closed）；私聊话题只认本人，群话题里通过准入的成员都可以点或回复，其他人无效
 - **结构化提问**：模型调用 `ask_user_question` 时，插件监听主机 `user-questions/request` 瀑布并发一张问答卡（每个问题一组选项按钮，多选先勾选再「提交本题选择」），答案回填给模型；主机自带的应答者只有 Web 客户端，没有本插件时纯飞书会话会以 `NO_PROVIDER` 失败。超时（`questionTimeoutMs`，默认 5 分钟）或回合取消时本轮提问失败（fail-closed）；没有可选项的问题直接提示用文字作答，**阻塞期间普通文本回复即作为该问题的自由文本答案**（同时支持多选后的自定义文本）
 - **准入与授权（默认开启）**：准入只看一张扁平的**用户表**，每人有四个独立开关：**对话准入**、**知识库读取**、**知识库写入**、**代码改动**。**管理员也是用户表里的一行**：打开「管理员」开关的人拥有全部权限（其他开关对他不起作用），可以有多个，只能在 Web 设置面板设置。对话准入打开的人可以私聊机器人，也可以在任何群里 @ 它（包括自己把机器人拉进的群），不再有群白名单；对话准入关闭等于停用，其他开关一并失效。新加入的人只打开对话准入。不在表里的人私聊只收到一条固定提示（`/userid` 例外），在群里 @ 机器人或把它拉进群时，管理员私聊收到**用户授权申请卡**。授权入口：飞书 `/auth` 命令、授权卡、Web 设置面板；**管理员只能在面板用户表里设置**（私聊 `/userid` 获取 user_id），飞书里不能授予或移除管理员。用户表里没有管理员时 `guarded` 拒绝所有对话
-- **代码改动开关**：飞书会话（含它派生的子代理）调用 `codeWriteTools` 里的工具（默认是 dsh-repo 的推送、MR 与 Issue 写操作、删除远端分支、重跑与取消 CI，以及观象的 SKILL 提交）之前，插件检查**当前这一轮的发言人**是否为管理员或打开了「代码改动」开关；没有时工具直接返回拒绝原因，模型会转告用户。本地工作区里的修改不受影响。共享话题里谁发的消息谁就是发言人；没有飞书用户发起的回合（子代理结果、后台任务、斜杠命令展开的提示）沿用上一位发言人。检查在工具自己的审批之前进行，所以不管 dsh-repo 的 `tools.writes` 设为 `ask` 还是 `allow` 都生效
-- **发言人身份由 DSH 写进会话日志**：插件不再自己拼用户消息交给 Agent，而是为每个调用方建一个进程内 Peer，经 DSH 的 `session/prompt` 提交每条飞书提示（入站消息、共享话题里的追问、启动话题的首条提示、「继续」按钮）。DSH 据此在消息来源里写下调用方：`source: { kind: 'user', rpcId, principal }`，其中 `rpcId` 是插件生成的请求 id，`principal` 是两种之一——私聊代表本人 `{ kind: 'feishu-user', userId }`，群聊代表群并记下发言人 `{ kind: 'feishu-group', chatId, userId }`。会话日志因此能区分 Host 所有者、不同的飞书用户和不同的群；代码改动开关、`Feishu-User:` 尾注都从被认领消息的 `principal` 读发言人，其他插件（例如记忆插件）也可以按它区分用户或群。`principal` 只含飞书 id，不含名字和凭据。提交前 DSH 按插件注册的访问策略检查调用方对该会话的权限（私聊会话只允许本人，群话题只允许同一个群的成员），策略直接从路由表给出，路由变化即失效缓存；被拒绝、附件被拒（模型不支持图片）或会话不存在时，卡片写明原因
+- **代码改动开关**：飞书会话（含它派生的子代理）调用 `codeWriteTools` 里的工具（默认是 dsh-repo 的推送、MR 与 Issue 写操作、删除远端分支、重跑与取消 CI，以及观象的 SKILL 提交）之前，插件按**会话所在位置**检查：私聊话题要求本人是管理员或打开了「代码改动」开关，群话题要求设置面板「群权限」里该群的「代码改动」开关打开；没有时工具直接返回拒绝原因，模型会转告用户。本地工作区里的修改不受影响。检查在工具自己的审批之前进行，所以不管 dsh-repo 的 `tools.writes` 设为 `ask` 还是 `allow` 都生效
+- **发言人身份由 DSH 写进会话日志**：插件不再自己拼用户消息交给 Agent，而是为每个调用方建一个进程内 Peer，经 DSH 的 `session/prompt` 提交每条飞书提示（入站消息、群话题里的追问、启动话题的首条提示、「继续」按钮）。DSH 据此在消息来源里写下调用方：`source: { kind: 'user', rpcId, principal }`，其中 `rpcId` 是插件生成的请求 id，`principal` 是两种之一——私聊代表本人 `{ kind: 'feishu-user', userId }`，群聊代表群并记下发言人 `{ kind: 'feishu-group', chatId, userId }`。会话日志因此能区分 Host 所有者、不同的飞书用户和不同的群；`Feishu-User:` 尾注从被认领消息的 `principal` 读发言人，其他插件（例如记忆插件）也可以按它区分用户或群。`principal` 只含飞书 id，不含名字和凭据。提交前 DSH 按插件注册的访问策略检查调用方对该会话的权限（私聊会话只允许本人，群话题只允许同一个群的成员），策略直接从路由表给出，路由变化即失效缓存；被拒绝、附件被拒（模型不支持图片）或会话不存在时，卡片写明原因
 - **提交记录飞书发言人**：飞书会话（含子代理）通过 dsh-repo 推送工作区时，插件监听 dsh-repo 的 `repo/commit-trailers` 事件，在提交说明的 `DSH-Session:` 之后加一行 `Feishu-User: 名字 <user_id>`，记录的是上面同一位发言人。名字取通讯录（需 `contact:user.base:readonly`），读不到时取用户表里记下的名字，都没有时只写 user_id。需要 dsh-repo 支持该事件，旧版本 dsh-repo 不加这一行
 - **提交作者显示为发言人**：管理员在设置面板「访问授权」用户表里点用户行的「未设 Git 邮箱」，给这位用户填 Git 邮箱（填本人 GitHub/GitLab 账号已验证的邮箱，留空清除）。之后这位用户在飞书里让机器人推送代码时，插件通过同一事件的 `setAuthor` 把提交作者设为「名字 <Git 邮箱>」，提交者仍是 dsh-repo 的令牌账号，`Feishu-User:` 尾注照常保留；平台按作者邮箱显示本人的头像和链接。没设 Git 邮箱的用户作者仍是令牌账号；管理员同样在自己那一行填 Git 邮箱。dsh-repo 不支持 `setAuthor` 时只加尾注
 - **PR/MR 动态唤醒飞书会话**：dsh-repo 跟踪的 PR/MR 有 CI 结果、评论、评审或合并时会唤醒发起它的会话。插件以 `prepend: true` 监听 dsh-repo 的 `repo/resolve-agent` 瀑布：飞书会话已经不在内存里时，由插件按飞书的组合恢复（带飞书工具和回复规范），其他会话原样 `next()`。没有 dsh-repo 时这个事件不会触发
 - 全部基于飞书官方 SDK [`@larksuiteoapi/node-sdk`](https://www.npmjs.com/package/@larksuiteoapi/node-sdk)（WebSocket 长连接，免公网）
-- **Web 设置面板**：Web/桌面端左侧栏 **飞书渠道** 入口（主区整页），顶部状态头 + 7 个标签页（连接 / 会话 / 模型 / 附件与工具 / 访问授权 / 知识库 / 高级）；凭据不完整时插件不连接、面板显示三步引导，填写保存后自动连接（保存写入本机覆盖文件，部分字段需重连生效）；详见下文「Web 设置面板」章节
+- **Web 设置面板**：Web/桌面端左侧栏 **飞书渠道** 入口（主区整页），顶部状态头 + 8 个标签页（连接 / 会话 / 模型 / 附件与工具 / 访问授权 / 群权限 / 知识库 / 高级）；凭据不完整时插件不连接、面板显示三步引导，填写保存后自动连接（保存写入本机覆盖文件，部分字段需重连生效）；详见下文「Web 设置面板」章节
 - **对话里的飞书来源**：从飞书发起的会话在 Web/桌面端对话标题旁多一个来源按钮（群名或「飞书私聊」），点开在右侧栏「飞书来源」标签页查看群聊/私聊、话题、发起人、开始与最近活跃时间，并可跳回飞书；其他会话不显示；详见下文「对话里的飞书来源」章节
 
-设计与可行性论证见 [docs/feasibility-and-design.md](docs/feasibility-and-design.md)；工作区粒度与会话隔离的取舍见 [docs/workspace-isolation-design.md](docs/workspace-isolation-design.md)；入站附件管线（存储 / 清单 / 工具 / 引用与历史 / 降级 / 隐私边界）见 [docs/attachment-pipeline-v2.md](docs/attachment-pipeline-v2.md)。
+设计与可行性论证见 [docs/feasibility-and-design.md](docs/feasibility-and-design.md)；工作区粒度的演进与取舍见 [docs/workspace-isolation-design.md](docs/workspace-isolation-design.md)（已被「一个话题一个工作区」取代，仅存历史）；入站附件管线（存储 / 清单 / 工具 / 引用与历史 / 降级 / 隐私边界）见 [docs/attachment-pipeline-v2.md](docs/attachment-pipeline-v2.md)。
 
 ## 斜杠命令
 
@@ -40,7 +40,7 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 - `/history`：显示当前话题的 Session 历史（含 `ctx.sessionQuery` 折叠出的会话标题与 live 标记）
 - `/export`：导出当前 Session 的逻辑日志
 
-选择卡的选项单列排列；按钮等同于在该卡下输入对应命令（如点「high」= `/effort high`），走同样的准入、归属与校验，执行结果原地替换该选择卡（更新失败时才另发一张结果卡）；只有话题发起人点击、且卡片仍在原聊天里时才生效，话题换绑 Session 后旧卡上的按钮失效。按钮最多显示 12 个，其余可直接输入命令。
+选择卡的选项单列排列；按钮等同于在该卡下输入对应命令（如点「high」= `/effort high`），走同样的准入、归属与校验，执行结果原地替换该选择卡（更新失败时才另发一张结果卡）；私聊只有本人、群话题里通过准入的成员点击，且卡片仍在原聊天里时才生效，话题换绑 Session 后旧卡上的按钮失效。按钮最多显示 12 个，其余可直接输入命令。
 
 `/new` 是 `/renew` 的别名。`/help` 由命令注册表按分组生成，新增命令只需在注册表里加一行。
 
@@ -63,8 +63,8 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
    - **委托进度行**（小字，只在当前正在流式输出的那张卡上渲染，与状态行互相独立）：`tool-workflow/run-start / agent-start / agent-end / run-end`（工作流进度：完成数/总数、阶段、活动成员）→ run 结束转为 `🧵 工作流 xxx 结束（完成）` 并**保留到最终卡片**；**子代理进度**（跨会话映射）：子代理是独立 session（`header.parentSession` 指向主会话），其 `subagent/descriptor`（label）、`tool/call`（当前工具）被折叠为 `🤖 子代理执行中：检索实现方案 (read) · 已运行 45s`，并行子代理显示计数，完成后在最终卡片汇总为 `🤖 子代理完成：a、b`。**只显示状态，不显示输出**——子代理正文是父模型的中间产物，绝不进卡片正文
    - 回合进行中还没有正文时，卡片只显示状态行，不放「正在生成」之类的占位；结束时仍没有正文才显示「（本次无正文输出）」
 2. **正文**：富文本 markdown；超长正文**自动分段投放**——单卡片预算用满后按干净断点（段落 / 标题 / 代码块边界）切分，且**每张卡最多 5 个表格**（飞书硬限制，错误 11310）；断点会避开代码围栏与表格，**单个表格/代码块小于单卡预算时不会被从中间切断**（单块本身超过单卡预算时只能硬切，内容仍不丢失）。续片以「📄 回复分段 n」卡片跟进同一话题，**全文无丢失**；续卡被飞书拒收时自动降级为纯文本消息（内容仍送达）。**续卡只留正文**：`📄 回复分段 n` → 状态行与委托进度行（仅当它是当前活动卡）→ 正文，无面板、无页脚、无分割线
-3. **停止按钮**：回合进行中，当前正在流式输出的那张卡（主卡或最新续卡）正文下方显示「⏹ 停止」，效果同 `/stop`。首帧不带按钮；排在后面的消息的卡片在轮到它运行时才出现按钮。只有话题发起人在原聊天里点击才生效，点击后按钮变为不可点的「正在停止…」；其他人点击只会在按钮下加一行「仅发起该会话的用户可停止」。回合结束后按钮移除；经 `/stop` 或按钮停止的回合状态行为「⏹ 已停止」。
-   - **排队卡片**：同一话题里上一轮还在运行时再发消息，新消息排到下一轮，回复卡片只显示「⏳ 排队中：上一轮回复结束后再处理这条消息」和按钮「⚡ 立即补充到当前回复」。点击后这条消息从下一轮队列撤回，改为在当前回合的下一步（当前这次输出或这批工具调用结束后）交给模型，卡片变为「↪️ 已补充到当前回复」，回复继续在上一张卡片中输出，两条消息的表情一起随该回合结束切换为 DONE/No。只有话题发起人在原聊天里点击才生效，其他人点击只会加一行「仅发起该会话的用户可补充」；当前回合正在停止，或消息已经开始自己的回合时，点击不生效。不点击时，上一轮结束后卡片自动转为正常的流式卡片。排队中的消息在 DSH 一侧被移出队列（例如在 dsh 客户端清空了队列）时，卡片改为「↩️ 这条消息已从队列中移除，没有处理」，表情换成 No。
+3. **停止按钮**：回合进行中，当前正在流式输出的那张卡（主卡或最新续卡）正文下方显示「⏹ 停止」，效果同 `/stop`。首帧不带按钮；排在后面的消息的卡片在轮到它运行时才出现按钮。私聊只有本人、群话题里通过准入的成员在原聊天里点击才生效，点击后按钮变为不可点的「正在停止…」；其他人点击只会在按钮下加一行「仅发起该会话的用户可停止」。回合结束后按钮移除；经 `/stop` 或按钮停止的回合状态行为「⏹ 已停止」。
+   - **排队卡片**：同一话题里上一轮还在运行时再发消息，新消息排到下一轮，回复卡片只显示「⏳ 排队中：上一轮回复结束后再处理这条消息」和按钮「⚡ 立即补充到当前回复」。点击后这条消息从下一轮队列撤回，改为在当前回合的下一步（当前这次输出或这批工具调用结束后）交给模型，卡片变为「↪️ 已补充到当前回复」，回复继续在上一张卡片中输出，两条消息的表情一起随该回合结束切换为 DONE/No。私聊只有本人、群话题里通过准入的成员在原聊天里点击才生效，其他人点击只会加一行「仅发起该会话的用户可补充」；当前回合正在停止，或消息已经开始自己的回合时，点击不生效。不点击时，上一轮结束后卡片自动转为正常的流式卡片。排队中的消息在 DSH 一侧被移出队列（例如在 dsh 客户端清空了队列）时，卡片改为「↩️ 这条消息已从队列中移除，没有处理」，表情换成 No。
    - **后台唤醒卡片**：DSH 在没有飞书消息的情况下也会开新回合，例如后台子代理结束或给父会话发消息、后台任务完成、定时跟进触发，dsh-repo 跟踪的 PR/MR 有新动态（「🔔 PR/MR 有新动态，继续处理」），或有人在 dsh 客户端里给这个会话发消息。这类回合在话题里新发一张流式卡片，顶部一行说明来源（如「🤖 子代理已结束，继续处理」），不会写进排队中的飞书消息卡片；这时在话题里发的消息照常排队，等它结束后再处理。这类卡片没有触发消息，所以不切换表情。设置 `hostTurnCards: false` 后这类回合不发卡片。每张卡片绑定的是领取了它那条消息的回合，而不是按到达顺序绑定；DSH 在同一步里一起领取的其他输入（例如新会话第一步前注入的工作区说明）不影响这个绑定，不会因此多发一张卡片。
 4. **结算页脚**（分割线 + 两行小字）：**只在主卡、且只在回合结束（`done` / `stopped` / `error`）后渲染一次**——首帧、流式中、续卡都没有，因此不会出现 0/— 的空统计。
    - 第一行：`🧠 模型 {model}({effort}) · 🔑 会话 {sessionId} · ⏱ 推理 {推理时长}`。推理时长为**本轮所有推理阶段的累计墙钟时间**（每个 step 从首个推理增量开始，到该 step 输出结束——首个正文增量或 step 结束——为止；工具执行时间不计入；回合在推理中结束时计到 turn 结束），无推理时为 `—`
@@ -89,12 +89,13 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 | 标签页 | 内容 |
 | --- | --- |
 | 连接 | 状态块（当前阶段唯一的操作按钮：连接 / 重试 / 重启连接，连接后显示话题路由 / 活动会话 / 在途回复 / Bot open_id 尾号）、自检（权限缺口可展开逐项开通、斜杠指令面板同步结果）、飞书应用凭据（更换 / 移除）；未配置时显示三步引导，有需重连才生效的已保存项时顶部显示「重启连接」横幅 |
-| 会话 | 「触发」：私聊、普通群需要 @、话题被拒时降级为会话级（均为开关）；「工作区」：工作区根目录、话题工作目录隔离方式（`topicIsolation`）；「话题与卡片」：话题过期（`routeTtlMs`，按天）、审批 / 提问卡片等待（`approvalTimeoutMs` / `questionTimeoutMs`，按秒）、流式刷新与状态行保活间隔；「飞书侧功能」：首次私聊引导、后台唤醒卡片、回复写法规范、斜杠指令面板同步、权限切换 |
+| 会话 | 「触发」：私聊、普通群需要 @、话题被拒时降级为会话级（均为开关）；「工作区」：工作区根目录（`baseDir`）；「话题与卡片」：话题过期（`routeTtlMs`，按天）、审批 / 提问卡片等待（`approvalTimeoutMs` / `questionTimeoutMs`，按秒）、流式刷新与状态行保活间隔；「飞书侧功能」：首次私聊引导、后台唤醒卡片、回复写法规范、斜杠指令面板同步、权限切换 |
 | 会话记录 | 飞书发起的全部会话：群聊按「群 → 用户 → 会话」、私聊按「用户 → 会话」分组，显示飞书群名、姓名和头像；顶部搜索框按群名、姓名或会话标题筛选；点会话行在主区进入该对话，用户行的「文件」只读浏览该用户的工作区（见下文「会话记录」） |
 | 模型 | 服务商、模型、推理档位、单次输出上限（`maxTokens`，留空使用模型默认）、Agent 预设 |
 | 附件与工具 | 「入站附件」：接收图片和文件（附件存入 DSH 原生附件库）、图片预取、首轮话题历史；「工具」：`feishu_topic_messages` / `feishu_send_file` 开关（`feishu_attachment_fetch` 随「接收图片和文件」挂载）；「限额与超时」：预取上限、读取附件上限与超时、读取话题消息超时、引用摘录与历史超时（共 8 项，默认收起，有改动或错误时自动展开） |
 | 访问授权 | 待处理申请（置顶，一键授权 / 忽略）、调试模式（`accessMode`，开关）、申请有效期；用户表：每人一行，「管理员」加四个开关（对话 / 读知识库 / 写知识库 / 改代码）点一下即切换，管理员或对话关闭时其余开关变灰（添加表单默认收起） |
-| 知识库 | 知识库读 / 写工具开关（`feishuTools.wikiRead` / `feishuTools.wikiWrite`）、可访问范围 `wikiRoots`（每条链接一个输入框，逐条校验）；「可使用的人」：用户表里读 / 写知识库开关的人数，在「访问授权」里逐人设置 |
+| 群权限 | 群表：机器人开过话题的群各一行（群名 + `chat_id`，首次在群里开话题时自动登记），三个开关「读知识库 / 写知识库 / 改代码」点一下即切换，默认都关；「移除」删掉记录（下次在群里开话题重新登记，开关归零）；只能在面板改，飞书里没有对应命令 |
+| 知识库 | 知识库读 / 写工具开关（`feishuTools.wikiRead` / `feishuTools.wikiWrite`）、可访问范围 `wikiRoots`（每条链接一个输入框，逐条校验）；「可使用的人」：用户表里读 / 写知识库开关的人数，在「访问授权」里逐人设置；群话题按「群权限」判权 |
 | 高级 | SDK 日志级别、Web 覆盖文件路径与「恢复 profile 配置」 |
 
 **调试模式**：「访问授权 → 调试模式」打开即 `accessMode: open`，所有人都能和机器人聊天；打开期间面板顶部常驻黄色警告。默认关闭（`guarded`）。
@@ -117,15 +118,17 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 
 **模型选择器**：模型与推理在面板里是**独立的「模型」标签页**：宿主 LLM 服务可用时，`provider` / `model` / `reasoningEffort` 与 `agentPreset` 渲染为**下拉选择**而不是手填：provider 来自 `ctx.llm.listProviders()`，model 来自所选 provider 的 `listModels()`，推理档位来自 `resolveModelInfo(provider, model).reasoning.efforts`，Agent 预设来自 `agentPresets.list()`。每个选择器的首项是「留空 = 部署默认 / 适配器默认 / roster 默认」，有部署默认模型（`agentDefaultModel`）或 roster 默认预设时会在标签里带上具体值。选择按依赖级联：先选 provider 才会加载 model，选了 model 才会加载推理档位；宿主暂时无法枚举的项（服务未挂载、适配器查询失败/超时）自动退回原来的自由文本框，已保存但当前列表里没有的值会作为「当前配置，不在宿主机列表中」选项保留，不会在打开面板时被静默改掉。级联查询走只读的 `GET /api/dsh-channels.catalog?provider=…&model=…`（Host 侧短 TTL 缓存，单次查询 4 秒上限）。`provider` 与 `model` 在宿主侧是一条完整的请求路由，因此面板保存时要求**两者同时设置或同时留空**，不允许只选一半。
 
-`baseDir` 是**模型/工具产生文件的落点**（入站附件只进 DSH 原生附件库，不落这里）：**每个用户拥有一个独立工作区**（私聊 `<baseDir>/p2p/<user_id>/`，群聊 `<baseDir>/groups/<chat_id>/<user_id>/`，同一群里不同用户互不影响；旧版本的「用户 × 聊天」共享工作区正好复用为这个新工作区）。每个话题在工作区内拥有独立工作目录 `<工作区>/topics/<话题 id>/`（无话题的降级会话用 session id），所以话题之间的文件互不干扰，而工作区数量只随用户增长。面板里只接受**绝对路径**（`~` 开头按家目录展开，拒绝文件系统根目录），保存时会创建并校验该目录，不可用时当场报错，不会等到飞书里提示「会话创建失败」。已有 Session / 目录不会被迁移，因此切到新目录后旧话题继续用旧目录（话题内 `/renew` 也一样），只有之后新开的会话使用新目录。
+`baseDir` 是**模型/工具产生文件的落点**（入站附件只进 DSH 原生附件库，不落这里）：**一个话题一个工作区**（私聊 `<baseDir>/p2p/<user_id>/<话题 id>/`，群聊 `<baseDir>/groups/<chat_id>/<话题 id>/`；无话题的降级会话用 session id），所以话题之间的文件互不干扰，群话题的目录按群而不按人。面板里只接受**绝对路径**（`~` 开头按家目录展开，拒绝文件系统根目录），保存时会创建并校验该目录，不可用时当场报错，不会等到飞书里提示「会话创建失败」。已有 Session / 目录不会被迁移，因此切到新目录后旧话题继续用旧目录（话题内 `/renew` 也一样），只有之后新开的会话使用新目录。
 
 **可视化选择工作区根目录**：输入框旁的「选择目录…」按钮会调用**宿主机的系统目录选择框**（macOS 的 NSOpenPanel / Windows 的文件夹对话框），选中后把绝对路径填进草稿，仍需点「保存更改」才落盘。该能力转发自宿主可选的 `ctx.directoryPicker` 服务：桌面端/本机 GUI 会话（native 后端）提供按钮；headless、远程或 SSH 会话没有可服务的显示会话（browse 后端），面板不显示按钮、保留手写输入，插件在缺少该服务的旧宿主上照常加载。选择框打开期间请求保持挂起；取消是正常结果，不会报错。
 
 **访问授权**：「访问授权」标签页集中管理准入：调试模式、授权申请有效期；「用户表」支持添加（user_id 可用 `/userid` 查看）、移除和逐个切换「管理员」与四个开关；「待处理申请」可一键授权/忽略（授权后只打开对话准入）。打开「管理员」的用户在任何私聊/群聊都直接放行、拥有全部权限，可以有多个；管理员只能在这里设置，飞书 `/auth` 不能授予或移除。`guarded` 且用户表里没有管理员时，标签页顶部会红字提示“当前会拒绝所有对话”。用户表、待处理申请在每次进入页面时实时读取飞书头像和名字（`GET /api/dsh-channels.profiles?users=…&chats=…`，每类最多 200 个，Host 侧缓存 30 秒）：用户需要 `contact:user.base:readonly` 且在应用的通讯录权限范围内，群需要 `im:chat:readonly`；读不到时显示授权时记下的名字或 ID，并在标签页顶部注明失败原因。用户表与申请记录保存在插件 `storageDomain`（`channels_routes_v2` 域），重启后保留；未建立飞书连接时用户表尚未加载，标签页会提示「连接建立后加载授权列表」并禁用写操作。
 
-**会话记录**：「会话记录」标签页列出插件记录过来源的全部会话（存储表 `session_origins`，包括已 `/renew` 或过期的旧会话），群聊下再按发起用户分组，每一层按最近活跃排序。群名、姓名与头像和「飞书来源」使用同一套实时查询与 30 秒缓存，读不到时显示 ID 并在顶部注明原因。会话标题与工作区根目录来自宿主 `sessionQuery`（会话日志的标题和 header cwd），宿主没有该服务时标题留空、工作区退回到当前路由记录的目录。顶部显示群数、用户数和会话数，搜索框按群名、姓名、ID 或会话标题筛选（命中群或用户时保留其全部会话，搜索期间所有层级展开）。时间显示为相对时间（刚刚、N 分钟前、昨天 HH:mm 等），悬停可看完整的开始与最近活跃时间。绿点和「当前话题」标记表示飞书里的这个话题仍然接着该会话，「群共享」表示群内共享会话。点会话行通过 Web 壳的 `uiWorkspace.openSession` 在主区打开对话，壳不提供该服务时会话行禁用。用户行的「文件」进入只读文件浏览：左栏为面包屑和目录列表（目录优先排序，按文件类型显示图标，单个目录最多列 2000 项），右栏预览选中的文件（UTF-8 文本带行号，最多 512 KB；png/jpg/gif/webp/bmp/svg 图片最多 5 MB 内联显示；其余只提供下载），面板较窄时两栏上下排列；下载单个文件上限 100 MB。文件路由只服务飞书会话的工作区根目录，路径必须是根目录内的相对路径，跟随符号链接后仍要落在根目录内，否则返回 403；接口为 `GET /api/dsh-channels.sessionRecords`、`/api/dsh-channels.workspaceFiles`、`/api/dsh-channels.workspaceFilePreview`、`/api/dsh-channels.workspaceFileDownload`（`?workspace=<根目录>&path=<相对路径>`），与其它面板路由一样需要 DSH 登录。
+**群权限**：「群权限」标签页列出机器人开过话题的群（存储表 `group_permissions`），每群一行：群名（实时读取，读不到显示 `chat_id`）、登记时间和三个开关「读知识库 / 写知识库 / 改代码」。群里的话题（用户自己 @ 开的，以及其他插件经 `feishuTopics` 发起的）调用知识库和代码改动工具时按这三个开关判权，与发言人本人的开关无关；谁能在群里说话仍由用户表决定。接口为 `POST /api/dsh-channels.setGroupPermission`（`{ chatId, permission, enabled }`）与 `/api/dsh-channels.removeAccessGroup`（`{ chatId }`）。
 
-**配置层级**：`configSchema` 默认值 < profile `cordis.patch.yml` 的 `config` < Web 面板覆盖。面板只把可编辑字段写入 `$DSH_HOME/dsh-channels/settings.json`；「高级 → 恢复 profile 配置」确认后删除该文件并回落到 profile 配置。`baseDir` 与 `topicIsolation` 在「会话 → 工作区」编辑（只影响之后新建的话题）；话题过期、审批 / 提问卡片等待与 `maxTokens` 保存后立即生效，不需要重连。凭据**值**在「连接 → 飞书应用凭据」编辑，凭据**引用名**（`appId` / `appSecret` 配置项）仍由 profile 配置决定。已移除的目录清理配置 `workspaceRetention` / `workspaceRetentionAuto` 与覆盖文件路径配置 `settingsFile` 若仍留在 profile 或覆盖文件中会被静默忽略，面板下次保存时从覆盖文件中去掉。
+**会话记录**：「会话记录」标签页列出插件记录过来源的全部会话（存储表 `session_origins`，包括已 `/renew` 或过期的旧会话），群聊下再按发起用户分组，每一层按最近活跃排序。群名、姓名与头像和「飞书来源」使用同一套实时查询与 30 秒缓存，读不到时显示 ID 并在顶部注明原因。会话标题与工作区根目录来自宿主 `sessionQuery`（会话日志的标题和 header cwd），宿主没有该服务时标题留空、工作区退回到当前路由记录的目录。顶部显示群数、用户数和会话数，搜索框按群名、姓名、ID 或会话标题筛选（命中群或用户时保留其全部会话，搜索期间所有层级展开）。时间显示为相对时间（刚刚、N 分钟前、昨天 HH:mm 等），悬停可看完整的开始与最近活跃时间。绿点和「当前话题」标记表示飞书里的这个话题仍然接着该会话，「群共享」表示群话题（群内通过准入的成员都能继续）。点会话行通过 Web 壳的 `uiWorkspace.openSession` 在主区打开对话，壳不提供该服务时会话行禁用。用户行的「文件」进入只读文件浏览：左栏为面包屑和目录列表（目录优先排序，按文件类型显示图标，单个目录最多列 2000 项），右栏预览选中的文件（UTF-8 文本带行号，最多 512 KB；png/jpg/gif/webp/bmp/svg 图片最多 5 MB 内联显示；其余只提供下载），面板较窄时两栏上下排列；下载单个文件上限 100 MB。文件路由只服务飞书会话的工作区根目录，路径必须是根目录内的相对路径，跟随符号链接后仍要落在根目录内，否则返回 403；接口为 `GET /api/dsh-channels.sessionRecords`、`/api/dsh-channels.workspaceFiles`、`/api/dsh-channels.workspaceFilePreview`、`/api/dsh-channels.workspaceFileDownload`（`?workspace=<根目录>&path=<相对路径>`），与其它面板路由一样需要 DSH 登录。
+
+**配置层级**：`configSchema` 默认值 < profile `cordis.patch.yml` 的 `config` < Web 面板覆盖。面板只把可编辑字段写入 `$DSH_HOME/dsh-channels/settings.json`；「高级 → 恢复 profile 配置」确认后删除该文件并回落到 profile 配置。`baseDir` 在「会话 → 工作区」编辑（只影响之后新建的话题）；话题过期、审批 / 提问卡片等待与 `maxTokens` 保存后立即生效，不需要重连。凭据**值**在「连接 → 飞书应用凭据」编辑，凭据**引用名**（`appId` / `appSecret` 配置项）仍由 profile 配置决定。已移除的目录清理配置 `workspaceRetention` / `workspaceRetentionAuto`、覆盖文件路径配置 `settingsFile` 与话题目录隔离方式 `topicIsolation` 若仍留在 profile 或覆盖文件中会被静默忽略，面板下次保存时从覆盖文件中去掉。
 
 **为什么落在插件自己的文件而不是 profile 的 `cordis.patch.yml`？** DSH 提供官方 `ctx.configEditor.edit()`，可以安全写 profile patch（完整 Config 校验、保留注释与 `!!js`、原子替换、失败回滚、与 HMR 串行）；但它是「完整配置编辑」通道——本插件的 Config 是 zod，没有 schemastery `.volatile()` 标记，普通字段写入会触发 Loader 重载插件，等于每次保存都断开并重连飞书；而且该服务只在有 `profileContext` 的启动器（桌面端 / `dsh web`）存在。`$DSH_HOME/<plugin>/` 是 DSH 插件保存运行时数据的惯例（如 dsh-pet 的 `$DSH_HOME/dsh-pet/`），因此面板偏好写入 `$DSH_HOME/dsh-channels/settings.json`：保存即生效（需重连字段除外）、可一键清除回退、不依赖 `profileContext`；profile 的 `cordis.patch.yml` 继续作为部署级基础配置层。若将来要求「所有配置统一进 profile」，迁移路径是改用 `ctx.configEditor.edit()` 并接受保存触发插件重载。
 
@@ -141,11 +144,11 @@ pnpm verify:client    # 用 __ModuleLoader__ shim 做 loader 冒烟
 
 ## 对话里的飞书来源
 
-从飞书发起的会话（话题、会话级降级、`/renew` 新开的会话、其他插件经 `feishuTopics` 发起的群共享话题）在 Web/桌面端对话标题旁会出现一个来源按钮：群聊显示群名，私聊显示「私聊 · 对方姓名」（读不到姓名时为「飞书私聊」）。点击后在右侧栏打开「飞书来源」标签页，内容包括：
+从飞书发起的会话（话题、会话级降级、`/renew` 新开的会话、其他插件经 `feishuTopics` 发起的群话题）在 Web/桌面端对话标题旁会出现一个来源按钮：群聊显示群名，私聊显示「私聊 · 对方姓名」（读不到姓名时为「飞书私聊」）。点击后在右侧栏打开「飞书来源」标签页，内容包括：
 
 - **标题**：群聊为群头像和群名，私聊为对方头像和姓名；
 - **来源**：私聊 / 群聊 / 群聊 · 话题；群名读不到时显示群 ID；
-- **发起人**：头像、姓名 + `user_id`（群共享话题显示发起人，并注明群内成员都可以继续）；
+- **发起人**：头像、姓名 + `user_id`（群话题显示的是开话题的人，并注明群内通过准入的成员都可以继续）；
 - **开始于 / 最近活跃**：飞书侧已经换到新会话（`/renew`、`/new`）或路由过期后，「最近活跃」换成「状态：飞书侧已切换到新会话或已过期」；
 - **在飞书中打开**（飞书 applink 打开对应聊天）与「刷新」。
 
@@ -204,7 +207,6 @@ src/
 │   ├── submit.ts          #   经 session/prompt 提交：图片回执暂存与重暂存、排队合并、失败措辞
 │   ├── repair.ts          #   inflight 快照 + 重启恢复（重放 / 补画 / 继续）
 │   ├── manager.ts         #   live Agent、冷恢复、preset、/renew 事务
-│   ├── isolation.ts       #   话题工作目录编排：workingDirectory 切换 / Git worktree + 降级
 │   └── request-policy.ts  #   会话请求策略：配置的 provider/model 与推理强度（含 /effort 覆盖）
 ├── feishu/
 │   ├── delivery.ts        # 出站投递：首帧话题卡、结果卡、分段降级、表情生命周期
@@ -303,7 +305,6 @@ npm 发行包已包含构建产物：Host 入口是 `lib/index.js`（profile 直
     requireMention: true                # 普通群需 @ 机器人
     dmMode: 'open'
     threadFallback: 'degrade'           # 话题被拒时降级为会话级路由
-    topicIsolation: 'auto'              # 话题目录隔离：auto（Git 仓库用 worktree，否则子目录）/ subdir / worktree
     routeTtlMs: 2592000000              # 话题路由 30 天无活动即过期；后续消息明确拒绝，不新建 Session（0 = 关闭）
     approvalTimeoutMs: 300000           # HITL 审批决策卡等待时长（默认 5 分钟；超时自动拒绝）
     questionTimeoutMs: 300000           # ask_user_question 问答卡等待时长（默认 5 分钟；超时本轮提问失败）
@@ -368,7 +369,7 @@ npm 发行包已包含构建产物：Host 入口是 `lib/index.js`（profile 直
     loggerLevel: 'info'
 ```
 
-飞书里不提供切换模型的命令：模型只在设置面板「模型」标签页（即上面的 `provider` / `model`）配置，对插件创建的所有会话统一生效；留空时使用 DSH 部署默认模型。`reasoningEffort` 是每个 Session 的初始/重置默认值。DSH 0.2.2 起模型选择归 Agent 所有（`agent.model`），插件在新建、恢复、借用 Agent 以及 `/effort` 成功后用 `agent.model.select()` 记录生效的 provider/model/推理强度；DSH 0.2.1 没有 `agent.model`，插件改为在该 Agent 作用域内以 `prepend` 外层覆盖 `agent/request`，因此胜过已存在的模型选择与 provider 默认。两种宿主自动识别，无需配置；借用外部 Agent 时，插件关闭只移除这条频道策略，不销毁外部 Agent。话题所有者可用 `/effort <档位-id>` 覆盖当前 Session，`/effort` 查看生效来源，`/effort reset` 恢复该配置值（未配置时恢复模型适配器/provider 默认）。成功选择由 Session 自带的 `command/run` / `command/done` 日志恢复，重启后仍生效；新建 Session 不继承旧 Session 的覆盖。
+飞书里不提供切换模型的命令：模型只在设置面板「模型」标签页（即上面的 `provider` / `model`）配置，对插件创建的所有会话统一生效；留空时使用 DSH 部署默认模型。`reasoningEffort` 是每个 Session 的初始/重置默认值。DSH 0.2.2 起模型选择归 Agent 所有（`agent.model`），插件在新建、恢复、借用 Agent 以及 `/effort` 成功后用 `agent.model.select()` 记录生效的 provider/model/推理强度；DSH 0.2.1 没有 `agent.model`，插件改为在该 Agent 作用域内以 `prepend` 外层覆盖 `agent/request`，因此胜过已存在的模型选择与 provider 默认。两种宿主自动识别，无需配置；借用外部 Agent 时，插件关闭只移除这条频道策略，不销毁外部 Agent。私聊本人或群话题里通过准入的成员可用 `/effort <档位-id>` 覆盖当前 Session，`/effort` 查看生效来源，`/effort reset` 恢复该配置值（未配置时恢复模型适配器/provider 默认）。成功选择由 Session 自带的 `command/run` / `command/done` 日志恢复，重启后仍生效；新建 Session 不继承旧 Session 的覆盖。
 
 推理档位是适配器拥有的不透明 id（常见如 `off`、`low`、`high`、`max`），命令不会猜测或预校验 provider 的能力；不受支持的值会在下一次模型请求前被 Harness 拒绝，并按失败终态显示错误。
 
@@ -389,7 +390,7 @@ FEISHU_APP_SECRET: xxxxxxxx
 
 启动成功标志（控制台）：`[dsh-channels] feishu long connection established, bot open_id: ou_xxx`；凭据不完整时不会连接，日志会提示缺少的凭据引用（如 `飞书应用凭据未配置完整（缺少 FEISHU_APP_SECRET…）`），打开 Web 左侧栏 **飞书渠道 → 连接** 补齐即可。
 
-宿主 profile 已内置所需服务（agent-loop、llm-deepseek、session 持久化、storage-domain、workspace、working-directory）；web profile 默认组合还包含 DSH 原生附件库 `dsh-attachment-local` 与 `dsh-tools`（`ctx.attachments` / `ctx.tools`）。原生附件库是插件的必需依赖（`inject` 含 `attachments`）：组合里缺少它时插件不会启动。**提示提交需要 DSH Web 组合**：插件以飞书用户身份经 `session/prompt` 提交提示，依赖 `connection`（Peer）、`typertGateway`、`remoteAccess`、`fileUploads` 四个宿主服务，它们来自 web-app bundle，并且都在 `inject` 里：加载器等它们就绪后才启动插件，组合里没有它们时插件不会启动（与 `attachments` 相同），不会退回为所有者身份提交。推荐确认 `dsh-token-meter` 已启用（卡片上下文占用显示）。Git worktree 隔离模式额外依赖可选的 `@deepseek-ai/dsh-experimental-worktree` 实验插件，缺失时自动回退为普通话题子目录。
+宿主 profile 已内置所需服务（agent-loop、llm-deepseek、session 持久化、storage-domain、workspace、working-directory）；web profile 默认组合还包含 DSH 原生附件库 `dsh-attachment-local` 与 `dsh-tools`（`ctx.attachments` / `ctx.tools`）。原生附件库是插件的必需依赖（`inject` 含 `attachments`）：组合里缺少它时插件不会启动。**提示提交需要 DSH Web 组合**：插件以飞书用户身份经 `session/prompt` 提交提示，依赖 `connection`（Peer）、`typertGateway`、`remoteAccess`、`fileUploads` 四个宿主服务，它们来自 web-app bundle，并且都在 `inject` 里：加载器等它们就绪后才启动插件，组合里没有它们时插件不会启动（与 `attachments` 相同），不会退回为所有者身份提交。推荐确认 `dsh-token-meter` 已启用（卡片上下文占用显示）。
 
 **工具与 agent preset（web profile）**：web profile 把 bash/fs/todo 等工具行全部标为 `disabled: true`，工具只存在于 agent preset 里，且 `agents.create()` 不会自动应用 preset——插件因此在创建/恢复会话时通过 `setup` 回调挂载 preset（默认 `standard`，可用 `agentPreset` 指定更精简的 preset，如只含 bash/fs 的自定义项），并把 preset id 记录进会话头。附件管线的两个模型工具在 preset `setup` 之后挂载：`feishu_attachment_fetch` 在 `acceptAttachments` 打开时挂载，`feishu_topic_messages` 总是挂载（均为 `inject(['tools'])`）；宿主缺 `tools` 服务时工具 no-op + 一次性告警，不阻塞会话（详见 [docs/attachment-pipeline-v2.md](docs/attachment-pipeline-v2.md)）。若机器人回复把 `<tool_calls>…` 当纯文本吐出，即该会话没挂上 preset；修好后再看会话的 `request/header` 应带 `tools` 字段、日志出现 `tool/call` 事件。无 preset roster 的部署（如 headless）不做此步骤，工具本就位于宿主层。
 
@@ -418,22 +419,21 @@ FEISHU_APP_SECRET: xxxxxxxx
 
 ## 工作区与会话隔离
 
-工作区（DSH workspace registry 中的「项目」）按**人**建立，只在首次需要时创建；每个话题在工作区内拥有独立的**实际工作目录**：
+**一个话题一个工作区**：每个话题在 `<baseDir>` 下有自己的目录，Session 创建时直接以它为 header cwd，并在 DSH 工作区列表里登记为一个项目：
 
-| 场景 | 工作区目录（header cwd） | 每个话题的工作目录（实际 cwd） |
+| 场景 | 话题目录（header cwd） | 工作区标题 |
 |---|---|---|
-| 私聊 | `<baseDir>/p2p/<user_id>/` | `<工作区>/topics/<话题 id>/` |
-| 群聊 | `<baseDir>/groups/<chat_id>/<user_id>/` | 同上 |
-| 其他插件经 `feishuTopics` 发起的话题 | `<baseDir>/<调用方给的路径段>/` | 同上 |
+| 私聊 | `<baseDir>/p2p/<user_id>/<话题 id>/` | `<人名> · <话题标题>` |
+| 群聊 | `<baseDir>/groups/<chat_id>/<话题 id>/` | `<群名> · <话题标题>` |
+| 其他插件经 `feishuTopics` 发起的话题 | `<baseDir>/groups/<chat_id>/<话题 id>/` | `<群名> · <根卡片标题>` |
 
-- 群聊必须是「群 × 用户」：同一个人在不同群之间不共享文件，避免 A 群会话把 B 群内容带出来。
-- 会话创建时以工作区为 header cwd（保证 GUI 里归属该项目、沙箱边界稳定），随后通过 `ctx.workingDirectory` 把实际工作目录切到话题目录；冷恢复会从 Session 日志还原该目录。因此话题之间的文件互不干扰，而工作区数量只随用户增长。
-- `topicIsolation` 控制隔离形式：`auto`（默认）在用户工作区是 Git 仓库（含 `.git`）时给每个话题建一个 `feishu-<话题>` 分支 + worktree（适合多个话题并发改同一个代码仓库），否则用普通子目录；`subdir` 一律子目录；`worktree` 一律尝试 worktree，失败告警并回退子目录。
-- 隔离强度：这是**默认工作目录层面**的隔离（bash / fs / 终端都从话题目录出发），不是防恶意的硬沙箱——沙箱写边界仍是用户工作区。若需要硬边界，可把话题目录直接作为 Session cwd，但会话会失去工作区归属（GUI 显示为未分组）。
-- **入站附件**：图片/文件只存入 DSH 原生附件库，**不写入话题目录**，因此工作区与话题目录只承载 Agent 产物。旧版本写下的 `<话题目录>/attachments/` 与 `<baseDir>/_staging/` 不会被迁移或删除，前者仍是普通工作区文件，后者已无人读取，可手动清理。`/renew` 复用同一话题目录。
-- **插件不删除任何工作区或话题目录**。需要回收磁盘时手动删除不再需要的话题目录即可：该话题下次对话时会重建一个空目录继续使用（worktree 模式下改建新的 worktree 分支）。手动删除 worktree checkout 后，可在仓库里 `git worktree prune` / `git branch -D` 回收 Git 记录。
-- 旧版本「一个话题一个工作区」（`<baseDir>/topics/...`）不会自动迁移：旧话题继续用原目录；旧版「用户 × 聊天」共享工作区正好作为新的用户工作区复用。
-- 设计取舍与约束详见 [docs/workspace-isolation-design.md](docs/workspace-isolation-design.md)。
+- 话题标题取首条消息的第一行（最长 40 字，超出以 `…` 结尾）；人名、群名从飞书通讯录读，读不到时用 id。话题在飞书里改名不会同步到工作区标题。
+- 群话题属于群：目录按群而不按人，同群通过准入的成员都在同一个目录里工作；同一个人在不同群的话题互不相通。
+- 话题目录就是 Session 的 cwd，也是沙箱的写边界，bash / fs / 终端都从它出发；没有额外的子目录或 Git worktree 层。需要在话题里操作代码仓库时，由代码仓库插件在话题目录下 checkout。
+- **入站附件**：图片/文件只存入 DSH 原生附件库，**不写入话题目录**，因此话题目录只承载 Agent 产物。旧版本写下的 `<话题目录>/attachments/` 与 `<baseDir>/_staging/` 不会被迁移或删除，前者仍是普通工作区文件，后者已无人读取，可手动清理。`/renew` 复用同一话题目录。
+- **插件不删除任何话题目录**。需要回收磁盘时手动删除不再需要的话题目录即可：该话题下次对话时会重建一个空目录继续使用。
+- 旧版本按人建立的工作区（`<baseDir>/p2p/<user_id>/`、`<baseDir>/groups/<chat_id>/<user_id>/`，话题在其下的 `topics/<话题 id>/` 或 worktree）不会自动迁移：旧话题继续用路由记录里的目录（`/renew` 也沿用），新话题一律按上表建立。不再需要的旧目录可手动删除。
+- 演进历史与取舍详见 [docs/workspace-isolation-design.md](docs/workspace-isolation-design.md)。
 
 ### 读权限与执行隔离
 
@@ -473,38 +473,36 @@ DSH 的沙箱只限制写，读不受限：不加处理时，飞书用户的会�
 
 ## 群话题服务（feishuTopics）
 
-插件向其他 DSH 插件提供 Cordis 服务 `feishuTopics`：调用方给出目标群、发起人、根卡片内容、工作区和 prompt，插件在群里发一张根卡片，在卡片下开话题，把 prompt 原样交给一个新 Session（prompt 开头的斜杠命令由 DSH 展开成对应 skill），过程在话题内流式输出，和用户自己发起的会话一样。首轮结束后根卡片的状态标签随之更新。群里通过准入的成员都可以在该话题内追问。
+插件向其他 DSH 插件提供 Cordis 服务 `feishuTopics`：调用方给出目标群、发起人、根卡片内容和 prompt，插件在群里发一张根卡片，在卡片下开话题，把 prompt 原样交给一个新 Session（prompt 开头的斜杠命令由 DSH 展开成对应 skill），过程在话题内流式输出，和用户自己发起的会话一样。首轮结束后根卡片的状态标签随之更新。群里通过准入的成员都可以在该话题内追问。
 
-**调用方式**：类型在包子路径 `@modesto_ma/dsh-channels/topics`（只有类型，没有运行时导出），调用方用 `import type` 引用，在每次调用时用 `ctx.get('feishuTopics')` 取服务（本插件未加载或正在重载时取不到），并检查 `version`（当前为 `1`）。不要把 `feishuTopics` 写进调用方插件的主 `inject`：那样本插件每次重载（例如改配置后重连）都会连带重载调用方。需要随服务上下线挂载路由时，在子作用域里 `ctx.inject(['feishuTopics'], …)`。
+**调用方式**：类型在包子路径 `@modesto_ma/dsh-channels/topics`（只有类型，没有运行时导出），调用方用 `import type` 引用，在每次调用时用 `ctx.get('feishuTopics')` 取服务（本插件未加载或正在重载时取不到），并检查 `version`（当前为 `2`：去掉了 `workspace` 参数，话题目录由本插件按群与话题决定）。不要把 `feishuTopics` 写进调用方插件的主 `inject`：那样本插件每次重载（例如改配置后重连）都会连带重载调用方。需要随服务上下线挂载路由时，在子作用域里 `ctx.inject(['feishuTopics'], …)`。
 
 ```ts
 const topics = ctx.get('feishuTopics') as FeishuTopicService | undefined
 const result = await topics?.launch({
   key, fingerprint, chatId, requesterUserId,
   card: { title: '日志分析', taskName: '分析', lead: [{ text: '于 … 发起了对 ' }, { text: 'camera', bold: true }, …], links },
-  workspace: { segments: ['analyze', 'camera', 'E1001'], title: '日志分析 · camera · E1001' },
   prompt,
 })
 ```
 
 - `key` / `fingerprint`：幂等键（1–200 个可见 ASCII 字符）与调用方定义的请求指纹。同一个键再次发起（包括并发）返回第一次的根卡片（`replayed: true`），指纹不同则拒绝（`key-conflict`）。记录永久保存在 `channels_routes_v2` 域的 `analyze_requests` 表（沿用旧接口的表名）；根卡片发出后的失败不会回滚记录，根卡片显示「失败」和原因，需要重试时换一个新键。
 - `chatId`：目标群，机器人需在群内。
-- `requesterUserId`：发起人，必须是管理员或对话准入打开的用户（`/auth add` 或面板「访问授权」）；`accessMode: open` 时不校验。
+- `requesterUserId`：发起人，首轮提示以这个人的身份提交，所以必须是管理员或对话准入打开的用户（`/auth add` 或面板「访问授权」）；`accessMode: open` 时不校验。
 - `card`：标题、任务名（状态文字里用，如「分析中」「分析已完成」）、跟在 @发起人 后的引导句（可加粗片段）、可选的链接表格（最多 50 行，每页 10 行）。
-- `workspace`：`<baseDir>` 下的 1–8 个路径段（只允许 `A-Z a-z 0-9 . _ -`，第一段不能是本插件自用的 `p2p`、`groups`、`topics`、`_staging`）和它在 DSH 工作区列表里的标题。路径段相同的发起共用一个工作区，各有一个话题目录。
 - `prompt`：1–100000 字符，原样作为首条用户消息。
 - 结果：成功时返回根卡片 `messageId`；失败时返回 `code` 和中文 `message`：`invalid`（参数不合法）、`not-connected`（飞书未连接或正在关闭）、`forbidden-chat`（发起人没有对话权限；沿用旧名）、`key-conflict`、`send-failed`（根卡片发送失败，如机器人不在群里）。
 
 **发起之后**：调用方可以读到每次发起后来的状态，用来把结果回传给外部系统（回传本身由调用方负责）。
 
-- `state(key)`：按幂等键返回 `{ key, status, reason?, sessionId?, workDir? }`。`status` 与根卡片一致：`running`（首轮进行中）、`done`、`stopped`、`error`（首轮失败）、`failed`（话题或 Session 没能建立，`reason` 写明原因）、`interrupted`（首轮进行中 DSH 重启）。`sessionId` 是话题路由当前指向的 Session（`/renew` 后为新 Session），`workDir` 是该话题的实际工作目录（话题目录或 worktree）；路由发布前、建立失败后、路由过期后两者都没有。键不存在或飞书未连接时返回 `undefined`。
+- `state(key)`：按幂等键返回 `{ key, status, reason?, sessionId?, workDir? }`。`status` 与根卡片一致：`running`（首轮进行中）、`done`、`stopped`、`error`（首轮失败）、`failed`（话题或 Session 没能建立，`reason` 写明原因）、`interrupted`（首轮进行中 DSH 重启）。`sessionId` 是话题路由当前指向的 Session（`/renew` 后为新 Session），`workDir` 是该话题的目录（`<baseDir>/groups/<chat_id>/<话题 id>/`，也是 DSH 工作区）；路由发布前、建立失败后、路由过期后两者都没有。键不存在或飞书未连接时返回 `undefined`。
 - `launchKeyOf(sessionId)`：该 Session 是某次发起的话题当前的 Session 时返回那次发起的幂等键，否则返回 `undefined`。调用方据此把 DSH 的 `session/event`（如 `turn/end`）对应到自己的请求，话题里的追问也能对上。
 - 事件 `feishu-topics/status`：每次记录根卡片状态后（首轮结束、建立失败、启动时标记为已中断）用 `ctx.emit` 发出，参数是新的 `state`。监听者抛错只记日志，不影响话题。
-- 这两个方法和事件是在契约版本 `1` 内新增的；需要兼容旧版本本插件的调用方，调用前先检查方法是否存在。
+- 这两个方法和事件在契约版本 `1` 内新增，版本 `2` 保留；需要兼容旧版本本插件的调用方，调用前先检查方法是否存在。
 
 **群里看到的**：先是根卡片「@发起人 <引导句>」，下面是链接表格，标题栏标签为「<任务名>中」；紧接着话题内一张流式卡片（它同时创建话题），首轮在这里流式输出，带停止按钮。首轮结束后根卡片的标签变成「已完成」「已停止」或「失败」，并加上 DONE / No 表情；之后的追问不再改动根卡片。启动失败时话题里的流式卡片和根卡片都会写明原因。过程中出现的审批卡、提问卡发在话题内。DSH 在首轮进行中重启或重连飞书时，话题里的流式卡片照常由中断修复处理；重新连上后，插件把仍是「<任务名>中」的根卡片改成「已中断」（橙色），提示在话题内回复即可继续，原来的 Session 会接着追问。根卡片状态同时记在发起记录里（连同重画卡片所需的内容）。
 
-**追问与权限**：这类话题的路由是**群内共享**的（路由记录 `shared: true`）：群里任何通过准入的成员（管理员，或对话准入打开的用户）都可以在话题内直接回复追问（无需 @），也可以点停止按钮、回答审批卡与提问卡、在话题里执行会话命令；未授权的人仍被静默忽略。追问的回复照常流式输出；每条追问都以群身份提交（`principal: { kind: 'feishu-group', chatId, userId }`，`userId` 是追问的人），代码改动工具按这位发言人检查「代码改动」开关。话题之间互不读取，和普通话题一样。结果怎么回传给外部系统由调用方插件负责，本插件只提供上面的状态查询和事件。
+**追问与权限**：这类话题和用户自己在群里开的话题一样是**群话题**（路由记录 `mode: 'group'`）：群里任何通过准入的成员（管理员，或对话准入打开的用户）都可以在话题内直接回复追问（无需 @），也可以点停止按钮、回答审批卡与提问卡、在话题里执行会话命令；未授权的人仍被静默忽略。追问的回复照常流式输出；每条追问都以群身份提交（`principal: { kind: 'feishu-group', chatId, userId }`，`userId` 是追问的人），知识库与代码改动工具按设置面板「群权限」里该群的开关判权。话题之间互不读取，和普通话题一样。结果怎么回传给外部系统由调用方插件负责，本插件只提供上面的状态查询和事件。
 
 ## 行为与降级
 
@@ -527,14 +525,14 @@ const result = await topics?.launch({
 - **重启恢复（流式中断）**：每条正在流式的 turn 会把恢复所需的信息写入 `channels_routes_v2` 域的 `inflight` 表（键 = 主卡 message id，turn 结束即删）：trigger 消息、Typing reaction id、全部段卡 id、路由，以及交给模型的那条消息（序列化后不超过 256 KB；更大时不保存）。后台唤醒卡片也会写，只是没有 trigger 消息。重启后长连接一建立，插件就恢复这些 turn 所在的 Session，读会话日志，按三种情况处理：
   - **还没轮到处理**（日志里没有这条消息，说明它当时还在排队）：同一张卡片里重新运行一次（`replay.pending`，默认开启；每条消息最多重放一次，再中断就按下面的「被打断」处理）。
   - **已经完成**（日志里这一轮正常结束，只是卡片没来得及更新）：用日志里的最终回复重画卡片，顶部注明「这轮回复在服务重启前已完成」，正文按原来的卡片数依次铺开，放不下时提示到 dsh 客户端查看。
-  - **被打断**：卡片改成「⚠️ 服务已重启，本轮回复中断」，主卡带「▶️ 继续」按钮（`replay.interrupted: 'ask'`，默认）。话题发起人点了之后，同一张卡片开始新一轮，让模型先核对工作目录、git 状态、远端分支和 MR、已发出的消息或文件，不重做已经完成的对外操作（推送、创建或评论 MR、发送文件、写知识库），再从中断处接着完成；每张卡片只能点一次。DSH 冷恢复时会给中断时已发出但没拿到结果的工具调用补一条“结果未知”的错误结果，模型在核对时能看到是哪些调用。设成 `notify` 时只显示中断提示，不带按钮。
+  - **被打断**：卡片改成「⚠️ 服务已重启，本轮回复中断」，主卡带「▶️ 继续」按钮（`replay.interrupted: 'ask'`，默认）。私聊本人或群话题里通过准入的成员点了之后，同一张卡片开始新一轮，让模型先核对工作目录、git 状态、远端分支和 MR、已发出的消息或文件，不重做已经完成的对外操作（推送、创建或评论 MR、发送文件、写知识库），再从中断处接着完成；每张卡片只能点一次。DSH 冷恢复时会给中断时已发出但没拿到结果的工具调用补一条“结果未知”的错误结果，模型在核对时能看到是哪些调用。设成 `notify` 时只显示中断提示，不带按钮。
 
   路由已失效、Session 换过（`/renew`）或恢复失败时，按「被打断」处理但不带按钮。卡片更新失败会重试一次（上限 2 次）后放弃。持久化盘点与缺口清单见 [docs/persistence.md](docs/persistence.md)。
 - **断连补偿**：长连接断开期间（服务重启、崩溃或断线重连）发来的消息飞书不会补推，插件连上后自己从消息历史里读回来（`missed`，默认开启）。启动时从上一个实例记下的「最后在线时间」开始读（连接期间每 `heartbeatMs` 记一次，正常关闭时记下关闭时刻），断线重连时从断开的那一刻开始读，最远不超过 24 小时。读取范围是插件知道的会话：有路由的私聊和群、已授权的群、发过引导卡的私聊，以及最近活跃的话题。`windowMs`（默认 30 分钟）以内的消息按正常消息处理，已经处理过的会被下面的去重丢掉；更早的消息里会触发机器人的那些（私聊、@ 机器人、已有话题里的回复）按会话汇总成一张「离线期间收到 N 条消息」卡片，消息发送者或管理员点「全部处理」后按顺序处理，点「忽略」则不再处理。每次最多读 `maxMessages` 条。读历史用到 `im:message:readonly`，群消息还需要 `im:message.group_msg`；没有权限的会话会跳过并记一条 warn。
 - **消息去重（WS 重投幂等）**：飞书长连接重连会重投未 ack 的事件；每条消息在任何副作用之前先落一条 `processed` 记录（键 = message id，飞书全局唯一），重投消息被直接丢弃——同进程靠内存守卫、跨重启靠持久化记录，每条消息至多处理一次。记录保留 24 小时后由 GC 清扫。
 - **路由表 GC 与过期话题拒绝**：超过 `routeTtlMs`（默认 30 天）无活动的真实话题路由会先写入最小持久化墓碑，再删除活动路由；此后该话题中的普通消息和 Session 命令会收到「话题已过期」提示，插件不会恢复旧 Session，也不会在可见历史仍属于旧 Session 的话题里新建 Session（`/help`、`/userid`、`/groupid`、`/health` 仍可用）。墓碑跨重启保留，仅含 thread/chat/owner/工作区路径/会话目录/最后活动时间；旧 DSH Session、日志与话题目录都不删除。降级的 chat-scoped 路由没有独立话题边界，仍直接清理。陈年 in-flight 快照同时在启动时及每 6 小时清扫。`routeTtlMs: 0` 关闭后续路由过期处理，已产生的墓碑仍保持拒绝语义。
 - **准入与授权**：`accessMode: 'guarded'`（默认）下，入站先过频道准入：**用户表里打开「管理员」的人**私聊/任意群聊都可直接开会话；**其他人**必须在用户表里且对话准入打开，私聊和群聊同一规则（`/auth` 仍仅管理员）。未通过的消息不建 Session、不建话题目录、不落附件、不调模型；私聊回固定文案（`/userid` 例外），群里静默，被 @ 时每位管理员都收到用户授权申请卡（任一管理员处理后，其他管理员的卡片同步更新）（含昵称/user_id/所在群，同一人有未处理申请时不重复发）。机器人被拉进任意群时（订阅 `im.chat.member.bot.added_v1`），邀请人没有对话权限则管理员收到用户授权申请卡（标注“把我拉进了群”），否则只收到群信息卡（群名/`chat_id`/成员数/邀请人）。用户表持久化在 `channels_routes_v2` 域的 `access_users` 表（每条记录带 `admin` 和四个开关），申请在 `access_requests` 表，撤销与开关切换立即生效。用户表里没有管理员时 `guarded` 拒绝所有对话（fail closed）。普通用户的增删和开关切换可走 `/auth` 命令、授权卡、面板三种入口；管理员只能在面板设置。
-- **HITL 审批**：插件以 `prepend: true` 注册为宿主 `approval/request` 瀑布的应答者——本频道路由的 session 的审批请求**优先于** Web 网关的通用应答（其面板对飞书用户不可见），非本频道的请求原样 `next()` 交给其他应答者。审批卡是**独立消息**（锚定到该 session 最新流式卡、同话题），绝不嵌入流式卡（其全量替换 patch 会冲掉按钮）。宿主请求不带工具参数，插件在 `session/event` 中按会话记录**当前回合**的 `tool/call`（回合结束即清空，不回读历史），按 `callId` 取出命令显示在卡上（超过 600 字截断并注明）。决策仅在会话发起人操作时生效；请求提升到 `danger-full-access` 的卡只有**管理员**能允许（按钮或文字回复，管理员不是发起人也可以点），发起人只能拒绝，非管理员点「允许」不生效并在卡上提示一次。允许 → `allowed-once`；本话题不再询问 → `allowed-once`，并在内存里记下「工具名 + 提权目标」，该 session 之后的同类请求直接 `allowed-once`、不再发卡，同 session 里其他被覆盖的待审批卡一并允许（`/renew` 换 session 或重启后失效，提升到 `danger-full-access` 时按钮标红）；拒绝 → `rejected`；文字回复中「允许 / 同意 / 好 / y」等、「拒绝 / 不行 / n」等、「全部允许」等关键词作用于该 session 最新一张待审批卡，其他文字把该 session 所有待审批卡按 `rejected` 结算后照常作为下一条消息交给 Agent；超时 → `rejected`（fail-closed，卡面显示「已超时」）、请求被撤回（abort）→ `cancelled`、卡片发送失败 → `unavailable`（fail-closed）；每次决策后卡片更新为终态（注明按钮 / 文字回复 / 不再询问 / 被新消息取代）并移除按钮。审批记录（`approval/asked`/`decided`）由宿主会话日志负责，插件不做持久化——重启后遗留问题随 turn 消亡，与 Web 网关一致。需要飞书应用订阅 **card.action.trigger** 回调（见「飞书侧准备」）；启动日志 `HITL 审批应答已就绪` 表示生效，`主机未挂载 approval 服务` 表示该部署未启用 HITL。
+- **HITL 审批**：插件以 `prepend: true` 注册为宿主 `approval/request` 瀑布的应答者——本频道路由的 session 的审批请求**优先于** Web 网关的通用应答（其面板对飞书用户不可见），非本频道的请求原样 `next()` 交给其他应答者。审批卡是**独立消息**（锚定到该 session 最新流式卡、同话题），绝不嵌入流式卡（其全量替换 patch 会冲掉按钮）。宿主请求不带工具参数，插件在 `session/event` 中按会话记录**当前回合**的 `tool/call`（回合结束即清空，不回读历史），按 `callId` 取出命令显示在卡上（超过 600 字截断并注明）。决策仅在私聊本人或群话题里通过准入的成员操作时生效；请求提升到 `danger-full-access` 的卡只有**管理员**能允许（按钮或文字回复，管理员不在该话题里也可以点），其他人只能拒绝，非管理员点「允许」不生效并在卡上提示一次。允许 → `allowed-once`；本话题不再询问 → `allowed-once`，并在内存里记下「工具名 + 提权目标」，该 session 之后的同类请求直接 `allowed-once`、不再发卡，同 session 里其他被覆盖的待审批卡一并允许（`/renew` 换 session 或重启后失效，提升到 `danger-full-access` 时按钮标红）；拒绝 → `rejected`；文字回复中「允许 / 同意 / 好 / y」等、「拒绝 / 不行 / n」等、「全部允许」等关键词作用于该 session 最新一张待审批卡，其他文字把该 session 所有待审批卡按 `rejected` 结算后照常作为下一条消息交给 Agent；超时 → `rejected`（fail-closed，卡面显示「已超时」）、请求被撤回（abort）→ `cancelled`、卡片发送失败 → `unavailable`（fail-closed）；每次决策后卡片更新为终态（注明按钮 / 文字回复 / 不再询问 / 被新消息取代）并移除按钮。审批记录（`approval/asked`/`decided`）由宿主会话日志负责，插件不做持久化——重启后遗留问题随 turn 消亡，与 Web 网关一致。需要飞书应用订阅 **card.action.trigger** 回调（见「飞书侧准备」）；启动日志 `HITL 审批应答已就绪` 表示生效，`主机未挂载 approval 服务` 表示该部署未启用 HITL。
 - **终态与表情**：成功轮的状态行变为「✅ 已完成」，并把 `Typing` 换成 `DONE`；`turn/end.kind = error` 时状态行为「❌ 失败」，错误只在正文出现一次（`❌ **本轮运行失败**` + 结构化错误消息与错误码），并把 `Typing` 换成 `No`。模型/推理强度/本轮缓存样本不会继承上一轮。
 - **限频**：卡片更新单条消息 5 QPS、应用级 1000 次/分钟；500ms（2 QPS）默认安全，`refreshMs` 下限 200ms；活动状态行的保活心跳默认 5s（`statusRefreshMs` 下限 1s），远低于限频。
 - **卡片体积**：预算常量收敛为三个——`CARD_TARGET_BYTES`（28 KB，分段目标）、`CARD_MAX_BYTES`（30 KB，飞书硬上限，仅作 `buildCard` 的绝对兜底）、`REASONING_MAX_BYTES`（5 KB，推理面板内容窗口）；**不再有面板预留**（原 5.5 KB 的 `CARD_PANEL_RESERVE_BYTES` 已删除），分段改为按整卡真实渲染测量：主卡探测面板最大窗口 + 完成态页脚，续卡无面板/页脚、可用满 28 KB（约 27.8 K ASCII 字符，100 KB ASCII 正文约 4 张卡）。正文超长自动分段为多张续卡，断点统一避开代码围栏与表格（段落/标题/行断点；单个代码块/表格小于单卡预算时整体换卡，超过单卡预算时只能硬切、内容不丢；每卡 ≤ 5 个表格，全文保留）。推理面板超出 5 KB 时保留头部并追加「…（内容过长，已截断）」（可见窗口约 4.96 K ASCII 字 / 1.65 K 中文字 / 1.24 K emoji），面板内表格省略；窗口长度与正文长短无关，不占用也不被正文挤占。
@@ -551,7 +549,7 @@ const result = await topics?.launch({
 - **v2 附件（权限降级）**：缺 `im:message:readonly` / `im:message.group_msg` 时引用摘录与首轮历史静默省略（首次一条 warn），显式调用 `feishu_topic_messages` 返回可读 `PERMISSION_DENIED`；普通对话不受影响。入群前历史只保证“机器人可见范围”。
 - **v2 附件（升级连续性）**：archive 后端已移除，旧配置里的 `attachmentStore` 与 `feishuTools.attachmentFetch` 会被忽略。历史话题里已有的 `attachments/` 不会被新会话枚举；Session 历史仍可按原路径读取，旧目录可手动删除。
 - **准入（升级连续性）**：升级到用户表后，原用户白名单里的人变成只打开对话准入的用户，**从此可以私聊、也可以在任何群里使用机器人**（以前私聊要开 `dmAllowWhitelist`、群聊要群已授权）。原群白名单和知识库白名单不迁移：数据留在存储里但不再读取，原来知识库白名单里的人需要管理员逐个打开「知识库读取」或「知识库写入」。待处理的群授权申请不再显示，旧卡片点了也不生效。`dmAllowWhitelist` 配置项和 `/auth allow|revoke`、`/auth user …`、`/auth wiki …` 命令已删除，旧配置里的 `dmAllowWhitelist` 会被忽略。代码改动开关默认关闭，非管理员需要管理员打开后才能在飞书里推送代码或提交 MR。
-- **代码改动开关的范围**：只拦 `codeWriteTools` 里列出的工具，不拦本地文件编辑和 shell 命令；发言人从被认领消息的 `principal` 读，在途快照存的是提示的请求 id、调用方和内容，重启后以同一个调用方、同一个请求 id 重新提交，DSH 按请求 id 去重，所以重放的消息仍认得发送者。被认领消息的 `principal` 不是合法的飞书用户或群（例如其他接入方的调用者）时拒绝，直到认领到一条飞书用户的消息。重启后还没有新消息时按路由所有者判断。共享话题里谁都可以点代码类工具的审批卡，但工具本身只认发言人的开关。
+- **代码改动开关的范围**：只拦 `codeWriteTools` 里列出的工具，不拦本地文件编辑和 shell 命令；按会话所在位置判权——私聊话题看本人的「代码改动」开关（管理员直通），群话题看设置面板「群权限」里该群的「代码改动」开关（默认关，与发言人是谁无关），旧版本开的群话题沿用发起人的开关。发言人只用于提交尾注：从被认领消息的 `principal` 读，群话题的路由记录同时记下最近发言人（`lastSpeakerUserId`），重启后还没有新消息时按它、再按发起人判断；在途快照存的是提示的请求 id、调用方和内容，重启后以同一个调用方、同一个请求 id 重新提交，DSH 按请求 id 去重，所以重放的消息仍认得发送者。
 - **发言人身份（升级连续性）**：升级前写下的在途快照里只有插件自己拼的消息、没有调用方，重启后不重放，卡片改为「服务已重启」并提供「继续」按钮（点击人成为这一轮的调用方）。升级后的部署必须使用 DSH Web 组合（见「宿主侧准备」），headless 等没有 `typertGateway` 的组合里插件不会启动。
 - **`/renew` 的会话语义**：同一话题内新建 Session 沿用话题目录、复用附件；但新 Session 首轮不注入 `<feishu_history>`（仅 `startSession` 路径注入首轮历史，当前语义保留，若产品期望“新会话即带话题历史”需另行确认）。
 - **degraded 群会话的读取容器**：话题创建失败降级为 chat 路由后，其容器是整群主时间线——同群他人主时间线消息可被读取/登记（topic 消息已明确拒绝）；是否按 sender 进一步收紧待产品确认。

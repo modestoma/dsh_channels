@@ -6,18 +6,18 @@
 |---|---|---|
 | 会话本体（事件日志 + header） | 宿主 `dsh-session-persistence` | `$DSH_HOME/sessions/<workspace>/<sessionId>/session.jsonl.zstd` |
 | 插件自有状态 | 插件 → `ctx.storageDomain` | 域 `channels_routes_v2`，JSON 后端为 `$DSH_HOME/storages/channels_routes_v2.json` |
-| 工作区 / 话题目录 | 磁盘目录 + 宿主 registry + Session 日志 | 工作区 `<baseDir>/p2p|groups/...`（`baseDir` 可在 Web 面板配置，注册表 `$DSH_HOME/storages/workspace.json`）；每个话题的工作目录（`<工作区>/topics/<话题>` 或 Git worktree）由 Session 日志的 `working-directory/change` 事件恢复 |
+| 话题目录（工作区） | 磁盘目录 + 宿主 registry | 每个话题一个目录 `<baseDir>/p2p/<user>/<话题>/`、`<baseDir>/groups/<chat>/<话题>/`（`baseDir` 可在 Web 面板配置），同时登记为 DSH 工作区（注册表 `$DSH_HOME/storages/workspace.json`）；目录就是 Session 的 header cwd |
 
 
 用户一律以飞书 `user_id` 标识。open_id 时代的旧域 `channels_routes`（`channels_routes.json`）与按 open_id 命名的旧工作区目录不再读取、也不迁移，原样留在磁盘上，确认不需要后可手动删除。
 ## 一、已持久化的内容
 
-1. **路由与过期墓碑**（`src/domain.ts` 域 `channels_routes_v2`）：`routes` 表以 `thread_id` 或降级键 `chat:p2p|group:<chatId>:<userId>` 保存活动 `RouteRecord`（sessionId / chatId / chatType / senderUserId / workspacePath / sessionDir? / worktreeBranch? / cardMessageId / createdAt / lastActivityAt）；`workspacePath` 是用户工作区（Session header cwd），`sessionDir` 是该话题的实际工作目录（旧记录缺省 = `workspacePath`）；`expired_routes` 以 thread id 保存 TTL 退休后的最小墓碑，跨重启拒绝旧话题误建 Session。`cardMessageId` 每 turn 更新，`lastActivityAt` 供路由退休使用。
+1. **路由与过期墓碑**（`src/domain.ts` 域 `channels_routes_v2`）：`routes` 表以 `thread_id` 或降级键 `chat:p2p|group:<chatId>:<userId>` 保存活动 `RouteRecord`（sessionId / chatId / chatType / senderUserId / workspacePath / mode? / lastSpeakerUserId? / sessionDir? / worktreeBranch? / cardMessageId / createdAt / lastActivityAt）；`workspacePath` 是话题目录（Session header cwd）；`mode: 'group'` 标记没有单一所有者的群话题（旧记录的 `shared: true` 读作同义），`senderUserId` 是开话题的人，`lastSpeakerUserId` 是群话题最近的发言人（重启后提交尾注的兜底）；`sessionDir` / `worktreeBranch` 只在旧版本按人建工作区时写下，旧话题继续用 `sessionDir`（缺省 = `workspacePath`），新记录不再写；`expired_routes` 以 thread id 保存 TTL 退休后的最小墓碑，跨重启拒绝旧话题误建 Session。`cardMessageId` 每 turn 更新，`lastActivityAt` 供路由退休使用。
 2. **会话本体与事件日志**：宿主代持。插件消费的 `assistant/chunk`、`tool/call`、`tool-workflow/run-*`、`subagent/descriptor` 等全部在持久化日志里，因此 `src/stats.ts` 的 token/缓存统计不单独存，`foldAll()` 重放日志，重启后继续累计。`meta.cwd`、`agentPreset` 随 header 落盘。
-3. **工作区与话题目录**：工作区目录确定性生成、幂等 mkdir，宿主 `workspace.json` 持久化 path/title/sessionIds；话题目录路径记录在路由的 `sessionDir`，实际工作目录同时由 Session 的 `working-directory/change` 事件持久化。
+3. **话题目录**：路径由聊天类型、群或用户 id 和话题 id 确定性生成，幂等 mkdir；宿主 `workspace.json` 持久化 path/title/sessionIds（标题为「群名 · 话题标题」或「人名 · 话题标题」）。`/renew` 复用同一目录。插件不删除目录。
 4. **凭据**：密钥存宿主 `$DSH_HOME/.credentials.yaml`，插件只持引用名。
 5. **收尾重试队列**（`src/outbox.ts`，`channels_routes_v2` 域的 `outbox` 表，加法新增不升版本）：一轮结束时失败的卡片终态更新、表情切换和没发出去的续卡，每条记录带 `kind`（`card` / `reaction` / `segment`）、首次尝试时间、失败次数、下次重试时间和最近一次错误。成功、消息已撤回 / 机器人不在群里、或满 24 小时即删除。
-6. **准入授权**（`src/domain.ts` 域 `channels_routes_v2`，同样保持 `version: 1` 加法新增）：`access_users` 表以 `user_id` 保存用户表，每条记录带 `admin` 和四个开关 `chat` / `wikiRead` / `wikiWrite` / `codeWrite`（旧记录缺开关时读作只有 `chat`、不是管理员）；`access_requests` 表以不透明 token 保存用户授权申请（含发给每位管理员的卡片 `messageIds`，以及旧版本写入的单个 `messageId`，重启后旧授权卡仍可点击结算；过期状态在同一表落审计；旧的群申请记录保留但加载时跳过）。已退役的 `access_groups`（群白名单）与 `access_wiki_users`（知识库白名单）仍在域里声明，以免 JSON 后端写入时丢掉旧数据，但不再读取。域全局值的 `knownGroups` 记录机器人被拉进过的群（最多 500 个），供断连补偿使用。准入模式属于配置层（profile + Web 覆盖）；管理员是 `access_users` 里 `admin` 为 true 的记录。
+6. **准入授权**（`src/domain.ts` 域 `channels_routes_v2`，同样保持 `version: 1` 加法新增）：`access_users` 表以 `user_id` 保存用户表，每条记录带 `admin` 和四个开关 `chat` / `wikiRead` / `wikiWrite` / `codeWrite`（旧记录缺开关时读作只有 `chat`、不是管理员）；`access_requests` 表以不透明 token 保存用户授权申请（含发给每位管理员的卡片 `messageIds`，以及旧版本写入的单个 `messageId`，重启后旧授权卡仍可点击结算；过期状态在同一表落审计；旧的群申请记录保留但加载时跳过）。`group_permissions` 表以 `chat_id` 保存群权限记录（`name?` / `addedAt` / `wikiRead` / `wikiWrite` / `codeWrite`），群里首次开话题时自动登记（三个开关全关），只在设置面板「群权限」修改或移除；群话题的知识库与代码改动工具按它判权。已退役的 `access_groups`（群白名单）与 `access_wiki_users`（知识库白名单）仍在域里声明，以免 JSON 后端写入时丢掉旧数据，但不再读取。域全局值的 `knownGroups` 记录机器人被拉进过的群（最多 500 个），供断连补偿使用。准入模式属于配置层（profile + Web 覆盖）；管理员是 `access_users` 里 `admin` 为 true 的记录。
 
 ## 二、内存态（有意不持久化）
 

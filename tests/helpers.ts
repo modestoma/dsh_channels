@@ -17,11 +17,8 @@ import type {
   FileAttachmentRef, HostContext, ImageAttachmentLimits, ImageAttachmentRef, ImageMediaType, PermissionPresets, PreToolDecision,
   PreToolExecution, PromptSection,
   Session, SessionEvent, SessionId, SessionProjections, StorageDomainFacility, ToolDefinition, ToolRuntime,
-  UserMessage, UserQuestionAnswererListener, Workspace, WorkspaceRegistry,
+  UserMessage, UserQuestionAnswererListener, WorkingDirectoryService, Workspace, WorkspaceRegistry,
 } from '../src/dsh-types.ts'
-import type {
-  CreatedWorktree, WorkingDirectoryService, WorktreeService,
-} from '../src/session/isolation.ts'
 import type {
   BotAddedEvent, CardActionEvent, ChatInfo, FeishuChannel, FeishuConnectionStatus, FeishuProfile, NormalizedMessage,
   OutboundMedia, RawMessageListParams, SendResult,
@@ -821,63 +818,28 @@ export function makeAgentPresets(options: FakeAgentPresetsOptions = {}): FakeAge
 
 /**
  * Fake effective-directory service mirroring `ctx.workingDirectory`: the
- * Session's directory defaults to its header cwd, and `set` records a durable
- * `working-directory/change` event on the fake log.
+ * Session's directory defaults to its header cwd; a test moves a Session
+ * with `apply` (the read fence then resolves paths against that directory).
  */
 export interface FakeWorkingDirectory {
   service: WorkingDirectoryService
   /** Session id → effective directory (only for sessions that moved). */
   dirs: Map<string, string>
-  /** Every successful `set` call, in order. */
-  sets: Array<{ sessionId: string; path: string }>
-  /** Directly move one agent (also records the event and the `sets` entry). */
+  /** Directly move one agent. */
   apply(agent: Agent, directory: string): void
 }
 
 export function makeWorkingDirectory(): FakeWorkingDirectory {
   const dirs = new Map<string, string>()
-  const sets: Array<{ sessionId: string; path: string }> = []
   const apply = (agent: Agent, directory: string): void => {
     dirs.set(agent.session.id, directory)
-    sets.push({ sessionId: agent.session.id, path: directory })
   }
   const service: WorkingDirectoryService = {
     get(session) {
       return dirs.get(session.id) ?? session.header.cwd ?? ''
     },
-    async set(agent, directory) {
-      apply(agent, directory)
-      return directory
-    },
   }
-  return { service, dirs, sets, apply }
-}
-
-/** Fake Git-worktree service mirroring `ctx.worktrees.create`. */
-export interface FakeWorktrees {
-  service: WorktreeService
-  created: Array<{ sessionId: string; name: string; path: string; branch: string }>
-  /** When set, every `create` rejects with this error (fallback-path tests). */
-  failWith?: Error
-}
-
-export function makeWorktrees(workingDirectory: FakeWorkingDirectory): FakeWorktrees {
-  const fake: FakeWorktrees = {
-    created: [],
-    service: {
-      create: vi.fn(async (agent, request = {}): Promise<CreatedWorktree> => {
-        if (fake.failWith !== undefined) throw fake.failWith
-        const name = request.name ?? `worktree-${fake.created.length}`
-        const root = workingDirectory.service.get(agent.session)
-        const directory = path.join(root, '.agents', 'worktrees', name)
-        mkdirSync(directory, { recursive: true })
-        workingDirectory.apply(agent, directory)
-        fake.created.push({ sessionId: agent.session.id, name, path: directory, branch: name })
-        return { path: directory, branch: name, baseCommit: 'deadbeef', repositoryRoot: root }
-      }),
-    },
-  } as FakeWorktrees
-  return fake
+  return { service, dirs, apply }
 }
 
 /** One `tools/pre-execute` waterfall listener. */
@@ -897,7 +859,6 @@ export function makeHostContext(
   workspaces: ReturnType<typeof makeWorkspaceRegistry>
   domain: ReturnType<typeof makeDomain>
   workingDirectory: FakeWorkingDirectory
-  worktrees: FakeWorktrees
   credentials: {
     resolve: ReturnType<typeof vi.fn>
     describe: ReturnType<typeof vi.fn>
@@ -933,7 +894,6 @@ export function makeHostContext(
   const workspaces = makeWorkspaceRegistry()
   const domain = makeDomain()
   const workingDirectory = makeWorkingDirectory()
-  const worktrees = makeWorktrees(workingDirectory)
   const sessionListeners: Array<(session: Session, event: SessionEvent) => void> = []
   const assistantStreamListeners: Array<(payload: AssistantStreamPayload) => void> = []
   const approvalListeners: Array<{ listener: ApprovalAnswererListener; options: { prepend?: boolean } | undefined }> = []
@@ -1015,7 +975,6 @@ export function makeHostContext(
     userQuestions: {},
     permissionPresets: permissions,
     workingDirectory: workingDirectory.service,
-    worktrees: worktrees.service,
     ...(agentPresets === undefined ? {} : { agentPresets }),
     ...(projections === undefined ? {} : { sessionProjections: projections }),
     ...extraServices,
@@ -1067,7 +1026,7 @@ export function makeHostContext(
   return {
     ctx, agents, workspaces, domain, credentials, sessionListeners, driver,
     assistantStreamListeners, approvalListeners, questionListeners, preExecuteListeners, commitTrailerListeners, resolveAgentListeners, permissions, sessionQuery,
-    workingDirectory, worktrees, remote,
+    workingDirectory, remote,
   }
 }
 

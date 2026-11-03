@@ -40,7 +40,9 @@ import {
   RECONNECT_ROUTE,
   TAKEOVER_ROUTE,
   REMOVE_ACCESS_USER_ROUTE,
+  REMOVE_ACCESS_GROUP_ROUTE,
   RESOLVE_ACCESS_REQUEST_ROUTE,
+  SET_GROUP_PERMISSION_ROUTE,
   SET_ACCESS_GIT_EMAIL_ROUTE,
   SET_ACCESS_PERMISSION_ROUTE,
   RESTART_KEYS,
@@ -52,6 +54,7 @@ import type {
   AccessMutationResponse,
   AccessPermissionWire,
   AccessWire,
+  GroupPermissionWire,
   CatalogWire,
   CredentialField,
   EditableValues,
@@ -155,6 +158,7 @@ class FakeTarget implements SettingsTarget {
     mode: 'guarded',
     loaded: true,
     users: [],
+    groups: [],
     requests: [],
   }
   /** Every user-table mutation the surface forwarded (asserted by the tests). */
@@ -285,6 +289,24 @@ class FakeTarget implements SettingsTarget {
     const user = this.accessState.users.find(item => item.userId === userId)
     if (user === undefined) return { ok: false, error: '用户不在用户表里' }
     user[permission] = enabled
+    return { ok: true, access: this.accessSnapshot() }
+  }
+
+  async setGroupPermission(chatId: string, permission: GroupPermissionWire, enabled: boolean): Promise<AccessMutationResponse> {
+    this.accessCalls.push({ op: 'set-group', chatId, permission, enabled })
+    const failed = this.accessFailure()
+    if (failed !== undefined) return failed
+    const group = this.accessState.groups.find(item => item.chatId === chatId)
+    if (group === undefined) return { ok: false, error: '该群还没有登记' }
+    group[permission] = enabled
+    return { ok: true, access: this.accessSnapshot() }
+  }
+
+  async removeAccessGroup(chatId: string): Promise<AccessMutationResponse> {
+    this.accessCalls.push({ op: 'remove-group', chatId })
+    const failed = this.accessFailure()
+    if (failed !== undefined) return failed
+    this.accessState.groups = this.accessState.groups.filter(group => group.chatId !== chatId)
     return { ok: true, access: this.accessSnapshot() }
   }
 
@@ -630,8 +652,6 @@ describe('field descriptors', () => {
         kind: 'number', group: 'cards', min: 10_000, max: 3_600_000, unit: '秒', scale: 1_000, restartRequired: false,
       })
     }
-    expect(byKey.get('topicIsolation')).toMatchObject({ kind: 'select', group: 'workspace', restartRequired: false })
-    expect(byKey.get('topicIsolation')?.options?.map(option => option.value)).toEqual(['auto', 'subdir', 'worktree'])
     expect(byKey.get('maxTokens')).toMatchObject({
       kind: 'number', group: 'model', min: 1, optional: true, restartRequired: false,
     })
@@ -1383,7 +1403,6 @@ describe('SettingsSurface', () => {
   it('saves the newly editable session and model fields live and clears maxTokens on empty', async () => {
     const { surface, store } = makeSurface()
     const saved = await surface.save({
-      topicIsolation: 'subdir',
       routeTtlMs: 86_400_000,
       approvalTimeoutMs: 60_000,
       questionTimeoutMs: 120_000,
@@ -1393,7 +1412,6 @@ describe('SettingsSurface', () => {
     if (!saved.ok) return
     expect(saved.panel.config.restartPendingKeys).toEqual([])
     expect(saved.panel.config.effective).toMatchObject({
-      topicIsolation: 'subdir',
       routeTtlMs: 86_400_000,
       approvalTimeoutMs: 60_000,
       questionTimeoutMs: 120_000,
@@ -1407,7 +1425,7 @@ describe('SettingsSurface', () => {
     expect(cleared.ok).toBe(true)
     const overlay = await store.load()
     expect(overlay.maxTokens).toBeUndefined()
-    expect(overlay.topicIsolation).toBe('subdir')
+    expect(overlay.routeTtlMs).toBe(86_400_000)
   })
 
   it('rejects unknown keys and invalid values with per-field issues', async () => {
@@ -1513,6 +1531,7 @@ describe('SettingsSurface access control', () => {
       wikiWrite: false,
       codeWrite: false,
     }],
+    groups: [{ chatId: 'oc_team', name: '研发群', addedAt: 1_700_000_200_000, wikiRead: false, wikiWrite: true, codeWrite: false }],
     requests: [{
       token: 'tok_1',
       targetId: 'u_bob',
@@ -1540,6 +1559,7 @@ describe('SettingsSurface access control', () => {
       mode: 'open',
       loaded: false,
       users: [],
+      groups: [],
       requests: [],
     })
     await expect(surface.access()).rejects.toThrow('access store down')
@@ -1577,6 +1597,25 @@ describe('SettingsSurface access control', () => {
       { op: 'set', userId: 'u_alice', permission: 'admin', enabled: true },
       { op: 'set', userId: 'u_alice', permission: 'codeWrite', enabled: true },
       { op: 'set', userId: 'u_alice', permission: 'chat', enabled: false },
+    ])
+  })
+
+  it('sets group switches and removes groups, validating the chat id and switch before writing', async () => {
+    const { surface, target } = makeSurface()
+    target.accessState.groups = [{ chatId: 'oc_team', name: '研发群', addedAt: 1, wikiRead: false, wikiWrite: false, codeWrite: false }]
+    const set = await surface.setGroupPermission(' oc_team ', 'codeWrite', true)
+    expect(set.ok && set.access.groups[0]).toMatchObject({ chatId: 'oc_team', codeWrite: true })
+    expect((await surface.setGroupPermission('oc_team', 'chat', true)).ok).toBe(false)
+    expect((await surface.setGroupPermission('oc_team', 'wikiRead', 'yes')).ok).toBe(false)
+    expect((await surface.setGroupPermission('u_alice', 'wikiRead', true)).ok).toBe(false)
+    expect((await surface.setGroupPermission('oc_unknown', 'wikiRead', true)).ok).toBe(false)
+    const removed = await surface.removeAccessGroup('oc_team')
+    expect(removed.ok && removed.access.groups).toEqual([])
+    expect((await surface.removeAccessGroup('')).ok).toBe(false)
+    expect(target.accessCalls).toEqual([
+      { op: 'set-group', chatId: 'oc_team', permission: 'codeWrite', enabled: true },
+      { op: 'set-group', chatId: 'oc_unknown', permission: 'wikiRead', enabled: true },
+      { op: 'remove-group', chatId: 'oc_team' },
     ])
   })
 
@@ -1827,6 +1866,8 @@ describe('settings routes', () => {
       [SET_ACCESS_PERMISSION_ROUTE]: 'POST',
       [SET_ACCESS_GIT_EMAIL_ROUTE]: 'POST',
       [RESOLVE_ACCESS_REQUEST_ROUTE]: 'POST',
+      [SET_GROUP_PERMISSION_ROUTE]: 'POST',
+      [REMOVE_ACCESS_GROUP_ROUTE]: 'POST',
     })
     for (const route of routes.values()) {
       expect(route.path).toMatch(/^\/api\/dsh-channels\.[a-z][A-Za-z]+$/u)
@@ -2082,6 +2123,7 @@ describe('settings routes', () => {
       mode: 'guarded',
       loaded: true,
       users: [],
+      groups: [],
       requests: [{
         token: 'tok_1',
         targetId: 'u_bob',
@@ -2198,7 +2240,7 @@ describe('apply() web wiring', () => {
     })
 
     expect(injected).toContainEqual(['connection'])
-    expect(routes.size).toBe(22)
+    expect(routes.size).toBe(24)
 
     const panel = await call(routes, PANEL_ROUTE)
     expect(panel.status).toBe(200)

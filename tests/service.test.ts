@@ -90,7 +90,6 @@ function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
       wikiRead: false,
       wikiWrite: false,
     },
-    topicIsolation: 'auto',
     ...partial,
   }
 }
@@ -735,7 +734,7 @@ describe('FeishuService', () => {
   it('denies a non-owner /history before resume, command execution, or Session enumeration', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_owned', senderId: 'u_owner', messageId: 'om_owner', content: '开始',
+      chatType: 'p2p', chatId: 'oc_owned', senderId: 'u_owner', messageId: 'om_owner', content: '开始',
     }))
     await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
@@ -743,7 +742,7 @@ describe('FeishuService', () => {
     mock(h.ctxState.ctx.commands.execute).mockClear()
 
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_owned', senderId: 'u_intruder',
+      chatType: 'p2p', chatId: 'oc_owned', senderId: 'u_intruder',
       threadId: 'omt_1', messageId: 'om_intruder', mentionedBot: false, content: '/history',
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
@@ -818,9 +817,9 @@ describe('FeishuService', () => {
     expect(cwd).toBeDefined()
     const route = [...(h.ctxState.domain.raw.table('routes').entries() as Iterable<[string, RouteRecord]>)]
       .map(([, value]) => value)[0]!
-    // The header keeps the user workspace; the command shows the topic dir.
+    // The topic directory is the Session header cwd and the directory the command shows.
     expect(route.workspacePath).toBe(cwd)
-    expect(sessionDirOf(route)).not.toBe(cwd)
+    expect(sessionDirOf(route)).toBe(cwd)
 
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_workdir', senderId: 'u_owner', threadId: 'omt_1',
@@ -829,7 +828,6 @@ describe('FeishuService', () => {
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
     const card = JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)
     expect(card).toContain(sessionDirOf(route))
-    expect(card).not.toContain(`\"${cwd}\"`)
   })
 
   it('rejects a mismatched /workspace and logs no path values', async () => {
@@ -1006,12 +1004,8 @@ describe('FeishuService', () => {
     expect(sessionEvents(old.handle.agent.session).at(-1)).toMatchObject({
       type: 'command/done', data: { kind: 'success' },
     })
-    const workspace = h.ctxState.workspaces.workspaces.get(route.workspacePath)!
-    expect(mock(workspace.attachSession)).toHaveBeenLastCalledWith(renewed.options.sessionId)
-    // The renewed Session re-enters the same topic directory.
-    expect(h.ctxState.workingDirectory.sets).toContainEqual({
-      sessionId: renewed.options.sessionId, path: sessionDirOf(route),
-    })
+    // The renewed Session is born in the same topic directory; no Session is moved.
+    expect(renewed.options.meta?.cwd).toBe(sessionDirOf(route))
 
     const resultCard = JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)
     expect(resultCard).toContain(old.options.sessionId)
@@ -1190,8 +1184,9 @@ describe('FeishuService', () => {
     expect(records.directs.map(user => user.userId)).toEqual(['u_dm'])
     expect(records.directs[0]!.sessions[0]!.workspace).toContain(path.join('p2p', 'u_dm'))
 
+    // The topic directory is browsable (empty until the Session writes files).
     const listing = await h.service.workspaceFiles(workspace, '')
-    expect(listing.entries.map(entry => entry.name)).toContain('topics')
+    expect(listing.entries).toEqual([])
     await expect(h.service.workspaceFiles(h.config.baseDir, '')).rejects.toMatchObject({ status: 403 })
     // The retired root is browsable once the records named it; it does not exist on disk.
     await expect(h.service.workspaceFiles(retiredRoot, '')).rejects.toMatchObject({ status: 404 })
@@ -1274,7 +1269,7 @@ describe('FeishuService', () => {
     expect(JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)).toContain('原 Session 仍保持绑定')
   })
 
-  it('rolls back workspace attachment and the new handle when route commit fails', async () => {
+  it('rolls back the new handle when the renewed route commit fails', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_renew_route_fail', senderId: 'u_owner', content: '开始',
@@ -1292,9 +1287,7 @@ describe('FeishuService', () => {
     const failed = h.ctxState.agents.created[1]!
     await waitUntil(() => expect(mock(failed.handle.dispose)).toHaveBeenCalledTimes(1))
     const route = h.ctxState.domain.raw.table('routes').get('omt_1') as RouteRecord
-    const workspace = h.ctxState.workspaces.workspaces.get(route.workspacePath)!
     expect(route.sessionId).toBe(old.options.sessionId)
-    expect(mock(workspace.detachSession)).toHaveBeenCalledWith(failed.options.sessionId)
     expect(mock(old.handle.dispose)).not.toHaveBeenCalled()
 
     await h.onMessage(makeMessage({
@@ -1491,14 +1484,14 @@ describe('FeishuService', () => {
   it('denies a non-owner /export before Session I/O and does not leak a file or Session id', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_export_owned', senderId: 'u_owner', content: '开始',
+      chatType: 'p2p', chatId: 'oc_export_owned', senderId: 'u_owner', content: '开始',
     }))
     await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
     mock(h.ctxState.ctx.commands.execute).mockClear()
 
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_export_owned', senderId: 'u_intruder', threadId: 'omt_1',
+      chatType: 'p2p', chatId: 'oc_export_owned', senderId: 'u_intruder', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_export_intruder', content: '/export',
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
@@ -1833,12 +1826,10 @@ describe('FeishuService', () => {
     const firstSend = h.channel.sent[0] as { options?: { replyTo?: string; replyInThread?: boolean } }
     expect(firstSend?.options).toMatchObject({ replyTo: msg.messageId, replyInThread: true })
 
-    // Agent created with the user workspace as header cwd (keeps the Session
-    // grouped under the project) …
+    // Agent created with the topic's own workspace as header cwd …
     expect(h.ctxState.agents.created).toHaveLength(1)
     const created = h.ctxState.agents.created[0]!
-    const workspacePath = path.join(h.config.baseDir, 'p2p', 'u_alice')
-    const sessionDir = path.join(workspacePath, 'topics', 'omt_1')
+    const workspacePath = path.join(h.config.baseDir, 'p2p', 'u_alice', 'omt_1')
     expect(created.options.meta?.cwd).toBe(workspacePath)
     expect(created.options.agentOptions).toEqual({
       provider: 'deepseek-official',
@@ -1850,15 +1841,9 @@ describe('FeishuService', () => {
       reasoningEffort: 'high',
     })).resolves.toMatchObject({ reasoningEffort: 'tiny' })
 
-    // … and switched to its own topic directory inside that workspace.
-    expect(h.ctxState.workingDirectory.sets).toContainEqual({
-      sessionId: created.options.sessionId, path: sessionDir,
-    })
-    expect(h.ctxState.worktrees.created).toHaveLength(0)
-
-    // Workspace registered and session attached.
-    expect(h.ctxState.workspaces.workspaces.get(workspacePath)).toBeDefined()
-    expect(mock(h.ctxState.workspaces.workspaces.get(workspacePath)!.attachSession)).toHaveBeenCalledWith(created.options.sessionId)
+    // … which is registered under the person's name and the opening message.
+    expect(h.ctxState.workspaces.workspaces.get(workspacePath)).toMatchObject({ title: 'u_alice · 你好呀' })
+    expect(existsSync(workspacePath)).toBe(true)
 
     // User message handed to the driver.
     expect(mock(created.handle.agent.followup)).toHaveBeenCalledTimes(1)
@@ -1973,24 +1958,22 @@ describe('FeishuService', () => {
     await waitForEstablishedSession(h)
   })
 
-  it('gives every group user their own workspace in the same chat', async () => {
+  it('gives every group topic its own workspace under the group, registered as a group route', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({ chatType: 'group', chatId: 'oc_grp', senderId: 'u_alice', content: 'a' }))
     await h.onMessage(makeMessage({ chatType: 'group', chatId: 'oc_grp', senderId: 'u_bob', threadId: 'omt_2', content: 'b' }))
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
     const cwds = h.ctxState.agents.created.map(entry => entry.options.meta?.cwd as string)
-    expect(cwds).toHaveLength(2)
-    const aliceWorkspace = path.join(h.config.baseDir, 'groups', 'oc_grp', 'u_alice')
-    const bobWorkspace = path.join(h.config.baseDir, 'groups', 'oc_grp', 'u_bob')
-    expect(new Set(cwds)).toEqual(new Set([aliceWorkspace, bobWorkspace]))
-    // Each user's Session works in its own topic directory below its workspace.
-    // The topic directory is entered after the Agent exists, so wait for both.
-    await waitUntil(() => {
-      const dirs = h.ctxState.workingDirectory.sets.map(entry => entry.path)
-      expect(dirs).toContainEqual(path.join(aliceWorkspace, 'topics', 'omt_1'))
-      expect(dirs).toContainEqual(path.join(bobWorkspace, 'topics', 'omt_2'))
+    const topicA = path.join(h.config.baseDir, 'groups', 'oc_grp', 'omt_1')
+    const topicB = path.join(h.config.baseDir, 'groups', 'oc_grp', 'omt_2')
+    expect(new Set(cwds)).toEqual(new Set([topicA, topicB]))
+    await waitUntil(() => expect(h.ctxState.domain.raw.table('routes').get('omt_2')).toBeDefined())
+    expect(h.ctxState.domain.raw.table('routes').get('omt_1')).toMatchObject({ mode: 'group', senderUserId: 'u_alice', workspacePath: topicA })
+    expect(h.ctxState.domain.raw.table('routes').get('omt_2')).toMatchObject({ mode: 'group', senderUserId: 'u_bob', workspacePath: topicB })
+    // The group is registered with every switch off the first time a topic opens in it.
+    expect(h.ctxState.domain.raw.table('group_permissions').get('oc_grp')).toMatchObject({
+      chatId: 'oc_grp', wikiRead: false, wikiWrite: false, codeWrite: false,
     })
-    expect(aliceWorkspace).not.toBe(bobWorkspace)
   })
 
   // Bot/app senders carry no user_id and are dropped by the channel adapter
@@ -3213,8 +3196,9 @@ describe('HITL approval wiring', () => {
 
   it('answers a routed session\'s approval through a decision card, owner-gated', async () => {
     const h = await setup()
+    // A private chat: only its person decides (a group topic lets anyone with chat access decide).
     const msg = makeMessage({
-      chatType: 'group', chatId: 'oc_approval', senderId: 'u_owner', content: '审批一下',
+      chatType: 'p2p', chatId: 'oc_approval', senderId: 'u_owner', content: '审批一下',
     })
     await h.onMessage(msg)
     await waitForEstablishedSession(h)
@@ -3449,7 +3433,7 @@ describe('/stop, structured questions, and host projections', () => {
   it('cancels the running turn from the streaming card stop button, owner only', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_stop_btn', senderId: 'u_owner', messageId: 'om_stop_btn_start', content: '开始',
+      chatType: 'p2p', chatId: 'oc_stop_btn', senderId: 'u_owner', messageId: 'om_stop_btn_start', content: '开始',
     }))
     await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
@@ -3503,14 +3487,14 @@ describe('/stop, structured questions, and host projections', () => {
   it('queues a topic message behind the running turn and steers it in from its card, owner only', async () => {
     const h = await setup()
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_steer', senderId: 'u_owner', messageId: 'om_steer_start', content: '开始',
+      chatType: 'p2p', chatId: 'oc_steer', senderId: 'u_owner', messageId: 'om_steer_start', content: '开始',
     }))
     await waitForEstablishedSession(h)
     const agent = h.ctxState.agents.created[0]!.handle.agent
     ;(agent as unknown as { status: string }).status = 'running'
 
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_steer', senderId: 'u_owner', threadId: 'omt_1',
+      chatType: 'p2p', chatId: 'oc_steer', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_steer_more', content: '再补充一点',
     }))
     await waitUntil(() => expect(mock(agent.followup)).toHaveBeenCalledTimes(2))
@@ -3928,8 +3912,8 @@ describe('command picker cards', () => {
     (h.channel.updated as Array<{ messageId: string; card: object }>)
       .filter(update => update.messageId === messageId).map(update => update.card)
 
-  async function establishWithModel(h: SetupResult, chatId: string) {
-    await h.onMessage(makeMessage({ chatType: 'group', chatId, senderId: 'u_owner', content: '开始' }))
+  async function establishWithModel(h: SetupResult, chatId: string, chatType: 'p2p' | 'group' = 'group') {
+    await h.onMessage(makeMessage({ chatType, chatId, senderId: 'u_owner', content: '开始' }))
     await waitForEstablishedSession(h)
     const created = h.ctxState.agents.created[0]!
     ;(sessionEvents(created.handle.agent.session) as unknown as Array<Record<string, unknown>>).push({
@@ -3945,9 +3929,10 @@ describe('command picker cards', () => {
       context: { contextWindow: 128000 },
       reasoning: { efforts: [{ id: 'low', name: '低' }, { id: 'high', name: '高' }], defaultEffort: 'low' },
     })
-    const created = await establishWithModel(h, 'oc_pick_effort')
+    // A private chat: only its person may pick.
+    const created = await establishWithModel(h, 'oc_pick_effort', 'p2p')
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_pick_effort', senderId: 'u_owner', threadId: 'omt_1',
+      chatType: 'p2p', chatId: 'oc_pick_effort', senderId: 'u_owner', threadId: 'omt_1',
       mentionedBot: false, messageId: 'om_pick_effort', content: '/effort',
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
@@ -4124,59 +4109,11 @@ describe('inbound attachments', () => {
     await waitUntil(() => expect(routes().some(route => route.sessionId !== routeA.sessionId)).toBe(true))
     const routeB = routes().find(route => route.sessionId !== routeA.sessionId)!
 
-    // Both topics share the user workspace but own distinct working
-    // directories named after their thread ids.
-    expect(routeB.workspacePath).toBe(routeA.workspacePath)
-    expect(sessionDirOf(routeB)).not.toBe(sessionDirOf(routeA))
+    // Both topics own distinct workspaces named after their thread ids.
+    expect(routeB.workspacePath).not.toBe(routeA.workspacePath)
+    expect(path.dirname(routeB.workspacePath)).toBe(path.dirname(routeA.workspacePath))
     expect(path.basename(sessionDirOf(routeA))).toBe(routeA.key)
     expect(path.basename(sessionDirOf(routeB))).toBe(routeB.key)
-    await h.service.shutdown()
-  })
-
-  it('uses a Git worktree per topic when the user workspace is a repository', async () => {
-    const h = await setup({ topicIsolation: 'auto' })
-    const workspaceDir = path.join(h.config.baseDir, 'p2p', 'u_alice')
-    mkdirSync(path.join(workspaceDir, '.git'), { recursive: true })
-    await h.onMessage(makeMessage({
-      chatType: 'p2p', senderId: 'u_alice', mentionedBot: false, content: 'hi',
-    }))
-    await waitForEstablishedSession(h)
-
-    const created = h.ctxState.agents.created[0]!
-    expect(created.options.meta?.cwd).toBe(workspaceDir)
-    expect(h.ctxState.worktrees.created).toHaveLength(1)
-    expect(h.ctxState.worktrees.created[0]?.name).toBe('feishu-omt_1')
-    const expectedDir = path.join(workspaceDir, '.agents', 'worktrees', 'feishu-omt_1')
-    const route = [...(h.ctxState.domain.raw.table('routes').entries() as Iterable<[string, RouteRecord]>)]
-      .map(([, value]) => value)[0]!
-    expect(route.workspacePath).toBe(workspaceDir)
-    expect(route.sessionDir).toBe(expectedDir)
-    expect(route.worktreeBranch).toBe('feishu-omt_1')
-    // The Session stays grouped under the user workspace.
-    expect(h.ctxState.workspaces.workspaces.get(workspaceDir)).toBeDefined()
-    expect(mock(h.ctxState.workspaces.workspaces.get(workspaceDir)!.attachSession))
-      .toHaveBeenCalledWith(created.options.sessionId)
-    await h.service.shutdown()
-  })
-
-  it('falls back to a plain topic directory when worktree creation fails', async () => {
-    const h = await setup({ topicIsolation: 'worktree' })
-    h.ctxState.worktrees.failWith = new Error('git denied')
-    await h.onMessage(makeMessage({
-      chatType: 'p2p', senderId: 'u_alice', mentionedBot: false, content: 'hi',
-    }))
-    await waitForEstablishedSession(h)
-
-    const workspaceDir = path.join(h.config.baseDir, 'p2p', 'u_alice')
-    const created = h.ctxState.agents.created[0]!
-    expect(created.options.meta?.cwd).toBe(workspaceDir)
-    const route = [...(h.ctxState.domain.raw.table('routes').entries() as Iterable<[string, RouteRecord]>)]
-      .map(([, value]) => value)[0]!
-    expect(route.workspacePath).toBe(workspaceDir)
-    expect(route.sessionDir).toBe(path.join(workspaceDir, 'topics', 'omt_1'))
-    expect(route.worktreeBranch).toBeUndefined()
-    const logged = mock(h.ctxState.ctx.logger!.warn!).mock.calls.map(call => String(call[0]))
-    expect(logged.some(line => line.includes('creating a worktree'))).toBe(true)
     await h.service.shutdown()
   })
 
@@ -4197,10 +4134,9 @@ describe('inbound attachments', () => {
     }))
     await waitUntil(() => expect(mock(created.handle.agent.followup)).toHaveBeenCalledTimes(2))
 
-    const sets = h.ctxState.workingDirectory.sets
-      .filter(entry => entry.sessionId === created.options.sessionId)
-    expect(sets.map(entry => entry.path)).toEqual([sessionDirOf(route)])
     expect(h.ctxState.agents.created).toHaveLength(1)
+    expect(h.ctxState.domain.raw.table('routes').get(route.key)).toMatchObject({ workspacePath: route.workspacePath })
+    expect(created.options.meta?.cwd).toBe(sessionDirOf(route))
     await h.service.shutdown()
   })
 
@@ -4594,7 +4530,7 @@ describe('native attachment pipeline', () => {
       },
     })
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_foreign', senderId: 'u_alice', mentionedBot: true,
+      chatType: 'p2p', chatId: 'oc_foreign', senderId: 'u_alice', mentionedBot: false,
       messageId: 'om_foreign_owner', content: '开始',
     }))
     await waitForEstablishedSession(h)
@@ -4604,14 +4540,14 @@ describe('native attachment pipeline', () => {
     const processed = h.ctxState.domain.raw.table('processed')
 
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_foreign', senderId: 'u_bob', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_foreign', senderId: 'u_bob', mentionedBot: false,
       threadId: route.key, messageId: 'om_foreign_image', rawContentType: 'image',
       content: '![image](img_9)', resources: [{ type: 'image', fileKey: 'img_9' }] as never,
     }))
     await waitUntil(() => expect(processed.get('om_foreign_image')).toBeDefined())
 
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_foreign', senderId: 'u_bob', mentionedBot: false,
+      chatType: 'p2p', chatId: 'oc_foreign', senderId: 'u_bob', mentionedBot: false,
       threadId: route.key, messageId: 'om_foreign_mixed', rawContentType: 'image',
       content: '看这个 ![image](img_9)', resources: [{ type: 'image', fileKey: 'img_9' }] as never,
     }))
@@ -5262,7 +5198,7 @@ describe('quote excerpts and first-turn topic history', () => {
     Object.assign(h.channel, { wiki })
     await makeAdmin(h, 'u_admin')
     await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_wiki', senderId: 'u_owner',
+      chatType: 'p2p', chatId: 'oc_wiki', senderId: 'u_owner', mentionedBot: false,
       messageId: 'om_wiki_trigger', content: '读一下知识库',
     }))
     await waitForEstablishedSession(h)

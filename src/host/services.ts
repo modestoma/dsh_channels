@@ -21,6 +21,8 @@ export interface Workspace {
   readonly title: string
   attachSession(id: SessionId): Promise<void> | void
   detachSession(id: SessionId): Promise<void> | void
+  /** Rename the workspace in the host's list (absent on older hosts). */
+  setTitle?(title: string): Promise<void>
 }
 
 export interface WorkspaceRegistry {
@@ -29,6 +31,25 @@ export interface WorkspaceRegistry {
   list(): Workspace[]
   /** Unregister one workspace record (the directory itself is the caller's concern). */
   delete(id: string): Promise<boolean>
+}
+
+/**
+ * The effective-directory service (`@deepseek-ai/dsh-working-directory`,
+ * mounted by every base-backed profile): the directory a Session's file
+ * tools resolve relative paths against. This plugin only reads it (the read
+ * fence); it never moves a Session.
+ */
+export interface WorkingDirectoryService {
+  get(session: Session): string
+}
+
+/**
+ * Resolve the effective-directory service from the host context.
+ * @param ctx - host context.
+ * @returns the service, or undefined when the deployment has none.
+ */
+export function workingDirectoryService(ctx: Pick<HostContext, 'get'>): WorkingDirectoryService | undefined {
+  return ctx.get?.('workingDirectory') as WorkingDirectoryService | undefined
 }
 
 // ---- Storage / token-meter / llm / credentials surface ------------------

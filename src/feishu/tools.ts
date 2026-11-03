@@ -104,7 +104,7 @@ export interface AttachmentFetchRoute {
   readonly chatId: string
   readonly chatType: 'p2p' | 'group'
   readonly senderUserId: string
-  /** Group-shared route: messages of any sender in the route's topic count as its own. */
+  /** Group route without a single owner: messages of any sender in the route's topic count as its own. */
   readonly shared?: boolean
 }
 

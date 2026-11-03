@@ -16,6 +16,7 @@ import type {
   AccessMutationResponse,
   AccessPermissionWire,
   AccessWire,
+  GroupPermissionWire,
   CatalogWire,
   ChannelStatusWire,
   ConfigValue,
@@ -36,10 +37,12 @@ import {
   pickDirectory as requestDirectoryPicker,
   reconnect,
   takeover,
+  removeAccessGroup,
   removeAccessUser,
   resolveAccessRequest,
   setAccessGitEmail,
   setAccessPermission,
+  setGroupPermission,
   saveConfig,
   saveCredentials,
 } from '../api.ts'
@@ -48,6 +51,7 @@ import { AccessTab } from './access-tab.tsx'
 import { AdvancedTab } from './advanced-tab.tsx'
 import { ConnectionTab } from './connection-tab.tsx'
 import { FieldsTab } from './fields-tab.tsx'
+import { GroupsTab } from './groups-tab.tsx'
 import { useFeishuProfiles } from './profiles.ts'
 import {
   fieldLabel,
@@ -474,6 +478,29 @@ function FeishuChannelsPanel(): JSX.Element | null {
     }
   }, [applyAccess])
 
+  const onToggleGroupPermission = useCallback(async (
+    chatId: string,
+    permission: GroupPermissionWire,
+    enabled: boolean,
+  ): Promise<void> => {
+    setBusy('access')
+    setAccessError(null)
+    setAccessNotice(null)
+    try {
+      const result = await setGroupPermission(chatId, permission, enabled)
+      if (!result.ok) {
+        setAccessError(result.error)
+        return
+      }
+      applyAccess(result.access)
+      setAccessNotice(PANEL_COPY.groupPermissionChanged)
+    } catch (error) {
+      setAccessError(messageOf(error))
+    } finally {
+      setBusy(null)
+    }
+  }, [applyAccess])
+
   /** Set or clear one user's git email; resolves true when the editor should close. */
   const onSetGitEmail = useCallback(async (userId: string, gitEmail: string): Promise<boolean> => {
     setBusy('access')
@@ -761,6 +788,18 @@ function FeishuChannelsPanel(): JSX.Element | null {
                 onTogglePermission={(userId, permission, enabled) => { void onTogglePermission(userId, permission, enabled) }}
                 onSetGitEmail={onSetGitEmail}
                 onResolveRequest={(token, decision) => { void onResolveAccessRequest(token, decision) }}
+              />
+            )
+          : null}
+        {activeTab === 'groups'
+          ? (
+              <GroupsTab
+                form={form}
+                profiles={profiles}
+                accessNotice={accessNotice}
+                accessError={accessError}
+                onRemoveGroup={chatId => { void removeUser(removeAccessGroup, chatId, PANEL_COPY.groupRemoved) }}
+                onTogglePermission={(chatId, permission, enabled) => { void onToggleGroupPermission(chatId, permission, enabled) }}
               />
             )
           : null}

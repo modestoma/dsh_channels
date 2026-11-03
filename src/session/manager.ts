@@ -20,6 +20,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
+import { mkdir } from 'node:fs/promises'
 import type {
   Agent, AgentContext, AgentHandle, AgentPresets, AgentSetup, HostContext, Session, SessionId,
 } from '../dsh-types.ts'
@@ -30,9 +31,6 @@ import type { RouteRecord } from '../domain.ts'
 import { mountChannelGuidance, mountReplyGuidance } from '../feishu/agent-context.ts'
 import { installRequestPolicy } from './request-policy.ts'
 import type { RequestPolicyController } from './request-policy.ts'
-import { placementServices, restoreTopicDir } from './isolation.ts'
-import type { PlacementServices, TopicPlacement } from './isolation.ts'
-import { workspaceTitleFor } from '../workspaces.ts'
 
 /** One live agent plus this plugin's ownership handle. */
 export interface LiveAgent {
@@ -279,74 +277,45 @@ export class SessionManager {
   }
 
   /**
-   * Create, place, workspace-attach, and atomically publish one renewed route.
+   * Create and atomically publish one renewed route.
    *
-   * A renewal keeps the topic's working directory: the new Session is created
-   * with the user workspace as its header cwd (so it stays grouped under the
-   * project) and then re-entered into the same topic directory or worktree.
+   * A renewal keeps the topic's directory: the new Session is created with
+   * the same directory the old one worked in as its header cwd (the topic
+   * workspace; for an older route its per-topic directory or worktree, which
+   * is recreated when it disappeared).
    */
   async renew(record: RouteRecord, oldLive: LiveAgent): Promise<RenewCommit> {
     const sessionId = randomUUID() as SessionId
     const preset = this.effectivePreset(oldLive.agent.session)
     const composition = await this.presetComposition(preset, false, sessionId)
-    const services: PlacementServices = placementServices(this.deps.ctx)
-    const switchable = services.workingDirectory !== undefined
-    const workspacePath = record.workspacePath
-    const workspace = await this.deps.ctx.workspaceRegistry.create(
-      workspacePath,
-      workspaceTitleFor(record.chatType, record.chatId, record.senderUserId),
-    )
+    const cwd = sessionDirOf(record)
+    await mkdir(cwd, { recursive: true })
 
     let newHandle: AgentHandle | undefined
-    let attached = false
     try {
       newHandle = await this.deps.ctx.agents.create({
         sessionId,
         meta: {
-          // Without an effective-directory service the Session must be born in
-          // its topic directory; otherwise the workspace root keeps it grouped.
-          cwd: switchable ? workspacePath : sessionDirOf(record),
+          cwd,
           ...(composition.agentPreset === undefined ? {} : { agentPreset: composition.agentPreset }),
         },
         agentOptions: { ...oldLive.agent.options },
         setup: composition.setup,
       })
       this.requestPolicy(newHandle.agent)
-      const placement: TopicPlacement = await restoreTopicDir(services, newHandle.agent, {
-        workspacePath,
-        sessionDir: sessionDirOf(record),
-        ...(record.worktreeBranch === undefined ? {} : { worktreeBranch: record.worktreeBranch }),
-      }, this.deps.warn.bind(this.deps))
-      if (switchable) {
-        await workspace.attachSession(sessionId)
-        attached = true
-      }
       await this.mountGuidance(newHandle.agent)
       const createdAt = newHandle.agent.session.header.createdAt
 
-      const base: RouteRecord = {
+      const current: RouteRecord = {
         ...record,
         sessionId,
         sessionHistory: appendSessionHistory(record, sessionId, createdAt),
         lastActivityAt: Date.now(),
-        sessionDir: placement.sessionDir,
       }
-      delete base.worktreeBranch
-      const current: RouteRecord = placement.worktreeBranch === undefined
-        ? base
-        : { ...base, worktreeBranch: placement.worktreeBranch }
       await this.deps.persistRoute(record.key, current)
       this.live.set(sessionId, { agent: newHandle.agent, handle: newHandle })
       return { previous: record, current, oldLive }
     } catch (error) {
-      if (attached) {
-        await Promise.resolve(workspace.detachSession(sessionId)).catch((detachError: unknown) => {
-          this.deps.warn(
-            'dsh-channels: rolling back workspace attachment for session %s failed: %s',
-            sessionId, String(detachError),
-          )
-        })
-      }
       await newHandle?.dispose().catch(() => {})
       throw error
     }
