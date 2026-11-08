@@ -55,6 +55,9 @@ function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
     // surviving, and GC tests opt in with explicit TTLs.
     routeTtlMs: 0,
     approvalTimeoutMs: 300_000,
+    approvalBackgroundTimeoutMs: 300_000,
+    // Reminder replies would shift send counts; its tests opt in.
+    approvalReminderMs: 0,
     questionTimeoutMs: 300_000,
     wikiRoots: [],
     allowPermissionSwitch: false,
@@ -3288,6 +3291,134 @@ describe('HITL approval wiring', () => {
     await waitUntil(() => expect(h.channel.sent.length).toBe(2))
     await h.service.shutdown()
     await expect(pending).resolves.toBe('cancelled')
+    const interrupted = JSON.stringify(h.channel.updated.find(update => (update as { messageId: string }).messageId === 'om_2'))
+    expect(interrupted).toContain('服务重启，审批已中断')
+    expect(interrupted).toContain('approval-retry')
+    expect(h.ctxState.domain.raw.table('approval_cards').get('om_2')).toMatchObject({ state: 'interrupted' })
+  })
+
+  /** Open a p2p topic and ask one approval in it. */
+  async function askApproval(partial: Partial<FeishuConfig> = {}) {
+    const h = await setup(partial)
+    await h.onMessage(makeMessage({ chatType: 'p2p', chatId: 'oc_retry', senderId: 'u_owner', content: '推一下' }))
+    await waitForEstablishedSession(h)
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    const { listener } = h.ctxState.approvalListeners[0]!
+    const pending = listener({ agent, toolName: 'bash', reason: '推送分支' }, vi.fn(async () => 'unavailable' as ApprovalOutcome))
+    await waitUntil(() => expect(h.channel.sent.length).toBe(2))
+    return { h, agent, pending, cardId: 'om_2' }
+  }
+
+  it('retries an expired approval card as a new turn under it, once, for someone who may act', async () => {
+    const { h, agent, pending, cardId } = await askApproval({ approvalTimeoutMs: 30 })
+    await expect(pending).resolves.toBe('rejected')
+    await waitUntil(() => expect(JSON.stringify(h.channel.updated.filter(update => (update as { messageId: string }).messageId === cardId).at(-1)))
+      .toContain('approval-retry'))
+    expect(mock(agent.followup)).toHaveBeenCalledTimes(1)
+    const value = { decision: 'approval-retry', sessionId: agent.session.id }
+
+    await h.channel.fireCardAction({ messageId: cardId, chatId: 'oc_retry', operator: { openId: 'ou_x', userId: 'u_mallory' }, action: { value, tag: 'button' } })
+    await flush()
+    expect(mock(agent.followup)).toHaveBeenCalledTimes(1)
+
+    await h.channel.fireCardAction({ messageId: cardId, chatId: 'oc_retry', operator: { openId: 'ou_o', userId: 'u_owner' }, action: { value, tag: 'button' } })
+    await waitUntil(() => expect(mock(agent.followup)).toHaveBeenCalledTimes(2))
+    const retried = mock(agent.followup).mock.calls[1]![0]
+    expect(JSON.stringify(retried)).toContain('重新发起')
+    expect(JSON.stringify(retried)).toContain('超时没有处理')
+    expect(retried).toMatchObject({ source: { principal: { kind: 'feishu-user', userId: 'u_owner' } } })
+    // The retry turn streams into a new card under the clicked one.
+    expect(h.channel.sent[2]).toMatchObject({ chatId: 'oc_retry', options: { replyTo: cardId } })
+    await waitUntil(() => expect(JSON.stringify(h.channel.updated.filter(update => (update as { messageId: string }).messageId === cardId).at(-1)))
+      .toContain('已重新发起'))
+    expect(h.ctxState.domain.raw.table('approval_cards').get(cardId)).toBeUndefined()
+
+    await h.channel.fireCardAction({ messageId: cardId, chatId: 'oc_retry', operator: { openId: 'ou_o', userId: 'u_owner' }, action: { value, tag: 'button' } })
+    await flush()
+    expect(mock(agent.followup)).toHaveBeenCalledTimes(2)
+    await h.service.shutdown()
+  })
+
+  it('ignores a retry click once /renew has bound the topic to another Session', async () => {
+    const { h, agent, pending, cardId } = await askApproval({ approvalTimeoutMs: 30 })
+    await expect(pending).resolves.toBe('rejected')
+    await waitUntil(() => expect(h.ctxState.domain.raw.table('approval_cards').get(cardId)).toMatchObject({ state: 'expired' }))
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_retry', senderId: 'u_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_retry_renew', content: '/renew',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
+    const renewed = h.ctxState.agents.created[1]!
+    await waitForRenewedRoute(h, 'omt_1', renewed.options.sessionId)
+    const before = h.ctxState.domain.raw.table('routes').get('omt_1')
+
+    const value = { decision: 'approval-retry', sessionId: agent.session.id }
+    await h.channel.fireCardAction({ messageId: cardId, chatId: 'oc_retry', operator: { openId: 'ou_o', userId: 'u_owner' }, action: { value, tag: 'button' } })
+    await flush()
+    expect(mock(agent.followup)).toHaveBeenCalledTimes(1)
+    expect(mock(renewed.handle.agent.followup)).not.toHaveBeenCalled()
+    expect(h.ctxState.domain.raw.table('routes').get('omt_1')).toEqual(before)
+    await h.service.shutdown()
+  })
+
+  it('marks an approval card a crashed instance left open as interrupted on start', async () => {
+    const { h, pending, cardId } = await askApproval()
+    const record = h.ctxState.domain.raw.table('approval_cards').get(cardId) as Record<string, unknown>
+    expect(record).toMatchObject({ state: 'open' })
+    await h.service.shutdown()
+    await pending
+    // A crash skips the shutdown withdrawal: the record stays open under the old instance.
+    await h.ctxState.domain.raw.table('approval_cards').put(cardId, record)
+    const channel2 = makeChannel()
+    const service2 = new FeishuService(h.ctxState.ctx, h.config, () => channel2)
+    await service2.start()
+    await waitUntil(() => expect(JSON.stringify(channel2.updated.find(update => (update as { messageId: string }).messageId === cardId)))
+      .toContain('服务重启，审批已中断'))
+    expect(h.ctxState.domain.raw.table('approval_cards').get(cardId)).toMatchObject({ state: 'interrupted' })
+    await service2.shutdown()
+  })
+
+  it('keeps a stop-asking grant across a restart and drops it once no route names the Session', async () => {
+    const { h, agent, pending, cardId } = await askApproval()
+    await h.channel.fireCardAction({ messageId: cardId, chatId: 'oc_retry', operator: { openId: 'ou_o', userId: 'u_owner' }, action: { value: { decision: 'always' }, tag: 'button' } })
+    await expect(pending).resolves.toBe('allowed-once')
+    await waitUntil(() => expect(h.ctxState.domain.raw.table('approval_grants').get(agent.session.id)).toBeDefined())
+    await h.service.shutdown()
+
+    const channel2 = makeChannel()
+    const service2 = new FeishuService(h.ctxState.ctx, h.config, () => channel2)
+    await service2.start()
+    const { listener } = h.ctxState.approvalListeners.at(-1)!
+    await expect(listener({ agent, toolName: 'bash' }, vi.fn(async () => 'unavailable' as ApprovalOutcome))).resolves.toBe('allowed-once')
+    expect(channel2.sent).toHaveLength(0)
+    await service2.shutdown()
+
+    // A grant of a Session no route names is dropped by the next sweep.
+    await h.ctxState.domain.raw.table('approval_grants').put('sess-unrouted', { key: 'sess-unrouted', grants: ['bash\u0000'], updatedAt: 1 })
+    const service3 = new FeishuService(h.ctxState.ctx, h.config, () => makeChannel())
+    await service3.start()
+    await waitUntil(() => expect(h.ctxState.domain.raw.table('approval_grants').get('sess-unrouted')).toBeUndefined())
+    expect(h.ctxState.domain.raw.table('approval_grants').get(agent.session.id)).toBeDefined()
+    await service3.shutdown()
+  })
+
+  it('reminds in a private-chat topic only', async () => {
+    const { h, pending } = await askApproval({ approvalReminderMs: 20 })
+    await waitUntil(() => expect(h.channel.sent.length).toBe(3))
+    expect(JSON.stringify(h.channel.sent[2])).toContain('还有一个审批在等你处理')
+    await h.service.shutdown()
+    await pending
+
+    const g = await setup({ approvalReminderMs: 20 })
+    await g.onMessage(makeMessage({ chatType: 'group', chatId: 'oc_group_remind', senderId: 'u_owner', content: '群里问' }))
+    await waitForEstablishedSession(g)
+    const { listener } = g.ctxState.approvalListeners[0]!
+    const inGroup = listener({ agent: g.ctxState.agents.created[0]!.handle.agent, toolName: 'bash' }, vi.fn(async () => 'unavailable' as ApprovalOutcome))
+    await waitUntil(() => expect(g.channel.sent.length).toBe(2))
+    await new Promise(resolve => setTimeout(resolve, 60))
+    expect(g.channel.sent).toHaveLength(2)
+    await g.service.shutdown()
+    await inGroup
   })
 })
 

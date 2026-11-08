@@ -24,8 +24,10 @@ import { AccessController } from './access/controller.ts'
 import { AccessRequests } from './access/requests.ts'
 import { AccessStore } from './access/store.ts'
 import { AUTH_USER_TARGET_ERRORS, resolveAuthUserTarget } from './access/targets.ts'
-import { ApprovalAnswerer } from './approvals.ts'
+import { ApprovalAnswerer, approvalRetryPrompt } from './approvals.ts'
 import type { ApprovalRoute } from './approvals.ts'
+import { ApprovalStore } from './interactions/approval-store.ts'
+import type { ApprovalCardRecord, ApprovalGrantRecord } from './interactions/approval-store.ts'
 import { QuestionAnswerer } from './questions.ts'
 import type {
   Agent,
@@ -44,7 +46,7 @@ import type {
   TokenMeter,
   UserMessage,
 } from './dsh-types.ts'
-import { buildPickerCard, parsePickAction, parseResumeAction, standaloneInfoCard, STEER_ACTION, STOP_ACTION } from './cards.ts'
+import { buildApprovalSettledCard, buildPickerCard, initialStreamingCard, parseApprovalRetryAction, parsePickAction, parseResumeAction, queuedStreamingCard, standaloneInfoCard, STEER_ACTION, STOP_ACTION } from './cards.ts'
 import type { PickerOption } from './cards.ts'
 import {
   armEffortCommand, armRenewCommand, commandResultCardKind, parseSlashCommand,
@@ -174,6 +176,8 @@ async function openFeishuDomain(ctx: HostContext): Promise<FeishuDomainHandle> {
   const topicLaunchesRaw = domain.table('analyze_requests')
   const sessionOriginsRaw = domain.table('session_origins')
   const outboxRaw = domain.table('outbox')
+  const approvalGrantsRaw = domain.table('approval_grants')
+  const approvalCardsRaw = domain.table('approval_cards')
   return {
     routes: {
       get: key => table.get(key) as RouteRecord | undefined,
@@ -234,6 +238,18 @@ async function openFeishuDomain(ctx: HostContext): Promise<FeishuDomainHandle> {
       put: (key, value) => outboxRaw.put(key, value),
       delete: key => outboxRaw.delete(key),
       entries: () => outboxRaw.entries() as IterableIterator<[string, OutboxEntry]>,
+    },
+    approvalGrants: {
+      get: key => approvalGrantsRaw.get(key) as ApprovalGrantRecord | undefined,
+      put: (key, value) => approvalGrantsRaw.put(key, value),
+      delete: key => approvalGrantsRaw.delete(key),
+      entries: () => approvalGrantsRaw.entries() as IterableIterator<[string, ApprovalGrantRecord]>,
+    },
+    approvalCards: {
+      get: key => approvalCardsRaw.get(key) as ApprovalCardRecord | undefined,
+      put: (key, value) => approvalCardsRaw.put(key, value),
+      delete: key => approvalCardsRaw.delete(key),
+      entries: () => approvalCardsRaw.entries() as IterableIterator<[string, ApprovalCardRecord]>,
     },
     close: () => domain.close(),
   }
@@ -457,6 +473,10 @@ export class FeishuService {
   private approvalAnswerer: ApprovalAnswerer | undefined
   /** Interrupted cards whose continue button already started a turn. */
   private readonly resumedCards = new Set<string>()
+  /** Approval cards whose 「重新发起」 click is being handled or was handled (once per card). */
+  private readonly retriedApprovalCards = new Set<string>()
+  /** Durable approval grants and cards. */
+  private readonly approvalStore: ApprovalStore
   /** Workspace roots of Feishu-routed Sessions seen by the last records read; file routes serve only these and active routes' roots. */
   private recordWorkspaces = new Set<string>()
   /** HITL structured-question answerer (`ask_user_question`). */
@@ -514,6 +534,12 @@ export class FeishuService {
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
       // Bindings derive from the route table; tell snapshot readers it moved.
       changed: () => this.remote?.remoteAccess.invalidate(),
+    })
+    this.approvalStore = new ApprovalStore({
+      tables: () => this.domain === undefined
+        ? undefined
+        : { grants: this.domain.approvalGrants, cards: this.domain.approvalCards },
+      warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
     })
     this.repair = new InflightRepair({
       domain: () => this.domain,
@@ -2035,7 +2061,13 @@ export class FeishuService {
       },
       isAdmin: userId => this.accessController.isAdmin(userId),
       patchCard: (messageId, card) => this.outbox.patch(messageId, card),
-    }, this.config.approvalTimeoutMs)
+      backgroundTurn: sessionId => this.streamer?.runsHostTurn(sessionId) === true,
+      store: this.approvalStore,
+    }, () => ({
+      timeoutMs: this.config.approvalTimeoutMs,
+      backgroundTimeoutMs: this.config.approvalBackgroundTimeoutMs,
+      reminderMs: this.config.approvalReminderMs,
+    }))
     this.approvalAnswerer = answerer
     this.unlistenApproval = this.ctx.on('approval/request', (req, next) => answerer.onRequest(req, next), { prepend: true })
     // Structured questions (`ask_user_question`): the host's only shipped
@@ -2083,6 +2115,9 @@ export class FeishuService {
       this.onSteerAction(event)
       void this.onResumeAction(event).catch((error: unknown) => {
         this.ctx.logger?.warn?.('dsh-channels: continue action failed: %s', String(error))
+      })
+      void this.onApprovalRetryAction(event).catch((error: unknown) => {
+        this.ctx.logger?.warn?.('dsh-channels: approval retry action failed: %s', String(error))
       })
       void this.onPickAction(event).catch((error: unknown) => {
         this.ctx.logger?.warn?.('dsh-channels: picker card action failed: %s', String(error))
@@ -2168,6 +2203,11 @@ export class FeishuService {
     void this.repair.repairAll().catch((error: unknown) => {
       this.ctx.logger?.warn?.('dsh-channels: inflight repair failed: %s', String(error))
     })
+    // Approval cards a crashed previous instance left undecided.
+    const interruptedApprovals = answerer.recoverInterrupted()
+    if (interruptedApprovals > 0) {
+      this.ctx.logger?.info?.('dsh-channels: marked %d approval card(s) interrupted by the restart', interruptedApprovals)
+    }
     // Record GC: one sweep right after boot, then a slow periodic sweep.
     // Dedup records are pruned unconditionally (fixed retention); route
     // records of deleted topics (their thread id never reappears) are pruned
@@ -2206,7 +2246,7 @@ export class FeishuService {
     const approvalMounted = this.ctx.get?.('approval') !== undefined
     console.info(
       approvalMounted
-        ? `[dsh-channels] HITL 审批应答已就绪（决策卡片超时 ${this.config.approvalTimeoutMs} ms）`
+        ? `[dsh-channels] HITL 审批应答已就绪（决策卡片超时 ${this.config.approvalTimeoutMs} ms，后台回合 ${this.config.approvalBackgroundTimeoutMs} ms，私聊提醒 ${this.config.approvalReminderMs} ms）`
         : '[dsh-channels] 主机未挂载 approval 服务，HITL 审批应答关闭',
     )
     const questionsMounted = this.ctx.get?.('userQuestions') !== undefined
@@ -2765,6 +2805,63 @@ export class FeishuService {
   }
 
   /**
+   * 「重新发起」 click on an expired or interrupted approval card: a user who
+   * may act on the route starts a turn that re-checks the current state and
+   * retries the step, streaming into a new card under the clicked one. Each
+   * card retries at most once; the clicked card then shows 已重新发起.
+   */
+  private async onApprovalRetryAction(event: CardActionEvent): Promise<void> {
+    if (!this.started) return
+    const target = parseApprovalRetryAction(event.action.value)
+    if (target === undefined || this.retriedApprovalCards.has(event.messageId)) return
+    const record: ApprovalCardRecord | undefined = this.approvalStore.retryable(event.messageId)
+    if (record === undefined || record.sessionId !== target.sessionId || record.state === 'open') return
+    const ended = record.state
+    const bound = this.routes.findBySession(record.sessionId)
+    const operator = event.operator.userId
+    if (bound === undefined || operator === undefined) return
+    this.retriedApprovalCards.add(event.messageId)
+    let accepted = false
+    try {
+      // Serialized with `/renew` and the topic's other route changes: the
+      // retry runs only while the topic still binds the card's Session.
+      accepted = await this.routeOperations.run(bound.key, async () => {
+        const route = this.routes.get(bound.key)
+        const channel = this.channel
+        if (!this.started || channel === undefined || route === undefined || route.sessionId !== record.sessionId
+          || !this.accessController.mayActOnRoute(operator, event.chatId, route)) return false
+        const live = await this.sessions.ensureLive(route)
+        const firstCard = this.streamer?.hasLiveTurn(route.sessionId) === true
+          ? queuedStreamingCard(route.sessionId)
+          : initialStreamingCard(route.sessionId)
+        const sent = await channel.send(route.chatId, { card: firstCard }, {
+          replyTo: event.messageId,
+          replyInThread: route.kind === 'thread',
+        })
+        const prompt = channelPrompt(approvalRetryPrompt(record.question, ended), principalOnRoute(route, operator))
+        const stored = storablePrompt(prompt)
+        await this.repair.write({
+          key: sent.messageId,
+          sessionId: route.sessionId,
+          chatId: route.chatId,
+          routeKey: route.key,
+          ...(stored === undefined ? {} : { prompt: stored }),
+          cards: [{ messageId: sent.messageId, mode: 'card' }],
+          startedAt: Date.now(),
+          attempts: 0,
+        })
+        await this.routes.put(route.key, { ...route, cardMessageId: sent.messageId, lastActivityAt: Date.now() })
+        return (await this.runTurn(live.agent, prompt, { cardMessageId: sent.messageId })).accepted
+      })
+    } finally {
+      if (!accepted) this.retriedApprovalCards.delete(event.messageId)
+    }
+    if (!accepted) return
+    this.approvalStore.settleCard(event.messageId)
+    void this.outbox.patch(event.messageId, buildApprovalSettledCard(record.question, 'retried'))
+  }
+
+  /**
    * Picker-card click: run the chosen `/<command> <arg>` exactly as if the
    * operator had typed it under the picker card, so access admission, route
    * ownership and validation are the typed command's. The result replaces
@@ -3257,6 +3354,12 @@ export class FeishuService {
       }
     }
     this.inbound.pruneAccepted(processedCutoff)
+    // Grants of Sessions no route names any more (`/renew`, retired topics)
+    // and 「重新发起」 records past their window.
+    const removedApproval = this.approvalStore.prune(sessionId => this.routes.findBySession(sessionId) !== undefined, now)
+    if (removedApproval > 0) {
+      this.ctx.logger?.info?.('dsh-channels: record GC removed %d approval record(s)', removedApproval)
+    }
 
     const ttlMs = this.config.routeTtlMs
     if (ttlMs === 0) {
@@ -3334,6 +3437,7 @@ export class FeishuService {
       cardMessageId: record.cardMessageId,
       inThread: record.kind === 'thread',
       senderUserId: record.senderUserId,
+      chatType: record.chatType,
       ...(isGroupRoute(record)
         ? { mayDecide: (userId: string) => this.accessController.mayActOnRoute(userId, record.chatId, record) }
         : {}),

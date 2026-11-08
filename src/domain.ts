@@ -12,6 +12,8 @@ import { z } from 'zod'
 import type { TopicRootCard } from './topics/contract.ts'
 import { outboxEntrySchema } from './outbox.ts'
 import type { OutboxTable } from './outbox.ts'
+import { approvalCardRecordSchema, approvalGrantRecordSchema } from './interactions/approval-store.ts'
+import type { ApprovalCardsTable, ApprovalGrantsTable } from './interactions/approval-store.ts'
 
 /**
  * Route key kinds. `thread` = real Feishu topic; `chat` = degraded chat-scoped
@@ -628,6 +630,14 @@ export interface FeishuDomainSpecShape {
       valueSchema: typeof outboxEntrySchema
       __key?: string
     }
+    approval_grants: {
+      valueSchema: typeof approvalGrantRecordSchema
+      __key?: string
+    }
+    approval_cards: {
+      valueSchema: typeof approvalCardRecordSchema
+      __key?: string
+    }
   }
 }
 
@@ -680,6 +690,10 @@ export const feishuDomain: FeishuDomainSpecShape = {
     session_origins: { valueSchema: sessionOriginRecordSchema },
     // Terminal Feishu actions waiting for a retry; a missing table loads empty.
     outbox: { valueSchema: outboxEntrySchema },
+    // Session "stop asking in this topic" grants (key = session id); a missing table loads empty.
+    approval_grants: { valueSchema: approvalGrantRecordSchema },
+    // Delivered approval cards until decided or retried (key = card message id); a missing table loads empty.
+    approval_cards: { valueSchema: approvalCardRecordSchema },
   },
 }
 
@@ -776,6 +790,10 @@ export interface FeishuDomainHandle {
   sessionOrigins: SessionOriginsTable
   /** Terminal Feishu actions waiting for a retry. */
   outbox: OutboxTable
+  /** Session "stop asking in this topic" grants. */
+  approvalGrants: ApprovalGrantsTable
+  /** Approval cards until decided or retried. */
+  approvalCards: ApprovalCardsTable
   getGlobal(): FeishuDomainGlobal
   setGlobal(value: FeishuDomainGlobal): Promise<unknown> | void
   close(): Promise<void>

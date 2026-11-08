@@ -12,7 +12,7 @@
 
 import { DSH_CHANNELS_VERSION } from '../session-export.ts'
 import type { FeishuConfig } from '../config.ts'
-import { MAX_TIMER_DELAY_MS } from '../config.ts'
+import { MAX_APPROVAL_TIMEOUT_MS, MAX_TIMER_DELAY_MS } from '../config.ts'
 import { FEISHU_USER_ID_PATTERN } from '../domain.ts'
 import { parseWikiRootLink, WIKI_ROOT_LINK_ERRORS } from '../feishu/wiki/links.ts'
 import type { HealthSnapshot } from '../health.ts'
@@ -277,6 +277,7 @@ const TOGGLES: Partial<Record<EditableKey, FieldToggleWire>> = {
 }
 
 const DAY_MS = 86_400_000
+const MINUTE_MS = 60_000
 
 /** Panel copy and bounds per editable key; numeric bounds stay in stored units. */
 interface FieldMeta {
@@ -319,12 +320,34 @@ const FIELD_META: Record<EditableKey, FieldMeta> = {
   approvalTimeoutMs: {
     label: '审批卡片等待',
     group: 'cards',
-    summary: '超时自动拒绝，等待期间回复暂停',
-    min: 10_000,
-    max: 3_600_000,
-    step: 1_000,
-    unit: '秒',
-    scale: 1_000,
+    summary: '超时自动拒绝，过期卡片可「重新发起」',
+    help: '等待期间这一轮回复暂停；在话题里回复其他内容会拒绝审批，并作为下一条指令。',
+    min: MINUTE_MS,
+    max: MAX_APPROVAL_TIMEOUT_MS,
+    step: MINUTE_MS,
+    unit: '分钟',
+    scale: MINUTE_MS,
+  },
+  approvalBackgroundTimeoutMs: {
+    label: '后台唤醒的审批等待',
+    group: 'cards',
+    summary: '子代理、后台任务、定时跟进、PR/MR 动态唤醒的回合',
+    min: MINUTE_MS,
+    max: MAX_APPROVAL_TIMEOUT_MS,
+    step: MINUTE_MS,
+    unit: '分钟',
+    scale: MINUTE_MS,
+  },
+  approvalReminderMs: {
+    label: '私聊审批提醒',
+    group: 'cards',
+    summary: '审批卡片没人处理时，过这么久在卡片下提醒一次，0 为不提醒',
+    help: '只在私聊话题里提醒，群聊话题不发。',
+    min: 0,
+    max: MAX_APPROVAL_TIMEOUT_MS,
+    step: MINUTE_MS,
+    unit: '分钟',
+    scale: MINUTE_MS,
   },
   questionTimeoutMs: {
     label: '提问卡片等待',

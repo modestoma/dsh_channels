@@ -712,6 +712,18 @@ export class TurnStreamer {
    * @param sessionId - the session to inspect.
    * @returns true while a turn is streaming or queued.
    */
+  /**
+   * Whether the session's running turn was started by the host (a subagent,
+   * background job, schedule, PR/MR activity, or dsh client) rather than by a
+   * prompt this channel submitted.
+   * @param sessionId - the Session.
+   * @returns false when no turn runs or a channel prompt opened it.
+   */
+  runsHostTurn(sessionId: string): boolean {
+    const running = this.running.get(sessionId)
+    return running !== undefined && running.state?.prompt === undefined
+  }
+
   hasLiveTurn(sessionId: string): boolean {
     return this.running.has(sessionId) || (this.bySession.get(sessionId) ?? []).some(state => !state.finalized)
   }

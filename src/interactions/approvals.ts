@@ -11,9 +11,16 @@
  * The host request carries no tool arguments, so the answerer keeps the
  * current turn's `tool/call` arguments per session (fed from `session/event`)
  * and looks the asked call up by `callId` to show what will run. Standing
- * "stop asking in this topic" grants live only in memory, keyed by session,
- * tool name, and requested sandbox mode; they end with the session (`/renew`),
- * the topic, or the process.
+ * "stop asking in this topic" grants are keyed by session, tool name, and
+ * requested sandbox mode, and are stored (`ApprovalStore`) so they survive a
+ * restart; they end with the session (`/renew`) or the topic.
+ *
+ * Timing: a turn a Feishu message started waits `timeoutMs` (24 h by
+ * default), a turn the host started (subagent, background job, schedule,
+ * PR/MR activity) waits `backgroundTimeoutMs`. A private-chat card that is
+ * still undecided after `reminderMs` gets one reminder reply under it; group
+ * cards never do. An expired card, and a card a restart left undecided, carry
+ * a 「重新发起」 button whose click the service turns into a new turn.
  *
  * Rendering lives in `cards/approval.ts`; the shared pending-card lifecycle
  * (delivery, owner gating, timeout, settle-once, withdrawal) lives in
@@ -23,15 +30,29 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { buildApprovalCard, buildApprovalSettledCard, UNCONFINED_MODE } from '../cards/approval.ts'
-import type { ApprovalCardState, ApprovalQuestion } from '../cards/approval.ts'
+import { approvalDurationLabel, buildApprovalCard, buildApprovalSettledCard, UNCONFINED_MODE } from '../cards/approval.ts'
+import type { ApprovalCardState, ApprovalQuestion, SettledApprovalQuestion } from '../cards/approval.ts'
 import type { ApprovalOutcome, ApprovalRequest, SessionEvent } from '../dsh-types.ts'
 import type { CardActionEvent, FeishuChannel } from '../feishu-channel.ts'
+import type { ApprovalStore } from './approval-store.ts'
 import { PendingCardTable } from './pending.ts'
 import type { InteractionRoute, PendingCardEntry } from './pending.ts'
 
 /** Feishu placement of one session's approval cards. */
-export type ApprovalRoute = InteractionRoute
+export interface ApprovalRoute extends InteractionRoute {
+  /** `p2p` routes get the undecided-card reminder; `group` routes never do. */
+  chatType: 'p2p' | 'group'
+}
+
+/** Approval windows, read when each card opens. */
+export interface ApprovalTimings {
+  /** Window of a card asked by a turn a Feishu message started. */
+  timeoutMs: number
+  /** Window of a card asked by a turn the host started. */
+  backgroundTimeoutMs: number
+  /** Delay of the one private-chat reminder; `0` disables it. */
+  reminderMs: number
+}
 
 export interface ApprovalHooks {
   /**
@@ -53,6 +74,17 @@ export interface ApprovalHooks {
    * patch is attempted once.
    */
   patchCard?(messageId: string, card: object): Promise<void>
+  /**
+   * Whether the session's running turn was started by the host rather than
+   * a Feishu message; such a card waits `backgroundTimeoutMs`. Absent =
+   * every card waits `timeoutMs`.
+   */
+  backgroundTurn?(sessionId: string): boolean
+  /**
+   * Durable grants and card records. Absent = grants live in memory only and
+   * settled cards carry no 「重新发起」 button.
+   */
+  store?: ApprovalStore
 }
 
 /**
@@ -74,6 +106,8 @@ interface Pending extends PendingCardEntry {
   openedAt: number
   /** The administrator-only notice was already added to the card. */
   adminNoted: boolean
+  /** Pending private-chat reminder, cleared on settle. */
+  reminder: ReturnType<typeof setTimeout> | undefined
   resolve(outcome: ApprovalOutcome): void
 }
 
@@ -90,6 +124,29 @@ const ESCALATION_REASON_PREFIX = 'escalate sandbox to '
 const ALLOW_WORDS = new Set(['允许', '同意', '可以', '好', '好的', '行', '确认', 'y', 'yes', 'ok', 'allow', 'approve'])
 const DENY_WORDS = new Set(['拒绝', '不允许', '不行', '不', '否', '不同意', 'n', 'no', 'deny', 'reject'])
 const ALWAYS_WORDS = new Set(['全部允许', '都允许', '允许所有', '允许全部', '总是允许', '始终允许', 'allow all', 'always'])
+
+/** Cap on the command quoted in a 「重新发起」 prompt. */
+const RETRY_PROMPT_COMMAND_MAX_CHARS = 600
+
+/**
+ * Prompt of the turn a 「重新发起」 click starts: what was asked, why it did
+ * not run, and an instruction to check the current state before retrying.
+ * @param question - the stored question of the clicked card.
+ * @param state - how the card ended.
+ * @returns the prompt text.
+ */
+export function approvalRetryPrompt(question: SettledApprovalQuestion, state: 'expired' | 'interrupted'): string {
+  const cause = state === 'expired' ? '超时没有处理，被自动拒绝' : '因为服务重启中断了，没有得到答复'
+  const target = question.escalateTo === undefined
+    ? `工具 \`${question.toolName}\``
+    : `工具 \`${question.toolName}\` 提升到 \`${question.escalateTo}\` 权限`
+  const command = question.command === undefined
+    ? ''
+    : `当时要执行的命令：\n\`\`\`\n${question.command.slice(0, RETRY_PROMPT_COMMAND_MAX_CHARS)}\n\`\`\`\n`
+  return `之前一次请求执行${target}的审批${cause}，用户点了「重新发起」。\n${command}`
+    + '先核对实际状态：工作目录里的文件和 git 状态、远端分支和 MR、已经发出的消息或文件。已经完成的对外操作不要重做；'
+    + '如果那一步仍然需要，就重新执行，需要授权时会再次发起审批。'
+}
 
 /**
  * Classify one typed reply. Trailing punctuation and case are ignored; the
@@ -139,14 +196,21 @@ export class ApprovalAnswerer {
   private readonly table: PendingCardTable<Pending>
   /** sessionId → callId → the current turn's recorded tool calls. */
   private readonly calls = new Map<string, Map<string, RecordedCall>>()
-  /** sessionId → standing "stop asking in this topic" grant keys. */
+  /** sessionId → standing "stop asking in this topic" grant keys (mirrors the store). */
   private readonly grants = new Map<string, Set<string>>()
+  /** Marks this process's stored card records; another instance's open records were interrupted. */
+  private readonly instanceId = randomUUID()
   private opened = 0
 
+  /**
+   * @param channel - channel that sends the cards and reminders.
+   * @param hooks - routing, permissions, durable patching, and storage.
+   * @param timings - the approval windows, read when each card opens.
+   */
   constructor(
-    channel: FeishuChannel,
+    private readonly channel: FeishuChannel,
     private readonly hooks: ApprovalHooks,
-    private readonly timeoutMs: number,
+    private readonly timings: () => ApprovalTimings,
   ) {
     this.table = new PendingCardTable(channel, hooks.onError, hooks.patchCard?.bind(hooks))
   }
@@ -205,7 +269,9 @@ export class ApprovalAnswerer {
     const described = asksUnconfined ? { ...recorded, escalateTo: UNCONFINED_MODE } : recorded
     const adminOnly = described.escalateTo === UNCONFINED_MODE
     const grantKey = `${req.toolName}\u0000${described.escalateTo ?? ''}`
-    if (this.grants.get(sessionId)?.has(grantKey) === true) return Promise.resolve('allowed-once')
+    if (this.hasGrant(sessionId, grantKey)) return Promise.resolve('allowed-once')
+    const timings = this.timings()
+    const timeoutMs = this.hooks.backgroundTurn?.(sessionId) === true ? timings.backgroundTimeoutMs : timings.timeoutMs
 
     const token = randomUUID()
     // `displayReason` (DSH 0.2.0) is presentation-only and locale-aware;
@@ -217,7 +283,7 @@ export class ApprovalAnswerer {
       ...(displayReason === undefined ? {} : { reason: displayReason }),
       ...described,
       ...(adminOnly ? { adminOnly } : {}),
-      timeoutMs: this.timeoutMs,
+      timeoutMs,
       sessionId,
     }
     return new Promise<ApprovalOutcome>((resolve) => {
@@ -232,6 +298,7 @@ export class ApprovalAnswerer {
         onAbort: undefined,
         unauthorizedNoted: false,
         adminNoted: false,
+        reminder: undefined,
         question,
         grantKey,
         openedAt: ++this.opened,
@@ -252,9 +319,7 @@ export class ApprovalAnswerer {
       void this.table.deliver(entry, {
         card: buildApprovalCard(question),
         onWithdrawn: e => this.table.patch(e, buildApprovalSettledCard(e.question, 'cancelled')),
-        onDelivered: e => this.table.armTimeout(e, this.timeoutMs, () => {
-          this.settle(e, 'rejected', 'expired')
-        }),
+        onDelivered: e => this.onDelivered(e, route, timings.reminderMs),
         // No card → no human answerer → fail closed.
         onFailure: e => {
           this.table.close(e, () => {})
@@ -324,11 +389,72 @@ export class ApprovalAnswerer {
     }
   }
 
-  /** Withdraw every in-flight question (plugin shutdown). */
+  /**
+   * Withdraw every in-flight question (plugin shutdown or restart). With a
+   * store, each delivered card becomes interrupted with a 「重新发起」 button;
+   * the host settles the questions cancelled either way.
+   */
   dispose(): void {
-    this.table.withdrawAll(entry => this.settle(entry, 'cancelled'))
+    this.table.withdrawAll(entry => this.settle(entry, 'cancelled', this.hooks.store === undefined ? undefined : 'interrupted'))
     this.calls.clear()
     this.grants.clear()
+  }
+
+  /**
+   * Turn the cards an earlier process left undecided (a crash or kill
+   * skipped `dispose`) into interrupted cards with a 「重新发起」 button.
+   * Call once the outbox can patch.
+   * @returns how many cards were recovered.
+   */
+  recoverInterrupted(): number {
+    const store = this.hooks.store
+    if (store === undefined) return 0
+    const records = store.interruptedCards(this.instanceId)
+    for (const record of records) {
+      store.settleCard(record.key, 'interrupted')
+      this.table.patchMessage(record.sessionId, record.key,
+        buildApprovalSettledCard(record.question, 'interrupted', { retry: { sessionId: record.sessionId } }))
+    }
+    return records.length
+  }
+
+  /** Whether a session holds a standing grant (memory first, then the store). */
+  private hasGrant(sessionId: string, grantKey: string): boolean {
+    return this.grants.get(sessionId)?.has(grantKey) === true || this.hooks.store?.hasGrant(sessionId, grantKey) === true
+  }
+
+  /**
+   * The card landed: store it, arm its deadline, and arm the private-chat
+   * reminder when it would fire before the deadline.
+   */
+  private onDelivered(entry: Pending, route: ApprovalRoute, reminderMs: number): void {
+    const { token: _token, ...stored } = entry.question
+    this.hooks.store?.openCard({
+      key: entry.messageId!,
+      sessionId: entry.sessionId,
+      question: stored,
+      state: 'open',
+      instanceId: this.instanceId,
+      createdAt: Date.now(),
+    })
+    this.table.armTimeout(entry, entry.question.timeoutMs, () => {
+      this.settle(entry, 'rejected', 'expired')
+    })
+    if (route.chatType !== 'p2p' || reminderMs <= 0 || reminderMs >= entry.question.timeoutMs) return
+    entry.reminder = setTimeout(() => {
+      entry.reminder = undefined
+      this.remind(entry)
+    }, reminderMs)
+    entry.reminder.unref?.()
+  }
+
+  /** Send the one reminder reply under a still-undecided card. */
+  private remind(entry: Pending): void {
+    if (entry.settled || entry.messageId === undefined) return
+    const text = `⏰ 还有一个审批在等你处理：\`${entry.question.toolName}\`。处理之前这一轮回复会一直暂停，`
+      + `卡片 ${approvalDurationLabel(entry.question.timeoutMs)}内有效，超时自动拒绝。`
+    void this.channel.send(entry.route.chatId, { text }, { replyTo: entry.messageId, replyInThread: entry.route.inThread })
+      .catch((error: unknown) => { this.hooks.onError(entry.sessionId, error) })
   }
 
   /** Undecided entries of one session, oldest first. */
@@ -349,6 +475,7 @@ export class ApprovalAnswerer {
       this.grants.set(entry.sessionId, grants)
     }
     grants.add(entry.grantKey)
+    this.hooks.store?.addGrant(entry.sessionId, entry.grantKey)
     for (const candidate of this.pendingOf(entry.sessionId)) {
       if (candidate.grantKey === entry.grantKey) this.settle(candidate, 'allowed-once', 'remembered')
     }
@@ -372,11 +499,23 @@ export class ApprovalAnswerer {
     this.hooks.onWaitingChange?.(sessionId, this.pendingOf(sessionId).map(entry => entry.question.toolName))
   }
 
-  /** Settle once, then patch the card to its terminal state. */
+  /**
+   * Settle once, then patch the card to its terminal state. With a store, an
+   * expired or interrupted card keeps its record and gets the 「重新发起」
+   * button; any other ending forgets the record.
+   */
   private settle(entry: Pending, outcome: ApprovalOutcome, cardState?: ApprovalCardState): void {
     const closed = this.table.close(entry, () => {
+      if (entry.reminder !== undefined) clearTimeout(entry.reminder)
+      entry.reminder = undefined
+      const store = this.hooks.store
+      const retryable = store !== undefined && (cardState === 'expired' || cardState === 'interrupted')
+      if (store !== undefined && entry.messageId !== undefined) {
+        store.settleCard(entry.messageId, retryable ? cardState : undefined)
+      }
       if (cardState !== undefined) {
-        this.table.patch(entry, buildApprovalSettledCard(entry.question, cardState))
+        this.table.patch(entry, buildApprovalSettledCard(entry.question, cardState,
+          retryable ? { retry: { sessionId: entry.sessionId } } : {}))
       }
     })
     if (!closed) return

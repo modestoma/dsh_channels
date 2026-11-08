@@ -236,6 +236,8 @@ export const EDITABLE_KEYS = [
   // 会话：话题与卡片
   'routeTtlMs',
   'approvalTimeoutMs',
+  'approvalBackgroundTimeoutMs',
+  'approvalReminderMs',
   'questionTimeoutMs',
   'refreshMs',
   'statusRefreshMs',

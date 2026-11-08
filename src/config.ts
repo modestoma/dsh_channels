@@ -29,8 +29,17 @@ export const DEFAULT_APP_SECRET_REF = 'FEISHU_APP_SECRET'
 /** Default route-table GC threshold: 30 days without activity. */
 export const DEFAULT_ROUTE_TTL_MS = 30 * 24 * 60 * 60 * 1000
 
-/** Default HITL approval decision window: 5 minutes per question. */
-export const DEFAULT_APPROVAL_TIMEOUT_MS = 5 * 60 * 1000
+/** Default HITL approval decision window: 24 hours per question. */
+export const DEFAULT_APPROVAL_TIMEOUT_MS = 24 * 60 * 60 * 1000
+
+/** Default approval window of a turn no Feishu message started (subagent, background job, schedule, PR/MR activity): 30 minutes. */
+export const DEFAULT_APPROVAL_BACKGROUND_TIMEOUT_MS = 30 * 60 * 1000
+
+/** Default delay of the one private-chat reminder about an undecided approval card: 10 minutes. */
+export const DEFAULT_APPROVAL_REMINDER_MS = 10 * 60 * 1000
+
+/** Longest approval window either approval timeout accepts: 7 days. */
+export const MAX_APPROVAL_TIMEOUT_MS = 7 * 24 * 60 * 60 * 1000
 
 /** Default structured-question window: 5 minutes per `ask_user_question` call. */
 export const DEFAULT_QUESTION_TIMEOUT_MS = 5 * 60 * 1000
@@ -149,12 +158,28 @@ export const configSchema = z.object({
    */
   routeTtlMs: z.number().int().min(0).default(DEFAULT_ROUTE_TTL_MS),
   /**
-   * HITL approval decision window: how long one approval decision card waits
-   * for an 允许/拒绝 click before failing closed (`rejected`; the card is
-   * patched to 已超时). The pending turn is blocked while the question is
-   * open, so the window trades user think-time against agent stall time.
+   * HITL approval decision window of a turn a Feishu message started: how
+   * long one approval decision card waits for an 允许/拒绝 click before
+   * failing closed (`rejected`; the card is patched to 已超时 with a
+   * 「重新发起」 button). The turn is blocked while the question is open, but
+   * any other reply in the topic rejects the card and runs as the next
+   * instruction, so a long window never locks the topic.
    */
-  approvalTimeoutMs: z.number().int().min(10_000).max(3_600_000).default(DEFAULT_APPROVAL_TIMEOUT_MS),
+  approvalTimeoutMs: z.number().int().min(60_000).max(MAX_APPROVAL_TIMEOUT_MS).default(DEFAULT_APPROVAL_TIMEOUT_MS),
+  /**
+   * Approval decision window of a turn no Feishu message started (a subagent
+   * finishing, a background job, a schedule, PR/MR activity). Shorter than
+   * `approvalTimeoutMs` because nobody is watching such a turn when it asks;
+   * the expired card keeps the 「重新发起」 button.
+   */
+  approvalBackgroundTimeoutMs: z.number().int().min(60_000).max(MAX_APPROVAL_TIMEOUT_MS).default(DEFAULT_APPROVAL_BACKGROUND_TIMEOUT_MS),
+  /**
+   * Delay of the one reminder an undecided approval card gets, sent as a
+   * reply under the card. Private-chat topics only: group topics never get
+   * it. `0` disables the reminder; a delay at or beyond the card's window
+   * never fires.
+   */
+  approvalReminderMs: z.number().int().min(0).max(MAX_APPROVAL_TIMEOUT_MS).default(DEFAULT_APPROVAL_REMINDER_MS),
   /**
    * Accept inbound Feishu images, files, and merged-forward chat records.
    *
