@@ -3339,6 +3339,28 @@ describe('HITL approval wiring', () => {
     await h.service.shutdown()
   })
 
+  it('ignores a retry click once /renew has bound the topic to another Session', async () => {
+    const { h, agent, pending, cardId } = await askApproval({ approvalTimeoutMs: 30 })
+    await expect(pending).resolves.toBe('rejected')
+    await waitUntil(() => expect(h.ctxState.domain.raw.table('approval_cards').get(cardId)).toMatchObject({ state: 'expired' }))
+    await h.onMessage(makeMessage({
+      chatType: 'p2p', chatId: 'oc_retry', senderId: 'u_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_retry_renew', content: '/renew',
+    }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
+    const renewed = h.ctxState.agents.created[1]!
+    await waitForRenewedRoute(h, 'omt_1', renewed.options.sessionId)
+    const before = h.ctxState.domain.raw.table('routes').get('omt_1')
+
+    const value = { decision: 'approval-retry', sessionId: agent.session.id }
+    await h.channel.fireCardAction({ messageId: cardId, chatId: 'oc_retry', operator: { openId: 'ou_o', userId: 'u_owner' }, action: { value, tag: 'button' } })
+    await flush()
+    expect(mock(agent.followup)).toHaveBeenCalledTimes(1)
+    expect(mock(renewed.handle.agent.followup)).not.toHaveBeenCalled()
+    expect(h.ctxState.domain.raw.table('routes').get('omt_1')).toEqual(before)
+    await h.service.shutdown()
+  })
+
   it('marks an approval card a crashed instance left open as interrupted on start', async () => {
     const { h, pending, cardId } = await askApproval()
     const record = h.ctxState.domain.raw.table('approval_cards').get(cardId) as Record<string, unknown>

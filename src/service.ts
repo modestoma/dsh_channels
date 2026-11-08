@@ -2816,47 +2816,48 @@ export class FeishuService {
     if (target === undefined || this.retriedApprovalCards.has(event.messageId)) return
     const record: ApprovalCardRecord | undefined = this.approvalStore.retryable(event.messageId)
     if (record === undefined || record.sessionId !== target.sessionId || record.state === 'open') return
-    const route = this.routes.findBySession(record.sessionId)
+    const bound = this.routes.findBySession(record.sessionId)
     const operator = event.operator.userId
-    if (route === undefined || operator === undefined
-      || !this.accessController.mayActOnRoute(operator, event.chatId, route)) return
-    const channel = this.channel
-    if (channel === undefined) return
+    if (bound === undefined || operator === undefined) return
     this.retriedApprovalCards.add(event.messageId)
+    let accepted = false
     try {
-      const live = await this.sessions.ensureLive(route)
-      const firstCard = this.streamer?.hasLiveTurn(route.sessionId) === true
-        ? queuedStreamingCard(route.sessionId)
-        : initialStreamingCard(route.sessionId)
-      const sent = await channel.send(route.chatId, { card: firstCard }, {
-        replyTo: event.messageId,
-        replyInThread: route.kind === 'thread',
+      // Serialized with `/renew` and the topic's other route changes: the
+      // retry runs only while the topic still binds the card's Session.
+      accepted = await this.routeOperations.run(bound.key, async () => {
+        const route = this.routes.get(bound.key)
+        const channel = this.channel
+        if (!this.started || channel === undefined || route === undefined || route.sessionId !== record.sessionId
+          || !this.accessController.mayActOnRoute(operator, event.chatId, route)) return false
+        const live = await this.sessions.ensureLive(route)
+        const firstCard = this.streamer?.hasLiveTurn(route.sessionId) === true
+          ? queuedStreamingCard(route.sessionId)
+          : initialStreamingCard(route.sessionId)
+        const sent = await channel.send(route.chatId, { card: firstCard }, {
+          replyTo: event.messageId,
+          replyInThread: route.kind === 'thread',
+        })
+        const prompt = channelPrompt(approvalRetryPrompt(record.question, record.state), principalOnRoute(route, operator))
+        const stored = storablePrompt(prompt)
+        await this.repair.write({
+          key: sent.messageId,
+          sessionId: route.sessionId,
+          chatId: route.chatId,
+          routeKey: route.key,
+          ...(stored === undefined ? {} : { prompt: stored }),
+          cards: [{ messageId: sent.messageId, mode: 'card' }],
+          startedAt: Date.now(),
+          attempts: 0,
+        })
+        await this.routes.put(route.key, { ...route, cardMessageId: sent.messageId, lastActivityAt: Date.now() })
+        return (await this.runTurn(live.agent, prompt, { cardMessageId: sent.messageId })).accepted
       })
-      const prompt = channelPrompt(approvalRetryPrompt(record.question, record.state), principalOnRoute(route, operator))
-      const stored = storablePrompt(prompt)
-      await this.repair.write({
-        key: sent.messageId,
-        sessionId: route.sessionId,
-        chatId: route.chatId,
-        routeKey: route.key,
-        ...(stored === undefined ? {} : { prompt: stored }),
-        cards: [{ messageId: sent.messageId, mode: 'card' }],
-        startedAt: Date.now(),
-        attempts: 0,
-      })
-      const current = this.routes.findBySession(route.sessionId) ?? route
-      await this.routes.put(current.key, { ...current, cardMessageId: sent.messageId, lastActivityAt: Date.now() })
-      const outcome = await this.runTurn(live.agent, prompt, { cardMessageId: sent.messageId })
-      if (!outcome.accepted) {
-        this.retriedApprovalCards.delete(event.messageId)
-        return
-      }
-      this.approvalStore.settleCard(event.messageId)
-      void this.outbox.patch(event.messageId, buildApprovalSettledCard(record.question, 'retried'))
-    } catch (error) {
-      this.retriedApprovalCards.delete(event.messageId)
-      throw error
+    } finally {
+      if (!accepted) this.retriedApprovalCards.delete(event.messageId)
     }
+    if (!accepted) return
+    this.approvalStore.settleCard(event.messageId)
+    void this.outbox.patch(event.messageId, buildApprovalSettledCard(record.question, 'retried'))
   }
 
   /**
