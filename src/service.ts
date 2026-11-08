@@ -2816,6 +2816,7 @@ export class FeishuService {
     if (target === undefined || this.retriedApprovalCards.has(event.messageId)) return
     const record: ApprovalCardRecord | undefined = this.approvalStore.retryable(event.messageId)
     if (record === undefined || record.sessionId !== target.sessionId || record.state === 'open') return
+    const ended = record.state
     const bound = this.routes.findBySession(record.sessionId)
     const operator = event.operator.userId
     if (bound === undefined || operator === undefined) return
@@ -2837,7 +2838,7 @@ export class FeishuService {
           replyTo: event.messageId,
           replyInThread: route.kind === 'thread',
         })
-        const prompt = channelPrompt(approvalRetryPrompt(record.question, record.state), principalOnRoute(route, operator))
+        const prompt = channelPrompt(approvalRetryPrompt(record.question, ended), principalOnRoute(route, operator))
         const stored = storablePrompt(prompt)
         await this.repair.write({
           key: sent.messageId,
