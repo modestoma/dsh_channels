@@ -647,11 +647,17 @@ describe('field descriptors', () => {
     expect(byKey.get('routeTtlMs')).toMatchObject({
       kind: 'number', group: 'cards', min: 0, unit: '天', scale: 86_400_000, restartRequired: false,
     })
-    for (const key of ['approvalTimeoutMs', 'questionTimeoutMs'] as const) {
+    expect(byKey.get('questionTimeoutMs')).toMatchObject({
+      kind: 'number', group: 'cards', min: 10_000, max: 3_600_000, unit: '秒', scale: 1_000, restartRequired: false,
+    })
+    for (const key of ['approvalTimeoutMs', 'approvalBackgroundTimeoutMs'] as const) {
       expect(byKey.get(key)).toMatchObject({
-        kind: 'number', group: 'cards', min: 10_000, max: 3_600_000, unit: '秒', scale: 1_000, restartRequired: false,
+        kind: 'number', group: 'cards', min: 60_000, max: 604_800_000, unit: '分钟', scale: 60_000, restartRequired: false,
       })
     }
+    expect(byKey.get('approvalReminderMs')).toMatchObject({
+      kind: 'number', group: 'cards', min: 0, max: 604_800_000, unit: '分钟', scale: 60_000, restartRequired: false,
+    })
     expect(byKey.get('maxTokens')).toMatchObject({
       kind: 'number', group: 'model', min: 1, optional: true, restartRequired: false,
     })
@@ -1405,6 +1411,8 @@ describe('SettingsSurface', () => {
     const saved = await surface.save({
       routeTtlMs: 86_400_000,
       approvalTimeoutMs: 60_000,
+      approvalBackgroundTimeoutMs: 600_000,
+      approvalReminderMs: 0,
       questionTimeoutMs: 120_000,
       maxTokens: 4096,
     })
@@ -1414,12 +1422,16 @@ describe('SettingsSurface', () => {
     expect(saved.panel.config.effective).toMatchObject({
       routeTtlMs: 86_400_000,
       approvalTimeoutMs: 60_000,
+      approvalBackgroundTimeoutMs: 600_000,
+      approvalReminderMs: 0,
       questionTimeoutMs: 120_000,
       maxTokens: 4096,
     })
 
-    const invalid = await surface.save({ approvalTimeoutMs: 1_000 })
+    const invalid = await surface.save({ approvalTimeoutMs: 30_000 })
     expect(invalid.ok).toBe(false)
+    const tooLong = await surface.save({ approvalBackgroundTimeoutMs: 604_800_001 })
+    expect(tooLong.ok).toBe(false)
 
     const cleared = await surface.save({ maxTokens: '' })
     expect(cleared.ok).toBe(true)

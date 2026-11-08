@@ -13,7 +13,9 @@ import { PANEL_CHEVRON_TOKEN } from './streaming.ts'
  * Terminal states an approval decision card can settle into. `allowed-text`
  * and `denied-text` are decisions typed as a topic reply; `remembered` is the
  * "stop asking in this topic" decision; `superseded` is a non-keyword reply
- * that rejected the request and was queued as the next instruction.
+ * that rejected the request and was queued as the next instruction;
+ * `interrupted` is a card a restart or channel shutdown left undecided;
+ * `retried` is an expired or interrupted card whose 「重新发起」 was clicked.
  */
 export type ApprovalCardState =
   | 'allowed'
@@ -24,6 +26,8 @@ export type ApprovalCardState =
   | 'superseded'
   | 'expired'
   | 'cancelled'
+  | 'interrupted'
+  | 'retried'
 
 /** The question one approval decision card presents. */
 export interface ApprovalQuestion {
@@ -55,6 +59,9 @@ export interface ApprovalQuestion {
   sessionId?: string
 }
 
+/** The question fields a settled card renders (the button token is not needed once decided). */
+export type SettledApprovalQuestion = Omit<ApprovalQuestion, 'token'>
+
 /** Approval card rendering options. */
 export interface ApprovalCardOptions {
   /** Add the owner-only notice (a non-owner clicked and was ignored). */
@@ -79,9 +86,18 @@ const LABEL_LINE = /^([^\s:：]{1,16})(?:：|: )(.*)$/u
 /** The sandbox mode whose standing grant removes all confinement. */
 export const UNCONFINED_MODE = 'danger-full-access'
 
-/** `⏱ 5 分钟内有效…` — human timeout label (whole minutes, min 1). */
-function approvalTimeoutLabel(timeoutMs: number): string {
-  return `${Math.max(1, Math.round(timeoutMs / 60_000))} 分钟`
+/** Card value `decision` of the 「重新发起」 button on an expired or interrupted card. */
+export const APPROVAL_RETRY_ACTION = 'approval-retry'
+
+/**
+ * Human duration label: whole minutes under an hour (at least 1), hours
+ * (one decimal at most) from an hour up.
+ * @param ms - the duration.
+ * @returns e.g. `10 分钟`, `24 小时`, `1.5 小时`.
+ */
+export function approvalDurationLabel(ms: number): string {
+  if (ms < 3_600_000) return `${Math.max(1, Math.round(ms / 60_000))} 分钟`
+  return `${Number((ms / 3_600_000).toFixed(1))} 小时`
 }
 
 /** Clip to `max` chars and report how many were dropped. */
@@ -97,7 +113,7 @@ function clip(value: string, max: number): { shown: string; hidden: number } {
  * @param question - the question whose grant scope is described.
  * @returns The scope phrase.
  */
-export function approvalGrantScope(question: Pick<ApprovalQuestion, 'toolName' | 'escalateTo'>): string {
+export function approvalGrantScope(question: Pick<SettledApprovalQuestion, 'toolName' | 'escalateTo'>): string {
   return question.escalateTo === undefined
     ? `\`${question.toolName}\``
     : `\`${question.toolName}\` 提升到 \`${question.escalateTo}\``
@@ -133,7 +149,7 @@ function approvalActions(question: ApprovalQuestion): object[] {
   return [
     columnSet((['allow', 'deny'] as const).map(decision => approvalButton(question, decision))),
     approvalButton(question, 'always'),
-    note(`♾️ ${scope}；/renew 或重启后恢复询问`),
+    note(`♾️ ${scope}；/renew 开新会话后恢复询问`),
   ]
 }
 
@@ -185,7 +201,7 @@ function reasonElements(reason: string): object[] {
 }
 
 /** The question summary shared by the pending and settled variants. */
-function approvalQuestionElements(question: ApprovalQuestion): object[] {
+function approvalQuestionElements(question: SettledApprovalQuestion): object[] {
   const elements: object[] = []
   const hasReason = question.reason !== undefined && question.reason.trim() !== ''
   const hasCommand = question.command !== undefined && question.command !== ''
@@ -222,7 +238,7 @@ export function buildApprovalCard(question: ApprovalQuestion, options: ApprovalC
   const elements: object[] = [
     ...approvalQuestionElements(question),
     divider(),
-    note(`⏱ ${approvalTimeoutLabel(question.timeoutMs)}内有效，超时自动拒绝 · 「允许」仅对本次生效`),
+    note(`⏱ ${approvalDurationLabel(question.timeoutMs)}内有效，超时自动拒绝 · 「允许」仅对本次生效`),
     note('💬 也可直接回复「允许」「拒绝」「全部允许」；回复其他内容视为拒绝，并作为下一条指令'),
   ]
   if (question.adminOnly === true) {
@@ -251,17 +267,57 @@ const APPROVAL_SETTLED_LINES: Record<ApprovalCardState, string> = {
   superseded: '❌ 已拒绝，你的新消息将作为下一条指令',
   expired: '⏱ 已超时未处理，自动拒绝',
   cancelled: '↩️ 请求已取消',
+  interrupted: '⚠️ 服务重启，审批已中断',
+  retried: '🔁 已重新发起',
+}
+
+/** Settled-card options. */
+export interface ApprovalSettledCardOptions {
+  /**
+   * Add the 「重新发起」 button (expired and interrupted cards whose record
+   * is stored). The click starts a turn in this Session.
+   */
+  retry?: { sessionId: string }
 }
 
 /**
  * The terminal replacement for a decision card after the question settles
- * (decision, timeout, or withdrawal). Keeps the question summary for context
- * and removes the decision controls entirely.
+ * (decision, timeout, withdrawal, or restart). Keeps the question summary
+ * for context and removes the decision controls; an expired or interrupted
+ * card may carry the 「重新发起」 button instead.
  */
-export function buildApprovalSettledCard(question: ApprovalQuestion, state: ApprovalCardState): object {
+export function buildApprovalSettledCard(
+  question: SettledApprovalQuestion,
+  state: ApprovalCardState,
+  options: ApprovalSettledCardOptions = {},
+): object {
   const elements = [...approvalQuestionElements(question), divider()]
   if (state === 'remembered') {
-    elements.push(note(`本话题内 ${approvalGrantScope(question)} 将自动允许；/renew 或重启后恢复询问`))
+    elements.push(note(`本话题内 ${approvalGrantScope(question)} 将自动允许；/renew 开新会话后恢复询问`))
+  }
+  if (options.retry !== undefined && (state === 'expired' || state === 'interrupted')) {
+    elements.push(
+      note('🔁 点「重新发起」让模型先核对当前状态，再重试这一步；需要授权时会重新发审批卡片'),
+      textButton({
+        label: '🔁 重新发起',
+        type: 'primary',
+        width: 'default',
+        margin: '8px 0 0 0',
+        value: { decision: APPROVAL_RETRY_ACTION, sessionId: options.retry.sessionId },
+      }),
+    )
   }
   return standaloneCard(`**${APPROVAL_SETTLED_LINES[state]} · \`${question.toolName}\`**`, elements)
+}
+
+/**
+ * Parse a 「重新发起」 click value.
+ * @param value - `action.value` of a card click.
+ * @returns the Session the clicked card belongs to, or undefined for any other click.
+ */
+export function parseApprovalRetryAction(value: unknown): { sessionId: string } | undefined {
+  if (typeof value !== 'object' || value === null) return undefined
+  const record = value as Record<string, unknown>
+  if (record.decision !== APPROVAL_RETRY_ACTION || typeof record.sessionId !== 'string' || record.sessionId === '') return undefined
+  return { sessionId: record.sessionId }
 }

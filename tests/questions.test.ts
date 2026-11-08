@@ -14,6 +14,7 @@ const ROUTE: ApprovalRoute = {
   cardMessageId: 'om_main',
   inThread: true,
   senderUserId: 'u_owner',
+  chatType: 'p2p',
 }
 
 function makeAnswerer(overrides: Partial<ApprovalRoute> = {}): {

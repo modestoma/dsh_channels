@@ -1736,6 +1736,26 @@ describe('TurnStreamer host turns', () => {
     await vi.waitFor(() => expect(ch.addReaction).toHaveBeenCalledWith('om_trigger', 'DONE'))
   })
 
+  it('tells a host-started running turn from one a channel prompt opened', async () => {
+    const ch = channel()
+    const streamer = new TurnStreamer(ch, 500, { ...hooks(), hostTurnOrigin: vi.fn(() => undefined) })
+    const host = makeSession('sess-host-kind')
+    const feishu = makeSession('sess-feishu-kind')
+    expect(streamer.runsHostTurn('sess-host-kind')).toBe(false)
+    streamer.onInboxClaimed(host, prompt('job-done', 'tool-jobs'), 1)
+    expect(streamer.runsHostTurn('sess-host-kind')).toBe(true)
+    // Still host-started once the turn rendered nowhere.
+    await vi.advanceTimersByTimeAsync(0)
+    expect(streamer.runsHostTurn('sess-host-kind')).toBe(true)
+    streamer.onSessionEvent(host, { type: 'turn/end', seq: 1, data: { turn: 1, reason: 'stop' } })
+    expect(streamer.runsHostTurn('sess-host-kind')).toBe(false)
+
+    const message = prompt('m-feishu-kind')
+    streamer.attach(feishu, 'om_user', 'om_trigger', 'react-typing', { prompt: promptOf(message) })
+    streamer.onInboxClaimed(feishu, message, 1)
+    expect(streamer.runsHostTurn('sess-feishu-kind')).toBe(false)
+  })
+
   it('takes a host card\'s origin from the batch\'s turn prompt, not injected next-step input', async () => {
     const ch = channel()
     const hooksInstance = { ...hooks(), hostTurnOrigin: vi.fn(() => 'origin') }
