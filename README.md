@@ -209,6 +209,11 @@ src/
 │   ├── repair.ts          #   inflight 快照 + 重启恢复（重放 / 补画 / 继续）
 │   ├── manager.ts         #   live Agent、冷恢复、preset、/renew 事务
 │   └── request-policy.ts  #   会话请求策略：配置的 provider/model 与推理强度（含 /effort 覆盖）
+├── turn/                  # 流式回复卡的回合层
+│   ├── streamer.ts        #   TurnStreamer：哪张卡渲染哪一轮（排队 / 认领 / 宿主回合）、停止与插话、卡片快照
+│   ├── state.ts           #   回合状态与纯折叠：会话事件、助手流帧、子代理事件 → 状态
+│   ├── activity.ts        #   首行与委派状态行的文字（纯函数）
+│   └── delivery.ts        #   卡片投递：节流更新、超长分段续卡、串行发送与重试、结算与表情切换
 ├── feishu/
 │   ├── delivery.ts        # 出站投递：首帧话题卡、结果卡、分段降级、表情生命周期
 │   ├── native-attachments.ts  # 原生附件存储：saveImage/saveFileStream、结构化失败、文件句柄文本
@@ -251,7 +256,13 @@ src/
 │   ├── origin-cache.ts    #   按会话缓存的来源查询
 │   ├── navigation.ts      #   保存壳的 uiWorkspace 服务，供「会话记录」打开会话
 │   ├── panel/             #   页面外壳 + 八个标签页
-│   │   ├── index.tsx      #     加载 / 5s 状态轮询 / 全局草稿 / catalog 级联 / 顶部状态头 / Tab
+│   │   ├── index.tsx      #     页面外壳：拼装下面四个 hook，渲染状态头 / Tab / 提示条 / 保存条
+│   │   ├── header.tsx     #     顶部状态头与 Tab 导航（未保存标记、待处理计数、键盘切换）
+│   │   ├── use-panel-data.ts #  加载 / 5s 状态轮询 / 手动刷新 / 写操作后替换面板与访问快照
+│   │   ├── use-config-draft.ts # 全局草稿：catalog 级联、选目录、保存 / 放弃 / 清除覆盖、各 Tab 未保存标记
+│   │   ├── use-connection-actions.ts # 连接 / 重连 / 接管与凭据输入框
+│   │   ├── use-access-actions.ts # 用户表与群权限的写操作和结果提示
+│   │   ├── actions.ts     #     写操作公共流程（busy / 提示 / 异常）与二次确认
 │   │   ├── shared.tsx     #     行 / 开关 / 分组 / 保存栏等渲染原语、阶段徽标、草稿校验
 │   │   ├── connection-tab.tsx #   连接：三步引导 / 状态块 / 自检 / 待生效提醒 / 凭据
 │   │   ├── credentials-card.tsx  #  凭据行：更换 / 移除（不回显）

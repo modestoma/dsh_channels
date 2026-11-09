@@ -5,8 +5,8 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { DROPPED_NOTICE } from '../src/cards/index.ts'
-import { TurnStreamer } from '../src/streamer.ts'
-import type { AttachOptions } from '../src/streamer.ts'
+import { TurnStreamer } from '../src/turn/streamer.ts'
+import type { AttachOptions } from '../src/turn/streamer.ts'
 import type { MessageId, Session, SessionEvent, SessionId, UserMessage } from '../src/host/index.ts'
 import type { ChannelPrompt } from '../src/session/prompt.ts'
 import type { FeishuChannel } from '../src/feishu-channel.ts'

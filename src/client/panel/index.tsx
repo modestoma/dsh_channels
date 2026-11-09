@@ -1,78 +1,33 @@
 /**
- * 左侧栏「飞书渠道」主区页面：数据加载、5 秒状态轮询、全局 draft、顶部状态头 /
- * tab 导航与底部保存条的外壳。
+ * 左侧栏「飞书渠道」主区页面：页面外壳把数据、草稿和写操作 hook 拼起来，渲染
+ * 顶部状态头 / tab 导航 / 提示条 / 当前标签页 / 底部保存条。
  *
- * 所有 Host 交互（panel / status / catalog / config / credentials / access /
- * pick-directory）都集中在这里；tab 组件只接收渲染所需的数据与
+ * Host 交互分在四个 hook 里：`use-panel-data`（加载、轮询、刷新）、
+ * `use-config-draft`（全局草稿与保存）、`use-connection-actions`（连接与凭据）、
+ * `use-access-actions`（用户表与群权限）；tab 组件只接收渲染所需的数据与
  * 回调。页面不 import 任何 DSH 客户端包，只依赖 react 与 `main` 槽位。
  *
  * @module dsh-channels/client/panel
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { KeyboardEvent } from 'react'
-import { PANEL_COPY, PANEL_TABS, TAB_FIELD_GROUPS } from '../../settings/contract.ts'
-import type {
-  AccessMutationResponse,
-  AccessPermissionWire,
-  AccessWire,
-  GroupPermissionWire,
-  CatalogWire,
-  ChannelStatusWire,
-  ConfigValue,
-  CredentialField,
-  EditableKey,
-  EditableValues,
-  FieldIssueWire,
-  PanelTabId,
-  PanelWire,
-} from '../../settings/contract.ts'
-import {
-  addAccessUser,
-  clearConfig,
-  clearCredential,
-  fetchCatalog,
-  fetchPanel,
-  fetchStatus,
-  pickDirectory as requestDirectoryPicker,
-  reconnect,
-  takeover,
-  removeAccessGroup,
-  removeAccessUser,
-  resolveAccessRequest,
-  setAccessGitEmail,
-  setAccessPermission,
-  setGroupPermission,
-  saveConfig,
-  saveCredentials,
-} from '../api.ts'
-import { applyCatalogFields, catalogFromFields } from '../catalog.ts'
+import { useCallback, useMemo, useState } from 'react'
+import { PANEL_COPY } from '../../settings/contract.ts'
+import type { FieldIssueWire, PanelTabId } from '../../settings/contract.ts'
+import type { PanelOps } from './actions.ts'
 import { AccessTab } from './access-tab.tsx'
 import { AdvancedTab } from './advanced-tab.tsx'
 import { ConnectionTab } from './connection-tab.tsx'
 import { FieldsTab } from './fields-tab.tsx'
 import { GroupsTab } from './groups-tab.tsx'
+import { PanelHeader, TabNav } from './header.tsx'
 import { useFeishuProfiles } from './profiles.ts'
-import {
-  fieldLabel,
-  formatUptime,
-  messageOf,
-  NoticeBar,
-  phaseBadge,
-  Pill,
-  SaveBar,
-  validateDraft,
-} from './shared.tsx'
-import type {
-  BusyAction,
-  CredentialsView,
-  FormView,
-  LoadState,
-  Notice,
-} from './shared.tsx'
-import { FeishuChannelsIcon } from '../icon.tsx'
-import { RefreshIcon } from './records-icons.tsx'
+import { NoticeBar, SaveBar } from './shared.tsx'
+import type { BusyAction, FormView, Notice } from './shared.tsx'
 import { RecordsTab } from './records-tab.tsx'
+import { useAccessActions } from './use-access-actions.ts'
+import { useConfigDraft } from './use-config-draft.ts'
+import { useConnectionActions } from './use-connection-actions.ts'
+import { usePanelData } from './use-panel-data.ts'
 import { WikiTab } from './wiki-tab.tsx'
 
 /**
@@ -92,624 +47,56 @@ export function FeishuChannelsPage(): JSX.Element {
 
 /** Panel shell: one panel payload, one status poll, one global config draft. */
 function FeishuChannelsPanel(): JSX.Element | null {
-  const [load, setLoad] = useState<LoadState>({ phase: 'loading' })
+  const data = usePanelData()
+  const { load, panel, hostBusy } = data
   const [activeTab, setActiveTab] = useState<PanelTabId>('connection')
-  const [draft, setDraft] = useState<EditableValues>({})
   const [notice, setNotice] = useState<Notice | null>(null)
   const [busy, setBusy] = useState<BusyAction | null>(null)
-  const [status, setStatus] = useState<ChannelStatusWire | null>(null)
-  const [pollError, setPollError] = useState<string | null>(null)
-  const [appIdInput, setAppIdInput] = useState('')
-  const [appSecretInput, setAppSecretInput] = useState('')
-  const [catalog, setCatalog] = useState<CatalogWire | null>(null)
-  const [catalogBusy, setCatalogBusy] = useState(false)
-  const [accessNotice, setAccessNotice] = useState<string | null>(null)
-  const [accessError, setAccessError] = useState<string | null>(null)
-  const catalogTicket = useRef(0)
-  /** Latest ready panel, read from the poll loop without restarting it. */
-  const panelRef = useRef<PanelWire | null>(null)
-  const panel = load.phase === 'ready' ? load.panel : null
-  /** Host-side lifecycle busy: connecting/restarting blocks every panel write. */
-  const hostBusy = (status ?? panel?.status)?.busy === true
-  useEffect(() => {
-    panelRef.current = panel
-  }, [panel])
-
-  const loadPanel = useCallback(async (): Promise<void> => {
-    setLoad({ phase: 'loading' })
-    setNotice(null)
-    setAccessNotice(null)
-    setAccessError(null)
-    try {
-      const next = await fetchPanel()
-      setLoad({ phase: 'ready', panel: next })
-      setStatus(next.status)
-      setDraft({})
-      setAppIdInput('')
-      setAppSecretInput('')
-    } catch (error) {
-      setLoad({ phase: 'error', message: messageOf(error) })
-    }
-  }, [])
-
-  useEffect(() => {
-    void loadPanel()
-  }, [loadPanel])
-
-  // The Host panel payload already carries options resolved for the effective
-  // route; re-seed the local catalog whenever a fresh panel arrives (load/save).
-  useEffect(() => {
-    if (panel === null) {
-      setCatalog(null)
-      return
-    }
-    setCatalog(catalogFromFields(panel.config.fields))
-    setCatalogBusy(false)
-  }, [panel])
-
-  useEffect(() => {
-    if (load.phase !== 'ready') return undefined
-    let cancelled = false
-    const tick = async (): Promise<void> => {
-      try {
-        const previousPhase = panelRef.current?.status.phase
-        const next = await fetchStatus()
-        if (cancelled) return
-        setStatus(next)
-        setPollError(null)
-        // A phase transition changes what the panel payload can offer: the
-        // storage domain opens/closes with the connection, so the access
-        // whitelists go stale. Re-read the panel but
-        // never touch the dirty draft.
-        if (previousPhase !== undefined && previousPhase !== next.phase) {
-          try {
-            const refreshed = await fetchPanel()
-            if (!cancelled) {
-              setLoad({ phase: 'ready', panel: refreshed })
-              setStatus(refreshed.status)
-            }
-          } catch {
-            // Keep the status-only update; the next manual refresh retries.
-          }
-        }
-      } catch (error) {
-        if (!cancelled) setPollError(messageOf(error))
-      }
-    }
-    const timer = window.setInterval(() => { void tick() }, 5_000)
-    return () => {
-      cancelled = true
-      window.clearInterval(timer)
-    }
-  }, [load.phase])
-
-  /** Fetch the selector catalog for a draft route (latest request wins). */
-  const refreshCatalog = useCallback(async (provider: string, model: string): Promise<void> => {
-    catalogTicket.current += 1
-    const ticket = catalogTicket.current
-    setCatalogBusy(true)
-    try {
-      const next = await fetchCatalog(provider, model)
-      if (catalogTicket.current === ticket) setCatalog(next)
-    } catch {
-      if (catalogTicket.current !== ticket) return
-      // Never keep another route's options: degrade the dependent fields to the
-      // free-text controls instead of offering stale values.
-      setCatalog(previous => previous === null ? null : {
-        provider: previous.provider,
-        model: { selectable: false, options: [] },
-        reasoningEffort: { selectable: false, options: [] },
-        agentPreset: previous.agentPreset,
-      })
-      setNotice({ kind: 'error', text: PANEL_COPY.catalogFailed })
-    } finally {
-      if (catalogTicket.current === ticket) setCatalogBusy(false)
-    }
-  }, [])
-
-  /** Current form values, used to keep unlisted configured values visible. */
-  const currentValues = useMemo(() => {
-    if (panel === null) return {}
-    const valueOf = (key: EditableKey): string | undefined => {
-      const raw = draft[key] ?? panel.config.effective[key] ?? panel.config.base[key]
-      return typeof raw === 'string' && raw !== '' ? raw : undefined
-    }
-    return {
-      provider: valueOf('provider'),
-      model: valueOf('model'),
-      reasoningEffort: valueOf('reasoningEffort'),
-      agentPreset: valueOf('agentPreset'),
-    }
-  }, [draft, panel])
-
-  const renderedFields = useMemo(
-    () => applyCatalogFields(panel?.config.fields ?? [], catalog, currentValues),
-    [panel, catalog, currentValues],
-  )
-
-  /** Whether one selector currently renders as a dropdown for this form. */
-  const isSelectField = useCallback(
-    (key: EditableKey): boolean => renderedFields.some(field => field.key === key && field.kind === 'select'),
-    [renderedFields],
-  )
-
-  /** Draft one field, cascading provider → model → effort like the Host catalog. */
-  const updateDraft = useCallback((key: EditableKey, value: ConfigValue) => {
-    if (panel === null) return
-    const providerNow = String(
-      draft.provider ?? panel.config.effective.provider ?? panel.config.base.provider ?? '',
-    )
-    setNotice(null)
-    if (key === 'provider') {
-      // Changing the provider invalidates the model/effort below it. When the
-      // selected provider is the configured one, keep showing its configured
-      // model; otherwise fall back to the inherit choice.
-      const nextProvider = String(value ?? '')
-      const configuredProvider = String(
-        panel.config.effective.provider ?? panel.config.base.provider ?? '',
-      )
-      const keepModel = nextProvider === configuredProvider
-        ? String(panel.config.effective.model ?? panel.config.base.model ?? '')
-        : ''
-      setDraft(previous => ({ ...previous, provider: value, model: '', reasoningEffort: '' }))
-      if (catalog !== null && isSelectField('provider')) void refreshCatalog(nextProvider, keepModel)
-      return
-    }
-    if (key === 'model') {
-      setDraft(previous => ({ ...previous, model: value, reasoningEffort: '' }))
-      if (catalog !== null && isSelectField('model')) void refreshCatalog(providerNow, String(value ?? ''))
-      return
-    }
-    setDraft(previous => ({ ...previous, [key]: value }))
-  }, [catalog, draft.provider, isSelectField, panel, refreshCatalog])
-
-  const refreshStatus = useCallback(async (): Promise<void> => {
-    try {
-      const next = await fetchStatus()
-      setStatus(next)
-      setPollError(null)
-    } catch (error) {
-      setPollError(messageOf(error))
-    }
-  }, [])
-
-  /**
-   * Manual refresh: reload the whole panel payload so access lists and
-   * `restartPendingKeys` catch up with the Host. The dirty draft is
-   * deliberately preserved — refreshing never discards user input.
-   */
-  const onRefresh = useCallback(async (): Promise<void> => {
-    try {
-      const next = await fetchPanel()
-      setLoad({ phase: 'ready', panel: next })
-      setStatus(next.status)
-      setPollError(null)
-      setAccessNotice(null)
-      setAccessError(null)
-    } catch (error) {
-      setPollError(messageOf(error))
-    }
-  }, [])
-
-  /** Submit every dirty field at once; the Host persists and re-validates. */
-  const onSave = useCallback(async (): Promise<void> => {
-    if (panel === null) return
-    const { values, issues } = validateDraft(panel, draft)
-    if (issues.length > 0) {
-      // Name the offending fields: with one draft shared by every tab, the
-      // user may be looking at a different tab than the invalid field.
-      const detail = issues
-        .map(issue => `${fieldLabel(panel.config.fields, issue.key as EditableKey)} ${issue.message}`)
-        .join('；')
-      setNotice({ kind: 'error', text: `${PANEL_COPY.saveInvalid}：${detail}`, issues })
-      return
-    }
-    if (Object.keys(values).length === 0) return
-    setBusy('save')
-    setNotice(null)
-    try {
-      const result = await saveConfig(values)
-      if (!result.ok) {
-        setNotice({ kind: 'error', text: result.error, issues: result.issues })
-        return
-      }
-      setLoad({ phase: 'ready', panel: result.panel })
-      setStatus(result.panel.status)
-      // Clear only the submitted keys: edits typed while the request was in
-      // flight stay in the draft instead of being silently discarded.
-      setDraft(previous => {
-        const next = { ...previous }
-        for (const key of Object.keys(values) as EditableKey[]) delete next[key]
-        return next
-      })
-      setNotice({ kind: 'ok', text: PANEL_COPY.saved })
-    } catch (error) {
-      setNotice({ kind: 'error', text: messageOf(error) })
-    } finally {
-      setBusy(null)
-    }
-  }, [draft, panel])
-
-  /** Drop the whole draft (nothing is written). */
-  const discardDraft = useCallback((): void => {
-    if (panel === null) return
-    setDraft({})
-    setNotice(null)
-    catalogTicket.current += 1
-    setCatalog(catalogFromFields(panel.config.fields))
-    setCatalogBusy(false)
-  }, [panel])
-
-  /**
-   * Open the host's native directory chooser (workspace root「选择目录…」) and
-   * stage the picked absolute path as a draft value. Nothing is persisted until
-   *「保存更改」; a canceled dialog is a no-op, not an error.
-   */
-  const onPickDirectory = useCallback(async (key: EditableKey): Promise<void> => {
-    setNotice(null)
-    try {
-      const result = await requestDirectoryPicker()
-      if (!result.ok) {
-        setNotice({ kind: 'error', text: result.error })
-        return
-      }
-      if ('canceled' in result) return
-      setDraft(previous => ({ ...previous, [key]: result.path }))
-      setNotice({ kind: 'ok', text: `${PANEL_COPY.directoryPicked}：${result.path}` })
-    } catch (error) {
-      setNotice({ kind: 'error', text: messageOf(error) })
-    }
-  }, [])
-
-  /** Drop every Web override and return the refreshed panel. */
-  const onClear = useCallback(async (): Promise<void> => {
-    const confirmed = typeof window.confirm === 'function'
-      ? window.confirm(PANEL_COPY.clearConfirm)
-      : true
-    if (!confirmed) return
-    setBusy('clear')
-    setNotice(null)
-    try {
-      const result = await clearConfig()
-      if (!result.ok) {
-        setNotice({ kind: 'error', text: result.error })
-        return
-      }
-      setLoad({ phase: 'ready', panel: result.panel })
-      setStatus(result.panel.status)
-      setDraft({})
-      setNotice({ kind: 'ok', text: PANEL_COPY.cleared })
-    } catch (error) {
-      setNotice({ kind: 'error', text: messageOf(error) })
-    } finally {
-      setBusy(null)
-    }
-  }, [])
-
-  const running = (status ?? panel?.status)?.running === true
-
-  /**
-   * The single connect/reconnect action: open a stopped channel or restart a
-   * running one. Only a restart interrupts live replies, so only it confirms.
-   */
-  const onReconnect = useCallback(async (): Promise<void> => {
-    if (running) {
-      const confirmed = typeof window.confirm === 'function'
-        ? window.confirm(PANEL_COPY.restartWarning)
-        : true
-      if (!confirmed) return
-    }
-    setBusy('reconnect')
-    setNotice(null)
-    try {
-      const result = await reconnect()
-      if (!result.ok) {
-        setNotice({ kind: 'error', text: result.error })
-        // Incomplete credentials: send the user back to the onboarding form.
-        if (result.unconfigured === true) setActiveTab('connection')
-        await refreshStatus()
-        return
-      }
-      setLoad({ phase: 'ready', panel: result.panel })
-      setStatus(result.panel.status)
-      setNotice({ kind: 'ok', text: running ? PANEL_COPY.reconnectDone : PANEL_COPY.connectDone })
-    } catch (error) {
-      setNotice({ kind: 'error', text: messageOf(error) })
-      await refreshStatus()
-    } finally {
-      setBusy(null)
-    }
-  }, [refreshStatus, running])
-
-  /** Take the connection over from the other dsh process; it interrupts that process's replies. */
-  const onTakeover = useCallback(async (): Promise<void> => {
-    const confirmed = typeof window.confirm === 'function'
-      ? window.confirm(PANEL_COPY.takeoverWarning)
-      : true
-    if (!confirmed) return
-    setBusy('takeover')
-    setNotice(null)
-    try {
-      const result = await takeover()
-      if (!result.ok) {
-        setNotice({ kind: 'error', text: result.error })
-        if (result.unconfigured === true) setActiveTab('connection')
-        await refreshStatus()
-        return
-      }
-      setLoad({ phase: 'ready', panel: result.panel })
-      setStatus(result.panel.status)
-      setNotice({ kind: 'ok', text: PANEL_COPY.takeoverDone })
-    } catch (error) {
-      setNotice({ kind: 'error', text: messageOf(error) })
-      await refreshStatus()
-    } finally {
-      setBusy(null)
-    }
-  }, [refreshStatus])
-
-  /** Replace the embedded access snapshot after a user-table mutation. */
-  const applyAccess = useCallback((access: AccessWire): void => {
-    setLoad(previous => previous.phase === 'ready'
-      ? { phase: 'ready', panel: { ...previous.panel, access } }
-      : previous)
-  }, [])
-
-  const onTogglePermission = useCallback(async (
-    userId: string,
-    permission: AccessPermissionWire,
-    enabled: boolean,
-  ): Promise<void> => {
-    setBusy('access')
-    setAccessError(null)
-    setAccessNotice(null)
-    try {
-      const result = await setAccessPermission(userId, permission, enabled)
-      if (!result.ok) {
-        setAccessError(result.error)
-        return
-      }
-      applyAccess(result.access)
-      setAccessNotice(PANEL_COPY.accessPermissionChanged)
-    } catch (error) {
-      setAccessError(messageOf(error))
-    } finally {
-      setBusy(null)
-    }
-  }, [applyAccess])
-
-  const onToggleGroupPermission = useCallback(async (
-    chatId: string,
-    permission: GroupPermissionWire,
-    enabled: boolean,
-  ): Promise<void> => {
-    setBusy('access')
-    setAccessError(null)
-    setAccessNotice(null)
-    try {
-      const result = await setGroupPermission(chatId, permission, enabled)
-      if (!result.ok) {
-        setAccessError(result.error)
-        return
-      }
-      applyAccess(result.access)
-      setAccessNotice(PANEL_COPY.groupPermissionChanged)
-    } catch (error) {
-      setAccessError(messageOf(error))
-    } finally {
-      setBusy(null)
-    }
-  }, [applyAccess])
-
-  /** Set or clear one user's git email; resolves true when the editor should close. */
-  const onSetGitEmail = useCallback(async (userId: string, gitEmail: string): Promise<boolean> => {
-    setBusy('access')
-    setAccessError(null)
-    setAccessNotice(null)
-    try {
-      const result = await setAccessGitEmail(userId, gitEmail)
-      if (!result.ok) {
-        setAccessError(result.error)
-        return false
-      }
-      applyAccess(result.access)
-      setAccessNotice(PANEL_COPY.accessGitEmailChanged)
-      return true
-    } catch (error) {
-      setAccessError(messageOf(error))
-      return false
-    } finally {
-      setBusy(null)
-    }
-  }, [applyAccess])
-
-  /** Add one user to the user table; resolves true when the input should clear. */
-  const addUser = useCallback(async (
-    add: (userId: string, name: string) => Promise<AccessMutationResponse>,
-    userId: string,
-    name: string,
-    notice: string,
-  ): Promise<boolean> => {
-    setBusy('access')
-    setAccessError(null)
-    setAccessNotice(null)
-    try {
-      const result = await add(userId, name)
-      if (!result.ok) {
-        setAccessError(result.error)
-        return false
-      }
-      applyAccess(result.access)
-      setAccessNotice(notice)
-      return true
-    } catch (error) {
-      setAccessError(messageOf(error))
-      return false
-    } finally {
-      setBusy(null)
-    }
-  }, [applyAccess])
-
-  const removeUser = useCallback(async (
-    remove: (userId: string) => Promise<AccessMutationResponse>,
-    userId: string,
-    notice: string,
-  ): Promise<void> => {
-    setBusy('access')
-    setAccessError(null)
-    setAccessNotice(null)
-    try {
-      const result = await remove(userId)
-      if (!result.ok) {
-        setAccessError(result.error)
-        return
-      }
-      applyAccess(result.access)
-      setAccessNotice(notice)
-    } catch (error) {
-      setAccessError(messageOf(error))
-    } finally {
-      setBusy(null)
-    }
-  }, [applyAccess])
-
-  const onResolveAccessRequest = useCallback(async (token: string, decision: 'allow' | 'deny'): Promise<void> => {
-    setBusy('access')
-    setAccessError(null)
-    setAccessNotice(null)
-    try {
-      const result = await resolveAccessRequest(token, decision)
-      if (!result.ok) {
-        setAccessError(result.error)
-        return
-      }
-      applyAccess(result.access)
-      setAccessNotice(decision === 'allow' ? PANEL_COPY.accessRequestAllowed : PANEL_COPY.accessRequestDenied)
-    } catch (error) {
-      setAccessError(messageOf(error))
-    } finally {
-      setBusy(null)
-    }
-  }, [applyAccess])
-
-  /** Save provided credential values; the Host reconnects automatically when ready. */
-  const onSaveCredentials = useCallback(async (): Promise<void> => {
-    const values: { appId?: string; appSecret?: string } = {}
-    if (appIdInput.trim() !== '') values.appId = appIdInput
-    if (appSecretInput.trim() !== '') values.appSecret = appSecretInput
-    if (values.appId === undefined && values.appSecret === undefined) return
-    setBusy('credentials')
-    setNotice(null)
-    try {
-      const result = await saveCredentials(values)
-      if (!result.ok) {
-        setNotice({ kind: 'error', text: result.error, issues: result.issues })
-        return
-      }
-      setLoad({ phase: 'ready', panel: result.panel })
-      setStatus(result.panel.status)
-      setAppIdInput('')
-      setAppSecretInput('')
-      const base = result.reconnect === 'pending'
-        ? PANEL_COPY.credentialSavedPending
-        : result.reconnect === 'auto'
-          ? PANEL_COPY.credentialSavedReconnected
-          : result.reconnect === 'unconfigured'
-            ? PANEL_COPY.credentialSavedUnconfigured
-            : result.reconnect === 'failed'
-              ? PANEL_COPY.credentialAutoConnectFailed
-              : PANEL_COPY.credentialSaved
-      setNotice({
-        kind: result.reconnect === 'failed' || result.autoReconnectError !== undefined ? 'error' : 'ok',
-        text: result.autoReconnectError === undefined
-          ? base
-          : `${base}：${result.autoReconnectError}`,
-      })
-    } catch (error) {
-      setNotice({ kind: 'error', text: messageOf(error) })
-    } finally {
-      setBusy(null)
-    }
-  }, [appIdInput, appSecretInput])
-
-  const onClearCredential = useCallback(async (field: CredentialField): Promise<void> => {
-    const confirmed = typeof window.confirm === 'function'
-      ? window.confirm(PANEL_COPY.credentialRemoveConfirm)
-      : true
-    if (!confirmed) return
-    setBusy('credentials-clear')
-    setNotice(null)
-    try {
-      const result = await clearCredential(field)
-      if (!result.ok) {
-        setNotice({ kind: 'error', text: result.error, issues: result.issues })
-        return
-      }
-      setLoad({ phase: 'ready', panel: result.panel })
-      setStatus(result.panel.status)
-      setNotice({
-        kind: 'ok',
-        text: result.reconnect === 'pending' ? PANEL_COPY.credentialRemovedPending : PANEL_COPY.credentialRemoved,
-      })
-    } catch (error) {
-      setNotice({ kind: 'error', text: messageOf(error) })
-    } finally {
-      setBusy(null)
-    }
-  }, [])
+  const ops = useMemo<PanelOps>(() => ({
+    setBusy,
+    setNotice,
+    applyPanel: data.applyPanel,
+    applyAccess: data.applyAccess,
+    refreshStatus: data.refreshStatus,
+    setActiveTab,
+  }), [data.applyAccess, data.applyPanel, data.refreshStatus])
 
   const issues = useMemo<FieldIssueWire[]>(
     () => (notice?.kind === 'error' ? notice.issues ?? [] : []),
     [notice],
   )
-  const dirtyCount = Object.keys(draft).length
-  const restartCount = useMemo(
-    () => (panel?.config.fields ?? []).filter(field => field.restartRequired && field.key in draft).length,
-    [draft, panel],
-  )
+  const config = useConfigDraft(panel, ops)
+  const connection = useConnectionActions(ops, { running: data.running, issues, busy, locked: hostBusy })
+  const access = useAccessActions(ops)
+  const profiles = useFeishuProfiles(panel?.access ?? null)
 
-  /** Which tabs currently own a dirty key (the dot is per tab, not global). */
-  const dirtyTabs = useMemo<ReadonlySet<PanelTabId>>(() => {
-    const tabs = new Set<PanelTabId>()
-    if (panel === null || dirtyCount === 0) return tabs
-    const groupOf = new Map(panel.config.fields.map(field => [field.key, field.group]))
-    for (const key of Object.keys(draft)) {
-      const group = groupOf.get(key as EditableKey)
-      if (group === undefined) continue
-      for (const tab of PANEL_TABS) {
-        if (TAB_FIELD_GROUPS[tab.id].includes(group)) tabs.add(tab.id)
-      }
-    }
-    return tabs
-  }, [dirtyCount, draft, panel])
+  /** Full reload: drop the banner, the access result line, the draft and the credential inputs. */
+  const reload = useCallback((): void => {
+    setNotice(null)
+    access.reset()
+    config.reset()
+    connection.resetCredentialInputs()
+    void data.reload()
+  }, [access, config, connection, data])
+
+  /** Manual refresh keeps the dirty draft; a successful one clears the access result line. */
+  const refresh = useCallback(async (): Promise<void> => {
+    if (await data.refresh()) access.reset()
+  }, [access, data])
 
   const form = useMemo<FormView | null>(() => {
     if (panel === null) return null
     return {
       panel,
-      fields: renderedFields,
-      draft,
+      fields: config.fields,
+      draft: config.draft,
       issues,
       busy,
       locked: hostBusy,
-      onChange: updateDraft,
-      onPickDirectory,
+      onChange: config.update,
+      onPickDirectory: config.pickDirectory,
     }
-  }, [busy, draft, hostBusy, issues, onPickDirectory, panel, renderedFields, updateDraft])
-
-  const profiles = useFeishuProfiles(panel?.access ?? null)
-
-  const credentials = useMemo<CredentialsView>(() => ({
-    appId: appIdInput,
-    appSecret: appSecretInput,
-    issues,
-    busy,
-    locked: hostBusy,
-    onAppIdChange: setAppIdInput,
-    onAppSecretChange: setAppSecretInput,
-    onSave: () => { void onSaveCredentials() },
-    onClear: (field: CredentialField) => { void onClearCredential(field) },
-  }), [appIdInput, appSecretInput, busy, hostBusy, issues, onClearCredential, onSaveCredentials])
+  }, [busy, config.draft, config.fields, config.pickDirectory, config.update, hostBusy, issues, panel])
 
   if (load.phase === 'loading') {
     return (
@@ -725,7 +112,7 @@ function FeishuChannelsPanel(): JSX.Element | null {
           <strong>{PANEL_COPY.loadFailed}</strong>
           <span>{load.message}</span>
           <div>
-            <button type="button" className="dsh-channels-cfg__btn" onClick={() => { void loadPanel() }}>
+            <button type="button" className="dsh-channels-cfg__btn" onClick={reload}>
               {PANEL_COPY.retry}
             </button>
           </div>
@@ -734,20 +121,20 @@ function FeishuChannelsPanel(): JSX.Element | null {
     )
   }
   if (form === null) return null
-  const current = status ?? load.panel.status
+  const current = data.status ?? load.panel.status
 
   return (
     <div className="dsh-channels-cfg">
       <PanelHeader
         status={current}
-        pollError={pollError}
+        pollError={data.pollError}
         busy={busy}
         locked={hostBusy}
-        onRefresh={() => { void onRefresh() }}
+        onRefresh={() => { void refresh() }}
       />
       <TabNav
         activeTab={activeTab}
-        dirtyTabs={dirtyTabs}
+        dirtyTabs={config.dirtyTabs}
         counts={{ access: load.panel.access.loaded ? load.panel.access.requests.length : 0 }}
         onChange={setActiveTab}
       />
@@ -764,16 +151,16 @@ function FeishuChannelsPanel(): JSX.Element | null {
                 panel={form.panel}
                 status={current}
                 busy={busy}
-                credentials={credentials}
-                onReconnect={() => { void onReconnect() }}
-                onTakeover={() => { void onTakeover() }}
+                credentials={connection.credentials}
+                onReconnect={() => { void connection.reconnect() }}
+                onTakeover={() => { void connection.takeover() }}
               />
             )
           : null}
         {activeTab === 'sessions' ? <FieldsTab form={form} tab="sessions" /> : null}
         {activeTab === 'records' ? <RecordsTab /> : null}
         {activeTab === 'model'
-          ? <FieldsTab form={form} tab="model" note={catalogBusy ? PANEL_COPY.catalogLoading : undefined} />
+          ? <FieldsTab form={form} tab="model" note={config.catalogBusy ? PANEL_COPY.catalogLoading : undefined} />
           : null}
         {activeTab === 'attachments' ? <FieldsTab form={form} tab="attachments" /> : null}
         {activeTab === 'access'
@@ -781,13 +168,13 @@ function FeishuChannelsPanel(): JSX.Element | null {
               <AccessTab
                 form={form}
                 profiles={profiles}
-                accessNotice={accessNotice}
-                accessError={accessError}
-                onAddUser={(userId, name) => addUser(addAccessUser, userId, name, PANEL_COPY.accessUserAdded)}
-                onRemoveUser={userId => { void removeUser(removeAccessUser, userId, PANEL_COPY.accessUserRemoved) }}
-                onTogglePermission={(userId, permission, enabled) => { void onTogglePermission(userId, permission, enabled) }}
-                onSetGitEmail={onSetGitEmail}
-                onResolveRequest={(token, decision) => { void onResolveAccessRequest(token, decision) }}
+                accessNotice={access.notice}
+                accessError={access.error}
+                onAddUser={access.addUser}
+                onRemoveUser={userId => { void access.removeUser(userId) }}
+                onTogglePermission={(userId, permission, enabled) => { void access.togglePermission(userId, permission, enabled) }}
+                onSetGitEmail={access.setGitEmail}
+                onResolveRequest={(token, decision) => { void access.resolveRequest(token, decision) }}
               />
             )
           : null}
@@ -796,135 +183,26 @@ function FeishuChannelsPanel(): JSX.Element | null {
               <GroupsTab
                 form={form}
                 profiles={profiles}
-                accessNotice={accessNotice}
-                accessError={accessError}
-                onRemoveGroup={chatId => { void removeUser(removeAccessGroup, chatId, PANEL_COPY.groupRemoved) }}
-                onTogglePermission={(chatId, permission, enabled) => { void onToggleGroupPermission(chatId, permission, enabled) }}
+                accessNotice={access.notice}
+                accessError={access.error}
+                onRemoveGroup={chatId => { void access.removeGroup(chatId) }}
+                onTogglePermission={(chatId, permission, enabled) => { void access.toggleGroupPermission(chatId, permission, enabled) }}
               />
             )
           : null}
-        {activeTab === 'wiki'
-          ? (
-              <WikiTab form={form} profiles={profiles} />
-            )
-          : null}
+        {activeTab === 'wiki' ? <WikiTab form={form} profiles={profiles} /> : null}
         {activeTab === 'advanced'
-          ? <AdvancedTab form={form} onClear={() => { void onClear() }} />
+          ? <AdvancedTab form={form} onClear={() => { void config.clearOverrides() }} />
           : null}
       </div>
       <SaveBar
-        dirtyCount={dirtyCount}
-        restartCount={restartCount}
+        dirtyCount={config.dirtyCount}
+        restartCount={config.restartCount}
         busy={busy}
         locked={hostBusy}
-        onSave={() => { void onSave() }}
-        onDiscard={discardDraft}
+        onSave={() => { void config.save() }}
+        onDiscard={config.discard}
       />
     </div>
-  )
-}
-
-/** Page header: title, phase pill, version and uptime, refresh; visible on every tab. */
-function PanelHeader(props: {
-  status: ChannelStatusWire
-  pollError: string | null
-  busy: BusyAction | null
-  locked: boolean
-  onRefresh: () => void
-}): JSX.Element {
-  const { status, pollError, busy, locked, onRefresh } = props
-  const badge = phaseBadge(status.phase)
-  return (
-    <header className="dsh-channels-cfg__panelHead">
-      <div className="dsh-channels-cfg__headRow">
-        <span className="dsh-channels-cfg__logo"><FeishuChannelsIcon size={18} active={false} /></span>
-        <h1 className="dsh-channels-cfg__title">{PANEL_COPY.title}</h1>
-        <Pill tone={badge.tone} dot>{badge.text}</Pill>
-        <span className="dsh-channels-cfg__meta dsh-channels-cfg__mono">v{status.version}</span>
-        {status.uptimeMs === undefined
-          ? null
-          : <span className="dsh-channels-cfg__meta">· {PANEL_COPY.uptimePrefix} {formatUptime(status.uptimeMs)}</span>}
-        <span className="dsh-channels-cfg__spacer" />
-        <button
-          type="button"
-          className="dsh-channels-cfg__btn dsh-channels-cfg__btn--ghost"
-          onClick={onRefresh}
-          disabled={busy !== null || locked}
-        >
-          <RefreshIcon />
-          {PANEL_COPY.refresh}
-        </button>
-      </div>
-      {pollError === null
-        ? null
-        : (
-            <span className="dsh-channels-cfg__fieldError" role="status" aria-live="polite">
-              {PANEL_COPY.pollFailed}：{pollError}
-            </span>
-          )}
-    </header>
-  )
-}
-
-/** Top-level tab navigation; the dirty dot keeps unsaved work visible per tab. */
-function TabNav(props: {
-  activeTab: PanelTabId
-  dirtyTabs: ReadonlySet<PanelTabId>
-  /** Items waiting for the operator per tab (pending access requests). */
-  counts: Partial<Record<PanelTabId, number>>
-  onChange: (tab: PanelTabId) => void
-}): JSX.Element {
-  const { activeTab, dirtyTabs, counts, onChange } = props
-  const refs = useRef<Array<HTMLButtonElement | null>>([])
-
-  /** Roving-focus keyboard navigation between tabs (WAI-ARIA tabs pattern). */
-  const onKeyDown = (index: number, event: KeyboardEvent<HTMLButtonElement>): void => {
-    const last = PANEL_TABS.length - 1
-    let next: number
-    switch (event.key) {
-      case 'ArrowRight': next = index === last ? 0 : index + 1; break
-      case 'ArrowLeft': next = index === 0 ? last : index - 1; break
-      case 'Home': next = 0; break
-      case 'End': next = last; break
-      default: return
-    }
-    event.preventDefault()
-    onChange(PANEL_TABS[next]!.id)
-    refs.current[next]?.focus()
-  }
-
-  return (
-    <nav className="dsh-channels-cfg__tabs" role="tablist" aria-label={PANEL_COPY.title}>
-      {PANEL_TABS.map((tab, index) => {
-        const selected = tab.id === activeTab
-        const dirty = dirtyTabs.has(tab.id)
-        return (
-          <button
-            key={tab.id}
-            ref={(node) => { refs.current[index] = node }}
-            type="button"
-            role="tab"
-            id={`dsh-channels-tab-${tab.id}`}
-            aria-selected={selected}
-            aria-controls={selected ? `dsh-channels-tabpanel-${tab.id}` : undefined}
-            tabIndex={selected ? 0 : -1}
-            className="dsh-channels-cfg__tab"
-            onClick={() => onChange(tab.id)}
-            onKeyDown={event => onKeyDown(index, event)}
-          >
-            {tab.label}
-            {(counts[tab.id] ?? 0) > 0 ? <span className="dsh-channels-cfg__tabCount">{counts[tab.id]}</span> : null}
-            {dirty
-              ? (
-                  <span
-                    className="dsh-channels-cfg__tabDot"
-                    aria-hidden="true"
-                  />
-                )
-              : null}
-          </button>
-        )
-      })}
-    </nav>
   )
 }

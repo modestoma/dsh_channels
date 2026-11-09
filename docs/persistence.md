@@ -79,8 +79,8 @@
 ## 生命周期
 
 1. **写入**（`routing/inbound.ts` `startSession` / `continueSession`、`topics/launcher.ts`）：回复卡发出、Typing 结果就绪后**先写快照、再写路由**（快照优先：崩溃窗口更偏安全侧——最多产生孤儿快照，修复无害）。提示组装完成后、提交 `session/prompt` 之前经 `recordPrompt()` 补写 `prompt`；宿主回合经 `recordMessage()` 补写 `message`。后台唤醒卡片在主卡送达时经 `onHostCardDelivered` 写快照（没有 trigger）。
-2. **段卡更新**（`streamer.ts`）：续卡发送成功、message id 解析后经钩子 `onSegmentDelivered(mainCardMessageId, index, messageId, mode)` 上报；服务端通过 `table.update()`（宿主原子 read-modify-write）合并进快照。
-3. **清除**（`streamer.ts` `finalize`）：turn 结束即经 `onTurnFinalized(sessionId, turn, mainCardMessageId)` 删除快照。会话创建失败路径（卡片已落「会话创建失败」终态）同样主动清除。
+2. **段卡更新**（`turn/delivery.ts`）：续卡发送成功、message id 解析后经钩子 `onSegmentDelivered(mainCardMessageId, index, messageId, mode)` 上报；服务端通过 `table.update()`（宿主原子 read-modify-write）合并进快照。
+3. **清除**（`turn/streamer.ts` `finalize`）：turn 结束即经 `onTurnFinalized(sessionId, turn, mainCardMessageId)` 删除快照。会话创建失败路径（卡片已落「会话创建失败」终态）同样主动清除。
 4. **恢复**（`session/repair.ts` `repairAll()`，长连接建立后后台执行）：对每条快照恢复它的 Session（不在线时冷恢复），用 `classifyTurn()` 读会话日志：
    - 日志里没有 `prompt.requestId` 对应的 `user/message`（来源 `rpcId`，还在排队）且 `replay.pending` 开启、未重放过：`replays + 1` 后以快照里的调用方、同一个请求 id 重新提交 `session/prompt` 进主卡（DSH 按请求 id 去重；图片块按附件引用从附件库重新暂存回执，暂存不了的降级为一段说明文字），快照保留到新一轮结束。只在 live Agent 的 inbox 里的提示只重新挂接卡片。
    - 这条消息之后的 `turn/end` 是正常结束（`completed` / `max-tokens`）：用其后各步 `assistant/message` 的文字重画全部卡片（`buildRecoveredReplyCards`），补 DONE。
@@ -101,7 +101,7 @@
 - `src/session/repair.ts` — 快照读写、`classifyTurn()`、`repairAll()` 启动恢复
 - `src/service.ts` — 恢复所需的 Session 接线（`recoveryAgent`、`runTurn`）、后台卡快照
 - `src/routing/card-actions.ts` — 继续按钮（`RESUME_PROMPT`）
-- `src/streamer.ts` — 钩子：`onTurnFinalized` 携带主卡 id、`onSegmentDelivered`、`onHostCardDelivered`
+- `src/turn/streamer.ts` / `src/turn/delivery.ts` — 钩子：`onTurnFinalized` 携带主卡 id、`onSegmentDelivered`、`onHostCardDelivered`
 - `src/cards/streaming.ts` — `buildInterruptionCard()`（可带继续按钮）、`buildRecoveredReplyCards()`
 - `tests/` — 快照生命周期与启动修复用例
 

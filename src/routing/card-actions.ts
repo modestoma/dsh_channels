@@ -28,7 +28,7 @@ import type { RouteStore } from '../session/routes.ts'
 import { steerQueued } from '../session/submit.ts'
 import type { SubmissionOutcome, TurnCard } from '../session/submit.ts'
 import type { Agent } from '../host/index.ts'
-import type { TurnStreamer } from '../streamer.ts'
+import type { TurnStreamer } from '../turn/streamer.ts'
 
 /** Prompt of the turn an interrupted card's continue button starts. */
 export const RESUME_PROMPT = '服务重启打断了上一轮回复。继续前先核对实际状态：工作目录里的文件和 git 状态、远端分支和 MR、已经发出的消息或文件。已经完成的对外操作不要重做，包括推送、创建或评论 MR、发送文件、写知识库；结果不确定的先查清楚。确认后从中断处继续完成上一轮的任务。'
