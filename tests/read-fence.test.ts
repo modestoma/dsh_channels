@@ -8,6 +8,7 @@ import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
+import { SessionLineage } from '../src/access/lineage.ts'
 import { ReadFence } from '../src/access/read-fence.ts'
 import type { FeishuConfig } from '../src/config.ts'
 import type { RouteRecord } from '../src/domain.ts'
@@ -33,12 +34,14 @@ function setup(overrides: Partial<FenceConfig> = {}) {
   }
   const routes = new Map<string, RouteRecord>([['s_alice', { workspacePath: alice } as RouteRecord]])
   const cwd = new Map<string, string>()
+  const lineage = new SessionLineage(sessionId => routes.get(sessionId))
   const fence = new ReadFence({
     config: () => ({ readFence: config }),
     routeOf: sessionId => routes.get(sessionId),
+    lineage,
     workingDirectory: session => cwd.get(session.id),
   })
-  return { fence, config, routes, cwd, base, alice, bob, skills, secret }
+  return { fence, lineage, config, routes, cwd, base, alice, bob, skills, secret }
 }
 
 /** One pending call by the agent of `sessionId`. */
@@ -113,13 +116,13 @@ describe('ReadFence', () => {
   })
 
   it('fences subagents of a routed Session, including nested ones, and ignores Sessions it does not route', async () => {
-    const { fence, bob } = setup()
+    const { fence, lineage, bob } = setup()
     const outside = { file_path: path.join(bob, 'notes.md') }
     expect(await fence.decide(call('read', outside, 's_child', 's_alice'))).toMatchObject(denied)
     expect(await fence.decide(call('read', outside, 's_grandchild', 's_child'))).toMatchObject(denied)
     expect(await fence.decide(call('read', outside, 's_web'))).toBeUndefined()
     expect(await fence.decide(call('read', outside, 's_web_child', 's_web'))).toBeUndefined()
-    fence.clear()
+    lineage.clear()
     expect(await fence.decide(call('read', outside, 's_grandchild', 's_child'))).toBeUndefined()
   })
 

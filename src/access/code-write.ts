@@ -8,9 +8,8 @@
  *
  * - Ownership: a call belongs to a Feishu route when its agent's Session is
  *   routed, or descends (through `parentSession`) from a routed Session.
- *   Every call remembers its Session's routed root, which covers nested
- *   subagents because a child must call a tool to spawn its own child. Calls
- *   of Sessions the channel does not route are never touched.
+ *   See `./lineage.ts`. Calls of Sessions the channel does not route are
+ *   never touched.
  * - The check runs in `tools/pre-execute`, before the tool's own approval, so
  *   it holds whatever approval mode the tool's plugin uses.
  *
@@ -22,8 +21,8 @@
  * results, jobs, schedules) keeps the previous speaker; a message naming a
  * principal other than a Feishu one makes the speaker unknown until a Feishu
  * message is claimed. Before any claimed message the route's last recorded
- * speaker, else the user who opened it, is the speaker. Speakers and
- * descendants are kept in memory and end with the process.
+ * speaker, else the user who opened it, is the speaker. Speakers are kept
+ * in memory and end with the process.
  *
  * @module dsh-channels/access/code-write
  */
@@ -33,13 +32,12 @@ import { isGroupRoute } from '../domain.ts'
 import type { RouteRecord } from '../domain.ts'
 import type { PreToolDecision, PreToolExecution } from '../host/index.ts'
 import type { UserMessage } from '../host/core.ts'
+import type { SessionLineage } from './lineage.ts'
 import { promptCallerOf } from './principal.ts'
 
 /** Speaker of a turn whose Feishu sender cannot be established. */
 const UNKNOWN_SENDER = Symbol('unknown sender')
 
-/** Longest `parentSession` chain {@link CodeWriteGate.resolveRoot} follows. */
-const MAX_SESSION_DEPTH = 32
 type Speaker = string | typeof UNKNOWN_SENDER
 
 export interface CodeWriteGateDeps {
@@ -47,6 +45,8 @@ export interface CodeWriteGateDeps {
   config(): Pick<FeishuConfig, 'codeWriteTools'>
   /** The route that names a Session, if any. */
   routeOf(sessionId: string): RouteRecord | undefined
+  /** Which routed Session each Session belongs to. */
+  lineage: SessionLineage
   /** Whether the route's location holds the `codeWrite` switch. */
   mayWrite(route: RouteRecord): boolean
 }
@@ -54,9 +54,6 @@ export interface CodeWriteGateDeps {
 export class CodeWriteGate {
   /** Routed Session id → user_id that speaks in its current turn. */
   private readonly speakers = new Map<string, Speaker>()
-  /** Descendant Session id → routed ancestor Session id. */
-  private readonly roots = new Map<string, string>()
-
   constructor(private readonly deps: CodeWriteGateDeps) {}
 
   /**
@@ -93,7 +90,7 @@ export class CodeWriteGate {
     if (agent === undefined) return undefined
     // Resolved before the tool check so every call remembers its Session's
     // root: a child spawns its own child through an ungated tool.
-    const root = this.rootOf(agent.session.id, agent.session.header.parentSession)
+    const root = this.deps.lineage.rootOfCall(agent.session.id, agent.session.header.parentSession)
     if (root === undefined || !this.deps.config().codeWriteTools.includes(exec.name)) return undefined
     const route = this.deps.routeOf(root)
     if (route === undefined || this.deps.mayWrite(route)) return undefined
@@ -113,60 +110,16 @@ export class CodeWriteGate {
    *   the Session or the speaker cannot be established.
    */
   speakerOf(sessionId: string): string | undefined {
-    const root = this.deps.routeOf(sessionId) !== undefined ? sessionId : this.roots.get(sessionId)
+    const root = this.deps.lineage.known(sessionId)
     const route = root === undefined ? undefined : this.deps.routeOf(root)
     if (root === undefined || route === undefined) return undefined
     const speaker = this.speakers.get(root) ?? route.lastSpeakerUserId ?? route.senderUserId
     return speaker === UNKNOWN_SENDER ? undefined : speaker
   }
 
-  /**
-   * The routed Session a Session belongs to: itself when routed, else the
-   * routed ancestor remembered from an earlier call, else the first routed
-   * Session on its `parentSession` chain as `parentOf` reports it (the live
-   * agent registry); every Session passed on the way is remembered. Used by
-   * events that name a Session without a call, such as `access/authorize`
-   * and `repo/commit-trailers`.
-   * @param sessionId - the Session.
-   * @param parentOf - parent of a live Session, or undefined when unknown or top-level.
-   * @returns the routed Session, or undefined when Feishu routes none of the chain.
-   */
-  resolveRoot(sessionId: string, parentOf: (sessionId: string) => string | undefined): string | undefined {
-    const chain: string[] = []
-    let current = sessionId
-    let root: string | undefined
-    while (root === undefined) {
-      if (this.deps.routeOf(current) !== undefined) {
-        root = current
-        break
-      }
-      root = this.roots.get(current)
-      if (root !== undefined) break
-      if (chain.includes(current) || chain.length >= MAX_SESSION_DEPTH) return undefined
-      chain.push(current)
-      const parent = parentOf(current)
-      if (parent === undefined) return undefined
-      current = parent
-    }
-    for (const descendant of chain) this.roots.set(descendant, root)
-    return root
-  }
-
-  /** Drop every speaker and descendant (shutdown). */
+  /** Drop every speaker (shutdown). */
   clear(): void {
     this.speakers.clear()
-    this.roots.clear()
-  }
-
-  /** The routed Session a call belongs to, remembering descendants. */
-  private rootOf(sessionId: string, parentSession: string | undefined): string | undefined {
-    if (this.deps.routeOf(sessionId) !== undefined) return sessionId
-    const known = this.roots.get(sessionId)
-    if (known !== undefined) return known
-    if (parentSession === undefined) return undefined
-    const root = this.deps.routeOf(parentSession) !== undefined ? parentSession : this.roots.get(parentSession)
-    if (root !== undefined) this.roots.set(sessionId, root)
-    return root
   }
 }
 

@@ -41,7 +41,7 @@
 
 ### 3.1 触发消息（立即建会话）
 
-以下顺序由 [src/routing/inbound.ts](../src/routing/inbound.ts) 的 `establishSession` 实现；**任何附件字节都不在会话建立前下载**：
+以下顺序由 [src/routing/inbound.ts](../src/routing/inbound.ts) 的 `establishSession` 实现（话题工作区与 Session 的创建步骤与群话题服务共用 `openTopicWorkspace` 和 `openTopicSession`）；**任何附件字节都不在会话建立前下载**：
 
 1. 去重（`processed` 表 + 进程内守卫）与频道准入（管理员 / 用户表的对话准入）通过；未通过者不建会话、不落附件、不调模型。
 2. 对触发消息加 `Typing` 表情（异步，不阻塞）。

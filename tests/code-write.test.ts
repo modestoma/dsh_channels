@@ -6,6 +6,7 @@
 
 import { describe, expect, it } from 'vitest'
 import { CodeWriteGate } from '../src/access/code-write.ts'
+import { SessionLineage } from '../src/access/lineage.ts'
 import type { RouteRecord } from '../src/domain.ts'
 import type { Agent, PreToolExecution } from '../src/host/index.ts'
 import type { UserMessage } from '../src/host/core.ts'
@@ -16,12 +17,14 @@ const PUSH = 'repo_workspace_push'
 function setup(route: Partial<RouteRecord> = {}, writable: (route: RouteRecord) => boolean = () => false) {
   const routes = new Map<string, RouteRecord>([['s_root', { chatId: 'oc_p2p', chatType: 'p2p', senderUserId: 'u_owner', ...route } as RouteRecord]])
   const tools = [PUSH, 'repo_mr_create']
+  const lineage = new SessionLineage(sessionId => routes.get(sessionId))
   const gate = new CodeWriteGate({
     config: () => ({ codeWriteTools: tools }),
     routeOf: sessionId => routes.get(sessionId),
+    lineage,
     mayWrite: writable,
   })
-  return { gate, routes, tools }
+  return { gate, lineage, routes, tools }
 }
 
 /** One pending call by the agent of `sessionId`. */
@@ -85,11 +88,11 @@ describe('CodeWriteGate', () => {
   })
 
   it('applies the routed ancestor rule to subagents, including nested ones, until cleared', () => {
-    const { gate, routes } = setup()
+    const { gate, lineage, routes } = setup()
     expect(gate.decide(call('s_child', 's_root'))?.kind).toBe('deny')
     expect(gate.decide(call('s_grandchild', 's_child'))?.kind).toBe('deny')
 
-    gate.clear()
+    lineage.clear()
     expect(gate.decide(call('s_grandchild', 's_child'))).toBeUndefined()
     routes.delete('s_root')
     expect(gate.decide(call('s_root'))).toBeUndefined()
@@ -102,17 +105,17 @@ describe('CodeWriteGate', () => {
   })
 
   it('resolves the routed root of a Session through the live parent chain and remembers it', () => {
-    const { gate } = setup()
+    const { gate, lineage } = setup()
     const parents = new Map([['s_child', 's_root'], ['s_grandchild', 's_child'], ['s_loop', 's_loop'], ['s_web_child', 's_web']])
     const parentOf = (id: string) => parents.get(id)
-    expect(gate.resolveRoot('s_root', parentOf)).toBe('s_root')
-    expect(gate.resolveRoot('s_grandchild', parentOf)).toBe('s_root')
+    expect(lineage.resolve('s_root', parentOf)).toBe('s_root')
+    expect(lineage.resolve('s_grandchild', parentOf)).toBe('s_root')
     // Remembered: the chain is not walked again, and the speaker follows.
-    expect(gate.resolveRoot('s_grandchild', () => undefined)).toBe('s_root')
+    expect(lineage.resolve('s_grandchild', () => undefined)).toBe('s_root')
     expect(gate.speakerOf('s_child')).toBe('u_owner')
-    expect(gate.resolveRoot('s_web_child', parentOf)).toBeUndefined()
-    expect(gate.resolveRoot('s_loop', parentOf)).toBeUndefined()
-    expect(gate.resolveRoot('s_orphan', () => undefined)).toBeUndefined()
+    expect(lineage.resolve('s_web_child', parentOf)).toBeUndefined()
+    expect(lineage.resolve('s_loop', parentOf)).toBeUndefined()
+    expect(lineage.resolve('s_orphan', () => undefined)).toBeUndefined()
   })
 
   it('names the speaker of routed Sessions and of descendants it has seen', () => {

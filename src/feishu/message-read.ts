@@ -29,6 +29,7 @@
  */
 
 import type { FeishuChannel, RawMessageListParams } from '../feishu-channel.ts'
+import { cancellable, isAbortError } from './abort.ts'
 
 // ---- Public limits ------------------------------------------------------
 
@@ -1265,50 +1266,6 @@ function createReadScope(options: MessageReadOptions): ReadScope {
       controller.abort()
     },
   }
-}
-
-/** Race one promise against an abort signal (late settlements are swallowed). */
-function cancellable<T>(task: Promise<T>, signal: AbortSignal): Promise<T> {
-  if (signal.aborted) {
-    task.catch(() => {})
-    return Promise.reject(readAbortError())
-  }
-  return new Promise<T>((resolve, reject) => {
-    let settled = false
-    const onAbort = (): void => {
-      if (settled) return
-      settled = true
-      signal.removeEventListener('abort', onAbort)
-      task.catch(() => {})
-      reject(readAbortError())
-    }
-    signal.addEventListener('abort', onAbort, { once: true })
-    task.then(
-      value => {
-        if (settled) return
-        settled = true
-        signal.removeEventListener('abort', onAbort)
-        resolve(value)
-      },
-      (error: unknown) => {
-        if (settled) return
-        settled = true
-        signal.removeEventListener('abort', onAbort)
-        reject(error)
-      },
-    )
-  })
-}
-
-function readAbortError(): Error {
-  const error = new Error('The operation was aborted')
-  error.name = 'AbortError'
-  return error
-}
-
-function isAbortError(error: unknown): boolean {
-  return typeof error === 'object' && error !== null
-    && (error as { name?: unknown }).name === 'AbortError'
 }
 
 /** Readable, bounded description of an arbitrary thrown value (never `[object Object]`). */

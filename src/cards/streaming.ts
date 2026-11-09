@@ -779,6 +779,17 @@ export function initialStreamingCard(sessionId: string): object {
 }
 
 /**
+ * The terminal frame of a streaming card whose topic or Session could not be
+ * created.
+ * @param sessionId - the Session the card was opened for.
+ * @param body - the failure text.
+ * @returns the card.
+ */
+export function failedStreamingCard(sessionId: string, body: string): object {
+  return buildCard({ phase: 'error', reasoning: '', body, stats: { sessionId, inputTokens: 0, outputTokens: 0 } })
+}
+
+/**
  * The first frame for a message that waits behind the session's running turn:
  * the queue notice plus the button that moves the message into that turn.
  * The streamer re-renders it as a normal streaming card once the message's

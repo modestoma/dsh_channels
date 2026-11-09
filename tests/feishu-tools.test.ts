@@ -568,7 +568,7 @@ describe('feishu attachment-fetch registration', () => {
     })
     const manager = new SessionManager({
       ctx: ctxState.ctx,
-      config: resolveConfig({}),
+      config: () => resolveConfig({}),
       persistRoute: async () => {},
       started: () => true,
       detachStream: () => {},
@@ -588,7 +588,7 @@ describe('feishu attachment-fetch registration', () => {
     const mountTools = vi.fn(async () => {})
     const manager = new SessionManager({
       ctx: ctxState.ctx,
-      config: resolveConfig({}),
+      config: () => resolveConfig({}),
       persistRoute: async () => {},
       started: () => true,
       detachStream: () => {},
@@ -622,7 +622,7 @@ describe('feishu attachment-fetch registration', () => {
     const borrowMount = vi.fn(async () => {})
     const borrowManager = new SessionManager({
       ctx: borrowState.ctx,
-      config: resolveConfig({}),
+      config: () => resolveConfig({}),
       persistRoute: async () => {},
       started: () => true,
       detachStream: () => {},
@@ -645,7 +645,7 @@ describe('feishu attachment-fetch registration', () => {
     const warn = vi.fn()
     const manager = new SessionManager({
       ctx: ctxState.ctx,
-      config: resolveConfig({}),
+      config: () => resolveConfig({}),
       persistRoute: async () => {},
       started: () => true,
       detachStream: () => {},

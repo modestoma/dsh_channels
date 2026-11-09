@@ -33,20 +33,20 @@ import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import type { AgentHandle, HostContext, SessionId } from '../host/index.ts'
 import type { FeishuConfig } from '../config.ts'
-import { buildCard, buildTopicRootCard, initialStreamingCard } from '../cards/index.ts'
+import { buildTopicRootCard, failedStreamingCard, initialStreamingCard } from '../cards/index.ts'
 import type { TopicStatus } from '../cards/index.ts'
 import type { RouteOperationQueue } from '../commands.ts'
 import { FEISHU_USER_ID_PATTERN, isGroupRoute } from '../domain.ts'
-import type { FeishuDomainHandle, RouteRecord, TopicLaunchRecord } from '../domain.ts'
+import type { FeishuDomainHandle, TopicLaunchRecord } from '../domain.ts'
 import type { FeishuChannel } from '../feishu-channel.ts'
 import { feishuGroupPrincipal } from '../access/principal.ts'
 import type { SessionManager } from '../session/manager.ts'
 import type { InflightRepair } from '../session/repair.ts'
 import { channelPrompt, storablePrompt } from '../session/prompt.ts'
 import type { TurnSubmission } from '../session/submit.ts'
+import { newTopicRoute } from '../session/routes.ts'
 import type { RouteStore } from '../session/routes.ts'
-import type { TurnStreamer } from '../streamer.ts'
-import { ensureTopicWorkspace, topicTitleOf, topicTokenFor, topicWorkspacePathFor, workspaceTitleFor } from '../workspaces.ts'
+import { openTopicWorkspace, topicTokenFor } from '../workspaces.ts'
 import type { TopicLocationPort } from '../workspaces.ts'
 import type {
   FeishuTopicService, FeishuTopicsServiceName, FeishuTopicsStatusEvent, FeishuTopicsVersion,
@@ -92,7 +92,8 @@ const topicLaunchSpecSchema = z.object({
 /** Collaborators of the launcher (late-bound where the service swaps them per connection). */
 export interface TopicLauncherDeps {
   ctx: HostContext
-  config: FeishuConfig
+  /** Live configuration; read per launch. */
+  config(): FeishuConfig
   started(): boolean
   channel(): FeishuChannel | undefined
   domain(): FeishuDomainHandle | undefined
@@ -300,20 +301,19 @@ export class TopicLauncher implements FeishuTopicService {
       threadId = topic.threadId
       releaseTopic = this.deps.reserveTopic(threadId)
       await this.recordThread(spec.key, threadId)
-      const groupName = await this.deps.location.groupName(spec.chatId)
-      const workspace = await ensureTopicWorkspace(
-        this.deps.ctx,
-        topicWorkspacePathFor(this.deps.config.baseDir, 'group', spec.chatId, spec.requesterUserId, topicTokenFor(threadId, 'thread', sessionId)),
-        workspaceTitleFor(groupName ?? spec.chatId, topicTitleOf(card.title)),
-      )
-      await this.deps.location.registerGroup(spec.chatId, groupName)
+      const workspace = await openTopicWorkspace(this.deps.ctx, this.deps.location, {
+        baseDir: this.deps.config().baseDir,
+        chatType: 'group',
+        chatId: spec.chatId,
+        userId: spec.requesterUserId,
+        topicToken: topicTokenFor(threadId, 'thread', sessionId),
+        titleText: card.title,
+      })
       this.assertStarted()
-      handle = await this.deps.sessions.createSession(sessionId, workspace.path)
-      await this.deps.sessions.mountGuidance(handle.agent)
+      handle = await this.deps.sessions.openTopicSession(sessionId, workspace.path)
       this.assertStarted()
 
-      const createdAt = handle.agent.session.header.createdAt
-      const record: RouteRecord = {
+      const record = newTopicRoute({
         key: threadId,
         kind: 'thread',
         sessionId,
@@ -322,10 +322,7 @@ export class TopicLauncher implements FeishuTopicService {
         senderUserId: spec.requesterUserId,
         workspacePath: workspace.path,
         cardMessageId: cardId,
-        createdAt,
-        lastActivityAt: createdAt,
-        sessionHistory: [{ sessionId, createdAt }],
-      }
+      }, handle.agent.session.header.createdAt)
       // The topic belongs to the group: its first prompt is submitted as the
       // group, with the requester as the speaker.
       const prompt = channelPrompt(spec.prompt, feishuGroupPrincipal(spec.chatId, spec.requesterUserId))
@@ -368,12 +365,7 @@ export class TopicLauncher implements FeishuTopicService {
       await handle?.dispose().catch(() => {})
       if (cardId !== undefined) {
         void this.deps.repair.clear(cardId)
-        await channel.updateCard(cardId, buildCard({
-          phase: 'error',
-          reasoning: '',
-          body: `❌ ${card.taskName}未能开始：${reason}`,
-          stats: { sessionId, inputTokens: 0, outputTokens: 0 },
-        })).catch(() => {})
+        await channel.updateCard(cardId, failedStreamingCard(sessionId, `❌ ${card.taskName}未能开始：${reason}`)).catch(() => {})
       }
       await showStatus({ kind: 'failed', reason })
     } finally {
@@ -398,12 +390,7 @@ export class TopicLauncher implements FeishuTopicService {
     const threadId = await channel.threadIdOfMessage(sent.messageId).catch(() => undefined)
       ?? await channel.threadIdOfMessage(rootId).catch(() => undefined)
     if (threadId === undefined) {
-      await channel.updateCard(sent.messageId, buildCard({
-        phase: 'error',
-        reasoning: '',
-        body: '❌ 无法在目标群创建话题',
-        stats: { sessionId, inputTokens: 0, outputTokens: 0 },
-      })).catch(() => {})
+      await channel.updateCard(sent.messageId, failedStreamingCard(sessionId, '❌ 无法在目标群创建话题')).catch(() => {})
       throw new Error('无法在目标群创建话题（读取话题 id 失败）')
     }
     return { cardId: sent.messageId, threadId }
