@@ -55,7 +55,8 @@ export interface PresetComposition {
 
 export interface SessionManagerDeps {
   ctx: HostContext
-  config: FeishuConfig
+  /** Live configuration; read per Session operation. */
+  config(): FeishuConfig
   /** Persist one route record (the `/renew` commit writes the new binding). */
   persistRoute(key: string, record: RouteRecord): Promise<void>
   /** Whether the service still accepts work (shutdown race guard). */
@@ -107,7 +108,7 @@ export class SessionManager {
   /** Provider/model/token caps sessions this plugin creates. */
   agentOptions(): Record<string, unknown> {
     const options: Record<string, unknown> = {}
-    const { provider, model, maxTokens } = this.deps.config
+    const { provider, model, maxTokens } = this.deps.config()
     if (provider !== undefined) options.provider = provider
     if (model !== undefined) options.model = model
     if (maxTokens !== undefined) options.maxTokens = maxTokens
@@ -141,6 +142,24 @@ export class SessionManager {
   }
 
   /**
+   * Create a new topic's Session in its workspace and mount its guidance. A
+   * Session created before a failure is disposed again.
+   * @param sessionId - the new Session.
+   * @param cwd - the topic workspace (Session header cwd).
+   * @returns the live handle.
+   */
+  async openTopicSession(sessionId: SessionId, cwd: string): Promise<AgentHandle> {
+    const handle = await this.createSession(sessionId, cwd)
+    try {
+      await this.mountGuidance(handle.agent)
+    } catch (error) {
+      await handle.dispose().catch(() => {})
+      throw error
+    }
+    return handle
+  }
+
+  /**
    * Register the reply guidance and the attachment guidance for one Session.
    * The reply guidance is mounted for every Feishu Session; its text follows
    * `replyGuidance` on each model request. The attachment guidance is mounted
@@ -152,7 +171,7 @@ export class SessionManager {
     if (this.guided.has(agent)) return
     this.guided.add(agent)
     try {
-      await mountReplyGuidance(agent.ctx, () => this.deps.config.replyGuidance)
+      await mountReplyGuidance(agent.ctx, () => this.deps.config().replyGuidance)
     } catch (error) {
       this.deps.warn(
         'dsh-channels: mounting reply guidance for session %s failed: %s',
@@ -161,7 +180,7 @@ export class SessionManager {
     }
     // With inbound attachments disabled the Agent has no attachment workflow to
     // discover.
-    if (!this.deps.config.acceptAttachments) return
+    if (!this.deps.config().acceptAttachments) return
     try {
       await mountChannelGuidance(agent.ctx)
     } catch (error) {
@@ -254,9 +273,9 @@ export class SessionManager {
   /** Mount one mutable Session-aware request policy outside every other wrapper. */
   mountRequestPolicy(agentCtx: AgentContext, agent?: Agent): () => void {
     const controller = installRequestPolicy(agentCtx, {
-      effort: this.deps.config.reasoningEffort,
-      provider: this.deps.config.provider,
-      model: this.deps.config.model,
+      effort: this.deps.config().reasoningEffort,
+      provider: this.deps.config().provider,
+      model: this.deps.config().model,
     })
     if (agent !== undefined) controller.sync(agent.session.snapshotEvents(), agent)
     this.policies.set(agentCtx, controller)
@@ -356,7 +375,7 @@ export class SessionManager {
    * the worktree) has been created.
    */
   private async presetComposition(
-    requestedPreset: string | undefined = this.deps.config.agentPreset,
+    requestedPreset: string | undefined = this.deps.config().agentPreset,
     useRosterDefault = true,
     sessionId?: string,
   ): Promise<PresetComposition> {

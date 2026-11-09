@@ -124,28 +124,28 @@ describe('FeishuService slash-command panel sync', () => {
     const { service } = await boot({ slashCommands: api }, {})
     await new Promise(resolve => setTimeout(resolve, 10))
     expect(api.list).not.toHaveBeenCalled()
-    expect(service.slashCommandSync()).toBeUndefined()
+    expect(service.checks.slashCommandSync()).toBeUndefined()
     await service.shutdown()
   })
 
   it('syncs after connecting, records the counts, and clears them on shutdown', async () => {
     const { api } = fakeApi()
     const { service, ctxState } = await boot({ slashCommands: api })
-    await vi.waitFor(() => expect(service.slashCommandSync()?.state).toBe('ok'))
+    await vi.waitFor(() => expect(service.checks.slashCommandSync()?.state).toBe('ok'))
     const total = CHANNEL_COMMANDS.length
-    expect(service.slashCommandSync()).toMatchObject({ created: total, updated: 0, removed: 0, total })
+    expect(service.checks.slashCommandSync()).toMatchObject({ created: total, updated: 0, removed: 0, total })
     expect(mock(ctxState.ctx.logger?.info).mock.calls).toContainEqual([
       'dsh-channels: slash command panel synced (%d commands, %d created, %d updated, %d removed)', total, total, 0, 0,
     ])
     await service.shutdown()
-    expect(service.slashCommandSync()).toBeUndefined()
+    expect(service.checks.slashCommandSync()).toBeUndefined()
   })
 
   it('records a failure and warns', async () => {
     const { api } = fakeApi()
     vi.mocked(api.list).mockRejectedValueOnce(new FeishuApiError('code=99991672 Access denied', 99991672))
     const { service, ctxState } = await boot({ slashCommands: api })
-    await vi.waitFor(() => expect(service.slashCommandSync()).toMatchObject({ state: 'error', error: 'code=99991672 Access denied' }))
+    await vi.waitFor(() => expect(service.checks.slashCommandSync()).toMatchObject({ state: 'error', error: 'code=99991672 Access denied' }))
     expect(mock(ctxState.ctx.logger?.warn).mock.calls).toContainEqual([
       'dsh-channels: 飞书原生斜杠指令面板同步失败（直接输入命令不受影响）：%s', 'code=99991672 Access denied',
     ])
@@ -162,6 +162,6 @@ describe('FeishuService slash-command panel sync', () => {
     releaseList()
     await new Promise(resolve => setTimeout(resolve, 10))
     expect(writes).toEqual([])
-    expect(service.slashCommandSync()).toBeUndefined()
+    expect(service.checks.slashCommandSync()).toBeUndefined()
   })
 })

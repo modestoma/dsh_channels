@@ -29,6 +29,7 @@ import type {
   ImageMediaType,
 } from '../host/attachments.ts'
 import { sanitizeFileName } from './inbound-attachments.ts'
+import { isAbortError } from './abort.ts'
 
 /** File name used when a source resource carries no usable display name. */
 export const DEFAULT_FILE_NAME = 'file.bin'
@@ -126,11 +127,6 @@ export function attachmentErrorCodeOf(error: unknown, service?: AttachmentStore)
     if (!classified) return undefined
   }
   return code
-}
-
-function isAbortError(error: unknown): boolean {
-  return error !== null && typeof error === 'object'
-    && (error as { name?: unknown }).name === 'AbortError'
 }
 
 /** Cap for one error description placed into a model-safe reason. */

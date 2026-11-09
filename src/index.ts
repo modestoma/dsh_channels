@@ -24,6 +24,7 @@ import { OverlayStore, defaultOverlayPath } from './settings/overlay.ts'
 import { mountSettingsRoutes } from './settings/routes.ts'
 import { FEISHU_TOPICS_SERVICE } from './topics/launcher.ts'
 import { SettingsSurface } from './settings/surface.ts'
+import { settingsTarget } from './settings/target.ts'
 import { createHostCatalog } from './settings/catalog.ts'
 import { createSettingsDirectoryPicker } from './settings/directory-picker.ts'
 
@@ -89,7 +90,7 @@ export function apply(ctx: HostContext, config?: unknown): void {
   // button (absent in headless/remote compositions → plain text input).
   const warn = (message: string, ...args: unknown[]): void => { ctx.logger?.warn?.(message, ...args) }
   mountSettingsRoutes(ctx, new SettingsSurface(
-    service,
+    settingsTarget(service),
     overlay,
     { warn },
     createHostCatalog(ctx, warn),

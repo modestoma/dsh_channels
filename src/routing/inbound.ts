@@ -15,7 +15,7 @@ import type {
   Agent, AgentHandle, AttachmentStore, HostContext, SessionId, Workspace,
 } from '../host/index.ts'
 import type { FeishuConfig } from '../config.ts'
-import { buildCard, buildOnboardingCard, initialStreamingCard, queuedStreamingCard } from '../cards/index.ts'
+import { buildOnboardingCard, failedStreamingCard, initialStreamingCard, queuedStreamingCard } from '../cards/index.ts'
 import { RouteOperationQueue } from '../commands.ts'
 import { chatRouteKey, isGroupRoute } from '../domain.ts'
 import type { FeishuDomainHandle, RouteRecord } from '../domain.ts'
@@ -31,12 +31,13 @@ import type { QuestionAnswerer } from '../interactions/questions.ts'
 import type { ApprovalAnswerer, ApprovalTextResult } from '../interactions/approvals.ts'
 import type { InflightRepair } from '../session/repair.ts'
 import type { SessionManager } from '../session/manager.ts'
+import { newTopicRoute } from '../session/routes.ts'
 import type { RouteStore } from '../session/routes.ts'
 import type { TurnStreamer } from '../streamer.ts'
 import { principalOnRoute } from '../access/principal.ts'
 import { channelPrompt, type ChannelPrompt, type PromptBlock, type PromptImageBlock } from '../session/prompt.ts'
 import type { TurnSubmission } from '../session/submit.ts'
-import { ensureTopicWorkspace, topicTitleOf, topicTokenFor, topicWorkspacePathFor, workspaceTitleFor } from '../workspaces.ts'
+import { openTopicWorkspace, topicTokenFor } from '../workspaces.ts'
 import type { TopicLocationPort } from '../workspaces.ts'
 
 /** The command plane the inbound router delegates admission-time work to. */
@@ -114,7 +115,8 @@ export interface AttachmentPrefetchPolicy {
 
 export interface InboundDeps {
   ctx: HostContext
-  config: FeishuConfig
+  /** Live configuration; read per message, so overlay changes apply at once. */
+  config(): FeishuConfig
   started(): boolean
   domain(): FeishuDomainHandle | undefined
   routes: RouteStore
@@ -264,7 +266,7 @@ export class InboundRouter {
   constructor(private readonly deps: InboundDeps) {}
 
   private get ctx(): HostContext { return this.deps.ctx }
-  private get config(): FeishuConfig { return this.deps.config }
+  private get config(): FeishuConfig { return this.deps.config() }
   private get started(): boolean { return this.deps.started() }
   private get routes(): RouteStore { return this.deps.routes }
   private get repair(): InflightRepair { return this.deps.repair }
@@ -830,7 +832,6 @@ export class InboundRouter {
     const typingPromise = this.delivery.requireChannel().addReaction(msg.messageId, 'Typing').catch(() => undefined)
 
     const sessionId = randomUUID() as SessionId
-    const initialStats = { sessionId, inputTokens: 0, outputTokens: 0 }
 
     // 2. First card frame — also creates the topic (reply_in_thread). The
     //    topic identity is only known after Feishu answers, and it names the
@@ -844,12 +845,7 @@ export class InboundRouter {
     /** Patch the streaming card to its terminal creation-failure state. */
     const failCreation = async (error: unknown): Promise<void> => {
       void this.repair.clear(sent.messageId)
-      await this.delivery.requireChannel().updateCard(sent.messageId, buildCard({
-        phase: 'error',
-        reasoning: '',
-        body: `会话创建失败：${String(error)}`,
-        stats: { ...initialStats },
-      })).catch(() => {})
+      await this.delivery.requireChannel().updateCard(sent.messageId, failedStreamingCard(sessionId, `会话创建失败：${String(error)}`)).catch(() => {})
     }
 
     // 3. The topic's own workspace (its directory is the Session header cwd:
@@ -859,14 +855,14 @@ export class InboundRouter {
     //    opens. No Agent exists yet.
     let workspace: Workspace
     try {
-      const group = msg.chatType === 'group'
-      const ownerName = group ? await this.deps.location.groupName(msg.chatId) : await this.deps.location.userName(msg.senderId)
-      workspace = await ensureTopicWorkspace(
-        this.ctx,
-        topicWorkspacePathFor(this.config.baseDir, msg.chatType, msg.chatId, msg.senderId, topicToken),
-        workspaceTitleFor(ownerName ?? (group ? msg.chatId : msg.senderId), topicTitleOf(content)),
-      )
-      if (group) await this.deps.location.registerGroup(msg.chatId, ownerName)
+      workspace = await openTopicWorkspace(this.ctx, this.deps.location, {
+        baseDir: this.config.baseDir,
+        chatType: msg.chatType,
+        chatId: msg.chatId,
+        userId: msg.senderId,
+        topicToken,
+        titleText: content,
+      })
     } catch (error) {
       await failCreation(error)
       throw error
@@ -889,24 +885,17 @@ export class InboundRouter {
     })
 
     // 4. Create the Session in the topic directory (its header cwd).
-    let handle: AgentHandle | undefined
+    let handle: AgentHandle
     try {
-      handle = await this.sessions.createSession(sessionId, workspace.path)
-      await this.sessions.mountGuidance(handle.agent)
+      handle = await this.sessions.openTopicSession(sessionId, workspace.path)
     } catch (error) {
-      // The card lands in a final failure state — no repair needed later. A
-      // Session created just before the failure must not stay live unnoticed.
-      await handle?.dispose().catch(() => {})
+      // The card lands in a final failure state — no repair needed later.
       await failCreation(error)
       throw error
     }
-    if (handle === undefined) {
-      throw new Error('dsh-channels: session creation completed without a handle')
-    }
 
     // 5. Persist the route (thread-scoped, or degraded chat-scoped).
-    const createdAt = handle.agent.session.header.createdAt
-    const record: RouteRecord = {
+    const record = newTopicRoute({
       key,
       kind,
       sessionId,
@@ -915,10 +904,7 @@ export class InboundRouter {
       senderUserId: msg.senderId,
       workspacePath: workspace.path,
       cardMessageId: sent.messageId,
-      createdAt,
-      lastActivityAt: createdAt,
-      sessionHistory: [{ sessionId, createdAt }],
-    }
+    }, handle.agent.session.header.createdAt)
     // The delivery gate is opened BEFORE the route becomes durable: a message
     // that can see the route must also wait for this Session's first followup
     // (the image prefetch below keeps the route-to-followup window open).

@@ -218,3 +218,37 @@ export async function ensureTopicWorkspace(ctx: HostContext, dir: string, title:
   await mkdir(dir, { recursive: true })
   return ctx.workspaceRegistry.create(dir, title)
 }
+
+/** Where a new topic opens and what it is about. */
+export interface TopicPlace {
+  baseDir: string
+  chatType: 'p2p' | 'group'
+  chatId: string
+  /** The private chat's person, or the group topic's initiator. */
+  userId: string
+  /** {@link topicTokenFor} of the topic. */
+  topicToken: string
+  /** Text the topic title is taken from (the opening message or task title). */
+  titleText: string | undefined
+}
+
+/**
+ * Open a new topic's workspace: its directory registered with the host,
+ * titled after the group or person and the topic. A group gets its
+ * permission record (every switch off) when its first topic opens.
+ * @param ctx - host context (workspace registry).
+ * @param location - names and group registration.
+ * @param place - the topic.
+ * @returns the workspace.
+ */
+export async function openTopicWorkspace(ctx: HostContext, location: TopicLocationPort, place: TopicPlace): Promise<Workspace> {
+  const group = place.chatType === 'group'
+  const ownerName = group ? await location.groupName(place.chatId) : await location.userName(place.userId)
+  const workspace = await ensureTopicWorkspace(
+    ctx,
+    topicWorkspacePathFor(place.baseDir, place.chatType, place.chatId, place.userId, place.topicToken),
+    workspaceTitleFor(ownerName ?? (group ? place.chatId : place.userId), topicTitleOf(place.titleText)),
+  )
+  if (group) await location.registerGroup(place.chatId, ownerName)
+  return workspace
+}

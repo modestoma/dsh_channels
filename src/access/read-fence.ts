@@ -4,8 +4,8 @@
  * `readableRoots`.
  *
  * - Ownership: a call is fenced when its agent's Session is routed, or
- *   descends (through `parentSession`) from a routed Session; descendants are
- *   remembered by their first call, like the code-write gate. Sessions the
+ *   descends (through `parentSession`) from a routed Session; see
+ *   `./lineage.ts`. Sessions the
  *   channel does not route are never touched.
  * - Paths: relative arguments resolve against the calling Session's effective
  *   working directory (header cwd when the host has no working-directory
@@ -31,12 +31,15 @@ import path from 'node:path'
 import type { FeishuConfig } from '../config.ts'
 import type { RouteRecord } from '../domain.ts'
 import type { PreToolDecision, PreToolExecution, Session } from '../host/index.ts'
+import type { SessionLineage } from './lineage.ts'
 
 export interface ReadFenceDeps {
   /** Live configuration (`readFence`). */
   config(): Pick<FeishuConfig, 'readFence'>
   /** The route that names a Session, if any. */
   routeOf(sessionId: string): RouteRecord | undefined
+  /** Which routed Session each Session belongs to. */
+  lineage: SessionLineage
   /** The Session's effective working directory, when the host tracks one. */
   workingDirectory(session: Session): string | undefined
 }
@@ -45,9 +48,6 @@ export interface ReadFenceDeps {
 const GLOB_MAGIC = /[*?[\]{}!()]/u
 
 export class ReadFence {
-  /** Descendant Session id → routed ancestor Session id. */
-  private readonly roots = new Map<string, string>()
-
   constructor(private readonly deps: ReadFenceDeps) {}
 
   /**
@@ -59,7 +59,7 @@ export class ReadFence {
     const agent = exec.agent
     if (agent === undefined) return undefined
     // Resolved before the tool check so every call remembers its Session's root.
-    const root = this.rootOf(agent.session.id, agent.session.header.parentSession)
+    const root = this.deps.lineage.rootOfCall(agent.session.id, agent.session.header.parentSession)
     const fence = this.deps.config().readFence
     if (root === undefined || !fence.enabled) return undefined
     const argumentNames = Object.hasOwn(fence.tools, exec.name) ? fence.tools[exec.name] : undefined
@@ -83,22 +83,6 @@ export class ReadFence {
       if (!allowed.some(rootPath => isInside(resolved, rootPath))) return deny(exec.name, value, route)
     }
     return undefined
-  }
-
-  /** Forget every descendant (shutdown). */
-  clear(): void {
-    this.roots.clear()
-  }
-
-  /** The routed Session a call belongs to, remembering descendants. */
-  private rootOf(sessionId: string, parentSession: string | undefined): string | undefined {
-    if (this.deps.routeOf(sessionId) !== undefined) return sessionId
-    const known = this.roots.get(sessionId)
-    if (known !== undefined) return known
-    if (parentSession === undefined) return undefined
-    const root = this.deps.routeOf(parentSession) !== undefined ? parentSession : this.roots.get(parentSession)
-    if (root !== undefined) this.roots.set(sessionId, root)
-    return root
   }
 }
 

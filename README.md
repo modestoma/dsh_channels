@@ -174,8 +174,10 @@ Web 里直接新建的会话不显示按钮。来源在 Host 侧按会话 id 持
 src/
 ├── index.ts               # 插件入口 apply(ctx)：只导出 Cordis 插件面（name / inject / Config / apply）
 ├── config.ts              # 配置 schema 与凭据引用校验
-├── service.ts             # FeishuService 门面：生命周期、事件接线、入站与命令编排
+├── service.ts             # FeishuService：连接生命周期、组件装配、宿主事件接线、回合提交与恢复
 ├── access/                # 准入与授权：纯策略、持久化用户表、授权卡、申请生命周期、代码改动闸门
+│   ├── admin.ts           #   访问管理：设置面板的用户表 / 群权限修改与 /auth 命令
+│   ├── lineage.ts         #   会话血缘：子代理顺着 parentSession 归到所属飞书话题（闸门、读取围栏与事件共用）
 │   ├── principal.ts       #   飞书 principal（feishu-user / feishu-group）、路由上的身份、日志来源读取
 │   ├── peers.ts           #   每个 principal 一个进程内 Peer
 │   └── remote-policy.ts   #   session/prompt 的访问策略：从路由表给出每个会话的绑定
@@ -215,15 +217,26 @@ src/
 │   ├── message-read.ts    # 消息读取：get/mget/list、引用摘录、首轮历史、统一渲染
 │   ├── history-events.ts  # 把消息历史还原成长连接事件（断连补偿用）
 │   ├── slash-commands.ts  # 连接后把命令注册表幂等同步到飞书原生斜杠指令面板
+│   ├── connection-checks.ts # 连接后的权限自检与斜杠指令面板同步，结果供设置面板读取
+│   ├── profiles.ts        # 飞书用户 / 群名称与头像（短缓存），面板、话题标题、提交尾注共用
+│   ├── tool-mount.ts      # 在每个 Agent 作用域里注册通道工具（等待有上限、失败只告警一次）
+│   ├── abort.ts           # 读取与工具共用的取消辅助
 │   ├── tools.ts           # feishu_attachment_fetch / feishu_topic_messages 与每 route 白名单
 │   ├── send-file.ts       # feishu_send_file：把话题工作目录内的图片/文件发回当前会话
 │   ├── wiki/              # 知识库工具：links（wikiRoots 链接解析）、api（wiki/docx/docs_ai 接口）、sheet-api / base-api（电子表格、多维表格接口）、scope（范围判定）、consent（授权卡）、shared（失败码与公共步骤）、tools / sheet-tools / base-tools、a1（A1 范围）
 │   └── agent-context.ts   # agent 作用域 system prompt：附件指引与回复写法
 ├── routing/
 │   ├── inbound.ts         # 入站路由：去重、准入、路由决策树、建/续会话、首触引导
+│   ├── message-context.ts # 提示里的引用摘录与首轮话题历史
+│   ├── card-actions.ts    # 卡片按钮统一分发；回合卡按钮（停止、插话、继续、重新发起、选择卡）
 │   └── missed.ts          # 断连补偿：最后在线时间、读回漏掉的消息、待处理卡
 ├── commands.ts            # 斜杠命令解析、agent 作用域注册与结果卡
-├── commands/registry.ts   # 命令注册表：词表 / 准入规则 / 分组 help 的单一事实来源
+├── commands/
+│   ├── registry.ts        #   命令注册表：词表 / 准入规则 / 分组 help 的单一事实来源
+│   ├── dispatcher.ts      #   命令准入、按平面分发（免路由 / 通道 / agent 命令面）与结果渲染
+│   ├── permissions.ts     #   /permissions
+│   ├── effort.ts          #   /effort 与推理强度选择卡
+│   └── renew.ts           #   /renew
 ├── session-commands.ts    # /status /workspace /renew /history /compact 渲染
 ├── stats.ts               # 宿主投影优先的 token / 缓存 / 上下文折叠
 ├── domain.ts              # storageDomain 域声明、各表记录 schema 与打开函数
@@ -259,9 +272,12 @@ src/
 │   ├── catalog.ts         #   宿主选择目录：provider/model/推理档位/preset
 │   ├── directory-picker.ts #  系统目录选择框适配（ctx.directoryPicker native 后端）
 │   ├── surface.ts         #   状态 / 面板视图模型 + 保存 / 清除 / 重连 / 选目录
+│   ├── target.ts          #   面板读写的服务面：由服务的生命周期与各组件拼成
+│   ├── records.ts         #   会话来源、会话记录分组与工作区文件路由
+│   ├── credentials.ts     #   凭据引用解析与面板凭据槽
 │   └── routes.ts          #   HTTP 路由 + DSH 登录鉴权 + 同源写保护
 ├── workspace-files.ts     # 「会话记录」的只读工作区文件访问：路径约束、目录列表、预览、下载
-└── workspaces.ts          # 用户工作区 / 话题目录路径解析
+└── workspaces.ts          # 话题目录路径、标题与新话题工作区
 ```
 
 `lib/index.js` 与 `lib/client.js` 是构建产物（`pnpm build`）：前者是安装后 profile 直接加载的 Host 入口（普通 ESM，不依赖 TypeScript 运行时转换），后者是设置面板的浏览器 bundle。`scripts/verify-host-loader.mjs` / `scripts/verify-client-loader.mjs` 分别做冒烟。

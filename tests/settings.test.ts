@@ -88,6 +88,7 @@ import {
 } from '../src/settings/surface.ts'
 import { WIKI_ROOT_LINK_ERRORS } from '../src/feishu/wiki/links.ts'
 import type { SettingsTarget } from '../src/settings/surface.ts'
+import { settingsTarget } from '../src/settings/target.ts'
 import { createHostCatalog } from '../src/settings/catalog.ts'
 import type { SettingsCatalog } from '../src/settings/catalog.ts'
 import type { SettingsDirectoryPicker } from '../src/settings/directory-picker.ts'
@@ -2340,7 +2341,7 @@ describe('FeishuService settings integration', () => {
     expect(service.startError()).toBeUndefined()
     expect(service.health().level).toBe('degraded') // fake channel exposes no connection status
 
-    expect(await service.credentialStates()).toMatchObject({ appId: { configured: true }, appSecret: { configured: true } })
+    expect(await service.credentials.states()).toMatchObject({ appId: { configured: true }, appSecret: { configured: true } })
     await service.shutdown()
   })
 
@@ -2412,7 +2413,7 @@ describe('FeishuService settings integration', () => {
     expect(service.startError()).toContain('ws handshake failed')
     expect(service.missingConfig()).toEqual([])
 
-    const panel = await new SettingsSurface(service, h.store).panel()
+    const panel = await new SettingsSurface(settingsTarget(service), h.store).panel()
     expect(panel.status.running).toBe(false)
     expect(panel.status.phase).toBe('error')
     expect(panel.status.lastStartError).toContain('ws handshake failed')
@@ -2428,7 +2429,7 @@ describe('FeishuService settings integration', () => {
     const service = new FeishuService(h.ctx, h.config, () => makeChannel(), undefined, h.store, locks)
     await service.boot()
     expect(service.isRunning()).toBe(false)
-    const surface = new SettingsSurface(service, h.store)
+    const surface = new SettingsSurface(settingsTarget(service), h.store)
     const panel = await surface.panel()
     expect(panel.status.phase).toBe('occupied')
     expect(panel.status.occupiedBy).toEqual({
@@ -2442,7 +2443,7 @@ describe('FeishuService settings integration', () => {
       expect(taken.panel.status.occupiedBy).toBeUndefined()
     }
     await vi.waitFor(() => expect(owner.isRunning()).toBe(false))
-    expect((await new SettingsSurface(owner, h.store).panel()).status.phase).toBe('occupied')
+    expect((await new SettingsSurface(settingsTarget(owner), h.store).panel()).status.phase).toBe('occupied')
     await service.shutdown()
   })
 
@@ -2463,7 +2464,7 @@ describe('FeishuService settings integration', () => {
     expect(service.missingConfig()).toEqual(['FEISHU_APP_SECRET（飞书 App Secret）'])
     expect(service.startError()).toBeUndefined()
 
-    const surface = new SettingsSurface(service, h.store)
+    const surface = new SettingsSurface(settingsTarget(service), h.store)
     const panel = await surface.panel()
     expect(panel.status.phase).toBe('unconfigured')
     expect(panel.status.configured).toBe(false)
@@ -2503,7 +2504,7 @@ describe('FeishuService settings integration', () => {
     const h = harness()
     const service = new FeishuService(h.ctx, h.config, () => h.channel, undefined, h.store)
     await service.boot()
-    const surface = new SettingsSurface(service, h.store)
+    const surface = new SettingsSurface(settingsTarget(service), h.store)
     const original = h.config.baseDir
     const next = mkdtempSync(path.join(tmpdir(), 'dsh-channels-ws-hot-'))
     const saved = await surface.save({ baseDir: next })
@@ -2521,7 +2522,7 @@ describe('FeishuService settings integration', () => {
   it('credential writes enable a channel that booted without credentials', async () => {
     const h = harness({}, {})
     const service = new FeishuService(h.ctx, h.config, () => h.channel, undefined, h.store)
-    const surface = new SettingsSurface(service, h.store)
+    const surface = new SettingsSurface(settingsTarget(service), h.store)
     // No credentials: boot succeeds (the plugin is loaded for the settings
     // panel) but deliberately opens no connection.
     await service.boot()
@@ -2553,7 +2554,7 @@ describe('FeishuService settings integration', () => {
       calls.push(options as unknown as Record<string, unknown>)
       return h.channel
     }, undefined, h.store)
-    const surface = new SettingsSurface(service, h.store)
+    const surface = new SettingsSurface(settingsTarget(service), h.store)
     await service.boot()
     expect(service.isRunning()).toBe(false)
 
@@ -2637,7 +2638,7 @@ describe('FeishuService settings integration', () => {
       get: (name: string) => (name === 'credentials' ? readOnly : h.ctx.get?.(name)),
     } as unknown as HostContext
     const service = new FeishuService(ctx, h.config, () => h.channel, undefined, h.store)
-    await expect(service.setCredential('appId', 'cli_x')).rejects.toThrow(/不可写/)
-    await expect(service.clearCredential('appSecret')).rejects.toThrow(/不支持移除/)
+    await expect(service.credentials.set('appId', 'cli_x')).rejects.toThrow(/不可写/)
+    await expect(service.credentials.clear('appSecret')).rejects.toThrow(/不支持移除/)
   })
 })

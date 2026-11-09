@@ -99,7 +99,8 @@
 
 - `src/domain.ts` — `inflight` 表 schema / 句柄
 - `src/session/repair.ts` — 快照读写、`classifyTurn()`、`repairAll()` 启动恢复
-- `src/service.ts` — 恢复所需的 Session 接线（`recoveryAgent`、`runIntoCard`）、继续按钮、后台卡快照
+- `src/service.ts` — 恢复所需的 Session 接线（`recoveryAgent`、`runTurn`）、后台卡快照
+- `src/routing/card-actions.ts` — 继续按钮（`RESUME_PROMPT`）
 - `src/streamer.ts` — 钩子：`onTurnFinalized` 携带主卡 id、`onSegmentDelivered`、`onHostCardDelivered`
 - `src/cards/streaming.ts` — `buildInterruptionCard()`（可带继续按钮）、`buildRecoveredReplyCards()`
 - `tests/` — 快照生命周期与启动修复用例
@@ -138,7 +139,7 @@
 
 ## 涉及文件
 
-- `src/service.ts` — `establishing` 注册表、`startSession`/`establishSession` 拆分、`handleMessage` 在途建立分支
+- `src/routing/inbound.ts` — `establishing` 注册表、`startSession`/`establishSession` 拆分、在途建立分支
 - `tests/service.test.ts` — 4 个并发用例（话题内竞态续聊、降级并发、建立失败回落、旁路消息另起 session）
 
 ---
@@ -210,8 +211,8 @@
 
 ## 涉及文件
 
-- `src/domain.ts` — `processed` 表 schema / `ProcessedTable` 句柄
-- `src/service.ts` — `accepted` 内存守卫、`handleMessage` 幂等门、`gcExpiredEntries` 无条件清扫 processed
+- `src/domain.ts` — `processed` 表 schema
+- `src/routing/inbound.ts` — `accepted` 内存守卫与幂等门；`src/service.ts` — `gcExpiredEntries` 无条件清扫 processed
 - `tests/service.test.ts` — 4 个用例（首消息重投、续聊重投、跨重启重投、processed 记录 GC）
 
 ---

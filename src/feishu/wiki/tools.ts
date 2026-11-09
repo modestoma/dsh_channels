@@ -27,16 +27,15 @@ import type { WikiConsentAction } from '../../cards/wiki.ts'
 import type { FeishuConfig } from '../../config.ts'
 import type { AgentContext, ToolContentBlock, ToolDefinition, ToolExecution } from '../../host/agent.ts'
 import type { FeishuChannel } from '../../feishu-channel.ts'
-import { FeishuApiError } from '../../feishu-channel.ts'
 import type { InteractionRoute } from '../../interactions/pending.ts'
 import {
   consentFailure, describeError, display, failure, failureOf, FAILURE_REASONS, guarded, nodeUrl, ownedByApp,
   parseArgs, preview, previewBlock,
 } from './shared.ts'
-import type { WikiCallContext, WikiFailure, WikiFailureCode, WikiGate, WikiToolKit, WikiToolSpec } from './shared.ts'
-import { MOUNT_INJECT_RETRY_WAIT_MS, MOUNT_INJECT_WAIT_MS, waitForAvailability } from '../tools.ts'
+import type { WikiCallContext, WikiFailure, WikiGate, WikiToolKit, WikiToolSpec } from './shared.ts'
+import { AgentToolMount } from '../tool-mount.ts'
 import type { WikiApi, WikiDocFormat, WikiNode, WikiUpdateRequest } from './api.ts'
-import type { WikiConsent, WikiConsentOutcome } from './consent.ts'
+import type { WikiConsent } from './consent.ts'
 import { parseWikiRef, parseWikiRoots } from './links.ts'
 import type { WikiRef, WikiRoot } from './links.ts'
 import { containingRoot, spaceIsRoot } from './scope.ts'
@@ -269,10 +268,15 @@ type CallContext = WikiCallContext
  * each call through the gates in the module contract.
  */
 export class WikiToolRuntime implements WikiToolKit {
-  private readonly mountAttempts = new WeakMap<AgentContext, Promise<void>>()
+  /** Registers the tools in each Agent scope. */
+  private readonly toolMount = new AgentToolMount({
+    label: '知识库工具',
+    enabled: () => this.enabledTools().length > 0,
+    definitions: sessionId => this.enabledTools().map(name => this.definitionFor(name, sessionId)),
+    describeError: error => describeError(error),
+    warn: (message, ...args) => this.deps.warn(message, ...args),
+  })
   private readonly spaceNames = new Map<string, string>()
-  private warnedUnavailable = false
-  private warnedMountFailure = false
 
   constructor(private readonly deps: WikiToolRuntimeDeps) {}
 
@@ -297,52 +301,7 @@ export class WikiToolRuntime implements WikiToolKit {
    * @param sessionId Session the tools act for.
    */
   async mount(agentCtx: AgentContext, sessionId: string): Promise<void> {
-    if (this.enabledTools().length === 0) return
-    const existing = this.mountAttempts.get(agentCtx)
-    if (existing !== undefined) return await existing
-    const attempt = this.mountAttempt(agentCtx, sessionId)
-    this.mountAttempts.set(agentCtx, attempt)
-    await attempt
-  }
-
-  private async mountAttempt(agentCtx: AgentContext, sessionId: string): Promise<void> {
-    let injected = false
-    const outcome = await waitForAvailability(
-      Promise.resolve(agentCtx.inject(['tools'], (ctx) => {
-        injected = true
-        this.registerInScope(ctx, sessionId)
-      })),
-      this.warnedUnavailable ? MOUNT_INJECT_RETRY_WAIT_MS : MOUNT_INJECT_WAIT_MS,
-    )
-    if (outcome === 'failed') {
-      this.warnMountFailure('dsh-channels: mounting the wiki tools failed')
-      return
-    }
-    if (!injected && !this.warnedUnavailable) {
-      this.warnedUnavailable = true
-      this.deps.warn('dsh-channels: 知识库工具未挂载：宿主 tools 服务不可用（会话继续）')
-    }
-  }
-
-  private registerInScope(agentCtx: AgentContext, sessionId: string): void {
-    const tools = agentCtx.tools
-    if (tools === undefined || typeof tools.register !== 'function') {
-      this.warnMountFailure('dsh-channels: 知识库工具未注册：宿主 tools 服务不可用')
-      return
-    }
-    for (const name of this.enabledTools()) {
-      try {
-        tools.register(this.definitionFor(name, sessionId))
-      } catch (error) {
-        this.warnMountFailure(`dsh-channels: registering ${name} failed: ${describeError(error)}`)
-      }
-    }
-  }
-
-  private warnMountFailure(message: string): void {
-    if (this.warnedMountFailure) return
-    this.warnedMountFailure = true
-    this.deps.warn(message)
+    await this.toolMount.mount(agentCtx, sessionId)
   }
 
   private definitionFor(name: string, sessionId: string): ToolDefinition {

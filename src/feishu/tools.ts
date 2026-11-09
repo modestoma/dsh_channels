@@ -55,11 +55,12 @@ import {
   describeReadError,
   knownMessageOfItems,
   messageBelongsToRoute,
+  parseMessageItems,
   quoteItemsOf,
   topicMessageViewOf,
 } from './message-read.ts'
 import type {
-  MessageReadFailureCode, TopicMessageResourceView, TopicMessageView,
+  MessageReadFailureCode, RawMessageItem, TopicMessageResourceView, TopicMessageView,
 } from './message-read.ts'
 import {
   attachmentFailureReason, FALLBACK_MAX_IMAGE_BYTES, NativeAttachmentStore,
@@ -67,6 +68,8 @@ import {
 import type {
   AttachmentFailureCode, AttachmentResult, StoredFile, StoredImage,
 } from './native-attachments.ts'
+import { abortError, cancellable, isAbortError } from './abort.ts'
+import { AgentToolMount } from './tool-mount.ts'
 
 // ---- Public identity ----------------------------------------------------
 
@@ -79,17 +82,6 @@ export const ATTACHMENT_FETCH_TOOL_NAME = 'feishu_attachment_fetch'
  * entries of the current turn must not evict each other.
  */
 export const DEFAULT_KNOWN_MESSAGES_PER_ROUTE = 128
-
-/**
- * Maximum time agent setup waits for the host `tools` service
- * before degrading to "tool not mounted". A deployment without those services
- * must not block session creation; if they appear later the pending injection
- * still registers the tool.
- */
-export const MOUNT_INJECT_WAIT_MS = 2_000
-
-/** Retry wait for later sessions once the first mount timed out (fast-fail). */
-export const MOUNT_INJECT_RETRY_WAIT_MS = 250
 
 // ---- Route / whitelist vocabulary ---------------------------------------
 
@@ -445,12 +437,15 @@ interface DownloadBudget {
  * owns the per-route whitelist that the admission/quote layers populate.
  */
 export class AttachmentFetchToolRuntime {
+  /** Registers the tool in each Agent scope. */
+  private readonly toolMount = new AgentToolMount({
+    label: ATTACHMENT_FETCH_TOOL_NAME,
+    enabled: () => this.enabled(),
+    definitions: sessionId => [this.definitionFor(sessionId)],
+    describeError: error => String(error),
+    warn: (message, ...args) => this.deps.warn(message, ...args),
+  })
   readonly whitelist: RouteAttachmentWhitelist
-  /** Agent scope → its one mount attempt (cordis callbacks get distinct ctx objects). */
-  private readonly mountAttempts = new WeakMap<AgentContext, Promise<void>>()
-  private warnedMissingTools = false
-  private warnedMountFailure = false
-  private warnedUnavailable = false
 
   constructor(private readonly deps: AttachmentFetchRuntimeDeps) {
     this.whitelist = new RouteAttachmentWhitelist(DEFAULT_KNOWN_MESSAGES_PER_ROUTE)
@@ -503,42 +498,7 @@ export class AttachmentFetchToolRuntime {
    * injection.
    */
   async mount(agentCtx: AgentContext, sessionId: string): Promise<void> {
-    if (!this.enabled()) return
-    // Cordis hands the inject callback a DIFFERENT context object than the
-    // agent ctx, so dedupe on the outer scope and reuse its single attempt.
-    const existing = this.mountAttempts.get(agentCtx)
-    if (existing !== undefined) return await existing
-    const attempt = this.mountAttempt(agentCtx, sessionId)
-    this.mountAttempts.set(agentCtx, attempt)
-    await attempt
-  }
-
-  private async mountAttempt(agentCtx: AgentContext, sessionId: string): Promise<void> {
-    let injected = false
-    const outcome = await waitForAvailability(
-      Promise.resolve(agentCtx.inject(['tools'], (ctx) => {
-        injected = true
-        this.registerInScope(ctx, sessionId)
-      })),
-      // A deployment that already timed out once is unlikely to gain the
-      // services a moment later: fail fast on later sessions while the pending
-      // injection can still backfill registration if they do appear.
-      this.warnedUnavailable ? MOUNT_INJECT_RETRY_WAIT_MS : MOUNT_INJECT_WAIT_MS,
-    )
-    if (outcome === 'failed') {
-      this.warnMountFailure(`dsh-channels: mounting ${ATTACHMENT_FETCH_TOOL_NAME} failed`)
-      return
-    }
-    // Real cordis settles an injection whose dependencies never appear WITHOUT
-    // calling the callback; treat "settled but never injected" as unavailable.
-    // The fiber stays pending so a late service still backfills registration.
-    if (!injected && !this.warnedUnavailable) {
-      this.warnedUnavailable = true
-      this.deps.warn(
-        'dsh-channels: %s 未挂载：宿主 tools 服务不可用（会话继续）',
-        ATTACHMENT_FETCH_TOOL_NAME,
-      )
-    }
+    await this.toolMount.mount(agentCtx, sessionId)
   }
 
   /** Drop the whitelist entries of one retired route (record GC). */
@@ -565,38 +525,6 @@ export class AttachmentFetchToolRuntime {
   /** Drop every whitelisted route (shutdown). */
   clear(): void {
     this.whitelist.clear()
-  }
-
-  private registerInScope(agentCtx: AgentContext, sessionId: string): void {
-    // No per-callback-context dedupe: when a host service unloads/reloads,
-    // cordis disposes the injection fiber's effects (including our
-    // `tools.register`) and invokes this callback again with the same ctx
-    // object. Skipping the re-registration would silently lose the tool; a
-    // genuinely duplicated registration is caught below as a warning.
-    const tools = agentCtx.tools
-    if (tools === undefined || typeof tools.register !== 'function') {
-      if (!this.warnedMissingTools) {
-        this.warnedMissingTools = true
-        this.deps.warn(
-          'dsh-channels: %s 未注册：宿主 tools 服务不可用（附件工具已禁用）',
-          ATTACHMENT_FETCH_TOOL_NAME,
-        )
-      }
-      return
-    }
-    try {
-      tools.register(this.definitionFor(sessionId))
-    } catch (error) {
-      this.warnMountFailure(
-        `dsh-channels: registering ${ATTACHMENT_FETCH_TOOL_NAME} failed: ${String(error)}`,
-      )
-    }
-  }
-
-  private warnMountFailure(message: string): void {
-    if (this.warnedMountFailure) return
-    this.warnedMountFailure = true
-    this.deps.warn(message)
   }
 
   private now(): number {
@@ -853,17 +781,14 @@ export class AttachmentFetchToolRuntime {
         `${attachmentFetchFailureReason('MESSAGE_READ_FAILED')}：${describeFetchError(error)}`,
       )
     }
-    const items = rawMessageItems(response)
+    const items = parseMessageItems(response)
     if (items === undefined) {
       return failure(
         'MESSAGE_READ_FAILED',
         `${attachmentFetchFailureReason('MESSAGE_READ_FAILED')}：返回内容无法识别`,
       )
     }
-    const resources = message.kind === 'merge_forward'
-      ? mergedForwardResources(items)
-      : messageResourcesOfItems(items)
-    return { ok: true, resources }
+    return { ok: true, resources: uniqueResources(items) }
   }
 
   // ---- Per-resource fetch ----------------------------------------------
@@ -1010,55 +935,6 @@ function downloadFailureItem(
 }
 
 // ---- Download plumbing --------------------------------------------------
-
-/**
- * Run one promise with cooperative cancellation: an aborted signal rejects the
- * wrapper immediately (the underlying operation is signalled too where the
- * host contract supports it). Late rejections are swallowed so a timed-out
- * tool call never produces an unhandled rejection.
- */
-function cancellable<T>(task: Promise<T>, signal: AbortSignal): Promise<T> {
-  if (signal.aborted) {
-    task.catch(() => {})
-    return Promise.reject(abortError())
-  }
-  return new Promise<T>((resolve, reject) => {
-    let settled = false
-    const onAbort = (): void => {
-      if (settled) return
-      settled = true
-      signal.removeEventListener('abort', onAbort)
-      task.catch(() => {})
-      reject(abortError())
-    }
-    signal.addEventListener('abort', onAbort, { once: true })
-    task.then(
-      (value) => {
-        if (settled) return
-        settled = true
-        signal.removeEventListener('abort', onAbort)
-        resolve(value)
-      },
-      (error: unknown) => {
-        if (settled) return
-        settled = true
-        signal.removeEventListener('abort', onAbort)
-        reject(error)
-      },
-    )
-  })
-}
-
-function abortError(): Error {
-  const error = new Error('The operation was aborted')
-  error.name = 'AbortError'
-  return error
-}
-
-function isAbortError(error: unknown): boolean {
-  return typeof error === 'object' && error !== null
-    && (error as { name?: unknown }).name === 'AbortError'
-}
 
 /** Total budget for one tool call; also forwards caller/timeout cancellation. */
 function createAbortScope(caller: AbortSignal, timeoutMs: number): {
@@ -1252,250 +1128,23 @@ function displayText(value: string): string {
   return sanitizeInlineText(value, 200)
 }
 
-// ---- Raw message parsing (merged forward / message.get) -----------------
-
-interface RawMessageItem {
-  readonly messageId?: string
-  readonly msgType?: string
-  readonly content?: unknown
-}
-
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : undefined
-}
-
-function stringField(record: Record<string, unknown> | undefined, key: string): string | undefined {
-  const value = record?.[key]
-  return typeof value === 'string' && value.length > 0 ? value : undefined
-}
-
 /**
- * `im.v1.message.get` response → message items. Tolerates the SDK envelope
- * (`{ data: { items } }`) and an unwrapped `{ items }` for stubs.
+ * Resources of the items one `message.get` answered, without duplicates. A
+ * merged-forward container answers its children (the container itself
+ * carries no resource), and their bytes are fetched through the container's
+ * own message id (P0 rule).
  */
-function rawMessageItems(response: unknown): RawMessageItem[] | undefined {
-  const root = asRecord(response)
-  const data = asRecord(root?.data) ?? root
-  const items = data?.items
-  if (!Array.isArray(items)) return undefined
-  const parsed: RawMessageItem[] = []
-  for (const item of items) {
-    const record = asRecord(item)
-    if (record === undefined) continue
-    const body = asRecord(record.body)
-    parsed.push({
-      ...(stringField(record, 'message_id') === undefined ? {} : { messageId: stringField(record, 'message_id') }),
-      ...(stringField(record, 'msg_type') === undefined ? {} : { msgType: stringField(record, 'msg_type') }),
-      ...(body?.content === undefined ? {} : { content: body.content }),
-    })
-  }
-  return parsed
-}
-
-/** Parse Feishu's JSON-string message body content. */
-function parsedContent(content: unknown): Record<string, unknown> | undefined {
-  if (typeof content === 'string') {
-    try {
-      return asRecord(JSON.parse(content))
-    } catch {
-      return undefined
-    }
-  }
-  return asRecord(content)
-}
-
-/** Resources of one regular (non merged-forward) message. */
-function messageResourcesOfItems(items: readonly RawMessageItem[]): KnownAttachmentResource[] {
+function uniqueResources(items: readonly RawMessageItem[]): KnownAttachmentResource[] {
   const resources: KnownAttachmentResource[] = []
   const seen = new Set<string>()
   for (const item of items) {
-    for (const resource of resourcesOfItem(item)) {
+    for (const resource of item.resources) {
       if (seen.has(resource.fileKey)) continue
       seen.add(resource.fileKey)
       resources.push(resource)
     }
   }
   return resources
-}
-
-/**
- * Resources of a merged-forward container: every returned item is a child (the
- * top-level container itself carries no resource), and their bytes are fetched
- * through the container's own message id (P0 rule).
- */
-function mergedForwardResources(items: readonly RawMessageItem[]): KnownAttachmentResource[] {
-  const resources: KnownAttachmentResource[] = []
-  const seen = new Set<string>()
-  for (const item of items) {
-    for (const resource of resourcesOfItem(item)) {
-      if (seen.has(resource.fileKey)) continue
-      seen.add(resource.fileKey)
-      resources.push(resource)
-    }
-  }
-  return resources
-}
-
-/** Extract downloadable resources from one raw message item. */
-function resourcesOfItem(item: RawMessageItem): KnownAttachmentResource[] {
-  const content = parsedContent(item.content)
-  if (content === undefined) return []
-  switch (item.msgType) {
-    case 'image': {
-      const fileKey = stringField(content, 'image_key')
-      return fileKey === undefined ? [] : [{ type: 'image', fileKey }]
-    }
-    case 'file': {
-      const fileKey = stringField(content, 'file_key')
-      if (fileKey === undefined) return []
-      const fileName = stringField(content, 'file_name')
-      return [{ type: 'file', fileKey, ...(fileName === undefined ? {} : { fileName }) }]
-    }
-    case 'post': {
-      return postResources(content)
-    }
-    case 'folder': {
-      const fileKey = stringField(content, 'file_key')
-      if (fileKey === undefined) return []
-      const fileName = stringField(content, 'file_name')
-      return [{
-        type: 'file',
-        fileKey,
-        folder: true,
-        ...(fileName === undefined ? {} : { fileName }),
-      }]
-    }
-    default:
-      return []
-  }
-}
-
-/** Locale keys Feishu uses to wrap a localized post body. */
-const POST_LOCALES: ReadonlySet<string> = new Set([
-  'zh_cn', 'zh_hk', 'zh_tw', 'en_us', 'ja_jp', 'ko_kr', 'de_de', 'fr_fr',
-  'es_es', 'pt_br', 'ru_ru', 'th_th', 'vi_vn', 'id_id', 'it_it', 'ms_my',
-])
-
-/**
- * Resources embedded in a rich-text (`post`) body.
- *
- * Feishu serializes a post as `{ title, content, files }`, optionally wrapped
- * in one or more known locales (`{ zh_cn: { content, files }, ... }`). The
- * `content` rows carry inline `img`/`file`/`media` elements while attached
- * files live in the body's top-level `files[]` array that the SDK's post
- * converter drops — the same gap `postAttachedFiles` recovers on the inbound
- * path.
- *
- * Only the standard body shape is inspected: arbitrary nested `files`/`tag`
- * fields elsewhere in the body are NOT adopted, so the tool never treats
- * unrelated metadata as an attachment of an authorized message.
- */
-function postResources(content: Record<string, unknown>): KnownAttachmentResource[] {
-  const resources: KnownAttachmentResource[] = []
-  const byKey = new Map<string, KnownAttachmentResource>()
-  const push = (resource: KnownAttachmentResource): void => {
-    const existing = byKey.get(resource.fileKey)
-    if (existing === undefined) {
-      byKey.set(resource.fileKey, resource)
-      resources.push(resource)
-      return
-    }
-    // A folder marker from `files[]` must survive an inline duplicate.
-    if (existing.folder !== true && resource.folder === true) {
-      const index = resources.indexOf(existing)
-      if (index !== -1) resources[index] = { ...existing, folder: true }
-    }
-  }
-  for (const body of postBodies(content)) {
-    const rows = body.content
-    if (Array.isArray(rows)) {
-      for (const row of rows) {
-        if (!Array.isArray(row)) continue
-        for (const rawElement of row) {
-          const element = asRecord(rawElement)
-          if (element === undefined) continue
-          const tag = stringField(element, 'tag')
-          if (tag === 'img') {
-            const fileKey = stringField(element, 'image_key')
-            if (fileKey !== undefined) push({ type: 'image', fileKey })
-            continue
-          }
-          if (tag === 'file' || tag === 'media') {
-            const fileKey = stringField(element, 'file_key')
-            if (fileKey === undefined) continue
-            const fileName = stringField(element, 'file_name')
-            push({
-              type: 'file',
-              fileKey,
-              ...(fileName === undefined ? {} : { fileName }),
-              ...(element.is_folder === true ? { folder: true } : {}),
-            })
-          }
-        }
-      }
-    }
-    const files = body.files
-    if (Array.isArray(files)) {
-      for (const rawFile of files) {
-        const file = asRecord(rawFile)
-        if (file === undefined) continue
-        const fileKey = stringField(file, 'file_key')
-        if (fileKey === undefined) continue
-        const fileName = stringField(file, 'file_name')
-        push({
-          type: 'file',
-          fileKey,
-          ...(fileName === undefined ? {} : { fileName }),
-          ...(file.is_folder === true ? { folder: true } : {}),
-        })
-      }
-    }
-  }
-  return resources
-}
-
-/** The standard post body record(s): the direct shape plus known locale wrappers. */
-function postBodies(content: Record<string, unknown>): Array<Record<string, unknown>> {
-  const bodies: Array<Record<string, unknown>> = []
-  if (isPostBody(content)) bodies.push(content)
-  for (const [key, value] of Object.entries(content)) {
-    if (!POST_LOCALES.has(key)) continue
-    const body = asRecord(value)
-    if (body !== undefined && isPostBody(body)) bodies.push(body)
-  }
-  return bodies
-}
-
-function isPostBody(record: Record<string, unknown>): boolean {
-  return Array.isArray(record.content) || Array.isArray(record.files)
-}
-
-/**
- * Wait for one cordis injection to settle, but never longer than `timeoutMs`:
- * a hard dependency on a service a deployment does not mount would otherwise
- * block agent creation forever.
- */
-export function waitForAvailability(
-  task: PromiseLike<unknown>,
-  timeoutMs: number,
-): Promise<'ready' | 'failed' | 'timeout'> {
-  return new Promise<'ready' | 'failed' | 'timeout'>((resolve) => {
-    let settled = false
-    const finish = (outcome: 'ready' | 'failed' | 'timeout'): void => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      resolve(outcome)
-    }
-    const timer = setTimeout(() => finish('timeout'), timeoutMs)
-    timer.unref?.()
-    Promise.resolve(task).then(
-      () => finish('ready'),
-      () => finish('failed'),
-    )
-  })
 }
 
 // ---- Rendering / presentation -------------------------------------------
@@ -1803,11 +1452,14 @@ type TopicReadOutcome =
  * so this runtime only needs its mount bookkeeping.
  */
 export class TopicMessagesToolRuntime {
-  /** Agent scope → its one mount attempt (cordis callbacks get distinct ctx objects). */
-  private readonly mountAttempts = new WeakMap<AgentContext, Promise<void>>()
-  private warnedMissingTools = false
-  private warnedMountFailure = false
-  private warnedUnavailable = false
+  /** Registers the tool in each Agent scope. */
+  private readonly toolMount = new AgentToolMount({
+    label: TOPIC_MESSAGES_TOOL_NAME,
+    enabled: () => this.enabled(),
+    definitions: sessionId => [this.definitionFor(sessionId)],
+    describeError: error => describeFetchError(error),
+    warn: (message, ...args) => this.deps.warn(message, ...args),
+  })
 
   constructor(private readonly deps: TopicMessagesRuntimeDeps) {}
 
@@ -1823,78 +1475,12 @@ export class TopicMessagesToolRuntime {
    * creation (bounded 2 s wait, the pending injection can still backfill).
    */
   async mount(agentCtx: AgentContext, sessionId: string): Promise<void> {
-    if (!this.enabled()) return
-    // Cordis hands the inject callback a DIFFERENT context object than the
-    // agent ctx, so dedupe on the outer scope and reuse its single attempt.
-    const existing = this.mountAttempts.get(agentCtx)
-    if (existing !== undefined) return await existing
-    const attempt = this.mountAttempt(agentCtx, sessionId)
-    this.mountAttempts.set(agentCtx, attempt)
-    await attempt
+    await this.toolMount.mount(agentCtx, sessionId)
   }
 
   /** No process-local state to drop; kept for symmetry with the fetch runtime. */
   clear(): void {
     // Intentionally empty: this runtime registers a tool per Agent scope only.
-  }
-
-  private async mountAttempt(agentCtx: AgentContext, sessionId: string): Promise<void> {
-    let injected = false
-    const outcome = await waitForAvailability(
-      Promise.resolve(agentCtx.inject(['tools'], (ctx) => {
-        injected = true
-        this.registerInScope(ctx, sessionId)
-      })),
-      // A deployment that already timed out once is unlikely to gain the
-      // services a moment later: fail fast on later sessions while the pending
-      // injection can still backfill registration if they do appear.
-      this.warnedUnavailable ? MOUNT_INJECT_RETRY_WAIT_MS : MOUNT_INJECT_WAIT_MS,
-    )
-    if (outcome === 'failed') {
-      this.warnMountFailure(`dsh-channels: mounting ${TOPIC_MESSAGES_TOOL_NAME} failed`)
-      return
-    }
-    // Real cordis settles an injection whose dependencies never appear WITHOUT
-    // calling the callback; treat "settled but never injected" as unavailable.
-    // The fiber stays pending so a late service still backfills registration.
-    if (!injected && !this.warnedUnavailable) {
-      this.warnedUnavailable = true
-      this.deps.warn(
-        'dsh-channels: %s 未挂载：宿主 tools 服务不可用（会话继续）',
-        TOPIC_MESSAGES_TOOL_NAME,
-      )
-    }
-  }
-
-  private registerInScope(agentCtx: AgentContext, sessionId: string): void {
-    // No per-callback-context dedupe: when a host service unloads/reloads,
-    // cordis disposes the injection fiber's effects (including our
-    // `tools.register`) and invokes this callback again with the same ctx
-    // object. Skipping the re-registration would silently lose the tool.
-    const tools = agentCtx.tools
-    if (tools === undefined || typeof tools.register !== 'function') {
-      if (!this.warnedMissingTools) {
-        this.warnedMissingTools = true
-        this.deps.warn(
-          'dsh-channels: %s 未注册：宿主 tools 服务不可用（话题消息工具已禁用）',
-          TOPIC_MESSAGES_TOOL_NAME,
-        )
-      }
-      return
-    }
-    try {
-      tools.register(this.definitionFor(sessionId))
-    } catch (error) {
-      this.warnMountFailure(
-        `dsh-channels: registering ${TOPIC_MESSAGES_TOOL_NAME} failed: ${describeFetchError(error)}`,
-      )
-    }
-  }
-
-  private warnMountFailure(message: string): void {
-    if (this.warnedMountFailure) return
-    this.warnedMountFailure = true
-    this.deps.warn(message)
   }
 
   private definitionFor(sessionId: string): ToolDefinition {

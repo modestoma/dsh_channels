@@ -12,6 +12,20 @@
 
 import type { ExpiredRouteRecord, FeishuDomainHandle, RouteRecord, SessionOriginRecord } from '../domain.ts'
 
+/**
+ * The route record of a newly opened topic: its first Session is its only
+ * history entry and its creation is its last activity.
+ * @param route - the route's identity, Session, workspace, and first card.
+ * @param createdAt - the Session's creation time.
+ * @returns the record.
+ */
+export function newTopicRoute(
+  route: Omit<RouteRecord, 'createdAt' | 'lastActivityAt' | 'sessionHistory' | 'lastSpeakerUserId'>,
+  createdAt: number,
+): RouteRecord {
+  return { ...route, createdAt, lastActivityAt: createdAt, sessionHistory: [{ sessionId: route.sessionId, createdAt }] }
+}
+
 export interface RouteStoreDeps {
   /** The opened domain handle, or undefined before `start()` / after shutdown. */
   domain(): FeishuDomainHandle | undefined

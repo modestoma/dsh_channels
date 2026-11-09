@@ -115,8 +115,8 @@ interface Harness {
 
 /** Adds `userId` to the user table as an administrator through the settings-panel path. */
 async function makeAdmin(h: Harness, userId: string): Promise<void> {
-  await h.service.addAccessUser(userId)
-  await h.service.setAccessPermission(userId, 'admin', true)
+  await h.service.accessAdmin.addUser(userId)
+  await h.service.accessAdmin.setPermission(userId, 'admin', true)
 }
 
 async function setup(
@@ -1045,7 +1045,7 @@ describe('FeishuService', () => {
       routeKey: 'omt_1', kind: 'thread', chatId: 'oc_origin', chatType: 'group', senderUserId: 'u_owner',
     })
     // A group topic belongs to the group, so its origin reads as shared.
-    expect(await h.service.sessionOrigin(renewed.options.sessionId)).toMatchObject({
+    expect(await h.service.records.origin(renewed.options.sessionId)).toMatchObject({
       sessionId: renewed.options.sessionId,
       chatType: 'group',
       kind: 'thread',
@@ -1058,13 +1058,13 @@ describe('FeishuService', () => {
       bound: true,
       chatLink: 'https://applink.feishu.cn/client/chat/open?openChatId=oc_origin',
     })
-    const previous = await h.service.sessionOrigin(old.options.sessionId)
+    const previous = await h.service.records.origin(old.options.sessionId)
     expect(previous).toMatchObject({ bound: false, chatName: '研发群', senderName: '张三' })
     expect(previous).not.toHaveProperty('lastActivityAt')
     // Profiles are cached briefly: one lookup serves both Sessions of the same chat and user.
     expect(mock(h.channel.chatProfile)).toHaveBeenCalledTimes(1)
     expect(mock(h.channel.userProfiles)).toHaveBeenCalledTimes(1)
-    expect(await h.service.sessionOrigin('not-a-feishu-session')).toBeNull()
+    expect(await h.service.records.origin('not-a-feishu-session')).toBeNull()
   })
 
   it('serves a private-chat origin without a chat name and with the user id when no name resolves', async () => {
@@ -1078,7 +1078,7 @@ describe('FeishuService', () => {
     }))
     await waitForEstablishedSession(h)
     const sessionId = h.ctxState.agents.created[0]!.options.sessionId
-    const origin = await h.service.sessionOrigin(sessionId)
+    const origin = await h.service.records.origin(sessionId)
     expect(origin).toMatchObject({ chatType: 'p2p', senderUserId: 'u_dm', bound: true })
     expect(origin).not.toHaveProperty('chatName')
     expect(origin).not.toHaveProperty('senderName')
@@ -1097,7 +1097,7 @@ describe('FeishuService', () => {
       chatType: 'group', chatId: 'oc_member', senderId: 'u_owner', messageId: 'om_member_start', content: '开始',
     }))
     await waitForEstablishedSession(h)
-    const origin = await h.service.sessionOrigin(h.ctxState.agents.created[0]!.options.sessionId)
+    const origin = await h.service.records.origin(h.ctxState.agents.created[0]!.options.sessionId)
     expect(origin).toMatchObject({ chatName: '研发群', senderName: '张三' })
     expect(origin).not.toHaveProperty('senderAvatarUrl')
   })
@@ -1112,21 +1112,21 @@ describe('FeishuService', () => {
           return { name: '研发群', avatarUrl: 'https://cdn.example/chat.png' }
         },
       })
-      const first = await h.service.feishuProfiles(['u_a', 'u_unknown', 'ou_open', 'u_a'], ['oc_dev', 'oc_gone', 'bad id'])
+      const first = await h.service.profiles.lookup(['u_a', 'u_unknown', 'ou_open', 'u_a'], ['oc_dev', 'oc_gone', 'bad id'])
       expect(first).toEqual({
         users: { u_a: { name: '名-u_a' } },
         chats: { oc_dev: { name: '研发群', avatarUrl: 'https://cdn.example/chat.png' } },
         warning: '读取群信息失败：code=232011 not found',
       })
       expect(mock(h.channel.userProfiles)).toHaveBeenCalledWith(['u_a', 'u_unknown'])
-      await h.service.feishuProfiles(['u_a', 'u_unknown'], ['oc_dev'])
+      await h.service.profiles.lookup(['u_a', 'u_unknown'], ['oc_dev'])
       expect(mock(h.channel.userProfiles)).toHaveBeenCalledTimes(1)
       expect(mock(h.channel.chatProfile)).toHaveBeenCalledTimes(2)
       // A failed chat is not cached; it is asked again on the next entry.
-      await h.service.feishuProfiles([], ['oc_gone'])
+      await h.service.profiles.lookup([], ['oc_gone'])
       expect(mock(h.channel.chatProfile)).toHaveBeenCalledTimes(3)
       vi.setSystemTime(Date.now() + 30_000)
-      await h.service.feishuProfiles(['u_a'], [])
+      await h.service.profiles.lookup(['u_a'], [])
       expect(mock(h.channel.userProfiles)).toHaveBeenCalledTimes(2)
     } finally {
       vi.useRealTimers()
@@ -1171,7 +1171,7 @@ describe('FeishuService', () => {
         : { title: { title: `标题-${sessionId.slice(0, 4)}`, updatedAt: 1 } },
     })))
 
-    const records = await h.service.sessionRecords()
+    const records = await h.service.records.list()
     expect(records.groups).toHaveLength(1)
     const group = records.groups[0]!
     expect(group).toMatchObject({ chatId: 'oc_rec', chatName: '研发群', chatAvatarUrl: 'https://cdn.example/chat.png' })
@@ -1188,11 +1188,11 @@ describe('FeishuService', () => {
     expect(records.directs[0]!.sessions[0]!.workspace).toContain(path.join('p2p', 'u_dm'))
 
     // The topic directory is browsable (empty until the Session writes files).
-    const listing = await h.service.workspaceFiles(workspace, '')
+    const listing = await h.service.records.files(workspace, '')
     expect(listing.entries).toEqual([])
-    await expect(h.service.workspaceFiles(h.config.baseDir, '')).rejects.toMatchObject({ status: 403 })
+    await expect(h.service.records.files(h.config.baseDir, '')).rejects.toMatchObject({ status: 403 })
     // The retired root is browsable once the records named it; it does not exist on disk.
-    await expect(h.service.workspaceFiles(retiredRoot, '')).rejects.toMatchObject({ status: 404 })
+    await expect(h.service.records.files(retiredRoot, '')).rejects.toMatchObject({ status: 404 })
   })
 
   it('rolls back a failed renewed Agent creation and keeps the old route live', async () => {

@@ -35,9 +35,7 @@ import type {
 } from '../host/agent.ts'
 import type { FeishuChannel, OutboundMedia } from '../feishu-channel.ts'
 import { FeishuApiError, sniffImageMediaType } from '../feishu-channel.ts'
-import {
-  MOUNT_INJECT_RETRY_WAIT_MS, MOUNT_INJECT_WAIT_MS, waitForAvailability,
-} from './tools.ts'
+import { AgentToolMount } from './tool-mount.ts'
 
 /** Model-facing tool name; stable across releases (session history references it). */
 export const SEND_FILE_TOOL_NAME = 'feishu_send_file'
@@ -180,11 +178,14 @@ export interface SendFileRuntimeDeps {
  * one workspace file per call to the session's current route.
  */
 export class SendFileToolRuntime {
-  /** Agent scope → its one mount attempt (cordis callbacks get distinct ctx objects). */
-  private readonly mountAttempts = new WeakMap<AgentContext, Promise<void>>()
-  private warnedMissingTools = false
-  private warnedMountFailure = false
-  private warnedUnavailable = false
+  /** Registers the tool in each Agent scope. */
+  private readonly toolMount = new AgentToolMount({
+    label: SEND_FILE_TOOL_NAME,
+    enabled: () => this.enabled(),
+    definitions: sessionId => [this.definitionFor(sessionId)],
+    describeError: error => describeError(error),
+    warn: (message, ...args) => this.deps.warn(message, ...args),
+  })
 
   constructor(private readonly deps: SendFileRuntimeDeps) {}
 
@@ -202,53 +203,7 @@ export class SendFileToolRuntime {
    * @param sessionId Session the tool sends for.
    */
   async mount(agentCtx: AgentContext, sessionId: string): Promise<void> {
-    if (!this.enabled()) return
-    const existing = this.mountAttempts.get(agentCtx)
-    if (existing !== undefined) return await existing
-    const attempt = this.mountAttempt(agentCtx, sessionId)
-    this.mountAttempts.set(agentCtx, attempt)
-    await attempt
-  }
-
-  private async mountAttempt(agentCtx: AgentContext, sessionId: string): Promise<void> {
-    let injected = false
-    const outcome = await waitForAvailability(
-      Promise.resolve(agentCtx.inject(['tools'], (ctx) => {
-        injected = true
-        this.registerInScope(ctx, sessionId)
-      })),
-      this.warnedUnavailable ? MOUNT_INJECT_RETRY_WAIT_MS : MOUNT_INJECT_WAIT_MS,
-    )
-    if (outcome === 'failed') {
-      this.warnMountFailure(`dsh-channels: mounting ${SEND_FILE_TOOL_NAME} failed`)
-      return
-    }
-    if (!injected && !this.warnedUnavailable) {
-      this.warnedUnavailable = true
-      this.deps.warn('dsh-channels: %s 未挂载：宿主 tools 服务不可用（会话继续）', SEND_FILE_TOOL_NAME)
-    }
-  }
-
-  private registerInScope(agentCtx: AgentContext, sessionId: string): void {
-    const tools = agentCtx.tools
-    if (tools === undefined || typeof tools.register !== 'function') {
-      if (!this.warnedMissingTools) {
-        this.warnedMissingTools = true
-        this.deps.warn('dsh-channels: %s 未注册：宿主 tools 服务不可用（发送文件工具已禁用）', SEND_FILE_TOOL_NAME)
-      }
-      return
-    }
-    try {
-      tools.register(this.definitionFor(sessionId))
-    } catch (error) {
-      this.warnMountFailure(`dsh-channels: registering ${SEND_FILE_TOOL_NAME} failed: ${describeError(error)}`)
-    }
-  }
-
-  private warnMountFailure(message: string): void {
-    if (this.warnedMountFailure) return
-    this.warnedMountFailure = true
-    this.deps.warn(message)
+    await this.toolMount.mount(agentCtx, sessionId)
   }
 
   private definitionFor(sessionId: string): ToolDefinition {
