@@ -38,8 +38,8 @@ import {
   splitBodyForCard,
   stripTables,
   tableBlocks,
-} from '../src/cards.ts'
-import type { ApprovalQuestion, CardState } from '../src/cards.ts'
+} from '../src/cards/index.ts'
+import type { ApprovalQuestion, CardState } from '../src/cards/index.ts'
 
 /** JSON-escaped UTF-8 size of a string; the metric the panel budget uses. */
 function escapedJsonBytes(text: string): number {

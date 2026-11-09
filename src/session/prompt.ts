@@ -13,7 +13,7 @@ import { randomUUID } from 'node:crypto'
 import type { ChannelPrincipal } from '../access/principal.ts'
 import { INFLIGHT_PROMPT_MAX_BYTES } from '../domain.ts'
 import type { InflightSnapshot } from '../domain.ts'
-import type { FileAttachmentRef, FileUploadReceiptId, ImageAttachmentRef } from '../dsh-types.ts'
+import type { FileAttachmentRef, FileUploadReceiptId, ImageAttachmentRef } from '../host/index.ts'
 
 /** Text of a prompt. */
 export interface PromptTextBlock {

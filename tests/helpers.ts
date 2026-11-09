@@ -18,12 +18,12 @@ import type {
   PreToolExecution, PromptSection,
   Session, SessionEvent, SessionId, SessionProjections, StorageDomainFacility, ToolDefinition, ToolRuntime,
   UserMessage, UserQuestionAnswererListener, WorkingDirectoryService, Workspace, WorkspaceRegistry,
-} from '../src/dsh-types.ts'
+} from '../src/host/index.ts'
 import type {
   BotAddedEvent, CardActionEvent, ChatInfo, FeishuChannel, FeishuConnectionStatus, FeishuProfile, NormalizedMessage,
   OutboundMedia, RawMessageListParams, SendResult,
 } from '../src/feishu-channel.ts'
-import type { RawDomainHandle } from '../src/domain.ts'
+import type { RawDomainHandle } from '../src/storage/table.ts'
 import type {
   FileUploads, HostConnection, InvokeRemoteRequest, PeerScope, RemoteAccess, RemoteAccessPolicy, SessionPromptRequest, TypertGateway,
 } from '../src/host/remote.ts'

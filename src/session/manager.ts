@@ -23,10 +23,10 @@ import { randomUUID } from 'node:crypto'
 import { mkdir } from 'node:fs/promises'
 import type {
   Agent, AgentContext, AgentHandle, AgentPresets, AgentSetup, HostContext, Session, SessionId,
-} from '../dsh-types.ts'
+} from '../host/index.ts'
 import type { FeishuConfig } from '../config.ts'
 import { mountChannelCommands } from '../commands.ts'
-import { appendSessionHistory, sessionDirOf } from '../domain.ts'
+import { appendSessionHistory } from '../domain.ts'
 import type { RouteRecord } from '../domain.ts'
 import { mountChannelGuidance, mountReplyGuidance } from '../feishu/agent-context.ts'
 import { installRequestPolicy } from './request-policy.ts'
@@ -280,15 +280,13 @@ export class SessionManager {
    * Create and atomically publish one renewed route.
    *
    * A renewal keeps the topic's directory: the new Session is created with
-   * the same directory the old one worked in as its header cwd (the topic
-   * workspace; for an older route its per-topic directory or worktree, which
-   * is recreated when it disappeared).
+   * the topic directory as its header cwd, recreated when it disappeared.
    */
   async renew(record: RouteRecord, oldLive: LiveAgent): Promise<RenewCommit> {
     const sessionId = randomUUID() as SessionId
     const preset = this.effectivePreset(oldLive.agent.session)
     const composition = await this.presetComposition(preset, false, sessionId)
-    const cwd = sessionDirOf(record)
+    const cwd = record.workspacePath
     await mkdir(cwd, { recursive: true })
 
     let newHandle: AgentHandle | undefined

@@ -7,7 +7,7 @@
 import { describe, expect, it } from 'vitest'
 import { CodeWriteGate } from '../src/access/code-write.ts'
 import type { RouteRecord } from '../src/domain.ts'
-import type { Agent, PreToolExecution } from '../src/dsh-types.ts'
+import type { Agent, PreToolExecution } from '../src/host/index.ts'
 import type { UserMessage } from '../src/host/core.ts'
 
 const PUSH = 'repo_workspace_push'
@@ -50,7 +50,7 @@ describe('CodeWriteGate', () => {
   })
 
   it('denies a gated tool in a group whose permission record lacks codeWrite, pointing at the group table', () => {
-    const { gate } = setup({ chatId: 'oc_group', chatType: 'group', mode: 'group' })
+    const { gate } = setup({ chatId: 'oc_group', chatType: 'group' })
     const decision = gate.decide(call('s_root'))
     expect(decision).toMatchObject({ kind: 'deny', reason: expect.stringContaining('本群没有代码改动权限') })
     expect(decision && 'reason' in decision ? decision.reason : '').toContain('「群权限」')
@@ -145,7 +145,7 @@ describe('CodeWriteGate', () => {
   })
 
   it('falls back to the route\'s last recorded speaker before any claimed message, then to the initiator', () => {
-    const { gate, routes } = setup({ chatId: 'oc_group', chatType: 'group', mode: 'group', lastSpeakerUserId: 'u_last' })
+    const { gate, routes } = setup({ chatId: 'oc_group', chatType: 'group', lastSpeakerUserId: 'u_last' })
     expect(gate.speakerOf('s_root')).toBe('u_last')
     routes.set('s_root', { ...routes.get('s_root')!, lastSpeakerUserId: undefined })
     expect(gate.speakerOf('s_root')).toBe('u_owner')
@@ -161,7 +161,7 @@ describe('CodeWriteGate', () => {
   })
 
   it('takes the member of a group principal as the speaker; a group principal without its chat is malformed', () => {
-    const { gate } = setup({ chatId: 'oc_group', chatType: 'group', mode: 'group' })
+    const { gate } = setup({ chatId: 'oc_group', chatType: 'group' })
     gate.onClaimed('s_root', fromGroup('oc_group', 'u_bob'))
     expect(gate.speakerOf('s_root')).toBe('u_bob')
     gate.onClaimed('s_root', { source: { kind: 'user', rpcId: 'r', principal: { kind: 'feishu-group', userId: 'u_carol' } } })

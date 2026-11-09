@@ -5,19 +5,20 @@
 | 层 | 负责方 | 落点 |
 |---|---|---|
 | 会话本体（事件日志 + header） | 宿主 `dsh-session-persistence` | `$DSH_HOME/sessions/<workspace>/<sessionId>/session.jsonl.zstd` |
-| 插件自有状态 | 插件 → `ctx.storageDomain` | 域 `channels_routes_v2`，JSON 后端为 `$DSH_HOME/storages/channels_routes_v2.json` |
+| 插件自有状态 | 插件 → `ctx.storageDomain` | 域 `dsh_channels`，JSON 后端为 `$DSH_HOME/storages/dsh_channels.json` |
 | 话题目录（工作区） | 磁盘目录 + 宿主 registry | 每个话题一个目录 `<baseDir>/p2p/<user>/<话题>/`、`<baseDir>/groups/<chat>/<话题>/`（`baseDir` 可在 Web 面板配置），同时登记为 DSH 工作区（注册表 `$DSH_HOME/storages/workspace.json`）；目录就是 Session 的 header cwd |
 
+用户一律以飞书 `user_id` 标识。更早版本的 `channels_routes` / `channels_routes_v2` 域不再读取、也不迁移；升级时清空插件数据重新安装。
 
-用户一律以飞书 `user_id` 标识。open_id 时代的旧域 `channels_routes`（`channels_routes.json`）与按 open_id 命名的旧工作区目录不再读取、也不迁移，原样留在磁盘上，确认不需要后可手动删除。
 ## 一、已持久化的内容
 
-1. **路由与过期墓碑**（`src/domain.ts` 域 `channels_routes_v2`）：`routes` 表以 `thread_id` 或降级键 `chat:p2p|group:<chatId>:<userId>` 保存活动 `RouteRecord`（sessionId / chatId / chatType / senderUserId / workspacePath / mode? / lastSpeakerUserId? / sessionDir? / worktreeBranch? / cardMessageId / createdAt / lastActivityAt）；`workspacePath` 是话题目录（Session header cwd）；`mode: 'group'` 标记没有单一所有者的群话题（旧记录的 `shared: true` 读作同义），`senderUserId` 是开话题的人，`lastSpeakerUserId` 是群话题最近的发言人（重启后提交尾注的兜底）；`sessionDir` / `worktreeBranch` 只在旧版本按人建工作区时写下，旧话题继续用 `sessionDir`（缺省 = `workspacePath`），新记录不再写；`expired_routes` 以 thread id 保存 TTL 退休后的最小墓碑，跨重启拒绝旧话题误建 Session。`cardMessageId` 每 turn 更新，`lastActivityAt` 供路由退休使用。
+1. **路由与过期墓碑**（`src/domain.ts` 域 `dsh_channels`）：`routes` 表以 `thread_id` 或降级键 `chat:p2p|group:<chatId>:<userId>` 保存活动 `RouteRecord`（sessionId / chatId / chatType / senderUserId / workspacePath / lastSpeakerUserId? / cardMessageId / createdAt / lastActivityAt / sessionHistory）；`workspacePath` 是话题目录（Session header cwd）；`chatType` 决定路由归属：群里的路由（含降级键）一律是群话题，私聊路由属于 `senderUserId`；`lastSpeakerUserId` 是群话题最近的发言人（重启后提交尾注的兜底）；`sessionHistory` 按时间记录这个话题指向过的 Session（`/renew` 追加）；`expired_routes` 以 thread id 保存 TTL 退休后的最小墓碑，跨重启拒绝旧话题误建 Session。`cardMessageId` 每 turn 更新，`lastActivityAt` 供路由退休使用。
 2. **会话本体与事件日志**：宿主代持。插件消费的 `assistant/chunk`、`tool/call`、`tool-workflow/run-*`、`subagent/descriptor` 等全部在持久化日志里，因此 `src/stats.ts` 的 token/缓存统计不单独存，`foldAll()` 重放日志，重启后继续累计。`meta.cwd`、`agentPreset` 随 header 落盘。
 3. **话题目录**：路径由聊天类型、群或用户 id 和话题 id 确定性生成，幂等 mkdir；宿主 `workspace.json` 持久化 path/title/sessionIds（标题为「群名 · 话题标题」或「人名 · 话题标题」）。`/renew` 复用同一目录。插件不删除目录。
 4. **凭据**：密钥存宿主 `$DSH_HOME/.credentials.yaml`，插件只持引用名。
-5. **收尾重试队列**（`src/outbox.ts`，`channels_routes_v2` 域的 `outbox` 表，加法新增不升版本）：一轮结束时失败的卡片终态更新、表情切换和没发出去的续卡，每条记录带 `kind`（`card` / `reaction` / `segment`）、首次尝试时间、失败次数、下次重试时间和最近一次错误。成功、消息已撤回 / 机器人不在群里、或满 24 小时即删除。
-6. **准入授权**（`src/domain.ts` 域 `channels_routes_v2`，同样保持 `version: 1` 加法新增）：`access_users` 表以 `user_id` 保存用户表，每条记录带 `admin` 和四个开关 `chat` / `wikiRead` / `wikiWrite` / `codeWrite`（旧记录缺开关时读作只有 `chat`、不是管理员）；`access_requests` 表以不透明 token 保存用户授权申请（含发给每位管理员的卡片 `messageIds`，以及旧版本写入的单个 `messageId`，重启后旧授权卡仍可点击结算；过期状态在同一表落审计；旧的群申请记录保留但加载时跳过）。`group_permissions` 表以 `chat_id` 保存群权限记录（`name?` / `addedAt` / `wikiRead` / `wikiWrite` / `codeWrite`），群里首次开话题时自动登记（三个开关全关），只在设置面板「群权限」修改或移除；群话题的知识库与代码改动工具按它判权。已退役的 `access_groups`（群白名单）与 `access_wiki_users`（知识库白名单）仍在域里声明，以免 JSON 后端写入时丢掉旧数据，但不再读取。域全局值的 `knownGroups` 记录机器人被拉进过的群（最多 500 个），供断连补偿使用。准入模式属于配置层（profile + Web 覆盖）；管理员是 `access_users` 里 `admin` 为 true 的记录。
+5. **收尾重试队列**（`src/outbox.ts`，`dsh_channels` 域的 `outbox` 表）：一轮结束时失败的卡片终态更新、表情切换和没发出去的续卡，每条记录带 `kind`（`card` / `reaction` / `segment`）、首次尝试时间、失败次数、下次重试时间和最近一次错误。成功、消息已撤回 / 机器人不在群里、或满 24 小时即删除。
+6. **准入授权**（`src/domain.ts` 域 `dsh_channels`）：`access_users` 表以 `user_id` 保存用户表，每条记录带 `admin`、四个开关 `chat` / `wikiRead` / `wikiWrite` / `codeWrite` 和可选 `gitEmail`；`access_requests` 表以不透明 token 保存用户授权申请（含发给每位管理员的卡片 `messageIds`，重启后授权卡仍可点击结算；过期状态在同一表落审计）。`group_permissions` 表以 `chat_id` 保存群权限记录（`name?` / `addedAt` / `wikiRead` / `wikiWrite` / `codeWrite`），群里首次开话题时自动登记（三个开关全关），只在设置面板「群权限」修改或移除；群话题的知识库与代码改动工具按它判权。域全局值的 `knownGroups` 记录机器人被拉进过的群（最多 500 个），供断连补偿使用。准入模式属于配置层（profile + Web 覆盖）；管理员是 `access_users` 里 `admin` 为 true 的记录。
+7. **其他表**：`processed`（消息去重）、`inflight`（在途快照，见缺口 1）、`topic_launches`（其他插件经 `feishuTopics` 开话题的启动记录）、`session_origins`（Session → 飞书来源）、`approval_grants` / `approval_cards`（审批「总是允许」与待决审批卡）。
 
 ## 二、内存态（有意不持久化）
 
@@ -49,7 +50,7 @@
 
 ## 方案
 
-在 `channels_routes_v2` 域**新增 `inflight` 表**（加法操作，域 `version` 保持 `1` —— 宿主语义：介质版本与 spec 版本不一致会 `version-mismatch` 拒绝打开，因此**不能** bump；spec 里新增的表在介质上不存在时按空表加载）。
+在 `dsh_channels` 域的 `inflight` 表保存在途快照。
 
 **键**：主卡（每 turn 第一张卡）的 message id —— 每 turn 唯一且 attach 时已知，避免并发 turn 互相覆盖。
 
@@ -64,8 +65,8 @@
   reactionId?: string            // Typing 表情的 reaction id（add 失败时缺省）
   routeKey?: string              // 这一轮所在的路由，恢复时据此找回 Session
   prompt?: { requestId, principal, content }  // 飞书提示：session/prompt 的请求 id、调用方（feishu-user / feishu-group）、内容块（图片块只存附件引用；序列化 ≤ 256 KB，超出不存）
-  message?: UserMessage          // 宿主回合（后台唤醒等）认领的消息，只用来在会话日志里定位这一轮；升级前的快照也只有它，不重放
-  senderUserId?: string          // 宿主回合开始时会话的当前驱动者（升级前的快照：这一轮的飞书发送者，已不再读取）
+  message?: UserMessage          // 宿主回合（后台唤醒等）认领的消息，只用来在会话日志里定位这一轮，不重放
+  senderUserId?: string          // 宿主回合开始时会话的当前驱动者，重启后恢复代码改动的驱动者
   replays?: number               // 已重放次数（上限 1）
   cards: Array<{ messageId: string; mode: 'card' | 'text' }>  // 段卡列表，[0] = 主卡
   startedAt: number              // 附加时间（TTL 清理用）
@@ -73,7 +74,7 @@
 }
 ```
 
-新增字段都是可选的，不升域版本：旧快照没有 `routeKey` 时按 `sessionId` 找路由，没有 `prompt` 时按「被打断」处理（有 `message` 时按它的 id 定位这一轮，但不重放）。
+没有 `routeKey` 的快照按 `sessionId` 找路由；没有 `prompt` 的快照按「被打断」处理（有 `message` 时按它的 id 定位这一轮，但不重放）。
 
 ## 生命周期
 
@@ -234,7 +235,7 @@
 ## 已知取舍
 
 - 心跳写入频率决定崩溃后往回多读多少：读多了由去重兜底，不会重复处理。
-- 补偿只覆盖插件已知的会话；从没和机器人说过话、也不在 `knownGroups` 里的群读不到。升级前授权过、但升级后机器人没有重新入群且没有活动路由的群，补偿读不到。
+- 补偿只覆盖插件已知的会话；从没和机器人说过话、也不在 `knownGroups` 里的群读不到。机器人入群早于 `knownGroups` 登记、又没有活动路由的群，补偿读不到。
 - 待处理卡在进程内防重复点击；重启后再点由 `processed` 去重保证不会处理两遍。
 
 ## 涉及文件

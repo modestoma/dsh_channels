@@ -970,7 +970,7 @@ export const PANEL_COPY = {
   accessGitEmailChanged: '已更新 Git 邮箱',
   groupsTitle: '群权限表',
   groupsEmpty: '还没有群开过话题',
-  groupsHint: '机器人在群里第一次开话题时自动登记该群，三个开关默认关闭；开关只在这里设置，作用于该群的所有话题（谁能在群里说话仍由用户表决定）。移除后该群下次开话题时重新登记。旧版本群话题仍只由发起人继续，并按发起人的开关判权。',
+  groupsHint: '机器人在群里第一次开话题时自动登记该群，三个开关默认关闭；开关只在这里设置，作用于该群的所有话题（谁能在群里说话仍由用户表决定）。移除后该群下次开话题时重新登记。',
   groupsNotLoaded: '飞书连接建立后加载群权限表',
   groupRemoved: '已移除群',
   groupPermissionChanged: '已更新群权限',

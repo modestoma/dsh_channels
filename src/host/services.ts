@@ -6,6 +6,7 @@
  * @module dsh-channels/host/services
  */
 
+import type { RawDomainHandle } from '../storage/table.ts'
 import type { Agent, AgentRegistry } from './agent.ts'
 import type { AttachmentStore } from './attachments.ts'
 import type { CommandRuntime } from './commands.ts'
@@ -56,7 +57,7 @@ export function workingDirectoryService(ctx: Pick<HostContext, 'get'>): WorkingD
 
 /** The host's storage-domain facility (narrowly typed at the call site). */
 export interface StorageDomainFacility {
-  open(spec: unknown): Promise<unknown>
+  open(spec: unknown): Promise<RawDomainHandle>
 }
 
 /** One resolved credential value and the source layer that supplied it. */

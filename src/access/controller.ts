@@ -17,8 +17,7 @@
  * It also answers the permission switches (knowledge base, code write) for
  * the tool gates, by where the Session lives: a private-chat topic uses its
  * person's switches (an administrator holds every switch); a group route
- * without a single owner uses the group's permission record; an older group
- * route uses its initiator's switches.
+ * uses the group's permission record.
  *
  * The controller never creates a Session or a workspace.
  *
@@ -28,6 +27,7 @@
 import type { FeishuConfig } from '../config.ts'
 import { isGroupRoute } from '../domain.ts'
 import type { AccessPermission, GroupPermission, RouteRecord } from '../domain.ts'
+import type { AuthorizeEvent } from '../host/index.ts'
 import type { FeishuChannel, NormalizedMessage } from '../feishu-channel.ts'
 import { decideAccess } from './policy.ts'
 import type { AccessDecision } from './policy.ts'
@@ -91,15 +91,14 @@ export class AccessController {
   }
 
   /**
-   * Whether one route's Session holds a permission switch. A `mode: 'group'`
-   * route (or an older `shared` one) reads the group's permission record,
-   * where no record means off; any other route reads the switches of the
-   * user who opened it (see {@link mayUse}).
+   * Whether one route's Session holds a permission switch. A group route
+   * reads the group's permission record, where no record means off; a
+   * private-chat route reads the switches of its person (see {@link mayUse}).
    * @param record - the route the Session is bound to.
    * @param permission - the switch to check.
    * @returns true when allowed.
    */
-  mayUseOnRoute(record: Pick<RouteRecord, 'chatId' | 'senderUserId' | 'mode' | 'shared'>, permission: GroupPermission): boolean {
+  mayUseOnRoute(record: Pick<RouteRecord, 'chatId' | 'chatType' | 'senderUserId'>, permission: GroupPermission): boolean {
     if (isGroupRoute(record)) return this.deps.store.groupAllows(record.chatId, permission)
     return this.mayUse(record.senderUserId, permission)
   }
@@ -182,9 +181,9 @@ export class AccessController {
 
   /**
    * Whether `userId`, acting in `chatId`, may continue the route's Session,
-   * decide its cards, and run its session commands: on a group route without
-   * a single owner ({@link isGroupRoute}) any user the admission matrix
-   * admits in that chat; on any other route only the user who opened it.
+   * decide its cards, and run its session commands: on a group route
+   * ({@link isGroupRoute}) any user the admission matrix admits in that chat;
+   * on a private-chat route only its person.
    * @param userId - Feishu user_id of the actor.
    * @param chatId - chat the action comes from (must be the route's chat).
    * @param record - the route acted on.
@@ -214,6 +213,34 @@ export class AccessController {
       this.config(),
       this.deps.store.snapshot(),
     ).kind === 'allow'
+  }
+
+  /**
+   * Why a write asked through `access/authorize` is refused for a routed
+   * Session, by where it lives: `code-write`, `wiki-read`, and `wiki-write`
+   * follow the location's switches (a private chat's person, a group's
+   * permission record); `admin` needs the person of a private chat to be an
+   * administrator and is never granted to a group; unknown levels are refused.
+   * @param route - the Session's route.
+   * @param event - the write.
+   * @returns the refusal text for the model, or undefined when allowed.
+   */
+  authorizeRefusal(route: RouteRecord, event: AuthorizeEvent): string | undefined {
+    const group = isGroupRoute(route)
+    const where = group ? '本群' : `飞书用户 ${route.senderUserId} `
+    switch (event.level) {
+      case 'code-write':
+        return this.mayUseOnRoute(route, 'codeWrite') ? undefined : `${where}没有代码改动权限，不能执行 ${event.action}${group ? '；需要管理员在设置面板「群权限」里打开本群的「改代码」' : '；需要管理员在设置面板「访问授权」里打开该用户的「改代码」'}`
+      case 'wiki-read':
+        return this.mayUseOnRoute(route, 'wikiRead') ? undefined : `${where}没有知识库读取权限，不能执行 ${event.action}`
+      case 'wiki-write':
+        return this.mayUseOnRoute(route, 'wikiWrite') ? undefined : `${where}没有知识库写入权限，不能执行 ${event.action}`
+      case 'admin':
+        if (group) return `${event.action} 是管理操作，不能在群会话里执行；请管理员在私聊里操作`
+        return this.isAdmin(route.senderUserId) ? undefined : `${where}不是管理员，不能执行 ${event.action}`
+      default:
+        return `飞书会话不允许未知的授权级别 ${event.level}，不能执行 ${event.action}`
+    }
   }
 
   /** Drop in-memory notices (shutdown; durable state lives in the store). */

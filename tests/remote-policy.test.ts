@@ -13,7 +13,7 @@ import { makeRemoteServices } from './helpers.ts'
 function route(partial: Partial<RouteRecord> & Pick<RouteRecord, 'sessionId' | 'chatId' | 'chatType' | 'senderUserId'>): RouteRecord {
   return {
     key: `key-${partial.sessionId}`, kind: 'thread', workspacePath: '/w', cardMessageId: 'om_1',
-    createdAt: 1, lastActivityAt: 1, ...partial,
+    createdAt: 1, lastActivityAt: 1, sessionHistory: [], ...partial,
   }
 }
 
@@ -21,13 +21,13 @@ const routes: RouteRecord[] = [
   route({ sessionId: 's_dm_alice', chatId: 'oc_dm_alice', chatType: 'p2p', senderUserId: 'u_alice' }),
   route({ sessionId: 's_dm_bob', chatId: 'oc_dm_bob', chatType: 'p2p', senderUserId: 'u_bob' }),
   route({ sessionId: 's_group_alice', chatId: 'oc_group', chatType: 'group', senderUserId: 'u_alice' }),
-  route({ sessionId: 's_group_shared', chatId: 'oc_group', chatType: 'group', senderUserId: 'u_bob', shared: true }),
-  route({ sessionId: 's_other_group', chatId: 'oc_other', chatType: 'group', senderUserId: 'u_alice', shared: true }),
+  route({ sessionId: 's_group_bob', chatId: 'oc_group', chatType: 'group', senderUserId: 'u_bob' }),
+  route({ sessionId: 's_other_group', chatId: 'oc_other', chatType: 'group', senderUserId: 'u_alice' }),
 ]
 
-/** The channel-plane rule: the owner, or anyone on a shared route (u_carol is not admitted). */
+/** The channel-plane rule: the person of a private chat, or any admitted member of a group (u_carol is not admitted). */
 const mayActOnRoute = (userId: string, chatId: string, record: RouteRecord): boolean =>
-  record.chatId === chatId && (record.senderUserId === userId || (record.shared === true && userId !== 'u_carol'))
+  record.chatId === chatId && (record.chatType === 'group' ? userId !== 'u_carol' : record.senderUserId === userId)
 
 const deps = { routes: () => routes, mayActOnRoute }
 
@@ -39,11 +39,11 @@ describe('channel access bindings', () => {
     expect(channelAccessBindings(deps, feishuUserPrincipal('u_carol'))).toEqual([])
   })
 
-  it('binds a group member to that group\'s routes they own or that are shared with them, never to another group', () => {
+  it('binds an admitted group member to that group\'s routes, never to another group', () => {
     const ids = (userId: string, chatId = 'oc_group') =>
       channelAccessBindings(deps, feishuGroupPrincipal(chatId, userId)).map(binding => binding.resource.id)
-    expect(ids('u_alice')).toEqual(['s_group_alice', 's_group_shared'])
-    expect(ids('u_bob')).toEqual(['s_group_shared'])
+    expect(ids('u_alice')).toEqual(['s_group_alice', 's_group_bob'])
+    expect(ids('u_bob')).toEqual(['s_group_alice', 's_group_bob'])
     expect(ids('u_carol')).toEqual([])
     expect(ids('u_alice', 'oc_other')).toEqual(['s_other_group'])
     // The group principal never reaches private-chat Sessions.
@@ -66,8 +66,8 @@ describe('registerChannelAccessPolicies', () => {
     const dispose = registerChannelAccessPolicies(remote.remoteAccess, { routes: () => live, mayActOnRoute })
     expect([...remote.remoteAccess.policies.keys()].sort()).toEqual(['feishu-group', 'feishu-user'])
     expect(remote.remoteAccess.decide(feishuUserPrincipal('u_alice'), 's_dm_alice')).toEqual({ kind: 'allow' })
-    expect(remote.remoteAccess.decide(feishuGroupPrincipal('oc_group', 'u_bob'), 's_group_shared')).toEqual({ kind: 'allow' })
-    expect(remote.remoteAccess.decide(feishuGroupPrincipal('oc_group', 'u_bob'), 's_group_alice')).toEqual({ kind: 'deny', reason: ROUTE_NOT_PERMITTED })
+    expect(remote.remoteAccess.decide(feishuGroupPrincipal('oc_group', 'u_bob'), 's_group_alice')).toEqual({ kind: 'allow' })
+    expect(remote.remoteAccess.decide(feishuGroupPrincipal('oc_group', 'u_carol'), 's_group_alice')).toEqual({ kind: 'deny', reason: ROUTE_NOT_PERMITTED })
     // A route removed later is refused at the next decision.
     live.splice(0, 1)
     expect(remote.remoteAccess.decide(feishuUserPrincipal('u_alice'), 's_dm_alice')).toEqual({ kind: 'deny', reason: ROUTE_NOT_PERMITTED })

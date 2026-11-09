@@ -68,11 +68,11 @@
  * @module dsh-channels/streamer
  */
 
-import type { AssistantStreamFrame, Session, SessionEvent, TurnEndReason, UserMessage } from './dsh-types.ts'
+import type { AssistantStreamFrame, Session, SessionEvent, TurnEndReason, UserMessage } from './host/index.ts'
 import { promptRequestIdOf } from './access/principal.ts'
 import type { ChannelPrompt } from './session/prompt.ts'
-import { buildCard, buildMergedCard, segmentCardContent, segmentCardOptions } from './cards.ts'
-import type { CardState, PanelPhase, StopControl } from './cards.ts'
+import { buildCard, buildMergedCard, segmentCardContent, segmentCardOptions } from './cards/index.ts'
+import type { CardState, PanelPhase, StopControl } from './cards/index.ts'
 import type { FeishuChannel } from './feishu-channel.ts'
 import { cacheHitPct, foldAll, foldEvent } from './stats.ts'
 import type { HeaderSample, StatsFold, UsageSample } from './stats.ts'

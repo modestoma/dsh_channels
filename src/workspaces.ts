@@ -30,7 +30,7 @@ import { constants } from 'node:fs'
 import { access, mkdir, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import path from 'node:path'
-import type { HostContext, Workspace } from './dsh-types.ts'
+import type { HostContext, Workspace } from './host/index.ts'
 
 const SAFE_SEGMENT = /^[A-Za-z0-9._-]+$/
 

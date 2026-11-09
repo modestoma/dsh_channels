@@ -17,7 +17,7 @@
  * @module dsh-channels/settings/directory-picker
  */
 
-import type { HostContext } from '../dsh-types.ts'
+import type { HostContext } from '../host/index.ts'
 
 /** 宿主 native 能力的最小结构副本（`kind` + `pick`，其余字段不关心）。 */
 export interface NativeDirectoryPickerCapability {

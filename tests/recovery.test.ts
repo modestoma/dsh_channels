@@ -6,8 +6,8 @@
 import { describe, expect, it } from 'vitest'
 import {
   buildInterruptionCard, buildRecoveredReplyCards, cardJsonBytes, CARD_MAX_BYTES, parseResumeAction, RESUME_ACTION,
-} from '../src/cards.ts'
-import type { MessageId, SessionEvent, TurnEndReason, UserMessage } from '../src/dsh-types.ts'
+} from '../src/cards/index.ts'
+import type { MessageId, SessionEvent, TurnEndReason, UserMessage } from '../src/host/index.ts'
 import { classifyTurn, storableMessage } from '../src/session/repair.ts'
 import { promptOfSnapshot, storablePrompt } from '../src/session/prompt.ts'
 import type { ChannelPrompt } from '../src/session/prompt.ts'

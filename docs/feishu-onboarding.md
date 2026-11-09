@@ -134,7 +134,7 @@ chmod 600 $DSH_HOME/.credentials.yaml
     approvalBackgroundTimeoutMs: 1800000 # 后台唤醒的回合的审批等待（默认 30 分钟）
     approvalReminderMs: 600000          # 私聊审批卡未处理时多久提醒一次（默认 10 分钟，0 = 不提醒）
     accessMode: 'guarded'               # 准入模式：guarded（默认）| open（旧行为，不安全）
-    # codeWriteTools: [...]             # 需要「代码改动」开关的工具名，默认是 dsh-repo 推送/MR/Issue 写操作、删分支、重跑/取消 CI
+    # codeWriteTools: []                # 另外需要「代码改动」开关的工具名（默认空；经 access/authorize 发问的插件不用列）
     authRequestTtlDays: 7               # 入群/用户授权申请卡有效期（天）
     loggerLevel: 'info'
 ```
@@ -156,7 +156,7 @@ chmod 600 $DSH_HOME/.credentials.yaml
 | `approvalBackgroundTimeoutMs` | `1800000` | 子代理、后台任务、定时跟进、PR/MR 动态唤醒的回合的审批等待时长（1 分钟–7 天） |
 | `approvalReminderMs` | `600000` | 私聊话题审批卡未处理时，过这么久在卡片下提醒一次；`0` 不提醒；群话题从不提醒 |
 | `accessMode` | `guarded` | 准入模式：`guarded` 仅管理员 + 用户表里对话准入打开的人；`open` 保留旧行为（任何可用范围用户可对话，不安全；知识库与代码改动开关仍生效） |
-| `codeWriteTools` | dsh-repo 写操作（推送、MR、Issue、删分支、CI 重跑/取消） | 飞书会话调用这些工具前按会话所在位置检查「代码改动」开关（私聊看本人，管理员直通；群看群权限）；经 `access/authorize` 发问的插件不用列 |
+| `codeWriteTools` | `[]` | 另外需要「代码改动」开关的工具名：飞书会话调用这些工具前按会话所在位置检查（私聊看本人，管理员直通；群看群权限）。dsh-repo 等经 `access/authorize` 发问的插件已经按同一规则判权，不用列 |
 | `authRequestTtlDays` | `7` | 入群/用户授权申请卡有效期（1–30 天） |
 | `acceptAttachments` | `true` | 接收飞书图片/文件/合并转发记录。native 下触发消息图片预取、文件懒取、纯附件静默不回复（引用该消息再提问时列入清单）；`false` 时附件消息完全惰性（不保存、不触发、不列入清单） |
 | `prefetchImages` | `true` | native 下把触发消息图片预取为首轮 `ImageBlock`；失败/超限/超时降级为清单懒取项。关闭后图片也需 `feishu_attachment_fetch` |
@@ -192,7 +192,7 @@ chmod 600 $DSH_HOME/.credentials.yaml
    - 「知识库写入」：该用户发起的话题可以新建、修改文档和表格（不需要同时打开读取）；
    - 「代码改动」：该用户的私聊话题可以推送代码、提交或合并 MR、写 Issue（`codeWriteTools` 里的工具和经 `access/authorize` 发问的写操作）；
    - 关闭「对话准入」等于停用该用户，其他开关保留但不生效；
-6. 授权/撤销**立即生效**；用户表与待处理申请持久化在插件 `channels_routes_v2` 域，重启不丢。`/auth list` 可随时查看用户表与待处理申请。
+6. 授权/撤销**立即生效**；用户表与待处理申请持久化在插件 `dsh_channels` 域，重启不丢。`/auth list` 可随时查看用户表与待处理申请。
 
 > 说明：**管理员拥有全部权限，其他开关对他不起作用**——机器人被拉进新群后，管理员可以直接 @ 机器人开会话。管理员在任意群里都可以使用 `/auth`、`/groupid` 等命令，但 `/auth` 不能授予或移除管理员。有多位管理员时，授权申请卡发给每一位，任一位处理后其他人的卡片同步更新。
 

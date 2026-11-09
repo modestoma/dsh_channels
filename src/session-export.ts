@@ -11,7 +11,7 @@
 import { readFileSync } from 'node:fs'
 import { promisify } from 'node:util'
 import { gzip } from 'node:zlib'
-import type { Session } from './dsh-types.ts'
+import type { Session } from './host/index.ts'
 
 interface PackageMetadata {
   version?: unknown

@@ -27,7 +27,7 @@
 import { buildInterruptionCard, buildRecoveredReplyCards, segmentCardOptions } from '../cards/streaming.ts'
 import type { InflightSnapshot } from '../domain.ts'
 import { INFLIGHT_PROMPT_MAX_BYTES } from '../domain.ts'
-import type { Agent, SessionEvent, UserMessage } from '../dsh-types.ts'
+import type { Agent, SessionEvent, UserMessage } from '../host/index.ts'
 import type { FeishuChannel } from '../feishu-channel.ts'
 import type { FeishuDomainHandle } from '../domain.ts'
 import { promptRequestIdOf } from '../access/principal.ts'

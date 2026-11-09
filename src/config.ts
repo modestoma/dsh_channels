@@ -414,30 +414,17 @@ export const configSchema = z.object({
    */
   accessMode: z.enum(['open', 'guarded']).default('guarded'),
   /**
-   * Tools that write to a remote repository (push, merge requests, issues,
-   * branch deletion, CI retry and cancel). In a Feishu Session a call is
-   * refused unless the Session's location holds the `codeWrite` switch.
-   * Names are matched exactly; an empty list turns the check off. Tools of
-   * plugins that ask through `access/authorize` need no entry here.
+   * Extra tools that change a remote system on the user's behalf and do not
+   * ask through `access/authorize`. In a Feishu Session a call is refused
+   * unless the Session's location holds the `codeWrite` switch. Names are
+   * matched exactly; empty by default, because plugins that write for a
+   * Session ask `access/authorize`, which this channel answers by the same switch.
    */
-  codeWriteTools: z.array(z.string().trim().min(1)).default([
-    'repo_workspace_push',
-    'repo_mr_create',
-    'repo_mr_update',
-    'repo_mr_comment',
-    'repo_mr_merge',
-    'repo_issue_create',
-    'repo_issue_update',
-    'repo_issue_comment',
-    'repo_branch_delete',
-    'repo_ci_retry',
-    'repo_ci_cancel',
-  ]),
+  codeWriteTools: z.array(z.string().trim().min(1)).default([]),
   /**
    * Read fence for in-process file tools in Feishu Sessions (and the
    * subagents they spawn). A listed tool's path arguments must resolve, after
-   * symlinks, inside the route's workspace, its topic directory, or one of
-   * `readableRoots`; otherwise the call is denied before it runs. Relative
+   * symlinks, inside the route's topic directory or one of `readableRoots`; otherwise the call is denied before it runs. Relative
    * paths resolve against the Session's effective working directory. Shell,
    * terminal, and code-execution tools spawn processes and are not covered
    * here: confine them with the sandbox runner described in the README.

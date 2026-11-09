@@ -8,8 +8,8 @@
  * @module dsh-channels/health
  */
 
-import { CordisFiberState } from './dsh-types.ts'
-import type { CordisFiber } from './dsh-types.ts'
+import { CordisFiberState } from './host/index.ts'
+import type { CordisFiber } from './host/index.ts'
 import type { FeishuConnectionStatus } from './feishu-channel.ts'
 import { standaloneCard } from './cards/primitives.ts'
 import { FAILING_ATTEMPTS } from './outbox.ts'

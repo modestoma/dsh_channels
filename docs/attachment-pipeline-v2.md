@@ -283,6 +283,5 @@
 
 - [README.md](../README.md)：安装、命令、面板、配置示例与行为总览。
 - [docs/feishu-onboarding.md](feishu-onboarding.md)：飞书应用权限、配置与真机联调 / P3 验证清单。
-- [docs/workspace-isolation-design.md](workspace-isolation-design.md)：工作区粒度的演进（现为一个话题一个工作区）。
 - `.agents/roadmaps/attachment_pipeline_v2/`：roadmap / decisions / acceptance。
 - 各任务证据：`.agents/issues/{platform_spike,native_attachment_store,pending_attachment_registry,attachment_fetch_tool,admission_manifest_flow,quote_history_tools,panel_docs_release}.md`。

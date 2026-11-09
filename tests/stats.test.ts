@@ -5,7 +5,7 @@ import {
   EMPTY_TOTALS, addUsage, applyProjectionViews, averageDecodeTokensPerSecond, averageTtftMs,
   cacheHitPct, foldAll, measureSessionContext, readProjectionViews, usageFromBuckets,
 } from '../src/stats.ts'
-import type { SessionEvent, SessionProjections, TokenUsage } from '../src/dsh-types.ts'
+import type { SessionEvent, SessionProjections, TokenUsage } from '../src/host/index.ts'
 import { makeSession, sessionEvents } from './helpers.ts'
 
 let seq = 0

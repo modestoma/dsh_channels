@@ -13,7 +13,7 @@
  * @module dsh-channels/settings/routes
  */
 
-import type { HostContext } from '../dsh-types.ts'
+import type { HostContext } from '../host/index.ts'
 import {
   ACCESS_ROUTE,
   ADD_ACCESS_USER_ROUTE,
