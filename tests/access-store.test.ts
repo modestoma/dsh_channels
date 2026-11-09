@@ -59,14 +59,6 @@ describe('AccessStore.load', () => {
     expect(store.adminIds()).toEqual(['u_root'])
   })
 
-  it('跳过旧版本写下的群申请记录', () => {
-    const { store, domain } = makeStore()
-    void domain.handle.accessRequests.put('tok-g', requestRecord({ token: 'tok-g', kind: 'group', targetId: 'oc_a' }))
-    store.load()
-    expect(store.getRequest('tok-g')).toBeUndefined()
-    expect(store.pendingRequests(0)).toEqual([])
-  })
-
   it('用户按 addedAt 从旧到新排序', () => {
     const { store, domain } = makeStore()
     void domain.handle.accessUsers.put('u_new', userRecord({ userId: 'u_new', addedAt: 300 }))

@@ -20,7 +20,7 @@
 import { readFile } from 'node:fs/promises'
 import type { PeerRegistry } from '../access/peers.ts'
 import { ROUTE_NOT_PERMITTED } from '../access/remote-policy.ts'
-import type { Agent, AttachmentStore, FileUploads, PromptContentPart, SessionPromptRequest, TypertGateway, UserMessage } from '../dsh-types.ts'
+import type { Agent, AttachmentStore, FileUploads, PromptContentPart, SessionPromptRequest, TypertGateway, UserMessage } from '../host/index.ts'
 import { remoteFailureOf } from '../host/remote.ts'
 import { promptRequestIdOf } from '../access/principal.ts'
 import { sniffImageMediaType } from '../feishu-channel.ts'

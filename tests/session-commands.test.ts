@@ -4,7 +4,7 @@ import {
   buildWorkDirCard, compactFailureContext, querySessionHistory, resolveWorkDir,
 } from '../src/session-commands.ts'
 import { foldAll } from '../src/stats.ts'
-import type { SessionEvent } from '../src/dsh-types.ts'
+import type { SessionEvent } from '../src/host/index.ts'
 import type { RouteRecord } from '../src/domain.ts'
 
 function at(time: number, type: string, data: unknown): SessionEvent {
@@ -15,7 +15,7 @@ function route(partial: Partial<RouteRecord> = {}): RouteRecord {
   return {
     key: 'thread-1', kind: 'thread', sessionId: 'session-current', chatId: 'chat-1', chatType: 'group',
     senderUserId: 'u_owner', workspacePath: '/workspace/alice', cardMessageId: 'message-1',
-    createdAt: 1_000, lastActivityAt: 1_000, ...partial,
+    createdAt: 1_000, lastActivityAt: 1_000, sessionHistory: [{ sessionId: 'session-current', createdAt: 1_000 }], ...partial,
   }
 }
 
@@ -67,19 +67,10 @@ describe('Session command result cards', () => {
     expect(json).not.toContain('0 tokens/s')
   })
 
-  it('returns only a verified absolute effective working directory', () => {
-    // Legacy route: the workspace path itself is the session directory.
+  it('returns only a verified absolute working directory', () => {
     expect(resolveWorkDir('/workspace/alice', { workspacePath: '/workspace/alice' })).toEqual({
       kind: 'success', path: '/workspace/alice',
     })
-    // Per-topic route: header cwd is the workspace root, effective dir is the topic dir.
-    expect(resolveWorkDir('/workspace/alice', {
-      workspacePath: '/workspace/alice', sessionDir: '/workspace/alice/topics/omt_1',
-    })).toEqual({ kind: 'success', path: '/workspace/alice/topics/omt_1' })
-    // Degraded placement (no workingDirectory service): header cwd is the topic dir.
-    expect(resolveWorkDir('/workspace/alice/topics/omt_1', {
-      workspacePath: '/workspace/alice', sessionDir: '/workspace/alice/topics/omt_1',
-    })).toEqual({ kind: 'success', path: '/workspace/alice/topics/omt_1' })
     expect(resolveWorkDir('/workspace/alice', { workspacePath: '/workspace/bob' }))
       .toMatchObject({ kind: 'mismatch' })
     expect(resolveWorkDir(undefined, { workspacePath: '/workspace/alice' })).toMatchObject({ kind: 'missing' })
@@ -120,19 +111,6 @@ describe('Session command result cards', () => {
     expect(json).toContain('2026-08-17T00:24:00.000Z')
     expect(json).toContain('另有 5 条未展示')
     expect(json).not.toContain('session-05')
-  })
-
-  it('uses the current Session as the sole history entry for a legacy route', () => {
-    const legacy = route({ sessionId: 'legacy-session', createdAt: Date.UTC(2026, 7, 17, 8) })
-    expect(querySessionHistory(legacy)).toEqual({
-      total: 1,
-      hidden: 0,
-      items: [{ sessionId: 'legacy-session', createdAt: Date.UTC(2026, 7, 17, 8), current: true }],
-    })
-    const json = JSON.stringify(buildSessionHistoryCard(legacy))
-    expect(json).toContain('**总数**：1')
-    expect(json).toContain('legacy-session')
-    expect(json).not.toContain('未展示')
   })
 
   it('renders compact before/after bars and exact token accounting', () => {

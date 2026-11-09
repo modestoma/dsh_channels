@@ -11,7 +11,7 @@
 import type {
   AssistantStreamRecord, ContextPressureView, LlmService, Session, SessionEvent, SessionProjections, SessionStatsView,
   TokenMeter, TokenUsage, TokenUsageView,
-} from './dsh-types.ts'
+} from './host/index.ts'
 
 export interface SessionTotals {
   inputTokens: number

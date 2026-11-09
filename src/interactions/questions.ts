@@ -22,7 +22,7 @@
 import { randomUUID } from 'node:crypto'
 import { buildQuestionCard, buildQuestionSettledCard } from '../cards/question.ts'
 import type { QuestionCardInput, QuestionCardItem, QuestionCardState } from '../cards/question.ts'
-import type { AskUserQuestionAnswer, AskUserQuestionItem, AskUserQuestionRequestEvent } from '../dsh-types.ts'
+import type { AskUserQuestionAnswer, AskUserQuestionItem, AskUserQuestionRequestEvent } from '../host/index.ts'
 import type { CardActionEvent, FeishuChannel } from '../feishu-channel.ts'
 import { PendingCardTable } from './pending.ts'
 import type { InteractionRoute, PendingCardEntry } from './pending.ts'

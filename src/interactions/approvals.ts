@@ -32,7 +32,7 @@
 import { randomUUID } from 'node:crypto'
 import { approvalDurationLabel, buildApprovalCard, buildApprovalSettledCard, UNCONFINED_MODE } from '../cards/approval.ts'
 import type { ApprovalCardState, ApprovalQuestion, SettledApprovalQuestion } from '../cards/approval.ts'
-import type { ApprovalOutcome, ApprovalRequest, SessionEvent } from '../dsh-types.ts'
+import type { ApprovalOutcome, ApprovalRequest, SessionEvent } from '../host/index.ts'
 import type { CardActionEvent, FeishuChannel } from '../feishu-channel.ts'
 import type { ApprovalStore } from './approval-store.ts'
 import { PendingCardTable } from './pending.ts'

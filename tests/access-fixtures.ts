@@ -76,7 +76,6 @@ export function adminRecord(userId = 'u_admin'): AccessUserRecord {
 export function requestRecord(partial: Partial<AccessRequestRecord> = {}): AccessRequestRecord {
   return {
     token: 'tok-default',
-    kind: 'user',
     targetId: 'u_alice',
     status: 'pending',
     createdAt: 1_000,

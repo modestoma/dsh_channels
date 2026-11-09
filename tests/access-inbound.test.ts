@@ -9,7 +9,7 @@ import { describe, expect, it, vi } from 'vitest'
 import type { FeishuConfig } from '../src/config.ts'
 import type { ChannelFactory, NormalizedMessage } from '../src/feishu-channel.ts'
 import type { RouteRecord } from '../src/domain.ts'
-import type { Agent } from '../src/dsh-types.ts'
+import type { Agent } from '../src/host/index.ts'
 import { join } from 'node:path'
 import { CHAT_ACCESS_REVOKED_TEXT } from '../src/routing/inbound.ts'
 import { TestFeishuService as FeishuService } from './helpers.ts'
@@ -599,7 +599,7 @@ describe('guarded 模式：群话题归群', () => {
     }))
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
     const [threadKey, aliceRoute] = await waitForRoute(h, 'u_alice')
-    expect(aliceRoute).toMatchObject({ kind: 'thread', mode: 'group', senderUserId: 'u_alice' })
+    expect(aliceRoute).toMatchObject({ kind: 'thread', chatType: 'group', senderUserId: 'u_alice' })
     expect(aliceRoute.lastSpeakerUserId).toBeUndefined()
     // The topic directory is named after the group and the opening message.
     expect(aliceRoute.workspacePath).toBe(join(h.config.baseDir, 'groups', 'oc_group', threadKey))
@@ -721,7 +721,7 @@ describe('guarded 模式：群话题归群', () => {
 
 describe('guarded 模式：代码改动开关', () => {
   it('私聊话题调用代码改动工具前检查本人的「代码改动」开关，打开后立即放行', async () => {
-    const h = await setup()
+    const h = await setup({ codeWriteTools: ['repo_workspace_push'] })
     await h.service.addAccessUser('u_alice')
     await h.onMessage(makeMessage({
       chatType: 'p2p', chatId: 'oc_p2p_alice', senderId: 'u_alice',
@@ -744,12 +744,12 @@ describe('guarded 模式：代码改动开关', () => {
     expect(await listener!({ name: 'repo_workspace_push', agent }, next)).toEqual({ kind: 'allow' })
     // Chat off suspends every other switch.
     expect(await h.service.setAccessPermission('u_alice', 'chat', false)).toMatchObject({ ok: true })
-    expect(await listener!({ name: 'repo_mr_create', agent }, next)).toMatchObject({ kind: 'deny' })
+    expect(await listener!({ name: 'repo_workspace_push', agent }, next)).toMatchObject({ kind: 'deny' })
     await h.service.shutdown()
   })
 
   it('群话题调用代码改动工具按群权限表判权，与发言人的开关无关；移除群后失效', async () => {
-    const h = await setup()
+    const h = await setup({ codeWriteTools: ['repo_workspace_push'] })
     await h.service.addAccessUser('u_alice')
     await h.service.setAccessPermission('u_alice', 'codeWrite', true)
     await h.onMessage(makeMessage({

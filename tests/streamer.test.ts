@@ -4,10 +4,10 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { DROPPED_NOTICE } from '../src/cards.ts'
+import { DROPPED_NOTICE } from '../src/cards/index.ts'
 import { TurnStreamer } from '../src/streamer.ts'
 import type { AttachOptions } from '../src/streamer.ts'
-import type { MessageId, Session, SessionEvent, SessionId, UserMessage } from '../src/dsh-types.ts'
+import type { MessageId, Session, SessionEvent, SessionId, UserMessage } from '../src/host/index.ts'
 import type { ChannelPrompt } from '../src/session/prompt.ts'
 import type { FeishuChannel } from '../src/feishu-channel.ts'
 import { FakeTurnDriver, makeSession, sessionEvents } from './helpers.ts'

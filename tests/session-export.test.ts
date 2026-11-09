@@ -6,7 +6,7 @@ import {
   createLogicalSessionExport, DSH_CHANNELS_VERSION, LOGICAL_EXPORT_FORMAT,
   LOGICAL_EXPORT_FORMAT_VERSION, serializeLogicalSession,
 } from '../src/session-export.ts'
-import type { SessionEvent } from '../src/dsh-types.ts'
+import type { SessionEvent } from '../src/host/index.ts'
 import { makeSession, sessionEvents } from './helpers.ts'
 
 const gunzipBuffer = promisify(gunzip)

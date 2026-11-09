@@ -7,13 +7,13 @@
  * same rule the channel plane applies (`AccessController.mayActOnRoute`): a
  * private-chat principal may prompt the Sessions of the private-chat routes
  * it owns; a group principal may prompt the Sessions of that group's routes
- * it owns or, on a shared route, that the admission matrix admits its user
- * to. No binding means the Gateway refuses the call with
+ * the admission matrix admits its user to. No binding means the Gateway refuses the call with
  * `remote-access/denied`, which the submitter turns into a card notice.
  *
  * @module dsh-channels/access/remote-policy
  */
 
+import { isGroupRoute } from '../domain.ts'
 import type { RouteRecord } from '../domain.ts'
 import type { RemoteAccess, RemoteAccessBinding, RemoteAccessRole } from '../host/remote.ts'
 import {
@@ -56,9 +56,9 @@ export function channelAccessBindings(deps: ChannelAccessPolicyDeps, principal: 
 function routePermits(deps: ChannelAccessPolicyDeps, principal: ChannelPrincipal, record: RouteRecord): boolean {
   switch (principal.kind) {
     case FEISHU_USER_PRINCIPAL_KIND:
-      return record.chatType === 'p2p' && deps.mayActOnRoute(principal.userId, record.chatId, record)
+      return !isGroupRoute(record) && deps.mayActOnRoute(principal.userId, record.chatId, record)
     case FEISHU_GROUP_PRINCIPAL_KIND:
-      return record.chatType === 'group' && record.chatId === principal.chatId
+      return isGroupRoute(record) && record.chatId === principal.chatId
         && deps.mayActOnRoute(principal.userId, principal.chatId, record)
     default:
       return assertNever(principal)

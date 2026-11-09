@@ -9,24 +9,13 @@
  */
 
 import { z } from 'zod'
-import type { TopicRootCard } from './topics/contract.ts'
 import { outboxEntrySchema } from './outbox.ts'
-import type { OutboxTable } from './outbox.ts'
+import type { OutboxEntry } from './outbox.ts'
 import { approvalCardRecordSchema, approvalGrantRecordSchema } from './interactions/approval-store.ts'
-import type { ApprovalCardsTable, ApprovalGrantsTable } from './interactions/approval-store.ts'
-
-/**
- * Route key kinds. `thread` = real Feishu topic; `chat` = degraded chat-scoped
- * fallback.
- *
- * Version 3 routes own one workspace per topic (`workspacePath` is the topic
- * directory and the Session header cwd) and carry `mode: 'group'` on group
- * routes without a single owner. Version-2 records (per-user workspaces with
- * an optional per-topic `sessionDir` / `worktreeBranch`) and version-1 records
- * (an absent `sessionDir` means the workspace path is the working directory)
- * stay readable and keep their directories; they are never rewritten.
- */
-export const ROUTE_RECORD_VERSION = 3
+import type { ApprovalCardRecord, ApprovalGrantRecord } from './interactions/approval-store.ts'
+import type { StorageDomainFacility } from './host/services.ts'
+import { typedTable } from './storage/table.ts'
+import type { DomainTable } from './storage/table.ts'
 
 export const sessionHistoryEntrySchema = z.object({
   /** One Session that has been bound to this route. */
@@ -37,52 +26,34 @@ export const sessionHistoryEntrySchema = z.object({
 
 export type SessionHistoryEntry = z.infer<typeof sessionHistoryEntrySchema>
 
+/**
+ * One Feishu topic (or degraded chat-scoped conversation) bound to a DSH
+ * Session. `workspacePath` is the topic's own directory: the Session header
+ * cwd, the sandbox root, and the workspace the Session is grouped under.
+ */
 export const routeRecordSchema = z.object({
-  /** Route key the record is stored under (thread_id or chat:<chatId>). */
+  /** Route key the record is stored under (thread_id or a {@link chatRouteKey}). */
   key: z.string().min(1),
-  /** Kind of the key. */
+  /** `thread` = real Feishu topic; `chat` = degraded chat-scoped fallback. */
   kind: z.enum(['thread', 'chat']),
   /** Bound DSH session id. */
   sessionId: z.string().min(1),
   /** Feishu chat the session lives in. */
   chatId: z.string().min(1),
-  /** `p2p` or `group`. */
+  /** `p2p` or `group`; decides the route's scope (see {@link isGroupRoute}). */
   chatType: z.enum(['p2p', 'group']),
   /**
    * The user who opened the route. In a private chat the person the topic
-   * belongs to, whose switches gate its tools. On a `mode: 'group'` route the
-   * initiator, shown on cards and records only: group permissions gate the
-   * tools and anyone with chat access may continue. On older group routes
-   * without `mode` the only user who may continue (and whose switches apply).
+   * belongs to, whose switches gate its tools; in a group the initiator,
+   * shown on cards and records only.
    */
   senderUserId: z.string().min(1),
-  /**
-   * The Session header cwd: the sandbox root and the workspace the Session is
-   * grouped under. Version-3 routes: the topic directory. Older routes: the
-   * per-user workspace root (see `sessionDir`).
-   */
+  /** The topic directory: Session header cwd, sandbox root, and workspace. */
   workspacePath: z.string().min(1),
   /**
-   * Older routes only: the per-topic directory or Git worktree checkout the
-   * Session works in inside `workspacePath`. Absent on version-3 routes and on
-   * records written before per-topic directories existed; `workspacePath` is
-   * then the working directory too. Never written by this version.
-   */
-  sessionDir: z.string().min(1).optional(),
-  /** Older routes only: Git branch owning `sessionDir` when it is a worktree checkout. */
-  worktreeBranch: z.string().min(1).optional(),
-  /**
-   * `group`: a group route without a single owner, written by version 3 for
-   * every topic opened in a group (by a message or a `feishuTopics` launch).
-   * Anyone with chat access may continue it; the group's permission record
-   * gates its tools. Absent on private-chat routes and on older group routes.
-   */
-  mode: z.literal('group').optional(),
-  /**
-   * The user whose message most recently continued a `mode: 'group'` route
-   * (the resume click after a restart counts). Restores the speaker a
-   * commit trailer names after a restart; absent until someone other than
-   * the initiator speaks.
+   * The user whose message most recently continued a group route (the resume
+   * click after a restart counts). Restores the speaker a commit trailer
+   * names after a restart; absent until someone other than the initiator speaks.
    */
   lastSpeakerUserId: z.string().min(1).optional(),
   /** Message id of the latest streaming card (updated per turn). */
@@ -91,29 +62,23 @@ export const routeRecordSchema = z.object({
   createdAt: z.number().int().nonnegative(),
   /** Epoch ms of the last activity routed through this record. */
   lastActivityAt: z.number().int().nonnegative(),
-  /** Sessions this topic has pointed at, oldest first. Optional for v1 compatibility. */
-  sessionHistory: z.array(sessionHistoryEntrySchema).optional(),
-  /**
-   * Older group routes started through `feishuTopics` before `mode` existed:
-   * read exactly like `mode: 'group'` (see {@link isGroupRoute}). Never
-   * written by this version.
-   */
-  shared: z.literal(true).optional(),
+  /** Sessions this topic has pointed at, oldest first; always names `sessionId`. */
+  sessionHistory: z.array(sessionHistoryEntrySchema),
 })
 
 export type RouteRecord = z.infer<typeof routeRecordSchema>
 
 /**
- * Whether a route is a group route without a single owner: anyone with chat
- * access in its chat may continue it, decide its cards, and run its session
- * commands, and the group's permission record gates its tools. True for
- * `mode: 'group'` routes and for older `shared` routes; false for private
- * chats and for older group routes that only their initiator continues.
- * @param record - the route (any record carrying the two markers).
- * @returns true for a group route without a single owner.
+ * Whether a route belongs to a group rather than to one person. Every route
+ * in a group chat does, a degraded chat-scoped one included: anyone with chat
+ * access in the chat may continue its topic, decide its cards, and run its
+ * session commands; the group's permission record gates its tools; prompts
+ * are submitted as the group; commits are authored by the token account.
+ * @param route - the route (or anything carrying its chat type).
+ * @returns true for a group route.
  */
-export function isGroupRoute(record: Pick<RouteRecord, 'mode' | 'shared'>): boolean {
-  return record.mode === 'group' || record.shared === true
+export function isGroupRoute(route: { readonly chatType: 'p2p' | 'group' }): boolean {
+  return route.chatType === 'group'
 }
 
 /**
@@ -135,66 +100,33 @@ export const expiredRouteRecordSchema = z.object({
   senderUserId: z.string().min(1),
   /** Epoch ms when the route was retired. */
   expiredAt: z.number().int().nonnegative(),
-  /** Workspace the retired route belonged to; absent in tombstones written by
-   *  older plugin versions, so the field must stay optional. */
-  workspacePath: z.string().min(1).optional(),
-  /** Effective working directory the retired route's Session used; absent in
-   *  legacy tombstones, where `workspacePath` was the directory (pre-v2 routes). */
-  sessionDir: z.string().min(1).optional(),
-  /** Git branch of that directory when it was a worktree checkout. */
-  worktreeBranch: z.string().min(1).optional(),
-  /** Epoch ms of the last activity through the route before retirement.
-   *  Optional for the same legacy-compatibility reason; consumers fall back to
-   *  `expiredAt` when it is absent. */
-  lastActivityAt: z.number().int().nonnegative().optional(),
+  /** Workspace the retired route belonged to. */
+  workspacePath: z.string().min(1),
+  /** Epoch ms of the last activity through the route before retirement. */
+  lastActivityAt: z.number().int().nonnegative(),
 })
 
 export type ExpiredRouteRecord = z.infer<typeof expiredRouteRecordSchema>
 
 /**
- * Normalize legacy and partially duplicated histories without mutating the
- * durable record. The current Session is always represented, duplicate ids
- * collapse to their earliest timestamp, and output order is deterministic.
+ * Append a newly created Session to one route history. A Session already in
+ * the history keeps its earliest timestamp; the result is ordered oldest first.
+ * @param record - the route.
+ * @param sessionId - the new Session.
+ * @param createdAt - its creation time.
+ * @returns the new history.
  */
-export function normalizeSessionHistory(record: RouteRecord): SessionHistoryEntry[] {
-  const bySession = new Map<string, SessionHistoryEntry>()
-  for (const entry of record.sessionHistory ?? []) {
-    const existing = bySession.get(entry.sessionId)
-    if (existing === undefined || entry.createdAt < existing.createdAt) {
-      bySession.set(entry.sessionId, { ...entry })
-    }
-  }
-  if (!bySession.has(record.sessionId)) {
-    bySession.set(record.sessionId, { sessionId: record.sessionId, createdAt: record.createdAt })
-  }
-  return [...bySession.values()].sort((left, right) => left.createdAt - right.createdAt)
-}
-
-/** Materialize the optional legacy history field for in-memory consumers. */
-export function normalizeRouteRecord(record: RouteRecord): RouteRecord {
-  return { ...record, sessionHistory: normalizeSessionHistory(record) }
-}
-
-/** Append a newly created Session to one normalized route history. */
 export function appendSessionHistory(
-  record: RouteRecord,
+  record: Pick<RouteRecord, 'sessionHistory'>,
   sessionId: string,
   createdAt: number,
 ): SessionHistoryEntry[] {
-  return normalizeSessionHistory({
-    ...record,
-    sessionId,
-    sessionHistory: [...normalizeSessionHistory(record), { sessionId, createdAt }],
-  })
-}
-
-/**
- * Effective working directory of one route's Session: the topic directory of
- * a version-3 route, the per-topic `sessionDir` of a version-2 route, or the
- * workspace path of a record written before per-topic directories existed.
- */
-export function sessionDirOf(record: Pick<RouteRecord, 'workspacePath' | 'sessionDir'>): string {
-  return record.sessionDir ?? record.workspacePath
+  const bySession = new Map<string, SessionHistoryEntry>()
+  for (const entry of [...record.sessionHistory, { sessionId, createdAt }]) {
+    const existing = bySession.get(entry.sessionId)
+    if (existing === undefined || entry.createdAt < existing.createdAt) bySession.set(entry.sessionId, { ...entry })
+  }
+  return [...bySession.values()].sort((left, right) => left.createdAt - right.createdAt)
 }
 
 /**
@@ -205,8 +137,6 @@ export function sessionDirOf(record: Pick<RouteRecord, 'workspacePath' | 'sessio
  * overwrite each other. Written before the route record, updated as segment
  * cards resolve, deleted when the turn finalizes (or the creation fails).
  */
-export const INFLIGHT_VERSION = 1
-
 export const inflightCardSchema = z.object({
   /** Feishu message id of one segment card. */
   messageId: z.string().min(1),
@@ -269,15 +199,12 @@ export const inflightSnapshotSchema = z.object({
   prompt: inflightPromptSchema.optional(),
   /**
    * The claimed message of a host turn (a turn no Feishu message started),
-   * kept for classifying the turn from the Session log; also the prompt of a
-   * snapshot written before this channel submitted through `session/prompt`,
-   * which restart recovery classifies but never replays.
+   * kept for classifying the turn from the Session log; never replayed.
    */
   message: inflightMessageSchema.optional(),
   /**
    * Feishu user_id a host turn acts for (the Session's driver when it
-   * started), restoring the code-write driver after a restart. In older
-   * snapshots, the sender of `message`.
+   * started), restoring the code-write driver after a restart.
    */
   senderUserId: z.string().min(1).optional(),
   /** How often restart recovery already replayed `prompt` (cap: 1). */
@@ -295,27 +222,12 @@ export const inflightSnapshotSchema = z.object({
 export type InflightSnapshot = z.infer<typeof inflightSnapshotSchema>
 
 /**
- * Retired group grant written by versions that had a group whitelist. The
- * `access_groups` table stays declared only so the JSON backend keeps the
- * stored records; nothing reads it.
- */
-export const retiredAccessGroupRecordSchema = z.object({
-  chatId: z.string().min(1),
-  name: z.string().optional(),
-  source: z.enum(['command', 'card', 'panel']),
-  addedBy: z.string().min(1),
-  addedAt: z.number().int().nonnegative(),
-})
-
-/**
- * One user (`user_id`) of the access table (v1 format, added without a domain
- * version bump — see the notes on `feishuDomain` below). A user with `admin`
+ * One user (`user_id`) of the access table. A user with `admin`
  * on is an administrator: always admitted, holding every permission, and
  * able to settle authorization requests; any number of users may be. Every
  * other user carries four independent permission switches; `chat` gates
  * everything, so a user with `chat` off is suspended and the other switches
- * have no effect. Records written before the switches existed parse as a
- * conversation grant only.
+ * have no effect.
  */
 export const accessUserRecordSchema = z.object({
   /** Feishu `user_id` — also the table key. */
@@ -364,11 +276,10 @@ export type GroupPermission = Exclude<AccessPermission, 'chat'>
 export const GROUP_PERMISSIONS: readonly GroupPermission[] = ['wikiRead', 'wikiWrite', 'codeWrite']
 
 /**
- * The permissions of one group chat (`chat_id`), added without a domain
- * version bump like the user table. A record is created the first time an
+ * The permissions of one group chat (`chat_id`). A record is created the first time an
  * admitted message opens a topic in the group, with every switch off; only
  * the settings panel changes the switches. The switches gate the tools of
- * every `mode: 'group'` route in the chat: knowledge-base read, knowledge-base
+ * every route in the chat: knowledge-base read, knowledge-base
  * create/edit, and the configured code-write tools. Who may talk in the group
  * is decided per user by the user table, never here.
  */
@@ -398,13 +309,7 @@ export type GroupPermissionRecord = z.infer<typeof groupPermissionRecordSchema>
 export const accessRequestRecordSchema = z.object({
   /** Opaque token carried by the card buttons — also the table key. */
   token: z.string().min(1),
-  /**
-   * What is being requested. Only `user` requests are created; `group` only
-   * appears in records written by versions that had a group whitelist, and
-   * the access store skips those records.
-   */
-  kind: z.enum(['group', 'user']),
-  /** `user_id` the request asks to whitelist. */
+  /** `user_id` the request asks to add to the user table. */
   targetId: z.string().min(1),
   /** Chat the request originated from, when applicable. */
   chatId: z.string().optional(),
@@ -420,8 +325,6 @@ export const accessRequestRecordSchema = z.object({
   createdAt: z.number().int().nonnegative(),
   /** Epoch ms after which a pending request can no longer be decided. */
   expiresAt: z.number().int().nonnegative(),
-  /** DM message id of the card, written by versions with a single administrator. */
-  messageId: z.string().optional(),
   /** DM message ids of the cards delivered to the administrators. */
   messageIds: z.array(z.string()).optional(),
 })
@@ -436,8 +339,6 @@ export type AccessRequestRecord = z.infer<typeof accessRequestRecordSchema>
  * GC sweep after a fixed retention window (24 h — redelivery windows are
  * minutes).
  */
-export const PROCESSED_VERSION = 1
-
 /** Retention of `processed` records; also the farthest back missed-message catch-up reads. */
 export const PROCESSED_RETENTION_MS = 24 * 60 * 60 * 1000
 
@@ -450,7 +351,7 @@ export const processedRecordSchema = z.object({
 
 export type ProcessedRecord = z.infer<typeof processedRecordSchema>
 
-/** {@link TopicRootCard} as stored in a launch record. */
+/** A `TopicRootCard` as stored in a launch record. */
 export const topicRootCardSchema = z.object({
   title: z.string(),
   taskName: z.string(),
@@ -463,31 +364,14 @@ export const topicRootCardSchema = z.object({
 })
 
 /**
- * Root card content written by plugin versions before the `feishuTopics`
- * service (the built-in log-platform analyze API). Read only; converted by
- * {@link rootCardOf}.
- */
-const legacyAnalyzeSubjectSchema = z.object({
-  requesterUserId: z.string(),
-  triggeredAt: z.string(),
-  app: z.string(),
-  errorCode: z.string(),
-  logDetails: z.array(z.object({ name: z.string(), url: z.string() })),
-})
-
-/**
  * One accepted `feishuTopics` launch, keyed by its idempotency key. Kept
  * forever: a retried key answers the stored root card instead of posting a
- * second topic, and a reused key with another fingerprint is refused. The
- * records live in the `analyze_requests` table, named after the analyze API
- * that wrote the first of them; those older records carry `subject` instead
- * of `requesterUserId` + `card`, and their keys are the analyze API's
- * `Idempotency-Key`s.
+ * second topic, and a reused key with another fingerprint is refused.
  */
 export const topicLaunchRecordSchema = z.object({
   /** The launch's idempotency key (also the table key). */
   key: z.string().min(1),
-  /** The launch's fingerprint (older records: SHA-256 of the analyze request). */
+  /** The launch's fingerprint. */
   bodyHash: z.string().min(1),
   /** Target group chat. */
   chatId: z.string().min(1),
@@ -495,54 +379,23 @@ export const topicLaunchRecordSchema = z.object({
   messageId: z.string().min(1),
   /** Epoch ms when the launch was accepted. */
   acceptedAt: z.number().int().nonnegative(),
-  /** Requester @-mentioned on the root card; absent on older records. */
-  requesterUserId: z.string().optional(),
-  /** What the root card shows, kept so the card can be redrawn after a restart; absent on older records. */
-  card: topicRootCardSchema.optional(),
-  /** Root card content of older records. */
-  subject: legacyAnalyzeSubjectSchema.optional(),
+  /** Requester @-mentioned on the root card. */
+  requesterUserId: z.string().min(1),
+  /** What the root card shows, kept so the card can be redrawn after a restart. */
+  card: topicRootCardSchema,
   /**
    * Root card status. `running` until the first turn settles; a record still
    * `running` when the channel starts belongs to a topic the previous
    * instance never finished, and becomes `interrupted`.
    */
   status: z.enum(['running', 'done', 'stopped', 'error', 'failed', 'interrupted']),
-  /** Why the topic could not be started (status `failed`); absent on older records. */
+  /** Why the topic could not be started (status `failed`). */
   reason: z.string().optional(),
-  /** Topic id (the route key) once the topic is opened; absent on older records. */
+  /** Topic id (the route key) once the topic is opened. */
   threadId: z.string().min(1).optional(),
 })
 
 export type TopicLaunchRecord = z.infer<typeof topicLaunchRecordSchema>
-
-/**
- * The requester and root card content of one launch record, converting the
- * analyze API's older records to the card that API drew.
- * @param record - stored launch record.
- * @returns what to redraw, or undefined for a record carrying neither form.
- */
-export function rootCardOf(record: TopicLaunchRecord): { requesterUserId: string; card: TopicRootCard } | undefined {
-  if (record.card !== undefined && record.requesterUserId !== undefined) {
-    return { requesterUserId: record.requesterUserId, card: record.card }
-  }
-  const subject = record.subject
-  if (subject === undefined) return undefined
-  return {
-    requesterUserId: subject.requesterUserId,
-    card: {
-      title: '日志分析',
-      taskName: '分析',
-      lead: [
-        { text: `于 ${subject.triggeredAt} 发起了对 ` },
-        { text: subject.app, bold: true },
-        { text: ' 应用 ' },
-        { text: subject.errorCode, bold: true },
-        { text: ' 错误码不良日志的分析。' },
-      ],
-      links: { nameHeader: '日志', linkHeader: '详情页', rows: subject.logDetails },
-    },
-  }
-}
 
 /**
  * Where one Feishu-routed Session came from, keyed by its DSH session id.
@@ -566,86 +419,11 @@ export const sessionOriginRecordSchema = z.object({
   senderUserId: z.string().min(1),
   /** Epoch ms when the Session was bound to the route. */
   createdAt: z.number().int().nonnegative(),
-  /** Older origins of group routes started through `feishuTopics`: read like `mode: 'group'`. */
-  shared: z.literal(true).optional(),
-  /** `group`: the Session belongs to a group route without a single owner (see `RouteRecord.mode`). */
-  mode: z.literal('group').optional(),
 })
 
 export type SessionOriginRecord = z.infer<typeof sessionOriginRecordSchema>
 
-export interface FeishuDomainSpecShape {
-  name: 'channels_routes_v2'
-  version: 1
-  global: {
-    schema: z.ZodType<FeishuDomainGlobal>
-    initial: FeishuDomainGlobal
-  }
-  tables: {
-    routes: {
-      valueSchema: typeof routeRecordSchema
-      __key?: string
-    }
-    inflight: {
-      valueSchema: typeof inflightSnapshotSchema
-      __key?: string
-    }
-    processed: {
-      valueSchema: typeof processedRecordSchema
-      __key?: string
-    }
-    expired_routes: {
-      valueSchema: typeof expiredRouteRecordSchema
-      __key?: string
-    }
-    access_groups: {
-      valueSchema: typeof retiredAccessGroupRecordSchema
-      __key?: string
-    }
-    access_users: {
-      valueSchema: typeof accessUserRecordSchema
-      __key?: string
-    }
-    access_requests: {
-      valueSchema: typeof accessRequestRecordSchema
-      __key?: string
-    }
-    access_wiki_users: {
-      valueSchema: typeof accessUserRecordSchema
-      __key?: string
-    }
-    group_permissions: {
-      valueSchema: typeof groupPermissionRecordSchema
-      __key?: string
-    }
-    analyze_requests: {
-      valueSchema: typeof topicLaunchRecordSchema
-      __key?: string
-    }
-    session_origins: {
-      valueSchema: typeof sessionOriginRecordSchema
-      __key?: string
-    }
-    outbox: {
-      valueSchema: typeof outboxEntrySchema
-      __key?: string
-    }
-    approval_grants: {
-      valueSchema: typeof approvalGrantRecordSchema
-      __key?: string
-    }
-    approval_cards: {
-      valueSchema: typeof approvalCardRecordSchema
-      __key?: string
-    }
-  }
-}
-
 export const feishuDomainGlobalSchema = z.object({
-  /** Legacy: img_key of a previously uploaded chevron icon. Kept optional so
-   *  storage written by older plugin versions still validates; the card now
-   *  uses the built-in `standard_icon` chevron and never writes this. */
-  chevronImgKey: z.string().optional(),
   /** p2p chats already shown the one-time onboarding card (bounded list). */
   welcomedChats: z.array(z.string()).optional(),
   /** Groups the bot was added to (bounded list), read by missed-message catch-up. */
@@ -656,15 +434,9 @@ export const feishuDomainGlobalSchema = z.object({
 
 export type FeishuDomainGlobal = z.infer<typeof feishuDomainGlobalSchema>
 
-/**
- * Domain declaration for the host's storage facility. Plain data plus zod
- * schemas — deliberately not built with `defineDomain` so this module has no
- * runtime import of `@deepseek-ai/dsh-storage-domain`.
- */
-export const feishuDomain: FeishuDomainSpecShape = {
-  // v2 keys every user by `user_id`. The open_id-keyed `channels_routes` unit
-  // is neither read nor migrated; it stays on disk untouched.
-  name: 'channels_routes_v2',
+/** The plugin's storage domain: one table per record kind plus a small global record. */
+export const feishuDomain = {
+  name: 'dsh_channels',
   version: 1,
   global: {
     schema: feishuDomainGlobalSchema,
@@ -675,147 +447,70 @@ export const feishuDomain: FeishuDomainSpecShape = {
     inflight: { valueSchema: inflightSnapshotSchema },
     processed: { valueSchema: processedRecordSchema },
     expired_routes: { valueSchema: expiredRouteRecordSchema },
-    // Retired group whitelist: declared so the stored records survive, never read.
-    access_groups: { valueSchema: retiredAccessGroupRecordSchema },
     access_users: { valueSchema: accessUserRecordSchema },
     access_requests: { valueSchema: accessRequestRecordSchema },
-    // Retired wiki whitelist (knowledge-base access now lives on `access_users`):
-    // declared so the stored records survive, never read.
-    access_wiki_users: { valueSchema: accessUserRecordSchema },
-    // Per-group permission switches (key = chat_id); a missing table loads empty.
+    // Per-group permission switches (key = chat_id).
     group_permissions: { valueSchema: groupPermissionRecordSchema },
-    // `feishuTopics` launch records (historical name); a missing table loads empty.
-    analyze_requests: { valueSchema: topicLaunchRecordSchema },
-    // Session id → Feishu origin; a missing table loads empty.
+    // `feishuTopics` launches (key = idempotency key).
+    topic_launches: { valueSchema: topicLaunchRecordSchema },
+    // Session id → Feishu origin.
     session_origins: { valueSchema: sessionOriginRecordSchema },
-    // Terminal Feishu actions waiting for a retry; a missing table loads empty.
+    // Terminal Feishu actions waiting for a retry.
     outbox: { valueSchema: outboxEntrySchema },
-    // Session "stop asking in this topic" grants (key = session id); a missing table loads empty.
+    // Session "stop asking in this topic" grants (key = session id).
     approval_grants: { valueSchema: approvalGrantRecordSchema },
-    // Delivered approval cards until decided or retried (key = card message id); a missing table loads empty.
+    // Delivered approval cards until decided or retried (key = card message id).
     approval_cards: { valueSchema: approvalCardRecordSchema },
   },
-}
+} as const
 
-export type FeishuDomainSpec = typeof feishuDomain
-
-/** Normalized table handle for the routes table. */
-export interface RoutesTable {
-  get(key: string): RouteRecord | undefined
-  put(key: string, value: RouteRecord): Promise<unknown> | void
-  delete(key: string): Promise<unknown> | void
-  entries(): IterableIterator<[string, RouteRecord]>
-}
-
-/** Normalized table handle for the inflight table (repair snapshots). */
-export interface InflightTable {
-  get(key: string): InflightSnapshot | undefined
-  put(key: string, value: InflightSnapshot): Promise<unknown> | void
-  /**
-   * Atomic read-modify-write on the host's write chain (mirrors `KvTable`).
-   * Rejects with `missing-key` when the key is absent (e.g. the turn finalize
-   * deleted the snapshot while a late segment delivery was still landing).
-   */
-  update(key: string, fn: (current: InflightSnapshot) => InflightSnapshot): Promise<unknown>
-  delete(key: string): Promise<unknown> | void
-  entries(): IterableIterator<[string, InflightSnapshot]>
-}
-
-/** Normalized table handle for the processed-message dedup table. */
-export interface ProcessedTable {
-  get(key: string): ProcessedRecord | undefined
-  put(key: string, value: ProcessedRecord): Promise<unknown> | void
-  delete(key: string): Promise<unknown> | void
-  entries(): IterableIterator<[string, ProcessedRecord]>
-}
-
-/** Persistent thread tombstones used to reject post-TTL messages. */
-export interface ExpiredRoutesTable {
-  get(key: string): ExpiredRouteRecord | undefined
-  put(key: string, value: ExpiredRouteRecord): Promise<unknown> | void
-  entries(): IterableIterator<[string, ExpiredRouteRecord]>
-}
-
-/** Normalized table handle for the access-table users (key = `user_id`). */
-export interface AccessUsersTable {
-  get(key: string): AccessUserRecord | undefined
-  put(key: string, value: AccessUserRecord): Promise<unknown> | void
-  delete(key: string): Promise<unknown> | void
-  entries(): IterableIterator<[string, AccessUserRecord]>
-}
-
-/** Normalized table handle for the group permission records (key = `chat_id`). */
-export interface GroupPermissionsTable {
-  get(key: string): GroupPermissionRecord | undefined
-  put(key: string, value: GroupPermissionRecord): Promise<unknown> | void
-  delete(key: string): Promise<unknown> | void
-  entries(): IterableIterator<[string, GroupPermissionRecord]>
-}
-
-/** Normalized table handle for authorization requests (key = opaque token). */
-export interface AccessRequestsTable {
-  get(key: string): AccessRequestRecord | undefined
-  put(key: string, value: AccessRequestRecord): Promise<unknown> | void
-  delete(key: string): Promise<unknown> | void
-  entries(): IterableIterator<[string, AccessRequestRecord]>
-}
-
-/** Normalized table handle for `feishuTopics` launches (key = idempotency key). */
-export interface TopicLaunchesTable {
-  get(key: string): TopicLaunchRecord | undefined
-  put(key: string, value: TopicLaunchRecord): Promise<unknown> | void
-  entries(): IterableIterator<[string, TopicLaunchRecord]>
-}
-
-/** Normalized table handle for the session-origin table (key = DSH session id). */
-export interface SessionOriginsTable {
-  get(key: string): SessionOriginRecord | undefined
-  put(key: string, value: SessionOriginRecord): Promise<unknown> | void
-  entries(): IterableIterator<[string, SessionOriginRecord]>
-}
-
-/** Normalized domain handle. */
+/** The open storage domain, one typed handle per table. */
 export interface FeishuDomainHandle {
-  routes: RoutesTable
-  inflight: InflightTable
-  processed: ProcessedTable
-  expiredRoutes: ExpiredRoutesTable
-  accessUsers: AccessUsersTable
-  accessRequests: AccessRequestsTable
-  /** Per-group permission switches. */
-  groupPermissions: GroupPermissionsTable
-  /** `feishuTopics` launch records. */
-  topicLaunches: TopicLaunchesTable
+  routes: DomainTable<RouteRecord>
+  /** Repair snapshots of in-flight turns (key = main card message id). */
+  inflight: DomainTable<InflightSnapshot>
+  /** Inbound dedup records (key = Feishu message id). */
+  processed: DomainTable<ProcessedRecord>
+  /** Tombstones of TTL-retired thread routes (key = thread id). */
+  expiredRoutes: DomainTable<ExpiredRouteRecord>
+  accessUsers: DomainTable<AccessUserRecord>
+  accessRequests: DomainTable<AccessRequestRecord>
+  groupPermissions: DomainTable<GroupPermissionRecord>
+  topicLaunches: DomainTable<TopicLaunchRecord>
   /** Feishu origin of every Session a route ever named. */
-  sessionOrigins: SessionOriginsTable
-  /** Terminal Feishu actions waiting for a retry. */
-  outbox: OutboxTable
-  /** Session "stop asking in this topic" grants. */
-  approvalGrants: ApprovalGrantsTable
-  /** Approval cards until decided or retried. */
-  approvalCards: ApprovalCardsTable
+  sessionOrigins: DomainTable<SessionOriginRecord>
+  outbox: DomainTable<OutboxEntry>
+  approvalGrants: DomainTable<ApprovalGrantRecord>
+  approvalCards: DomainTable<ApprovalCardRecord>
   getGlobal(): FeishuDomainGlobal
-  setGlobal(value: FeishuDomainGlobal): Promise<unknown> | void
+  setGlobal(value: FeishuDomainGlobal): Promise<unknown>
   close(): Promise<void>
 }
 
-/** The raw shape `ctx.storageDomain.open()` resolves to (cast at the seam).
- *  Mirrors `KvTable` from `@deepseek-ai/dsh-storage-domain`: reads are sync,
- *  writes go through `put`/`delete` (NOT `set`), and `update` provides the
- *  atomic read-modify-write used by the inflight merge. */
-export interface RawDomainHandle {
-  table(name: string): {
-    get(key: string): unknown
-    put(key: string, value: unknown): Promise<unknown>
-    update(key: string, fn: (current: unknown) => unknown): Promise<unknown>
-    delete(key: string): Promise<unknown>
-    entries(): IterableIterator<[string, unknown]>
+/**
+ * Open the plugin's storage domain through the host facility.
+ * @param facility - `ctx.storageDomain`.
+ * @returns the typed handle.
+ */
+export async function openFeishuDomain(facility: StorageDomainFacility): Promise<FeishuDomainHandle> {
+  const domain = await facility.open(feishuDomain)
+  return {
+    routes: typedTable(domain.table('routes')),
+    inflight: typedTable(domain.table('inflight')),
+    processed: typedTable(domain.table('processed')),
+    expiredRoutes: typedTable(domain.table('expired_routes')),
+    accessUsers: typedTable(domain.table('access_users')),
+    accessRequests: typedTable(domain.table('access_requests')),
+    groupPermissions: typedTable(domain.table('group_permissions')),
+    topicLaunches: typedTable(domain.table('topic_launches')),
+    sessionOrigins: typedTable(domain.table('session_origins')),
+    outbox: typedTable(domain.table('outbox')),
+    approvalGrants: typedTable(domain.table('approval_grants')),
+    approvalCards: typedTable(domain.table('approval_cards')),
+    getGlobal: () => (domain.global.get() ?? {}) as FeishuDomainGlobal,
+    setGlobal: value => domain.global.set(value),
+    close: () => domain.close(),
   }
-  global: {
-    get(): unknown
-    set(value: unknown): Promise<unknown>
-  }
-  close(): Promise<void>
 }
 
 /**

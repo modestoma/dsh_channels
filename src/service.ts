@@ -24,14 +24,13 @@ import { AccessController } from './access/controller.ts'
 import { AccessRequests } from './access/requests.ts'
 import { AccessStore } from './access/store.ts'
 import { AUTH_USER_TARGET_ERRORS, resolveAuthUserTarget } from './access/targets.ts'
-import { ApprovalAnswerer, approvalRetryPrompt } from './approvals.ts'
-import type { ApprovalRoute } from './approvals.ts'
+import { ApprovalAnswerer, approvalRetryPrompt } from './interactions/approvals.ts'
+import type { ApprovalRoute } from './interactions/approvals.ts'
 import { ApprovalStore } from './interactions/approval-store.ts'
 import type { ApprovalCardRecord, ApprovalGrantRecord } from './interactions/approval-store.ts'
-import { QuestionAnswerer } from './questions.ts'
+import { QuestionAnswerer } from './interactions/questions.ts'
 import type {
   Agent,
-  AuthorizeEvent,
   CommandInvocation,
   CommandResult,
   CredentialInfo,
@@ -45,9 +44,9 @@ import type {
   SessionProjections,
   TokenMeter,
   UserMessage,
-} from './dsh-types.ts'
-import { buildApprovalSettledCard, buildPickerCard, initialStreamingCard, parseApprovalRetryAction, parsePickAction, parseResumeAction, queuedStreamingCard, standaloneInfoCard, STEER_ACTION, STOP_ACTION } from './cards.ts'
-import type { PickerOption } from './cards.ts'
+} from './host/index.ts'
+import { buildApprovalSettledCard, buildPickerCard, initialStreamingCard, parseApprovalRetryAction, parsePickAction, parseResumeAction, queuedStreamingCard, standaloneInfoCard, STEER_ACTION, STOP_ACTION } from './cards/index.ts'
+import type { PickerOption } from './cards/index.ts'
 import {
   armEffortCommand, armRenewCommand, commandResultCardKind, parseSlashCommand,
   registerEffortCommand, registerRenewCommand, RouteOperationQueue, supportedCommandHelp, supportedCommandList,
@@ -55,13 +54,13 @@ import {
 import type { EffortCommandAction, ParsedSlashCommand } from './commands.ts'
 import { commandSpec } from './commands/registry.ts'
 import type { ChannelCommandSpec } from './commands/registry.ts'
-import { workingDirectoryService } from './dsh-types.ts'
-import type { PermissionPresets, SessionQuery } from './dsh-types.ts'
-import { ACCESS_PERMISSIONS, FEISHU_USER_ID_PATTERN, feishuDomain, isGroupRoute, PROCESSED_RETENTION_MS, sessionDirOf } from './domain.ts'
+import { workingDirectoryService } from './host/index.ts'
+import type { PermissionPresets, SessionQuery } from './host/index.ts'
+import { ACCESS_PERMISSIONS, FEISHU_USER_ID_PATTERN, isGroupRoute, openFeishuDomain, PROCESSED_RETENTION_MS } from './domain.ts'
 import type {
   AccessPermission, AccessRequestRecord, AccessSwitch, AccessUserRecord,
   ExpiredRouteRecord, FeishuDomainGlobal, FeishuDomainHandle, GroupPermission, GroupPermissionRecord, InflightSnapshot,
-  ProcessedRecord, RawDomainHandle, RouteRecord, SessionOriginRecord, TopicLaunchRecord,
+  ProcessedRecord, RouteRecord, SessionOriginRecord, TopicLaunchRecord,
 } from './domain.ts'
 import { Outbox } from './outbox.ts'
 import type { OutboxEntry } from './outbox.ts'
@@ -104,7 +103,6 @@ import {
   compactFailureContext, resolveWorkDir, SESSION_HISTORY_DISPLAY_LIMIT,
 } from './session-commands.ts'
 import type { SessionHistoryAnnotation } from './session-commands.ts'
-import { normalizeSessionHistory } from './domain.ts'
 import { foldSessionStats, measureSessionContext, readProjectionViews } from './stats.ts'
 import type { ContextMeasurement, ContextServices } from './stats.ts'
 import { createLogicalSessionExport } from './session-export.ts'
@@ -162,98 +160,6 @@ function feishuReason(error: unknown): string {
 
 /** Feishu `chat_id`s the profile lookup accepts. */
 const FEISHU_CHAT_ID_PATTERN = /^oc_[A-Za-z0-9_-]+$/u
-
-/** Wrap the host's storage facility open behind a stable local type. */
-async function openFeishuDomain(ctx: HostContext): Promise<FeishuDomainHandle> {
-  const domain = await ctx.storageDomain.open(feishuDomain) as unknown as RawDomainHandle
-  const table = domain.table('routes')
-  const inflightRaw = domain.table('inflight')
-  const processedRaw = domain.table('processed')
-  const expiredRoutesRaw = domain.table('expired_routes')
-  const accessUsersRaw = domain.table('access_users')
-  const accessRequestsRaw = domain.table('access_requests')
-  const groupPermissionsRaw = domain.table('group_permissions')
-  const topicLaunchesRaw = domain.table('analyze_requests')
-  const sessionOriginsRaw = domain.table('session_origins')
-  const outboxRaw = domain.table('outbox')
-  const approvalGrantsRaw = domain.table('approval_grants')
-  const approvalCardsRaw = domain.table('approval_cards')
-  return {
-    routes: {
-      get: key => table.get(key) as RouteRecord | undefined,
-      put: (key, value) => table.put(key, value),
-      delete: key => table.delete(key),
-      entries: () => table.entries() as IterableIterator<[string, RouteRecord]>,
-    },
-    inflight: {
-      get: key => inflightRaw.get(key) as InflightSnapshot | undefined,
-      put: (key, value) => inflightRaw.put(key, value),
-      update: (key, fn) => inflightRaw.update(key, current => fn(current as InflightSnapshot)),
-      delete: key => inflightRaw.delete(key),
-      entries: () => inflightRaw.entries() as IterableIterator<[string, InflightSnapshot]>,
-    },
-    processed: {
-      get: key => processedRaw.get(key) as ProcessedRecord | undefined,
-      put: (key, value) => processedRaw.put(key, value),
-      delete: key => processedRaw.delete(key),
-      entries: () => processedRaw.entries() as IterableIterator<[string, ProcessedRecord]>,
-    },
-    expiredRoutes: {
-      get: key => expiredRoutesRaw.get(key) as ExpiredRouteRecord | undefined,
-      put: (key, value) => expiredRoutesRaw.put(key, value),
-      entries: () => expiredRoutesRaw.entries() as IterableIterator<[string, ExpiredRouteRecord]>,
-    },
-    accessUsers: {
-      get: key => accessUsersRaw.get(key) as AccessUserRecord | undefined,
-      put: (key, value) => accessUsersRaw.put(key, value),
-      delete: key => accessUsersRaw.delete(key),
-      entries: () => accessUsersRaw.entries() as IterableIterator<[string, AccessUserRecord]>,
-    },
-    accessRequests: {
-      get: key => accessRequestsRaw.get(key) as AccessRequestRecord | undefined,
-      put: (key, value) => accessRequestsRaw.put(key, value),
-      delete: key => accessRequestsRaw.delete(key),
-      entries: () => accessRequestsRaw.entries() as IterableIterator<[string, AccessRequestRecord]>,
-    },
-    groupPermissions: {
-      get: key => groupPermissionsRaw.get(key) as GroupPermissionRecord | undefined,
-      put: (key, value) => groupPermissionsRaw.put(key, value),
-      delete: key => groupPermissionsRaw.delete(key),
-      entries: () => groupPermissionsRaw.entries() as IterableIterator<[string, GroupPermissionRecord]>,
-    },
-    topicLaunches: {
-      get: key => topicLaunchesRaw.get(key) as TopicLaunchRecord | undefined,
-      put: (key, value) => topicLaunchesRaw.put(key, value),
-      entries: () => topicLaunchesRaw.entries() as IterableIterator<[string, TopicLaunchRecord]>,
-    },
-    sessionOrigins: {
-      get: key => sessionOriginsRaw.get(key) as SessionOriginRecord | undefined,
-      put: (key, value) => sessionOriginsRaw.put(key, value),
-      entries: () => sessionOriginsRaw.entries() as IterableIterator<[string, SessionOriginRecord]>,
-    },
-    getGlobal: () => (domain.global.get() ?? {}) as FeishuDomainGlobal,
-    setGlobal: value => domain.global.set(value),
-    outbox: {
-      get: key => outboxRaw.get(key) as OutboxEntry | undefined,
-      put: (key, value) => outboxRaw.put(key, value),
-      delete: key => outboxRaw.delete(key),
-      entries: () => outboxRaw.entries() as IterableIterator<[string, OutboxEntry]>,
-    },
-    approvalGrants: {
-      get: key => approvalGrantsRaw.get(key) as ApprovalGrantRecord | undefined,
-      put: (key, value) => approvalGrantsRaw.put(key, value),
-      delete: key => approvalGrantsRaw.delete(key),
-      entries: () => approvalGrantsRaw.entries() as IterableIterator<[string, ApprovalGrantRecord]>,
-    },
-    approvalCards: {
-      get: key => approvalCardsRaw.get(key) as ApprovalCardRecord | undefined,
-      put: (key, value) => approvalCardsRaw.put(key, value),
-      delete: key => approvalCardsRaw.delete(key),
-      entries: () => approvalCardsRaw.entries() as IterableIterator<[string, ApprovalCardRecord]>,
-    },
-    close: () => domain.close(),
-  }
-}
 
 /** `/auth` usage line (input-error card). */
 const AUTH_USAGE = '用法：/auth [status|list]；/auth add <@用户|user_id>；/auth remove <@用户|user_id>；/auth set <chat|wiki-read|wiki-write|code> <on|off> <@用户|user_id>'
@@ -606,35 +512,13 @@ export class FeishuService {
       config: () => this.config,
       channel: () => this.channel,
       attachments: () => this.ctx.attachments,
-      routeOfSession: sessionId => {
-        const record = this.routes.findBySession(sessionId)
-        if (record === undefined) return undefined
-        return {
-          key: record.key,
-          kind: record.kind,
-          chatId: record.chatId,
-          chatType: record.chatType,
-          senderUserId: record.senderUserId,
-          ...(isGroupRoute(record) ? { shared: true } : {}),
-        }
-      },
+      routeOfSession: sessionId => this.routes.findBySession(sessionId),
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
     })
     this.topicMessagesTools = new TopicMessagesToolRuntime({
       config: () => this.config,
       channel: () => this.channel,
-      routeOfSession: sessionId => {
-        const record = this.routes.findBySession(sessionId)
-        if (record === undefined) return undefined
-        return {
-          key: record.key,
-          kind: record.kind,
-          chatId: record.chatId,
-          chatType: record.chatType,
-          senderUserId: record.senderUserId,
-          ...(isGroupRoute(record) ? { shared: true } : {}),
-        }
-      },
+      routeOfSession: sessionId => this.routes.findBySession(sessionId),
       noteKnownMessage: (route, message, source) => {
         this.attachmentFetchTools.noteKnownMessage(route, message, source)
       },
@@ -678,7 +562,7 @@ export class FeishuService {
         return {
           replyTo: record.cardMessageId,
           inThread: record.kind === 'thread',
-          rootDir: sessionDirOf(record),
+          rootDir: record.workspacePath,
         }
       },
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
@@ -1678,34 +1562,6 @@ export class FeishuService {
   }
 
   /**
-   * Why a write asked through `access/authorize` is refused for a routed
-   * Session, by where it lives: `code-write`, `wiki-read`, and `wiki-write`
-   * follow the location's switches (a private chat's person, a group's
-   * permission record); `admin` needs the person of a private chat to be an
-   * administrator and is never granted to a group; unknown levels are refused.
-   * @param route - the Session's route.
-   * @param event - the write.
-   * @returns the refusal text for the model, or undefined when allowed.
-   */
-  private authorizeRefusal(route: RouteRecord, event: AuthorizeEvent): string | undefined {
-    const group = route.chatType === 'group'
-    const where = group ? '本群' : `飞书用户 ${route.senderUserId} `
-    switch (event.level) {
-      case 'code-write':
-        return this.accessController.mayUseOnRoute(route, 'codeWrite') ? undefined : `${where}没有代码改动权限，不能执行 ${event.action}${group ? '；需要管理员在设置面板「群权限」里打开本群的「改代码」' : '；需要管理员在设置面板「访问授权」里打开该用户的「改代码」'}`
-      case 'wiki-read':
-        return this.accessController.mayUseOnRoute(route, 'wikiRead') ? undefined : `${where}没有知识库读取权限，不能执行 ${event.action}`
-      case 'wiki-write':
-        return this.accessController.mayUseOnRoute(route, 'wikiWrite') ? undefined : `${where}没有知识库写入权限，不能执行 ${event.action}`
-      case 'admin':
-        if (group) return `${event.action} 是管理操作，不能在群会话里执行；请管理员在私聊里操作`
-        return this.accessController.isAdmin(route.senderUserId) ? undefined : `${where}不是管理员，不能执行 ${event.action}`
-      default:
-        return `飞书会话不允许未知的授权级别 ${event.level}，不能执行 ${event.action}`
-    }
-  }
-
-  /**
    * Name of a group as commits record it: the chat profile's name without
    * `<`, `>`, or control characters, cut to 80 characters.
    * @param chatId - Feishu chat_id.
@@ -2037,7 +1893,7 @@ export class FeishuService {
       this.config.statusRefreshMs,
     )
 
-    const domain = await openFeishuDomain(this.ctx)
+    const domain = await openFeishuDomain(this.ctx.storageDomain)
     if (this.lifecycle !== lifecycle) {
       await domain.close()
       throw new StartSupersededError()
@@ -2149,7 +2005,7 @@ export class FeishuService {
     this.unlistenHost.push(this.ctx.on('access/authorize', (event) => {
       const route = this.routedRouteOf(event.session)
       if (route === undefined) return
-      const refusal = this.authorizeRefusal(route, event)
+      const refusal = this.accessController.authorizeRefusal(route, event)
       if (refusal !== undefined) throw new Error(refusal)
     }))
     this.unlistenHost.push(this.ctx.on('repo/commit-trailers', async (event) => {
@@ -2157,7 +2013,7 @@ export class FeishuService {
       const userId = this.codeWriteGate.speakerOf(event.session)
       if (route === undefined || userId === undefined) return
       const name = await this.commitName(userId)
-      if (route.chatType === 'group') {
+      if (isGroupRoute(route)) {
         // A group's commits belong to the group: the token account authors
         // them, the group and the speaker are recorded as trailers.
         const chatName = await this.commitChatName(route.chatId)
@@ -3096,7 +2952,7 @@ export class FeishuService {
       await this.delivery.standaloneReply(msg, buildRenewCard({
         previousSessionId: renewAdmission.commit.previous.sessionId,
         currentSessionId: renewAdmission.commit.current.sessionId,
-        sessionDir: sessionDirOf(renewAdmission.commit.current),
+        sessionDir: renewAdmission.commit.current.workspacePath,
       }))
       return
     }
@@ -3116,7 +2972,7 @@ export class FeishuService {
         context,
         extras: {
           permissionPreset: this.permissionPresetOf(session),
-          sessionDir: sessionDirOf(current),
+          sessionDir: current.workspacePath,
           uptimeMs: this.startedAt === undefined ? undefined : Date.now() - this.startedAt,
           liveAgents: this.sessions.liveCount(),
           routeCount: this.routes.size(),
@@ -3125,10 +2981,7 @@ export class FeishuService {
       return
     }
     if (spec.name === 'workspace' && result.kind === 'success') {
-      const resolved = resolveWorkDir(live.agent.session.header.cwd, {
-        workspacePath: current.workspacePath,
-        ...(current.sessionDir === undefined ? {} : { sessionDir: current.sessionDir }),
-      })
+      const resolved = resolveWorkDir(live.agent.session.header.cwd, current)
       if (resolved.kind === 'success') {
         await this.delivery.standaloneReply(msg, buildWorkDirCard(current.sessionId, resolved.path))
         return
@@ -3200,7 +3053,7 @@ export class FeishuService {
    * best-effort — a missing or failing `sessionQuery` only drops the titles.
    */
   private async sessionHistoryAnnotations(record: RouteRecord): Promise<Record<string, SessionHistoryAnnotation>> {
-    const ids = normalizeSessionHistory(record)
+    const ids = record.sessionHistory
       .slice(-SESSION_HISTORY_DISPLAY_LIMIT)
       .map(entry => entry.sessionId)
     const annotations: Record<string, SessionHistoryAnnotation> = {}

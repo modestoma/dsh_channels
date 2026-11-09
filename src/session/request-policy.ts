@@ -24,7 +24,7 @@
  * @module dsh-channels/session/request-policy
  */
 
-import type { Agent, AgentContext, AgentModel, CommandId, SessionEvent } from '../dsh-types.ts'
+import type { Agent, AgentContext, AgentModel, CommandId, SessionEvent } from '../host/index.ts'
 
 /** A provider route and model id pinned in channel settings. */
 export interface ConfiguredModel {

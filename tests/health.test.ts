@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   buildHealthCard, countFiberStates, foldHealthSnapshot, HEALTH_DEPENDENCY_NAMES, maskOpenIdTail,
 } from '../src/health.ts'
-import { CordisFiberState } from '../src/dsh-types.ts'
+import { CordisFiberState } from '../src/host/index.ts'
 import type { HealthDependencyName } from '../src/health.ts'
 
 function dependencies(missing?: HealthDependencyName): Record<HealthDependencyName, boolean> {

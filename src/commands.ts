@@ -11,7 +11,7 @@
 
 import type {
   AgentContext, CommandDefinition, CommandDescriptor, CommandResult, CommandRuntime,
-} from './dsh-types.ts'
+} from './host/index.ts'
 import { card } from './cards/primitives.ts'
 
 import {

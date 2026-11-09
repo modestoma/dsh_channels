@@ -36,6 +36,7 @@
  * @module dsh-channels/feishu/tools
  */
 
+import { isGroupRoute } from '../domain.ts'
 import { z } from 'zod'
 import type { FeishuConfig } from '../config.ts'
 import type {
@@ -103,9 +104,8 @@ export interface AttachmentFetchRoute {
   readonly kind: 'thread' | 'chat'
   readonly chatId: string
   readonly chatType: 'p2p' | 'group'
+  /** Opener of the route; on a group route messages of any sender count as its own. */
   readonly senderUserId: string
-  /** Group route without a single owner: messages of any sender in the route's topic count as its own. */
-  readonly shared?: boolean
 }
 
 /** Why a message became known to one route. */
@@ -802,7 +802,7 @@ export class AttachmentFetchToolRuntime {
     if (!read.ok) return undefined
     const container = quoteItemsOf(read.value)
     if (container === undefined || container.deleted) return undefined
-    if (call.route.shared !== true && container.senderUserId !== call.route.senderUserId) return undefined
+    if (!isGroupRoute(call.route) && container.senderUserId !== call.route.senderUserId) return undefined
     if (!messageBelongsToRoute(call.route, container)) return undefined
     return knownMessageOfItems(read.value)
   }

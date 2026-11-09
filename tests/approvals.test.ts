@@ -5,11 +5,11 @@
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { ApprovalAnswerer, approvalRetryPrompt, classifyApprovalReply } from '../src/approvals.ts'
+import { ApprovalAnswerer, approvalRetryPrompt, classifyApprovalReply } from '../src/interactions/approvals.ts'
 import { ApprovalStore, RETRY_WINDOW_MS } from '../src/interactions/approval-store.ts'
 import type { ApprovalCardRecord, ApprovalGrantRecord } from '../src/interactions/approval-store.ts'
-import type { ApprovalRoute, ApprovalTimings } from '../src/approvals.ts'
-import type { ApprovalOutcome, ApprovalRequest } from '../src/dsh-types.ts'
+import type { ApprovalRoute, ApprovalTimings } from '../src/interactions/approvals.ts'
+import type { ApprovalOutcome, ApprovalRequest } from '../src/host/index.ts'
 import type { CardActionEvent, FeishuChannel, SendResult } from '../src/feishu-channel.ts'
 import { makeAgent, makeChannel, makeSession } from './helpers.ts'
 

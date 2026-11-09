@@ -9,11 +9,10 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import { describe, expect, it, vi } from 'vitest'
-import { buildTopicRootCard } from '../src/cards.ts'
+import { buildTopicRootCard } from '../src/cards/index.ts'
 import { resolveConfig } from '../src/config.ts'
 import type { FeishuConfig } from '../src/config.ts'
-import type { HostContext } from '../src/dsh-types.ts'
-import { rootCardOf } from '../src/domain.ts'
+import type { HostContext } from '../src/host/index.ts'
 import type { RouteRecord, TopicLaunchRecord } from '../src/domain.ts'
 import type { CardActionEvent, ChannelFactory, NormalizedMessage } from '../src/feishu-channel.ts'
 import { apply, inject, name } from '../src/index.ts'
@@ -66,19 +65,6 @@ describe('topic root card', () => {
     expect(running).toContain('巡检过程在本卡片下的话题内实时输出')
     expect(running).toContain('\\\\*not bold\\\\*')
     expect(running).not.toContain('"tag":"table"')
-  })
-
-  it('redraws records the former analyze API wrote as the card it drew', () => {
-    const legacy: TopicLaunchRecord = {
-      key: 'req-1', bodyHash: 'h', chatId: 'oc_group', messageId: 'om_1', acceptedAt: 1, status: 'running',
-      subject: {
-        requesterUserId: 'u_alice', triggeredAt: '2026-10-22 19:30', app: 'camera', errorCode: 'E1001',
-        logDetails: [{ name: '设备 A 崩溃日志', url: 'https://logs.example/detail/1' }],
-      },
-    }
-    const root = rootCardOf(legacy)!
-    expect(root).toEqual({ requesterUserId: 'u_alice', card: spec().card })
-    expect(rootCardOf({ ...legacy, subject: undefined })).toBeUndefined()
   })
 })
 
@@ -134,7 +120,7 @@ describe('topic launch flow', () => {
       service, channel, ctxState, config, launcher,
       onMessage: (msg: NormalizedMessage) => Promise.resolve(handler(msg)),
       routes: () => [...ctxState.domain.raw.table('routes').entries()].map(([, value]) => value as RouteRecord),
-      record: (key: string) => ctxState.domain.raw.table('analyze_requests').get(key) as TopicLaunchRecord | undefined,
+      record: (key: string) => ctxState.domain.raw.table('topic_launches').get(key) as TopicLaunchRecord | undefined,
     }
   }
 
@@ -183,10 +169,10 @@ describe('topic launch flow', () => {
     expect(JSON.stringify(streaming.input)).toContain('⚙️ 进行中')
     expect(h.routes()[0]).toMatchObject({
       key: 'omt_2', kind: 'thread', chatId: 'oc_group', senderUserId: 'u_alice',
-      cardMessageId: 'om_2', mode: 'group',
+      cardMessageId: 'om_2', chatType: 'group',
       workspacePath: path.join(h.config.baseDir, 'groups', 'oc_group', 'omt_2'),
     })
-    expect(h.routes()[0]).not.toHaveProperty('shared')
+    expect(h.routes()[0]).not.toHaveProperty('mode')
     expect(h.ctxState.workspaces.workspaces.get(path.join(h.config.baseDir, 'groups', 'oc_group', 'omt_2'))).toMatchObject({ title: 'oc_group · 日志分析' })
     expect(h.ctxState.domain.raw.table('group_permissions').get('oc_group')).toMatchObject({ chatId: 'oc_group', codeWrite: false })
     const agent = h.ctxState.agents.created[0]!.handle.agent
@@ -360,22 +346,18 @@ describe('topic launch flow', () => {
     expect(h.record('key-1')).toBeUndefined()
   })
 
-  it('marks a running record the former analyze API wrote as interrupted at start', async () => {
+  it('marks a record still running at start as interrupted', async () => {
     const h = await setup()
-    await h.ctxState.domain.raw.table('analyze_requests').put('req-legacy', {
-      key: 'req-legacy', bodyHash: 'h', chatId: 'oc_group', messageId: 'om_legacy', acceptedAt: 1, status: 'running',
-      subject: {
-        requesterUserId: 'u_alice', triggeredAt: '2026-10-22 19:30', app: 'camera', errorCode: 'E1001',
-        logDetails: [{ name: '设备 A 崩溃日志', url: 'https://logs.example/detail/1' }],
-      },
+    await h.ctxState.domain.raw.table('topic_launches').put('req-left', {
+      key: 'req-left', bodyHash: 'h', chatId: 'oc_group', messageId: 'om_left', acceptedAt: 1, status: 'running',
+      requesterUserId: 'u_alice', card: spec().card,
     })
     await h.service.shutdown()
     await h.service.start()
-    await waitUntil(() => expect(h.record('req-legacy')?.status).toBe('interrupted'))
-    const card = lastCard(h, 'om_legacy')
+    await waitUntil(() => expect(h.record('req-left')?.status).toBe('interrupted'))
+    const card = lastCard(h, 'om_left')
     expect(card).toContain('已中断')
-    expect(card).toContain('<at id=u_alice></at> 于 2026-10-22 19:30 发起了对 **camera** 应用 **E1001** 错误码不良日志的分析。')
-    expect(card).toContain('设备 A 崩溃日志')
+    expect(card).toContain('<at id=u_alice></at>')
   })
 
   it('ends on a failure card without a route when setup fails', async () => {

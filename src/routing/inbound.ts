@@ -13,11 +13,11 @@ import { randomUUID } from 'node:crypto'
 import { mkdir } from 'node:fs/promises'
 import type {
   Agent, AgentHandle, AttachmentStore, HostContext, SessionId, Workspace,
-} from '../dsh-types.ts'
+} from '../host/index.ts'
 import type { FeishuConfig } from '../config.ts'
-import { buildCard, buildOnboardingCard, initialStreamingCard, queuedStreamingCard } from '../cards.ts'
+import { buildCard, buildOnboardingCard, initialStreamingCard, queuedStreamingCard } from '../cards/index.ts'
 import { RouteOperationQueue } from '../commands.ts'
-import { chatRouteKey, isGroupRoute, sessionDirOf } from '../domain.ts'
+import { chatRouteKey, isGroupRoute } from '../domain.ts'
 import type { FeishuDomainHandle, RouteRecord } from '../domain.ts'
 import type { CardDelivery } from '../feishu/delivery.ts'
 import {
@@ -914,9 +914,6 @@ export class InboundRouter {
       chatType: msg.chatType,
       senderUserId: msg.senderId,
       workspacePath: workspace.path,
-      // A group topic has no single owner; a degraded chat-scoped group route
-      // is keyed per sender and stays that sender's.
-      ...(msg.chatType === 'group' && kind === 'thread' ? { mode: 'group' as const } : {}),
       cardMessageId: sent.messageId,
       createdAt,
       lastActivityAt: createdAt,
@@ -965,8 +962,8 @@ export class InboundRouter {
     const live = await this.sessions.ensureLive(record)
     // The topic directory can disappear independently of the Session (manual
     // deletion, external cleanup); recreate it so the turn has its directory.
-    await mkdir(sessionDirOf(record), { recursive: true }).catch((error: unknown) => {
-      this.ctx.logger?.warn?.('dsh-channels: recreating topic directory %s failed: %s', sessionDirOf(record), String(error))
+    await mkdir(record.workspacePath, { recursive: true }).catch((error: unknown) => {
+      this.ctx.logger?.warn?.('dsh-channels: recreating topic directory %s failed: %s', record.workspacePath, String(error))
     })
     // A group route remembers its latest speaker for the commit trailer a
     // restart would otherwise attribute to the initiator.

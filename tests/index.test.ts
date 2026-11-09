@@ -3,8 +3,8 @@
 import { Context, resolveConfig, ValidationError } from '@deepseek-ai/cordis'
 import type { Plugin } from '@deepseek-ai/cordis'
 import { describe, expect, it } from 'vitest'
-import { CordisFiberState } from '../src/dsh-types.ts'
-import type { HostContext } from '../src/dsh-types.ts'
+import { CordisFiberState } from '../src/host/index.ts'
+import type { HostContext } from '../src/host/index.ts'
 import { apply, Config, inject, name } from '../src/index.ts'
 import type { FeishuConfig } from '../src/index.ts'
 

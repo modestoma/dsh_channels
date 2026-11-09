@@ -2,9 +2,8 @@
  * Code-write gate: in a Feishu Session, a call to one of the configured
  * `codeWriteTools` runs only when the Session's location holds the
  * `codeWrite` switch: the person of a private-chat topic (an administrator
- * holds every switch), the group's permission record of a group route
- * without a single owner, or the initiator of an older group route (see
- * `AccessController.mayUseOnRoute`). Who speaks in the turn does not change
+ * holds every switch) or the group's permission record of a group route
+ * (see `AccessController.mayUseOnRoute`). Who speaks in the turn does not change
  * the decision.
  *
  * - Ownership: a call belongs to a Feishu route when its agent's Session is
@@ -32,7 +31,7 @@
 import type { FeishuConfig } from '../config.ts'
 import { isGroupRoute } from '../domain.ts'
 import type { RouteRecord } from '../domain.ts'
-import type { PreToolDecision, PreToolExecution } from '../dsh-types.ts'
+import type { PreToolDecision, PreToolExecution } from '../host/index.ts'
 import type { UserMessage } from '../host/core.ts'
 import { promptCallerOf } from './principal.ts'
 

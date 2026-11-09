@@ -9,12 +9,6 @@
  * User-table mutations run one at a time, each reading the record after the
  * previous write, so concurrent switch changes never overwrite each other.
  *
- * The tables (`access_users`, `access_requests`, `group_permissions`) were added without bumping
- * the domain version on purpose: the JSON backend's `single` layout refuses a
- * stored-version mismatch, while unknown/missing tables are simply empty on
- * load (see `docs/access-control-design.md`). Request records of the retired
- * `group` kind are skipped on load.
- *
  * @module dsh-channels/access/store
  */
 
@@ -70,9 +64,7 @@ export class AccessStore {
     }
     for (const [key, record] of domain.accessUsers.entries()) this.remember(key, record)
     for (const [key, record] of domain.groupPermissions.entries()) this.groups.set(key, record)
-    for (const [key, record] of domain.accessRequests.entries()) {
-      if (record.kind === 'user') this.requests.set(key, record)
-    }
+    for (const [key, record] of domain.accessRequests.entries()) this.requests.set(key, record)
   }
 
   /** Drop every in-memory record (shutdown). The domain owns durability. */

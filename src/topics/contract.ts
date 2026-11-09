@@ -11,11 +11,11 @@
  * continue the topic; the group's permission switches (set in the channel's
  * settings panel) gate its knowledge-base and code-write tools.
  *
- * This module has no runtime exports, and the package subpath
- * `@modesto_ma/dsh-channels/topics` exposes only its types. A consumer imports
- * them with `import type`, looks the service up per call with
- * `ctx.get('feishuTopics')` (absent while dsh-channels is not loaded or
- * reloading), and checks {@link FeishuTopicService.version} before calling.
+ * This module has no runtime exports and is not part of the package exports:
+ * a consumer declares the subset it calls in its own code, looks the service
+ * up per call with `ctx.get('feishuTopics')` (absent while dsh-channels is not
+ * loaded or reloading), and checks {@link FeishuTopicService.version} before
+ * calling.
  *
  * @module dsh-channels/topics/contract
  */

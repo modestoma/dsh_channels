@@ -17,11 +17,10 @@ import type { FeishuConfig } from '../src/config.ts'
 import type {
   CardActionEvent, ChannelFactory, FeishuChannel, NormalizedMessage, RawMessageListParams,
 } from '../src/feishu-channel.ts'
-import { CordisFiberState } from '../src/dsh-types.ts'
-import type { Agent, AgentHandle, ApprovalOutcome, CordisPluginRuntime, MessageId, Session, SessionId, SessionProjections, UserMessage } from '../src/dsh-types.ts'
-import { RESUME_ACTION } from '../src/cards.ts'
+import { CordisFiberState } from '../src/host/index.ts'
+import type { Agent, AgentHandle, ApprovalOutcome, CordisPluginRuntime, MessageId, Session, SessionId, SessionProjections, UserMessage } from '../src/host/index.ts'
+import { RESUME_ACTION } from '../src/cards/index.ts'
 import type { RouteRecord } from '../src/domain.ts'
-import { sessionDirOf } from '../src/domain.ts'
 import { FEISHU_ATTACHMENTS_GUIDANCE, FEISHU_ATTACHMENTS_SECTION, FEISHU_REPLIES_GUIDANCE, FEISHU_REPLIES_SECTION } from '../src/feishu/agent-context.ts'
 import { ATTACHMENT_FETCH_TOOL_NAME, TOPIC_MESSAGES_TOOL_NAME } from '../src/feishu/tools.ts'
 import { SEND_FILE_TOOL_NAME } from '../src/feishu/send-file.ts'
@@ -822,7 +821,7 @@ describe('FeishuService', () => {
       .map(([, value]) => value)[0]!
     // The topic directory is the Session header cwd and the directory the command shows.
     expect(route.workspacePath).toBe(cwd)
-    expect(sessionDirOf(route)).toBe(cwd)
+    expect(route.workspacePath).toBe(cwd)
 
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_workdir', senderId: 'u_owner', threadId: 'omt_1',
@@ -830,7 +829,7 @@ describe('FeishuService', () => {
     }))
     await waitUntil(() => expect(h.channel.sent).toHaveLength(2))
     const card = JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)
-    expect(card).toContain(sessionDirOf(route))
+    expect(card).toContain(route.workspacePath)
   })
 
   it('rejects a mismatched /workspace and logs no path values', async () => {
@@ -1008,12 +1007,12 @@ describe('FeishuService', () => {
       type: 'command/done', data: { kind: 'success' },
     })
     // The renewed Session is born in the same topic directory; no Session is moved.
-    expect(renewed.options.meta?.cwd).toBe(sessionDirOf(route))
+    expect(renewed.options.meta?.cwd).toBe(route.workspacePath)
 
     const resultCard = JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)
     expect(resultCard).toContain(old.options.sessionId)
     expect(resultCard).toContain(renewed.options.sessionId)
-    expect(resultCard).toContain(sessionDirOf(route))
+    expect(resultCard).toContain(route.workspacePath)
 
     await h.onMessage(makeMessage({
       chatType: 'group', chatId: 'oc_renew', senderId: 'u_owner', threadId: 'omt_1',
@@ -1043,7 +1042,7 @@ describe('FeishuService', () => {
 
     const origins = h.ctxState.domain.raw.table('session_origins')
     expect(origins.get(old.options.sessionId)).toMatchObject({
-      routeKey: 'omt_1', kind: 'thread', chatId: 'oc_origin', chatType: 'group', senderUserId: 'u_owner', mode: 'group',
+      routeKey: 'omt_1', kind: 'thread', chatId: 'oc_origin', chatType: 'group', senderUserId: 'u_owner',
     })
     // A group topic belongs to the group, so its origin reads as shared.
     expect(await h.service.sessionOrigin(renewed.options.sessionId)).toMatchObject({
@@ -1195,55 +1194,6 @@ describe('FeishuService', () => {
     // The retired root is browsable once the records named it; it does not exist on disk.
     await expect(h.service.workspaceFiles(retiredRoot, '')).rejects.toMatchObject({ status: 404 })
   })
-
-  it('backfills origins for routes written before origins existed', async () => {
-    const h = await setup()
-    await h.onMessage(makeMessage({
-      chatType: 'group', chatId: 'oc_backfill', senderId: 'u_owner', messageId: 'om_backfill', content: '开始',
-    }))
-    await waitForEstablishedSession(h)
-    const sessionId = h.ctxState.agents.created[0]!.options.sessionId
-    await h.service.shutdown()
-    await h.ctxState.domain.raw.table('session_origins').delete(sessionId)
-
-    const service2 = new FeishuService(h.ctxState.ctx, h.config, () => makeChannel())
-    await service2.start()
-    await waitUntil(() => expect(h.ctxState.domain.raw.table('session_origins').get(sessionId)).toMatchObject({
-      chatId: 'oc_backfill', senderUserId: 'u_owner',
-    }))
-    expect(await service2.sessionOrigin(sessionId)).toMatchObject({ chatType: 'group', bound: true })
-    await service2.shutdown()
-  })
-
-  it.each(['running', 'next-turn', 'next-step'] as const)(
-    'rejects /renew while the old Agent has %s work without creating a Session',
-    async busyKind => {
-      const h = await setup()
-      await h.onMessage(makeMessage({
-        chatType: 'group', chatId: 'oc_renew_busy', senderId: 'u_owner', content: '开始',
-      }))
-      await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
-      const agent = h.ctxState.agents.created[0]!.handle.agent
-      if (busyKind === 'running') Object.defineProperty(agent, 'status', { value: 'running' })
-      if (busyKind === 'next-turn') (agent.inbox.nextTurn as unknown[]).push({ queued: true })
-      if (busyKind === 'next-step') (agent.inbox.nextStep as unknown[]).push({ queued: true })
-
-      await h.onMessage(makeMessage({
-        chatType: 'group', chatId: 'oc_renew_busy', senderId: 'u_owner', threadId: 'omt_1',
-        mentionedBot: false, content: '/renew',
-      }))
-      await waitUntil(() => expect(sessionEvents(agent.session).at(-1)).toMatchObject({
-        type: 'command/done', data: { kind: 'error' },
-      }))
-
-      expect(h.ctxState.agents.created).toHaveLength(1)
-      expect(JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)).toContain('会话正忙')
-      expect(sessionEvents(agent.session).at(-1)).toMatchObject({
-        type: 'command/done', data: { kind: 'error' },
-      })
-      expect(mock(h.ctxState.agents.created[0]!.handle.dispose)).not.toHaveBeenCalled()
-    },
-  )
 
   it('rolls back a failed renewed Agent creation and keeps the old route live', async () => {
     const agentsOptions: FakeAgentsOptions = {}
@@ -1972,11 +1922,11 @@ describe('FeishuService', () => {
     const topicB = path.join(h.config.baseDir, 'groups', 'oc_grp', 'omt_2')
     expect(new Set(cwds)).toEqual(new Set([topicA, topicB]))
     await waitUntil(() => expect(h.ctxState.domain.raw.table('routes').get('omt_2')).toBeDefined())
-    expect(h.ctxState.domain.raw.table('routes').get('omt_1')).toMatchObject({ mode: 'group', senderUserId: 'u_alice', workspacePath: topicA })
-    expect(h.ctxState.domain.raw.table('routes').get('omt_2')).toMatchObject({ mode: 'group', senderUserId: 'u_bob', workspacePath: topicB })
+    expect(h.ctxState.domain.raw.table('routes').get('omt_1')).toMatchObject({ chatType: 'group', senderUserId: 'u_alice', workspacePath: topicA })
+    expect(h.ctxState.domain.raw.table('routes').get('omt_2')).toMatchObject({ chatType: 'group', senderUserId: 'u_bob', workspacePath: topicB })
     // The origin carries the group marker, so the records panel and the origin tab show the topic as group-shared.
     const originA = h.ctxState.domain.raw.table('routes').get('omt_1') as RouteRecord
-    expect(h.ctxState.domain.raw.table('session_origins').get(originA.sessionId)).toMatchObject({ mode: 'group', senderUserId: 'u_alice' })
+    expect(h.ctxState.domain.raw.table('session_origins').get(originA.sessionId)).toMatchObject({ chatType: 'group', senderUserId: 'u_alice' })
     // The group is registered with every switch off the first time a topic opens in it.
     expect(h.ctxState.domain.raw.table('group_permissions').get('oc_grp')).toMatchObject({
       chatId: 'oc_grp', wikiRead: false, wikiWrite: false, codeWrite: false,
@@ -4247,8 +4197,8 @@ describe('inbound attachments', () => {
     // Both topics own distinct workspaces named after their thread ids.
     expect(routeB.workspacePath).not.toBe(routeA.workspacePath)
     expect(path.dirname(routeB.workspacePath)).toBe(path.dirname(routeA.workspacePath))
-    expect(path.basename(sessionDirOf(routeA))).toBe(routeA.key)
-    expect(path.basename(sessionDirOf(routeB))).toBe(routeB.key)
+    expect(path.basename(routeA.workspacePath)).toBe(routeA.key)
+    expect(path.basename(routeB.workspacePath)).toBe(routeB.key)
     await h.service.shutdown()
   })
 
@@ -4271,7 +4221,7 @@ describe('inbound attachments', () => {
 
     expect(h.ctxState.agents.created).toHaveLength(1)
     expect(h.ctxState.domain.raw.table('routes').get(route.key)).toMatchObject({ workspacePath: route.workspacePath })
-    expect(created.options.meta?.cwd).toBe(sessionDirOf(route))
+    expect(created.options.meta?.cwd).toBe(route.workspacePath)
     await h.service.shutdown()
   })
 
@@ -4418,7 +4368,7 @@ describe('native attachment pipeline', () => {
     }))
     await waitForEstablishedSession(h)
     expect(attachments.savedImages).toHaveLength(1)
-    const topicDir = sessionDirOf(routesOf(h)[0]!)
+    const topicDir = routesOf(h)[0]!.workspacePath
     // The native pipeline writes only the native attachment library: no
     // workspace copy and no legacy staging.
     expect(existsSync(path.join(topicDir, 'attachments'))).toBe(false)
@@ -4734,7 +4684,7 @@ describe('native attachment pipeline', () => {
     expect(guidance).toContain('native attachment library')
     expect(guidance).toContain('feishu_attachment_fetch')
     expect(guidance).toContain('<feishu_context>')
-    expect(guidance).not.toContain(`${sessionDirOf(routesOf(h)[0]!)}/attachments`)
+    expect(guidance).not.toContain(`${routesOf(h)[0]!.workspacePath}/attachments`)
     await h.service.shutdown()
   })
 })
@@ -5299,7 +5249,7 @@ describe('quote excerpts and first-turn topic history', () => {
     await waitForEstablishedSession(h)
     const record = [...(h.ctxState.domain.raw.table('routes').entries() as Iterable<[string, RouteRecord]>)]
       .map(([, value]) => value)[0]!
-    writeFileSync(path.join(sessionDirOf(record), 'chart.png'), Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]))
+    writeFileSync(path.join(record.workspacePath, 'chart.png'), Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]))
     const sendTool = tools.definitions.get(SEND_FILE_TOOL_NAME)
     expect(sendTool).toBeDefined()
     const value = await sendTool!.execute({ path: 'chart.png' }, { signal: new AbortController().signal })

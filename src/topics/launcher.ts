@@ -20,7 +20,7 @@
  * The topic is reserved in the inbound router from its creation until the
  * route and the first prompt are published, so replies posted meanwhile queue
  * behind the first turn. Follow-ups then use the ordinary topic routing: the
- * route is a group route (`mode: 'group'`), so anyone with chat access in the
+ * route is a group route, so anyone with chat access in the
  * group may continue it, and the group's permission record gates its tools. A
  * failure before the first turn (including a disconnect meanwhile) marks the
  * root card failed with the reason, closes the streaming card, and leaves no
@@ -31,12 +31,12 @@
 
 import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
-import type { AgentHandle, HostContext, SessionId } from '../dsh-types.ts'
+import type { AgentHandle, HostContext, SessionId } from '../host/index.ts'
 import type { FeishuConfig } from '../config.ts'
-import { buildCard, buildTopicRootCard, initialStreamingCard } from '../cards.ts'
-import type { TopicStatus } from '../cards.ts'
+import { buildCard, buildTopicRootCard, initialStreamingCard } from '../cards/index.ts'
+import type { TopicStatus } from '../cards/index.ts'
 import type { RouteOperationQueue } from '../commands.ts'
-import { FEISHU_USER_ID_PATTERN, isGroupRoute, rootCardOf, sessionDirOf } from '../domain.ts'
+import { FEISHU_USER_ID_PATTERN, isGroupRoute } from '../domain.ts'
 import type { FeishuDomainHandle, RouteRecord, TopicLaunchRecord } from '../domain.ts'
 import type { FeishuChannel } from '../feishu-channel.ts'
 import { feishuGroupPrincipal } from '../access/principal.ts'
@@ -161,7 +161,7 @@ export class TopicLauncher implements FeishuTopicService {
       key,
       status: record.status,
       ...(record.status === 'failed' && record.reason !== undefined ? { reason: record.reason } : {}),
-      ...(route === undefined ? {} : { sessionId: route.sessionId, workDir: sessionDirOf(route) }),
+      ...(route === undefined ? {} : { sessionId: route.sessionId, workDir: route.workspacePath }),
     }
   }
 
@@ -225,13 +225,10 @@ export class TopicLauncher implements FeishuTopicService {
     if (channel === undefined || domain === undefined) return
     for (const [key, record] of [...domain.topicLaunches.entries()]) {
       if (record.status !== 'running') continue
-      const root = rootCardOf(record)
-      if (root !== undefined) {
-        await channel.updateCard(record.messageId, buildTopicRootCard(root.requesterUserId, root.card, { kind: 'interrupted' }))
-          .catch((error: unknown) => {
-            this.deps.ctx.logger?.warn?.('dsh-channels: marking topic card %s interrupted failed: %s', key, String(error))
-          })
-      }
+      await channel.updateCard(record.messageId, buildTopicRootCard(record.requesterUserId, record.card, { kind: 'interrupted' }))
+        .catch((error: unknown) => {
+          this.deps.ctx.logger?.warn?.('dsh-channels: marking topic card %s interrupted failed: %s', key, String(error))
+        })
       await this.recordStatus(key, 'interrupted')
     }
   }
@@ -324,7 +321,6 @@ export class TopicLauncher implements FeishuTopicService {
         chatType: 'group',
         senderUserId: spec.requesterUserId,
         workspacePath: workspace.path,
-        mode: 'group',
         cardMessageId: cardId,
         createdAt,
         lastActivityAt: createdAt,

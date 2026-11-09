@@ -1,7 +1,7 @@
 /**
  * Read fence: in a Feishu Session, a configured in-process file tool may only
- * read inside the route's own workspace, its topic directory, and the
- * deployment's shared `readableRoots`.
+ * read inside the route's topic directory and the deployment's shared
+ * `readableRoots`.
  *
  * - Ownership: a call is fenced when its agent's Session is routed, or
  *   descends (through `parentSession`) from a routed Session; descendants are
@@ -11,9 +11,8 @@
  *   working directory (header cwd when the host has no working-directory
  *   service), `~` against the Host user's home. The deepest existing ancestor
  *   of each path is resolved through symlinks, so a link planted inside the
- *   workspace cannot point the tool elsewhere. The route's workspace and
- *   topic directories are allowed only as real directories: one replaced by a
- *   symlink grants nothing.
+ *   workspace cannot point the tool elsewhere. The topic directory is allowed
+ *   only as a real directory: one replaced by a symlink grants nothing.
  * - A glob `pattern` is checked by its leading directories up to the first
  *   wildcard segment; a pattern with a `..` segment is denied.
  * - An omitted path argument is checked as the effective working directory,
@@ -31,7 +30,7 @@ import { homedir } from 'node:os'
 import path from 'node:path'
 import type { FeishuConfig } from '../config.ts'
 import type { RouteRecord } from '../domain.ts'
-import type { PreToolDecision, PreToolExecution, Session } from '../dsh-types.ts'
+import type { PreToolDecision, PreToolExecution, Session } from '../host/index.ts'
 
 export interface ReadFenceDeps {
   /** Live configuration (`readFence`). */
@@ -106,16 +105,12 @@ export class ReadFence {
 /**
  * The canonical directories one route's Sessions may read.
  *
- * The workspace and topic directories are judged without following a symlink
- * at their own path, because a Session that can write their parent could
- * replace them with a link to anywhere; a topic directory inside the
- * workspace adds nothing and is skipped. The deployment's `readableRoots`
- * are followed through symlinks.
+ * The topic directory is judged without following a symlink at its own path,
+ * because a Session that can write its parent could replace it with a link to
+ * anywhere. The deployment's `readableRoots` are followed through symlinks.
  */
 async function allowedRootsOf(route: RouteRecord, readableRoots: readonly string[]): Promise<string[]> {
-  const owned = [route.workspacePath]
-  if (route.sessionDir !== undefined && !isInside(path.resolve(route.sessionDir), path.resolve(route.workspacePath))) owned.push(route.sessionDir)
-  const roots = await Promise.all([...owned.map(ownedRoot), ...readableRoots.map(async root => await resolveReal(root))])
+  const roots = await Promise.all([ownedRoot(route.workspacePath), ...readableRoots.map(async root => await resolveReal(root))])
   return roots.filter((root): root is string => root !== undefined)
 }
 
