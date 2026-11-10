@@ -1175,7 +1175,7 @@ describe('FeishuService', () => {
     expect(records.groups).toHaveLength(1)
     const group = records.groups[0]!
     expect(group).toMatchObject({ chatId: 'oc_rec', chatName: '研发群', chatAvatarUrl: 'https://cdn.example/chat.png' })
-    const users = Object.fromEntries(group.users.map(user => [user.userId, user]))
+    const users = Object.fromEntries(group.users.map(user => [user.userId ?? '', user]))
     expect(users.u_owner).toMatchObject({ name: '名-u_owner' })
     expect(users.u_member).toMatchObject({ name: '李四' })
     const ownerSessions = Object.fromEntries(users.u_owner!.sessions.map(record => [record.sessionId, record]))

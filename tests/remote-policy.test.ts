@@ -10,7 +10,7 @@ import { CHANNEL_PROMPT_ROLE, channelAccessBindings, registerChannelAccessPolici
 import type { RouteRecord } from '../src/domain.ts'
 import { makeRemoteServices } from './helpers.ts'
 
-function route(partial: Partial<RouteRecord> & Pick<RouteRecord, 'sessionId' | 'chatId' | 'chatType' | 'senderUserId'>): RouteRecord {
+function route(partial: Partial<RouteRecord> & Pick<RouteRecord, 'sessionId' | 'chatId' | 'chatType'>): RouteRecord {
   return {
     key: `key-${partial.sessionId}`, kind: 'thread', workspacePath: '/w', cardMessageId: 'om_1',
     createdAt: 1, lastActivityAt: 1, sessionHistory: [], ...partial,
@@ -23,6 +23,7 @@ const routes: RouteRecord[] = [
   route({ sessionId: 's_group_alice', chatId: 'oc_group', chatType: 'group', senderUserId: 'u_alice' }),
   route({ sessionId: 's_group_bob', chatId: 'oc_group', chatType: 'group', senderUserId: 'u_bob' }),
   route({ sessionId: 's_other_group', chatId: 'oc_other', chatType: 'group', senderUserId: 'u_alice' }),
+  route({ sessionId: 's_group_external', chatId: 'oc_group', chatType: 'group', senderLabel: '[machine] app-1' }),
 ]
 
 /** The channel-plane rule: the person of a private chat, or any admitted member of a group (u_carol is not admitted). */
@@ -42,12 +43,17 @@ describe('channel access bindings', () => {
   it('binds an admitted group member to that group\'s routes, never to another group', () => {
     const ids = (userId: string, chatId = 'oc_group') =>
       channelAccessBindings(deps, feishuGroupPrincipal(chatId, userId)).map(binding => binding.resource.id)
-    expect(ids('u_alice')).toEqual(['s_group_alice', 's_group_bob'])
-    expect(ids('u_bob')).toEqual(['s_group_alice', 's_group_bob'])
+    expect(ids('u_alice')).toEqual(['s_group_alice', 's_group_bob', 's_group_external'])
+    expect(ids('u_bob')).toEqual(['s_group_alice', 's_group_bob', 's_group_external'])
     expect(ids('u_carol')).toEqual([])
     expect(ids('u_alice', 'oc_other')).toEqual(['s_other_group'])
     // The group principal never reaches private-chat Sessions.
     expect(ids('u_alice', 'oc_dm_alice')).toEqual([])
+  })
+
+  it('binds a group principal without a speaker only to that group\'s routes opened without an initiator', () => {
+    expect(channelAccessBindings(deps, feishuGroupPrincipal('oc_group', undefined)).map(binding => binding.resource.id)).toEqual(['s_group_external'])
+    expect(channelAccessBindings(deps, feishuGroupPrincipal('oc_other', undefined))).toEqual([])
   })
 
   it('names only session/prompt', () => {

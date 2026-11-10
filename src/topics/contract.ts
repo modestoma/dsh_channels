@@ -7,7 +7,9 @@
  * directory below the channel's `baseDir`, and streams the first turn (the
  * prompt, verbatim) in that topic. The root card's status tag follows the
  * first turn (进行中 → 已完成 / 已停止 / 失败) and turns 已中断 when DSH
- * restarts before it settles. Anyone with chat access in the group may
+ * restarts before it settles. The requester is a Feishu user or an external
+ * requester without a Feishu account (see {@link TopicRequester}). Anyone
+ * with chat access in the group may
  * continue the topic; the group's permission switches (set in the channel's
  * settings panel) gate its knowledge-base and code-write tools.
  *
@@ -27,9 +29,10 @@ export type FeishuTopicsServiceName = 'feishuTopics'
  * Version of this contract. It changes only when a change would make an older
  * consumer misbehave; a consumer refuses a provider whose version it does not
  * know. Version 2 removed `TopicLaunchSpec.workspace`: the topic's workspace
- * is derived from the group.
+ * is derived from the group. Version 3 replaced `TopicLaunchSpec.requesterUserId`
+ * with {@link TopicLaunchSpec.requester}.
  */
-export type FeishuTopicsVersion = 2
+export type FeishuTopicsVersion = 3
 
 /** One run of the root card's lead sentence. */
 export interface TopicCardText {
@@ -56,7 +59,7 @@ export interface TopicRootCard {
    * `分析中` and the footer `分析已完成，结果见话题…`.
    */
   readonly taskName: string
-  /** Lead sentence, shown after an @-mention of the requester. */
+  /** Lead sentence, shown after the requester (an @-mention, or the external requester's text). */
   readonly lead: readonly TopicCardText[]
   /** Optional table of links (at most 50 rows). */
   readonly links?: {
@@ -67,6 +70,26 @@ export interface TopicRootCard {
     readonly rows: readonly TopicCardLink[]
   }
 }
+
+/** Who a launch is for. */
+export type TopicRequester =
+  /**
+   * A Feishu user (`user_id`): @-mentioned on the root card, the speaker of
+   * the first turn (the prompt is submitted as them), and recorded as the
+   * topic's initiator, which grants nothing on the topic (it belongs to the
+   * group). They must be an administrator or a user whose `chat` switch is
+   * on, unless the channel runs in `open` access mode.
+   */
+  | { readonly kind: 'feishu-user'; readonly userId: string }
+  /**
+   * A requester without a Feishu account, such as another system: `label`
+   * (1–200 characters, one line, shown literally) replaces the @-mention on
+   * the root card and in the records view. The first turn is submitted as the
+   * group with no speaker, so it carries no speaker-bound attribution such as
+   * a commit trailer. No Feishu access check applies: the caller is
+   * responsible for authenticating whoever it launches for.
+   */
+  | { readonly kind: 'external'; readonly label: string }
 
 /** One topic to start. */
 export interface TopicLaunchSpec {
@@ -84,14 +107,8 @@ export interface TopicLaunchSpec {
   readonly fingerprint: string
   /** Target group chat (`oc_…`); the bot must be a member. */
   readonly chatId: string
-  /**
-   * Feishu `user_id` of the person the launch is for: @-mentioned on the root
-   * card, the speaker of the first turn (the prompt is submitted as them),
-   * and recorded as the topic's initiator, which grants nothing on the topic
-   * (it belongs to the group). They must be an administrator or a user whose
-   * `chat` switch is on, unless the channel runs in `open` access mode.
-   */
-  readonly requesterUserId: string
+  /** Who the launch is for. */
+  readonly requester: TopicRequester
   readonly card: TopicRootCard
   /** First user message of the Session, sent verbatim (at most 100 000 characters). */
   readonly prompt: string
@@ -108,8 +125,8 @@ export type TopicLaunchFailureCode =
   /** The Feishu connection is not established, or the channel is shutting down. */
   | 'not-connected'
   /**
-   * The requester may not talk to the bot (not an administrator and no
-   * `chat` switch). The code name predates the user table and is kept for
+   * The Feishu requester may not talk to the bot (not an administrator and
+   * no `chat` switch). The code name predates the user table and is kept for
    * existing callers.
    */
   | 'forbidden-chat'

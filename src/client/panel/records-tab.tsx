@@ -21,7 +21,7 @@ import { fetchSessionRecords } from '../api.ts'
 import { Avatar } from '../avatar.tsx'
 import { useSessionNavigator } from '../navigation.ts'
 import type { SessionNavigator } from '../navigation.ts'
-import { filterRecords, formatRelativeTime, formatTime, latestOf, recordTotals } from './records-format.ts'
+import { filterRecords, formatRelativeTime, formatTime, latestOf, memberKey, memberTitle, recordTotals } from './records-format.ts'
 import { ChevronIcon, FolderIcon, OpenIcon, RefreshIcon, SearchIcon } from './records-icons.tsx'
 import { messageOf } from './shared.tsx'
 import { WorkspaceBrowser } from './workspace-browser.tsx'
@@ -200,7 +200,7 @@ export function RecordsTab(): JSX.Element {
                       </h3>
                       <div className="dsh-channels-rec__card">
                         {directs.length === 0 ? <div className="dsh-channels-rec__muted">{RECORDS_COPY.emptyDirects}</div> : null}
-                        {directs.map(user => <UserBlock key={user.userId} user={user} toggleKey={`p2p:${user.userId}`} tree={tree} />)}
+                        {directs.map(user => <UserBlock key={memberKey(user)} user={user} toggleKey={`p2p:${memberKey(user)}`} tree={tree} />)}
                       </div>
                     </section>
                   )}
@@ -241,7 +241,7 @@ function GroupItem(props: { group: SessionRecordGroupWire; tree: TreeProps }): J
         ? (
             <div className="dsh-channels-rec__members">
               {group.users.map(user => (
-                <UserBlock key={user.userId} user={user} groupName={title} toggleKey={`${key}:${user.userId}`} tree={tree} />
+                <UserBlock key={memberKey(user)} user={user} groupName={title} toggleKey={`${key}:${memberKey(user)}`} tree={tree} />
               ))}
             </div>
           )
@@ -260,7 +260,7 @@ function UserBlock(props: {
   const { user, groupName, toggleKey, tree } = props
   const navigator = useSessionNavigator()
   const open = tree.isOpen(toggleKey)
-  const title = user.name ?? user.userId
+  const title = memberTitle(user)
   const hasWorkspace = user.workspaces.length > 0
   const latest = latestOf(user)
   return (

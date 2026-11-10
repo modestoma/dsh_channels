@@ -28,6 +28,18 @@ export interface SessionRecordsDeps {
   warn(message: string, ...args: unknown[]): void
 }
 
+/** Who started a Session: a Feishu user, or an external requester's display text. */
+interface Who {
+  readonly userId?: string
+  readonly label?: string
+}
+
+/** One records-view member and its Sessions. */
+interface Member {
+  readonly who: Who
+  readonly records: SessionRecordWire[]
+}
+
 /** Panel views over Feishu-routed Sessions. */
 export class SessionRecords {
   /** Workspace roots of Feishu-routed Sessions seen by the last records read; file routes serve only these and active routes' roots. */
@@ -46,10 +58,11 @@ export class SessionRecords {
     const route = routes.findBySession(sessionId)
     const bound = route !== undefined
     const group = origin.chatType === 'group'
-    const found = await profiles.lookup([origin.senderUserId], group ? [origin.chatId] : [])
+    const senderUserId = origin.senderUserId
+    const found = await profiles.lookup(senderUserId === undefined ? [] : [senderUserId], group ? [origin.chatId] : [])
     const chat = found.chats[origin.chatId] ?? {}
-    const sender = found.users[origin.senderUserId] ?? {}
-    const senderName = sender.name ?? (group ? await profiles.memberName(origin.senderUserId, origin.chatId) : undefined)
+    const sender = senderUserId === undefined ? {} : found.users[senderUserId] ?? {}
+    const senderName = sender.name ?? (group && senderUserId !== undefined ? await profiles.memberName(senderUserId, origin.chatId) : undefined)
     return {
       sessionId,
       chatType: origin.chatType,
@@ -57,7 +70,8 @@ export class SessionRecords {
       chatId: origin.chatId,
       ...(chat.name === undefined ? {} : { chatName: chat.name }),
       ...(chat.avatarUrl === undefined ? {} : { chatAvatarUrl: chat.avatarUrl }),
-      senderUserId: origin.senderUserId,
+      ...(senderUserId === undefined ? {} : { senderUserId }),
+      ...(origin.senderLabel === undefined ? {} : { senderLabel: origin.senderLabel }),
       ...(senderName === undefined ? {} : { senderName }),
       ...(sender.avatarUrl === undefined ? {} : { senderAvatarUrl: sender.avatarUrl }),
       shared: isGroupRoute(origin),
@@ -82,32 +96,41 @@ export class SessionRecords {
     const userIds = new Set<string>()
     const chatIds = new Set<string>()
     for (const origin of origins) {
-      userIds.add(origin.senderUserId)
+      if (origin.senderUserId !== undefined) userIds.add(origin.senderUserId)
       if (origin.chatType === 'group') chatIds.add(origin.chatId)
     }
     const found = await profiles.lookup([...userIds], [...chatIds])
     const activity = (record: SessionRecordWire): number => record.lastActivityAt ?? record.createdAt
     const byActivity = (a: SessionRecordWire, b: SessionRecordWire): number => activity(b) - activity(a)
     const latest = (user: SessionRecordUserWire): number => activity(user.sessions[0]!)
-    const groupMembers = new Map<string, Map<string, SessionRecordWire[]>>()
-    const directMembers = new Map<string, SessionRecordWire[]>()
+    const groupMembers = new Map<string, Map<string, Member>>()
+    const directMembers = new Map<string, Member>()
+    const add = (members: Map<string, Member>, who: Who, record: SessionRecordWire): void => {
+      const key = who.userId === undefined ? `label:${who.label ?? ''}` : `user:${who.userId}`
+      const member = members.get(key) ?? { who, records: [] }
+      member.records.push(record)
+      members.set(key, member)
+    }
     origins.forEach((origin, index) => {
       const record = sessions[index]!
+      const who: Who = origin.senderUserId === undefined ? { label: origin.senderLabel } : { userId: origin.senderUserId }
       if (origin.chatType === 'group') {
-        const members = groupMembers.get(origin.chatId) ?? new Map<string, SessionRecordWire[]>()
+        const members = groupMembers.get(origin.chatId) ?? new Map<string, Member>()
         groupMembers.set(origin.chatId, members)
-        members.set(origin.senderUserId, [...(members.get(origin.senderUserId) ?? []), record])
+        add(members, who, record)
       } else {
-        directMembers.set(origin.senderUserId, [...(directMembers.get(origin.senderUserId) ?? []), record])
+        add(directMembers, who, record)
       }
     })
-    const userEntry = async (userId: string, records: SessionRecordWire[], chatId?: string): Promise<SessionRecordUserWire> => {
+    const userEntry = async ({ who, records }: Member, chatId?: string): Promise<SessionRecordUserWire> => {
       records.sort(byActivity)
-      const profile = found.users[userId] ?? {}
-      const name = profile.name ?? (chatId === undefined ? undefined : await profiles.memberName(userId, chatId))
+      const userId = who.userId
+      const profile = userId === undefined ? {} : found.users[userId] ?? {}
+      const name = profile.name ?? (chatId === undefined || userId === undefined ? undefined : await profiles.memberName(userId, chatId))
       const workspaces = [...new Set(records.flatMap(record => (record.workspace === undefined ? [] : [record.workspace])))]
       return {
-        userId,
+        ...(userId === undefined ? {} : { userId }),
+        ...(who.label === undefined ? {} : { label: who.label }),
         ...(name === undefined ? {} : { name }),
         ...(profile.avatarUrl === undefined ? {} : { avatarUrl: profile.avatarUrl }),
         workspaces,
@@ -115,7 +138,7 @@ export class SessionRecords {
       }
     }
     const groups = await Promise.all([...groupMembers].map(async ([chatId, members]): Promise<SessionRecordGroupWire> => {
-      const users = await Promise.all([...members].map(([userId, records]) => userEntry(userId, records, chatId)))
+      const users = await Promise.all([...members.values()].map(member => userEntry(member, chatId)))
       users.sort((a, b) => latest(b) - latest(a))
       const chat = found.chats[chatId] ?? {}
       return {
@@ -126,7 +149,7 @@ export class SessionRecords {
       }
     }))
     groups.sort((a, b) => latest(b.users[0]!) - latest(a.users[0]!))
-    const directs = await Promise.all([...directMembers].map(([userId, records]) => userEntry(userId, records)))
+    const directs = await Promise.all([...directMembers.values()].map(member => userEntry(member)))
     directs.sort((a, b) => latest(b) - latest(a))
     return {
       groups,

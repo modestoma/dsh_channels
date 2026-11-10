@@ -154,7 +154,8 @@ export class RouteStore {
         kind: record.kind,
         chatId: record.chatId,
         chatType: record.chatType,
-        senderUserId: record.senderUserId,
+        ...(record.senderUserId === undefined ? {} : { senderUserId: record.senderUserId }),
+        ...(record.senderLabel === undefined ? {} : { senderLabel: record.senderLabel }),
         createdAt: entry.createdAt,
       }
       try {
@@ -206,7 +207,7 @@ export class RouteStore {
       key,
       chatId: record.chatId,
       chatType: record.chatType,
-      senderUserId: record.senderUserId,
+      ...(record.senderUserId === undefined ? {} : { senderUserId: record.senderUserId }),
       expiredAt: now,
       workspacePath: record.workspacePath,
       lastActivityAt: record.lastActivityAt,

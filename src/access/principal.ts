@@ -12,7 +12,8 @@
  *
  * - A private chat acts for the person: `{ kind: 'feishu-user', userId }`.
  * - A group acts for the group, with the speaker recorded:
- *   `{ kind: 'feishu-group', chatId, userId }`.
+ *   `{ kind: 'feishu-group', chatId, userId }`. The first turn of a topic
+ *   launched for an external requester has no speaker and omits `userId`.
  *
  * Principals carry Feishu ids only: they are persisted in Session logs, so
  * they hold no credential and no display name.
@@ -37,8 +38,8 @@ export interface FeishuGroupPrincipal {
   readonly kind: typeof FEISHU_GROUP_PRINCIPAL_KIND
   /** Feishu chat_id of the group. */
   readonly chatId: string
-  /** Feishu user_id of the member who sent the prompt. */
-  readonly userId: string
+  /** Feishu user_id of the member who sent the prompt; absent when no Feishu user speaks. */
+  readonly userId?: string
 }
 
 /** Every principal this channel creates Peers for. */
@@ -56,11 +57,11 @@ export function feishuUserPrincipal(userId: string): FeishuUserPrincipal {
 /**
  * The principal of one member speaking in a Feishu group.
  * @param chatId - Feishu chat_id of the group.
- * @param userId - Feishu user_id of the member.
+ * @param userId - Feishu user_id of the member, or undefined for a turn no Feishu user speaks.
  * @returns the principal.
  */
-export function feishuGroupPrincipal(chatId: string, userId: string): FeishuGroupPrincipal {
-  return { kind: FEISHU_GROUP_PRINCIPAL_KIND, chatId, userId }
+export function feishuGroupPrincipal(chatId: string, userId: string | undefined): FeishuGroupPrincipal {
+  return userId === undefined ? { kind: FEISHU_GROUP_PRINCIPAL_KIND, chatId } : { kind: FEISHU_GROUP_PRINCIPAL_KIND, chatId, userId }
 }
 
 /**
@@ -84,7 +85,7 @@ export function principalKey(principal: ChannelPrincipal): string {
     case FEISHU_USER_PRINCIPAL_KIND:
       return `${principal.kind}:${principal.userId}`
     case FEISHU_GROUP_PRINCIPAL_KIND:
-      return `${principal.kind}:${principal.chatId}:${principal.userId}`
+      return `${principal.kind}:${principal.chatId}:${principal.userId ?? ''}`
     default:
       return assertNever(principal)
   }
@@ -97,8 +98,8 @@ export type LoggedSource = { readonly kind: string; readonly [key: string]: unkn
 export type PromptCaller =
   /** A Feishu user in a private chat, through this channel (or any surface writing the same principal). */
   | { readonly kind: 'feishu-user'; readonly userId: string }
-  /** A member speaking in a Feishu group. */
-  | { readonly kind: 'feishu-group'; readonly chatId: string; readonly userId: string }
+  /** A member speaking in a Feishu group; `userId` is absent when no Feishu user speaks. */
+  | { readonly kind: 'feishu-group'; readonly chatId: string; readonly userId?: string }
   /** A caller other than a Feishu principal: a different principal kind, or a malformed one. */
   | { readonly kind: 'other-principal' }
   /** No principal: the Host owner, or Host code submitting on nobody's behalf (commands, jobs, subagent results). */
@@ -116,11 +117,13 @@ export function promptCallerOf(source: LoggedSource): PromptCaller {
   if (principal === undefined) return { kind: 'none' }
   if (typeof principal !== 'object' || principal === null || !('kind' in principal)) return { kind: 'other-principal' }
   const userId = 'userId' in principal && typeof principal.userId === 'string' && principal.userId !== '' ? principal.userId : undefined
-  if (userId === undefined) return { kind: 'other-principal' }
-  if (principal.kind === FEISHU_USER_PRINCIPAL_KIND) return { kind: 'feishu-user', userId }
+  if (principal.kind === FEISHU_USER_PRINCIPAL_KIND) return userId === undefined ? { kind: 'other-principal' } : { kind: 'feishu-user', userId }
   if (principal.kind === FEISHU_GROUP_PRINCIPAL_KIND) {
     const chatId = 'chatId' in principal && typeof principal.chatId === 'string' && principal.chatId !== '' ? principal.chatId : undefined
-    return chatId === undefined ? { kind: 'other-principal' } : { kind: 'feishu-group', chatId, userId }
+    if (chatId === undefined) return { kind: 'other-principal' }
+    // A present but malformed speaker is not the same as no speaker.
+    if ('userId' in principal && principal.userId !== undefined && userId === undefined) return { kind: 'other-principal' }
+    return userId === undefined ? { kind: 'feishu-group', chatId } : { kind: 'feishu-group', chatId, userId }
   }
   return { kind: 'other-principal' }
 }
