@@ -490,12 +490,12 @@ DSH 的沙箱只限制写，读不受限：不加处理时，飞书用户的会�
 
 插件向其他 DSH 插件提供 Cordis 服务 `feishuTopics`：调用方给出目标群、发起人、根卡片内容和 prompt，插件在群里发一张根卡片，在卡片下开话题，把 prompt 原样交给一个新 Session（prompt 开头的斜杠命令由 DSH 展开成对应 skill），过程在话题内流式输出，和用户自己发起的会话一样。首轮结束后根卡片的状态标签随之更新。群里通过准入的成员都可以在该话题内追问。
 
-**调用方式**：本包不导出类型，调用方在自己的代码里声明要用到的那部分接口（参考本仓库 `src/topics/contract.ts`），在每次调用时用 `ctx.get('feishuTopics')` 取服务（本插件未加载或正在重载时取不到），并检查 `version`（当前为 `2`：去掉了 `workspace` 参数，话题目录由本插件按群与话题决定）。不要把 `feishuTopics` 写进调用方插件的主 `inject`：那样本插件每次重载（例如改配置后重连）都会连带重载调用方。需要随服务上下线挂载路由时，在子作用域里 `ctx.inject(['feishuTopics'], …)`。
+**调用方式**：本包不导出类型，调用方在自己的代码里声明要用到的那部分接口（参考本仓库 `src/topics/contract.ts`），在每次调用时用 `ctx.get('feishuTopics')` 取服务（本插件未加载或正在重载时取不到），并检查 `version`（当前为 `3`：`requesterUserId` 换成 `requester`，可以是飞书用户或外部发起人；版本 `2` 去掉了 `workspace` 参数，话题目录由本插件按群与话题决定）。不要把 `feishuTopics` 写进调用方插件的主 `inject`：那样本插件每次重载（例如改配置后重连）都会连带重载调用方。需要随服务上下线挂载路由时，在子作用域里 `ctx.inject(['feishuTopics'], …)`。
 
 ```ts
 const topics = ctx.get('feishuTopics') as FeishuTopicService | undefined
 const result = await topics?.launch({
-  key, fingerprint, chatId, requesterUserId,
+  key, fingerprint, chatId, requester: { kind: 'feishu-user', userId },
   card: { title: '日志分析', taskName: '分析', lead: [{ text: '于 … 发起了对 ' }, { text: 'camera', bold: true }, …], links },
   prompt,
 })
@@ -503,8 +503,10 @@ const result = await topics?.launch({
 
 - `key` / `fingerprint`：幂等键（1–200 个可见 ASCII 字符）与调用方定义的请求指纹。同一个键再次发起（包括并发）返回第一次的根卡片（`replayed: true`），指纹不同则拒绝（`key-conflict`）。记录永久保存在 `dsh_channels` 域的 `topic_launches` 表；根卡片发出后的失败不会回滚记录，根卡片显示「失败」和原因，需要重试时换一个新键。
 - `chatId`：目标群，机器人需在群内。
-- `requesterUserId`：发起人，首轮提示以这个人的身份提交，所以必须是管理员或对话准入打开的用户（`/auth add` 或面板「访问授权」）；`accessMode: open` 时不校验。
-- `card`：标题、任务名（状态文字里用，如「分析中」「分析已完成」）、跟在 @发起人 后的引导句（可加粗片段）、可选的链接表格（最多 50 行，每页 10 行）。
+- `requester`：发起人，两种之一：
+  - `{ kind: 'feishu-user', userId }`：飞书用户。根卡片 @ 这个人，首轮提示以群身份提交并记这个人为发言人（`principal: { kind: 'feishu-group', chatId, userId }`），所以必须是管理员或对话准入打开的用户（`/auth add` 或面板「访问授权」）；`accessMode: open` 时不校验。
+  - `{ kind: 'external', label }`：没有飞书账号的发起人（例如另一个系统）。`label`（1–200 字符、单行）原样显示在根卡片开头和「会话记录」里，不 @ 任何人；首轮以群身份提交、不带发言人（`principal: { kind: 'feishu-group', chatId }`），因此不会有 `Feishu-User` 之类按发言人生成的署名；不做飞书准入校验，由调用方负责认证请求。
+- `card`：标题、任务名（状态文字里用，如「分析中」「分析已完成」）、跟在发起人后的引导句（可加粗片段，Markdown 字符原样显示）、可选的链接表格（最多 50 行，每页 10 行）。
 - `prompt`：1–100000 字符，原样作为首条用户消息。
 - 结果：成功时返回根卡片 `messageId`；失败时返回 `code` 和中文 `message`：`invalid`（参数不合法）、`not-connected`（飞书未连接或正在关闭）、`forbidden-chat`（发起人没有对话权限；沿用旧名）、`key-conflict`、`send-failed`（根卡片发送失败，如机器人不在群里）。
 
@@ -513,9 +515,9 @@ const result = await topics?.launch({
 - `state(key)`：按幂等键返回 `{ key, status, reason?, sessionId?, workDir? }`。`status` 与根卡片一致：`running`（首轮进行中）、`done`、`stopped`、`error`（首轮失败）、`failed`（话题或 Session 没能建立，`reason` 写明原因）、`interrupted`（首轮进行中 DSH 重启）。`sessionId` 是话题路由当前指向的 Session（`/renew` 后为新 Session），`workDir` 是该话题的目录（`<baseDir>/groups/<chat_id>/<话题 id>/`，也是 DSH 工作区）；路由发布前、建立失败后、路由过期后两者都没有。键不存在或飞书未连接时返回 `undefined`。
 - `launchKeyOf(sessionId)`：该 Session 是某次发起的话题当前的 Session 时返回那次发起的幂等键，否则返回 `undefined`。调用方据此把 DSH 的 `session/event`（如 `turn/end`）对应到自己的请求，话题里的追问也能对上。
 - 事件 `feishu-topics/status`：每次记录根卡片状态后（首轮结束、建立失败、启动时标记为已中断）用 `ctx.emit` 发出，参数是新的 `state`。监听者抛错只记日志，不影响话题。
-- 这两个方法和事件在契约版本 `1` 内新增，版本 `2` 保留；需要兼容旧版本本插件的调用方，调用前先检查方法是否存在。
+- 这两个方法和事件在契约版本 `1` 内新增，版本 `2`、`3` 保留；需要兼容旧版本本插件的调用方，调用前先检查方法是否存在。
 
-**群里看到的**：先是根卡片「@发起人 <引导句>」，下面是链接表格，标题栏标签为「<任务名>中」；紧接着话题内一张流式卡片（它同时创建话题），首轮在这里流式输出，带停止按钮。首轮结束后根卡片的标签变成「已完成」「已停止」或「失败」，并加上 DONE / No 表情；之后的追问不再改动根卡片。启动失败时话题里的流式卡片和根卡片都会写明原因。过程中出现的审批卡、提问卡发在话题内。DSH 在首轮进行中重启或重连飞书时，话题里的流式卡片照常由中断修复处理；重新连上后，插件把仍是「<任务名>中」的根卡片改成「已中断」（橙色），提示在话题内回复即可继续，原来的 Session 会接着追问。根卡片状态同时记在发起记录里（连同重画卡片所需的内容）。
+**群里看到的**：先是根卡片「@发起人 <引导句>」（外部发起人显示为它的 `label`），下面是链接表格，标题栏标签为「<任务名>中」；紧接着话题内一张流式卡片（它同时创建话题），首轮在这里流式输出，带停止按钮。首轮结束后根卡片的标签变成「已完成」「已停止」或「失败」，并加上 DONE / No 表情；之后的追问不再改动根卡片。启动失败时话题里的流式卡片和根卡片都会写明原因。过程中出现的审批卡、提问卡发在话题内。DSH 在首轮进行中重启或重连飞书时，话题里的流式卡片照常由中断修复处理；重新连上后，插件把仍是「<任务名>中」的根卡片改成「已中断」（橙色），提示在话题内回复即可继续，原来的 Session 会接着追问。根卡片状态同时记在发起记录里（连同重画卡片所需的内容）。
 
 **追问与权限**：这类话题和用户自己在群里开的话题一样是**群话题**：群里任何通过准入的成员（管理员，或对话准入打开的用户）都可以在话题内直接回复追问（无需 @），也可以点停止按钮、回答审批卡与提问卡、在话题里执行会话命令；未授权的人仍被静默忽略。追问的回复照常流式输出；每条追问都以群身份提交（`principal: { kind: 'feishu-group', chatId, userId }`，`userId` 是追问的人），知识库与代码改动工具按设置面板「群权限」里该群的开关判权。话题之间互不读取，和普通话题一样。结果怎么回传给外部系统由调用方插件负责，本插件只提供上面的状态查询和事件。
 

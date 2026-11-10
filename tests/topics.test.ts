@@ -30,7 +30,7 @@ function spec(partial: Partial<TopicLaunchSpec> = {}): TopicLaunchSpec {
     key: 'key-1',
     fingerprint: 'fp-1',
     chatId: 'oc_group',
-    requesterUserId: 'u_alice',
+    requester: { kind: 'feishu-user', userId: 'u_alice' },
     card: {
       title: '日志分析',
       taskName: '分析',
@@ -51,7 +51,7 @@ function spec(partial: Partial<TopicLaunchSpec> = {}): TopicLaunchSpec {
 describe('topic root card', () => {
   it('mentions the requester, emphasizes bold runs, and keeps link targets intact', () => {
     const card = { ...spec().card, links: { nameHeader: '日志', linkHeader: '详情页', rows: [{ name: 'a', url: 'https://logs.example/d (1)' }] } }
-    const stopped = JSON.stringify(buildTopicRootCard('u_alice', card, { kind: 'stopped' }))
+    const stopped = JSON.stringify(buildTopicRootCard({ kind: 'feishu-user', userId: 'u_alice' }, card, { kind: 'stopped' }))
     expect(stopped).toContain('<at id=u_alice></at> 于 2026-10-22 19:30 发起了对 **camera** 应用 **E1001** 错误码不良日志的分析。')
     expect(stopped).toContain('[查看](https://logs.example/d%20%281%29)')
     expect(stopped).toContain('已停止')
@@ -60,11 +60,17 @@ describe('topic root card', () => {
 
   it('names the task in the status texts and escapes caller markdown', () => {
     const card = { title: '巡检', taskName: '巡检', lead: [{ text: '*not bold*' }] }
-    const running = JSON.stringify(buildTopicRootCard('u_alice', card, { kind: 'running' }))
+    const running = JSON.stringify(buildTopicRootCard({ kind: 'feishu-user', userId: 'u_alice' }, card, { kind: 'running' }))
     expect(running).toContain('巡检中')
     expect(running).toContain('巡检过程在本卡片下的话题内实时输出')
     expect(running).toContain('\\\\*not bold\\\\*')
     expect(running).not.toContain('"tag":"table"')
+  })
+
+  it('shows an external requester as literal text instead of a mention', () => {
+    const card = { title: '巡检', taskName: '巡检', lead: [{ text: '发起了巡检 <at id=all></at>' }] }
+    const running = JSON.stringify(buildTopicRootCard({ kind: 'external', label: '[machine] app-1' }, card, { kind: 'running' }))
+    expect(running).toContain('\\\\[machine\\\\] app-1 发起了巡检 \\\\<at id=all\\\\>\\\\</at\\\\>')
   })
 })
 
@@ -83,7 +89,7 @@ describe('feishuTopics service provision', () => {
     await vi.waitFor(() => expect(ctx.get(FEISHU_TOPICS_SERVICE)).toBeDefined())
     const service = ctx.get(FEISHU_TOPICS_SERVICE) as FeishuTopicService
     expect(service).toBeInstanceOf(TopicLauncher)
-    expect(service.version).toBe(2)
+    expect(service.version).toBe(3)
     expect(await service.launch(spec())).toMatchObject({ ok: false, code: 'not-connected' })
     await fiber.dispose()
     expect(ctx.get(FEISHU_TOPICS_SERVICE)).toBeUndefined()
@@ -183,6 +189,49 @@ describe('topic launch flow', () => {
     expect(h.ctxState.domain.raw.table('inflight').get('om_2')).toMatchObject({
       prompt: { requestId: followupMessagesOf(agent)[0]!.source.rpcId, principal: { kind: 'feishu-group', chatId: 'oc_group', userId: 'u_alice' } },
     })
+  })
+
+  it('starts a topic for an external requester as the group, without a speaker or an access check', async () => {
+    const h = await setup()
+    const response = await h.launcher.launch(spec({ requester: { kind: 'external', label: '[machine] app-1' } }))
+    expect(response).toMatchObject({ ok: true, messageId: 'om_1' })
+    const rootCard = JSON.stringify(h.channel.sent[0]!.input)
+    expect(rootCard).toContain('\\\\[machine\\\\] app-1 于 2026-10-22 19:30 发起了对')
+    expect(rootCard).not.toContain('<at id=')
+    expect(h.record('key-1')).toMatchObject({ requesterLabel: '[machine] app-1' })
+    expect(h.record('key-1')).not.toHaveProperty('requesterUserId')
+
+    await waitUntil(() => expect(h.routes()).toHaveLength(1))
+    const route = h.routes()[0]!
+    expect(route).toMatchObject({ chatType: 'group', senderLabel: '[machine] app-1' })
+    expect(route).not.toHaveProperty('senderUserId')
+    expect(route.workspacePath).toBe(path.join(h.config.baseDir, 'groups', 'oc_group', 'omt_2'))
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    const principal = followupMessagesOf(agent)[0]!.source.principal
+    expect(principal).toEqual({ kind: 'feishu-group', chatId: 'oc_group' })
+    expect(h.ctxState.domain.raw.table('session_origins').get(route.sessionId)).toMatchObject({ senderLabel: '[machine] app-1' })
+    const origin = await h.service.records.origin(route.sessionId)
+    expect(origin).toMatchObject({ senderLabel: '[machine] app-1', shared: true })
+    expect(origin).not.toHaveProperty('senderUserId')
+    const records = await h.service.records.list()
+    expect(records.groups[0]!.users).toEqual([expect.objectContaining({ label: '[machine] app-1' })])
+    expect(records.groups[0]!.users[0]).not.toHaveProperty('userId')
+    // Commits made in the topic name the group only: no Feishu user speaks.
+    const trailers: Array<[string, string]> = []
+    await h.ctxState.commitTrailerListeners[0]!({ session: route.sessionId, dir: '/ws', add: (token, value) => { trailers.push([token, value]) } })
+    expect(trailers).toEqual([['Feishu-Chat', 'oc_group']])
+  })
+
+  it('redraws an interrupted external launch with its label', async () => {
+    const h = await setup()
+    await h.ctxState.domain.raw.table('topic_launches').put('req-ext', {
+      key: 'req-ext', bodyHash: 'h', chatId: 'oc_group', messageId: 'om_ext', acceptedAt: 1, status: 'running',
+      requesterLabel: '[machine] app-1', card: spec().card,
+    })
+    await h.service.shutdown()
+    await h.service.start()
+    await waitUntil(() => expect(h.record('req-ext')?.status).toBe('interrupted'))
+    expect(lastCard(h, 'om_ext')).toContain('\\\\[machine\\\\] app-1')
   })
 
   it('streams the first turn in the topic and marks the root card when it settles', async () => {
@@ -325,7 +374,9 @@ describe('topic launch flow', () => {
     await h.service.accessAdmin.addUser('u_alice')
     const invalid: Array<[string, TopicLaunchSpec]> = [
       ['chatId', spec({ chatId: 'ou_user' })],
-      ['requesterUserId', spec({ requesterUserId: 'ou_open_id' })],
+      ['requester.userId', spec({ requester: { kind: 'feishu-user', userId: 'ou_open_id' } })],
+      ['requester.label', spec({ requester: { kind: 'external', label: 'two\nlines' } })],
+      ['requester.label', spec({ requester: { kind: 'external', label: '   ' } })],
       ['key', spec({ key: 'has space' })],
       ['prompt', spec({ prompt: '  ' })],
       ['card.links.rows.0.url', spec({ card: { ...spec().card, links: { nameHeader: 'a', linkHeader: 'b', rows: [{ name: 'x', url: 'javascript:alert(1)' }] } } })],

@@ -10,6 +10,25 @@ import type { SessionRecordsWire, SessionRecordUserWire, SessionRecordWire } fro
 const pad = (value: number): string => String(value).padStart(2, '0')
 
 /**
+ * Stable key of one records member: a Feishu user, or an external requester.
+ * @param user - the member.
+ * @returns a key distinct for distinct members.
+ */
+export function memberKey(user: SessionRecordUserWire): string {
+  return user.userId === undefined ? `label:${user.label ?? ''}` : `user:${user.userId}`
+}
+
+/**
+ * Display title of one records member: the user's name or id, or the
+ * external requester's text.
+ * @param user - the member.
+ * @returns the title.
+ */
+export function memberTitle(user: SessionRecordUserWire): string {
+  return user.name ?? user.userId ?? user.label ?? '外部发起'
+}
+
+/**
  * Full local timestamp, for tooltips.
  * @param ms - epoch ms.
  * @returns `YYYY-MM-DD HH:mm`.
@@ -79,12 +98,12 @@ export function recordTotals(records: SessionRecordsWire): RecordTotals {
   let sessions = 0
   for (const group of records.groups) {
     for (const user of group.users) {
-      users.add(user.userId)
+      users.add(memberKey(user))
       sessions += user.sessions.length
     }
   }
   for (const user of records.directs) {
-    users.add(user.userId)
+    users.add(memberKey(user))
     sessions += user.sessions.length
   }
   return { groups: records.groups.length, users: users.size, sessions }
@@ -105,7 +124,7 @@ export function filterRecords(records: SessionRecordsWire, rawQuery: string): Se
   const query = rawQuery.trim().toLowerCase()
   if (query === '') return records
   const filterUser = (user: SessionRecordUserWire): SessionRecordUserWire | undefined => {
-    if (matches(query, user.name, user.userId)) return user
+    if (matches(query, user.name, user.userId, user.label)) return user
     const sessions = user.sessions.filter(record => matches(query, record.title, record.sessionId))
     return sessions.length === 0 ? undefined : { ...user, sessions }
   }

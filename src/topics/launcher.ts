@@ -3,8 +3,8 @@
  * `./contract.ts`).
  *
  * Synchronously (before {@link TopicLauncher.launch} settles): spec
- * validation, service state, requester chat access, idempotency replay, and
- * the root card (进行中).
+ * validation, service state, a Feishu requester's chat access, idempotency
+ * replay, and the root card (进行中).
  * In the background: the topic (opened by the first streaming card, replied
  * in thread below the root card), the topic's own workspace under the
  * group's directory, the group's permission record, the Session, the group
@@ -50,14 +50,14 @@ import { openTopicWorkspace, topicTokenFor } from '../workspaces.ts'
 import type { TopicLocationPort } from '../workspaces.ts'
 import type {
   FeishuTopicService, FeishuTopicsServiceName, FeishuTopicsStatusEvent, FeishuTopicsVersion,
-  TopicLaunchFailureCode, TopicLaunchResult, TopicLaunchSpec, TopicLaunchState, TopicRootCard,
+  TopicLaunchFailureCode, TopicLaunchResult, TopicLaunchSpec, TopicLaunchState, TopicRequester, TopicRootCard,
 } from './contract.ts'
 
 /** Name the launcher is provided under. */
 export const FEISHU_TOPICS_SERVICE: FeishuTopicsServiceName = 'feishuTopics'
 
 /** Contract version the launcher implements. */
-export const FEISHU_TOPICS_VERSION: FeishuTopicsVersion = 2
+export const FEISHU_TOPICS_VERSION: FeishuTopicsVersion = 3
 
 /** Event emitted after a launch status is recorded. */
 export const FEISHU_TOPICS_STATUS_EVENT: FeishuTopicsStatusEvent = 'feishu-topics/status'
@@ -72,7 +72,16 @@ const topicLaunchSpecSchema = z.object({
   key: z.string().regex(/^[\x21-\x7E]{1,200}$/u, 'must be 1-200 visible ASCII characters'),
   fingerprint: z.string().min(1).max(512),
   chatId: z.string().regex(CHAT_ID, 'must be a Feishu group chat_id (oc_...)'),
-  requesterUserId: z.string().regex(FEISHU_USER_ID_PATTERN, 'must be a Feishu user_id').max(128),
+  requester: z.discriminatedUnion('kind', [
+    z.object({
+      kind: z.literal('feishu-user'),
+      userId: z.string().regex(FEISHU_USER_ID_PATTERN, 'must be a Feishu user_id').max(128),
+    }).strict(),
+    z.object({
+      kind: z.literal('external'),
+      label: text(200).refine(value => !/[\u0000-\u001f\u007f]/u.test(value), 'must be one line without control characters'),
+    }).strict(),
+  ]),
   card: z.object({
     title: text(100),
     taskName: text(20),
@@ -112,7 +121,7 @@ export interface TopicLauncherDeps {
   reserveTopic(threadId: string): () => void
   /** Group names and group registration. */
   location: TopicLocationPort
-  /** Whether the requester (`user_id`) may speak: the first turn is submitted as them. */
+  /** Whether a Feishu requester (`user_id`) may speak: the first turn is submitted as them. */
   mayLaunchFor(requesterUserId: string): boolean
 }
 
@@ -226,7 +235,7 @@ export class TopicLauncher implements FeishuTopicService {
     if (channel === undefined || domain === undefined) return
     for (const [key, record] of [...domain.topicLaunches.entries()]) {
       if (record.status !== 'running') continue
-      await channel.updateCard(record.messageId, buildTopicRootCard(record.requesterUserId, record.card, { kind: 'interrupted' }))
+      await channel.updateCard(record.messageId, buildTopicRootCard(requesterOfRecord(record), record.card, { kind: 'interrupted' }))
         .catch((error: unknown) => {
           this.deps.ctx.logger?.warn?.('dsh-channels: marking topic card %s interrupted failed: %s', key, String(error))
         })
@@ -245,14 +254,14 @@ export class TopicLauncher implements FeishuTopicService {
       if (stored.bodyHash !== spec.fingerprint) return reusedKey()
       return { ok: true, replayed: true, chatId: stored.chatId, messageId: stored.messageId }
     }
-    if (!this.deps.mayLaunchFor(spec.requesterUserId)) {
+    if (spec.requester.kind === 'feishu-user' && !this.deps.mayLaunchFor(spec.requester.userId)) {
       return refused('forbidden-chat', '发起人没有对话权限：请管理员发送 /auth add @发起人，或在设置面板「访问授权」中添加')
     }
     const card = copyCard(spec.card)
     let rootId: string
     try {
       rootId = (await channel.send(spec.chatId, {
-        card: buildTopicRootCard(spec.requesterUserId, card, { kind: 'running' }),
+        card: buildTopicRootCard(spec.requester, card, { kind: 'running' }),
       })).messageId
     } catch (error) {
       return refused('send-failed', `${spec.card.taskName}卡片发送失败（机器人需在目标群内）：${messageOf(error)}`)
@@ -260,7 +269,7 @@ export class TopicLauncher implements FeishuTopicService {
     try {
       await domain.topicLaunches.put(spec.key, {
         key: spec.key, bodyHash: spec.fingerprint, chatId: spec.chatId, messageId: rootId, acceptedAt: Date.now(),
-        requesterUserId: spec.requesterUserId, card, status: 'running',
+        ...requesterFields(spec.requester), card, status: 'running',
       })
     } catch (error) {
       // The card is visible already; a lost record only means a retry of this
@@ -284,12 +293,13 @@ export class TopicLauncher implements FeishuTopicService {
       this.deps.ctx.logger?.warn?.(message, ...args)
     }
     const showStatus = async (status: TopicStatus): Promise<void> => {
-      await channel.updateCard(rootId, buildTopicRootCard(spec.requesterUserId, card, status)).catch((error: unknown) => {
+      await channel.updateCard(rootId, buildTopicRootCard(spec.requester, card, status)).catch((error: unknown) => {
         warn('dsh-channels: updating topic card %s failed: %s', rootId, String(error))
       })
       await this.recordStatus(spec.key, status.kind, status.kind === 'failed' ? status.reason : undefined)
     }
     const sessionId = randomUUID() as SessionId
+    const requesterUserId = spec.requester.kind === 'feishu-user' ? spec.requester.userId : undefined
     let handle: AgentHandle | undefined
     let cardId: string | undefined
     let threadId: string | undefined
@@ -305,7 +315,7 @@ export class TopicLauncher implements FeishuTopicService {
         baseDir: this.deps.config().baseDir,
         chatType: 'group',
         chatId: spec.chatId,
-        userId: spec.requesterUserId,
+        ...(requesterUserId === undefined ? {} : { userId: requesterUserId }),
         topicToken: topicTokenFor(threadId, 'thread', sessionId),
         titleText: card.title,
       })
@@ -319,13 +329,14 @@ export class TopicLauncher implements FeishuTopicService {
         sessionId,
         chatId: spec.chatId,
         chatType: 'group',
-        senderUserId: spec.requesterUserId,
+        ...(requesterUserId === undefined ? {} : { senderUserId: requesterUserId }),
+        ...(spec.requester.kind === 'external' ? { senderLabel: spec.requester.label } : {}),
         workspacePath: workspace.path,
         cardMessageId: cardId,
       }, handle.agent.session.header.createdAt)
       // The topic belongs to the group: its first prompt is submitted as the
-      // group, with the requester as the speaker.
-      const prompt = channelPrompt(spec.prompt, feishuGroupPrincipal(spec.chatId, spec.requesterUserId))
+      // group, with a Feishu requester as the speaker.
+      const prompt = channelPrompt(spec.prompt, feishuGroupPrincipal(spec.chatId, requesterUserId))
       const stored = storablePrompt(prompt)
       await this.deps.repair.write({
         key: cardId,
@@ -463,4 +474,32 @@ function refused(code: TopicLaunchFailureCode, message: string): TopicLaunchResu
 
 function reusedKey(): TopicLaunchResult {
   return refused('key-conflict', '幂等键已被内容不同的请求使用')
+}
+
+/**
+ * The launch record fields naming a requester.
+ * @param requester - the spec's requester.
+ * @returns `requesterUserId` or `requesterLabel`.
+ */
+function requesterFields(requester: TopicRequester): Pick<TopicLaunchRecord, 'requesterUserId' | 'requesterLabel'> {
+  switch (requester.kind) {
+    case 'feishu-user': return { requesterUserId: requester.userId }
+    case 'external': return { requesterLabel: requester.label }
+    default: return assertNever(requester)
+  }
+}
+
+/**
+ * The requester a launch record names. The record schema requires exactly
+ * one of the two fields.
+ * @param record - a stored launch.
+ * @returns the requester.
+ */
+function requesterOfRecord(record: TopicLaunchRecord): TopicRequester {
+  if (record.requesterUserId !== undefined) return { kind: 'feishu-user', userId: record.requesterUserId }
+  return { kind: 'external', label: record.requesterLabel ?? '' }
+}
+
+function assertNever(value: never): never {
+  throw new Error(`unexpected topic requester: ${JSON.stringify(value)}`)
 }

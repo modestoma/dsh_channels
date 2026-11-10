@@ -1115,17 +1115,21 @@ export class FeishuService {
     }))
     this.unlistenHost.push(this.ctx.on('repo/commit-trailers', async (event) => {
       const route = this.routedRouteOf(event.session)
+      if (route === undefined) return
       const userId = this.codeWriteGate.speakerOf(event.session)
-      if (route === undefined || userId === undefined) return
-      const name = await this.profiles.commitUserName(userId)
       if (isGroupRoute(route)) {
         // A group's commits belong to the group: the token account authors
-        // them, the group and the speaker are recorded as trailers.
+        // them, the group and the speaker (when a Feishu user speaks) are
+        // recorded as trailers.
         const chatName = await this.profiles.commitChatName(route.chatId)
         event.add('Feishu-Chat', chatName === undefined ? route.chatId : `${chatName} <${route.chatId}>`)
+        if (userId === undefined) return
+        const name = await this.profiles.commitUserName(userId)
         event.add('Feishu-User', name === undefined ? userId : `${name} <${userId}>`)
         return
       }
+      if (userId === undefined) return
+      const name = await this.profiles.commitUserName(userId)
       event.add('Feishu-User', name === undefined ? userId : `${name} <${userId}>`)
       const gitEmail = this.accessStore.getUser(userId)?.gitEmail
       if (gitEmail !== undefined) event.setAuthor?.(name ?? userId, gitEmail)
@@ -1556,7 +1560,7 @@ export class FeishuService {
       chatId: record.chatId,
       cardMessageId: record.cardMessageId,
       inThread: record.kind === 'thread',
-      senderUserId: record.senderUserId,
+      ...(record.senderUserId === undefined ? {} : { senderUserId: record.senderUserId }),
       chatType: record.chatType,
       ...(isGroupRoute(record)
         ? { mayDecide: (userId: string) => this.accessController.mayActOnRoute(userId, record.chatId, record) }

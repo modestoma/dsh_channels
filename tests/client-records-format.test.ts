@@ -10,6 +10,8 @@ import {
   formatBytes,
   formatRelativeTime,
   latestOf,
+  memberKey,
+  memberTitle,
   recordTotals,
 } from '../src/client/panel/records-format.ts'
 import type { SessionRecordsWire, SessionRecordUserWire, SessionRecordWire } from '../src/settings/contract.ts'
@@ -61,6 +63,15 @@ describe('formatBytes', () => {
 describe('recordTotals and latestOf', () => {
   it('counts groups, distinct users and every Session', () => {
     expect(recordTotals(records)).toEqual({ groups: 2, users: 3, sessions: 5 })
+  })
+
+  it('keys and titles an external requester apart from Feishu users', () => {
+    const external: SessionRecordUserWire = { label: '[machine] app-1', workspaces: [], sessions: [] }
+    expect(memberKey(external)).not.toBe(memberKey(user('[machine] app-1', undefined, [])))
+    expect(memberTitle(external)).toBe('[machine] app-1')
+    expect(memberTitle(user('u_li', undefined, []))).toBe('u_li')
+    expect(memberTitle(user('u_li', '李四', []))).toBe('李四')
+    expect(recordTotals({ groups: [{ chatId: 'oc_1', users: [external, user('u_li', '李四', [])] }], directs: [] }).users).toBe(2)
   })
 
   it('takes a user’s latest activity from the first Session', () => {

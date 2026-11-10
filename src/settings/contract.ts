@@ -71,8 +71,10 @@ export interface SessionOriginWire {
   chatName?: string
   /** 群头像 URL（群聊且能读取群信息时）。 */
   chatAvatarUrl?: string
-  /** 发起人 user_id（群共享话题为调用方指定的发起人）。 */
-  senderUserId: string
+  /** 发起人 user_id（群共享话题为调用方指定的发起人）；外部发起的话题没有，改为 {@link senderLabel}。 */
+  senderUserId?: string
+  /** 外部发起人的显示文本（调用方给出），只在没有 {@link senderUserId} 时出现。 */
+  senderLabel?: string
   /** 发起人姓名（通讯录或群成员列表能查到时）。 */
   senderName?: string
   /** 发起人头像 URL（通讯录能查到时）。 */
@@ -154,7 +156,10 @@ export interface SessionRecordWire {
 
 /** One user's Sessions inside a group, or in their private chat. */
 export interface SessionRecordUserWire {
-  userId: string
+  /** 飞书用户 user_id；外部发起人没有，改为 {@link label}。 */
+  userId?: string
+  /** 外部发起人的显示文本，只在没有 {@link userId} 时出现。 */
+  label?: string
   /** 用户姓名（通讯录或群成员列表能查到时）。 */
   name?: string
   avatarUrl?: string

@@ -164,19 +164,23 @@ export function topicTokenFor(
  * @param baseDir - the channel's workspace root.
  * @param chatType - `p2p` or `group`.
  * @param chatId - Feishu chat id (used for groups).
- * @param userId - Feishu user_id (used for private chats).
+ * @param userId - Feishu user_id (required for private chats, ignored for groups).
  * @param topicToken - {@link topicTokenFor} of the topic.
  * @returns the absolute topic directory.
+ * @throws Error when a private chat has no user id or a segment is unsafe.
  */
 export function topicWorkspacePathFor(
   baseDir: string,
   chatType: 'p2p' | 'group',
   chatId: string,
-  userId: string,
+  userId: string | undefined,
   topicToken: string,
 ): string {
   const topic = safeSegment(topicToken, 'topic token')
-  if (chatType === 'p2p') return path.join(baseDir, 'p2p', safeSegment(userId, 'user id'), topic)
+  if (chatType === 'p2p') {
+    if (userId === undefined) throw new Error('a private-chat topic workspace needs a user id')
+    return path.join(baseDir, 'p2p', safeSegment(userId, 'user id'), topic)
+  }
   return path.join(baseDir, 'groups', safeSegment(chatId, 'chatId'), topic)
 }
 
@@ -220,17 +224,19 @@ export async function ensureTopicWorkspace(ctx: HostContext, dir: string, title:
 }
 
 /** Where a new topic opens and what it is about. */
-export interface TopicPlace {
+export type TopicPlace = {
   baseDir: string
-  chatType: 'p2p' | 'group'
   chatId: string
-  /** The private chat's person, or the group topic's initiator. */
-  userId: string
   /** {@link topicTokenFor} of the topic. */
   topicToken: string
   /** Text the topic title is taken from (the opening message or task title). */
   titleText: string | undefined
-}
+} & (
+  /** A private chat: `userId` is its person. */
+  | { chatType: 'p2p'; userId: string }
+  /** A group: `userId` is the topic's initiator, absent for an external requester; the workspace does not depend on it. */
+  | { chatType: 'group'; userId?: string }
+)
 
 /**
  * Open a new topic's workspace: its directory registered with the host,
@@ -242,13 +248,20 @@ export interface TopicPlace {
  * @returns the workspace.
  */
 export async function openTopicWorkspace(ctx: HostContext, location: TopicLocationPort, place: TopicPlace): Promise<Workspace> {
-  const group = place.chatType === 'group'
-  const ownerName = group ? await location.groupName(place.chatId) : await location.userName(place.userId)
+  if (place.chatType === 'p2p') {
+    const ownerName = await location.userName(place.userId)
+    return await ensureTopicWorkspace(
+      ctx,
+      topicWorkspacePathFor(place.baseDir, 'p2p', place.chatId, place.userId, place.topicToken),
+      workspaceTitleFor(ownerName ?? place.userId, topicTitleOf(place.titleText)),
+    )
+  }
+  const ownerName = await location.groupName(place.chatId)
   const workspace = await ensureTopicWorkspace(
     ctx,
-    topicWorkspacePathFor(place.baseDir, place.chatType, place.chatId, place.userId, place.topicToken),
-    workspaceTitleFor(ownerName ?? (group ? place.chatId : place.userId), topicTitleOf(place.titleText)),
+    topicWorkspacePathFor(place.baseDir, 'group', place.chatId, undefined, place.topicToken),
+    workspaceTitleFor(ownerName ?? place.chatId, topicTitleOf(place.titleText)),
   )
-  if (group) await location.registerGroup(place.chatId, ownerName)
+  await location.registerGroup(place.chatId, ownerName)
   return workspace
 }

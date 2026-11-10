@@ -1,6 +1,7 @@
 /**
  * Root card of a topic started through the `feishuTopics` service: the
- * caller's title, an @-mention of the requester followed by the caller's lead
+ * caller's title, the requester (an @-mention of a Feishu user, or an
+ * external requester's text) followed by the caller's lead
  * sentence, an optional link table, and a status tag (进行中 → 已完成 /
  * 已停止 / 失败 / 已中断) whose wording uses the caller's task name. The work
  * itself streams in the topic below the card through the ordinary streaming
@@ -9,7 +10,7 @@
  * @module dsh-channels/cards/topic
  */
 
-import type { TopicRootCard } from '../topics/contract.ts'
+import type { TopicRequester, TopicRootCard } from '../topics/contract.ts'
 import { CARD_CONFIG, CARD_SCHEMA, markdown, note } from './primitives.ts'
 
 /**
@@ -30,12 +31,25 @@ const TABLE_PAGE_SIZE = 10
 
 /** Escape markdown emphasis characters in caller-supplied text. */
 function plain(text: string): string {
-  return text.replace(/([*_~`[\]\\])/gu, '\\$1')
+  return text.replace(/([*_~`[\]\\<>])/gu, '\\$1')
 }
 
 /** Percent-encode the characters that would end a markdown link target early. */
 function linkTarget(url: string): string {
   return url.replace(/[()\s]/gu, char => `%${char.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0')}`)
+}
+
+/** The requester as card markdown. */
+function requesterText(requester: TopicRequester): string {
+  switch (requester.kind) {
+    case 'feishu-user': return `<at id=${requester.userId}></at>`
+    case 'external': return plain(requester.label)
+    default: return assertNever(requester)
+  }
+}
+
+function assertNever(value: never): never {
+  throw new Error(`unexpected topic requester: ${JSON.stringify(value)}`)
 }
 
 /** Header tag text, tag color, and header template of each status. */
@@ -64,16 +78,17 @@ function statusNote(status: TopicStatus, task: string): string {
 
 /**
  * The topic root card.
- * @param requesterUserId - `user_id` @-mentioned before the lead sentence.
+ * @param requester - who is shown before the lead sentence: a Feishu user as
+ *   an @-mention, an external requester as its text.
  * @param card - what the caller asked the card to show.
  * @param status - the status the card shows.
  * @returns card JSON.
  */
-export function buildTopicRootCard(requesterUserId: string, card: TopicRootCard, status: TopicStatus): object {
+export function buildTopicRootCard(requester: TopicRequester, card: TopicRootCard, status: TopicStatus): object {
   const task = plain(card.taskName)
   const look = statusLook(status, card.taskName)
   const lead = card.lead.map(run => (run.bold === true ? `**${plain(run.text)}**` : plain(run.text))).join('')
-  const elements: object[] = [markdown(`<at id=${requesterUserId}></at> ${lead}`)]
+  const elements: object[] = [markdown(`${requesterText(requester)} ${lead}`)]
   if (card.links !== undefined && card.links.rows.length > 0) {
     elements.push({
       tag: 'table',
