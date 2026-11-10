@@ -42,12 +42,29 @@ export interface TopicCardText {
   readonly bold?: boolean
 }
 
-/** One linked row of the root card's table. */
+/** One row of the root card's link table. */
 export interface TopicCardLink {
   /** Row label. */
   readonly name: string
-  /** `http(s)` address opened by the row's link. */
-  readonly url: string
+  /** `http(s)` address opened by the row's link; without it the cell shows `—`. */
+  readonly url?: string
+  /**
+   * `http(s)` address opened by the row's link in the second link column
+   * (shown only when {@link TopicCardLinks.extraLinkHeader} is set); without
+   * it the cell shows `—`.
+   */
+  readonly extraUrl?: string
+}
+
+/** The root card's link table (at most 50 rows). */
+export interface TopicCardLinks {
+  /** Header of the label column. */
+  readonly nameHeader: string
+  /** Header of the link column. */
+  readonly linkHeader: string
+  /** Header of an optional second link column, filled from {@link TopicCardLink.extraUrl}. */
+  readonly extraLinkHeader?: string
+  readonly rows: readonly TopicCardLink[]
 }
 
 /** What the root card shows besides its status. */
@@ -61,14 +78,8 @@ export interface TopicRootCard {
   readonly taskName: string
   /** Lead sentence, shown after the requester (an @-mention, or the external requester's text). */
   readonly lead: readonly TopicCardText[]
-  /** Optional table of links (at most 50 rows). */
-  readonly links?: {
-    /** Header of the label column. */
-    readonly nameHeader: string
-    /** Header of the link column. */
-    readonly linkHeader: string
-    readonly rows: readonly TopicCardLink[]
-  }
+  /** Optional table of links; {@link FeishuTopicService.updateLinks} replaces it later. */
+  readonly links?: TopicCardLinks
 }
 
 /** Who a launch is for. */
@@ -189,9 +200,40 @@ export interface TopicLaunchState {
 export type FeishuTopicsStatusEvent = 'feishu-topics/status'
 
 /**
- * The `feishuTopics` service. {@link FeishuTopicService.state} and
- * {@link FeishuTopicService.launchKeyOf} were added without a version change;
- * a consumer that must work with older providers checks that they exist.
+ * Why {@link FeishuTopicService.updateLinks} did not change the card.
+ */
+export type TopicLinksUpdateFailureCode =
+  /** The links break a rule documented on {@link TopicCardLinks}. */
+  | 'invalid'
+  /** No launch was accepted under the key. */
+  | 'unknown-key'
+  /** The Feishu connection is not established, or the channel is shutting down. */
+  | 'not-connected'
+  /**
+   * The links could not be recorded, or Feishu refused the card update. When
+   * only the card update failed, the links are recorded and the next status
+   * change shows them; a retry with the same links redraws the card.
+   */
+  | 'update-failed'
+
+/** Outcome of {@link FeishuTopicService.updateLinks}. */
+export type TopicLinksUpdateResult =
+  | { readonly ok: true }
+  | {
+    readonly ok: false
+    readonly code: TopicLinksUpdateFailureCode
+    /** Readable reason (Chinese). */
+    readonly message: string
+  }
+
+/**
+ * The `feishuTopics` service. {@link FeishuTopicService.state},
+ * {@link FeishuTopicService.launchKeyOf}, {@link FeishuTopicService.updateLinks},
+ * {@link TopicCardLinks.extraLinkHeader}, {@link TopicCardLink.extraUrl}, and
+ * the optional {@link TopicCardLink.url} were added without a version change;
+ * a consumer that must work with older providers checks that the methods
+ * exist, and uses the optional link fields only when `updateLinks` exists
+ * (an older provider refuses them as `invalid`).
  */
 export interface FeishuTopicService {
   readonly version: FeishuTopicsVersion
@@ -218,4 +260,13 @@ export interface FeishuTopicService {
    * not the current Session of a launched topic.
    */
   launchKeyOf(sessionId: string): string | undefined
+  /**
+   * Replace the link table of a launch's root card and redraw the card with
+   * its current status. The new table is recorded, so later status changes
+   * and the 已中断 redraw keep it. Updates of one launch apply in call order.
+   * @param key - the launch's idempotency key.
+   * @param links - the new table; undefined removes it.
+   * @returns whether the card shows the new table, or why not.
+   */
+  updateLinks(key: string, links: TopicCardLinks | undefined): Promise<TopicLinksUpdateResult>
 }

@@ -2,7 +2,7 @@
  * Root card of a topic started through the `feishuTopics` service: the
  * caller's title, the requester (an @-mention of a Feishu user, or an
  * external requester's text) followed by the caller's lead
- * sentence, an optional link table, and a status tag (进行中 → 已完成 /
+ * sentence, an optional link table (one or two link columns), and a status tag (进行中 → 已完成 /
  * 已停止 / 失败 / 已中断) whose wording uses the caller's task name. The work
  * itself streams in the topic below the card through the ordinary streaming
  * card.
@@ -37,6 +37,11 @@ function plain(text: string): string {
 /** Percent-encode the characters that would end a markdown link target early. */
 function linkTarget(url: string): string {
   return url.replace(/[()\s]/gu, char => `%${char.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0')}`)
+}
+
+/** A link table cell: `查看` linking to the address, or `—` without one. */
+function linkCell(url: string | undefined): string {
+  return url === undefined ? '—' : `[查看](${linkTarget(url)})`
 }
 
 /** The requester as card markdown. */
@@ -90,6 +95,7 @@ export function buildTopicRootCard(requester: TopicRequester, card: TopicRootCar
   const lead = card.lead.map(run => (run.bold === true ? `**${plain(run.text)}**` : plain(run.text))).join('')
   const elements: object[] = [markdown(`${requesterText(requester)} ${lead}`)]
   if (card.links !== undefined && card.links.rows.length > 0) {
+    const extraHeader = card.links.extraLinkHeader
     elements.push({
       tag: 'table',
       page_size: TABLE_PAGE_SIZE,
@@ -98,10 +104,12 @@ export function buildTopicRootCard(requester: TopicRequester, card: TopicRootCar
       columns: [
         { name: 'name', display_name: card.links.nameHeader, data_type: 'text', width: 'auto' },
         { name: 'link', display_name: card.links.linkHeader, data_type: 'markdown', width: 'auto' },
+        ...(extraHeader === undefined ? [] : [{ name: 'extra', display_name: extraHeader, data_type: 'markdown', width: 'auto' }]),
       ],
       rows: card.links.rows.map(row => ({
         name: row.name,
-        link: `[查看](${linkTarget(row.url)})`,
+        link: linkCell(row.url),
+        ...(extraHeader === undefined ? {} : { extra: linkCell(row.extraUrl) }),
       })),
     })
   }

@@ -365,7 +365,8 @@ export const topicRootCardSchema = z.object({
   links: z.object({
     nameHeader: z.string(),
     linkHeader: z.string(),
-    rows: z.array(z.object({ name: z.string(), url: z.string() })),
+    extraLinkHeader: z.string().optional(),
+    rows: z.array(z.object({ name: z.string(), url: z.string().optional(), extraUrl: z.string().optional() })),
   }).optional(),
 })
 

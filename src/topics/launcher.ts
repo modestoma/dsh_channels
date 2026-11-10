@@ -15,7 +15,10 @@
  * never finished; {@link TopicLauncher.markInterrupted} marks their cards
  * 已中断. Every recorded status is emitted as the `feishu-topics/status`
  * event. {@link TopicLauncher.state} and {@link TopicLauncher.launchKeyOf}
- * read the record together with the topic's current route.
+ * read the record together with the topic's current route;
+ * {@link TopicLauncher.updateLinks} replaces the recorded link table and
+ * redraws the root card. Root card writes of one launch (status changes,
+ * link updates, the 已中断 redraw) run one at a time in call order.
  *
  * The topic is reserved in the inbound router from its creation until the
  * route and the first prompt are published, so replies posted meanwhile queue
@@ -50,7 +53,8 @@ import { openTopicWorkspace, topicTokenFor } from '../workspaces.ts'
 import type { TopicLocationPort } from '../workspaces.ts'
 import type {
   FeishuTopicService, FeishuTopicsServiceName, FeishuTopicsStatusEvent, FeishuTopicsVersion,
-  TopicLaunchFailureCode, TopicLaunchResult, TopicLaunchSpec, TopicLaunchState, TopicRequester, TopicRootCard,
+  TopicCardLinks, TopicLaunchFailureCode, TopicLaunchResult, TopicLaunchSpec, TopicLaunchState,
+  TopicLinksUpdateFailureCode, TopicLinksUpdateResult, TopicRequester, TopicRootCard,
 } from './contract.ts'
 
 /** Name the launcher is provided under. */
@@ -66,6 +70,20 @@ const text = (max: number) => z.string().min(1).max(max).refine(value => value.t
 
 /** Feishu group chat id (`oc_…`). */
 const CHAT_ID = /^oc_[A-Za-z0-9_-]{1,128}$/u
+
+const linkUrl = z.url({ protocol: /^https?$/u, error: 'must be an http(s) URL' }).max(2048)
+
+/** Link table validation: the rules {@link TopicCardLinks} documents. */
+const topicCardLinksSchema = z.object({
+  nameHeader: text(20),
+  linkHeader: text(20),
+  extraLinkHeader: text(20).optional(),
+  rows: z.array(z.object({
+    name: text(200),
+    url: linkUrl.optional(),
+    extraUrl: linkUrl.optional(),
+  }).strict()).max(50),
+}).strict()
 
 /** Launch spec validation: the rules {@link TopicLaunchSpec} documents. */
 const topicLaunchSpecSchema = z.object({
@@ -86,14 +104,7 @@ const topicLaunchSpecSchema = z.object({
     title: text(100),
     taskName: text(20),
     lead: z.array(z.object({ text: z.string().max(1000), bold: z.boolean().optional() }).strict()).min(1).max(20),
-    links: z.object({
-      nameHeader: text(20),
-      linkHeader: text(20),
-      rows: z.array(z.object({
-        name: text(200),
-        url: z.url({ protocol: /^https?$/u, error: 'must be an http(s) URL' }).max(2048),
-      }).strict()).max(50),
-    }).strict().optional(),
+    links: topicCardLinksSchema.optional(),
   }).strict(),
   prompt: text(100_000),
 }).strict()
@@ -131,6 +142,11 @@ interface PendingAccept {
   readonly result: Promise<TopicLaunchResult>
 }
 
+/** Readable reason of zod issues. */
+function issuesText(error: z.ZodError): string {
+  return error.issues.map(issue => `${issue.path.join('.') || '(spec)'}: ${issue.message}`).join('; ')
+}
+
 /** Readable reason of an error value. */
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
@@ -144,6 +160,8 @@ export class TopicLauncher implements FeishuTopicService {
   private readonly running = new Set<Promise<void>>()
   /** Whether launches are admitted: from {@link open} after start until {@link close}. */
   private admitting = false
+  /** Idempotency key → last root card write, so writes of one launch apply in call order. */
+  private readonly cardWrites = new Map<string, Promise<unknown>>()
 
   constructor(private readonly deps: TopicLauncherDeps) {}
 
@@ -186,13 +204,39 @@ export class TopicLauncher implements FeishuTopicService {
     return undefined
   }
 
+  async updateLinks(key: string, links: TopicCardLinks | undefined): Promise<TopicLinksUpdateResult> {
+    const parsed = topicCardLinksSchema.optional().safeParse(links)
+    if (!parsed.success) return linksRefused('invalid', `链接表不合法：${issuesText(parsed.error)}`)
+    const valid = parsed.data
+    return await this.serialize(key, async () => {
+      const channel = this.deps.channel()
+      const domain = this.deps.domain()
+      if (!this.deps.started() || channel === undefined || domain === undefined) {
+        return linksRefused('not-connected', '飞书渠道尚未连接，请稍后重试')
+      }
+      const record = domain.topicLaunches.get(key)
+      if (record === undefined) return linksRefused('unknown-key', `没有幂等键为 ${key} 的话题`)
+      const card: TopicLaunchRecord['card'] = { title: record.card.title, taskName: record.card.taskName, lead: record.card.lead }
+      if (valid !== undefined) card.links = copyLinks(valid)
+      const next: TopicLaunchRecord = { ...record, card }
+      try {
+        await domain.topicLaunches.put(key, next)
+      } catch (error) {
+        return linksRefused('update-failed', `记录链接表失败：${messageOf(error)}`)
+      }
+      try {
+        await channel.updateCard(record.messageId, buildTopicRootCard(requesterOfRecord(next), card, statusOfRecord(next)))
+      } catch (error) {
+        return linksRefused('update-failed', `更新根卡片失败：${messageOf(error)}`)
+      }
+      return { ok: true }
+    })
+  }
+
   async launch(spec: TopicLaunchSpec): Promise<TopicLaunchResult> {
     const parsed = topicLaunchSpecSchema.safeParse(spec)
     if (!parsed.success) {
-      const details = parsed.error.issues
-        .map(issue => `${issue.path.join('.') || '(spec)'}: ${issue.message}`)
-        .join('; ')
-      return refused('invalid', `话题参数不合法：${details}`)
+      return refused('invalid', `话题参数不合法：${issuesText(parsed.error)}`)
     }
     const valid = parsed.data
     const pending = this.accepting.get(valid.key)
@@ -235,11 +279,13 @@ export class TopicLauncher implements FeishuTopicService {
     if (channel === undefined || domain === undefined) return
     for (const [key, record] of [...domain.topicLaunches.entries()]) {
       if (record.status !== 'running') continue
-      await channel.updateCard(record.messageId, buildTopicRootCard(requesterOfRecord(record), record.card, { kind: 'interrupted' }))
-        .catch((error: unknown) => {
-          this.deps.ctx.logger?.warn?.('dsh-channels: marking topic card %s interrupted failed: %s', key, String(error))
-        })
-      await this.recordStatus(key, 'interrupted')
+      await this.serialize(key, async () => {
+        await channel.updateCard(record.messageId, buildTopicRootCard(requesterOfRecord(record), record.card, { kind: 'interrupted' }))
+          .catch((error: unknown) => {
+            this.deps.ctx.logger?.warn?.('dsh-channels: marking topic card %s interrupted failed: %s', key, String(error))
+          })
+        await this.recordStatus(key, 'interrupted')
+      })
     }
   }
 
@@ -293,10 +339,14 @@ export class TopicLauncher implements FeishuTopicService {
       this.deps.ctx.logger?.warn?.(message, ...args)
     }
     const showStatus = async (status: TopicStatus): Promise<void> => {
-      await channel.updateCard(rootId, buildTopicRootCard(spec.requester, card, status)).catch((error: unknown) => {
-        warn('dsh-channels: updating topic card %s failed: %s', rootId, String(error))
+      await this.serialize(spec.key, async () => {
+        // The recorded card carries link tables replaced since the launch.
+        const current = this.deps.domain()?.topicLaunches.get(spec.key)?.card ?? card
+        await channel.updateCard(rootId, buildTopicRootCard(spec.requester, current, status)).catch((error: unknown) => {
+          warn('dsh-channels: updating topic card %s failed: %s', rootId, String(error))
+        })
+        await this.recordStatus(spec.key, status.kind, status.kind === 'failed' ? status.reason : undefined)
       })
-      await this.recordStatus(spec.key, status.kind, status.kind === 'failed' ? status.reason : undefined)
     }
     const sessionId = randomUUID() as SessionId
     const requesterUserId = spec.requester.kind === 'feishu-user' ? spec.requester.userId : undefined
@@ -445,6 +495,23 @@ export class TopicLauncher implements FeishuTopicService {
     }
   }
 
+  /**
+   * Run one root card write of a launch after the writes queued before it.
+   * @param key - the launch's idempotency key.
+   * @param write - the write; its failure is returned to its own caller only.
+   * @returns the write's result.
+   */
+  private async serialize<T>(key: string, write: () => Promise<T>): Promise<T> {
+    const previous = this.cardWrites.get(key) ?? Promise.resolve()
+    const result = previous.then(write, write)
+    const settled = result.then(() => {}, () => {})
+    this.cardWrites.set(key, settled)
+    void settled.then(() => {
+      if (this.cardWrites.get(key) === settled) this.cardWrites.delete(key)
+    })
+    return await result
+  }
+
   private assertStarted(): void {
     if (!this.deps.started()) throw new Error('飞书渠道已断开，已取消')
   }
@@ -456,19 +523,46 @@ function copyCard(card: TopicRootCard): NonNullable<TopicLaunchRecord['card']> {
     title: card.title,
     taskName: card.taskName,
     lead: card.lead.map(run => (run.bold === undefined ? { text: run.text } : { text: run.text, bold: run.bold })),
-    ...(card.links === undefined
-      ? {}
-      : {
-          links: {
-            nameHeader: card.links.nameHeader,
-            linkHeader: card.links.linkHeader,
-            rows: card.links.rows.map(row => ({ name: row.name, url: row.url })),
-          },
-        }),
+    ...(card.links === undefined ? {} : { links: copyLinks(card.links) }),
+  }
+}
+
+/** A detached copy of a link table, without absent optional fields. */
+function copyLinks(links: TopicCardLinks): NonNullable<TopicLaunchRecord['card']['links']> {
+  return {
+    nameHeader: links.nameHeader,
+    linkHeader: links.linkHeader,
+    ...(links.extraLinkHeader === undefined ? {} : { extraLinkHeader: links.extraLinkHeader }),
+    rows: links.rows.map(row => ({
+      name: row.name,
+      ...(row.url === undefined ? {} : { url: row.url }),
+      ...(row.extraUrl === undefined ? {} : { extraUrl: row.extraUrl }),
+    })),
+  }
+}
+
+/**
+ * The root card status a launch record names.
+ * @param record - a stored launch.
+ * @returns the card status.
+ */
+function statusOfRecord(record: TopicLaunchRecord): TopicStatus {
+  switch (record.status) {
+    case 'running': return { kind: 'running' }
+    case 'done': return { kind: 'done' }
+    case 'stopped': return { kind: 'stopped' }
+    case 'error': return { kind: 'error' }
+    case 'failed': return { kind: 'failed', reason: record.reason ?? '' }
+    case 'interrupted': return { kind: 'interrupted' }
+    default: return assertNever(record.status)
   }
 }
 
 function refused(code: TopicLaunchFailureCode, message: string): TopicLaunchResult {
+  return { ok: false, code, message }
+}
+
+function linksRefused(code: TopicLinksUpdateFailureCode, message: string): TopicLinksUpdateResult {
   return { ok: false, code, message }
 }
 
@@ -501,5 +595,5 @@ function requesterOfRecord(record: TopicLaunchRecord): TopicRequester {
 }
 
 function assertNever(value: never): never {
-  throw new Error(`unexpected topic requester: ${JSON.stringify(value)}`)
+  throw new Error(`unexpected value: ${JSON.stringify(value)}`)
 }
