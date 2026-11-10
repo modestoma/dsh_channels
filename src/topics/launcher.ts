@@ -277,9 +277,12 @@ export class TopicLauncher implements FeishuTopicService {
     const channel = this.deps.channel()
     const domain = this.deps.domain()
     if (channel === undefined || domain === undefined) return
-    for (const [key, record] of [...domain.topicLaunches.entries()]) {
-      if (record.status !== 'running') continue
+    for (const [key, listed] of [...domain.topicLaunches.entries()]) {
+      if (listed.status !== 'running') continue
       await this.serialize(key, async () => {
+        // A link update may have replaced the card while earlier redraws ran.
+        const record = domain.topicLaunches.get(key)
+        if (record?.status !== 'running') return
         await channel.updateCard(record.messageId, buildTopicRootCard(requesterOfRecord(record), record.card, { kind: 'interrupted' }))
           .catch((error: unknown) => {
             this.deps.ctx.logger?.warn?.('dsh-channels: marking topic card %s interrupted failed: %s', key, String(error))

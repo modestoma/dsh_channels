@@ -379,6 +379,32 @@ describe('topic launch flow', () => {
     expect(h.record('key-done')?.status).toBe('done')
   })
 
+  it('keeps a link update made while start is still marking earlier launches interrupted', async () => {
+    const h = await setup()
+    await h.service.accessAdmin.addUser('u_alice')
+    await h.launcher.launch(spec({ key: 'key-a' }))
+    await waitUntil(() => expect(h.routes()).toHaveLength(1))
+    await h.launcher.launch(spec({ key: 'key-b', fingerprint: 'fp-2', prompt: 'second' }))
+    await waitUntil(() => expect(h.routes()).toHaveLength(2))
+    await h.service.shutdown()
+
+    const updateCard = h.channel.updateCard as unknown as ReturnType<typeof vi.fn>
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const calls = updateCard.mock.calls.length
+    updateCard.mockImplementationOnce(async () => { await gate })
+    const starting = h.service.start()
+    await waitUntil(() => expect(updateCard.mock.calls.length).toBe(calls + 1))
+    const links = { nameHeader: '日志', linkHeader: '详情页', rows: [{ name: '新表', url: 'https://logs.example/new' }] }
+    expect(await h.launcher.updateLinks('key-b', links)).toEqual({ ok: true })
+    release()
+    await starting
+    await waitUntil(() => expect(h.record('key-b')?.status).toBe('interrupted'))
+    const card = lastCard(h, h.record('key-b')!.messageId)
+    expect(card).toContain('已中断')
+    expect(card).toContain('https://logs.example/new')
+  })
+
   it('replays a retried key and refuses a reused one', async () => {
     const h = await setup()
     await h.service.accessAdmin.addUser('u_alice')
