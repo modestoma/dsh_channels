@@ -67,6 +67,25 @@ describe('topic root card', () => {
     expect(running).not.toContain('"tag":"table"')
   })
 
+  it('adds a second link column and shows a dash for rows without an address', () => {
+    const card = {
+      ...spec().card,
+      links: {
+        nameHeader: '日志', linkHeader: '详情页', extraLinkHeader: '分析报告',
+        rows: [{ name: 'a', url: 'https://logs.example/d/1', extraUrl: 'https://logs.example/r/1' }, { name: 'b' }],
+      },
+    }
+    const built = buildTopicRootCard({ kind: 'feishu-user', userId: 'u_alice' }, card, { kind: 'done' }) as {
+      body: { elements: Array<{ tag: string; columns?: Array<{ display_name: string }>; rows?: object[] }> }
+    }
+    const table = built.body.elements.find(element => element.tag === 'table')!
+    expect(table.columns?.map(column => column.display_name)).toEqual(['日志', '详情页', '分析报告'])
+    expect(table.rows).toEqual([
+      { name: 'a', link: '[查看](https://logs.example/d/1)', extra: '[查看](https://logs.example/r/1)' },
+      { name: 'b', link: '—', extra: '—' },
+    ])
+  })
+
   it('shows an external requester as literal text instead of a mention', () => {
     const card = { title: '巡检', taskName: '巡检', lead: [{ text: '发起了巡检 <at id=all></at>' }] }
     const running = JSON.stringify(buildTopicRootCard({ kind: 'external', label: '[machine] app-1' }, card, { kind: 'running' }))
@@ -291,6 +310,53 @@ describe('topic launch flow', () => {
     expect(h.launcher.state('key-1')).toEqual({ key: 'key-1', status: 'done' })
   })
 
+  it('replaces the link table of a launched card and keeps it through later status changes', async () => {
+    const h = await setup()
+    await h.service.accessAdmin.addUser('u_alice')
+    await h.launcher.launch(spec())
+    await waitUntil(() => expect(h.routes()).toHaveLength(1))
+    const links = {
+      nameHeader: '日志', linkHeader: '详情页', extraLinkHeader: '分析报告',
+      rows: [{ name: '设备 A 崩溃日志', url: 'https://logs.example/detail/1', extraUrl: 'https://logs.example/report/1' }],
+    }
+    expect(await h.launcher.updateLinks('key-1', links)).toEqual({ ok: true })
+    expect(lastCard(h, 'om_1')).toContain('分析报告')
+    expect(lastCard(h, 'om_1')).toContain('https://logs.example/report/1')
+    expect(lastCard(h, 'om_1')).toContain('分析中')
+    expect(h.record('key-1')?.card.links).toEqual(links)
+
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    h.ctxState.sessionListeners[0]!(agent.session, { type: 'turn/end', seq: 1, data: { turn: 1, reason: 'stop' } })
+    await waitUntil(() => expect(h.record('key-1')?.status).toBe('done'))
+    expect(lastCard(h, 'om_1')).toContain('已完成')
+    expect(lastCard(h, 'om_1')).toContain('https://logs.example/report/1')
+
+    expect(await h.launcher.updateLinks('key-1', undefined)).toEqual({ ok: true })
+    expect(lastCard(h, 'om_1')).not.toContain('"tag":"table"')
+    expect(lastCard(h, 'om_1')).toContain('已完成')
+    expect(h.record('key-1')?.card.links).toBeUndefined()
+  })
+
+  it('refuses link updates that are invalid, name no launch, or Feishu rejects', async () => {
+    const h = await setup()
+    await h.service.accessAdmin.addUser('u_alice')
+    await h.launcher.launch(spec())
+    await waitUntil(() => expect(h.routes()).toHaveLength(1))
+    const links = { nameHeader: '日志', linkHeader: '详情页', rows: [{ name: 'a', extraUrl: 'ftp://x' }] }
+    expect(await h.launcher.updateLinks('key-1', links)).toMatchObject({ ok: false, code: 'invalid' })
+    const valid = { nameHeader: '日志', linkHeader: '详情页', rows: [{ name: 'a' }] }
+    expect(await h.launcher.updateLinks('key-missing', valid)).toMatchObject({ ok: false, code: 'unknown-key' })
+
+    const updateCard = h.channel.updateCard as unknown as ReturnType<typeof vi.fn>
+    updateCard.mockRejectedValueOnce(new Error('card recalled'))
+    expect(await h.launcher.updateLinks('key-1', valid)).toMatchObject({ ok: false, code: 'update-failed', message: expect.stringContaining('card recalled') })
+    // The table is recorded even though the card was not redrawn.
+    expect(h.record('key-1')?.card.links).toEqual(valid)
+
+    await h.service.shutdown()
+    expect(await h.launcher.updateLinks('key-1', valid)).toMatchObject({ ok: false, code: 'not-connected' })
+  })
+
   it('marks analyses a previous instance never finished as interrupted at start', async () => {
     const h = await setup()
     await h.service.accessAdmin.addUser('u_alice')
@@ -311,6 +377,32 @@ describe('topic launch flow', () => {
     expect(card).toContain('"template":"orange"')
     expect(card).toContain('设备 A 崩溃日志')
     expect(h.record('key-done')?.status).toBe('done')
+  })
+
+  it('keeps a link update made while start is still marking earlier launches interrupted', async () => {
+    const h = await setup()
+    await h.service.accessAdmin.addUser('u_alice')
+    await h.launcher.launch(spec({ key: 'key-a' }))
+    await waitUntil(() => expect(h.routes()).toHaveLength(1))
+    await h.launcher.launch(spec({ key: 'key-b', fingerprint: 'fp-2', prompt: 'second' }))
+    await waitUntil(() => expect(h.routes()).toHaveLength(2))
+    await h.service.shutdown()
+
+    const updateCard = h.channel.updateCard as unknown as ReturnType<typeof vi.fn>
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const calls = updateCard.mock.calls.length
+    updateCard.mockImplementationOnce(async () => { await gate })
+    const starting = h.service.start()
+    await waitUntil(() => expect(updateCard.mock.calls.length).toBe(calls + 1))
+    const links = { nameHeader: '日志', linkHeader: '详情页', rows: [{ name: '新表', url: 'https://logs.example/new' }] }
+    expect(await h.launcher.updateLinks('key-b', links)).toEqual({ ok: true })
+    release()
+    await starting
+    await waitUntil(() => expect(h.record('key-b')?.status).toBe('interrupted'))
+    const card = lastCard(h, h.record('key-b')!.messageId)
+    expect(card).toContain('已中断')
+    expect(card).toContain('https://logs.example/new')
   })
 
   it('replays a retried key and refuses a reused one', async () => {
