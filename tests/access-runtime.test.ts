@@ -152,6 +152,7 @@ function routeRecord(partial: Partial<RouteRecord> = {}): RouteRecord {
     cardMessageId: 'om_card',
     createdAt: 1,
     lastActivityAt: 1,
+    sessionHistory: [{ sessionId: 'session-a', createdAt: 1 }],
     ...partial,
   }
 }
@@ -358,18 +359,18 @@ describe('AccessController.admitCommand', () => {
   })
 })
 
-describe('AccessController.ownsRoute / isAdmin / mayUse / mayLaunchFor', () => {
-  it('chatId 与 sender 双匹配才算话题拥有者', () => {
+describe('AccessController.ownsRoute / isAdmin / mayUse / mayUseOnRoute', () => {
+  it('私聊路由：chatId 与 sender 双匹配才算话题拥有者', () => {
     const runtime = setup()
-    const record = routeRecord({ senderUserId: 'u_alice', chatId: 'oc_group' })
+    const record = routeRecord({ chatType: 'p2p', senderUserId: 'u_alice', chatId: 'oc_p2p' })
     expect(runtime.controller.ownsRoute(makeMessage({
-      chatType: 'group', chatId: 'oc_group', senderId: 'u_alice', content: 'x',
+      chatType: 'p2p', chatId: 'oc_p2p', senderId: 'u_alice', content: 'x',
     }), record)).toBe(true)
     expect(runtime.controller.ownsRoute(makeMessage({
-      chatType: 'group', chatId: 'oc_group', senderId: 'u_bob', content: 'x',
+      chatType: 'p2p', chatId: 'oc_p2p', senderId: 'u_bob', content: 'x',
     }), record)).toBe(false)
     expect(runtime.controller.ownsRoute(makeMessage({
-      chatType: 'group', chatId: 'oc_other', senderId: 'u_alice', content: 'x',
+      chatType: 'p2p', chatId: 'oc_other', senderId: 'u_alice', content: 'x',
     }), record)).toBe(false)
   })
 
@@ -403,6 +404,42 @@ describe('AccessController.ownsRoute / isAdmin / mayUse / mayLaunchFor', () => {
     expect(runtime.controller.mayLaunchFor('u_stranger')).toBe(false)
     expect(setup({ config: { accessMode: 'open' } }).controller.mayLaunchFor('u_stranger')).toBe(true)
   })
+
+  it('群路由（话题或降级的会话级路由）：有对话权限的人都能继续；allows 只看准入矩阵', async () => {
+    const runtime = setup()
+    await runtime.store.putUser(userRecord({ userId: 'u_alice' }))
+    await runtime.store.putUser(userRecord({ userId: 'u_bob' }))
+    for (const record of [routeRecord(), routeRecord({ kind: 'chat', key: 'chat:group:oc_group:u_alice' })]) {
+      expect(runtime.controller.mayActOnRoute('u_bob', 'oc_group', record)).toBe(true)
+      expect(runtime.controller.mayActOnRoute(ADMIN, 'oc_group', record)).toBe(true)
+      expect(runtime.controller.mayActOnRoute('u_stranger', 'oc_group', record)).toBe(false)
+      expect(runtime.controller.mayActOnRoute('u_bob', 'oc_other', record)).toBe(false)
+    }
+    const msg = makeMessage({ chatType: 'group', chatId: 'oc_group', senderId: 'u_bob', content: 'x' })
+    expect(runtime.controller.allows(msg)).toBe(true)
+    await runtime.store.setPermission('u_bob', 'chat', false)
+    expect(runtime.controller.allows(msg)).toBe(false)
+    expect(runtime.controller.mayActOnRoute('u_bob', 'oc_group', routeRecord())).toBe(false)
+  })
+
+  it('mayUseOnRoute：群路由按群权限表判权（未登记即无权限），私聊路由按本人开关', async () => {
+    const runtime = setup()
+    await runtime.store.putUser(userRecord({ userId: 'u_alice', codeWrite: true }))
+    const personal = routeRecord({ chatType: 'p2p', chatId: 'oc_p2p', senderUserId: 'u_alice' })
+    expect(runtime.controller.mayUseOnRoute(personal, 'codeWrite')).toBe(true)
+    expect(runtime.controller.mayUseOnRoute(personal, 'wikiRead')).toBe(false)
+    expect(runtime.controller.mayUseOnRoute(routeRecord({ chatType: 'p2p', chatId: 'oc_p2p', senderUserId: ADMIN }), 'wikiWrite')).toBe(true)
+    const group = routeRecord({ senderUserId: 'u_alice' })
+    expect(runtime.controller.mayUseOnRoute(group, 'codeWrite')).toBe(false)
+    await runtime.store.ensureGroup('oc_group', '研发群', 5)
+    expect(runtime.controller.mayUseOnRoute(group, 'codeWrite')).toBe(false)
+    await runtime.store.setGroupPermission('oc_group', 'codeWrite', true)
+    expect(runtime.controller.mayUseOnRoute(group, 'codeWrite')).toBe(true)
+    expect(runtime.controller.mayUseOnRoute(group, 'wikiRead')).toBe(false)
+    expect(runtime.controller.mayUseOnRoute(routeRecord({ kind: 'chat', key: 'chat:group:oc_group:u_alice' }), 'codeWrite')).toBe(true)
+    await runtime.store.removeGroup('oc_group')
+    expect(runtime.controller.mayUseOnRoute(group, 'codeWrite')).toBe(false)
+  })
 })
 
 describe('AccessRequests.handleBotAdded', () => {
@@ -423,7 +460,7 @@ describe('AccessRequests.handleBotAdded', () => {
     expect(json).toContain('u_inviter')
     expect(buttonValue(sentCard(entry!), '授权用户')).toBeDefined()
     expect(runtime.store.pendingRequestFor('u_inviter')).toMatchObject({
-      kind: 'user', targetId: 'u_inviter', chatId: 'oc_new', groupName: '产品群', status: 'pending', messageIds: ['om_1'],
+      targetId: 'u_inviter', chatId: 'oc_new', groupName: '产品群', status: 'pending', messageIds: ['om_1'],
     })
     expect(runtime.store.hasUser('u_inviter')).toBe(false)
   })
@@ -585,7 +622,7 @@ describe('AccessRequests.onCardAction', () => {
   it('过期 token 不生效：落 expired 并 patch 为已过期', async () => {
     const runtime = setup()
     await runtime.store.putRequest(requestRecord({
-      token: 'tok-expired', targetId: 'u_bob', createdAt: 0, expiresAt: runtime.clock.now - 1, messageId: 'om_1',
+      token: 'tok-expired', targetId: 'u_bob', createdAt: 0, expiresAt: runtime.clock.now - 1, messageIds: ['om_1'],
     }))
 
     await runtime.requests.onCardAction(cardAction('om_1', { token: 'tok-expired', action: 'allow' }))
@@ -665,7 +702,7 @@ describe('AccessRequests.resolve（面板与卡片共用路径）', () => {
   it('过期 token 返回 ok:false 并落 expired', async () => {
     const runtime = setup()
     await runtime.store.putRequest(requestRecord({
-      token: 'tok-expired', targetId: 'u_bob', createdAt: 0, expiresAt: runtime.clock.now - 1, messageId: 'om_1',
+      token: 'tok-expired', targetId: 'u_bob', createdAt: 0, expiresAt: runtime.clock.now - 1, messageIds: ['om_1'],
     }))
     const result = await runtime.requests.resolve('tok-expired', 'allow', AS_ADMIN)
     expect(result).toMatchObject({ ok: false, error: expect.stringContaining('已过期') })
@@ -687,7 +724,7 @@ describe('AccessRequests.expirePending', () => {
   it('把到期的 pending 申请落为 expired 并 patch 卡片终态', async () => {
     const runtime = setup()
     await runtime.store.putRequest(requestRecord({
-      token: 'tok-expired', targetId: 'u_bob', createdAt: 0, expiresAt: runtime.clock.now - 1, messageId: 'om_card',
+      token: 'tok-expired', targetId: 'u_bob', createdAt: 0, expiresAt: runtime.clock.now - 1, messageIds: ['om_card'],
     }))
 
     await runtime.requests.expirePending()

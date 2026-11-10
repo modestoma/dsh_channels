@@ -4,8 +4,8 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { QuestionAnswerer } from '../src/questions.ts'
-import type { ApprovalRoute } from '../src/approvals.ts'
+import { QuestionAnswerer } from '../src/interactions/questions.ts'
+import type { ApprovalRoute } from '../src/interactions/approvals.ts'
 import type { CardActionEvent } from '../src/feishu-channel.ts'
 import { makeAgent, makeChannel, makeSession } from './helpers.ts'
 
@@ -14,6 +14,7 @@ const ROUTE: ApprovalRoute = {
   cardMessageId: 'om_main',
   inThread: true,
   senderUserId: 'u_owner',
+  chatType: 'p2p',
 }
 
 function makeAnswerer(overrides: Partial<ApprovalRoute> = {}): {

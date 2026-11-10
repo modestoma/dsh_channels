@@ -1,6 +1,6 @@
 /**
  * Durable access-control store: the flat user table with its permission
- * switches, and the authorization requests.
+ * switches, the group permission records, and the authorization requests.
  *
  * Reads come from in-memory maps (seeded once from the plugin's
  * `storageDomain` tables) so admission decisions stay synchronous and cheap;
@@ -8,12 +8,6 @@
  * matching the store patterns used for routes and inflight snapshots.
  * User-table mutations run one at a time, each reading the record after the
  * previous write, so concurrent switch changes never overwrite each other.
- *
- * The tables (`access_users`, `access_requests`) were added without bumping
- * the domain version on purpose: the JSON backend's `single` layout refuses a
- * stored-version mismatch, while unknown/missing tables are simply empty on
- * load (see `docs/access-control-design.md`). Request records of the retired
- * `group` kind are skipped on load.
  *
  * @module dsh-channels/access/store
  */
@@ -24,6 +18,8 @@ import type {
   AccessSwitch,
   AccessUserRecord,
   FeishuDomainHandle,
+  GroupPermission,
+  GroupPermissionRecord,
 } from '../domain.ts'
 
 export interface AccessStoreDeps {
@@ -46,12 +42,15 @@ export type AccessRequestStatus = AccessRequestRecord['status']
 export class AccessStore {
   private readonly users = new Map<string, AccessUserRecord>()
   private readonly requests = new Map<string, AccessRequestRecord>()
+  private readonly groups = new Map<string, GroupPermissionRecord>()
   /** Cached `chat`-enabled keys so `snapshot()` stays allocation-free per message. */
   private readonly chatKeys = new Set<string>()
   /** Cached `admin` keys, likewise. */
   private readonly adminKeys = new Set<string>()
   /** Tail of the user-table mutation queue; always fulfilled. */
   private userWrites: Promise<void> = Promise.resolve()
+  /** Tail of the group-table mutation queue; always fulfilled. */
+  private groupWrites: Promise<void> = Promise.resolve()
 
   constructor(private readonly deps: AccessStoreDeps) {}
 
@@ -64,15 +63,15 @@ export class AccessStore {
       return
     }
     for (const [key, record] of domain.accessUsers.entries()) this.remember(key, record)
-    for (const [key, record] of domain.accessRequests.entries()) {
-      if (record.kind === 'user') this.requests.set(key, record)
-    }
+    for (const [key, record] of domain.groupPermissions.entries()) this.groups.set(key, record)
+    for (const [key, record] of domain.accessRequests.entries()) this.requests.set(key, record)
   }
 
   /** Drop every in-memory record (shutdown). The domain owns durability. */
   clear(): void {
     this.users.clear()
     this.requests.clear()
+    this.groups.clear()
     this.chatKeys.clear()
     this.adminKeys.clear()
   }
@@ -179,6 +178,89 @@ export class AccessStore {
     })
   }
 
+  // ---- group permissions -----------------------------------------------
+
+  /** Every group record, oldest first. */
+  groupRecords(): GroupPermissionRecord[] {
+    return [...this.groups.values()].sort((left, right) => left.addedAt - right.addedAt)
+  }
+
+  getGroup(chatId: string): GroupPermissionRecord | undefined {
+    return this.groups.get(chatId)
+  }
+
+  /**
+   * Whether the group `chatId` holds one permission switch. A group without
+   * a record holds none.
+   * @param chatId - Feishu chat_id.
+   * @param permission - the switch to read.
+   * @returns true when the group has a record with the switch on.
+   */
+  groupAllows(chatId: string, permission: GroupPermission): boolean {
+    const record = this.groups.get(chatId)
+    return record !== undefined && record[permission]
+  }
+
+  /**
+   * Register a group the first time a topic opens in it: every switch off.
+   * An existing record is kept as it is, except that a newly known name is
+   * stored. One queued mutation either way.
+   * @param chatId - Feishu chat_id.
+   * @param name - group name when the event carried one.
+   * @param now - creation instant for a new record.
+   * @returns the stored record.
+   */
+  async ensureGroup(chatId: string, name: string | undefined, now = Date.now()): Promise<GroupPermissionRecord> {
+    return await this.serializeGroupWrite(async () => {
+      const current = this.groups.get(chatId)
+      if (current === undefined) {
+        return await this.writeGroup({
+          chatId,
+          ...(name === undefined ? {} : { name }),
+          addedAt: now,
+          wikiRead: false,
+          wikiWrite: false,
+          codeWrite: false,
+        })
+      }
+      if (name === undefined || current.name === name) return current
+      return await this.writeGroup({ ...current, name })
+    })
+  }
+
+  /**
+   * Set one permission switch of an existing group.
+   * @param chatId - Feishu chat_id.
+   * @param permission - the switch to set.
+   * @param enabled - new value.
+   * @returns the updated record, or undefined when the group has no record.
+   */
+  async setGroupPermission(chatId: string, permission: GroupPermission, enabled: boolean): Promise<GroupPermissionRecord | undefined> {
+    return await this.serializeGroupWrite(async () => {
+      const current = this.groups.get(chatId)
+      if (current === undefined) return undefined
+      if (current[permission] === enabled) return current
+      return await this.writeGroup({ ...current, [permission]: enabled })
+    })
+  }
+
+  /**
+   * Delete one group record. Its topics then hold no switch until a later
+   * message in the group registers it again.
+   * @param chatId - Feishu chat_id.
+   * @returns true when a record was deleted.
+   */
+  async removeGroup(chatId: string): Promise<boolean> {
+    return await this.serializeGroupWrite(async () => {
+      if (!this.groups.has(chatId)) return false
+      await this.requireDomain('remove group permissions').groupPermissions.delete(chatId)
+      this.groups.delete(chatId)
+      return true
+    })
+  }
+
+  // ---- authorization requests -------------------------------------------
+
   /** Every authorization request, including settled ones (audit). */
   requestRecords(): AccessRequestRecord[] {
     return [...this.requests.values()].sort((left, right) => left.createdAt - right.createdAt)
@@ -259,6 +341,22 @@ export class AccessStore {
       (_error: unknown) => { /* The failure is reported to the caller awaiting `run`; the queue continues. */ },
     )
     return run
+  }
+
+  /** Group-table counterpart of {@link serializeUserWrite}. */
+  private serializeGroupWrite<T>(work: () => Promise<T>): Promise<T> {
+    const run = this.groupWrites.then(work)
+    this.groupWrites = run.then(
+      () => undefined,
+      (_error: unknown) => { /* The failure is reported to the caller awaiting `run`; the queue continues. */ },
+    )
+    return run
+  }
+
+  private async writeGroup(record: GroupPermissionRecord): Promise<GroupPermissionRecord> {
+    await this.requireDomain('put group permissions').groupPermissions.put(record.chatId, record)
+    this.groups.set(record.chatId, record)
+    return record
   }
 
   private async writeUser(record: AccessUserRecord): Promise<AccessUserRecord> {

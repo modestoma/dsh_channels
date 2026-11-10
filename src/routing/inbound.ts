@@ -10,13 +10,14 @@
  */
 
 import { randomUUID } from 'node:crypto'
+import { mkdir } from 'node:fs/promises'
 import type {
-  AgentHandle, AttachmentStore, ContentBlock, HostContext, SessionId, UserMessage, Workspace,
-} from '../dsh-types.ts'
+  Agent, AgentHandle, AttachmentStore, HostContext, SessionId, Workspace,
+} from '../host/index.ts'
 import type { FeishuConfig } from '../config.ts'
-import { buildCard, buildOnboardingCard, initialStreamingCard, queuedStreamingCard } from '../cards.ts'
+import { buildOnboardingCard, failedStreamingCard, initialStreamingCard, queuedStreamingCard } from '../cards/index.ts'
 import { RouteOperationQueue } from '../commands.ts'
-import { chatRouteKey, sessionDirOf } from '../domain.ts'
+import { chatRouteKey, isGroupRoute } from '../domain.ts'
 import type { FeishuDomainHandle, RouteRecord } from '../domain.ts'
 import type { CardDelivery } from '../feishu/delivery.ts'
 import {
@@ -24,21 +25,20 @@ import {
 } from '../feishu/inbound-attachments.ts'
 import type { InboundAttachmentState } from '../feishu/inbound-attachments.ts'
 import { buildFeishuContextBlock, manifestEntriesOfKnownMessage, triggerManifestAttachments } from '../feishu/manifest.ts'
-import { NativeAttachmentStore } from '../feishu/native-attachments.ts'
 import type { KnownAttachmentMessageInput, KnownAttachmentSource } from '../feishu/tools.ts'
 import type { FeishuChannel, NormalizedMessage } from '../feishu-channel.ts'
 import type { QuestionAnswerer } from '../interactions/questions.ts'
 import type { ApprovalAnswerer, ApprovalTextResult } from '../interactions/approvals.ts'
 import type { InflightRepair } from '../session/repair.ts'
 import type { SessionManager } from '../session/manager.ts'
+import { newTopicRoute } from '../session/routes.ts'
 import type { RouteStore } from '../session/routes.ts'
-import type { TurnStreamer } from '../streamer.ts'
-import {
-  enterTopic, placementServices, planTopic, restoreTopicDir,
-} from '../session/isolation.ts'
-import { feishuUserMessage } from '../access/principal.ts'
-import type { PlacementServices, TopicPlacement, TopicPlan } from '../session/isolation.ts'
-import { ensureWorkspace, topicTokenFor } from '../workspaces.ts'
+import type { TurnStreamer } from '../turn/streamer.ts'
+import { principalOnRoute } from '../access/principal.ts'
+import { channelPrompt, type ChannelPrompt, type PromptBlock, type PromptImageBlock } from '../session/prompt.ts'
+import type { TurnSubmission } from '../session/submit.ts'
+import { openTopicWorkspace, topicTokenFor } from '../workspaces.ts'
+import type { TopicLocationPort } from '../workspaces.ts'
 
 /** The command plane the inbound router delegates admission-time work to. */
 export interface CommandPlanePort {
@@ -61,7 +61,14 @@ export interface InboundAccessPort {
   /** Full admission for a non-slash message; false = handled (deny/notice). */
   admit(msg: NormalizedMessage): Promise<boolean>
   /**
-   * Route ownership: only the sender who created a topic may continue it.
+   * The admission matrix alone, with no side effect: re-read right before a
+   * queued turn is submitted, so a sender whose chat access was turned off
+   * while their message waited is refused with a notice instead of served.
+   */
+  allows(msg: NormalizedMessage): boolean
+  /**
+   * Whether the sender may continue the route: anyone the matrix admits on a
+   * group route without a single owner, else only the user who opened it.
    * Also guards against cross-chat id confusion.
    */
   ownsRoute(msg: NormalizedMessage, record: RouteRecord): boolean
@@ -108,7 +115,8 @@ export interface AttachmentPrefetchPolicy {
 
 export interface InboundDeps {
   ctx: HostContext
-  config: FeishuConfig
+  /** Live configuration; read per message, so overlay changes apply at once. */
+  config(): FeishuConfig
   started(): boolean
   domain(): FeishuDomainHandle | undefined
   routes: RouteStore
@@ -117,6 +125,8 @@ export interface InboundDeps {
   sessions: SessionManager
   /** Host-level DSH native attachment library (required plugin dependency). */
   nativeAttachments(): AttachmentStore
+  /** Image staging and card-bound prompt submission (the service owns both). */
+  prompts: TurnSubmission
   /**
    * Pre-authorize a message's attachments for `feishu_attachment_fetch`:
    * `trigger` (the triggering message) by default, `quote`/`history`/`recent`
@@ -137,6 +147,8 @@ export interface InboundDeps {
   prefetchImages(): AttachmentPrefetchPolicy
   /** Channel-plane access control (administrator + user table). */
   access: InboundAccessPort
+  /** Names of the places topics open in, and group registration. */
+  location: TopicLocationPort
   /** Shared per-route FIFO admission (commands and turns must not interleave). */
   queue: RouteOperationQueue
   streamer(): TurnStreamer | undefined
@@ -177,6 +189,9 @@ export function knownAttachmentMessageOf(msg: NormalizedMessage): KnownAttachmen
     senderUserId: msg.senderId,
   }
 }
+
+/** Notice for a queued message whose sender lost chat access before it was served. */
+export const CHAT_ACCESS_REVOKED_TEXT = '你的对话权限已被关闭，这条消息没有发送给会话。'
 
 /** Feishu message-id shape accepted for quote resolution (`om_...`). */
 const QUOTE_MESSAGE_ID = /^om_[A-Za-z0-9_-]{1,128}$/u
@@ -251,7 +266,7 @@ export class InboundRouter {
   constructor(private readonly deps: InboundDeps) {}
 
   private get ctx(): HostContext { return this.deps.ctx }
-  private get config(): FeishuConfig { return this.deps.config }
+  private get config(): FeishuConfig { return this.deps.config() }
   private get started(): boolean { return this.deps.started() }
   private get routes(): RouteStore { return this.deps.routes }
   private get repair(): InflightRepair { return this.deps.repair }
@@ -503,25 +518,26 @@ export class InboundRouter {
   }
 
   /**
-   * Build the first-turn user message for the native pipeline: the caption
-   * text, the quoted-message excerpt, the prefetched trigger images, the
+   * Build the prompt of one turn for the native pipeline: the caption text,
+   * the quoted-message excerpt, the prefetched trigger images, the
    * `<feishu_context>` manifest block listing every attachment still unloaded,
    * and (first turn only) the `<feishu_history>` topic bootstrap. Optional
    * blocks are omitted entirely (no token cost) when empty.
    *
-   * Runs after the session/card/route exist and before `followup`; only the
-   * triggering message's images are prefetched (bounded and short-timeout),
-   * files never are. Block order is stable: text, quote, images, manifest,
-   * history.
+   * Runs after the session/card/route exist and before the submission; only
+   * the triggering message's images are prefetched (bounded and
+   * short-timeout) and staged for the live Agent, files never are. Block
+   * order is stable: text, quote, images, manifest, history.
    */
-  private async nativeTurnMessage(
+  private async nativeTurnPrompt(
     msg: NormalizedMessage,
     record: RouteRecord,
     content: string,
+    agent: Agent,
     options: TurnDeliveryOptions,
-  ): Promise<UserMessage> {
-    const message = feishuUserMessage(content, msg.senderId)
-    const blocks: ContentBlock[] = content === '' ? [] : [{ type: 'text', text: content }]
+  ): Promise<ChannelPrompt> {
+    const principal = principalOnRoute(record, msg.senderId)
+    const blocks: PromptBlock[] = content === '' ? [] : [{ type: 'text', text: content }]
     const state = inboundAttachmentState(msg)
     const attachmentPipeline = this.config.acceptAttachments
 
@@ -546,30 +562,21 @@ export class InboundRouter {
     const contextPromise = this.readTurnContext(msg, record, options)
 
     const loadedFileKeys = new Set<string>()
-    const prefetchedBlocks: ContentBlock[] = []
+    const prefetchedBlocks: PromptImageBlock[] = []
     const policy = this.deps.prefetchImages()
     const images = state.resources.filter(resource => resource.type === 'image')
     if (state.hasPayload && attachmentPipeline && policy.enabled && images.length > 0) {
-      const prefetched = await prefetchImageAttachments({
+      const prefetched = await prefetchImageAttachments<PromptImageBlock>({
         msg,
         resources: images,
         channel: this.liveChannel(),
         maxImageBytes: policy.maxImageBytes,
         maxTotalBytes: policy.maxTotalBytes,
         timeoutMs: policy.timeoutMs,
-        saveImage: async (bytes, name) => {
-          const store = new NativeAttachmentStore({ service: () => this.deps.nativeAttachments() })
-          const saved = await store.saveImage({ bytes, ...(name === undefined ? {} : { name }) })
-          return saved.ok
-            ? { ok: true, block: saved.value.block }
-            : { ok: false, reason: saved.reason }
-        },
+        saveImage: (bytes, name) => this.deps.prompts.stageImage(agent, bytes, name),
         warn: (warning, ...args) => this.ctx.logger?.warn?.(warning, ...args),
       })
-      // Spread each block into a plain object literal: the host `ContentBlock`
-      // union carries an index signature that the named `ImageBlock` interface
-      // does not declare, and the clone is structurally identical.
-      prefetchedBlocks.push(...prefetched.blocks.map(block => ({ ...block })))
+      prefetchedBlocks.push(...prefetched.blocks)
       for (const fileKey of prefetched.loadedFileKeys) loadedFileKeys.add(fileKey)
     }
     // Stable block order: text, quote, image blocks, manifest, history.
@@ -590,35 +597,35 @@ export class InboundRouter {
       : ''
     if (manifest !== '') blocks.push({ type: 'text', text: manifest })
     if (context.historyBlock !== undefined) blocks.push({ type: 'text', text: context.historyBlock })
-    // A trigger always carries caption text, but keep the message well-formed
+    // A trigger always carries caption text, but keep the prompt well-formed
     // if a future call path ever reaches here with nothing to say.
     if (blocks.length === 0) blocks.push({ type: 'text', text: '' })
-    message.content = blocks
-    return message
+    return { ...channelPrompt('', principal), content: blocks }
   }
 
   /**
-   * Deliver the prompt for one turn: caption text, quoted-message excerpt,
+   * Assemble the prompt for one turn: caption text, quoted-message excerpt,
    * prefetched images, attachment manifest, and (first turn only) the bounded
-   * topic history; see {@link nativeTurnMessage}.
+   * topic history; see {@link nativeTurnPrompt}.
    *
    * A failure in prompt assembly degrades to the plain text prompt (the turn
    * must run); a failed quote/history read degrades silently to its absence.
    */
-  private async deliverTurnMessage(
+  private async assembleTurnPrompt(
     msg: NormalizedMessage,
     record: RouteRecord,
     content: string,
+    agent: Agent,
     options: TurnDeliveryOptions = {},
-  ): Promise<UserMessage> {
+  ): Promise<ChannelPrompt> {
     try {
-      return await this.nativeTurnMessage(msg, record, content, options)
+      return await this.nativeTurnPrompt(msg, record, content, agent, options)
     } catch (error) {
       this.ctx.logger?.warn?.(
         'dsh-channels: assembling the attachment manifest for %s failed: %s',
         msg.messageId, String(error),
       )
-      return feishuUserMessage(content, msg.senderId)
+      return channelPrompt(content, principalOnRoute(record, msg.senderId))
     }
   }
 
@@ -825,42 +832,37 @@ export class InboundRouter {
     const typingPromise = this.delivery.requireChannel().addReaction(msg.messageId, 'Typing').catch(() => undefined)
 
     const sessionId = randomUUID() as SessionId
-    const initialStats = { sessionId, inputTokens: 0, outputTokens: 0 }
 
     // 2. First card frame — also creates the topic (reply_in_thread). The
     //    topic identity is only known after Feishu answers, and it names the
-    //    topic's private working directory inside the user's workspace.
+    //    topic's workspace directory.
     const sent = await this.delivery.replyFirstCard(msg, initialStreamingCard(sessionId))
     const typingId = await typingPromise
     const key = sent.degraded || sent.threadId === undefined ? chatKey : sent.threadId
     const kind = sent.degraded || sent.threadId === undefined ? 'chat' : 'thread'
 
     const topicToken = topicTokenFor(key, kind, sessionId)
-    const services: PlacementServices = placementServices(this.ctx)
-    const warn = (message: string, ...args: unknown[]): void => {
-      this.ctx.logger?.warn?.(message, ...args)
-    }
     /** Patch the streaming card to its terminal creation-failure state. */
     const failCreation = async (error: unknown): Promise<void> => {
       void this.repair.clear(sent.messageId)
-      await this.delivery.requireChannel().updateCard(sent.messageId, buildCard({
-        phase: 'error',
-        reasoning: '',
-        body: `会话创建失败：${String(error)}`,
-        stats: { ...initialStats },
-      })).catch(() => {})
+      await this.delivery.requireChannel().updateCard(sent.messageId, failedStreamingCard(sessionId, `会话创建失败：${String(error)}`)).catch(() => {})
     }
 
-    // 3. User workspace (the durable project this Session is grouped under)
-    //    plus the per-topic placement plan. No Agent exists yet; the plan
-    //    materializes anything that must exist before creation.
+    // 3. The topic's own workspace (its directory is the Session header cwd:
+    //    the sandbox root and the project the Session is grouped under),
+    //    titled after the group or person and the opening message. A group
+    //    gets its permission record (every switch off) when its first topic
+    //    opens. No Agent exists yet.
     let workspace: Workspace
-    let plan: TopicPlan
     try {
-      workspace = await ensureWorkspace(
-        this.ctx, this.config.baseDir, msg.chatType, msg.chatId, msg.senderId,
-      )
-      plan = await planTopic(services, this.config, workspace.path, topicToken, warn)
+      workspace = await openTopicWorkspace(this.ctx, this.deps.location, {
+        baseDir: this.config.baseDir,
+        chatType: msg.chatType,
+        chatId: msg.chatId,
+        userId: msg.senderId,
+        topicToken,
+        titleText: content,
+      })
     } catch (error) {
       await failCreation(error)
       throw error
@@ -882,36 +884,18 @@ export class InboundRouter {
       attempts: 0,
     })
 
-    // 4. Create the Session (header cwd = user workspace when directories can
-    //    be switched), then enter its own topic directory / worktree.
-    let handle: AgentHandle | undefined
-    let placement: TopicPlacement | undefined
+    // 4. Create the Session in the topic directory (its header cwd).
+    let handle: AgentHandle
     try {
-      handle = await this.sessions.createSession(sessionId, plan.cwd)
-      placement = await enterTopic(services, handle.agent, plan, workspace.path, topicToken, warn)
-      // A workspace attachment only validates when the header cwd is the
-      // workspace itself; the hard fallback (no workingDirectory service) must
-      // skip it instead of logging a guaranteed failure.
-      if (plan.cwd === workspace.path) {
-        void Promise.resolve(workspace.attachSession(sessionId)).catch((error: unknown) => {
-          warn('dsh-channels: attaching initial session %s to workspace failed: %s', sessionId, String(error))
-        })
-      }
-      await this.sessions.mountGuidance(handle.agent)
+      handle = await this.sessions.openTopicSession(sessionId, workspace.path)
     } catch (error) {
-      // The card lands in a final failure state — no repair needed later. A
-      // Session created just before the failure must not stay live unnoticed.
-      await handle?.dispose().catch(() => {})
+      // The card lands in a final failure state — no repair needed later.
       await failCreation(error)
       throw error
     }
-    if (handle === undefined || placement === undefined) {
-      throw new Error('dsh-channels: session creation completed without a handle')
-    }
 
     // 5. Persist the route (thread-scoped, or degraded chat-scoped).
-    const createdAt = handle.agent.session.header.createdAt
-    const record: RouteRecord = {
+    const record = newTopicRoute({
       key,
       kind,
       sessionId,
@@ -919,13 +903,8 @@ export class InboundRouter {
       chatType: msg.chatType,
       senderUserId: msg.senderId,
       workspacePath: workspace.path,
-      sessionDir: placement.sessionDir,
-      ...(placement.worktreeBranch === undefined ? {} : { worktreeBranch: placement.worktreeBranch }),
       cardMessageId: sent.messageId,
-      createdAt,
-      lastActivityAt: createdAt,
-      sessionHistory: [{ sessionId, createdAt }],
-    }
+    }, handle.agent.session.header.createdAt)
     // The delivery gate is opened BEFORE the route becomes durable: a message
     // that can see the route must also wait for this Session's first followup
     // (the image prefetch below keeps the route-to-followup window open).
@@ -933,20 +912,23 @@ export class InboundRouter {
     try {
       await this.routes.put(key, record)
 
-      // 6. Stream into the card and hand the message to the driver. The prompt
-      //    is assembled only now (after the route is durable and tools are
-      //    mounted): images may be prefetched, files stay lazy behind the
+      // 6. Stream into the card and submit the prompt as the sender. The
+      //    prompt is assembled only now (after the route is durable and tools
+      //    are mounted): images may be prefetched, files stay lazy behind the
       //    manifest, and the (first turn only) bounded topic history plus the
       //    quoted-message excerpt are attached as text blocks. `routes.put` and
-      //    `followup` stay synchronous with respect to other turns because
+      //    the submission stay ordered with respect to other turns because
       //    later messages wait on the delivery gate.
-      const message = await this.deliverTurnMessage(msg, record, content, {
+      const prompt = await this.assembleTurnPrompt(msg, record, content, handle.agent, {
         firstTurn: true,
         excludeMessageIds: [msg.messageId, sent.messageId],
       })
-      await this.repair.recordMessage(sent.messageId, message, msg.senderId)
-      this.streamer?.attach(handle.agent.session, sent.messageId, msg.messageId, typingId, { message })
-      handle.agent.followup(message)
+      await this.repair.recordPrompt(sent.messageId, prompt)
+      await this.deps.prompts.run(handle.agent, prompt, {
+        cardMessageId: sent.messageId,
+        triggerMessageId: msg.messageId,
+        ...(typingId === undefined ? {} : { reactionId: typingId }),
+      })
     } finally {
       closeDeliveryGate()
     }
@@ -956,26 +938,24 @@ export class InboundRouter {
     // Defence in depth: every current caller checks this first, but a future
     // call path must not be able to continue another user's Session.
     if (!this.access.ownsRoute(msg, record)) return
-    const services = placementServices(this.ctx)
-    const warn = (message: string, ...args: unknown[]): void => {
-      this.ctx.logger?.warn?.(message, ...args)
+    // The message may have waited behind a running turn; chat access turned
+    // off meanwhile refuses it here, before anything reaches the Session.
+    if (!this.access.allows(msg)) {
+      await this.delivery.noticeText(msg, CHAT_ACCESS_REVOKED_TEXT)
+      return
     }
     const typingPromise = this.delivery.requireChannel().addReaction(msg.messageId, 'Typing').catch(() => undefined)
     const live = await this.sessions.ensureLive(record)
     // The topic directory can disappear independently of the Session (manual
-    // deletion, external cleanup). Recreate it and re-align the effective
-    // working directory so the turn never leaks into the shared workspace root.
-    const placement = await restoreTopicDir(services, live.agent, {
-      workspacePath: record.workspacePath,
-      sessionDir: sessionDirOf(record),
-      ...(record.worktreeBranch === undefined ? {} : { worktreeBranch: record.worktreeBranch }),
-    }, warn)
-    let current: RouteRecord = record
-    if (placement.sessionDir !== sessionDirOf(record) || placement.worktreeBranch !== record.worktreeBranch) {
-      current = { ...record, sessionDir: placement.sessionDir }
-      delete current.worktreeBranch
-      if (placement.worktreeBranch !== undefined) current = { ...current, worktreeBranch: placement.worktreeBranch }
-    }
+    // deletion, external cleanup); recreate it so the turn has its directory.
+    await mkdir(record.workspacePath, { recursive: true }).catch((error: unknown) => {
+      this.ctx.logger?.warn?.('dsh-channels: recreating topic directory %s failed: %s', record.workspacePath, String(error))
+    })
+    // A group route remembers its latest speaker for the commit trailer a
+    // restart would otherwise attribute to the initiator.
+    const current: RouteRecord = isGroupRoute(record) && record.lastSpeakerUserId !== msg.senderId
+      ? { ...record, lastSpeakerUserId: msg.senderId }
+      : record
 
     // A message behind a running turn opens as a queued card whose button can
     // move it into that turn instead (see `TurnStreamer.mergeQueued`).
@@ -1003,11 +983,14 @@ export class InboundRouter {
       cardMessageId: sent.messageId,
       lastActivityAt: Date.now(),
     })
-    const message = await this.deliverTurnMessage(msg, current, content, {
+    const prompt = await this.assembleTurnPrompt(msg, current, content, live.agent, {
       excludeMessageIds: [msg.messageId, sent.messageId],
     })
-    await this.repair.recordMessage(sent.messageId, message, msg.senderId)
-    this.streamer?.attach(live.agent.session, sent.messageId, msg.messageId, typingId, { message })
-    live.agent.followup(message)
+    await this.repair.recordPrompt(sent.messageId, prompt)
+    await this.deps.prompts.run(live.agent, prompt, {
+      cardMessageId: sent.messageId,
+      triggerMessageId: msg.messageId,
+      ...(typingId === undefined ? {} : { reactionId: typingId }),
+    })
   }
 }

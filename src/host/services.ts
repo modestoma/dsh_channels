@@ -6,11 +6,12 @@
  * @module dsh-channels/host/services
  */
 
+import type { RawDomainHandle } from '../storage/table.ts'
 import type { Agent, AgentRegistry } from './agent.ts'
 import type { AttachmentStore } from './attachments.ts'
 import type { CommandRuntime } from './commands.ts'
 import type { TopicLaunchState } from '../topics/contract.ts'
-import type { AssistantStreamPayload, CommitTrailersEvent, InboxClaimedPayload, InboxDiscardedPayload, PreToolDecision, PreToolExecution, Session, SessionEvent, SessionId } from './core.ts'
+import type { AssistantStreamPayload, AuthorizeEvent, CommitTrailersEvent, InboxClaimedPayload, InboxDiscardedPayload, PreToolDecision, PreToolExecution, Session, SessionEvent, SessionId } from './core.ts'
 import type { ApprovalAnswererListener, UserQuestionAnswererListener } from './interaction.ts'
 
 // ---- Workspace surface --------------------------------------------------
@@ -21,6 +22,8 @@ export interface Workspace {
   readonly title: string
   attachSession(id: SessionId): Promise<void> | void
   detachSession(id: SessionId): Promise<void> | void
+  /** Rename the workspace in the host's list (absent on older hosts). */
+  setTitle?(title: string): Promise<void>
 }
 
 export interface WorkspaceRegistry {
@@ -31,11 +34,30 @@ export interface WorkspaceRegistry {
   delete(id: string): Promise<boolean>
 }
 
+/**
+ * The effective-directory service (`@deepseek-ai/dsh-working-directory`,
+ * mounted by every base-backed profile): the directory a Session's file
+ * tools resolve relative paths against. This plugin only reads it (the read
+ * fence); it never moves a Session.
+ */
+export interface WorkingDirectoryService {
+  get(session: Session): string
+}
+
+/**
+ * Resolve the effective-directory service from the host context.
+ * @param ctx - host context.
+ * @returns the service, or undefined when the deployment has none.
+ */
+export function workingDirectoryService(ctx: Pick<HostContext, 'get'>): WorkingDirectoryService | undefined {
+  return ctx.get?.('workingDirectory') as WorkingDirectoryService | undefined
+}
+
 // ---- Storage / token-meter / llm / credentials surface ------------------
 
 /** The host's storage-domain facility (narrowly typed at the call site). */
 export interface StorageDomainFacility {
-  open(spec: unknown): Promise<unknown>
+  open(spec: unknown): Promise<RawDomainHandle>
 }
 
 /** One resolved credential value and the source layer that supplied it. */
@@ -341,9 +363,15 @@ export interface HostContext {
     listener: (exec: PreToolExecution, next: () => Promise<PreToolDecision>) => Promise<PreToolDecision>,
   ): () => boolean
   /**
+   * The neutral `access/authorize` event, dispatched with `ctx.parallel`
+   * before a write is made for a Session; a throwing listener refuses the
+   * write with its message. Never fires without a plugin that asks.
+   */
+  on(name: 'access/authorize', listener: (event: AuthorizeEvent) => void | Promise<void>): () => boolean
+  /**
    * dsh-repo's `repo/commit-trailers` event, dispatched with `ctx.parallel`
-   * before `repo_workspace_push` commits for a Session. Never fires without
-   * dsh-repo.
+   * before a workspace is committed and pushed for a Session. Never fires
+   * without dsh-repo.
    */
   on(name: 'repo/commit-trailers', listener: (event: CommitTrailersEvent) => void | Promise<void>): () => boolean
   /**

@@ -5,7 +5,7 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import type { HostContext } from '../src/dsh-types.ts'
+import type { HostContext } from '../src/host/index.ts'
 import { createSettingsDirectoryPicker } from '../src/settings/directory-picker.ts'
 import type { HostDirectoryPickerService } from '../src/settings/directory-picker.ts'
 import { FIELD_DESCRIPTORS, withDirectoryBrowse } from '../src/settings/surface.ts'

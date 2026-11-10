@@ -13,20 +13,22 @@ import type { AcquireOptions, InstanceLockProvider, LockHolderInfo } from '../sr
 import { FeishuService } from '../src/service.ts'
 import type {
   Agent, AgentContext, AgentHandle, AgentOptions, AgentRegistry, AgentRequestConfig, AgentRequestListener, ApprovalAnswererListener,
-  AssistantStreamPayload, AttachmentStore, CommitTrailersEvent, InboxClaimedPayload, CommandDefinition, CommandInvocation, CommandRuntime, EncodedImageAttachment,
+  AssistantStreamPayload, AttachmentStore, AuthorizeEvent, CommitTrailersEvent, InboxClaimedPayload, CommandDefinition, CommandInvocation, CommandRuntime, EncodedImageAttachment,
   FileAttachmentRef, HostContext, ImageAttachmentLimits, ImageAttachmentRef, ImageMediaType, PermissionPresets, PreToolDecision,
   PreToolExecution, PromptSection,
   Session, SessionEvent, SessionId, SessionProjections, StorageDomainFacility, ToolDefinition, ToolRuntime,
-  UserMessage, UserQuestionAnswererListener, Workspace, WorkspaceRegistry,
-} from '../src/dsh-types.ts'
-import type {
-  CreatedWorktree, WorkingDirectoryService, WorktreeService,
-} from '../src/session/isolation.ts'
+  UserMessage, UserQuestionAnswererListener, WorkingDirectoryService, Workspace, WorkspaceRegistry,
+} from '../src/host/index.ts'
 import type {
   BotAddedEvent, CardActionEvent, ChatInfo, FeishuChannel, FeishuConnectionStatus, FeishuProfile, NormalizedMessage,
   OutboundMedia, RawMessageListParams, SendResult,
 } from '../src/feishu-channel.ts'
-import type { RawDomainHandle } from '../src/domain.ts'
+import type { RawDomainHandle } from '../src/storage/table.ts'
+import type {
+  FileUploads, HostConnection, InvokeRemoteRequest, PeerScope, RemoteAccess, RemoteAccessPolicy, SessionPromptRequest, TypertGateway,
+} from '../src/host/remote.ts'
+import type { ChannelPrincipal } from '../src/access/principal.ts'
+import { randomUUID } from 'node:crypto'
 import type { ScopeGrant } from '../src/feishu/scopes.ts'
 import type { SlashCommandApi } from '../src/feishu/slash-commands.ts'
 
@@ -305,8 +307,9 @@ export function makeAttachmentStore(options: FakeAttachmentStoreOptions = {}): A
 
 /** The parts of a submitted prompt tests read. */
 interface FollowupMessage {
+  id: string
   content: Array<{ type: string; text?: string; attachment?: unknown }>
-  source: { kind: string; principal?: unknown }
+  source: { kind: string; rpcId?: string; principal?: unknown }
 }
 
 /** Snapshot every followup prompt handed to a fake agent. */
@@ -366,6 +369,28 @@ export class FakeTurnDriver {
   }
 
   /**
+   * The messages still waiting for their own turn (the Agent's `inbox.nextTurn`).
+   * @param session - the Agent's session.
+   * @returns the queue, oldest first.
+   */
+  queued(session: Session): readonly UserMessage[] {
+    return this.of(session).queue
+  }
+
+  /**
+   * Remove one still-pending message (the Agent's `inbox.remove`).
+   * @param session - the Agent's session.
+   * @param messageId - the message to drop.
+   * @returns false when no pending message has the id.
+   */
+  remove(session: Session, messageId: string): boolean {
+    const entry = this.of(session)
+    const before = entry.queue.length
+    entry.queue = entry.queue.filter(queued => queued.id !== messageId)
+    return entry.queue.length < before
+  }
+
+  /**
    * Observe a session event; `turn/end` of the running turn claims the next followup.
    * @param session - the event's session.
    * @param event - the appended event.
@@ -404,16 +429,185 @@ export class FakeTurnDriver {
 }
 
 export function makeAgent(session: Session, options: AgentOptions = {}, ctx?: AgentContext, driver?: FakeTurnDriver): Agent {
+  const ownQueue: UserMessage[] = []
   return {
     id: session.id,
     options,
     session,
     status: 'idle',
-    inbox: { nextTurn: [], nextStep: [], remove: vi.fn(() => true) },
+    // The inbox mirrors the fake loop's queue, as the host's does; without a
+    // loop, tests fill the array themselves.
+    inbox: {
+      get nextTurn() { return driver?.queued(session) ?? ownQueue },
+      nextStep: [],
+      remove: vi.fn((messageId: string) => driver?.remove(session, messageId) ?? true),
+    },
     ctx: ctx ?? makeAgentContext(),
     followup: vi.fn((message: UserMessage) => { driver?.followup(session, message) }),
     steer: vi.fn((message: UserMessage) => { driver?.steered(session, message) }),
   }
+}
+
+/** A Remote failure as DSH's `RemoteError` throws it (structural marker, no class). */
+export function remoteError(code: string, message: string, details: Record<string, unknown> = {}): Error & { isDSHRemoteError: true; code: string; details: unknown } {
+  return Object.assign(new Error(message), { isDSHRemoteError: true as const, code, details })
+}
+
+/** One staged upload of the fake `fileUploads`. */
+export type FakeStagedAttachment =
+  | { readonly type: 'image'; readonly attachment: ImageAttachmentRef }
+  | { readonly type: 'file'; readonly attachment: FileAttachmentRef }
+
+/**
+ * Fakes of the DSH Web services the prompt path uses: in-process Peers, the
+ * access registry, staged uploads, and a Gateway whose `session/prompt`
+ * behaves like the host's (access decision for non-owner Peers, live-Agent
+ * lookup, request-id deduplication, receipt resolution, host-minted message
+ * id with `source: { kind: 'user', rpcId, principal }`).
+ */
+export interface FakeRemoteServices {
+  connection: HostConnection & { peers: PeerScope[] }
+  remoteAccess: RemoteAccess & {
+    policies: Map<string, RemoteAccessPolicy<ChannelPrincipal>>
+    invalidations: number
+    /** The decision the fake Gateway makes for one prompt. */
+    decide(principal: ChannelPrincipal, sessionId: string): { kind: 'allow' } | { kind: 'deny'; reason: string }
+  }
+  gateway: TypertGateway & { calls: InvokeRemoteRequest[] }
+  fileUploads: FileUploads & { staged: Map<string, Map<string, FakeStagedAttachment>> }
+}
+
+export function makeRemoteServices(deps: {
+  agents: AgentRegistry
+  attachments: AttachmentStore
+  llm: { resolveModelInfo(provider: string, model: string): Promise<{ inputModalities?: readonly string[]; [key: string]: unknown }> }
+}): FakeRemoteServices {
+  const peers: PeerScope[] = []
+  const connection: FakeRemoteServices['connection'] = {
+    peers,
+    createPeer: vi.fn(({ principal }: { principal: ChannelPrincipal }) => {
+      const lifetime = new AbortController()
+      const peer: PeerScope = {
+        id: randomUUID(),
+        principal,
+        signal: lifetime.signal,
+        dispose: vi.fn(async () => { lifetime.abort(new Error('disposed')) }),
+      }
+      peers.push(peer)
+      return peer
+    }),
+  }
+  const policies = new Map<string, RemoteAccessPolicy<ChannelPrincipal>>()
+  const remoteAccess: FakeRemoteServices['remoteAccess'] = {
+    policies,
+    invalidations: 0,
+    registerPolicy: vi.fn((kind: string, policy: RemoteAccessPolicy<ChannelPrincipal>) => {
+      if (policies.has(kind)) throw new Error(`remote-access: a policy for ${JSON.stringify(kind)} is already registered`)
+      policies.set(kind, policy)
+      return () => { policies.delete(kind) }
+    }) as RemoteAccess['registerPolicy'],
+    invalidate: vi.fn(() => { remoteAccess.invalidations += 1 }),
+    decide(principal, sessionId) {
+      const policy = policies.get(principal.kind)
+      if (policy === undefined) return { kind: 'deny', reason: 'no-allow' }
+      const allowed = policy.bindings(principal).some(binding =>
+        binding.resource.kind === 'session' && binding.resource.id === sessionId && binding.role.actions.includes('session/prompt'))
+      if (allowed) return { kind: 'allow' }
+      return { kind: 'deny', reason: policy.explain?.({ principal, action: 'session/prompt', resources: [{ kind: 'session', id: sessionId }] }) ?? 'no-allow' }
+    },
+  }
+  const staged = new Map<string, Map<string, FakeStagedAttachment>>()
+  const stage = (sessionId: string, attachment: FakeStagedAttachment): string => {
+    let bySession = staged.get(sessionId)
+    if (bySession === undefined) {
+      bySession = new Map()
+      staged.set(sessionId, bySession)
+    }
+    const receiptId = `receipt-${randomUUID()}`
+    bySession.set(receiptId, attachment)
+    return receiptId
+  }
+  const collect = async (data: AsyncIterable<Uint8Array>): Promise<Uint8Array> => {
+    const chunks: Uint8Array[] = []
+    for await (const chunk of data) chunks.push(chunk)
+    return new Uint8Array(Buffer.concat(chunks.map(chunk => Buffer.from(chunk))))
+  }
+  const fileUploads: FakeRemoteServices['fileUploads'] = {
+    staged,
+    uploadImageStream: vi.fn(async (request: { sessionId: string; data: AsyncIterable<Uint8Array>; mediaType: string; name?: string }) => {
+      if (deps.agents.get(request.sessionId as SessionId) === undefined) {
+        throw remoteError('session/not-found', `session "${request.sessionId}" is not attached`, { sessionId: request.sessionId })
+      }
+      const data = await collect(request.data)
+      const image = await deps.attachments.saveImage({
+        data, mediaType: request.mediaType as ImageMediaType, ...(request.name === undefined ? {} : { name: request.name }),
+      })
+      return { receiptId: stage(request.sessionId, { type: 'image', attachment: image }), image }
+    }),
+    upload: vi.fn(async (agent: Agent, request: { data: string; name?: string }) => {
+      const bytes = new Uint8Array(Buffer.from(request.data, 'base64'))
+      const file = await deps.attachments.saveFileStream({
+        data: (async function* () { yield bytes })(), ...(request.name === undefined ? {} : { name: request.name }),
+      })
+      return { receiptId: stage(agent.id, { type: 'file', attachment: file }), file }
+    }),
+    resolve: vi.fn((agent: Agent, receiptId: string) => staged.get(agent.id)?.get(receiptId)),
+  }
+  const calls: InvokeRemoteRequest[] = []
+  const gateway: FakeRemoteServices['gateway'] = {
+    calls,
+    invoke: vi.fn(async (request: InvokeRemoteRequest) => {
+      calls.push(request)
+      if (request.namespace !== 'session' || request.method !== 'prompt') {
+        throw remoteError('gateway/unknown-endpoint', `${request.namespace}/${request.method}`)
+      }
+      const prompt = request.args.request as SessionPromptRequest
+      const decision = remoteAccess.decide(request.peer.principal, prompt.sessionId)
+      if (decision.kind === 'deny') {
+        throw remoteError('remote-access/denied', `remote access: session/prompt: access denied (${decision.reason})`, { action: 'session/prompt', reason: decision.reason })
+      }
+      if (!prompt.content.some(part => part.type === 'file' || (part.type === 'text' && part.text.trim() !== ''))) {
+        throw remoteError('gateway/bad-request', 'prompt content must include non-whitespace text or an attachment')
+      }
+      const agent = deps.agents.get(prompt.sessionId)
+      if (agent === undefined) throw remoteError('session/not-found', `session "${prompt.sessionId}" is not attached`, { sessionId: prompt.sessionId })
+      const requested = (source: unknown): boolean =>
+        typeof source === 'object' && source !== null && (source as { rpcId?: unknown }).rpcId === prompt.requestId
+      const queued = [...agent.inbox.nextTurn, ...agent.inbox.nextStep]
+        .some(message => requested((message as { source?: unknown }).source))
+      const logged = sessionEvents(agent.session).some(event => event.type === 'user/message' && requested(event.data.source))
+      if (queued || logged) return { accepted: true }
+      const content: UserMessage['content'] = []
+      for (const part of prompt.content) {
+        if (part.type === 'text') {
+          content.push({ type: 'text', text: part.text })
+          continue
+        }
+        const upload = staged.get(agent.id)?.get(part.receiptId)
+        if (upload === undefined) throw remoteError('session/attachment-invalid', 'file upload receipt is not staged', { reason: 'FILE_NOT_STAGED' })
+        content.push({ type: upload.type, attachment: upload.attachment })
+      }
+      const current = agent.model?.current()
+      if (content.some(block => block.type === 'image') && current !== undefined) {
+        const model = await deps.llm.resolveModelInfo(current.provider, current.model)
+        if (model.inputModalities !== undefined && !model.inputModalities.includes('image')) {
+          throw remoteError('session/attachment-invalid', `Model "${current.model}" does not support image input.`, { reason: 'MODEL_DOES_NOT_SUPPORT_IMAGES' })
+        }
+      }
+      const source: UserMessage['source'] & { rpcId: string; principal: ChannelPrincipal } = {
+        kind: 'user', rpcId: prompt.requestId, principal: request.peer.principal,
+      }
+      const message: UserMessage = { id: `msg-${randomUUID()}` as UserMessage['id'], role: 'user', content, source }
+      try {
+        if (prompt.mode === 'steer') agent.steer(message)
+        else agent.followup(message)
+      } catch (error) {
+        throw remoteError('session/agent-busy', 'prompt rejected', { reason: String(error) })
+      }
+      return { accepted: true }
+    }),
+  }
+  return { connection, remoteAccess, gateway, fileUploads }
 }
 
 export interface FakeAgentsOptions {
@@ -624,63 +818,28 @@ export function makeAgentPresets(options: FakeAgentPresetsOptions = {}): FakeAge
 
 /**
  * Fake effective-directory service mirroring `ctx.workingDirectory`: the
- * Session's directory defaults to its header cwd, and `set` records a durable
- * `working-directory/change` event on the fake log.
+ * Session's directory defaults to its header cwd; a test moves a Session
+ * with `apply` (the read fence then resolves paths against that directory).
  */
 export interface FakeWorkingDirectory {
   service: WorkingDirectoryService
   /** Session id → effective directory (only for sessions that moved). */
   dirs: Map<string, string>
-  /** Every successful `set` call, in order. */
-  sets: Array<{ sessionId: string; path: string }>
-  /** Directly move one agent (also records the event and the `sets` entry). */
+  /** Directly move one agent. */
   apply(agent: Agent, directory: string): void
 }
 
 export function makeWorkingDirectory(): FakeWorkingDirectory {
   const dirs = new Map<string, string>()
-  const sets: Array<{ sessionId: string; path: string }> = []
   const apply = (agent: Agent, directory: string): void => {
     dirs.set(agent.session.id, directory)
-    sets.push({ sessionId: agent.session.id, path: directory })
   }
   const service: WorkingDirectoryService = {
     get(session) {
       return dirs.get(session.id) ?? session.header.cwd ?? ''
     },
-    async set(agent, directory) {
-      apply(agent, directory)
-      return directory
-    },
   }
-  return { service, dirs, sets, apply }
-}
-
-/** Fake Git-worktree service mirroring `ctx.worktrees.create`. */
-export interface FakeWorktrees {
-  service: WorktreeService
-  created: Array<{ sessionId: string; name: string; path: string; branch: string }>
-  /** When set, every `create` rejects with this error (fallback-path tests). */
-  failWith?: Error
-}
-
-export function makeWorktrees(workingDirectory: FakeWorkingDirectory): FakeWorktrees {
-  const fake: FakeWorktrees = {
-    created: [],
-    service: {
-      create: vi.fn(async (agent, request = {}): Promise<CreatedWorktree> => {
-        if (fake.failWith !== undefined) throw fake.failWith
-        const name = request.name ?? `worktree-${fake.created.length}`
-        const root = workingDirectory.service.get(agent.session)
-        const directory = path.join(root, '.agents', 'worktrees', name)
-        mkdirSync(directory, { recursive: true })
-        workingDirectory.apply(agent, directory)
-        fake.created.push({ sessionId: agent.session.id, name, path: directory, branch: name })
-        return { path: directory, branch: name, baseCommit: 'deadbeef', repositoryRoot: root }
-      }),
-    },
-  } as FakeWorktrees
-  return fake
+  return { service, dirs, apply }
 }
 
 /** One `tools/pre-execute` waterfall listener. */
@@ -700,7 +859,6 @@ export function makeHostContext(
   workspaces: ReturnType<typeof makeWorkspaceRegistry>
   domain: ReturnType<typeof makeDomain>
   workingDirectory: FakeWorkingDirectory
-  worktrees: FakeWorktrees
   credentials: {
     resolve: ReturnType<typeof vi.fn>
     describe: ReturnType<typeof vi.fn>
@@ -716,12 +874,16 @@ export function makeHostContext(
   questionListeners: Array<{ listener: UserQuestionAnswererListener; options: { prepend?: boolean } | undefined }>
   /** Every `tools/pre-execute` listener the service registered. */
   preExecuteListeners: PreExecuteListener[]
+  /** Every `access/authorize` listener the service registered. */
+  authorizeListeners: Array<(event: AuthorizeEvent) => void | Promise<void>>
   /** Every `repo/commit-trailers` listener the service registered. */
   commitTrailerListeners: Array<(event: CommitTrailersEvent) => void | Promise<void>>
   /** Every `repo/resolve-agent` listener the service registered, with its options. */
   resolveAgentListeners: Array<{ listener: ResolveAgentListener; options: { prepend?: boolean } | undefined }>
   permissions: PermissionPresets & { set: ReturnType<typeof vi.fn>; preset: string }
   sessionQuery: { readTitleSnapshots: ReturnType<typeof vi.fn> }
+  /** The fake DSH Web services behind `session/prompt` submission. */
+  remote: FakeRemoteServices
 } {
   const inboxClaimedListeners: Array<(payload: InboxClaimedPayload) => void> = []
   const driver = new FakeTurnDriver((session, message, turn) => {
@@ -734,12 +896,12 @@ export function makeHostContext(
   const workspaces = makeWorkspaceRegistry()
   const domain = makeDomain()
   const workingDirectory = makeWorkingDirectory()
-  const worktrees = makeWorktrees(workingDirectory)
   const sessionListeners: Array<(session: Session, event: SessionEvent) => void> = []
   const assistantStreamListeners: Array<(payload: AssistantStreamPayload) => void> = []
   const approvalListeners: Array<{ listener: ApprovalAnswererListener; options: { prepend?: boolean } | undefined }> = []
   const questionListeners: Array<{ listener: UserQuestionAnswererListener; options: { prepend?: boolean } | undefined }> = []
   const preExecuteListeners: PreExecuteListener[] = []
+  const authorizeListeners: Array<(event: AuthorizeEvent) => void | Promise<void>> = []
   const commitTrailerListeners: Array<(event: CommitTrailersEvent) => void | Promise<void>> = []
   const resolveAgentListeners: Array<{ listener: ResolveAgentListener; options: { prepend?: boolean } | undefined }> = []
   const tokenMeter = { measure: () => ({ totalTokens: 1234 }) }
@@ -798,9 +960,14 @@ export function makeHostContext(
   // The native attachment library is a required plugin dependency; a test may
   // pass its own fake through `extraServices.attachments` to inspect it.
   const attachments = (extraServices.attachments as AttachmentStore | undefined) ?? makeAttachmentStore()
+  const remote = makeRemoteServices({ agents: agents.registry, attachments, llm })
   const services: Record<string, unknown> = {
     agents: agents.registry,
     attachments,
+    connection: remote.connection,
+    typertGateway: remote.gateway,
+    remoteAccess: remote.remoteAccess,
+    fileUploads: remote.fileUploads,
     sessionQuery,
     commands,
     workspaceRegistry: workspaces.registry,
@@ -811,7 +978,6 @@ export function makeHostContext(
     userQuestions: {},
     permissionPresets: permissions,
     workingDirectory: workingDirectory.service,
-    worktrees: worktrees.service,
     ...(agentPresets === undefined ? {} : { agentPresets }),
     ...(projections === undefined ? {} : { sessionProjections: projections }),
     ...extraServices,
@@ -846,6 +1012,8 @@ export function makeHostContext(
         })
       } else if (name === 'tools/pre-execute') {
         preExecuteListeners.push(listener as PreExecuteListener)
+      } else if (name === 'access/authorize') {
+        authorizeListeners.push(listener as (event: AuthorizeEvent) => void | Promise<void>)
       } else if (name === 'repo/commit-trailers') {
         commitTrailerListeners.push(listener as (event: CommitTrailersEvent) => void | Promise<void>)
       } else if (name === 'repo/resolve-agent') {
@@ -862,8 +1030,8 @@ export function makeHostContext(
   }
   return {
     ctx, agents, workspaces, domain, credentials, sessionListeners, driver,
-    assistantStreamListeners, approvalListeners, questionListeners, preExecuteListeners, commitTrailerListeners, resolveAgentListeners, permissions, sessionQuery,
-    workingDirectory, worktrees,
+    assistantStreamListeners, approvalListeners, questionListeners, preExecuteListeners, authorizeListeners, commitTrailerListeners, resolveAgentListeners, permissions, sessionQuery,
+    workingDirectory, remote,
   }
 }
 

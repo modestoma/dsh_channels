@@ -20,11 +20,12 @@ export interface InteractionRoute {
   cardMessageId: string
   /** Whether the anchor lives in a real topic (replyInThread). */
   inThread: boolean
-  /** The session owner (user_id); the only operator allowed to decide unless `mayDecide` is set. */
+  /** The user who opened the session (user_id); the only operator allowed to decide unless `mayDecide` is set. */
   senderUserId: string
   /**
-   * Decision gate of a group-shared route: replaces the owner-only check with
-   * the route's member admission. Absent = only `senderUserId` decides.
+   * Decision gate of a group route without a single owner: replaces the
+   * owner-only check with the route's member admission (anyone with chat
+   * access in the group). Absent = only `senderUserId` decides.
    */
   mayDecide?(userId: string): boolean
 }
@@ -151,12 +152,23 @@ export class PendingCardTable<E extends PendingCardEntry> {
   /** Full-replacement patch of one delivered card; failures stay contained. */
   patch(entry: E, card: object): void {
     if (entry.messageId === undefined) return
+    this.patchMessage(entry.sessionId, entry.messageId, card)
+  }
+
+  /**
+   * Full-replacement patch of a card no pending entry holds any more (a card
+   * an earlier process left behind); failures stay contained.
+   * @param sessionId - the Session the card belongs to (error logs).
+   * @param messageId - the card message.
+   * @param card - the replacement card.
+   */
+  patchMessage(sessionId: string, messageId: string, card: object): void {
     if (this.patchCard !== undefined) {
-      void this.patchCard(entry.messageId, card)
+      void this.patchCard(messageId, card)
       return
     }
-    void this.channel.updateCard(entry.messageId, card)
-      .catch((error: unknown) => { this.onError(entry.sessionId, error) })
+    void this.channel.updateCard(messageId, card)
+      .catch((error: unknown) => { this.onError(sessionId, error) })
   }
 
   /** Arm the local deadline for a request the host does not time itself. */

@@ -117,7 +117,6 @@ chmod 600 $DSH_HOME/.credentials.yaml
     requireMention: true                # 普通群需 @ 机器人
     dmMode: 'open'                      # 私聊通道开关
     threadFallback: 'degrade'           # 话题被拒时降级为会话级路由
-    topicIsolation: 'auto'              # 话题目录隔离：auto（Git 仓库用 worktree，否则子目录）/ subdir / worktree
     acceptAttachments: true             # 接收飞书附件：native 下图片预取、文件懒取、纯附件静默不回复
     prefetchImages: true                # 触发消息图片预取为首轮 ImageBlock
     prefetchImageMaxBytes: 20971520     # 单张预取图片上限（20 MiB）
@@ -131,9 +130,11 @@ chmod 600 $DSH_HOME/.credentials.yaml
       attachmentFetchTimeoutMs: 120000  # 单次调用整段超时（120 s）
       topicMessages: true               # feishu_topic_messages：读取引用/话题历史并授权附件
       topicMessagesTimeoutMs: 20000     # 单次话题读取整段超时（20 s）
-    approvalTimeoutMs: 300000           # HITL 审批决策卡等待时长（默认 5 分钟）
+    approvalTimeoutMs: 86400000         # HITL 审批决策卡等待时长（默认 24 小时）
+    approvalBackgroundTimeoutMs: 1800000 # 后台唤醒的回合的审批等待（默认 30 分钟）
+    approvalReminderMs: 600000          # 私聊审批卡未处理时多久提醒一次（默认 10 分钟，0 = 不提醒）
     accessMode: 'guarded'               # 准入模式：guarded（默认）| open（旧行为，不安全）
-    # codeWriteTools: [...]             # 需要「代码改动」开关的工具名，默认是 dsh-repo 推送/MR/Issue 写操作与观象的 SKILL 提交
+    # codeWriteTools: []                # 另外需要「代码改动」开关的工具名（默认空；经 access/authorize 发问的插件不用列）
     authRequestTtlDays: 7               # 入群/用户授权申请卡有效期（天）
     loggerLevel: 'info'
 ```
@@ -143,7 +144,7 @@ chmod 600 $DSH_HOME/.credentials.yaml
 | 配置项 | 默认 | 说明 |
 |--------|------|------|
 | `appId` / `appSecret` | `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | 凭据引用名（shell 标识符），经 `ctx.credentials` 解析；仅当凭据库使用其它变量名时才需要覆盖。明文密钥会被拒绝 |
-| `baseDir` | `./channels-data` | 工作区目录树根：每个用户一个工作区（私聊 `p2p/<user_id>/`，群聊 `groups/<chat_id>/<user_id>/`），每个话题的工作目录为 `<工作区>/topics/<话题>/`（模型/工具产生文件的落点）；Web 面板可覆盖，只接受绝对路径，`~` 展开，保存时创建并校验目录，只影响之后新建的会话 |
+| `baseDir` | `./channels-data` | 话题目录树根：每个话题一个目录（私聊 `p2p/<user_id>/<话题>/`，群聊 `groups/<chat_id>/<话题>/`），同时登记为 DSH 工作区（模型/工具产生文件的落点）；Web 面板可覆盖，只接受绝对路径，`~` 展开，保存时创建并校验目录，只影响之后新建的会话 |
 | `provider` / `model` | 部署默认 | 新建 session 的路由；省略时继承部署默认 |
 | `reasoningEffort` | 适配器/provider 默认 | Session 初始/重置推理档位；可在话题内用 `/effort` 覆盖 |
 | `maxTokens` | 适配器默认 | 每次模型请求输出上限 |
@@ -151,10 +152,11 @@ chmod 600 $DSH_HOME/.credentials.yaml
 | `dmMode` | `open` | 私聊开关 |
 | `requireMention` | `true` | 普通群是否需要 @ 机器人（话题内续聊不受影响） |
 | `threadFallback` | `degrade` | 话题回复被拒时：`degrade` 降级为会话级延续 / `strict` 直接失败 |
-| `topicIsolation` | `auto` | 话题工作目录形式：`auto`（工作区含 `.git` 时用 Git worktree，否则普通子目录）/ `subdir` / `worktree`（失败回退子目录） |
-| `approvalTimeoutMs` | `300000` | HITL 审批决策卡等待时长（10s–1h）；超时自动拒绝 |
+| `approvalTimeoutMs` | `86400000` | 飞书消息发起的回合的 HITL 审批决策卡等待时长（1 分钟–7 天）；超时自动拒绝，卡片带「重新发起」按钮 |
+| `approvalBackgroundTimeoutMs` | `1800000` | 子代理、后台任务、定时跟进、PR/MR 动态唤醒的回合的审批等待时长（1 分钟–7 天） |
+| `approvalReminderMs` | `600000` | 私聊话题审批卡未处理时，过这么久在卡片下提醒一次；`0` 不提醒；群话题从不提醒 |
 | `accessMode` | `guarded` | 准入模式：`guarded` 仅管理员 + 用户表里对话准入打开的人；`open` 保留旧行为（任何可用范围用户可对话，不安全；知识库与代码改动开关仍生效） |
-| `codeWriteTools` | dsh-repo 写操作与观象 SKILL 提交 | 飞书会话调用这些工具前检查当前发言人的「代码改动」开关（管理员始终放行） |
+| `codeWriteTools` | `[]` | 另外需要「代码改动」开关的工具名：飞书会话调用这些工具前按会话所在位置检查（私聊看本人，管理员直通；群看群权限）。dsh-repo 等经 `access/authorize` 发问的插件已经按同一规则判权，不用列 |
 | `authRequestTtlDays` | `7` | 入群/用户授权申请卡有效期（1–30 天） |
 | `acceptAttachments` | `true` | 接收飞书图片/文件/合并转发记录。native 下触发消息图片预取、文件懒取、纯附件静默不回复（引用该消息再提问时列入清单）；`false` 时附件消息完全惰性（不保存、不触发、不列入清单） |
 | `prefetchImages` | `true` | native 下把触发消息图片预取为首轮 `ImageBlock`；失败/超限/超时降级为清单懒取项。关闭后图片也需 `feishu_attachment_fetch` |
@@ -188,9 +190,9 @@ chmod 600 $DSH_HOME/.credentials.yaml
 5. **按需打开其他开关**（默认关闭，开关互相独立）：管理员发 `/auth set <chat|wiki-read|wiki-write|code> <on|off> @用户`，或在 Web 面板用户表里点对应的开关：
    - 「知识库读取」：该用户发起的话题可以列目录、读文档和表格；
    - 「知识库写入」：该用户发起的话题可以新建、修改文档和表格（不需要同时打开读取）；
-   - 「代码改动」：该用户在飞书里发的消息可以触发推送代码、提交或合并 MR、写 Issue 等工具（`codeWriteTools`）；
+   - 「代码改动」：该用户的私聊话题可以推送代码、提交或合并 MR、写 Issue（`codeWriteTools` 里的工具和经 `access/authorize` 发问的写操作）；
    - 关闭「对话准入」等于停用该用户，其他开关保留但不生效；
-6. 授权/撤销**立即生效**；用户表与待处理申请持久化在插件 `channels_routes_v2` 域，重启不丢。`/auth list` 可随时查看用户表与待处理申请。
+6. 授权/撤销**立即生效**；用户表与待处理申请持久化在插件 `dsh_channels` 域，重启不丢。`/auth list` 可随时查看用户表与待处理申请。
 
 > 说明：**管理员拥有全部权限，其他开关对他不起作用**——机器人被拉进新群后，管理员可以直接 @ 机器人开会话。管理员在任意群里都可以使用 `/auth`、`/groupid` 等命令，但 `/auth` 不能授予或移除管理员。有多位管理员时，授权申请卡发给每一位，任一位处理后其他人的卡片同步更新。
 
@@ -212,7 +214,7 @@ DSH_HOME=$DSH_HOME pnpm dsh web        # 默认 http://127.0.0.1:3080
 
 ```
 [dsh-channels] feishu long connection established, bot open_id: ou_xxxxxxxx
-[dsh-channels] HITL 审批应答已就绪（决策卡片超时 300000 ms）
+[dsh-channels] HITL 审批应答已就绪（决策卡片超时 86400000 ms，后台回合 1800000 ms，私聊提醒 600000 ms）
 [dsh-channels] 准入=guarded，管理员已配置
 ```
 
@@ -254,12 +256,12 @@ DSH_HOME=$DSH_HOME pnpm dsh web        # 默认 http://127.0.0.1:3080
 | 2 | 私聊续聊 | 在刚建的话题里直接再发消息（**不 @**） | 继续同一 session：完成后主卡结算页脚第一行的 session id 不变，input/output token 累计增长 |
 | 3 | 群聊 @ | 在普通群 @ 机器人发消息 | 同 #1；该消息成为新话题根 |
 | 4 | 群聊话题内 | 在上一步的话题里直接发消息（不 @） | 延续该 session，不再要求 @ |
-| 5 | 同群第二个用户 | 换另一个人 @ 机器人 | 新话题 + 新 session；dsh 工作区列表中出现**该用户的独立工作区**（`groups/<chat_id>/<用户 user_id>/`），会话实际工作在它自己的 `topics/<话题>/` 下，与原用户的话题目录互不可见 |
+| 5 | 同群第二个用户 | 换另一个人 @ 机器人 | 新话题 + 新 session；dsh 工作区列表中出现**该话题自己的工作区**（`groups/<chat_id>/<话题 id>/`，标题「群名 · 话题标题」），与第一个话题的目录互不可见；在第一个话题里直接回复则延续第一个 session |
 | 6 | 话题群 | 在话题群某话题中 @ 机器人 | 机器人直接在该话题内回复卡片（不新建话题） |
 | 7 | 折叠面板 | 点面板标题 | 展开推理内容，右侧箭头翻转向上；再点收起 |
 | 8 | 重启恢复 | 重启 dsh 后在旧话题里发消息 | 机器人懒恢复原 session，token 统计继续累计 |
 | 9 | 降级路径 | 在关闭话题功能的群里 @ 机器人 | 正常回复（普通回复气泡），后续 @ 延续同一 session |
-| 10 | HITL 审批 | 让模型执行需要审批的动作（如提示沙箱升级：`bash` 被沙箱拒绝后带 `sandbox_permissions` 重试） | 同一话题内出现独立的「⚠️ 需要你的审批」卡片（✅ 允许 / ❌ 拒绝）；点允许后卡片变「✅ 已允许执行」且动作继续，点拒绝变「❌ 已拒绝」；不点则到时（默认 5 分钟）变「⏱ 已超时未处理，自动拒绝」 |
+| 10 | HITL 审批 | 让模型执行需要审批的动作（如提示沙箱升级：`bash` 被沙箱拒绝后带 `sandbox_permissions` 重试） | 同一话题内出现独立的「⚠️ 需要你的审批」卡片（✅ 允许 / ❌ 拒绝）；点允许后卡片变「✅ 已允许执行」且动作继续，点拒绝变「❌ 已拒绝」；不点则到时（默认 24 小时）变「⏱ 已超时未处理，自动拒绝」并出现「🔁 重新发起」按钮；私聊话题 10 分钟没处理时卡片下会收到一条提醒 |
 | 11 | 管理员初始化（准入） | 没有管理员时私聊 `/userid`，在面板用户表里添加该 user_id 并打开「管理员」 | 没有管理员时 `/userid` 也只回固定文本、不建会话；打开后面板顶部的红字提示消失，管理员私聊正常对话 |
 | 12 | 无权限者私聊 | 用另一个不在用户表里的飞书账号私聊机器人 | 只收到一条固定提示（“你还没有对话权限哦…”）；不建话题/会话、不产生模型调用；该账号发 `/userid` 仍可拿到自己的 ID |
 | 13 | 入群通知 | 分别用管理员和不在用户表里的账号把机器人拉进新群 | 管理员拉群：管理员私聊收到群信息卡（群名/`chat_id`/成员数/邀请人），没有按钮；无权限者拉群：管理员收到用户授权申请卡，标注“把我拉进了群”；群里没有任何机器人消息 |
@@ -276,7 +278,10 @@ DSH_HOME=$DSH_HOME pnpm dsh web        # 默认 http://127.0.0.1:3080
 1. **卡片形态**：审批卡是流式卡之外**新发的独立消息**，锚定在最新流式卡下、同一话题内；流式卡本身不带按钮。
 2. **按钮回传**：待审批时允许/拒绝按钮在同一行等宽排列；点击后卡片立即更新为终态并移除两个按钮。若点击无反应，先核对 §1 第 4 步是否已订阅 **card.action.trigger** 回调并**重新发布版本**（回调订阅随版本生效）。
 3. **归属校验**：群里非发起人点击审批卡：卡片出现「ℹ️ 仅发起该会话的用户可操作此卡片」提示，动作不生效。
-4. **超时**：`approvalTimeoutMs` 内不点 → 卡片变「已超时」，动作被自动拒绝（fail-closed），模型收到拒绝结果后会换路径继续。
+4. **超时**：`approvalTimeoutMs` 内不点 → 卡片变「已超时」，动作被自动拒绝（fail-closed），模型收到拒绝结果后会换路径继续。测试时可在设置面板把「审批卡片等待」调到 1 分钟。
+4a. **重新发起**：点已超时卡片上的「🔁 重新发起」→ 卡片下出现一张新的回复卡，模型先核对状态再重试，需要授权时再发一张审批卡；原卡变「🔁 已重新发起」，再点无效。审批卡未决定时重启 dsh → 卡片变「⚠️ 服务重启，审批已中断」并带同一按钮。
+4b. **私聊提醒**：私聊话题里审批卡 `approvalReminderMs`（默认 10 分钟）没处理 → 卡片下收到一条「⏰ 还有一个审批在等你处理」；群话题不发。
+4c. **不再询问跨重启**：点「本话题不再询问」后重启 dsh，同一话题里同类请求仍直接放行；`/renew` 后重新询问。
 5. **多会话并行**：不同话题的审批互不串扰（每张卡只结算自己的问题）。
 
 ### 5.1 私聊话题验证点（重点）
@@ -285,14 +290,14 @@ DSH_HOME=$DSH_HOME pnpm dsh web        # 默认 http://127.0.0.1:3080
 
 ### 5.2 验证工作区与话题目录
 
-打开 dsh Web GUI → 工作区列表，应看到**每人一个**项目：
+打开 dsh Web GUI → 工作区列表，应看到**每个话题一个**项目：
 
 ```
-飞书私聊 · <user_id>          （对应 <baseDir>/p2p/<user_id>/）
-飞书群聊 · oc_yyy · <user_id> （对应 <baseDir>/groups/oc_yyy/<user_id>/）
+<人名> · <话题标题>   （对应 <baseDir>/p2p/<user_id>/<话题 id>/）
+<群名> · <话题标题>   （对应 <baseDir>/groups/oc_yyy/<话题 id>/）
 ```
 
-每个新话题在该工作区内创建独立的话题工作目录 `<工作区>/topics/<话题 id>/`，会话列表仍归属该项目；同一话题内 `/renew` 复用同一话题目录。也可在飞书里用 `/workspace` 查看当前会话的实际工作目录。
+话题标题取首条消息第一行（最长 40 字）；同一话题内 `/renew` 复用同一目录。也可在飞书里用 `/workspace` 查看当前会话的工作目录。
 
 **附件落点**：入站图片/文件只存入 **DSH 原生附件库**（`$DSH_HOME/attachments/v1` 一类宿主目录，由宿主管理），**话题目录下不会出现 `attachments/`**，插件也不再读写 `<baseDir>/_staging/`。原生附件库是插件的必需依赖：组合里没有 `dsh-attachment-local` 时插件不会启动。旧版本留下的 `attachments/` 与 `_staging/` 可手动删除。插件不会自动删除工作区或话题目录。
 

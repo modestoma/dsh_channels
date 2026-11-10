@@ -9,14 +9,17 @@
  * and reads its log to decide, per turn:
  *
  * - the Agent never claimed the prompt (it was still queued): replay it into
- *   the same card, at most once (`replay.pending`);
+ *   the same card, at most once (`replay.pending`), as the same principal and
+ *   with the same request id, which `session/prompt` deduplicates;
  * - the turn completed but its card never received the final patch: render
  *   the final reply from the log;
  * - the turn was cut off: patch the cards to the interrupted state, with a
  *   continue button on the main card (`replay.interrupted: 'ask'`).
  *
  * A snapshot whose Session cannot be resumed settles as interrupted without a
- * continue button.
+ * continue button. A snapshot holding only a `message` (a host turn, or one
+ * written before prompts went through `session/prompt`) is classified by the
+ * message id and never replayed.
  *
  * @module dsh-channels/session/repair
  */
@@ -24,9 +27,11 @@
 import { buildInterruptionCard, buildRecoveredReplyCards, segmentCardOptions } from '../cards/streaming.ts'
 import type { InflightSnapshot } from '../domain.ts'
 import { INFLIGHT_PROMPT_MAX_BYTES } from '../domain.ts'
-import type { Agent, SessionEvent, UserMessage } from '../dsh-types.ts'
+import type { Agent, SessionEvent, UserMessage } from '../host/index.ts'
 import type { FeishuChannel } from '../feishu-channel.ts'
 import type { FeishuDomainHandle } from '../domain.ts'
+import { promptRequestIdOf } from '../access/principal.ts'
+import { promptOfSnapshot, storablePrompt, type ChannelPrompt } from './prompt.ts'
 
 /** What the Session log says about one snapshot's turn. */
 export type InterruptedTurnState =
@@ -37,15 +42,24 @@ export type InterruptedTurnState =
   /** The turn started but did not finish (cut off, failed, or stopped). */
   | { kind: 'interrupted' }
 
+/** How the prompt of a turn is found in the Session log. */
+export type TurnKey =
+  /** A channel prompt: the message whose `source.rpcId` is the request id. */
+  | { readonly requestId: string }
+  /** A host turn or a legacy snapshot: the message id. */
+  | { readonly messageId: string }
+
 /**
  * Classify one turn from its Session log.
  * @param events - the Session log (after cold resume, which closes the
  *   unfinished turn with `turn/end {kind: 'interrupted'}`).
- * @param messageId - id of the prompt the turn was started with.
+ * @param key - how the turn's prompt is found.
  * @returns the turn's state.
  */
-export function classifyTurn(events: readonly SessionEvent[], messageId: string): InterruptedTurnState {
-  const start = events.findIndex(event => event.type === 'user/message' && event.data.id === messageId)
+export function classifyTurn(events: readonly SessionEvent[], key: TurnKey): InterruptedTurnState {
+  const start = events.findIndex(event => event.type === 'user/message' && ('requestId' in key
+    ? promptRequestIdOf(event.data.source) === key.requestId
+    : event.data.id === key.messageId))
   if (start < 0) return { kind: 'pending' }
   const texts: string[] = []
   for (const event of events.slice(start + 1)) {
@@ -81,9 +95,9 @@ function completedReason(reason: unknown): boolean {
 }
 
 /**
- * The prompt as stored in a snapshot, or undefined when its JSON exceeds
- * `INFLIGHT_PROMPT_MAX_BYTES` (restart recovery then cannot replay it).
- * @param message - the prompt handed to `followup()`.
+ * A host turn's claimed message as stored in a snapshot, or undefined when
+ * its JSON exceeds `INFLIGHT_PROMPT_MAX_BYTES`.
+ * @param message - the claimed message.
  * @returns the snapshot field value.
  */
 export function storableMessage(message: UserMessage): InflightSnapshot['message'] {
@@ -113,11 +127,11 @@ export interface InflightRecovery {
    */
   liveAgent(snapshot: InflightSnapshot): Promise<Agent | undefined>
   /**
-   * Stream the turn running `message` into the snapshot's main card: submit it
+   * Stream the turn running `prompt` into the snapshot's main card: submit it
    * again (`submit`), or only reattach the card when the Agent still holds it.
    * The snapshot stays and is retired when that turn settles.
    */
-  replay(agent: Agent, snapshot: InflightSnapshot, message: UserMessage, submit: boolean): void
+  replay(agent: Agent, snapshot: InflightSnapshot, prompt: ChannelPrompt, submit: boolean): void
 }
 
 export interface InflightRepairDeps {
@@ -164,15 +178,14 @@ export class InflightRepair {
   }
 
   /**
-   * Store the prompt of a turn, and its Feishu sender, whose snapshot was
-   * written before the prompt was assembled. A missing snapshot (the turn
-   * already settled) is skipped.
+   * Store the prompt of a turn whose snapshot was written before the prompt
+   * was assembled. A missing snapshot (the turn already settled) is skipped.
    */
-  async recordMessage(key: string, message: UserMessage, senderUserId: string): Promise<void> {
-    const stored = storableMessage(message)
+  async recordPrompt(key: string, prompt: ChannelPrompt): Promise<void> {
+    const stored = storablePrompt(prompt)
     if (stored === undefined) return
     try {
-      await this.deps.domain()?.inflight.update(key, snapshot => ({ ...snapshot, message: stored, senderUserId }))
+      await this.deps.domain()?.inflight.update(key, snapshot => ({ ...snapshot, prompt: stored }))
     } catch (error) {
       this.deps.warn('dsh-channels: storing the prompt of inflight snapshot %s failed: %s', key, String(error))
     }
@@ -268,19 +281,20 @@ export class InflightRepair {
       return 'interrupted'
     }
     const policy = recovery.policy()
-    const state = snapshot.message === undefined
-      ? { kind: 'interrupted' as const }
-      : classifyTurn(agent.session.snapshotEvents(), snapshot.message.id)
+    const key = turnKeyOf(snapshot)
+    const state = key === undefined ? { kind: 'interrupted' as const } : classifyTurn(agent.session.snapshotEvents(), key)
     if (state.kind === 'completed') {
       await this.settleCompleted(snapshot, state.text)
       return 'completed'
     }
+    // Only a channel prompt is replayable; a host turn's message was claimed
+    // before its snapshot existed, and a legacy prompt has no principal.
+    const prompt = snapshot.prompt === undefined ? undefined : promptOfSnapshot(snapshot.prompt)
     // A borrowed Agent outlives a channel restart, inbox included: a prompt
     // still queued there runs on its own and only needs its card back.
-    const message = snapshot.message
-    if (state.kind === 'pending' && message !== undefined && snapshot.cards[0]?.mode === 'card'
-      && [...agent.inbox.nextTurn, ...agent.inbox.nextStep].some(queued => queuedId(queued) === message.id)) {
-      recovery.replay(agent, snapshot, userMessageOf(message), false)
+    if (state.kind === 'pending' && prompt !== undefined && snapshot.cards[0]?.mode === 'card'
+      && [...agent.inbox.nextTurn, ...agent.inbox.nextStep].some(queued => queuedRequestId(queued) === prompt.requestId)) {
+      recovery.replay(agent, snapshot, prompt, false)
       return 'replayed'
     }
     // A running Agent may still be working on this turn (or about to log the
@@ -290,10 +304,10 @@ export class InflightRepair {
       return 'interrupted'
     }
     // A replay streams into the main card, so that card must still be patchable.
-    if (state.kind === 'pending' && message !== undefined && policy.pending
+    if (state.kind === 'pending' && prompt !== undefined && policy.pending
       && (snapshot.replays ?? 0) < 1 && snapshot.cards[0]?.mode === 'card') {
       await this.deps.domain()?.inflight.put(snapshot.key, { ...snapshot, replays: (snapshot.replays ?? 0) + 1, attempts: 0 })
-      recovery.replay(agent, snapshot, userMessageOf(message), true)
+      recovery.replay(agent, snapshot, prompt, true)
       return 'replayed'
     }
     await this.settleInterrupted(snapshot, policy.interrupted === 'ask')
@@ -343,25 +357,23 @@ export class InflightRepair {
   }
 }
 
-/** Id of a message in an Agent inbox. */
-function queuedId(message: unknown): string | undefined {
+/** How a snapshot's turn is found in the Session log; undefined when it stored no prompt. */
+function turnKeyOf(snapshot: InflightSnapshot): TurnKey | undefined {
+  if (snapshot.prompt !== undefined) return { requestId: snapshot.prompt.requestId }
+  return snapshot.message === undefined ? undefined : { messageId: snapshot.message.id }
+}
+
+/** Request id of a message in an Agent inbox (its `source.rpcId`). */
+function queuedRequestId(message: unknown): string | undefined {
   if (typeof message !== 'object' || message === null) return undefined
-  const id = (message as { id?: unknown }).id
-  return typeof id === 'string' ? id : undefined
+  const source = (message as { source?: unknown }).source
+  if (typeof source !== 'object' || source === null || typeof (source as { kind?: unknown }).kind !== 'string') return undefined
+  return promptRequestIdOf(source as { kind: string })
 }
 
 /** Whether the stored snapshot still describes the recovered turn. */
 function sameTurn(current: InflightSnapshot | undefined, recovered: InflightSnapshot): boolean {
   return current !== undefined && current.startedAt === recovered.startedAt
+    && current.prompt?.requestId === recovered.prompt?.requestId
     && current.message?.id === recovered.message?.id
-}
-
-/** Rebuild the prompt stored in a snapshot. */
-function userMessageOf(stored: NonNullable<InflightSnapshot['message']>): UserMessage {
-  return {
-    id: stored.id as UserMessage['id'],
-    role: 'user',
-    content: stored.content,
-    source: stored.source,
-  }
 }

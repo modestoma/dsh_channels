@@ -4,6 +4,9 @@
 
 import { describe, expect, it } from 'vitest'
 import {
+  APPROVAL_RETRY_ACTION,
+  approvalDurationLabel,
+  parseApprovalRetryAction,
   CARD_MAX_BYTES,
   CARD_TARGET_BYTES,
   DROPPED_NOTICE,
@@ -35,8 +38,8 @@ import {
   splitBodyForCard,
   stripTables,
   tableBlocks,
-} from '../src/cards.ts'
-import type { ApprovalQuestion, CardState } from '../src/cards.ts'
+} from '../src/cards/index.ts'
+import type { ApprovalQuestion, CardState } from '../src/cards/index.ts'
 
 /** JSON-escaped UTF-8 size of a string; the metric the panel budget uses. */
 function escapedJsonBytes(text: string): number {
@@ -701,6 +704,8 @@ describe('approval decision cards', () => {
     ['superseded', '下一条指令'],
     ['expired', '已超时'],
     ['cancelled', '已取消'],
+    ['interrupted', '服务重启，审批已中断'],
+    ['retried', '已重新发起'],
   ] as const)('renders the %s settled variant without decision controls', (state, expected) => {
     const card = buildApprovalSettledCard(question, state) as unknown as CardShape
     expect(markdownsOf(card)[0]).toContain(expected)
@@ -708,6 +713,31 @@ describe('approval decision cards', () => {
     expect(approvalElements(card).some(element => element.tag === 'column_set')).toBe(false)
     // The settled card keeps the question summary for context.
     expect(markdownsOf(card).some(text => text.includes('bash'))).toBe(true)
+  })
+
+  it('adds the 重新发起 button to expired and interrupted cards only', () => {
+    for (const state of ['expired', 'interrupted'] as const) {
+      const card = buildApprovalSettledCard(question, state, { retry: { sessionId: 'sess-r' } })
+      expect(JSON.stringify(card)).toContain('重新发起')
+      const buttons = JSON.stringify(card).match(/"tag":"button"/gu) ?? []
+      expect(buttons).toHaveLength(1)
+      expect(JSON.stringify(card)).toContain(JSON.stringify({ decision: APPROVAL_RETRY_ACTION, sessionId: 'sess-r' }))
+    }
+    expect(JSON.stringify(buildApprovalSettledCard(question, 'denied', { retry: { sessionId: 'sess-r' } }))).not.toContain('"tag":"button"')
+  })
+
+  it('parses only 重新发起 clicks that name a Session', () => {
+    expect(parseApprovalRetryAction({ decision: APPROVAL_RETRY_ACTION, sessionId: 's' })).toEqual({ sessionId: 's' })
+    expect(parseApprovalRetryAction({ decision: APPROVAL_RETRY_ACTION, sessionId: '' })).toBeUndefined()
+    expect(parseApprovalRetryAction({ decision: 'allow', sessionId: 's' })).toBeUndefined()
+    expect(parseApprovalRetryAction('approval-retry')).toBeUndefined()
+    expect(parseApprovalRetryAction(null)).toBeUndefined()
+  })
+
+  it.each([
+    [10_000, '1 分钟'], [600_000, '10 分钟'], [3_600_000, '1 小时'], [5_400_000, '1.5 小时'], [86_400_000, '24 小时'],
+  ])('labels %d ms as %s', (ms, label) => {
+    expect(approvalDurationLabel(ms)).toBe(label)
   })
 })
 

@@ -48,7 +48,12 @@ export interface UserMessage {
   id: MessageId
   role: 'user'
   content: ContentBlock[]
-  source: { kind: string }
+  /**
+   * Where the message came from. A prompt submitted through `session/prompt`
+   * has `kind: 'user'`, `rpcId` (the caller's request id) and, for a
+   * non-owner caller, `principal`; see `src/access/principal.ts`.
+   */
+  source: { kind: string; [key: string]: unknown }
 }
 
 /** The chunk vocabulary consumed from live assistant-stream frames. */
@@ -156,12 +161,32 @@ export type PreToolDecision =
  * existed omit it.
  */
 export interface CommitTrailersEvent {
-  /** Session id of the Agent pushing the workspace. */
+  /** Session the push is made for (a tool call's Agent, possibly a subagent, or a service caller's Session). */
   readonly session: string
   /** Workspace directory being pushed. */
   readonly dir: string
   add(token: string, value: string): void
   setAuthor?(name: string, email: string): void
+}
+
+/**
+ * Payload of the neutral `access/authorize` event other plugins dispatch with
+ * `ctx.parallel` before a write made for a Session (dsh-repo's write tools
+ * and service calls ask `code-write`; the log-analysis plugin asks `admin`
+ * before changing its repository list), declared locally so this plugin
+ * needs none of their packages. A listener that knows the Session and
+ * refuses throws an `Error` whose message says why; one that does not know
+ * it returns.
+ */
+export interface AuthorizeEvent {
+  /** Session the write is made for; may be a subagent's. */
+  readonly session: string
+  /** What is asked for; levels this plugin does not know are refused. */
+  readonly level: string
+  /** The tool name or service method. */
+  readonly action: string
+  /** Chinese description of the write, as its approval request shows it. */
+  readonly summary: string
 }
 
 // ---- Session surface ----------------------------------------------------

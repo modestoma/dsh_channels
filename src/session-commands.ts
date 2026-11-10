@@ -7,7 +7,6 @@
 import path from 'node:path'
 import { standaloneCard } from './cards/primitives.ts'
 import type { RouteRecord, SessionHistoryEntry } from './domain.ts'
-import { normalizeSessionHistory } from './domain.ts'
 import type { ContextMeasurement, StatsFold, ToolEventSample } from './stats.ts'
 import {
   averageDecodeTokensPerSecond, averageTtftMs, cacheHitPct,
@@ -150,20 +149,13 @@ export type WorkDirResolution =
 
 /** The durable route facts needed to verify a Session's working directory. */
 export interface WorkDirRoute {
-  /** Workspace root owning the Session (its header cwd when grouped). */
+  /** The topic directory (the Session header cwd). */
   readonly workspacePath: string
-  /** Effective working directory (topic directory / worktree); absent on v1 routes. */
-  readonly sessionDir?: string
 }
 
 /**
  * Validate the Session header cwd against the plugin's durable route and
- * return the Session's effective working directory.
- *
- * The header cwd is normally the workspace root (the Session stays grouped
- * under the user's project while working in a per-topic directory). In the
- * degraded placement used when the host exposes no `workingDirectory` service,
- * the header cwd is the topic directory itself.
+ * return the Session's working directory (the topic directory).
  */
 export function resolveWorkDir(
   headerCwd: string | undefined,
@@ -181,20 +173,13 @@ export function resolveWorkDir(
       text: '当前飞书路由未记录可用的工作区目录；请检查路由持久化状态。',
     }
   }
-  if (route.sessionDir !== undefined && !path.isAbsolute(route.sessionDir)) {
-    return {
-      kind: 'missing',
-      text: '当前飞书路由未记录可用的会话目录；请检查路由持久化状态。',
-    }
-  }
-  const expected = route.sessionDir ?? route.workspacePath
-  if (headerCwd !== route.workspacePath && headerCwd !== expected) {
+  if (headerCwd !== route.workspacePath) {
     return {
       kind: 'mismatch',
       text: 'Session header 与飞书路由记录的工作目录不一致；为避免返回错误目录，已拒绝显示。',
     }
   }
-  return { kind: 'success', path: expected }
+  return { kind: 'success', path: route.workspacePath }
 }
 
 /** Render one verified absolute working directory. */
@@ -237,9 +222,9 @@ export interface SessionHistoryView {
   hidden: number
 }
 
-/** Read one route's normalized history without consulting the Session repository. */
+/** Read one route's history without consulting the Session repository. */
 export function querySessionHistory(record: RouteRecord): SessionHistoryView {
-  const history = normalizeSessionHistory(record)
+  const history = record.sessionHistory
   const items = history
     .slice(-SESSION_HISTORY_DISPLAY_LIMIT)
     .reverse()

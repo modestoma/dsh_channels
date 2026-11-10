@@ -37,7 +37,7 @@ import {
   type TopicMessagesValue,
 } from '../src/feishu/tools.ts'
 import { SessionManager } from '../src/session/manager.ts'
-import type { SessionId } from '../src/dsh-types.ts'
+import type { SessionId } from '../src/host/index.ts'
 import {
   makeAgent, makeAgentContext, makeAgentPresets, makeChannel, makeHostContext, makeMessage,
   makeMessageGetResponse, makeMessageListResponse, makeRawMessage, makeSession,
@@ -215,6 +215,9 @@ const DEFAULT_ROUTE: AttachmentFetchRoute = {
   chatType: 'group',
   senderUserId: 'u_user',
 }
+
+/** A private-chat topic route: only its person's messages are its own. */
+const P2P_ROUTE: AttachmentFetchRoute = { ...DEFAULT_ROUTE, chatType: 'p2p' }
 
 interface RuntimeHarness {
   runtime: AttachmentFetchToolRuntime
@@ -565,7 +568,7 @@ describe('feishu attachment-fetch registration', () => {
     })
     const manager = new SessionManager({
       ctx: ctxState.ctx,
-      config: resolveConfig({}),
+      config: () => resolveConfig({}),
       persistRoute: async () => {},
       started: () => true,
       detachStream: () => {},
@@ -585,7 +588,7 @@ describe('feishu attachment-fetch registration', () => {
     const mountTools = vi.fn(async () => {})
     const manager = new SessionManager({
       ctx: ctxState.ctx,
-      config: resolveConfig({}),
+      config: () => resolveConfig({}),
       persistRoute: async () => {},
       started: () => true,
       detachStream: () => {},
@@ -603,6 +606,7 @@ describe('feishu attachment-fetch registration', () => {
       cardMessageId: 'om_card',
       createdAt: 1,
       lastActivityAt: 1,
+      sessionHistory: [{ sessionId: 'session-resume', createdAt: 1 }],
     }
 
     await manager.ensureLive(record)
@@ -618,7 +622,7 @@ describe('feishu attachment-fetch registration', () => {
     const borrowMount = vi.fn(async () => {})
     const borrowManager = new SessionManager({
       ctx: borrowState.ctx,
-      config: resolveConfig({}),
+      config: () => resolveConfig({}),
       persistRoute: async () => {},
       started: () => true,
       detachStream: () => {},
@@ -641,7 +645,7 @@ describe('feishu attachment-fetch registration', () => {
     const warn = vi.fn()
     const manager = new SessionManager({
       ctx: ctxState.ctx,
-      config: resolveConfig({}),
+      config: () => resolveConfig({}),
       persistRoute: async () => {},
       started: () => true,
       detachStream: () => {},
@@ -810,7 +814,7 @@ describe('feishu attachment-fetch authorization', () => {
       ownerFile('om_foreign', { deleted: true }),
     ]
     for (const message of cases) {
-      const harness = setupRuntime()
+      const harness = setupRuntime({ route: P2P_ROUTE })
       const definition = await harness.mount()
       readBack(harness, message)
       const value = await runTool(definition, { message_id: 'om_foreign' })
@@ -818,6 +822,14 @@ describe('feishu attachment-fetch authorization', () => {
       expect(value.summary).toContain(attachmentFetchFailureReason('AUTHORIZATION_DENIED'))
       expect(harness.channel.downloaded).toEqual([])
     }
+  })
+
+  it('reads back a message of another sender in the same topic of a group route', async () => {
+    const harness = setupRuntime()
+    const definition = await harness.mount()
+    readBack(harness, ownerFile('om_member', { sender_id: 'u_someone_else' }))
+    const value = await runTool(definition, { message_id: 'om_member' })
+    expect(value.ok).toBe(true)
   })
 
   it('fails closed when the read-back fails', async () => {
@@ -2408,6 +2420,7 @@ describe('feishu topic-messages list', () => {
 describe('feishu topic-messages authorization chain (AC5)', () => {
   it('makes a discovered file fetchable and keeps undiscovered ids refused', async () => {
     const harness = setupRuntime({
+      route: P2P_ROUTE,
       channel: makeTestChannel({
         messageGet: async () => makeMessageGetResponse([
           makeRawMessage({

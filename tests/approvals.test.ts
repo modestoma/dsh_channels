@@ -5,9 +5,11 @@
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { ApprovalAnswerer, classifyApprovalReply } from '../src/approvals.ts'
-import type { ApprovalRoute } from '../src/approvals.ts'
-import type { ApprovalOutcome, ApprovalRequest } from '../src/dsh-types.ts'
+import { ApprovalAnswerer, approvalRetryPrompt, classifyApprovalReply } from '../src/interactions/approvals.ts'
+import { ApprovalStore, RETRY_WINDOW_MS } from '../src/interactions/approval-store.ts'
+import type { ApprovalCardRecord, ApprovalGrantRecord } from '../src/interactions/approval-store.ts'
+import type { ApprovalRoute, ApprovalTimings } from '../src/interactions/approvals.ts'
+import type { ApprovalOutcome, ApprovalRequest } from '../src/host/index.ts'
 import type { CardActionEvent, FeishuChannel, SendResult } from '../src/feishu-channel.ts'
 import { makeAgent, makeChannel, makeSession } from './helpers.ts'
 
@@ -18,6 +20,12 @@ const ROUTE: ApprovalRoute = {
   cardMessageId: 'om_main_card',
   inThread: true,
   senderUserId: 'u_owner',
+  chatType: 'p2p',
+}
+
+/** Fixed windows: every card waits `timeoutMs`, no reminder unless asked. */
+function timings(timeoutMs = TIMEOUT, extra: Partial<ApprovalTimings> = {}): () => ApprovalTimings {
+  return () => ({ timeoutMs, backgroundTimeoutMs: timeoutMs, reminderMs: 0, ...extra })
 }
 
 function makeRequest(sessionId = 'sess-approval', overrides: Partial<ApprovalRequest> = {}): ApprovalRequest {
@@ -57,7 +65,7 @@ function makeEnv(timeoutMs = TIMEOUT) {
   const channel = makeChannel()
   const routeFor = vi.fn<(sessionId: string) => ApprovalRoute | undefined>(() => ROUTE)
   const onError = vi.fn()
-  const answerer = new ApprovalAnswerer(channel, { routeFor, onError, isAdmin: userId => userId === 'u_admin' }, timeoutMs)
+  const answerer = new ApprovalAnswerer(channel, { routeFor, onError, isAdmin: userId => userId === 'u_admin' }, timings(timeoutMs))
   return { channel, routeFor, onError, answerer }
 }
 
@@ -126,7 +134,7 @@ describe('ApprovalAnswerer', () => {
   it('routes the settled patch through the durable patchCard hook when given', async () => {
     const channel = makeChannel()
     const patchCard = vi.fn(async (_messageId: string, _card: object) => {})
-    const answerer = new ApprovalAnswerer(channel, { routeFor: () => ROUTE, onError: vi.fn(), patchCard, isAdmin: () => false }, TIMEOUT)
+    const answerer = new ApprovalAnswerer(channel, { routeFor: () => ROUTE, onError: vi.fn(), patchCard, isAdmin: () => false }, timings())
     const pending = answerer.onRequest(makeRequest(), nextOf('unavailable'))
     await vi.waitFor(() => expect(channel.sent).toHaveLength(1))
     answerer.onCardAction(clickEvent('om_1', 'allow'))
@@ -177,7 +185,7 @@ describe('ApprovalAnswerer', () => {
       routeFor: () => ({ ...ROUTE, mayDecide }),
       onError: vi.fn(),
       isAdmin: () => false,
-    }, TIMEOUT)
+    }, timings())
     const pending = answerer.onRequest(makeRequest(), nextOf('unavailable'))
     await vi.waitFor(() => expect(channel.sent).toHaveLength(1))
     answerer.onCardAction(clickEvent('om_1', 'allow', 'u_outsider'))
@@ -249,7 +257,7 @@ describe('ApprovalAnswerer', () => {
     const answerer = new ApprovalAnswerer(
       slowChannel,
       { routeFor: () => ROUTE, onError: vi.fn(), isAdmin: () => false },
-      TIMEOUT,
+      timings(),
     )
     const controller = new AbortController()
     const pending = answerer.onRequest(makeRequest('sess-slow', { signal: controller.signal }), nextOf('unavailable'))
@@ -266,7 +274,7 @@ describe('ApprovalAnswerer', () => {
   it('fails closed (unavailable) when the card cannot be delivered', async () => {
     const channel = makeChannel({ failCardSends: true })
     const onError = vi.fn()
-    const answerer = new ApprovalAnswerer(channel, { routeFor: () => ROUTE, onError, isAdmin: () => false }, TIMEOUT)
+    const answerer = new ApprovalAnswerer(channel, { routeFor: () => ROUTE, onError, isAdmin: () => false }, timings())
     await expect(answerer.onRequest(makeRequest(), nextOf('unavailable'))).resolves.toBe('unavailable')
     expect(onError).toHaveBeenCalled()
     expect(answerer.pendingCount()).toBe(0)
@@ -500,13 +508,274 @@ describe('ApprovalAnswerer usability', () => {
   it('reports the session\'s waiting tools on open and settle', async () => {
     const channel = makeChannel()
     const onWaitingChange = vi.fn()
-    const answerer = new ApprovalAnswerer(channel, { routeFor: () => ROUTE, onError: vi.fn(), onWaitingChange, isAdmin: () => false }, TIMEOUT)
+    const answerer = new ApprovalAnswerer(channel, { routeFor: () => ROUTE, onError: vi.fn(), onWaitingChange, isAdmin: () => false }, timings())
     const pending = answerer.onRequest(makeRequest('sess-a'), nextOf('unavailable'))
     expect(onWaitingChange).toHaveBeenLastCalledWith('sess-a', ['bash'])
     await vi.waitFor(() => expect(channel.sent).toHaveLength(1))
     answerer.onCardAction(clickEvent('om_1', 'allow'))
     await pending
     expect(onWaitingChange).toHaveBeenLastCalledWith('sess-a', [])
+  })
+})
+
+/** In-memory approval tables behind a real store. */
+function makeStore() {
+  const grants = new Map<string, ApprovalGrantRecord>()
+  const cards = new Map<string, ApprovalCardRecord>()
+  const table = <T>(records: Map<string, T>) => ({
+    get: (key: string) => records.get(key),
+    put: (key: string, value: T) => { records.set(key, value) },
+    delete: (key: string) => { records.delete(key) },
+    entries: () => records.entries(),
+  })
+  const warn = vi.fn()
+  const store = new ApprovalStore({ tables: () => ({ grants: table(grants), cards: table(cards) }), warn })
+  return { store, grants, cards, warn }
+}
+
+/** Every button of a card, wherever it sits. */
+function allButtons(card: object): Array<{ value?: Record<string, unknown> }> {
+  const found: Array<{ value?: Record<string, unknown> }> = []
+  const walk = (node: unknown): void => {
+    if (Array.isArray(node)) { node.forEach(walk); return }
+    if (typeof node !== 'object' || node === null) return
+    const record = node as Record<string, unknown>
+    if (record.tag === 'button') {
+      const behaviors = record.behaviors as Array<{ value?: Record<string, unknown> }> | undefined
+      found.push({ value: behaviors?.[0]?.value })
+    }
+    Object.values(record).forEach(walk)
+  }
+  walk(card)
+  return found
+}
+
+describe('ApprovalAnswerer timing and reminders', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('gives a host-started turn the background window', async () => {
+    vi.useFakeTimers()
+    const channel = makeChannel()
+    const answerer = new ApprovalAnswerer(channel, {
+      routeFor: () => ROUTE, onError: vi.fn(), isAdmin: () => false, backgroundTurn: id => id === 'sess-bg',
+    }, timings(10_000, { backgroundTimeoutMs: 100 }))
+    const background = answerer.onRequest(makeRequest('sess-bg'), nextOf('unavailable'))
+    const foreground = answerer.onRequest(makeRequest('sess-fg'), nextOf('unavailable'))
+    await vi.waitFor(() => expect(channel.sent).toHaveLength(2))
+    await vi.advanceTimersByTimeAsync(100)
+    await expect(background).resolves.toBe('rejected')
+    expect(answerer.pendingCount()).toBe(1)
+    await vi.advanceTimersByTimeAsync(10_000)
+    await expect(foreground).resolves.toBe('rejected')
+  })
+
+  it('shows the window in hours from an hour up', async () => {
+    const channel = makeChannel()
+    const answerer = new ApprovalAnswerer(channel, { routeFor: () => ROUTE, onError: vi.fn(), isAdmin: () => false }, timings(86_400_000))
+    const pending = answerer.onRequest(makeRequest(), nextOf('unavailable'))
+    await vi.waitFor(() => expect(channel.sent).toHaveLength(1))
+    expect(JSON.stringify(channel.sent[0]!.input)).toContain('24 小时内有效')
+    answerer.dispose()
+    await pending
+  })
+
+  it('reminds once under an undecided private-chat card', async () => {
+    vi.useFakeTimers()
+    const channel = makeChannel()
+    const answerer = new ApprovalAnswerer(channel, { routeFor: () => ROUTE, onError: vi.fn(), isAdmin: () => false },
+      timings(10_000, { reminderMs: 1_000 }))
+    const pending = answerer.onRequest(makeRequest(), nextOf('unavailable'))
+    await vi.waitFor(() => expect(channel.sent).toHaveLength(1))
+    await vi.advanceTimersByTimeAsync(999)
+    expect(channel.sent).toHaveLength(1)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(channel.sent).toHaveLength(2)
+    expect(channel.sent[1]).toMatchObject({
+      chatId: ROUTE.chatId,
+      options: { replyTo: 'om_1', replyInThread: true },
+    })
+    expect(JSON.stringify(channel.sent[1]!.input)).toContain('还有一个审批在等你处理')
+    await vi.advanceTimersByTimeAsync(5_000)
+    expect(channel.sent).toHaveLength(2)
+    answerer.onCardAction(clickEvent('om_1', 'allow'))
+    await expect(pending).resolves.toBe('allowed-once')
+  })
+
+  it('never reminds in a group topic, after a decision, or when the reminder would come after the deadline', async () => {
+    vi.useFakeTimers()
+    const channel = makeChannel()
+    const group: ApprovalRoute = { ...ROUTE, chatType: 'group' }
+    const answerer = new ApprovalAnswerer(channel, {
+      routeFor: id => (id === 'sess-group' ? group : ROUTE), onError: vi.fn(), isAdmin: () => false,
+    }, timings(10_000, { reminderMs: 1_000 }))
+    const inGroup = answerer.onRequest(makeRequest('sess-group'), nextOf('unavailable'))
+    const decided = answerer.onRequest(makeRequest('sess-decided'), nextOf('unavailable'))
+    await vi.waitFor(() => expect(channel.sent).toHaveLength(2))
+    answerer.onCardAction(clickEvent('om_2', 'deny'))
+    await expect(decided).resolves.toBe('rejected')
+    await vi.advanceTimersByTimeAsync(10_000)
+    await expect(inGroup).resolves.toBe('rejected')
+    expect(channel.sent).toHaveLength(2)
+
+    const late = new ApprovalAnswerer(channel, { routeFor: () => ROUTE, onError: vi.fn(), isAdmin: () => false },
+      timings(1_000, { reminderMs: 1_000 }))
+    const expired = late.onRequest(makeRequest('sess-late'), nextOf('unavailable'))
+    await vi.waitFor(() => expect(channel.sent).toHaveLength(3))
+    await vi.advanceTimersByTimeAsync(2_000)
+    await expect(expired).resolves.toBe('rejected')
+    expect(channel.sent).toHaveLength(3)
+  })
+})
+
+describe('ApprovalAnswerer durable state', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('keeps a stop-asking grant across a restart of the answerer, per session', async () => {
+    const { store, grants } = makeStore()
+    const channel = makeChannel()
+    const first = new ApprovalAnswerer(channel, { routeFor: () => ROUTE, onError: vi.fn(), isAdmin: () => false, store }, timings())
+    const pending = first.onRequest(makeRequest('sess-a'), nextOf('unavailable'))
+    await vi.waitFor(() => expect(channel.sent).toHaveLength(1))
+    first.onCardAction(clickEvent('om_1', 'always'))
+    await expect(pending).resolves.toBe('allowed-once')
+    await flush()
+    expect(grants.get('sess-a')?.grants).toEqual(['bash\u0000'])
+    first.dispose()
+
+    const second = new ApprovalAnswerer(channel, { routeFor: () => ROUTE, onError: vi.fn(), isAdmin: () => false, store }, timings())
+    await expect(second.onRequest(makeRequest('sess-a'), nextOf('unavailable'))).resolves.toBe('allowed-once')
+    expect(channel.sent).toHaveLength(1)
+    // Another Session (e.g. after /renew) asks again.
+    const renewed = second.onRequest(makeRequest('sess-b'), nextOf('unavailable'))
+    await vi.waitFor(() => expect(channel.sent).toHaveLength(2))
+    second.dispose()
+    await renewed
+  })
+
+  it('forgets the card record on a decision and keeps it with a retry button on expiry', async () => {
+    vi.useFakeTimers()
+    const { store, cards } = makeStore()
+    const channel = makeChannel()
+    const answerer = new ApprovalAnswerer(channel, { routeFor: () => ROUTE, onError: vi.fn(), isAdmin: () => false, store }, timings(20))
+    const decided = answerer.onRequest(makeRequest('sess-a'), nextOf('unavailable'))
+    await vi.waitFor(() => expect(channel.sent).toHaveLength(1))
+    await vi.advanceTimersByTimeAsync(0)
+    expect(cards.get('om_1')).toMatchObject({ sessionId: 'sess-a', state: 'open', question: { toolName: 'bash' } })
+    answerer.onCardAction(clickEvent('om_1', 'allow'))
+    await expect(decided).resolves.toBe('allowed-once')
+    await vi.advanceTimersByTimeAsync(0)
+    expect(cards.has('om_1')).toBe(false)
+    expect(allButtons(channel.updated[0]!.card)).toHaveLength(0)
+
+    const expired = answerer.onRequest(makeRequest('sess-a'), nextOf('unavailable'))
+    await vi.waitFor(() => expect(channel.sent).toHaveLength(2))
+    await vi.advanceTimersByTimeAsync(20)
+    await expect(expired).resolves.toBe('rejected')
+    await vi.advanceTimersByTimeAsync(0)
+    expect(cards.get('om_2')).toMatchObject({ state: 'expired' })
+    expect(store.retryable('om_2')?.sessionId).toBe('sess-a')
+    expect(allButtons(channel.updated[1]!.card).map(button => button.value))
+      .toEqual([{ decision: 'approval-retry', sessionId: 'sess-a' }])
+  })
+
+  it('has no retry button on expiry without a store', async () => {
+    vi.useFakeTimers()
+    const { channel, answerer } = makeEnv(20)
+    const pending = answerer.onRequest(makeRequest(), nextOf('unavailable'))
+    await vi.waitFor(() => expect(channel.sent).toHaveLength(1))
+    await vi.advanceTimersByTimeAsync(20)
+    await expect(pending).resolves.toBe('rejected')
+    await vi.waitFor(() => expect(channel.updated).toHaveLength(1))
+    expect(allButtons(channel.updated[0]!.card)).toHaveLength(0)
+  })
+
+  it('marks in-flight cards interrupted with a retry button on dispose', async () => {
+    const { store, cards } = makeStore()
+    const channel = makeChannel()
+    const answerer = new ApprovalAnswerer(channel, { routeFor: () => ROUTE, onError: vi.fn(), isAdmin: () => false, store }, timings())
+    const pending = answerer.onRequest(makeRequest('sess-a'), nextOf('unavailable'))
+    await vi.waitFor(() => expect(channel.sent).toHaveLength(1))
+    await flush()
+    answerer.dispose()
+    await expect(pending).resolves.toBe('cancelled')
+    await vi.waitFor(() => expect(channel.updated).toHaveLength(1))
+    expect(JSON.stringify(channel.updated[0]!.card)).toContain('服务重启，审批已中断')
+    expect(allButtons(channel.updated[0]!.card)).toHaveLength(1)
+    expect(cards.get('om_1')).toMatchObject({ state: 'interrupted' })
+  })
+
+  it('recovers the open cards an earlier process left behind, and only those', async () => {
+    const { store, cards } = makeStore()
+    const channel = makeChannel()
+    cards.set('om_old', {
+      key: 'om_old', sessionId: 'sess-old', state: 'open', instanceId: 'previous', createdAt: 1,
+      question: { toolName: 'bash', command: 'rm -rf build', timeoutMs: 60_000 },
+    })
+    const answerer = new ApprovalAnswerer(channel, { routeFor: () => ROUTE, onError: vi.fn(), isAdmin: () => false, store }, timings())
+    const live = answerer.onRequest(makeRequest('sess-live'), nextOf('unavailable'))
+    await vi.waitFor(() => expect(channel.sent).toHaveLength(1))
+    await flush()
+    expect(answerer.recoverInterrupted()).toBe(1)
+    await vi.waitFor(() => expect(channel.updated).toHaveLength(1))
+    expect(channel.updated[0]!.messageId).toBe('om_old')
+    expect(JSON.stringify(channel.updated[0]!.card)).toContain('rm -rf build')
+    expect(allButtons(channel.updated[0]!.card).map(button => button.value))
+      .toEqual([{ decision: 'approval-retry', sessionId: 'sess-old' }])
+    expect(cards.get('om_old')).toMatchObject({ state: 'interrupted' })
+    expect(cards.get('om_1')).toMatchObject({ state: 'open' })
+    expect(answerer.recoverInterrupted()).toBe(0)
+    answerer.dispose()
+    await live
+  })
+})
+
+describe('ApprovalStore', () => {
+  it('prunes grants of unrouted sessions and retry records past the window', () => {
+    const { store, grants, cards } = makeStore()
+    grants.set('sess-live', { key: 'sess-live', grants: ['bash\u0000'], updatedAt: 1 })
+    grants.set('sess-gone', { key: 'sess-gone', grants: ['bash\u0000'], updatedAt: 1 })
+    const question = { toolName: 'bash', timeoutMs: 60_000 }
+    cards.set('om_fresh', { key: 'om_fresh', sessionId: 's', state: 'expired', instanceId: 'i', createdAt: 0, settledAt: 1_000, question })
+    cards.set('om_stale', { key: 'om_stale', sessionId: 's', state: 'interrupted', instanceId: 'i', createdAt: 0, settledAt: 0, question })
+    cards.set('om_open', { key: 'om_open', sessionId: 's', state: 'open', instanceId: 'i', createdAt: 0, question })
+    expect(store.prune(id => id === 'sess-live', RETRY_WINDOW_MS + 500)).toBe(2)
+    expect([...grants.keys()]).toEqual(['sess-live'])
+    expect([...cards.keys()].sort()).toEqual(['om_fresh', 'om_open'])
+  })
+
+  it('reports an open card as not retryable and contains write failures', async () => {
+    const warn = vi.fn()
+    const failing = {
+      get: () => undefined,
+      put: () => Promise.reject(new Error('disk full')),
+      delete: () => undefined,
+      entries: () => new Map().entries(),
+    }
+    const store = new ApprovalStore({ tables: () => ({ grants: failing, cards: failing }), warn })
+    store.addGrant('sess-a', 'bash\u0000')
+    await flush()
+    expect(warn).toHaveBeenCalledWith('dsh-channels: storing %s failed: %s', 'grant for session sess-a', 'Error: disk full')
+    const { store: real, cards } = makeStore()
+    cards.set('om_open', { key: 'om_open', sessionId: 's', state: 'open', instanceId: 'i', createdAt: 0, question: { toolName: 'bash', timeoutMs: 1 } })
+    expect(real.retryable('om_open')).toBeUndefined()
+    expect(real.retryable('om_missing')).toBeUndefined()
+  })
+})
+
+describe('approvalRetryPrompt', () => {
+  it('names the tool, the command, and why it did not run', () => {
+    const expired = approvalRetryPrompt({ toolName: 'bash', command: 'git push', timeoutMs: 1 }, 'expired')
+    expect(expired).toContain('`bash`')
+    expect(expired).toContain('git push')
+    expect(expired).toContain('超时')
+    expect(expired).toContain('先核对实际状态')
+    const interrupted = approvalRetryPrompt({ toolName: 'bash', escalateTo: 'workspace-write', timeoutMs: 1 }, 'interrupted')
+    expect(interrupted).toContain('提升到 `workspace-write`')
+    expect(interrupted).toContain('服务重启')
   })
 })
 

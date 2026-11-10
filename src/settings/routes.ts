@@ -13,7 +13,7 @@
  * @module dsh-channels/settings/routes
  */
 
-import type { HostContext } from '../dsh-types.ts'
+import type { HostContext } from '../host/index.ts'
 import {
   ACCESS_ROUTE,
   ADD_ACCESS_USER_ROUTE,
@@ -26,10 +26,12 @@ import {
   PROFILES_ROUTE,
   RECONNECT_ROUTE,
   TAKEOVER_ROUTE,
+  REMOVE_ACCESS_GROUP_ROUTE,
   REMOVE_ACCESS_USER_ROUTE,
   RESOLVE_ACCESS_REQUEST_ROUTE,
   SET_ACCESS_GIT_EMAIL_ROUTE,
   SET_ACCESS_PERMISSION_ROUTE,
+  SET_GROUP_PERMISSION_ROUTE,
   SAVE_CONFIG_ROUTE,
   SAVE_CREDENTIALS_ROUTE,
   SESSION_ORIGIN_ROUTE,
@@ -258,6 +260,11 @@ export function registerSettingsRoutes(connection: HostConnection, surface: Sett
       const payload = await readJsonObject(request)
       return result(await surface.resolveAccessRequest(payload.token, payload.decision))
     }),
+    post(SET_GROUP_PERMISSION_ROUTE, async (request) => {
+      const payload = await readJsonObject(request)
+      return result(await surface.setGroupPermission(payload.chatId, payload.permission, payload.enabled))
+    }),
+    post(REMOVE_ACCESS_GROUP_ROUTE, async request => result(await surface.removeAccessGroup((await readJsonObject(request)).chatId))),
   ]
   const disposers = routes.map(route => connection.fetch.register(route))
   return () => {

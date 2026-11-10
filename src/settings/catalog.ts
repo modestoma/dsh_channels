@@ -17,7 +17,7 @@ import type {
   HostContext,
   LlmModelInfo,
   LlmProviderInfo,
-} from '../dsh-types.ts'
+} from '../host/index.ts'
 import type { CatalogWire, FieldOptionWire, SelectCatalogWire } from './contract.ts'
 
 /** 目录查询的硬上限：面板加载不能被宿主的模型发现/连接拖住。 */

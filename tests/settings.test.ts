@@ -9,7 +9,7 @@ import path from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import { resolveConfig } from '../src/config.ts'
 import type { FeishuConfig } from '../src/config.ts'
-import type { AgentPreset, HostContext, LlmModelInfo, LlmService } from '../src/dsh-types.ts'
+import type { AgentPreset, HostContext, LlmModelInfo, LlmService } from '../src/host/index.ts'
 import { makeInstanceLocks, TestFeishuService as FeishuService } from './helpers.ts'
 import type { LockHolderInfo } from '../src/instance-lock.ts'
 import { HEALTH_DEPENDENCY_NAMES } from '../src/health.ts'
@@ -40,7 +40,9 @@ import {
   RECONNECT_ROUTE,
   TAKEOVER_ROUTE,
   REMOVE_ACCESS_USER_ROUTE,
+  REMOVE_ACCESS_GROUP_ROUTE,
   RESOLVE_ACCESS_REQUEST_ROUTE,
+  SET_GROUP_PERMISSION_ROUTE,
   SET_ACCESS_GIT_EMAIL_ROUTE,
   SET_ACCESS_PERMISSION_ROUTE,
   RESTART_KEYS,
@@ -52,6 +54,7 @@ import type {
   AccessMutationResponse,
   AccessPermissionWire,
   AccessWire,
+  GroupPermissionWire,
   CatalogWire,
   CredentialField,
   EditableValues,
@@ -85,6 +88,7 @@ import {
 } from '../src/settings/surface.ts'
 import { WIKI_ROOT_LINK_ERRORS } from '../src/feishu/wiki/links.ts'
 import type { SettingsTarget } from '../src/settings/surface.ts'
+import { settingsTarget } from '../src/settings/target.ts'
 import { createHostCatalog } from '../src/settings/catalog.ts'
 import type { SettingsCatalog } from '../src/settings/catalog.ts'
 import type { SettingsDirectoryPicker } from '../src/settings/directory-picker.ts'
@@ -155,6 +159,7 @@ class FakeTarget implements SettingsTarget {
     mode: 'guarded',
     loaded: true,
     users: [],
+    groups: [],
     requests: [],
   }
   /** Every user-table mutation the surface forwarded (asserted by the tests). */
@@ -285,6 +290,24 @@ class FakeTarget implements SettingsTarget {
     const user = this.accessState.users.find(item => item.userId === userId)
     if (user === undefined) return { ok: false, error: '用户不在用户表里' }
     user[permission] = enabled
+    return { ok: true, access: this.accessSnapshot() }
+  }
+
+  async setGroupPermission(chatId: string, permission: GroupPermissionWire, enabled: boolean): Promise<AccessMutationResponse> {
+    this.accessCalls.push({ op: 'set-group', chatId, permission, enabled })
+    const failed = this.accessFailure()
+    if (failed !== undefined) return failed
+    const group = this.accessState.groups.find(item => item.chatId === chatId)
+    if (group === undefined) return { ok: false, error: '该群还没有登记' }
+    group[permission] = enabled
+    return { ok: true, access: this.accessSnapshot() }
+  }
+
+  async removeAccessGroup(chatId: string): Promise<AccessMutationResponse> {
+    this.accessCalls.push({ op: 'remove-group', chatId })
+    const failed = this.accessFailure()
+    if (failed !== undefined) return failed
+    this.accessState.groups = this.accessState.groups.filter(group => group.chatId !== chatId)
     return { ok: true, access: this.accessSnapshot() }
   }
 
@@ -625,13 +648,17 @@ describe('field descriptors', () => {
     expect(byKey.get('routeTtlMs')).toMatchObject({
       kind: 'number', group: 'cards', min: 0, unit: '天', scale: 86_400_000, restartRequired: false,
     })
-    for (const key of ['approvalTimeoutMs', 'questionTimeoutMs'] as const) {
+    expect(byKey.get('questionTimeoutMs')).toMatchObject({
+      kind: 'number', group: 'cards', min: 10_000, max: 3_600_000, unit: '秒', scale: 1_000, restartRequired: false,
+    })
+    for (const key of ['approvalTimeoutMs', 'approvalBackgroundTimeoutMs'] as const) {
       expect(byKey.get(key)).toMatchObject({
-        kind: 'number', group: 'cards', min: 10_000, max: 3_600_000, unit: '秒', scale: 1_000, restartRequired: false,
+        kind: 'number', group: 'cards', min: 60_000, max: 604_800_000, unit: '分钟', scale: 60_000, restartRequired: false,
       })
     }
-    expect(byKey.get('topicIsolation')).toMatchObject({ kind: 'select', group: 'workspace', restartRequired: false })
-    expect(byKey.get('topicIsolation')?.options?.map(option => option.value)).toEqual(['auto', 'subdir', 'worktree'])
+    expect(byKey.get('approvalReminderMs')).toMatchObject({
+      kind: 'number', group: 'cards', min: 0, max: 604_800_000, unit: '分钟', scale: 60_000, restartRequired: false,
+    })
     expect(byKey.get('maxTokens')).toMatchObject({
       kind: 'number', group: 'model', min: 1, optional: true, restartRequired: false,
     })
@@ -1383,9 +1410,10 @@ describe('SettingsSurface', () => {
   it('saves the newly editable session and model fields live and clears maxTokens on empty', async () => {
     const { surface, store } = makeSurface()
     const saved = await surface.save({
-      topicIsolation: 'subdir',
       routeTtlMs: 86_400_000,
       approvalTimeoutMs: 60_000,
+      approvalBackgroundTimeoutMs: 600_000,
+      approvalReminderMs: 0,
       questionTimeoutMs: 120_000,
       maxTokens: 4096,
     })
@@ -1393,21 +1421,24 @@ describe('SettingsSurface', () => {
     if (!saved.ok) return
     expect(saved.panel.config.restartPendingKeys).toEqual([])
     expect(saved.panel.config.effective).toMatchObject({
-      topicIsolation: 'subdir',
       routeTtlMs: 86_400_000,
       approvalTimeoutMs: 60_000,
+      approvalBackgroundTimeoutMs: 600_000,
+      approvalReminderMs: 0,
       questionTimeoutMs: 120_000,
       maxTokens: 4096,
     })
 
-    const invalid = await surface.save({ approvalTimeoutMs: 1_000 })
+    const invalid = await surface.save({ approvalTimeoutMs: 30_000 })
     expect(invalid.ok).toBe(false)
+    const tooLong = await surface.save({ approvalBackgroundTimeoutMs: 604_800_001 })
+    expect(tooLong.ok).toBe(false)
 
     const cleared = await surface.save({ maxTokens: '' })
     expect(cleared.ok).toBe(true)
     const overlay = await store.load()
     expect(overlay.maxTokens).toBeUndefined()
-    expect(overlay.topicIsolation).toBe('subdir')
+    expect(overlay.routeTtlMs).toBe(86_400_000)
   })
 
   it('rejects unknown keys and invalid values with per-field issues', async () => {
@@ -1513,6 +1544,7 @@ describe('SettingsSurface access control', () => {
       wikiWrite: false,
       codeWrite: false,
     }],
+    groups: [{ chatId: 'oc_team', name: '研发群', addedAt: 1_700_000_200_000, wikiRead: false, wikiWrite: true, codeWrite: false }],
     requests: [{
       token: 'tok_1',
       targetId: 'u_bob',
@@ -1540,6 +1572,7 @@ describe('SettingsSurface access control', () => {
       mode: 'open',
       loaded: false,
       users: [],
+      groups: [],
       requests: [],
     })
     await expect(surface.access()).rejects.toThrow('access store down')
@@ -1577,6 +1610,25 @@ describe('SettingsSurface access control', () => {
       { op: 'set', userId: 'u_alice', permission: 'admin', enabled: true },
       { op: 'set', userId: 'u_alice', permission: 'codeWrite', enabled: true },
       { op: 'set', userId: 'u_alice', permission: 'chat', enabled: false },
+    ])
+  })
+
+  it('sets group switches and removes groups, validating the chat id and switch before writing', async () => {
+    const { surface, target } = makeSurface()
+    target.accessState.groups = [{ chatId: 'oc_team', name: '研发群', addedAt: 1, wikiRead: false, wikiWrite: false, codeWrite: false }]
+    const set = await surface.setGroupPermission(' oc_team ', 'codeWrite', true)
+    expect(set.ok && set.access.groups[0]).toMatchObject({ chatId: 'oc_team', codeWrite: true })
+    expect((await surface.setGroupPermission('oc_team', 'chat', true)).ok).toBe(false)
+    expect((await surface.setGroupPermission('oc_team', 'wikiRead', 'yes')).ok).toBe(false)
+    expect((await surface.setGroupPermission('u_alice', 'wikiRead', true)).ok).toBe(false)
+    expect((await surface.setGroupPermission('oc_unknown', 'wikiRead', true)).ok).toBe(false)
+    const removed = await surface.removeAccessGroup('oc_team')
+    expect(removed.ok && removed.access.groups).toEqual([])
+    expect((await surface.removeAccessGroup('')).ok).toBe(false)
+    expect(target.accessCalls).toEqual([
+      { op: 'set-group', chatId: 'oc_team', permission: 'codeWrite', enabled: true },
+      { op: 'set-group', chatId: 'oc_unknown', permission: 'wikiRead', enabled: true },
+      { op: 'remove-group', chatId: 'oc_team' },
     ])
   })
 
@@ -1827,6 +1879,8 @@ describe('settings routes', () => {
       [SET_ACCESS_PERMISSION_ROUTE]: 'POST',
       [SET_ACCESS_GIT_EMAIL_ROUTE]: 'POST',
       [RESOLVE_ACCESS_REQUEST_ROUTE]: 'POST',
+      [SET_GROUP_PERMISSION_ROUTE]: 'POST',
+      [REMOVE_ACCESS_GROUP_ROUTE]: 'POST',
     })
     for (const route of routes.values()) {
       expect(route.path).toMatch(/^\/api\/dsh-channels\.[a-z][A-Za-z]+$/u)
@@ -2082,6 +2136,7 @@ describe('settings routes', () => {
       mode: 'guarded',
       loaded: true,
       users: [],
+      groups: [],
       requests: [{
         token: 'tok_1',
         targetId: 'u_bob',
@@ -2198,7 +2253,7 @@ describe('apply() web wiring', () => {
     })
 
     expect(injected).toContainEqual(['connection'])
-    expect(routes.size).toBe(22)
+    expect(routes.size).toBe(24)
 
     const panel = await call(routes, PANEL_ROUTE)
     expect(panel.status).toBe(200)
@@ -2286,7 +2341,7 @@ describe('FeishuService settings integration', () => {
     expect(service.startError()).toBeUndefined()
     expect(service.health().level).toBe('degraded') // fake channel exposes no connection status
 
-    expect(await service.credentialStates()).toMatchObject({ appId: { configured: true }, appSecret: { configured: true } })
+    expect(await service.credentials.states()).toMatchObject({ appId: { configured: true }, appSecret: { configured: true } })
     await service.shutdown()
   })
 
@@ -2358,7 +2413,7 @@ describe('FeishuService settings integration', () => {
     expect(service.startError()).toContain('ws handshake failed')
     expect(service.missingConfig()).toEqual([])
 
-    const panel = await new SettingsSurface(service, h.store).panel()
+    const panel = await new SettingsSurface(settingsTarget(service), h.store).panel()
     expect(panel.status.running).toBe(false)
     expect(panel.status.phase).toBe('error')
     expect(panel.status.lastStartError).toContain('ws handshake failed')
@@ -2374,7 +2429,7 @@ describe('FeishuService settings integration', () => {
     const service = new FeishuService(h.ctx, h.config, () => makeChannel(), undefined, h.store, locks)
     await service.boot()
     expect(service.isRunning()).toBe(false)
-    const surface = new SettingsSurface(service, h.store)
+    const surface = new SettingsSurface(settingsTarget(service), h.store)
     const panel = await surface.panel()
     expect(panel.status.phase).toBe('occupied')
     expect(panel.status.occupiedBy).toEqual({
@@ -2388,7 +2443,7 @@ describe('FeishuService settings integration', () => {
       expect(taken.panel.status.occupiedBy).toBeUndefined()
     }
     await vi.waitFor(() => expect(owner.isRunning()).toBe(false))
-    expect((await new SettingsSurface(owner, h.store).panel()).status.phase).toBe('occupied')
+    expect((await new SettingsSurface(settingsTarget(owner), h.store).panel()).status.phase).toBe('occupied')
     await service.shutdown()
   })
 
@@ -2409,7 +2464,7 @@ describe('FeishuService settings integration', () => {
     expect(service.missingConfig()).toEqual(['FEISHU_APP_SECRET（飞书 App Secret）'])
     expect(service.startError()).toBeUndefined()
 
-    const surface = new SettingsSurface(service, h.store)
+    const surface = new SettingsSurface(settingsTarget(service), h.store)
     const panel = await surface.panel()
     expect(panel.status.phase).toBe('unconfigured')
     expect(panel.status.configured).toBe(false)
@@ -2449,7 +2504,7 @@ describe('FeishuService settings integration', () => {
     const h = harness()
     const service = new FeishuService(h.ctx, h.config, () => h.channel, undefined, h.store)
     await service.boot()
-    const surface = new SettingsSurface(service, h.store)
+    const surface = new SettingsSurface(settingsTarget(service), h.store)
     const original = h.config.baseDir
     const next = mkdtempSync(path.join(tmpdir(), 'dsh-channels-ws-hot-'))
     const saved = await surface.save({ baseDir: next })
@@ -2467,7 +2522,7 @@ describe('FeishuService settings integration', () => {
   it('credential writes enable a channel that booted without credentials', async () => {
     const h = harness({}, {})
     const service = new FeishuService(h.ctx, h.config, () => h.channel, undefined, h.store)
-    const surface = new SettingsSurface(service, h.store)
+    const surface = new SettingsSurface(settingsTarget(service), h.store)
     // No credentials: boot succeeds (the plugin is loaded for the settings
     // panel) but deliberately opens no connection.
     await service.boot()
@@ -2499,7 +2554,7 @@ describe('FeishuService settings integration', () => {
       calls.push(options as unknown as Record<string, unknown>)
       return h.channel
     }, undefined, h.store)
-    const surface = new SettingsSurface(service, h.store)
+    const surface = new SettingsSurface(settingsTarget(service), h.store)
     await service.boot()
     expect(service.isRunning()).toBe(false)
 
@@ -2583,7 +2638,7 @@ describe('FeishuService settings integration', () => {
       get: (name: string) => (name === 'credentials' ? readOnly : h.ctx.get?.(name)),
     } as unknown as HostContext
     const service = new FeishuService(ctx, h.config, () => h.channel, undefined, h.store)
-    await expect(service.setCredential('appId', 'cli_x')).rejects.toThrow(/不可写/)
-    await expect(service.clearCredential('appSecret')).rejects.toThrow(/不支持移除/)
+    await expect(service.credentials.set('appId', 'cli_x')).rejects.toThrow(/不可写/)
+    await expect(service.credentials.clear('appSecret')).rejects.toThrow(/不支持移除/)
   })
 })

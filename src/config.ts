@@ -29,8 +29,17 @@ export const DEFAULT_APP_SECRET_REF = 'FEISHU_APP_SECRET'
 /** Default route-table GC threshold: 30 days without activity. */
 export const DEFAULT_ROUTE_TTL_MS = 30 * 24 * 60 * 60 * 1000
 
-/** Default HITL approval decision window: 5 minutes per question. */
-export const DEFAULT_APPROVAL_TIMEOUT_MS = 5 * 60 * 1000
+/** Default HITL approval decision window: 24 hours per question. */
+export const DEFAULT_APPROVAL_TIMEOUT_MS = 24 * 60 * 60 * 1000
+
+/** Default approval window of a turn no Feishu message started (subagent, background job, schedule, PR/MR activity): 30 minutes. */
+export const DEFAULT_APPROVAL_BACKGROUND_TIMEOUT_MS = 30 * 60 * 1000
+
+/** Default delay of the one private-chat reminder about an undecided approval card: 10 minutes. */
+export const DEFAULT_APPROVAL_REMINDER_MS = 10 * 60 * 1000
+
+/** Longest approval window either approval timeout accepts: 7 days. */
+export const MAX_APPROVAL_TIMEOUT_MS = 7 * 24 * 60 * 60 * 1000
 
 /** Default structured-question window: 5 minutes per `ask_user_question` call. */
 export const DEFAULT_QUESTION_TIMEOUT_MS = 5 * 60 * 1000
@@ -139,23 +148,6 @@ export const configSchema = z.object({
    */
   threadFallback: z.enum(['degrade', 'strict']).default('degrade'),
   /**
-   * Per-topic working-directory isolation inside one user workspace.
-   *
-   * - `auto` (default): use a Git worktree per topic when the user workspace
-   *   is a Git repository (the workspace directory contains `.git`), otherwise
-   *   a plain subdirectory.
-   * - `subdir`: always a plain subdirectory (no Git requirement, no duplicated
-   *   checkouts).
-   * - `worktree`: always try a Git worktree; when the workspace is not a Git
-   *   repository, the `worktrees` service is unavailable, or creation is
-   *   denied, log a warning and fall back to a subdirectory.
-   *
-   * The workspace itself stays the Session header cwd either way, so Sessions
-   * remain grouped under the user's project; only the effective working
-   * directory changes. See `docs/workspace-isolation-design.md`.
-   */
-  topicIsolation: z.enum(['auto', 'subdir', 'worktree']).default('auto'),
-  /**
    * Route-table GC threshold. Route records (and stale in-flight repair
    * snapshots) whose last activity is older than this many milliseconds are
    * retired at startup and on every periodic sweep. Real thread routes leave a
@@ -166,12 +158,28 @@ export const configSchema = z.object({
    */
   routeTtlMs: z.number().int().min(0).default(DEFAULT_ROUTE_TTL_MS),
   /**
-   * HITL approval decision window: how long one approval decision card waits
-   * for an 允许/拒绝 click before failing closed (`rejected`; the card is
-   * patched to 已超时). The pending turn is blocked while the question is
-   * open, so the window trades user think-time against agent stall time.
+   * HITL approval decision window of a turn a Feishu message started: how
+   * long one approval decision card waits for an 允许/拒绝 click before
+   * failing closed (`rejected`; the card is patched to 已超时 with a
+   * 「重新发起」 button). The turn is blocked while the question is open, but
+   * any other reply in the topic rejects the card and runs as the next
+   * instruction, so a long window never locks the topic.
    */
-  approvalTimeoutMs: z.number().int().min(10_000).max(3_600_000).default(DEFAULT_APPROVAL_TIMEOUT_MS),
+  approvalTimeoutMs: z.number().int().min(60_000).max(MAX_APPROVAL_TIMEOUT_MS).default(DEFAULT_APPROVAL_TIMEOUT_MS),
+  /**
+   * Approval decision window of a turn no Feishu message started (a subagent
+   * finishing, a background job, a schedule, PR/MR activity). Shorter than
+   * `approvalTimeoutMs` because nobody is watching such a turn when it asks;
+   * the expired card keeps the 「重新发起」 button.
+   */
+  approvalBackgroundTimeoutMs: z.number().int().min(60_000).max(MAX_APPROVAL_TIMEOUT_MS).default(DEFAULT_APPROVAL_BACKGROUND_TIMEOUT_MS),
+  /**
+   * Delay of the one reminder an undecided approval card gets, sent as a
+   * reply under the card. Private-chat topics only: group topics never get
+   * it. `0` disables the reminder; a delay at or beyond the card's window
+   * never fires.
+   */
+  approvalReminderMs: z.number().int().min(0).max(MAX_APPROVAL_TIMEOUT_MS).default(DEFAULT_APPROVAL_REMINDER_MS),
   /**
    * Accept inbound Feishu images, files, and merged-forward chat records.
    *
@@ -406,28 +414,17 @@ export const configSchema = z.object({
    */
   accessMode: z.enum(['open', 'guarded']).default('guarded'),
   /**
-   * Tools that write to a remote repository (push, merge requests, issues).
-   * In a Feishu Session a call is refused unless the user who drives the
-   * current turn is an administrator or holds the `codeWrite` switch. Names
-   * are matched exactly; an empty list turns the check off.
+   * Extra tools that change a remote system on the user's behalf and do not
+   * ask through `access/authorize`. In a Feishu Session a call is refused
+   * unless the Session's location holds the `codeWrite` switch. Names are
+   * matched exactly; empty by default, because plugins that write for a
+   * Session ask `access/authorize`, which this channel answers by the same switch.
    */
-  codeWriteTools: z.array(z.string().trim().min(1)).default([
-    'repo_workspace_push',
-    'repo_mr_create',
-    'repo_mr_update',
-    'repo_mr_comment',
-    'repo_mr_merge',
-    'repo_issue_create',
-    'repo_issue_update',
-    'repo_issue_comment',
-    'logalyze_improve_skill',
-    'logalyze_submit_init',
-  ]),
+  codeWriteTools: z.array(z.string().trim().min(1)).default([]),
   /**
    * Read fence for in-process file tools in Feishu Sessions (and the
    * subagents they spawn). A listed tool's path arguments must resolve, after
-   * symlinks, inside the route's workspace, its topic directory, or one of
-   * `readableRoots`; otherwise the call is denied before it runs. Relative
+   * symlinks, inside the route's topic directory or one of `readableRoots`; otherwise the call is denied before it runs. Relative
    * paths resolve against the Session's effective working directory. Shell,
    * terminal, and code-execution tools spawn processes and are not covered
    * here: confine them with the sandbox runner described in the README.

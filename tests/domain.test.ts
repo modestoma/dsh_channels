@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
-  appendSessionHistory, expiredRouteRecordSchema, feishuDomain, normalizeRouteRecord, normalizeSessionHistory,
-  routeRecordSchema, sessionDirOf,
+  GROUP_PERMISSIONS, appendSessionHistory, expiredRouteRecordSchema, feishuDomain, groupPermissionRecordSchema,
+  isGroupRoute, routeRecordSchema,
 } from '../src/domain.ts'
 import type { RouteRecord } from '../src/domain.ts'
 
@@ -17,61 +17,30 @@ function route(partial: Partial<RouteRecord> = {}): RouteRecord {
     cardMessageId: 'om_card',
     createdAt: 100,
     lastActivityAt: 200,
+    sessionHistory: [{ sessionId: 'session-current', createdAt: 100 }],
     ...partial,
   }
 }
 
 describe('route Session history', () => {
-  it('accepts a legacy record and materializes its current Session in memory', () => {
-    const legacy = routeRecordSchema.parse(route())
-    expect(legacy.sessionHistory).toBeUndefined()
-    expect(normalizeRouteRecord(legacy).sessionHistory).toEqual([
-      { sessionId: 'session-current', createdAt: 100 },
-    ])
-  })
-
-  it('deduplicates by Session id, keeps the earliest timestamp, and sorts oldest first', () => {
-    const record = route({
-      sessionHistory: [
-        { sessionId: 'session-current', createdAt: 300 },
-        { sessionId: 'session-old', createdAt: 90 },
-        { sessionId: 'session-old', createdAt: 80 },
-      ],
-    })
-    expect(normalizeSessionHistory(record)).toEqual([
-      { sessionId: 'session-old', createdAt: 80 },
-      { sessionId: 'session-current', createdAt: 300 },
-    ])
+  it('requires the history on a route record', () => {
+    const { sessionHistory: _history, ...withoutHistory } = route()
+    expect(() => routeRecordSchema.parse(withoutHistory)).toThrow()
   })
 
   it('appends a renewed Session without duplicating existing entries', () => {
-    const record = route({
-      sessionHistory: [{ sessionId: 'session-current', createdAt: 100 }],
-    })
-    expect(appendSessionHistory(record, 'session-new', 300)).toEqual([
+    expect(appendSessionHistory(route(), 'session-new', 300)).toEqual([
       { sessionId: 'session-current', createdAt: 100 },
       { sessionId: 'session-new', createdAt: 300 },
     ])
   })
 
-  it('reads the effective session directory with a legacy fallback', () => {
-    expect(sessionDirOf(route())).toBe('/workspace/owner')
-    expect(sessionDirOf(route({
-      workspacePath: '/workspace/owner',
-      sessionDir: '/workspace/owner/topics/omt_1',
-      worktreeBranch: 'feishu-omt_1',
-    }))).toBe('/workspace/owner/topics/omt_1')
-  })
-
-  it('accepts per-topic placement fields on a route record and rejects empty ones', () => {
-    const parsed = routeRecordSchema.parse(route({
-      sessionDir: '/workspace/owner/topics/omt_1',
-      worktreeBranch: 'feishu-omt_1',
-    }))
-    expect(parsed.sessionDir).toBe('/workspace/owner/topics/omt_1')
-    expect(parsed.worktreeBranch).toBe('feishu-omt_1')
-    expect(() => routeRecordSchema.parse(route({ sessionDir: '' }))).toThrow()
-    expect(() => routeRecordSchema.parse(route({ worktreeBranch: '' }))).toThrow()
+  it('keeps the earliest timestamp of a repeated Session and sorts oldest first', () => {
+    const record = route({ sessionHistory: [{ sessionId: 'session-current', createdAt: 300 }, { sessionId: 'session-old', createdAt: 90 }] })
+    expect(appendSessionHistory(record, 'session-old', 80)).toEqual([
+      { sessionId: 'session-old', createdAt: 80 },
+      { sessionId: 'session-current', createdAt: 300 },
+    ])
   })
 
   it('rejects invalid history rows through the durable schema', () => {
@@ -79,85 +48,66 @@ describe('route Session history', () => {
       sessionHistory: [{ sessionId: '', createdAt: -1 }],
     }))).toThrow()
   })
+
+  it('drops fields the record does not declare', () => {
+    expect(routeRecordSchema.parse({ ...route(), sessionDir: '/x', mode: 'group' })).toEqual(route())
+  })
 })
 
 describe('expired route tombstone', () => {
+  const tombstone = {
+    key: 'omt_expired',
+    chatId: 'oc_chat',
+    chatType: 'group',
+    senderUserId: 'u_owner',
+    expiredAt: 300,
+    workspacePath: '/workspace/owner',
+    lastActivityAt: 250,
+  }
+
   it('keeps only the identity needed to reject a retired topic', () => {
-    expect(expiredRouteRecordSchema.parse({
-      key: 'omt_expired',
-      chatId: 'oc_chat',
-      chatType: 'group',
-      senderUserId: 'u_owner',
-      expiredAt: 300,
-    })).toEqual({
-      key: 'omt_expired',
-      chatId: 'oc_chat',
-      chatType: 'group',
-      senderUserId: 'u_owner',
-      expiredAt: 300,
-    })
+    expect(expiredRouteRecordSchema.parse(tombstone)).toEqual(tombstone)
   })
 
-  it('accepts the workspace metadata of a tombstone', () => {
-    expect(expiredRouteRecordSchema.parse({
-      key: 'omt_expired',
-      chatId: 'oc_chat',
-      chatType: 'group',
-      senderUserId: 'u_owner',
-      expiredAt: 300,
-      workspacePath: '/workspace/owner',
-      lastActivityAt: 250,
-    })).toEqual({
-      key: 'omt_expired',
-      chatId: 'oc_chat',
-      chatType: 'group',
-      senderUserId: 'u_owner',
-      expiredAt: 300,
-      workspacePath: '/workspace/owner',
-      lastActivityAt: 250,
-    })
+  it('rejects a tombstone without workspace metadata or with malformed metadata', () => {
+    const { workspacePath: _workspace, lastActivityAt: _last, ...bare } = tombstone
+    expect(() => expiredRouteRecordSchema.parse(bare)).toThrow()
+    expect(() => expiredRouteRecordSchema.parse({ ...tombstone, workspacePath: '' })).toThrow()
+    expect(() => expiredRouteRecordSchema.parse({ ...tombstone, lastActivityAt: -1 })).toThrow()
+    expect(() => expiredRouteRecordSchema.parse({ ...tombstone, lastActivityAt: 1.5 })).toThrow()
+  })
+})
+
+describe('group routes', () => {
+  it('treats every route in a group chat as a group route', () => {
+    expect(isGroupRoute(route())).toBe(true)
+    expect(isGroupRoute(route({ kind: 'chat', key: 'chat:group:oc_chat:u_owner' }))).toBe(true)
+    expect(isGroupRoute(route({ chatType: 'p2p' }))).toBe(false)
   })
 
-  it('still parses legacy tombstones without the workspace metadata', () => {
-    const legacy = expiredRouteRecordSchema.parse({
-      key: 'omt_expired',
-      chatId: 'oc_chat',
-      chatType: 'p2p',
-      senderUserId: 'u_owner',
-      expiredAt: 300,
-    })
-    expect(legacy.workspacePath).toBeUndefined()
-    expect(legacy.lastActivityAt).toBeUndefined()
+  it('accepts lastSpeakerUserId on a route record and rejects an empty one', () => {
+    expect(routeRecordSchema.parse(route({ lastSpeakerUserId: 'u_bob' })).lastSpeakerUserId).toBe('u_bob')
+    expect(() => routeRecordSchema.parse(route({ lastSpeakerUserId: '' }))).toThrow()
+  })
+})
+
+describe('group permission records', () => {
+  it('lists the three switches a group can hold', () => {
+    expect(GROUP_PERMISSIONS).toEqual(['wikiRead', 'wikiWrite', 'codeWrite'])
   })
 
-  it('rejects malformed workspace metadata in a tombstone', () => {
-    const base = {
-      key: 'omt_expired',
-      chatId: 'oc_chat',
-      chatType: 'group',
-      senderUserId: 'u_owner',
-      expiredAt: 300,
-    }
-    expect(() => expiredRouteRecordSchema.parse({ ...base, workspacePath: '' })).toThrow()
-    expect(() => expiredRouteRecordSchema.parse({ ...base, lastActivityAt: -1 })).toThrow()
-    expect(() => expiredRouteRecordSchema.parse({ ...base, lastActivityAt: 1.5 })).toThrow()
+  it('requires a chat id, defaults a missing switch to off, and keeps the name optional', () => {
+    const record = { chatId: 'oc_a', addedAt: 1, wikiRead: false, wikiWrite: true, codeWrite: false }
+    expect(groupPermissionRecordSchema.parse(record)).toEqual(record)
+    expect(groupPermissionRecordSchema.parse({ ...record, name: '研发群' }).name).toBe('研发群')
+    expect(() => groupPermissionRecordSchema.parse({ ...record, chatId: '' })).toThrow()
+    expect(() => groupPermissionRecordSchema.parse({ ...record, addedAt: -1 })).toThrow()
+    const { codeWrite: _codeWrite, ...missing } = record
+    expect(groupPermissionRecordSchema.parse(missing).codeWrite).toBe(false)
   })
 
-  it('carries the per-topic directory and worktree branch', () => {
-    expect(expiredRouteRecordSchema.parse({
-      key: 'omt_expired',
-      chatId: 'oc_chat',
-      chatType: 'group',
-      senderUserId: 'u_owner',
-      expiredAt: 300,
-      workspacePath: '/workspace/owner',
-      sessionDir: '/workspace/owner/topics/omt_expired',
-      worktreeBranch: 'feishu-omt_expired',
-      lastActivityAt: 250,
-    })).toMatchObject({
-      sessionDir: '/workspace/owner/topics/omt_expired',
-      worktreeBranch: 'feishu-omt_expired',
-    })
+  it('is stored in its own table', () => {
+    expect(Object.keys(feishuDomain.tables)).toContain('group_permissions')
   })
 })
 

@@ -14,7 +14,6 @@ assert.equal(plugin.name, 'channels', 'host bundle must export the Cordis plugin
 assert.equal(typeof plugin.apply, 'function', 'host bundle must export apply()')
 assert.ok(Array.isArray(plugin.inject) && plugin.inject.includes('agents'), 'inject list is missing')
 assert.ok(plugin.Config !== undefined, 'host bundle must export the Config schema')
-assert.equal(typeof plugin.FeishuService, 'function', 'host bundle is missing FeishuService')
 
 // The Loader validates a composition entry through Config's Standard Schema;
 // the same call must work from the built bundle.

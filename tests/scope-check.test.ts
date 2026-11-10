@@ -138,17 +138,17 @@ async function boot(partial: Partial<FeishuConfig>, options: Parameters<typeof m
 describe('FeishuService scope self-check', () => {
   it('records a passing check and logs it', async () => {
     const { service, ctxState } = await boot({}, { grantedScopes: async () => ALL_GRANTED })
-    await vi.waitFor(() => expect(service.scopeCheck()?.state).toBe('ok'))
+    await vi.waitFor(() => expect(service.checks.scopeCheck()?.state).toBe('ok'))
     expect(mock(ctxState.ctx.logger?.info).mock.calls).toContainEqual(['dsh-channels: scope self-check passed'])
     await service.shutdown()
-    expect(service.scopeCheck()).toBeUndefined()
+    expect(service.checks.scopeCheck()).toBeUndefined()
   })
 
   it('records missing scopes with deep links and warns about them', async () => {
     const grants = ALL_GRANTED.filter(grant => grant.name !== 'contact:user.employee_id:readonly')
     const { service, ctxState } = await boot({}, { grantedScopes: async () => grants })
-    await vi.waitFor(() => expect(service.scopeCheck()?.state).toBe('missing'))
-    const check = service.scopeCheck()
+    await vi.waitFor(() => expect(service.checks.scopeCheck()?.state).toBe('missing'))
+    const check = service.checks.scopeCheck()
     expect(check).toMatchObject({
       missing: [{ scopes: ['contact:user.employee_id:readonly'], level: 'required', consoleUrl: expect.stringContaining('/auth?q=contact') }],
       consoleUrl: expect.stringContaining('open.feishu.cn/app/'),
@@ -164,7 +164,7 @@ describe('FeishuService scope self-check', () => {
     ['transport error', async (): Promise<readonly ScopeGrant[]> => { throw new Error('socket hang up') }, 'socket hang up'],
   ])('records a failed check (%s)', async (_name, grantedScopes, reason) => {
     const { service, ctxState } = await boot({}, { grantedScopes })
-    await vi.waitFor(() => expect(service.scopeCheck()).toMatchObject({ state: 'error', error: reason }))
+    await vi.waitFor(() => expect(service.checks.scopeCheck()).toMatchObject({ state: 'error', error: reason }))
     expect(mock(ctxState.ctx.logger?.warn).mock.calls).toContainEqual(['dsh-channels: 飞书权限自检失败：%s', reason])
     await service.shutdown()
   })
@@ -175,11 +175,11 @@ describe('FeishuService scope self-check', () => {
     await late.service.shutdown()
     settle(ALL_GRANTED)
     await new Promise(resolve => setTimeout(resolve, 0))
-    expect(late.service.scopeCheck()).toBeUndefined()
+    expect(late.service.checks.scopeCheck()).toBeUndefined()
 
     const none = await boot({}, {})
     await new Promise(resolve => setTimeout(resolve, 0))
-    expect(none.service.scopeCheck()).toBeUndefined()
+    expect(none.service.checks.scopeCheck()).toBeUndefined()
     await none.service.shutdown()
   })
 
@@ -188,7 +188,7 @@ describe('FeishuService scope self-check', () => {
     try {
       const { service } = await boot({}, { grantedScopes: () => new Promise(() => {}) })
       await vi.advanceTimersByTimeAsync(10_000)
-      expect(service.scopeCheck()).toMatchObject({ state: 'error', error: expect.stringContaining('超时') })
+      expect(service.checks.scopeCheck()).toMatchObject({ state: 'error', error: expect.stringContaining('超时') })
       await service.shutdown()
     } finally {
       vi.useRealTimers()

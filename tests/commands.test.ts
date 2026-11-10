@@ -5,7 +5,7 @@ import {
   isSupportedCommand, registerChannelCommands, RouteOperationQueue, supportedCommandHelp, supportedCommandList,
 } from '../src/commands.ts'
 import { commandSpec } from '../src/commands/registry.ts'
-import type { AgentContext } from '../src/dsh-types.ts'
+import type { AgentContext } from '../src/host/index.ts'
 import { makeAgent, makeAgentContext, makeCommandRuntime, makeSession } from './helpers.ts'
 
 describe('slash command primitives', () => {

@@ -3,8 +3,8 @@
 import { Context, resolveConfig, ValidationError } from '@deepseek-ai/cordis'
 import type { Plugin } from '@deepseek-ai/cordis'
 import { describe, expect, it } from 'vitest'
-import { CordisFiberState } from '../src/dsh-types.ts'
-import type { HostContext } from '../src/dsh-types.ts'
+import { CordisFiberState } from '../src/host/index.ts'
+import type { HostContext } from '../src/host/index.ts'
 import { apply, Config, inject, name } from '../src/index.ts'
 import type { FeishuConfig } from '../src/index.ts'
 
@@ -17,6 +17,11 @@ describe('plugin composition', () => {
   it('requires the DSH native attachment library', () => {
     // Inbound images and files are stored only there; the loader waits for it.
     expect(inject).toContain('attachments')
+  })
+
+  it('waits for the Web services that submit prompts as the sender', () => {
+    // Boot is not retried, so the loader must order it after these appear.
+    for (const service of ['connection', 'typertGateway', 'remoteAccess', 'fileUploads']) expect(inject).toContain(service)
   })
 
   it('stays PENDING when commands is absent even if every other dependency is available', async () => {

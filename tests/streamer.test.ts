@@ -4,15 +4,35 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { DROPPED_NOTICE } from '../src/cards.ts'
-import { TurnStreamer } from '../src/streamer.ts'
-import type { AttachOptions } from '../src/streamer.ts'
-import type { MessageId, Session, SessionEvent, SessionId, UserMessage } from '../src/dsh-types.ts'
+import { DROPPED_NOTICE } from '../src/cards/index.ts'
+import { TurnStreamer } from '../src/turn/streamer.ts'
+import type { AttachOptions } from '../src/turn/streamer.ts'
+import type { MessageId, Session, SessionEvent, SessionId, UserMessage } from '../src/host/index.ts'
+import type { ChannelPrompt } from '../src/session/prompt.ts'
 import type { FeishuChannel } from '../src/feishu-channel.ts'
 import { FakeTurnDriver, makeSession, sessionEvents } from './helpers.ts'
 
+/**
+ * A message as the Agent loop claims it. A `user` message is one DSH created
+ * for a channel prompt whose request id is `id` (`source.rpcId`); any other
+ * kind is a host turn's message.
+ */
 function prompt(id: string, kind = 'user'): UserMessage {
-  return { id: id as MessageId, role: 'user', content: [{ type: 'text', text: id }], source: { kind } }
+  const source = kind === 'user'
+    ? { kind, rpcId: id, principal: { kind: 'feishu-user', userId: 'u_test' } }
+    : { kind }
+  return { id: `msg-${id}` as MessageId, role: 'user', content: [{ type: 'text', text: id }], source }
+}
+
+/** The channel prompt DSH turned into `prompt(id)`. */
+function promptOf(message: UserMessage): ChannelPrompt {
+  const rpcId = (message.source as { rpcId?: string }).rpcId ?? message.id
+  return { requestId: rpcId, principal: { kind: 'feishu-user', userId: 'u_test' }, content: [{ type: 'text', text: rpcId }] }
+}
+
+/** `steerTargetOf` / `mergeQueued` see the channel prompt of `prompt(id)`. */
+function queuedPrompt(id: string): ChannelPrompt {
+  return promptOf(prompt(id))
 }
 
 /**
@@ -30,11 +50,12 @@ class DrivenStreamer extends TurnStreamer {
     cardMessageId: string,
     triggerMessageId: string,
     reactionId: string | undefined,
-    options: Partial<AttachOptions> = {},
+    options: Partial<AttachOptions> & { message?: UserMessage } = {},
   ): void {
-    const message = options.message ?? prompt(`auto-${++this.nextPrompt}`)
+    const { message: given, ...rest } = options
+    const message = given ?? prompt(`auto-${++this.nextPrompt}`)
     this.attached.set(session.id, session)
-    super.attach(session, cardMessageId, triggerMessageId, reactionId, { ...options, message })
+    super.attach(session, cardMessageId, triggerMessageId, reactionId, { ...rest, prompt: rest.prompt ?? promptOf(message) })
     this.driver.followup(session, message)
   }
 
@@ -48,11 +69,11 @@ class DrivenStreamer extends TurnStreamer {
     this.driver.observe(session, event)
   }
 
-  override mergeQueued(messageId: string, steer: (sessionId: string, message: UserMessage) => boolean): boolean {
-    return super.mergeQueued(messageId, (sessionId, message) => {
-      const accepted = steer(sessionId, message)
+  override mergeQueued(messageId: string, steer: (sessionId: string, prompt: ChannelPrompt) => boolean): boolean {
+    return super.mergeQueued(messageId, (sessionId, queued) => {
+      const accepted = steer(sessionId, queued)
       const session = this.attached.get(sessionId)
-      if (accepted && session !== undefined) this.driver.steered(session, message)
+      if (accepted && session !== undefined) this.driver.steered(session, prompt(queued.requestId))
       return accepted
     })
   }
@@ -1476,7 +1497,7 @@ describe('TurnStreamer queued turns', () => {
     expect(streamer.hasLiveTurn('sess-q')).toBe(true)
     expect(streamer.hasLiveTurn('sess-other')).toBe(false)
     expect(streamer.steerTargetOf('om_first')).toBeUndefined()
-    expect(streamer.steerTargetOf('om_second')).toEqual({ sessionId: 'sess-q', message: prompt('m2') })
+    expect(streamer.steerTargetOf('om_second')).toEqual({ sessionId: 'sess-q', prompt: queuedPrompt('m2') })
   })
 
   it('merges a queued turn into the running one and settles both reactions together', async () => {
@@ -1484,7 +1505,7 @@ describe('TurnStreamer queued turns', () => {
     const { streamer, session } = queued(ch, 'sess-merge')
     const steer = vi.fn(() => true)
     expect(streamer.mergeQueued('om_second', steer)).toBe(true)
-    expect(steer).toHaveBeenCalledWith('sess-merge', prompt('m2'))
+    expect(steer).toHaveBeenCalledWith('sess-merge', queuedPrompt('m2'))
     expect(JSON.stringify(ch.updated.find(update => update.messageId === 'om_second')!.card)).toContain('已补充到当前回复')
     expect(streamer.steerTargetOf('om_second')).toBeUndefined()
 
@@ -1619,7 +1640,7 @@ describe('TurnStreamer headline', () => {
     // Another message id, or the running turn's prompt, changes nothing.
     streamer.onInboxDiscarded(session, prompt('m-other'))
     streamer.onInboxDiscarded(session, prompt('m-1'))
-    expect(streamer.steerTargetOf('om_queued')).toEqual({ sessionId: 'sess-drop', message: prompt('m-2') })
+    expect(streamer.steerTargetOf('om_queued')).toEqual({ sessionId: 'sess-drop', prompt: queuedPrompt('m-2') })
 
     streamer.onInboxDiscarded(session, prompt('m-2'))
     expect(streamer.steerTargetOf('om_queued')).toBeUndefined()
@@ -1634,8 +1655,8 @@ describe('TurnStreamer headline', () => {
     const session = makeSession('sess-steer-drop')
     streamer.attach(session, 'om_first', 'om_trigger_1', undefined, { message: prompt('m-1') })
     streamer.attach(session, 'om_queued', 'om_trigger_2', undefined, { message: prompt('m-2') })
-    const merged = streamer.mergeQueued('om_queued', (_sessionId, message) => {
-      streamer.onInboxDiscarded(session, message)
+    const merged = streamer.mergeQueued('om_queued', (_sessionId, queued) => {
+      streamer.onInboxDiscarded(session, prompt(queued.requestId))
       return true
     })
     expect(merged).toBe(true)
@@ -1672,7 +1693,7 @@ describe('TurnStreamer host turns', () => {
 
     // A Feishu message arriving meanwhile waits behind the host turn.
     streamer.attach(session, 'om_user', 'om_trigger', 'react-typing', { message: prompt('m-user') })
-    expect(streamer.steerTargetOf('om_user')).toEqual({ sessionId: 'sess-host', message: prompt('m-user') })
+    expect(streamer.steerTargetOf('om_user')).toEqual({ sessionId: 'sess-host', prompt: queuedPrompt('m-user') })
 
     frame(streamer, session, 1, '子代理的结论')
     await vi.advanceTimersByTimeAsync(500)
@@ -1699,7 +1720,7 @@ describe('TurnStreamer host turns', () => {
     const streamer = new TurnStreamer(ch, 500, hooksInstance)
     const session = makeSession('sess-batch')
     const feishu = prompt('m-feishu')
-    streamer.attach(session, 'om_user', 'om_trigger', 'react-typing', { message: feishu })
+    streamer.attach(session, 'om_user', 'om_trigger', 'react-typing', { prompt: promptOf(feishu) })
 
     // DSH claims the workspace instructions (next-step) before the prompt.
     streamer.onInboxClaimed(session, prompt('instructions', 'agent-instructions'), 1)
@@ -1713,6 +1734,26 @@ describe('TurnStreamer host turns', () => {
     expect(JSON.stringify(ch.updated.filter(update => update.messageId === 'om_user').at(-1))).toContain('你好')
     streamer.onSessionEvent(session, { type: 'turn/end', seq: 1, data: { turn: 1, reason: 'stop' } })
     await vi.waitFor(() => expect(ch.addReaction).toHaveBeenCalledWith('om_trigger', 'DONE'))
+  })
+
+  it('tells a host-started running turn from one a channel prompt opened', async () => {
+    const ch = channel()
+    const streamer = new TurnStreamer(ch, 500, { ...hooks(), hostTurnOrigin: vi.fn(() => undefined) })
+    const host = makeSession('sess-host-kind')
+    const feishu = makeSession('sess-feishu-kind')
+    expect(streamer.runsHostTurn('sess-host-kind')).toBe(false)
+    streamer.onInboxClaimed(host, prompt('job-done', 'tool-jobs'), 1)
+    expect(streamer.runsHostTurn('sess-host-kind')).toBe(true)
+    // Still host-started once the turn rendered nowhere.
+    await vi.advanceTimersByTimeAsync(0)
+    expect(streamer.runsHostTurn('sess-host-kind')).toBe(true)
+    streamer.onSessionEvent(host, { type: 'turn/end', seq: 1, data: { turn: 1, reason: 'stop' } })
+    expect(streamer.runsHostTurn('sess-host-kind')).toBe(false)
+
+    const message = prompt('m-feishu-kind')
+    streamer.attach(feishu, 'om_user', 'om_trigger', 'react-typing', { prompt: promptOf(message) })
+    streamer.onInboxClaimed(feishu, message, 1)
+    expect(streamer.runsHostTurn('sess-feishu-kind')).toBe(false)
   })
 
   it('takes a host card\'s origin from the batch\'s turn prompt, not injected next-step input', async () => {

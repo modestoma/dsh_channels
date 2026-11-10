@@ -9,11 +9,10 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import { describe, expect, it, vi } from 'vitest'
-import { buildTopicRootCard } from '../src/cards.ts'
+import { buildTopicRootCard } from '../src/cards/index.ts'
 import { resolveConfig } from '../src/config.ts'
 import type { FeishuConfig } from '../src/config.ts'
-import type { HostContext } from '../src/dsh-types.ts'
-import { rootCardOf } from '../src/domain.ts'
+import type { HostContext } from '../src/host/index.ts'
 import type { RouteRecord, TopicLaunchRecord } from '../src/domain.ts'
 import type { CardActionEvent, ChannelFactory, NormalizedMessage } from '../src/feishu-channel.ts'
 import { apply, inject, name } from '../src/index.ts'
@@ -44,7 +43,6 @@ function spec(partial: Partial<TopicLaunchSpec> = {}): TopicLaunchSpec {
       ],
       links: { nameHeader: '日志', linkHeader: '详情页', rows: [{ name: '设备 A 崩溃日志', url: 'https://logs.example/detail/1' }] },
     },
-    workspace: { segments: ['analyze', 'camera', 'E1001'], title: '日志分析 · camera · E1001' },
     prompt: PROMPT,
     ...partial,
   }
@@ -68,19 +66,6 @@ describe('topic root card', () => {
     expect(running).toContain('\\\\*not bold\\\\*')
     expect(running).not.toContain('"tag":"table"')
   })
-
-  it('redraws records the former analyze API wrote as the card it drew', () => {
-    const legacy: TopicLaunchRecord = {
-      key: 'req-1', bodyHash: 'h', chatId: 'oc_group', messageId: 'om_1', acceptedAt: 1, status: 'running',
-      subject: {
-        requesterUserId: 'u_alice', triggeredAt: '2026-10-22 19:30', app: 'camera', errorCode: 'E1001',
-        logDetails: [{ name: '设备 A 崩溃日志', url: 'https://logs.example/detail/1' }],
-      },
-    }
-    const root = rootCardOf(legacy)!
-    expect(root).toEqual({ requesterUserId: 'u_alice', card: spec().card })
-    expect(rootCardOf({ ...legacy, subject: undefined })).toBeUndefined()
-  })
 })
 
 describe('feishuTopics service provision', () => {
@@ -98,7 +83,7 @@ describe('feishuTopics service provision', () => {
     await vi.waitFor(() => expect(ctx.get(FEISHU_TOPICS_SERVICE)).toBeDefined())
     const service = ctx.get(FEISHU_TOPICS_SERVICE) as FeishuTopicService
     expect(service).toBeInstanceOf(TopicLauncher)
-    expect(service.version).toBe(1)
+    expect(service.version).toBe(2)
     expect(await service.launch(spec())).toMatchObject({ ok: false, code: 'not-connected' })
     await fiber.dispose()
     expect(ctx.get(FEISHU_TOPICS_SERVICE)).toBeUndefined()
@@ -126,8 +111,8 @@ describe('topic launch flow', () => {
     const factory: ChannelFactory = () => channel
     const service = new FeishuService(ctxState.ctx, config, factory)
     await service.start()
-    await service.addAccessUser('u_admin')
-    await service.setAccessPermission('u_admin', 'admin', true)
+    await service.accessAdmin.addUser('u_admin')
+    await service.accessAdmin.setPermission('u_admin', 'admin', true)
     const handler = (channel.onMessage as unknown as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0] as
       (msg: NormalizedMessage) => Promise<void>
     const launcher = service.topics()
@@ -135,7 +120,7 @@ describe('topic launch flow', () => {
       service, channel, ctxState, config, launcher,
       onMessage: (msg: NormalizedMessage) => Promise.resolve(handler(msg)),
       routes: () => [...ctxState.domain.raw.table('routes').entries()].map(([, value]) => value as RouteRecord),
-      record: (key: string) => ctxState.domain.raw.table('analyze_requests').get(key) as TopicLaunchRecord | undefined,
+      record: (key: string) => ctxState.domain.raw.table('topic_launches').get(key) as TopicLaunchRecord | undefined,
     }
   }
 
@@ -167,7 +152,7 @@ describe('topic launch flow', () => {
 
   it('posts the root card, opens a shared topic with a streaming card, and forwards the prompt verbatim', async () => {
     const h = await setup()
-    await h.service.addAccessUser('u_alice')
+    await h.service.accessAdmin.addUser('u_alice')
     const response = await h.launcher.launch(spec())
 
     expect(response).toEqual({ ok: true, replayed: false, chatId: 'oc_group', messageId: 'om_1' })
@@ -184,19 +169,25 @@ describe('topic launch flow', () => {
     expect(JSON.stringify(streaming.input)).toContain('⚙️ 进行中')
     expect(h.routes()[0]).toMatchObject({
       key: 'omt_2', kind: 'thread', chatId: 'oc_group', senderUserId: 'u_alice',
-      cardMessageId: 'om_2', shared: true,
-      workspacePath: path.join(h.config.baseDir, 'analyze', 'camera', 'E1001'),
+      cardMessageId: 'om_2', chatType: 'group',
+      workspacePath: path.join(h.config.baseDir, 'groups', 'oc_group', 'omt_2'),
     })
+    expect(h.routes()[0]).not.toHaveProperty('mode')
+    expect(h.ctxState.workspaces.workspaces.get(path.join(h.config.baseDir, 'groups', 'oc_group', 'omt_2'))).toMatchObject({ title: 'oc_group · 日志分析' })
+    expect(h.ctxState.domain.raw.table('group_permissions').get('oc_group')).toMatchObject({ chatId: 'oc_group', codeWrite: false })
     const agent = h.ctxState.agents.created[0]!.handle.agent
     expect(followupMessagesOf(agent).map(message => message.content[0]!.text)).toEqual([PROMPT])
-    expect(followupMessagesOf(agent)[0]!.source).toMatchObject({ kind: 'user', principal: { kind: 'feishu-user', userId: 'u_alice' } })
-    // Restart recovery replays the first prompt on behalf of the requester.
-    expect(h.ctxState.domain.raw.table('inflight').get('om_2')).toMatchObject({ senderUserId: 'u_alice' })
+    // The topic belongs to the group; the requester is its first speaker.
+    expect(followupMessagesOf(agent)[0]!.source).toMatchObject({ kind: 'user', principal: { kind: 'feishu-group', chatId: 'oc_group', userId: 'u_alice' } })
+    // Restart recovery replays the first prompt as the same principal.
+    expect(h.ctxState.domain.raw.table('inflight').get('om_2')).toMatchObject({
+      prompt: { requestId: followupMessagesOf(agent)[0]!.source.rpcId, principal: { kind: 'feishu-group', chatId: 'oc_group', userId: 'u_alice' } },
+    })
   })
 
   it('streams the first turn in the topic and marks the root card when it settles', async () => {
     const h = await setup()
-    await h.service.addAccessUser('u_alice')
+    await h.service.accessAdmin.addUser('u_alice')
     await h.launcher.launch(spec())
     await waitUntil(() => expect(h.routes()).toHaveLength(1))
     const agent = h.ctxState.agents.created[0]!.handle.agent
@@ -213,7 +204,7 @@ describe('topic launch flow', () => {
 
   it('marks the root card failed when the first turn fails', async () => {
     const h = await setup()
-    await h.service.addAccessUser('u_alice')
+    await h.service.accessAdmin.addUser('u_alice')
     await h.launcher.launch(spec())
     await waitUntil(() => expect(h.routes()).toHaveLength(1))
     const agent = h.ctxState.agents.created[0]!.handle.agent
@@ -229,13 +220,12 @@ describe('topic launch flow', () => {
     const h = await setup()
     const emit = vi.fn()
     h.ctxState.ctx.emit = emit
-    await h.service.addAccessUser('u_alice')
+    await h.service.accessAdmin.addUser('u_alice')
     expect(h.launcher.state('key-1')).toBeUndefined()
     await h.launcher.launch(spec())
     await waitUntil(() => expect(h.routes()).toHaveLength(1))
     const route = h.routes()[0]!
-    expect(route.sessionDir).toBeDefined()
-    const running = { key: 'key-1', status: 'running', sessionId: route.sessionId, workDir: route.sessionDir }
+    const running = { key: 'key-1', status: 'running', sessionId: route.sessionId, workDir: route.workspacePath }
     expect(h.launcher.state('key-1')).toEqual(running)
     expect(h.record('key-1')?.threadId).toBe(route.key)
     expect(h.launcher.launchKeyOf(route.sessionId)).toBe('key-1')
@@ -254,7 +244,7 @@ describe('topic launch flow', () => {
 
   it('marks analyses a previous instance never finished as interrupted at start', async () => {
     const h = await setup()
-    await h.service.addAccessUser('u_alice')
+    await h.service.accessAdmin.addUser('u_alice')
     await h.launcher.launch(spec({ key: 'key-done' }))
     await waitUntil(() => expect(h.routes()).toHaveLength(1))
     const first = h.ctxState.agents.created[0]!.handle.agent
@@ -276,7 +266,7 @@ describe('topic launch flow', () => {
 
   it('replays a retried key and refuses a reused one', async () => {
     const h = await setup()
-    await h.service.addAccessUser('u_alice')
+    await h.service.accessAdmin.addUser('u_alice')
     const [first, concurrent] = await Promise.all([h.launcher.launch(spec()), h.launcher.launch(spec())])
     const replay = await h.launcher.launch(spec())
     expect(first).toMatchObject({ ok: true, replayed: false })
@@ -286,11 +276,11 @@ describe('topic launch flow', () => {
     expect(await h.launcher.launch(spec({ fingerprint: 'fp-other', prompt: 'other' }))).toMatchObject({ ok: false, code: 'key-conflict' })
   })
 
-  it('refuses requesters without chat permission', async () => {
+  it('refuses requesters without chat permission (the first turn is submitted as them)', async () => {
     const h = await setup()
     expect(await h.launcher.launch(spec())).toMatchObject({ ok: false, code: 'forbidden-chat' })
-    await h.service.addAccessUser('u_alice')
-    await h.service.setAccessPermission('u_alice', 'chat', false)
+    await h.service.accessAdmin.addUser('u_alice')
+    await h.service.accessAdmin.setPermission('u_alice', 'chat', false)
     expect(await h.launcher.launch(spec())).toMatchObject({ ok: false, code: 'forbidden-chat', message: expect.stringContaining('没有对话权限') })
     expect(h.channel.sent).toHaveLength(0)
   })
@@ -303,7 +293,7 @@ describe('topic launch flow', () => {
 
   it('waits for an acceptance still sending its root card before shutdown finishes', async () => {
     const h = await setup()
-    await h.service.addAccessUser('u_alice')
+    await h.service.accessAdmin.addUser('u_alice')
     const sendMock = vi.mocked(h.channel.send)
     const send = sendMock.getMockImplementation()!
     let release!: () => void
@@ -332,11 +322,8 @@ describe('topic launch flow', () => {
 
   it('refuses invalid specs before posting anything', async () => {
     const h = await setup()
-    await h.service.addAccessUser('u_alice')
+    await h.service.accessAdmin.addUser('u_alice')
     const invalid: Array<[string, TopicLaunchSpec]> = [
-      ['workspace.segments', spec({ workspace: { segments: ['..'], title: 't' } })],
-      ['workspace.segments', spec({ workspace: { segments: ['p2p', 'u_alice'], title: 't' } })],
-      ['workspace.segments', spec({ workspace: { segments: [], title: 't' } })],
       ['chatId', spec({ chatId: 'ou_user' })],
       ['requesterUserId', spec({ requesterUserId: 'ou_open_id' })],
       ['key', spec({ key: 'has space' })],
@@ -353,33 +340,29 @@ describe('topic launch flow', () => {
 
   it('reports a root card Feishu refuses as send-failed', async () => {
     const h = await setup()
-    await h.service.addAccessUser('u_alice')
+    await h.service.accessAdmin.addUser('u_alice')
     vi.mocked(h.channel.send).mockRejectedValueOnce(new Error('bot not in chat'))
     expect(await h.launcher.launch(spec())).toMatchObject({ ok: false, code: 'send-failed', message: expect.stringContaining('bot not in chat') })
     expect(h.record('key-1')).toBeUndefined()
   })
 
-  it('marks a running record the former analyze API wrote as interrupted at start', async () => {
+  it('marks a record still running at start as interrupted', async () => {
     const h = await setup()
-    await h.ctxState.domain.raw.table('analyze_requests').put('req-legacy', {
-      key: 'req-legacy', bodyHash: 'h', chatId: 'oc_group', messageId: 'om_legacy', acceptedAt: 1, status: 'running',
-      subject: {
-        requesterUserId: 'u_alice', triggeredAt: '2026-10-22 19:30', app: 'camera', errorCode: 'E1001',
-        logDetails: [{ name: '设备 A 崩溃日志', url: 'https://logs.example/detail/1' }],
-      },
+    await h.ctxState.domain.raw.table('topic_launches').put('req-left', {
+      key: 'req-left', bodyHash: 'h', chatId: 'oc_group', messageId: 'om_left', acceptedAt: 1, status: 'running',
+      requesterUserId: 'u_alice', card: spec().card,
     })
     await h.service.shutdown()
     await h.service.start()
-    await waitUntil(() => expect(h.record('req-legacy')?.status).toBe('interrupted'))
-    const card = lastCard(h, 'om_legacy')
+    await waitUntil(() => expect(h.record('req-left')?.status).toBe('interrupted'))
+    const card = lastCard(h, 'om_left')
     expect(card).toContain('已中断')
-    expect(card).toContain('<at id=u_alice></at> 于 2026-10-22 19:30 发起了对 **camera** 应用 **E1001** 错误码不良日志的分析。')
-    expect(card).toContain('设备 A 崩溃日志')
+    expect(card).toContain('<at id=u_alice></at>')
   })
 
   it('ends on a failure card without a route when setup fails', async () => {
     const h = await setup()
-    await h.service.addAccessUser('u_alice')
+    await h.service.accessAdmin.addUser('u_alice')
     const emit = vi.fn()
     h.ctxState.ctx.emit = emit
     sessionsOf(h.launcher).mountGuidance = async () => { throw new Error('mount failed') }
@@ -396,8 +379,8 @@ describe('topic launch flow', () => {
 
   it('holds topic replies posted during setup until the analysis prompt is delivered', async () => {
     const h = await setup()
-    await h.service.addAccessUser('u_alice')
-    await h.service.addAccessUser('u_bob')
+    await h.service.accessAdmin.addUser('u_alice')
+    await h.service.accessAdmin.addUser('u_bob')
     const held = holdSetup(h.launcher)
     await h.launcher.launch(spec())
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
@@ -415,14 +398,14 @@ describe('topic launch flow', () => {
     expect(followupMessagesOf(agent).map(message => message.content[0]!.text)).toEqual([PROMPT, '顺便看下内存'])
     // Each prompt on the shared route names its own sender.
     expect(followupMessagesOf(agent).map(message => message.source.principal)).toEqual([
-      { kind: 'feishu-user', userId: 'u_alice' },
-      { kind: 'feishu-user', userId: 'u_bob' },
+      { kind: 'feishu-group', chatId: 'oc_group', userId: 'u_alice' },
+      { kind: 'feishu-group', chatId: 'oc_group', userId: 'u_bob' },
     ])
   })
 
   it('removes the published route when the first prompt cannot be delivered', async () => {
     const h = await setup()
-    await h.service.addAccessUser('u_alice')
+    await h.service.accessAdmin.addUser('u_alice')
     const held = holdSetup(h.launcher)
     await h.launcher.launch(spec())
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
@@ -437,7 +420,7 @@ describe('topic launch flow', () => {
 
   it('ends an analysis still starting at shutdown on the failure card', async () => {
     const h = await setup()
-    await h.service.addAccessUser('u_alice')
+    await h.service.accessAdmin.addUser('u_alice')
     const held = holdSetup(h.launcher)
     await h.launcher.launch(spec())
     await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(1))
@@ -451,8 +434,8 @@ describe('topic launch flow', () => {
 
   it('lets admitted group members, and nobody else, follow up and stop the shared topic', async () => {
     const h = await setup()
-    await h.service.addAccessUser('u_alice')
-    await h.service.addAccessUser('u_bob')
+    await h.service.accessAdmin.addUser('u_alice')
+    await h.service.accessAdmin.addUser('u_bob')
     await h.launcher.launch(spec())
     await waitUntil(() => expect(h.routes()).toHaveLength(1))
     const agent = h.ctxState.agents.created[0]!.handle.agent

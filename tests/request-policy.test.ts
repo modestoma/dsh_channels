@@ -2,7 +2,7 @@ import { Context } from '@deepseek-ai/cordis'
 import { describe, expect, it } from 'vitest'
 import type {
   Agent, AgentContext, AgentModel, AgentRequestConfig, AgentRequestListener, ModelSelection, SessionEvent,
-} from '../src/dsh-types.ts'
+} from '../src/host/index.ts'
 import { foldEffortOverride, installRequestPolicy } from '../src/session/request-policy.ts'
 
 type RequestWaterfall = (

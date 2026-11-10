@@ -44,6 +44,10 @@ export const SET_ACCESS_PERMISSION_ROUTE = '/api/dsh-channels.setAccessPermissio
 export const SET_ACCESS_GIT_EMAIL_ROUTE = '/api/dsh-channels.setAccessGitEmail'
 /** 结算一条待处理授权申请（POST，body `{ token, decision }`）。 */
 export const RESOLVE_ACCESS_REQUEST_ROUTE = '/api/dsh-channels.resolveAccessRequest'
+/** 设置一个群的权限开关（POST，body `{ chatId, permission, enabled }`，permission 为 wikiRead、wikiWrite 或 codeWrite）。 */
+export const SET_GROUP_PERMISSION_ROUTE = '/api/dsh-channels.setGroupPermission'
+/** 从群权限表移除一个群（POST，body `{ chatId }`）；该群下次开话题时重新登记（开关全关）。 */
+export const REMOVE_ACCESS_GROUP_ROUTE = '/api/dsh-channels.removeAccessGroup'
 /**
  * 打开宿主机的系统目录选择框（POST，无请求体），返回绝对路径。
  *
@@ -229,10 +233,11 @@ export const EDITABLE_KEYS = [
   'threadFallback',
   // 会话：工作区
   'baseDir',
-  'topicIsolation',
   // 会话：话题与卡片
   'routeTtlMs',
   'approvalTimeoutMs',
+  'approvalBackgroundTimeoutMs',
+  'approvalReminderMs',
   'questionTimeoutMs',
   'refreshMs',
   'statusRefreshMs',
@@ -585,6 +590,26 @@ export interface AccessUserWire {
   gitEmail?: string
 }
 
+/** Permission switches of one group record (same names as the stored record). */
+export type GroupPermissionWire = 'wikiRead' | 'wikiWrite' | 'codeWrite'
+
+/**
+ * One group `chat_id` with its permission switches: registered the first
+ * time a topic opens in the group, every switch off until an administrator
+ * turns it on here. The switches gate the tools of every topic in the group;
+ * who may talk there is decided per user by the user table.
+ */
+export interface AccessGroupWire {
+  chatId: string
+  /** Group name captured when the record was last written. */
+  name?: string
+  /** Epoch ms when the group was registered. */
+  addedAt: number
+  wikiRead: boolean
+  wikiWrite: boolean
+  codeWrite: boolean
+}
+
 /** One pending authorization request the panel may settle (same path as the DM card). */
 export interface AccessRequestWire {
   /** Opaque token; never derived from the target id. */
@@ -605,8 +630,8 @@ export interface AccessRequestWire {
 
 /**
  * `GET /api/dsh-channels.access` payload: admission mode, the user table
- * (administrators are users with `admin` on), and the still-pending
- * authorization requests.
+ * (administrators are users with `admin` on), the group permission table,
+ * and the still-pending authorization requests.
  */
 export interface AccessWire {
   mode: 'open' | 'guarded'
@@ -617,6 +642,8 @@ export interface AccessWire {
    */
   loaded: boolean
   users: AccessUserWire[]
+  /** Groups a topic has opened in, oldest first. */
+  groups: AccessGroupWire[]
   requests: AccessRequestWire[]
 }
 
@@ -728,6 +755,7 @@ export const PANEL_TABS = [
   { id: 'model', label: '模型' },
   { id: 'attachments', label: '附件与工具' },
   { id: 'access', label: '访问授权' },
+  { id: 'groups', label: '群权限' },
   { id: 'wiki', label: '知识库' },
   { id: 'advanced', label: '高级' },
 ] as const
@@ -742,6 +770,7 @@ export const TAB_FIELD_GROUPS: Readonly<Record<PanelTabId, readonly FieldGroup[]
   model: ['model'],
   attachments: ['attachments', 'tools', 'limits'],
   access: ['access'],
+  groups: [],
   wiki: ['wiki'],
   advanced: ['logging'],
 }
@@ -939,6 +968,12 @@ export const PANEL_COPY = {
   accessGitEmailPlaceholder: 'GitHub/GitLab 账号已验证的邮箱，留空清除',
   accessGitEmailSave: '保存',
   accessGitEmailChanged: '已更新 Git 邮箱',
+  groupsTitle: '群权限表',
+  groupsEmpty: '还没有群开过话题',
+  groupsHint: '机器人在群里第一次开话题时自动登记该群，三个开关默认关闭；开关只在这里设置，作用于该群的所有话题（谁能在群里说话仍由用户表决定）。移除后该群下次开话题时重新登记。',
+  groupsNotLoaded: '飞书连接建立后加载群权限表',
+  groupRemoved: '已移除群',
+  groupPermissionChanged: '已更新群权限',
   accessGitEmailHint: '设置了 Git 邮箱的用户在飞书里让机器人推送代码时，提交作者显示为本人（提交者仍是令牌账号）；邮箱要是本人 GitHub/GitLab 账号已验证的邮箱，平台才会显示头像和链接。',
   // ---- wiki ---------------------------------------------------------------
   wikiUsersTitle: '可使用的人',

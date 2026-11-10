@@ -1,7 +1,7 @@
 /**
  * Durable route store: thread/chat keys → bound DSH session records.
  *
- * Owns the hot cache over the `channels_routes` domain tables, the TTL
+ * Owns the hot cache over the `dsh_channels` domain tables, the TTL
  * retirement that leaves a persistent tombstone, session → route lookup, and
  * the durable session → Feishu origin records every route write feeds.
  * The domain handle is late-bound (`domain()`), because the service opens it
@@ -11,7 +11,20 @@
  */
 
 import type { ExpiredRouteRecord, FeishuDomainHandle, RouteRecord, SessionOriginRecord } from '../domain.ts'
-import { normalizeRouteRecord, normalizeSessionHistory } from '../domain.ts'
+
+/**
+ * The route record of a newly opened topic: its first Session is its only
+ * history entry and its creation is its last activity.
+ * @param route - the route's identity, Session, workspace, and first card.
+ * @param createdAt - the Session's creation time.
+ * @returns the record.
+ */
+export function newTopicRoute(
+  route: Omit<RouteRecord, 'createdAt' | 'lastActivityAt' | 'sessionHistory' | 'lastSpeakerUserId'>,
+  createdAt: number,
+): RouteRecord {
+  return { ...route, createdAt, lastActivityAt: createdAt, sessionHistory: [{ sessionId: route.sessionId, createdAt }] }
+}
 
 export interface RouteStoreDeps {
   /** The opened domain handle, or undefined before `start()` / after shutdown. */
@@ -20,6 +33,8 @@ export interface RouteStoreDeps {
   ttlMs(): number
   /** Structured warning sink (never throws). */
   warn(message: string, ...args: unknown[]): void
+  /** Called after the active route set changed (a put, a removal, a retirement). */
+  changed?(): void
 }
 
 export class RouteStore {
@@ -39,28 +54,22 @@ export class RouteStore {
     const domain = this.deps.domain()
     if (domain === undefined) return
     for (const [key, record] of domain.routes.entries()) {
-      this.active.set(key, normalizeRouteRecord(record))
+      this.active.set(key, record)
     }
     for (const [key, record] of domain.expiredRoutes.entries()) {
       this.expired.set(key, record)
       this.active.delete(key)
     }
-    // Routes written before origins existed get theirs now; a failure only
-    // leaves those Sessions without a Web origin view.
-    for (const record of this.active.values()) {
-      void this.recordOrigins(record)
-    }
   }
 
-  /** One active route by key (cache-first, normalized). */
+  /** One active route by key (cache-first). */
   get(key: string): RouteRecord | undefined {
     const cached = this.active.get(key)
     if (cached !== undefined) return cached
     const stored = this.deps.domain()?.routes.get(key)
     if (stored === undefined) return undefined
-    const normalized = normalizeRouteRecord(stored)
-    this.active.set(key, normalized)
-    return normalized
+    this.active.set(key, stored)
+    return stored
   }
 
   /** One durable tombstone by expired thread id. */
@@ -76,9 +85,9 @@ export class RouteStore {
   /** Persist one active route and refresh the cache. */
   async put(key: string, record: RouteRecord): Promise<void> {
     await this.deps.domain()?.routes.put(key, record)
-    const normalized = normalizeRouteRecord(record)
-    this.active.set(key, normalized)
-    await this.recordOrigins(normalized)
+    this.active.set(key, record)
+    this.deps.changed?.()
+    await this.recordOrigins(record)
   }
 
   /** Every recorded Session origin, retired routes included. */
@@ -96,6 +105,7 @@ export class RouteStore {
   async remove(key: string): Promise<void> {
     await this.deps.domain()?.routes.delete(key)
     this.active.delete(key)
+    this.deps.changed?.()
   }
 
   /** Drop one key from the cache only (used when a tombstone takes over). */
@@ -136,7 +146,7 @@ export class RouteStore {
   private async recordOrigins(record: RouteRecord): Promise<void> {
     const table = this.deps.domain()?.sessionOrigins
     if (table === undefined) return
-    for (const entry of normalizeSessionHistory(record)) {
+    for (const entry of record.sessionHistory) {
       if (table.get(entry.sessionId) !== undefined) continue
       const origin: SessionOriginRecord = {
         key: entry.sessionId,
@@ -146,7 +156,6 @@ export class RouteStore {
         chatType: record.chatType,
         senderUserId: record.senderUserId,
         createdAt: entry.createdAt,
-        ...(record.shared === true ? { shared: true as const } : {}),
       }
       try {
         await table.put(entry.sessionId, origin)
@@ -171,6 +180,7 @@ export class RouteStore {
     const existing = this.expiredRoute(key)
     if (existing !== undefined) {
       this.active.delete(key)
+      this.deps.changed?.()
       if (this.deps.domain()?.routes.get(key) !== undefined) {
         try {
           await this.deps.domain()?.routes.delete(key)
@@ -199,13 +209,12 @@ export class RouteStore {
       senderUserId: record.senderUserId,
       expiredAt: now,
       workspacePath: record.workspacePath,
-      ...(record.sessionDir === undefined ? {} : { sessionDir: record.sessionDir }),
-      ...(record.worktreeBranch === undefined ? {} : { worktreeBranch: record.worktreeBranch }),
       lastActivityAt: record.lastActivityAt,
     }
     await this.deps.domain()?.expiredRoutes.put(key, tombstone)
     this.expired.set(key, tombstone)
     this.active.delete(key)
+    this.deps.changed?.()
     try {
       await this.deps.domain()?.routes.delete(key)
     } catch (error) {

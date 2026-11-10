@@ -8,10 +8,11 @@ import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
+import { SessionLineage } from '../src/access/lineage.ts'
 import { ReadFence } from '../src/access/read-fence.ts'
 import type { FeishuConfig } from '../src/config.ts'
 import type { RouteRecord } from '../src/domain.ts'
-import type { Agent, PreToolExecution } from '../src/dsh-types.ts'
+import type { Agent, PreToolExecution } from '../src/host/index.ts'
 
 type FenceConfig = FeishuConfig['readFence']
 
@@ -33,12 +34,14 @@ function setup(overrides: Partial<FenceConfig> = {}) {
   }
   const routes = new Map<string, RouteRecord>([['s_alice', { workspacePath: alice } as RouteRecord]])
   const cwd = new Map<string, string>()
+  const lineage = new SessionLineage(sessionId => routes.get(sessionId))
   const fence = new ReadFence({
     config: () => ({ readFence: config }),
     routeOf: sessionId => routes.get(sessionId),
+    lineage,
     workingDirectory: session => cwd.get(session.id),
   })
-  return { fence, config, routes, cwd, base, alice, bob, skills, secret }
+  return { fence, lineage, config, routes, cwd, base, alice, bob, skills, secret }
 }
 
 /** One pending call by the agent of `sessionId`. */
@@ -50,13 +53,9 @@ function call(name: string, args: Record<string, unknown>, sessionId = 's_alice'
 const denied = { kind: 'deny', reason: expect.stringContaining('飞书会话只能读取自己的工作区') }
 
 describe('ReadFence', () => {
-  it('allows the route workspace, its topic directory, and the shared roots; denies everything else', async () => {
-    const { fence, routes, alice, bob, skills, secret, base } = setup()
-    const topic = path.join(base, 'topics', 't1')
-    mkdirSync(topic, { recursive: true })
-    routes.set('s_alice', { workspacePath: alice, sessionDir: topic } as RouteRecord)
+  it('allows the topic directory and the shared roots; denies everything else', async () => {
+    const { fence, alice, bob, skills, secret } = setup()
     expect(await fence.decide(call('read', { file_path: path.join(alice, 'a.md') }))).toBeUndefined()
-    expect(await fence.decide(call('read', { file_path: path.join(topic, 'b.md') }))).toBeUndefined()
     expect(await fence.decide(call('read', { file_path: path.join(skills, 'x', 'SKILL.md') }))).toBeUndefined()
     const decision = await fence.decide(call('read', { file_path: path.join(bob, 'notes.md') }))
     expect(decision).toMatchObject(denied)
@@ -97,17 +96,12 @@ describe('ReadFence', () => {
   })
 
   it('grants nothing through a topic directory replaced by a symlink', async () => {
-    const { fence, routes, alice, base, secret } = setup()
+    const { fence, routes, base, secret } = setup()
     const outside = path.join(base, 'topics-outside')
     mkdirSync(outside, { recursive: true })
     const linked = path.join(outside, 't1')
     symlinkSync(secret, linked)
-    routes.set('s_alice', { workspacePath: alice, sessionDir: linked } as RouteRecord)
-    expect(await fence.decide(call('read', { file_path: path.join(secret, 'token') }))).toMatchObject(denied)
-    const inside = path.join(alice, 'topics', 't2')
-    mkdirSync(path.dirname(inside), { recursive: true })
-    symlinkSync(secret, inside)
-    routes.set('s_alice', { workspacePath: alice, sessionDir: inside } as RouteRecord)
+    routes.set('s_alice', { workspacePath: linked } as RouteRecord)
     expect(await fence.decide(call('read', { file_path: path.join(secret, 'token') }))).toMatchObject(denied)
   })
 
@@ -122,13 +116,13 @@ describe('ReadFence', () => {
   })
 
   it('fences subagents of a routed Session, including nested ones, and ignores Sessions it does not route', async () => {
-    const { fence, bob } = setup()
+    const { fence, lineage, bob } = setup()
     const outside = { file_path: path.join(bob, 'notes.md') }
     expect(await fence.decide(call('read', outside, 's_child', 's_alice'))).toMatchObject(denied)
     expect(await fence.decide(call('read', outside, 's_grandchild', 's_child'))).toMatchObject(denied)
     expect(await fence.decide(call('read', outside, 's_web'))).toBeUndefined()
     expect(await fence.decide(call('read', outside, 's_web_child', 's_web'))).toBeUndefined()
-    fence.clear()
+    lineage.clear()
     expect(await fence.decide(call('read', outside, 's_grandchild', 's_child'))).toBeUndefined()
   })
 

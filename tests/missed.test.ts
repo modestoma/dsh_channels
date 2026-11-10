@@ -17,7 +17,7 @@ const MINUTE = 60_000
 function route(partial: Partial<RouteRecord> & Pick<RouteRecord, 'key' | 'chatId'>): RouteRecord {
   return {
     kind: 'thread', sessionId: 's', chatType: 'group', senderUserId: 'u_alice', workspacePath: '/w',
-    cardMessageId: 'om_card', createdAt: 0, lastActivityAt: NOW - 60 * MINUTE, ...partial,
+    cardMessageId: 'om_card', createdAt: 0, lastActivityAt: NOW - 60 * MINUTE, sessionHistory: [], ...partial,
   }
 }
 
@@ -64,11 +64,12 @@ function setup(options: {
     config: () => ({ enabled: true, windowMs: 30 * MINUTE, heartbeatMs: MINUTE, maxMessages: 200, ...options.config }),
     domain: () => ({
       getGlobal: () => global,
-      setGlobal: (value: FeishuDomainGlobal) => { Object.assign(global, value) },
+      setGlobal: async (value: FeishuDomainGlobal) => { Object.assign(global, value) },
       processed: {
         get: key => processed.get(key),
-        put: (key, value) => { processed.set(key, value) },
-        delete: key => { processed.delete(key) },
+        put: async (key, value) => { processed.set(key, value) },
+        delete: async key => { processed.delete(key) },
+        update: async (key, fn) => { processed.set(key, fn(processed.get(key)!)) },
         entries: () => processed.entries(),
       },
     }),

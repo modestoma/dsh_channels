@@ -358,7 +358,6 @@ export class AccessRequests {
     const now = this.now()
     return {
       token: randomUUID(),
-      kind: 'user',
       targetId: input.userId,
       chatId: input.chatId,
       ...(input.groupName === undefined || input.groupName === '' ? {} : { groupName: input.groupName }),
@@ -462,7 +461,7 @@ export class AccessRequests {
   /** Replace every DM card of the request with its terminal state; delivery failures only warn. */
   private async patchCard(record: AccessRequestRecord): Promise<void> {
     const status = settledStatus(record.status)
-    const messageIds = [...record.messageId === undefined ? [] : [record.messageId], ...record.messageIds ?? []]
+    const messageIds = record.messageIds ?? []
     if (status === undefined || messageIds.length === 0) return
     const channel = this.deps.channel()
     if (channel === undefined) return

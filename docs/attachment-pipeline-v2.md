@@ -41,13 +41,13 @@
 
 ### 3.1 触发消息（立即建会话）
 
-以下顺序由 [src/routing/inbound.ts](../src/routing/inbound.ts) 的 `establishSession` 实现；**任何附件字节都不在会话建立前下载**：
+以下顺序由 [src/routing/inbound.ts](../src/routing/inbound.ts) 的 `establishSession` 实现（话题工作区与 Session 的创建步骤与群话题服务共用 `openTopicWorkspace` 和 `openTopicSession`）；**任何附件字节都不在会话建立前下载**：
 
 1. 去重（`processed` 表 + 进程内守卫）与频道准入（管理员 / 用户表的对话准入）通过；未通过者不建会话、不落附件、不调模型。
 2. 对触发消息加 `Typing` 表情（异步，不阻塞）。
 3. 发出卡片第一帧并以 `reply_in_thread` 创建话题（飞书拒绝时按 `threadFallback: degrade` 退化为会话级路由）。
-4. 确保用户工作区（`<baseDir>/p2p/<open_id>/` 或 `<baseDir>/groups/<chat_id>/<open_id>/`），规划话题目录（子目录或 Git worktree）。
-5. 写入重启修复快照 → 创建 Session（preset `setup` 内挂载工具与 guidance）→ 进入话题目录。
+4. 建立话题目录（`<baseDir>/p2p/<open_id>/<话题>/` 或 `<baseDir>/groups/<chat_id>/<话题>/`）并登记为工作区。
+5. 写入重启修复快照 → 以话题目录为 cwd 创建 Session（preset `setup` 内挂载工具与 guidance）。
 6. **持久化路由记录后**、`followup` 前组装首轮消息：登记触发消息的附件白名单 → 并发读取引用摘录与首轮话题历史（各自独立 3s 预算）→ 预取触发消息图片（有界、短超时）→ 按固定顺序拼块。
 7. `followup` 投递后关闭首回合投递闸门；预取窗口内到达的同话题消息等待该闸门，避免乱序。
 
@@ -283,6 +283,5 @@
 
 - [README.md](../README.md)：安装、命令、面板、配置示例与行为总览。
 - [docs/feishu-onboarding.md](feishu-onboarding.md)：飞书应用权限、配置与真机联调 / P3 验证清单。
-- [docs/workspace-isolation-design.md](workspace-isolation-design.md)：工作区粒度与话题目录。
 - `.agents/roadmaps/attachment_pipeline_v2/`：roadmap / decisions / acceptance。
 - 各任务证据：`.agents/issues/{platform_spike,native_attachment_store,pending_attachment_registry,attachment_fetch_tool,admission_manifest_flow,quote_history_tools,panel_docs_release}.md`。

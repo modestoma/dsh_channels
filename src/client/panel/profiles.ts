@@ -27,6 +27,7 @@ export function profileIds(access: AccessWire): { users: string[]; chats: string
   const users = new Set<string>()
   const chats = new Set<string>()
   for (const user of access.users) users.add(user.userId)
+  for (const group of access.groups) chats.add(group.chatId)
   for (const request of access.requests) {
     users.add(request.targetId)
     if (request.chatId !== undefined) chats.add(request.chatId)

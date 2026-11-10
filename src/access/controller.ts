@@ -14,8 +14,10 @@
  *  - slash commands: `/userid` stays available to every private sender,
  *    everything else must pass admission.
  *
- * It also answers the per-user permission switches (knowledge base, code
- * write) for the tool gates: an administrator holds every switch.
+ * It also answers the permission switches (knowledge base, code write) for
+ * the tool gates, by where the Session lives: a private-chat topic uses its
+ * person's switches (an administrator holds every switch); a group route
+ * uses the group's permission record.
  *
  * The controller never creates a Session or a workspace.
  *
@@ -23,7 +25,9 @@
  */
 
 import type { FeishuConfig } from '../config.ts'
-import type { AccessPermission, RouteRecord } from '../domain.ts'
+import { isGroupRoute } from '../domain.ts'
+import type { AccessPermission, GroupPermission, RouteRecord } from '../domain.ts'
+import type { AuthorizeEvent } from '../host/index.ts'
 import type { FeishuChannel, NormalizedMessage } from '../feishu-channel.ts'
 import { decideAccess } from './policy.ts'
 import type { AccessDecision } from './policy.ts'
@@ -86,9 +90,32 @@ export class AccessController {
     return this.isAdmin(userId) || this.deps.store.allows(userId, permission)
   }
 
+  /**
+   * Whether one route's Session holds a permission switch. A group route
+   * reads the group's permission record, where no record means off; a
+   * private-chat route reads the switches of its person (see {@link mayUse}).
+   * @param record - the route the Session is bound to.
+   * @param permission - the switch to check.
+   * @returns true when allowed.
+   */
+  mayUseOnRoute(record: Pick<RouteRecord, 'chatId' | 'chatType' | 'senderUserId'>, permission: GroupPermission): boolean {
+    if (isGroupRoute(record)) return this.deps.store.groupAllows(record.chatId, permission)
+    return this.mayUse(record.senderUserId, permission)
+  }
+
   /** Current user-table snapshot used by the pure policy. */
   snapshot(): AccessStoreSnapshot {
     return this.deps.store.snapshot()
+  }
+
+  /**
+   * Whether the admission matrix admits one message now (pure; no notice).
+   * Re-read before a queued turn is submitted.
+   * @param msg - the message.
+   * @returns true when admitted.
+   */
+  allows(msg: NormalizedMessage): boolean {
+    return this.decide(msg).kind === 'allow'
   }
 
   /** Evaluate the admission matrix for one message (pure; no side effects). */
@@ -145,18 +172,18 @@ export class AccessController {
   }
 
   /**
-   * Topic/route ownership: a route belongs to the sender (and chat) that
-   * created it. Used to reject foreign replies, attachments, and command
-   * execution inside someone else's topic.
+   * Whether the sender of `msg` may act on a route: replies, attachments, and
+   * command execution inside a topic. Delegates to {@link mayActOnRoute}.
    */
   ownsRoute(msg: NormalizedMessage, record: RouteRecord): boolean {
     return this.mayActOnRoute(msg.senderId, msg.chatId, record)
   }
 
   /**
-   * Whether `userId`, acting in `chatId`, may continue or decide for the
-   * route's Session: the route owner, or, on a group-shared route
-   * (`record.shared`), any user the admission matrix allows in that chat.
+   * Whether `userId`, acting in `chatId`, may continue the route's Session,
+   * decide its cards, and run its session commands: on a group route
+   * ({@link isGroupRoute}) any user the admission matrix admits in that chat;
+   * on a private-chat route only its person.
    * @param userId - Feishu user_id of the actor.
    * @param chatId - chat the action comes from (must be the route's chat).
    * @param record - the route acted on.
@@ -164,8 +191,7 @@ export class AccessController {
    */
   mayActOnRoute(userId: string | undefined, chatId: string, record: RouteRecord): boolean {
     if (userId === undefined || record.chatId !== chatId) return false
-    if (record.senderUserId === userId) return true
-    if (record.shared !== true) return false
+    if (!isGroupRoute(record)) return record.senderUserId === userId
     return decideAccess(
       { chatType: record.chatType, senderId: userId },
       this.config(),
@@ -176,7 +202,8 @@ export class AccessController {
   /**
    * Whether a `feishuTopics` launch may start a topic for `requesterUserId`:
    * an administrator or a user with the conversation permission, or anyone
-   * in `open` access mode. The target group itself is not checked.
+   * in `open` access mode. The first turn is submitted as the requester, so
+   * they need chat access like any speaker; the target group is not checked.
    * @param requesterUserId - Feishu user_id the launch is for.
    * @returns true when the launch is permitted.
    */
@@ -186,6 +213,34 @@ export class AccessController {
       this.config(),
       this.deps.store.snapshot(),
     ).kind === 'allow'
+  }
+
+  /**
+   * Why a write asked through `access/authorize` is refused for a routed
+   * Session, by where it lives: `code-write`, `wiki-read`, and `wiki-write`
+   * follow the location's switches (a private chat's person, a group's
+   * permission record); `admin` needs the person of a private chat to be an
+   * administrator and is never granted to a group; unknown levels are refused.
+   * @param route - the Session's route.
+   * @param event - the write.
+   * @returns the refusal text for the model, or undefined when allowed.
+   */
+  authorizeRefusal(route: RouteRecord, event: AuthorizeEvent): string | undefined {
+    const group = isGroupRoute(route)
+    const where = group ? '本群' : `飞书用户 ${route.senderUserId} `
+    switch (event.level) {
+      case 'code-write':
+        return this.mayUseOnRoute(route, 'codeWrite') ? undefined : `${where}没有代码改动权限，不能执行 ${event.action}${group ? '；需要管理员在设置面板「群权限」里打开本群的「改代码」' : '；需要管理员在设置面板「访问授权」里打开该用户的「改代码」'}`
+      case 'wiki-read':
+        return this.mayUseOnRoute(route, 'wikiRead') ? undefined : `${where}没有知识库读取权限，不能执行 ${event.action}`
+      case 'wiki-write':
+        return this.mayUseOnRoute(route, 'wikiWrite') ? undefined : `${where}没有知识库写入权限，不能执行 ${event.action}`
+      case 'admin':
+        if (group) return `${event.action} 是管理操作，不能在群会话里执行；请管理员在私聊里操作`
+        return this.isAdmin(route.senderUserId) ? undefined : `${where}不是管理员，不能执行 ${event.action}`
+      default:
+        return `飞书会话不允许未知的授权级别 ${event.level}，不能执行 ${event.action}`
+    }
   }
 
   /** Drop in-memory notices (shutdown; durable state lives in the store). */

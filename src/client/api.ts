@@ -17,10 +17,12 @@ import {
   PROFILES_ROUTE,
   RECONNECT_ROUTE,
   TAKEOVER_ROUTE,
+  REMOVE_ACCESS_GROUP_ROUTE,
   REMOVE_ACCESS_USER_ROUTE,
   RESOLVE_ACCESS_REQUEST_ROUTE,
   SET_ACCESS_GIT_EMAIL_ROUTE,
   SET_ACCESS_PERMISSION_ROUTE,
+  SET_GROUP_PERMISSION_ROUTE,
   SAVE_CONFIG_ROUTE,
   SAVE_CREDENTIALS_ROUTE,
   SESSION_ORIGIN_ROUTE,
@@ -33,6 +35,7 @@ import {
 import type {
   AccessMutationResponse,
   AccessPermissionWire,
+  GroupPermissionWire,
   AccessWire,
   CatalogWire,
   ChannelStatusWire,
@@ -359,6 +362,20 @@ export async function setAccessPermission(
 /** Set one user's git email; an empty string clears it. */
 export async function setAccessGitEmail(userId: string, gitEmail: string): Promise<AccessMutationResponse> {
   return mutateAccess(SET_ACCESS_GIT_EMAIL_ROUTE, { userId, gitEmail })
+}
+
+/** Set one permission switch of a registered group. */
+export async function setGroupPermission(
+  chatId: string,
+  permission: GroupPermissionWire,
+  enabled: boolean,
+): Promise<AccessMutationResponse> {
+  return mutateAccess(SET_GROUP_PERMISSION_ROUTE, { chatId, permission, enabled })
+}
+
+/** Delete one group's permission record (the group is registered again by its next topic). */
+export async function removeAccessGroup(chatId: string): Promise<AccessMutationResponse> {
+  return mutateAccess(REMOVE_ACCESS_GROUP_ROUTE, { chatId })
 }
 
 /** Settle one pending authorization request (same resolver as the Feishu card). */
