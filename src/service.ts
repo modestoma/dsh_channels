@@ -287,6 +287,8 @@ export class FeishuService {
   private unlistenConnection: (() => void) | undefined
   /** Cached Feishu user and chat profiles. */
   readonly profiles: ProfileDirectory
+  /** Requests currently undergoing async `repairAll()` replay submission. */
+  private readonly replayingRequestIds = new Set<string>()
   /** Panel and `/auth` access administration. */
   readonly accessAdmin: AccessAdmin
   /** Panel views over Feishu-routed Sessions and their workspace files. */
@@ -343,11 +345,13 @@ export class FeishuService {
           }
           if (!submit) {
             this.streamer?.attach(agent.session, card.cardMessageId, card.triggerMessageId, card.reactionId, { prompt })
+            void this.settleReplayedActionReservation(prompt.requestId, snapshot.key, true)
             return
           }
           // The same request id as before the restart: `session/prompt`
           // deduplicates against the inbox and the log.
-          void this.runTurn(agent, prompt, card)
+          this.replayingRequestIds.add(prompt.requestId)
+          void this.replayTurn(agent, snapshot.key, prompt, card)
         },
       },
     })
@@ -1208,9 +1212,13 @@ export class FeishuService {
     // Read back what arrived while no instance was connected (background).
     this.missed.start()
     // Repair cards a previous instance left mid-flight (best-effort, background).
-    void this.repair.repairAll().catch((error: unknown) => {
-      this.ctx.logger?.warn?.('dsh-channels: inflight repair failed: %s', String(error))
-    })
+    void this.repair.repairAll()
+      .then(async () => {
+        if (this.lifecycle === lifecycle) await this.reconcileActionProposals(lifecycle)
+      })
+      .catch((error: unknown) => {
+        this.ctx.logger?.warn?.('dsh-channels: inflight repair failed: %s', String(error))
+      })
     // Approval cards a crashed previous instance left undecided.
     const interruptedApprovals = answerer.recoverInterrupted()
     if (interruptedApprovals > 0) {
@@ -1340,6 +1348,7 @@ export class FeishuService {
     this.attachmentFetchTools.clear()
     this.proposeActionsTools.clear()
     this.routeOperations.clear()
+    this.replayingRequestIds.clear()
     this.inbound.clear()
     this.routes.clear()
     this.accessStore.clear()
@@ -1782,6 +1791,10 @@ export class FeishuService {
         if (this.lifecycle !== lifecycle) return
         const resolved = await resolveProposalSession(record.sessionId, record.routeKey)
         for (const res of record.reservations ?? []) {
+          if (this.replayingRequestIds.has(res.requestId)) {
+            deferred.add(res.requestId)
+            continue
+          }
           if (resolved.kind === 'deferred') {
             deferred.add(res.requestId)
             continue
@@ -1816,7 +1829,7 @@ export class FeishuService {
             && this.config.replay.pending
             && (snapshot.replays ?? 0) < 1
           ) {
-            confirmed.add(res.requestId)
+            deferred.add(res.requestId)
           }
         }
       }
@@ -1827,6 +1840,50 @@ export class FeishuService {
     if (this.lifecycle !== lifecycle) return
     const reconciled = await this.actionProposalStore.reconcileReservations(confirmed, deferred)
     for (const updated of reconciled) {
+      void this.feishuActions.patchCardSerialized(
+        updated.proposalId,
+        updated.cardMessageId,
+        buildActionProposalCard(updated),
+      )
+    }
+  }
+
+  private async replayTurn(
+    agent: Agent,
+    snapshotKey: string,
+    prompt: ChannelPrompt,
+    card: TurnCard,
+  ): Promise<void> {
+    try {
+      const outcome = await this.runTurn(agent, prompt, card)
+      await this.settleReplayedActionReservation(prompt.requestId, snapshotKey, outcome.accepted)
+    } catch (error) {
+      this.ctx.logger?.warn?.('dsh-channels: replaying turn %s failed: %s', prompt.requestId, String(error))
+      await this.settleReplayedActionReservation(prompt.requestId, snapshotKey, false)
+    } finally {
+      this.replayingRequestIds.delete(prompt.requestId)
+    }
+  }
+
+  private async settleReplayedActionReservation(
+    requestId: string,
+    snapshotKey: string,
+    accepted: boolean,
+  ): Promise<void> {
+    if (accepted) {
+      const confirmed = await this.actionProposalStore.confirmByRequestId(requestId)
+      for (const updated of confirmed) {
+        void this.feishuActions.patchCardSerialized(
+          updated.proposalId,
+          updated.cardMessageId,
+          buildActionProposalCard(updated),
+        )
+      }
+      return
+    }
+    await this.repair.clear(snapshotKey)
+    const reverted = await this.actionProposalStore.revertByRequestId(requestId)
+    for (const updated of reverted) {
       void this.feishuActions.patchCardSerialized(
         updated.proposalId,
         updated.cardMessageId,

@@ -1410,6 +1410,117 @@ describe('TurnCardActions button click handling, access pre-checks, invalidation
       expect(reconciledP3?.reservations).toBeUndefined()
     })
 
+    // 6) Replay-eligible snapshot whose replay submission encounters a gateway error:
+    // Reservation stays deferred until replay settles; failed replay clears snapshot and rolls back to `pending`.
+    const p4 = await h.actions.propose({
+      key: 'replay-settlement-1',
+      sessionId: route.sessionId,
+      prompt: '测试重放提交结算：',
+      actions: [
+        { id: 'opt_replay', label: '重放动作', independent: true, followUpPrompt: '执行重放动作' },
+      ],
+    })
+    expect(p4.ok).toBe(true)
+    if (!p4.ok) return
+    const p4Id = proposalIdOfKey('replay-settlement-1')
+
+    await h.service.shutdown()
+    h.ctxState.agents.liveAgents.clear()
+    const baseP4 = proposalsTable.get(p4Id) as ActionProposalRecord
+    await proposalsTable.put(p4Id, {
+      ...baseP4,
+      actions: baseP4.actions.map(item => ({
+        ...item,
+        status: 'triggered' as const,
+        triggeredBy: 'u_alice',
+        triggeredAt: Date.now(),
+      })),
+      reservations: [{
+        requestId: 'req-replay-gateway-fail',
+        actionId: 'opt_replay',
+        changedIds: ['opt_replay'],
+        createdAt: Date.now(),
+      }],
+    })
+    await inflightTable.put('card_replay_fail', {
+      key: 'card_replay_fail',
+      sessionId: route.sessionId,
+      chatId: 'oc_p2p',
+      routeKey: route.key,
+      prompt: {
+        requestId: 'req-replay-gateway-fail',
+        principal: { kind: 'feishu-user', userId: 'u_alice' },
+        content: [{ type: 'text', text: '执行重放失败测试' }],
+      },
+      cards: [{ messageId: 'card_replay_fail', mode: 'card' }],
+      startedAt: Date.now(),
+      attempts: 0,
+      replays: 0,
+    })
+
+    const origGatewayInvoke = h.ctxState.remote.gateway.invoke
+    let failReplayOnce = true
+    h.ctxState.remote.gateway.invoke = vi.fn(async (request) => {
+      const reqPayload = request.args.request as { requestId?: string } | undefined
+      if (failReplayOnce && reqPayload?.requestId === 'req-replay-gateway-fail') {
+        failReplayOnce = false
+        throw new Error('transient gateway outage during replay')
+      }
+      return await origGatewayInvoke(request)
+    })
+
+    await h.service.start()
+    await h.waitUntil(() => {
+      expect(failReplayOnce).toBe(false)
+      const rolledBackP4 = h.proposals().find(r => r.key === 'replay-settlement-1')
+      expect(rolledBackP4?.actions.map(a => a.status)).toEqual(['pending'])
+      expect(rolledBackP4?.reservations).toBeUndefined()
+      expect(inflightTable.get('card_replay_fail')).toBeUndefined()
+    })
+
+    // 7) Successful pending replay confirms the deferred reservation once submission succeeds.
+    await h.service.shutdown()
+    h.ctxState.agents.liveAgents.clear()
+    h.ctxState.remote.gateway.invoke = origGatewayInvoke
+    const reopenedP4 = proposalsTable.get(p4Id) as ActionProposalRecord
+    await proposalsTable.put(p4Id, {
+      ...reopenedP4,
+      actions: reopenedP4.actions.map(item => ({
+        ...item,
+        status: 'triggered' as const,
+        triggeredBy: 'u_alice',
+        triggeredAt: Date.now(),
+      })),
+      reservations: [{
+        requestId: 'req-replay-gateway-ok',
+        actionId: 'opt_replay',
+        changedIds: ['opt_replay'],
+        createdAt: Date.now(),
+      }],
+    })
+    await inflightTable.put('card_replay_ok', {
+      key: 'card_replay_ok',
+      sessionId: route.sessionId,
+      chatId: 'oc_p2p',
+      routeKey: route.key,
+      prompt: {
+        requestId: 'req-replay-gateway-ok',
+        principal: { kind: 'feishu-user', userId: 'u_alice' },
+        content: [{ type: 'text', text: '执行重放成功测试' }],
+      },
+      cards: [{ messageId: 'card_replay_ok', mode: 'card' }],
+      startedAt: Date.now(),
+      attempts: 0,
+      replays: 0,
+    })
+
+    await h.service.start()
+    await h.waitUntil(() => {
+      const confirmedP4 = h.proposals().find(r => r.key === 'replay-settlement-1')
+      expect(confirmedP4?.actions.map(a => a.status)).toEqual(['triggered'])
+      expect(confirmedP4?.reservations).toBeUndefined()
+    })
+
     await h.service.shutdown()
   })
 })

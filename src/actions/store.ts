@@ -350,6 +350,9 @@ export class ActionProposalStore {
     let updated: ActionProposalRecord | undefined
     try {
       await table.update(proposalId, (current) => {
+        if (requestId !== undefined && !current.reservations?.some(r => r.requestId === requestId)) {
+          return current
+        }
         const rollbackStatus: ActionProposalStatus = current.superseded === true ? 'superseded' : 'pending'
         let mutated = false
         const nextActions = current.actions.map((item): ActionProposalStoredItem => {
@@ -379,6 +382,64 @@ export class ActionProposalStore {
       this.deps.warn('dsh-channels: reverting action proposal %s failed: %s', proposalId, String(error))
       return undefined
     }
+  }
+
+  /**
+   * Confirm every outstanding reservation matching `requestId` (typically at most one)
+   * after its replayed prompt is accepted by the Session.
+   */
+  async confirmByRequestId(requestId: string): Promise<ActionProposalRecord[]> {
+    const table = this.deps.table()
+    if (table === undefined) return []
+    const confirmed: ActionProposalRecord[] = []
+    for (const [proposalId, record] of [...table.entries()]) {
+      if (!record.reservations?.some(r => r.requestId === requestId)) continue
+      const updated = await this.confirmTrigger(proposalId, requestId)
+      if (updated !== undefined) confirmed.push(updated)
+    }
+    return confirmed
+  }
+
+  /**
+   * Roll back every outstanding reservation matching `requestId` when a deferred
+   * startup replay fails to be accepted by the Session.
+   */
+  async revertByRequestId(requestId: string): Promise<ActionProposalRecord[]> {
+    const table = this.deps.table()
+    if (table === undefined) return []
+    const reverted: ActionProposalRecord[] = []
+    for (const [proposalId, record] of [...table.entries()]) {
+      if (!record.reservations?.some(r => r.requestId === requestId)) continue
+      let updated: ActionProposalRecord | undefined
+      try {
+        await table.update(proposalId, (current) => {
+          const match = current.reservations?.find(r => r.requestId === requestId)
+          if (match === undefined) return current
+          const targetIds = new Set(match.changedIds)
+          const rollbackStatus: ActionProposalStatus = current.superseded === true ? 'superseded' : 'pending'
+          const nextActions = current.actions.map((item): ActionProposalStoredItem => {
+            if (!targetIds.has(item.id) || item.status === 'superseded' || item.status === 'pending') {
+              return item
+            }
+            const { triggeredBy: _by, triggeredAt: _at, ...rest } = item
+            return { ...rest, status: rollbackStatus }
+          })
+          const remaining = current.reservations?.filter(r => r.requestId !== requestId)
+          const { reservations: _old, ...base } = current
+          const next: ActionProposalRecord = {
+            ...base,
+            actions: nextActions,
+            ...(remaining !== undefined && remaining.length > 0 ? { reservations: remaining } : {}),
+          }
+          updated = next
+          return next
+        })
+        if (updated !== undefined) reverted.push(updated)
+      } catch (error) {
+        this.deps.warn('dsh-channels: reverting action proposal %s by request failed: %s', proposalId, String(error))
+      }
+    }
+    return reverted
   }
 
   /**
