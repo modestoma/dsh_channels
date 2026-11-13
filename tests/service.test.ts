@@ -89,6 +89,7 @@ function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
       topicMessages: true,
       topicMessagesTimeoutMs: 20_000,
       sendFile: true,
+      proposeActions: true,
       wikiRead: false,
       wikiWrite: false,
     },

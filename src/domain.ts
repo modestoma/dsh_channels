@@ -11,8 +11,13 @@
 import { z } from 'zod'
 import { outboxEntrySchema } from './outbox.ts'
 import type { OutboxEntry } from './outbox.ts'
+import { ACTION_PROPOSAL_TTL_MS, actionProposalRecordSchema } from './actions/store.ts'
+import type { ActionProposalRecord } from './actions/store.ts'
 import { approvalCardRecordSchema, approvalGrantRecordSchema } from './interactions/approval-store.ts'
 import type { ApprovalCardRecord, ApprovalGrantRecord } from './interactions/approval-store.ts'
+
+export { ACTION_PROPOSAL_TTL_MS, actionProposalRecordSchema }
+export type { ActionProposalRecord }
 import type { StorageDomainFacility } from './host/services.ts'
 import { typedTable } from './storage/table.ts'
 import type { DomainTable } from './storage/table.ts'
@@ -477,6 +482,8 @@ export const feishuDomain = {
     approval_grants: { valueSchema: approvalGrantRecordSchema },
     // Delivered approval cards until decided or retried (key = card message id).
     approval_cards: { valueSchema: approvalCardRecordSchema },
+    // Non-blocking follow-up action proposal cards (key = proposalId).
+    action_proposals: { valueSchema: actionProposalRecordSchema },
   },
 } as const
 
@@ -498,6 +505,7 @@ export interface FeishuDomainHandle {
   outbox: DomainTable<OutboxEntry>
   approvalGrants: DomainTable<ApprovalGrantRecord>
   approvalCards: DomainTable<ApprovalCardRecord>
+  actionProposals: DomainTable<ActionProposalRecord>
   getGlobal(): FeishuDomainGlobal
   setGlobal(value: FeishuDomainGlobal): Promise<unknown>
   close(): Promise<void>
@@ -523,6 +531,7 @@ export async function openFeishuDomain(facility: StorageDomainFacility): Promise
     outbox: typedTable(domain.table('outbox')),
     approvalGrants: typedTable(domain.table('approval_grants')),
     approvalCards: typedTable(domain.table('approval_cards')),
+    actionProposals: typedTable(domain.table('action_proposals')),
     getGlobal: () => (domain.global.get() ?? {}) as FeishuDomainGlobal,
     setGlobal: value => domain.global.set(value),
     close: () => domain.close(),

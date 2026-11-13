@@ -11,6 +11,7 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 - **知识库读写**：开启 `feishuTools.wikiRead` / `feishuTools.wikiWrite`（默认都关）并在 `wikiRoots` 里配置知识空间链接 `https://<租户>.feishu.cn/wiki/space/<space_id>` 或节点链接 `https://<租户>.feishu.cn/wiki/<node_token>` 后，模型可用 `feishu_wiki_list` 浏览、`feishu_wiki_read` 读取飞书文档（Markdown，或带 block id 的飞书文档 XML，支持目录/章节/区间/关键词局部读取）、`feishu_wiki_create` 在范围内新建飞书文档、电子表格或多维表格（新节点也可作为子目录继续往下建）、`feishu_wiki_edit` 修改**本应用创建的**文档（追加、在块后插入、替换/删除块、文本替换、整篇重写；必须带上读取时的 `revision_id`，文档被他人改过会被拒绝）。电子表格用 `feishu_wiki_sheet_read` 按子表和 A1 范围读成 CSV（每行带 `[row=N]` 真实行号），`feishu_wiki_sheet_edit` 向**本应用创建的**表格写入单元格值或公式、在数据末尾追加行（追加位置会越过空行找到真正的最后一行，目标单元格非空时失败、不会覆盖；同样校验 `revision_id`；不改样式、图表和行列结构）。多维表格用 `feishu_wiki_base_read` 列数据表、读字段和记录（支持筛选、排序、关键词搜索、分页），`feishu_wiki_base_edit` 增改删记录：**本应用创建的**多维表格可增改删，其他多维表格**只能新增记录**（不改表和字段结构）。所有调用都用应用身份，并且按**会话所在位置**判权：私聊话题看本人的开关——读取类工具要求**「知识库读取」开关**（`/auth set wiki-read on @用户`），新建与修改类工具要求**「知识库写入」开关**（`/auth set wiki-write on @用户`），管理员两者都有；群话题看设置面板「群权限」里该群的开关（默认都关，只能在面板改），与发言人是谁无关；两个开关互相独立；`wikiRoots` 之外一律拒绝；打开某个文档或表格、每次新建、每次修改都会在话题里弹出**授权卡**，私聊只有本人能点，群话题里通过准入的成员都能点（读取授权在本话题内对该文档持续有效，`/renew` 或重启后重新询问），超时（`approvalTimeoutMs`）自动拒绝；浏览目录不弹卡。需开通 `wiki:wiki`、`docx:document`（只读可用 `wiki:wiki:readonly` / `docx:document:readonly`），电子表格和多维表格另需细分权限 `sheets:spreadsheet:read` / `sheets:spreadsheet:write_only`、`base:table:read` / `base:field:read` / `base:record:read` / `base:record:create|update|delete`（旧版 `sheets:spreadsheet` / `bitable:app` 不生效），且应用要是目标知识空间的成员（可把包含机器人的群加为空间成员/管理员）
 - **HITL 审批**：当模型请求需要授权的动作（如 bash 沙箱升级 `sandbox_permissions`）时，插件监听主机 `approval/request` 事件，在同一话题里**新发一张独立审批决策卡**：卡片标题带工具名；工具在审批请求里给了说明时，说明按行显示为卡片主体（`标签：值` 行显示成标签和值，缩进行显示成列表，不按 markdown 解析），bash 等带 `command` 参数的工具另外显示将执行的命令，其余参数按 `名称: 值` 收进默认折叠的「调用参数」，没有说明和命令时直接展开显示；提权时写明提权目标。提供 ✅ 允许 / ❌ 拒绝 / ♾️ 本话题不再询问 三个按钮；也可以在话题里直接回复「允许」「拒绝」「全部允许」，回复其他内容视为拒绝并作为下一条指令。等待期间流式卡片状态行显示「✋ 等待审批：工具名」。飞书消息发起的回合等 `approvalTimeoutMs`（默认 24 小时），子代理、后台任务、定时跟进、PR/MR 动态唤醒的回合等 `approvalBackgroundTimeoutMs`（默认 30 分钟），超时自动拒绝（fail-closed）；等待再久也不会锁住话题，回复其他内容就会拒绝审批并作为下一条指令。私聊话题里卡片 `approvalReminderMs`（默认 10 分钟）还没处理，会在卡片下回复一条提醒（只提醒一次，群话题不发）。超时的卡片和服务重启中断的卡片带「🔁 重新发起」按钮：点了以后在卡片下开一轮新回复，让模型先核对当前状态、已经完成的不重做，再重试这一步，需要授权时重新发卡；每张卡只能重新发起一次，7 天后按钮失效。「本话题不再询问」只对当前 Session 有效，会持久保存，重启后仍然生效，`/renew` 开新 Session 后恢复询问。私聊话题只认本人，群话题里通过准入的成员都可以点或回复，其他人无效
 - **结构化提问**：模型调用 `ask_user_question` 时，插件监听主机 `user-questions/request` 瀑布并发一张问答卡（每个问题一组选项按钮，多选先勾选再「提交本题选择」），答案回填给模型；主机自带的应答者只有 Web 客户端，没有本插件时纯飞书会话会以 `NO_PROVIDER` 失败。超时（`questionTimeoutMs`，默认 5 分钟）或回合取消时本轮提问失败（fail-closed）；没有可选项的问题直接提示用文字作答，**阻塞期间普通文本回复即作为该问题的自由文本答案**（同时支持多选后的自定义文本）
+- **非阻塞后续动作提议（`propose_actions` / `feishuActions`）**：与回合中挂起等待的审批卡和提问卡不同，飞书活动路由的主会话（`delegationDepth === 0`，子代理不可调用）在回合收尾时可调用 `propose_actions` 工具（单回合最多成功 1 次；若收件箱已有排队中的下一条用户消息则自动跳过发卡），或其他宿主插件通过 `ctx.get('feishuActions')`（v1）在当前话题发送独立的「💡 后续可选动作」卡片（1–4 个可选按钮 + 自动追加灰色「暂不处理」按钮，本轮立即正常结束、不占用并发槽位）。记录持久化在 `action_proposals` 表（保留 14 天）；同一 Session 产生新提议时自动将此前仍有待选按钮的旧卡刷新为「已被后续新提议替代」（保留已触发的历史选择）。用户点击按钮时先按路由归属与按钮声明的 `requiredAccess`（`chat | code-write | wiki-write | admin`）拦截判权（权限不足仅在卡底回显中文引导提示，不消耗待选按钮），通过后原子流转状态并以点击者飞书身份（`principal`）提交 `<feishu_action_selected id="…" label="…"/>` 加 `followUpPrompt` 开启新一轮流式跟进回复。开关：`feishuTools.proposeActions`（默认开）
 - **准入与授权（默认开启）**：准入只看一张扁平的**用户表**，每人有四个独立开关：**对话准入**、**知识库读取**、**知识库写入**、**代码改动**。**管理员也是用户表里的一行**：打开「管理员」开关的人拥有全部权限（其他开关对他不起作用），可以有多个，只能在 Web 设置面板设置。对话准入打开的人可以私聊机器人，也可以在任何群里 @ 它（包括自己把机器人拉进的群），不再有群白名单；对话准入关闭等于停用，其他开关一并失效。新加入的人只打开对话准入。不在表里的人私聊只收到一条固定提示（`/userid` 例外），在群里 @ 机器人或把它拉进群时，管理员私聊收到**用户授权申请卡**。授权入口：飞书 `/auth` 命令、授权卡、Web 设置面板；**管理员只能在面板用户表里设置**（私聊 `/userid` 获取 user_id），飞书里不能授予或移除管理员。用户表里没有管理员时 `guarded` 拒绝所有对话
 - **代码改动开关**：其他插件的写操作经下面的授权事件按「代码改动」开关判权；不经授权事件发问的工具可以列进 `codeWriteTools`（默认空），飞书会话（含它派生的子代理）调用这些工具之前，插件按**会话所在位置**检查：私聊话题要求本人是管理员或打开了「代码改动」开关，群话题要求设置面板「群权限」里该群的「代码改动」开关打开；没有时工具直接返回拒绝原因，模型会转告用户。本地工作区里的修改不受影响。检查在工具自己的审批之前进行，不受工具审批模式影响
 - **授权事件**：其他插件在写操作之前用 `ctx.parallel('access/authorize', { session, level, action, summary })` 发问时（dsh-repo 的写工具和带会话的服务调用问 `code-write`，日志分析插件加仓库问 `admin`），本插件对飞书会话（含子代理，顺着 `parentSession` 找到所属话题）按同样的位置规则回答：`code-write`、`wiki-read`、`wiki-write` 看私聊本人或群的对应开关；`admin` 要求私聊本人是管理员，群会话一律拒绝；不认识的级别拒绝。拒绝时抛出中文原因，发问的插件据此不问用户、不执行；非飞书会话不回答。通过这个事件发问的插件的工具不必再列进 `codeWriteTools`
@@ -93,7 +94,7 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 | 会话 | 「触发」：私聊、普通群需要 @、话题被拒时降级为会话级（均为开关）；「工作区」：工作区根目录（`baseDir`）；「话题与卡片」：话题过期（`routeTtlMs`，按天）、审批卡片等待、后台唤醒的审批等待、私聊审批提醒（`approvalTimeoutMs` / `approvalBackgroundTimeoutMs` / `approvalReminderMs`，按分钟）、提问卡片等待（`questionTimeoutMs`，按秒）、流式刷新与状态行保活间隔；「飞书侧功能」：首次私聊引导、后台唤醒卡片、回复写法规范、斜杠指令面板同步、权限切换 |
 | 会话记录 | 飞书发起的全部会话：群聊按「群 → 用户 → 会话」、私聊按「用户 → 会话」分组，显示飞书群名、姓名和头像；顶部搜索框按群名、姓名或会话标题筛选；点会话行在主区进入该对话，用户行的「文件」只读浏览该用户的工作区（见下文「会话记录」） |
 | 模型 | 服务商、模型、推理档位、单次输出上限（`maxTokens`，留空使用模型默认）、Agent 预设 |
-| 附件与工具 | 「入站附件」：接收图片和文件（附件存入 DSH 原生附件库）、图片预取、首轮话题历史；「工具」：`feishu_topic_messages` / `feishu_send_file` 开关（`feishu_attachment_fetch` 随「接收图片和文件」挂载）；「限额与超时」：预取上限、读取附件上限与超时、读取话题消息超时、引用摘录与历史超时（共 8 项，默认收起，有改动或错误时自动展开） |
+| 附件与工具 | 「入站附件」：接收图片和文件（附件存入 DSH 原生附件库）、图片预取、首轮话题历史；「工具」：`feishu_topic_messages` / `feishu_send_file` / `propose_actions` 开关（`feishu_attachment_fetch` 随「接收图片和文件」挂载）；「限额与超时」：预取上限、读取附件上限与超时、读取话题消息超时、引用摘录与历史超时（共 8 项，默认收起，有改动或错误时自动展开） |
 | 访问授权 | 待处理申请（置顶，一键授权 / 忽略）、调试模式（`accessMode`，开关）、申请有效期；用户表：每人一行，「管理员」加四个开关（对话 / 读知识库 / 写知识库 / 改代码）点一下即切换，管理员或对话关闭时其余开关变灰（添加表单默认收起） |
 | 群权限 | 群表：机器人开过话题的群各一行（群名 + `chat_id`，首次在群里开话题时自动登记），三个开关「读知识库 / 写知识库 / 改代码」点一下即切换，默认都关；「移除」删掉记录（下次在群里开话题重新登记，开关归零）；只能在面板改，飞书里没有对应命令 |
 | 知识库 | 知识库读 / 写工具开关（`feishuTools.wikiRead` / `feishuTools.wikiWrite`）、可访问范围 `wikiRoots`（每条链接一个输入框，逐条校验）；「可使用的人」：用户表里读 / 写知识库开关的人数，在「访问授权」里逐人设置；群话题按「群权限」判权 |
@@ -104,7 +105,7 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 **入站附件与模型工具（v2）**：「附件与工具」标签页的字段与 profile 配置同名、写入同一 Web 覆盖文件（`$DSH_HOME/dsh-channels/settings.json`）：
 
 - **入站附件**：附件接收（`acceptAttachments`，同时决定是否挂载 `feishu_attachment_fetch`）、触发消息图片预取（`prefetchImages`）、首轮话题历史条数（`historyBootstrapLimit`）。
-- **工具**：`feishu_topic_messages`（`feishuTools.topicMessages`）、`feishu_send_file`（`feishuTools.sendFile`）开关。
+- **工具**：`feishu_topic_messages`（`feishuTools.topicMessages`）、`feishu_send_file`（`feishuTools.sendFile`）、`propose_actions`（`feishuTools.proposeActions`）开关。
 - **限额与超时**：预取单图 / 总量 / 整段超时（`prefetchImageMaxBytes` / `prefetchTotalMaxBytes` / `prefetchTimeoutMs`）、读取附件资源数 / 字节预算 / 超时（`feishuTools.attachmentFetchMaxResources` / `attachmentFetchMaxBytes` / `attachmentFetchTimeoutMs`）、读取话题消息超时（`feishuTools.topicMessagesTimeoutMs`）、被动引用 / 历史读取预算（`promptContextTimeoutMs`）。
 
 `feishuTools.*` 是嵌套配置：面板只把改动过的子键写进覆盖层，其余子键保持原值（Web 覆盖或 profile 配置），不会因部分保存变成未定义。字段默认值、边界与降级规则见下文配置示例和 [docs/attachment-pipeline-v2.md](docs/attachment-pipeline-v2.md)。
@@ -351,6 +352,7 @@ npm 发行包已包含构建产物：Host 入口是 `lib/index.js`（profile 直
       topicMessages: true               # feishu_topic_messages：读取引用消息 / 话题历史并授权其附件
       topicMessagesTimeoutMs: 20000     # 单次话题读取整段超时（20 s；被动摘录用独立 3 s 预算）
       sendFile: true                    # feishu_send_file：把话题工作目录内生成的图片/文件发给用户（需 im:resource）
+      proposeActions: true              # propose_actions：飞书主会话在回合末尾发送非阻塞「后续可选动作」按钮卡片
       wikiRead: false                   # feishu_wiki_list / feishu_wiki_read / feishu_wiki_sheet_read / feishu_wiki_base_read：浏览 wikiRoots 内的知识库，读取文档、电子表格、多维表格
       wikiWrite: false                  # feishu_wiki_create / feishu_wiki_edit / feishu_wiki_sheet_edit / feishu_wiki_base_edit：新建文档/表格，修改本应用创建的文档和表格，向多维表格写记录
     wikiRoots:                          # 知识库范围（空 = 不挂载知识库工具；最多 20 条）
@@ -521,6 +523,41 @@ const result = await topics?.launch({
 **群里看到的**：先是根卡片「@发起人 <引导句>」（外部发起人显示为它的 `label`），下面是链接表格，标题栏标签为「<任务名>中」；紧接着话题内一张流式卡片（它同时创建话题），首轮在这里流式输出，带停止按钮。首轮结束后根卡片的标签变成「已完成」「已停止」或「失败」，并加上 DONE / No 表情；之后的追问不再改动根卡片，只有调用方的 `updateLinks` 会改链接表格。启动失败时话题里的流式卡片和根卡片都会写明原因。过程中出现的审批卡、提问卡发在话题内。DSH 在首轮进行中重启或重连飞书时，话题里的流式卡片照常由中断修复处理；重新连上后，插件把仍是「<任务名>中」的根卡片改成「已中断」（橙色），提示在话题内回复即可继续，原来的 Session 会接着追问。根卡片状态同时记在发起记录里（连同重画卡片所需的内容）。
 
 **追问与权限**：这类话题和用户自己在群里开的话题一样是**群话题**：群里任何通过准入的成员（管理员，或对话准入打开的用户）都可以在话题内直接回复追问（无需 @），也可以点停止按钮、回答审批卡与提问卡、在话题里执行会话命令；未授权的人仍被静默忽略。追问的回复照常流式输出；每条追问都以群身份提交（`principal: { kind: 'feishu-group', chatId, userId }`，`userId` 是追问的人），知识库与代码改动工具按设置面板「群权限」里该群的开关判权。话题之间互不读取，和普通话题一样。结果怎么回传给外部系统由调用方插件负责，本插件只提供上面的状态查询和事件。
+
+## 非阻塞动作提议服务（feishuActions）
+
+插件向其他 DSH 插件提供 Cordis 服务 `feishuActions`（当前 `version: 1`，定义见 `src/actions/contract.ts`），同时向飞书活动路由的主 Agent（`delegationDepth === 0`）挂载同名语义的模型工具 `propose_actions`：在不挂起当前回合的前提下，向指定 Session 当前绑定的飞书话题或会话发送一张独立的 Card 2.0 按钮卡片，供用户跨天或跨重启按需点击触发后续回合。
+
+```ts
+const actions = ctx.get('feishuActions') as FeishuActionsService | undefined
+const result = await actions?.propose({
+  key: 'task-42-followup',
+  sessionId,
+  prompt: '已完成检查，可选择后续自动处理：',
+  actions: [
+    {
+      id: 'apply_fix',
+      label: '应用修复改动',
+      style: 'primary',
+      requiredAccess: 'code-write',
+      followUpPrompt: '请按照上述方案修改对应文件并运行检查。',
+    },
+    {
+      id: 'sync_wiki',
+      label: '同步知识库记录',
+      requiredAccess: 'wiki-write',
+      independent: true,
+      followUpPrompt: '请把本次结论整理写入知识库文档。',
+    },
+  ],
+})
+await actions?.supersede('task-42-followup', '已生成新版处理方案')
+```
+
+- **参数校验与幂等**：`prompt` trim 后 1–120 字（卡片内严格按 `plain_text` 渲染，不解析 Markdown 或 `@` 提及）；`actions` 1–4 项，`id` 为 1–64 位可见 ASCII、同卡唯一且禁止使用保留字 `'dismiss'`，`label` trim 后 1–32 字，`followUpPrompt` trim 后 1–8000 字；`key` 为 1–200 位可见 ASCII。相同 `key` 且规范化内容指纹一致时幂等重放 `{ ok: true, replayed: true, cardMessageId }`；相同 `key` 但内容指纹不同返回 `{ ok: false, code: 'invalid', message }`；未连接或未路由分别返回 `'not-connected'` / `'unrouted-session'`。
+- **自动追加与多选结算**：卡片末尾自动追加灰色「暂不处理」（`actionId: 'dismiss'`）按钮。单个动作默认 `independent: false`（点选后其余 `pending` 项自动转为 `dismissed` 并收起按钮）；设为 `independent: true` 时支持先后独立点击多项，每次触发在卡面保留 `✅ 已选择：…` 记录。
+- **同 Session 自动替代与生命周期**：记录保存在 `dsh_channels` 域的 `action_proposals` 表，有效期 14 天（随周期 GC 清理，超期点击原地刷新为已过期提示）。同一 `sessionId` 发送新动作提议卡时，此前仍有 `pending` 项的旧记录自动将剩余 `pending` 项标记为 `superseded`（保留已 `triggered` 的历史项）并经 `outbox` 异步刷新旧卡片；`/renew` 切换话题 Session 后旧卡点击原地刷新为已失效提示。
+- **前置判权与唤醒身份**：点击时先校验话题归属与 `requiredAccess`（`chat` 默认、`code-write`、`wiki-write`、`admin`）；权限不足时仅在卡片底部非破坏性回显中文授权指引（保留待选按钮可继续点击）。通过判权与 `table.update` 原子状态流转后，以点击者的渠道身份（`principalOnRoute(route, clickerUserId)`）发送新流式回复卡并提交 `<feishu_action_selected id="…" label="…"/>\n\n${followUpPrompt}` 开启跟进回合。
 
 ## 行为与降级
 

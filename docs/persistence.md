@@ -18,7 +18,7 @@
 4. **凭据**：密钥存宿主 `$DSH_HOME/.credentials.yaml`，插件只持引用名。
 5. **收尾重试队列**（`src/outbox.ts`，`dsh_channels` 域的 `outbox` 表）：一轮结束时失败的卡片终态更新、表情切换和没发出去的续卡，每条记录带 `kind`（`card` / `reaction` / `segment`）、首次尝试时间、失败次数、下次重试时间和最近一次错误。成功、消息已撤回 / 机器人不在群里、或满 24 小时即删除。
 6. **准入授权**（`src/domain.ts` 域 `dsh_channels`）：`access_users` 表以 `user_id` 保存用户表，每条记录带 `admin`、四个开关 `chat` / `wikiRead` / `wikiWrite` / `codeWrite` 和可选 `gitEmail`；`access_requests` 表以不透明 token 保存用户授权申请（含发给每位管理员的卡片 `messageIds`，重启后授权卡仍可点击结算；过期状态在同一表落审计）。`group_permissions` 表以 `chat_id` 保存群权限记录（`name?` / `addedAt` / `wikiRead` / `wikiWrite` / `codeWrite`），群里首次开话题时自动登记（三个开关全关），只在设置面板「群权限」修改或移除；群话题的知识库与代码改动工具按它判权。域全局值的 `knownGroups` 记录机器人被拉进过的群（最多 500 个），供断连补偿使用。准入模式属于配置层（profile + Web 覆盖）；管理员是 `access_users` 里 `admin` 为 true 的记录。
-7. **其他表**：`processed`（消息去重）、`inflight`（在途快照，见缺口 1）、`topic_launches`（其他插件经 `feishuTopics` 开话题的启动记录）、`session_origins`（Session → 飞书来源）、`approval_grants` / `approval_cards`（审批「总是允许」与待决审批卡）。
+7. **其他表**：`processed`（消息去重）、`inflight`（在途快照，见缺口 1）、`topic_launches`（其他插件经 `feishuTopics` 开话题的启动记录）、`action_proposals`（`feishuActions` / `propose_actions` 非阻塞后续动作提议：保存 `proposalId`、`key`、`fingerprint`、`sessionId`、`routeKey`、`chatId`、`cardMessageId`、`prompt`、各动作的 `pending | triggered | dismissed | superseded` 状态与触发人/时间、`createdAt`，经 `table.update` 原子流转状态，同 Session 新发提议自动替代未决旧项并保留已触发项，默认保留 14 天）、`session_origins`（Session → 飞书来源）、`approval_grants` / `approval_cards`（审批「总是允许」与待决审批卡）。
 
 ## 二、内存态（有意不持久化）
 
@@ -158,6 +158,7 @@
   - `routes` 表中过期的 `thread` 记录：先写入 `expired_routes` 最小持久化墓碑，再删除活动记录并同步清 `routeCache`；后续消息和 Session 命令明确拒绝，不恢复也不新建 Session；
   - 过期的降级 `chat` 路由：直接删除（它没有可辨识的独立话题边界）；
   - `inflight` 表：`startedAt < cutoff` 的僵尸快照**静默删除**——不 patch 卡片（给陈年老卡打"服务已重启"补丁反而惊扰用户）；
+  - `action_proposals` 表：无条件（不受 `routeTtlMs: 0` 影响）清理 `createdAt` 超过 14 天（`ACTION_PROPOSAL_TTL_MS`）的陈旧动作提议记录；
   - 单键处理失败只 warn 跳过，不中断整体清扫。
 - **与中断修复的分工**：`repairInflight()` 在 TTL 开启时跳过超龄快照（GC 的职责），两轮后台任务无论执行顺序如何都收敛一致；TTL 关闭时修复逻辑不变（照常修复全部快照）。
 - **边界**：只退休插件自己的路由条目，宿主侧的 Session / 工作区不动；被 GC 的真实话题后来再有消息会命中过期墓碑并明确拒绝，绝不在旧话题中新建 Session。`/help`、`/userid`、`/groupid`、`/health` 不依赖 Session，仍可执行。

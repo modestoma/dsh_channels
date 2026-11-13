@@ -2583,6 +2583,7 @@ describe('feishu attachment-fetch presentation and configuration', () => {
       topicMessages: true,
       topicMessagesTimeoutMs: 20_000,
       sendFile: true,
+      proposeActions: true,
       wikiRead: false,
       wikiWrite: false,
     })

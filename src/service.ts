@@ -47,6 +47,9 @@ import type { FeishuDomainHandle, InflightSnapshot, RouteRecord } from './domain
 import { Outbox } from './outbox.ts'
 import { RouteStore } from './session/routes.ts'
 import { TopicLauncher } from './topics/launcher.ts'
+import { FeishuActions } from './actions/service.ts'
+import { ActionProposalStore } from './actions/store.ts'
+import { ProposeActionsToolRuntime } from './feishu/propose-actions.ts'
 import type { TopicLocationPort } from './workspaces.ts'
 import { InflightRepair, storableMessage } from './session/repair.ts'
 import type { ChannelPrompt } from './session/prompt.ts'
@@ -188,6 +191,9 @@ export class FeishuService {
   private readonly inbound: InboundRouter
   /** The `feishuTopics` service (other plugins' launches → shared topics). */
   private readonly topicLauncher: TopicLauncher
+  /** The `feishuActions` service (non-blocking follow-up action proposals). */
+  private readonly feishuActions: FeishuActions
+  private readonly actionProposalStore: ActionProposalStore
   /** Agent/session lifecycle: live registry, resume, presets, renew. */
   private readonly sessions: SessionManager
   /**
@@ -198,6 +204,7 @@ export class FeishuService {
   private readonly attachmentFetchTools: AttachmentFetchToolRuntime
   private readonly topicMessagesTools: TopicMessagesToolRuntime
   private readonly sendFileTools: SendFileToolRuntime
+  private readonly proposeActionsTools: ProposeActionsToolRuntime
   private readonly wikiConsent: WikiConsent
   private readonly wikiTools: WikiToolRuntime
   /** FIFO admission for ordinary turns and commands targeting one route. */
@@ -312,6 +319,10 @@ export class FeishuService {
         : { grants: this.domain.approvalGrants, cards: this.domain.approvalCards },
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
     })
+    this.actionProposalStore = new ActionProposalStore({
+      table: () => this.domain?.actionProposals,
+      warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
+    })
     this.repair = new InflightRepair({
       domain: () => this.domain,
       channel: () => this.channel,
@@ -368,6 +379,7 @@ export class FeishuService {
         }
         mounts.push(this.topicMessagesTools.mount(agentCtx, sessionId))
         mounts.push(this.sendFileTools.mount(agentCtx, sessionId))
+        mounts.push(this.proposeActionsTools.mount(agentCtx, sessionId))
         mounts.push(this.wikiTools.mount(agentCtx, sessionId))
         return Promise.all(mounts).then(() => undefined)
       },
@@ -397,6 +409,22 @@ export class FeishuService {
       table: () => this.domain?.outbox,
       channel: () => this.channel,
       sendSegment: (sessionId, segment, card, text) => this.delivery.segmentCard(sessionId, segment, card, text),
+      warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
+    })
+    this.feishuActions = new FeishuActions({
+      started: () => this.started,
+      channel: () => this.channel,
+      domain: () => this.domain,
+      store: this.actionProposalStore,
+      routes: this.routes,
+      outbox: this.outbox,
+      warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
+    })
+    this.proposeActionsTools = new ProposeActionsToolRuntime({
+      config: () => this.config,
+      actions: this.feishuActions,
+      agentOfSession: sessionId => this.sessions.get(sessionId)?.agent ?? this.ctx.agents.get(sessionId as SessionId),
+      isRoutedSession: sessionId => this.routes.findBySession(sessionId) !== undefined,
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
     })
     this.wikiConsent = new WikiConsent({
@@ -561,6 +589,9 @@ export class FeishuService {
       sessions: this.sessions,
       repair: this.repair,
       approvals: this.approvalStore,
+      actionProposals: this.actionProposalStore,
+      patchProposalCard: (proposalId, cardMessageId, card) =>
+        this.feishuActions.patchCardSerialized(proposalId, cardMessageId, card),
       outbox: this.outbox,
       delivery: this.delivery,
       queue: this.routeOperations,
@@ -866,6 +897,8 @@ export class FeishuService {
 
   /** The `feishuTopics` service, provided by `apply()`. */
   topics(): TopicLauncher { return this.topicLauncher }
+  /** The `feishuActions` service, provided by `apply()`. */
+  actions(): FeishuActions { return this.feishuActions }
   isRunning(): boolean { return this.started }
   isRestarting(): boolean { return this.restarting }
   /** True while the panel's explicit connect action is in flight. */
@@ -1088,6 +1121,7 @@ export class FeishuService {
     this.unlistenHost.push(this.ctx.on('session/event', (session, event) => {
       this.streamer?.onSessionEvent(session, event)
       this.approvalAnswerer?.onSessionEvent(session.id, event)
+      this.proposeActionsTools.onSessionEvent(session, event)
     }))
     // DSH removed the durable `assistant/chunk` event (format v2 embeds the
     // stream in the settlement); the live deltas arrive here instead.
@@ -1097,13 +1131,17 @@ export class FeishuService {
     // Binds each card to the turn its own prompt opens (see `TurnStreamer`).
     this.unlistenHost.push(this.ctx.on('agent/inbox/claimed', ({ agent, message, turn }) => {
       this.codeWriteGate.onClaimed(agent.session.id, message)
+      this.proposeActionsTools.onInboxClaimed(agent.session.id, turn)
       this.streamer?.onInboxClaimed(agent.session, message, turn)
     }))
     this.unlistenHost.push(this.ctx.on('agent/inbox/discarded', ({ agent, message }) => {
       this.streamer?.onInboxDiscarded(agent.session, message)
     }))
     this.unlistenHost.push(this.ctx.on('tools/pre-execute', async (exec, next) =>
-      this.codeWriteGate.decide(exec) ?? await this.readFence.decide(exec) ?? await next()))
+      this.proposeActionsTools.decidePreExecute(exec)
+      ?? this.codeWriteGate.decide(exec)
+      ?? await this.readFence.decide(exec)
+      ?? await next()))
     // Writes made for a Feishu Session are answered by where it lives, before
     // the writing plugin asks the user; Sessions this channel does not route
     // are left to other listeners.
@@ -1162,6 +1200,7 @@ export class FeishuService {
     await this.topicLauncher.markInterrupted()
     ensureCurrent()
     this.topicLauncher.open()
+    this.feishuActions.open()
     // Read back what arrived while no instance was connected (background).
     this.missed.start()
     // Repair cards a previous instance left mid-flight (best-effort, background).
@@ -1259,7 +1298,9 @@ export class FeishuService {
     // already queued route operations observe `started === false` and retire.
     this.started = false
     this.topicLauncher.close()
+    this.feishuActions.close()
     await this.topicLauncher.drain()
+    await this.feishuActions.drain()
     await this.commands.drain()
     this.unlistenBotAdded?.()
     this.unlistenBotAdded = undefined
@@ -1293,6 +1334,7 @@ export class FeishuService {
     await this.sessions.disposeAll()
     await this.peers.clear()
     this.attachmentFetchTools.clear()
+    this.proposeActionsTools.clear()
     this.routeOperations.clear()
     this.inbound.clear()
     this.routes.clear()
@@ -1483,6 +1525,10 @@ export class FeishuService {
     const removedApproval = this.approvalStore.prune(sessionId => this.routes.findBySession(sessionId) !== undefined, now)
     if (removedApproval > 0) {
       this.ctx.logger?.info?.('dsh-channels: record GC removed %d approval record(s)', removedApproval)
+    }
+    const removedProposals = await this.actionProposalStore.prune(now)
+    if (removedProposals > 0) {
+      this.ctx.logger?.info?.('dsh-channels: record GC removed %d expired action proposal(s)', removedProposals)
     }
 
     const ttlMs = this.config.routeTtlMs
