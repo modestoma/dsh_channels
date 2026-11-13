@@ -1521,6 +1521,134 @@ describe('TurnCardActions button click handling, access pre-checks, invalidation
       expect(confirmedP4?.reservations).toBeUndefined()
     })
 
+    // 8) Concurrent live click while post-repairAll reconciliation runs must NEVER be rolled back!
+    const p5 = await h.actions.propose({
+      key: 'concurrent-live-click-1',
+      sessionId: route.sessionId,
+      prompt: '并发点击保护测试：',
+      actions: [
+        { id: 'opt_boot_stale', label: '过期启动预占', independent: true, followUpPrompt: '启动过期动作' },
+        { id: 'opt_live_click', label: '并发新点击', independent: true, followUpPrompt: '并发点击动作' },
+      ],
+    })
+    expect(p5.ok).toBe(true)
+    if (!p5.ok) return
+    const p5Id = proposalIdOfKey('concurrent-live-click-1')
+
+    await h.service.shutdown()
+    h.ctxState.agents.liveAgents.clear()
+
+    // Seed a replay-eligible boot reservation on `opt_boot_stale` AND an unrelated interrupted snapshot
+    // `card_hold_repair` whose `updateCard` pauses `repairAll()` while we trigger a live click on `opt_live_click`.
+    const baseP5 = proposalsTable.get(p5Id) as ActionProposalRecord
+    await proposalsTable.put(p5Id, {
+      ...baseP5,
+      actions: baseP5.actions.map(item => item.id === 'opt_boot_stale'
+        ? { ...item, status: 'triggered' as const, triggeredBy: 'u_alice', triggeredAt: Date.now() }
+        : item),
+      reservations: [{
+        requestId: 'req-boot-replay-defer',
+        actionId: 'opt_boot_stale',
+        changedIds: ['opt_boot_stale'],
+        createdAt: Date.now(),
+      }],
+    })
+    await inflightTable.put('card_boot_defer', {
+      key: 'card_boot_defer',
+      sessionId: route.sessionId,
+      chatId: 'oc_p2p',
+      routeKey: route.key,
+      prompt: {
+        requestId: 'req-boot-replay-defer',
+        principal: { kind: 'feishu-user', userId: 'u_alice' },
+        content: [{ type: 'text', text: '启动过期动作' }],
+      },
+      cards: [{ messageId: 'card_boot_defer', mode: 'card' }],
+      startedAt: Date.now(),
+      attempts: 0,
+      replays: 0,
+    })
+    await inflightTable.put('card_hold_repair', {
+      key: 'card_hold_repair',
+      sessionId: route.sessionId,
+      chatId: 'oc_p2p',
+      routeKey: route.key,
+      message: {
+        id: 'host-msg-hold',
+        role: 'user',
+        content: [{ type: 'text', text: 'hold repairAll' }],
+        source: { kind: 'user' },
+      },
+      cards: [{ messageId: 'card_hold_repair', mode: 'card' }],
+      startedAt: Date.now(),
+      attempts: 0,
+    })
+
+    let resolveRepairPaused!: () => void
+    const repairPaused = new Promise<void>((resolve) => { resolveRepairPaused = resolve })
+    let resolveReleaseRepair!: () => void
+    const releaseRepair = new Promise<void>((resolve) => { resolveReleaseRepair = resolve })
+    const origUpdateCard = h.channel.updateCard.bind(h.channel)
+    h.channel.updateCard = async (messageId, card) => {
+      if (messageId === 'card_hold_repair') {
+        resolveRepairPaused()
+        await releaseRepair
+      }
+      return await origUpdateCard(messageId, card)
+    }
+
+    let resolveLiveSendPaused!: () => void
+    const liveSendPaused = new Promise<void>((resolve) => { resolveLiveSendPaused = resolve })
+    let resolveReleaseLiveSend!: () => void
+    const releaseLiveSend = new Promise<void>((resolve) => { resolveReleaseLiveSend = resolve })
+    const origLiveSend = h.channel.send.bind(h.channel)
+    h.channel.send = async (chatId, content, options) => {
+      if (options?.replyTo === p5.cardMessageId) {
+        resolveLiveSendPaused()
+        await releaseLiveSend
+      }
+      return await origLiveSend(chatId, content, options)
+    }
+
+    await h.service.start()
+    await repairPaused
+
+    // Start a live click on `opt_live_click` while `repairAll()` is paused mid-flight,
+    // and pause its `channel.send` right AFTER `triggerAction()` persists the live reservation!
+    const liveClickDone = h.clickButton({
+      messageId: p5.cardMessageId,
+      chatId: 'oc_p2p',
+      userId: 'u_alice',
+      proposalId: p5Id,
+      actionId: 'opt_live_click',
+    })
+    await liveSendPaused
+    const liveReservation = h.proposals().find(r => r.key === 'concurrent-live-click-1')?.reservations
+      ?.find(r => r.actionId === 'opt_live_click')
+    expect(liveReservation).toBeDefined()
+
+    // Let `repairAll()` finish so the background `reconcileActionProposals(lifecycle, bootReservationIds)` runs
+    // WHILE `liveReservation` has no snapshot, log entry, or inbox entry yet.
+    resolveReleaseRepair()
+    await h.waitUntil(() => {
+      expect(inflightTable.get('card_hold_repair')).toBeUndefined()
+      const current = h.proposals().find(r => r.key === 'concurrent-live-click-1')
+      // Boot reservation confirmed after replay, AND concurrent live click reservation stayed intact!
+      expect(current?.actions.map(a => a.status)).toEqual(['triggered', 'triggered'])
+      expect(current?.reservations?.some(r => r.requestId === liveReservation?.requestId)).toBe(true)
+    })
+
+    // Release the live click send and confirm it completes cleanly with no duplicate click possible!
+    resolveReleaseLiveSend()
+    await liveClickDone
+    await h.waitUntil(() => {
+      const settledP5 = h.proposals().find(r => r.key === 'concurrent-live-click-1')
+      expect(settledP5?.actions.map(a => a.status)).toEqual(['triggered', 'triggered'])
+      expect(settledP5?.reservations).toBeUndefined()
+    })
+
+    h.channel.updateCard = origUpdateCard
+    h.channel.send = origLiveSend
     await h.service.shutdown()
   })
 })

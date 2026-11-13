@@ -1056,6 +1056,13 @@ export class FeishuService {
     this.accessStore.load()
     this.outbox.start()
 
+    // Capture the exact set of unfinished reservations inherited at boot so
+    // background reconciliation never touches concurrent live clicks from this instance.
+    const bootReservationIds = new Set<string>()
+    for (const [, record] of domain.actionProposals.entries()) {
+      for (const res of record.reservations ?? []) bootReservationIds.add(res.requestId)
+    }
+
     // HITL: answer the host's approval/request waterfall for sessions this
     // channel routes. `prepend` claims such requests BEFORE the web gateway's
     // generic answerer (its panel would be invisible to a Feishu user), while
@@ -1205,7 +1212,7 @@ export class FeishuService {
     if (this.config.slashCommandPanel) void this.checks.syncSlashCommands(channel)
     // Before admission opens, so every `running` record left is a previous instance's.
     await this.topicLauncher.markInterrupted()
-    await this.reconcileActionProposals(lifecycle)
+    await this.reconcileActionProposals(lifecycle, bootReservationIds)
     ensureCurrent()
     this.topicLauncher.open()
     this.feishuActions.open()
@@ -1214,7 +1221,7 @@ export class FeishuService {
     // Repair cards a previous instance left mid-flight (best-effort, background).
     void this.repair.repairAll()
       .then(async () => {
-        if (this.lifecycle === lifecycle) await this.reconcileActionProposals(lifecycle)
+        if (this.lifecycle === lifecycle) await this.reconcileActionProposals(lifecycle, bootReservationIds)
       })
       .catch((error: unknown) => {
         this.ctx.logger?.warn?.('dsh-channels: inflight repair failed: %s', String(error))
@@ -1688,17 +1695,19 @@ export class FeishuService {
    * example, after normal turn finalization deleted the snapshot before
    * confirmation committed).
    */
-  private async reconcileActionProposals(lifecycle: number): Promise<void> {
+  private async reconcileActionProposals(lifecycle: number, scopeRequestIds: ReadonlySet<string>): Promise<void> {
     const domain = this.domain
-    if (domain === undefined) return
+    if (domain === undefined || scopeRequestIds.size === 0) return
     const pendingRecords = [...domain.actionProposals.entries()]
       .map(([, record]) => record)
-      .filter(hasActiveReservations)
+      .filter(record => (record.reservations ?? []).some(res => scopeRequestIds.has(res.requestId)))
     if (pendingRecords.length === 0) return
 
     const neededIds = new Set<string>()
     for (const record of pendingRecords) {
-      for (const res of record.reservations ?? []) neededIds.add(res.requestId)
+      for (const res of record.reservations ?? []) {
+        if (scopeRequestIds.has(res.requestId)) neededIds.add(res.requestId)
+      }
     }
 
     const ttlMs = this.config.routeTtlMs
@@ -1719,7 +1728,7 @@ export class FeishuService {
     const sessionCache = new Map<string, ResolvedSession>()
     const tempHandles: AgentHandle[] = []
     const confirmed = new Set<string>()
-    const deferred = new Set<string>()
+    const rollback = new Set<string>()
 
     const isQueuedInInbox = (agent: Agent, requestId: string): boolean =>
       [...agent.inbox.nextTurn, ...agent.inbox.nextStep].some((msg) => {
@@ -1791,15 +1800,12 @@ export class FeishuService {
         if (this.lifecycle !== lifecycle) return
         const resolved = await resolveProposalSession(record.sessionId, record.routeKey)
         for (const res of record.reservations ?? []) {
-          if (this.replayingRequestIds.has(res.requestId)) {
-            deferred.add(res.requestId)
-            continue
-          }
-          if (resolved.kind === 'deferred') {
-            deferred.add(res.requestId)
+          if (!scopeRequestIds.has(res.requestId)) continue
+          if (this.replayingRequestIds.has(res.requestId) || resolved.kind === 'deferred') {
             continue
           }
           if (resolved.kind === 'unresolvable') {
+            rollback.add(res.requestId)
             continue
           }
           const { agent } = resolved
@@ -1813,24 +1819,26 @@ export class FeishuService {
           }
           const snapshot = snapshotsByRequestId.get(res.requestId)
           const snapshotPrompt = snapshot?.prompt
-          if (snapshot === undefined || snapshotPrompt === undefined) continue
-          const snapRoute = snapshot.routeKey === undefined
-            ? this.routes.findBySession(snapshot.sessionId)
-            : this.routes.get(snapshot.routeKey)
-          const prompt = promptOfSnapshot(snapshotPrompt)
-          const hasPatchableCard = snapshot.cards[0]?.mode === 'card'
-          if (
-            snapRoute !== undefined
-            && snapRoute.sessionId === snapshot.sessionId
-            && snapshot.sessionId === record.sessionId
-            && agent.status !== 'running'
-            && prompt !== undefined
-            && hasPatchableCard
-            && this.config.replay.pending
-            && (snapshot.replays ?? 0) < 1
-          ) {
-            deferred.add(res.requestId)
+          if (snapshot !== undefined && snapshotPrompt !== undefined) {
+            const snapRoute = snapshot.routeKey === undefined
+              ? this.routes.findBySession(snapshot.sessionId)
+              : this.routes.get(snapshot.routeKey)
+            const prompt = promptOfSnapshot(snapshotPrompt)
+            const hasPatchableCard = snapshot.cards[0]?.mode === 'card'
+            if (
+              snapRoute !== undefined
+              && snapRoute.sessionId === snapshot.sessionId
+              && snapshot.sessionId === record.sessionId
+              && agent.status !== 'running'
+              && prompt !== undefined
+              && hasPatchableCard
+              && this.config.replay.pending
+              && (snapshot.replays ?? 0) < 1
+            ) {
+              continue
+            }
           }
+          rollback.add(res.requestId)
         }
       }
     } finally {
@@ -1838,7 +1846,7 @@ export class FeishuService {
     }
 
     if (this.lifecycle !== lifecycle) return
-    const reconciled = await this.actionProposalStore.reconcileReservations(confirmed, deferred)
+    const reconciled = await this.actionProposalStore.reconcileReservations(confirmed, rollback)
     for (const updated of reconciled) {
       void this.feishuActions.patchCardSerialized(
         updated.proposalId,

@@ -443,41 +443,48 @@ export class ActionProposalStore {
   }
 
   /**
-   * Startup reconciliation pass: resolve any unconfirmed reservations left behind
-   * if the previous process exited mid-click or if `confirmTrigger()` failed to
-   * persist. Reservations whose `requestId` is present in `confirmedRequestIds`
-   * (found in the Session log/inbox or slated for `repairAll()` replay) are
-   * confirmed; reservations in `deferredRequestIds` (transient Session resume
-   * failure) stay untouched until a subsequent boot can inspect the Session; all
-   * remaining reservations roll back to `'pending'` (or `'superseded'`).
+   * Startup reconciliation pass: apply decisions strictly to the inspected
+   * reservation request IDs (`confirmedRequestIds` / `rollbackRequestIds`),
+   * leaving any deferred or concurrently added live-click reservations outside
+   * those sets completely untouched.
    */
   async reconcileReservations(
     confirmedRequestIds: ReadonlySet<string>,
-    deferredRequestIds?: ReadonlySet<string>,
+    rollbackRequestIds: ReadonlySet<string>,
   ): Promise<ActionProposalRecord[]> {
+    if (confirmedRequestIds.size === 0 && rollbackRequestIds.size === 0) return []
     const table = this.deps.table()
     if (table === undefined) return []
     const reconciled: ActionProposalRecord[] = []
     for (const [proposalId, record] of [...table.entries()]) {
       if (!hasActiveReservations(record)) continue
+      if (!(record.reservations ?? []).some(
+        r => confirmedRequestIds.has(r.requestId) || rollbackRequestIds.has(r.requestId),
+      )) {
+        continue
+      }
       let updated: ActionProposalRecord | undefined
       try {
         await table.update(proposalId, (current) => {
           if (!hasActiveReservations(current)) return current
-          const rollbackIds = new Set<string>()
+          const rawRollbackIds = new Set<string>()
           const remaining: ActionReservation[] = []
+          let reservationChanged = false
           for (const res of current.reservations ?? []) {
-            if (deferredRequestIds?.has(res.requestId)) {
-              remaining.push(res)
+            if (confirmedRequestIds.has(res.requestId)) {
+              reservationChanged = true
               continue
             }
-            if (!confirmedRequestIds.has(res.requestId)) {
-              for (const id of res.changedIds) rollbackIds.add(id)
+            if (rollbackRequestIds.has(res.requestId)) {
+              reservationChanged = true
+              for (const id of res.changedIds) rawRollbackIds.add(id)
+              continue
             }
+            remaining.push(res)
           }
-          if (rollbackIds.size === 0 && remaining.length === (current.reservations?.length ?? 0)) {
-            return current
-          }
+          if (!reservationChanged) return current
+          const protectedIds = new Set(remaining.flatMap(r => r.changedIds))
+          const rollbackIds = new Set([...rawRollbackIds].filter(id => !protectedIds.has(id)))
           const rollbackStatus: ActionProposalStatus = current.superseded === true ? 'superseded' : 'pending'
           const nextActions = rollbackIds.size === 0
             ? current.actions
