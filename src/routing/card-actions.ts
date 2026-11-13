@@ -431,15 +431,25 @@ export class TurnCardActions {
         const liveChannel = this.deps.channel()
         if (!this.deps.started() || liveChannel === undefined) return
 
+        const now = this.now()
+        const text = formatActionSelectedPrompt(
+          target.id,
+          target.label,
+          target.followUpPrompt,
+        )
+        const prompt = channelPrompt(text, principalOnRoute(route, clickerUserId))
+
         const triggered = await this.deps.actionProposals.triggerAction(
           proposal.proposalId,
           click.actionId,
           clickerUserId,
-          this.now(),
+          now,
+          prompt.requestId,
         )
         if (!triggered.changed) return
 
         let accepted = false
+        let repairCardMessageId: string | undefined
         try {
           const firstCard = this.deps.streamer()?.hasLiveTurn(route.sessionId) === true
             ? queuedStreamingCard(route.sessionId)
@@ -449,14 +459,8 @@ export class TurnCardActions {
             replyInThread: route.kind === 'thread',
           })
 
-          const text = formatActionSelectedPrompt(
-            triggered.action.id,
-            triggered.action.label,
-            triggered.action.followUpPrompt,
-          )
-          const prompt = channelPrompt(text, principalOnRoute(route, clickerUserId))
           const stored = storablePrompt(prompt)
-          const now = this.now()
+          repairCardMessageId = sent.messageId
           await this.deps.repair.write({
             key: sent.messageId,
             sessionId: route.sessionId,
@@ -476,16 +480,31 @@ export class TurnCardActions {
           })
           const outcome = await this.deps.runTurn(live.agent, prompt, { cardMessageId: sent.messageId })
           accepted = outcome.accepted
-          if (!accepted) {
-            void this.deps.repair.clear(sent.messageId)
-          }
         } finally {
           if (!accepted) {
-            await this.deps.actionProposals.revertTrigger(proposal.proposalId, triggered.changedIds)
+            if (repairCardMessageId !== undefined) {
+              await this.deps.repair.clear(repairCardMessageId).catch((error: unknown) => {
+                this.deps.ctx.logger?.warn?.(
+                  'dsh-channels: clearing failed action repair snapshot %s failed: %s',
+                  repairCardMessageId, String(error),
+                )
+              })
+            }
+            const reverted = await this.deps.actionProposals.revertTrigger(
+              proposal.proposalId,
+              triggered.changedIds,
+              prompt.requestId,
+            )
+            if (reverted?.superseded === true) {
+              patchProposal(buildActionProposalCard(reverted))
+            }
           }
         }
         if (!accepted) return
-        patchProposal(buildActionProposalCard(this.deps.actionProposals.get(proposal.proposalId) ?? triggered.record))
+        const confirmed = await this.deps.actionProposals.confirmTrigger(proposal.proposalId, prompt.requestId)
+        patchProposal(buildActionProposalCard(
+          confirmed ?? this.deps.actionProposals.get(proposal.proposalId) ?? triggered.record,
+        ))
       })
     } finally {
       this.inFlightProposalClicks.delete(clickKey)

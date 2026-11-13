@@ -1143,4 +1143,149 @@ describe('TurnCardActions button click handling, access pre-checks, invalidation
     expect(a).toBe(b)
     expect(a).not.toBe(c)
   })
+
+  it('preserves supersession on failed in-flight rollback, clears repair snapshots on exceptional exits, and reconciles unfinished reservations on restart', async () => {
+    const h = await setupService()
+    await h.onMessage(makeMessage({ chatId: 'oc_p2p', chatType: 'p2p', senderId: 'u_alice', content: '开启测试话题' }))
+    await h.waitUntil(() => expect(h.routes()).toHaveLength(1))
+    const route = h.routes()[0]!
+    const agent = h.ctxState.agents.created[0]!.handle.agent
+    for (const listener of h.ctxState.sessionListeners) {
+      listener(agent.session, { type: 'turn/end', seq: 1, data: { turn: 1 } } as never)
+    }
+
+    // 1) Finding #3: New proposal posted while a non-independent click is awaiting delivery; delivery fails -> rolls back to `superseded`, NEVER `pending`.
+    const p1 = await h.actions.propose({
+      key: 'race-supersede-1',
+      sessionId: route.sessionId,
+      prompt: '旧提议（二选一）：',
+      actions: [
+        { id: 'opt_a', label: '选项 A', followUpPrompt: '执行 A' },
+        { id: 'opt_b', label: '选项 B', followUpPrompt: '执行 B' },
+      ],
+    })
+    expect(p1.ok).toBe(true)
+    if (!p1.ok) return
+
+    const origSend = h.channel.send.bind(h.channel)
+    let resolveSendStarted!: () => void
+    const sendStarted = new Promise<void>((resolve) => { resolveSendStarted = resolve })
+    let resolveReleaseSend!: () => void
+    const releaseSend = new Promise<void>((resolve) => { resolveReleaseSend = resolve })
+    let interceptReplySend = true
+    h.channel.send = async (chatId, content, options) => {
+      if (interceptReplySend && options?.replyTo === p1.cardMessageId) {
+        interceptReplySend = false
+        resolveSendStarted()
+        await releaseSend
+        throw new Error('feishu send failed after supersession')
+      }
+      return await origSend(chatId, content, options)
+    }
+
+    const click1Done = h.clickButton({
+      messageId: p1.cardMessageId,
+      chatId: 'oc_p2p',
+      userId: 'u_alice',
+      proposalId: proposalIdOfKey('race-supersede-1'),
+      actionId: 'opt_a',
+    })
+    await sendStarted
+
+    // While `opt_a` delivery is suspended (`opt_a: triggered`, `opt_b: dismissed`), post p2!
+    const p2 = await h.actions.propose({
+      key: 'race-supersede-2',
+      sessionId: route.sessionId,
+      prompt: '新提议：',
+      actions: [
+        { id: 'opt_c', label: '选项 C', followUpPrompt: '执行 C' },
+      ],
+    })
+    expect(p2.ok).toBe(true)
+    if (!p2.ok) return
+
+    // Now let `opt_a` delivery fail: rollback must transition BOTH items to `superseded`, not `pending`!
+    resolveReleaseSend()
+    await click1Done
+    await h.waitUntil(() => {
+      const stored1 = h.proposals().find(r => r.key === 'race-supersede-1')
+      expect(stored1?.superseded).toBe(true)
+      expect(stored1?.actions.map(a => a.status)).toEqual(['superseded', 'superseded'])
+      expect(stored1?.reservations).toBeUndefined()
+      expect(h.lastPatchedCard(p1.cardMessageId)).not.toContain('"tag":"button"')
+    })
+
+    // 2) Finding #2: Exception thrown AFTER `repair.write()` (e.g. `routes.put` throws) retires the `inflight` snapshot before reopening buttons.
+    const routesTable = h.ctxState.domain.raw.table('routes')
+    const origPut = routesTable.put.bind(routesTable)
+    let failNextRoutePut = true
+    routesTable.put = async (k: string, v: unknown) => {
+      if (failNextRoutePut) {
+        failNextRoutePut = false
+        throw new Error('simulated disk error in routes.put')
+      }
+      await origPut(k, v)
+    }
+
+    await h.clickButton({
+      messageId: p2.cardMessageId,
+      chatId: 'oc_p2p',
+      userId: 'u_alice',
+      proposalId: proposalIdOfKey('race-supersede-2'),
+      actionId: 'opt_c',
+    })
+    await h.waitUntil(() => expect(failNextRoutePut).toBe(false))
+    await h.waitUntil(() => {
+      const stored2 = h.proposals().find(r => r.key === 'race-supersede-2')
+      expect(stored2?.actions.map(a => a.status)).toEqual(['pending'])
+      expect(stored2?.reservations).toBeUndefined()
+    })
+    expect([...h.ctxState.domain.raw.table('inflight').entries()]).toHaveLength(0)
+
+    // 3) Finding #1: Simulate an unclean process exit right after `triggerAction()` committed (before `repair.write()`), then restart -> startup reconciles back to `pending`!
+    const p2Id = proposalIdOfKey('race-supersede-2')
+    const proposalsTable = h.ctxState.domain.raw.table('action_proposals')
+    const currentP2 = proposalsTable.get(p2Id) as ActionProposalRecord
+    await proposalsTable.put(p2Id, {
+      ...currentP2,
+      actions: currentP2.actions.map(item => ({
+        ...item,
+        status: 'triggered' as const,
+        triggeredBy: 'u_alice',
+        triggeredAt: Date.now(),
+      })),
+      reservations: [{
+        requestId: 'orphaned-req-before-repair-write',
+        actionId: 'opt_c',
+        changedIds: ['opt_c'],
+        createdAt: Date.now(),
+      }],
+    })
+
+    await h.service.restart()
+    await h.waitUntil(() => {
+      const reconciled = h.proposals().find(r => r.key === 'race-supersede-2')
+      expect(reconciled?.actions.map(a => a.status)).toEqual(['pending'])
+      expect(reconciled?.reservations).toBeUndefined()
+    })
+
+    // User can now click `opt_c` after restart and execute it cleanly!
+    const resumedBeforeRetry = h.ctxState.agents.resumed.length
+    await h.clickButton({
+      messageId: p2.cardMessageId,
+      chatId: 'oc_p2p',
+      userId: 'u_alice',
+      proposalId: p2Id,
+      actionId: 'opt_c',
+    })
+    await h.waitUntil(() => {
+      expect(h.ctxState.agents.resumed.length).toBeGreaterThan(resumedBeforeRetry)
+      const resumedAgent = h.ctxState.agents.resumed.at(-1)!.handle.agent
+      expect(followupMessagesOf(resumedAgent).length).toBeGreaterThanOrEqual(1)
+    })
+    expect(h.proposals().find(r => r.key === 'race-supersede-2')?.actions.map(a => a.status)).toEqual(['triggered'])
+    expect(h.proposals().find(r => r.key === 'race-supersede-2')?.reservations).toBeUndefined()
+
+    await h.service.shutdown()
+  })
 })

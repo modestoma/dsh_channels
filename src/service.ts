@@ -48,11 +48,13 @@ import { Outbox } from './outbox.ts'
 import { RouteStore } from './session/routes.ts'
 import { TopicLauncher } from './topics/launcher.ts'
 import { FeishuActions } from './actions/service.ts'
-import { ActionProposalStore } from './actions/store.ts'
+import { ActionProposalStore, hasActiveReservations } from './actions/store.ts'
+import { buildActionProposalCard } from './cards/action-proposal.ts'
+import { promptRequestIdOf } from './access/principal.ts'
 import { ProposeActionsToolRuntime } from './feishu/propose-actions.ts'
 import type { TopicLocationPort } from './workspaces.ts'
-import { InflightRepair, storableMessage } from './session/repair.ts'
-import type { ChannelPrompt } from './session/prompt.ts'
+import { classifyTurn, InflightRepair, storableMessage } from './session/repair.ts'
+import { promptOfSnapshot, type ChannelPrompt } from './session/prompt.ts'
 import { PromptSubmitter, submissionFailureText } from './session/submit.ts'
 import type { SubmissionOutcome, TurnCard, TurnSubmission } from './session/submit.ts'
 import { PeerRegistry } from './access/peers.ts'
@@ -1198,6 +1200,7 @@ export class FeishuService {
     if (this.config.slashCommandPanel) void this.checks.syncSlashCommands(channel)
     // Before admission opens, so every `running` record left is a previous instance's.
     await this.topicLauncher.markInterrupted()
+    await this.reconcileActionProposals()
     ensureCurrent()
     this.topicLauncher.open()
     this.feishuActions.open()
@@ -1663,6 +1666,73 @@ export class FeishuService {
   /** Host projection registry, when this deployment mounts one. */
   private projectionRegistry(): SessionProjections | undefined {
     return this.ctx.get?.('sessionProjections') as SessionProjections | undefined
+  }
+
+  /**
+   * Reconcile unconfirmed action-proposal click reservations left behind if a
+   * previous process exited between `triggerAction()` and turn acceptance.
+   */
+  private async reconcileActionProposals(): Promise<void> {
+    const domain = this.domain
+    if (domain === undefined) return
+    const pendingRecords = [...domain.actionProposals.entries()]
+      .map(([, record]) => record)
+      .filter(hasActiveReservations)
+    if (pendingRecords.length === 0) return
+
+    const neededIds = new Set<string>()
+    for (const record of pendingRecords) {
+      for (const res of record.reservations ?? []) neededIds.add(res.requestId)
+    }
+
+    const ttlMs = this.config.routeTtlMs
+    const cutoff = ttlMs === 0 ? undefined : Date.now() - ttlMs
+    const recoverable = new Set<string>()
+    for (const [, snapshot] of domain.inflight.entries()) {
+      if (cutoff !== undefined && snapshot.startedAt < cutoff) continue
+      const snapshotPrompt = snapshot.prompt
+      if (snapshotPrompt === undefined || !neededIds.has(snapshotPrompt.requestId)) continue
+      const requestId = snapshotPrompt.requestId
+      const agent = await this.recoveryAgent(snapshot).catch(() => undefined)
+      if (agent === undefined) continue
+      const state = classifyTurn(agent.session.snapshotEvents(), { requestId })
+      if (state.kind !== 'pending') {
+        recoverable.add(requestId)
+        continue
+      }
+      const prompt = promptOfSnapshot(snapshotPrompt)
+      const hasPatchableCard = snapshot.cards[0]?.mode === 'card'
+      const queuedInInbox = prompt !== undefined && hasPatchableCard
+        && [...agent.inbox.nextTurn, ...agent.inbox.nextStep].some((msg) => {
+          if (typeof msg !== 'object' || msg === null) return false
+          const source = (msg as { source?: unknown }).source
+          if (typeof source !== 'object' || source === null || typeof (source as { kind?: unknown }).kind !== 'string') {
+            return false
+          }
+          return promptRequestIdOf(source as { kind: string }) === requestId
+        })
+      if (queuedInInbox || agent.status === 'running') {
+        recoverable.add(requestId)
+        continue
+      }
+      if (
+        prompt !== undefined
+        && hasPatchableCard
+        && this.config.replay.pending
+        && (snapshot.replays ?? 0) < 1
+      ) {
+        recoverable.add(requestId)
+      }
+    }
+
+    const reconciled = await this.actionProposalStore.reconcileReservations(recoverable)
+    for (const updated of reconciled) {
+      void this.feishuActions.patchCardSerialized(
+        updated.proposalId,
+        updated.cardMessageId,
+        buildActionProposalCard(updated),
+      )
+    }
   }
 
   /** Card figures from host projections (token totals / cache hit / window). */

@@ -39,6 +39,16 @@ export const actionProposalStoredItemSchema = z.object({
 
 export type ActionProposalStoredItem = z.infer<typeof actionProposalStoredItemSchema>
 
+/** Unconfirmed in-flight click reservation awaiting turn acceptance or startup reconciliation. */
+export const actionReservationSchema = z.object({
+  requestId: z.string().min(1),
+  actionId: z.string().min(1),
+  changedIds: z.array(z.string().min(1)).min(1),
+  createdAt: z.number().int().nonnegative(),
+})
+
+export type ActionReservation = z.infer<typeof actionReservationSchema>
+
 /** Durable record stored in `feishuDomain.tables.action_proposals` (keyed by `proposalId`). */
 export const actionProposalRecordSchema = z.object({
   proposalId: z.string().min(1),
@@ -50,7 +60,9 @@ export const actionProposalRecordSchema = z.object({
   cardMessageId: z.string().min(1),
   prompt: z.string().min(1),
   actions: z.array(actionProposalStoredItemSchema).min(1).max(4),
+  superseded: z.boolean().optional(),
   supersededReason: z.string().optional(),
+  reservations: z.array(actionReservationSchema).optional(),
   createdAt: z.number().int().nonnegative(),
 })
 
@@ -64,6 +76,17 @@ export function proposalIdOfKey(key: string): string {
 /** True when at least one action item on the record is still `'pending'`. */
 export function hasPendingActions(record: Pick<ActionProposalRecord, 'actions'>): boolean {
   return record.actions.some(item => item.status === 'pending')
+}
+
+/** True when the record carries at least one unconfirmed in-flight click reservation. */
+export function hasActiveReservations(record: Pick<ActionProposalRecord, 'reservations'>): boolean {
+  return (record.reservations?.length ?? 0) > 0
+}
+
+function canSupersedeRecord(
+  record: Pick<ActionProposalRecord, 'actions' | 'superseded' | 'reservations'>,
+): boolean {
+  return hasPendingActions(record) || (record.superseded !== true && hasActiveReservations(record))
 }
 
 /** True when the proposal's 14-day validity window has elapsed at `now`. */
@@ -122,21 +145,23 @@ export class ActionProposalStore {
     if (table === undefined) return undefined
     const proposalId = proposalIdOfKey(key)
     const existing = table.get(proposalId)
-    if (existing === undefined || existing.key !== key || !hasPendingActions(existing)) {
+    if (existing === undefined || existing.key !== key || !canSupersedeRecord(existing)) {
       return undefined
     }
     const cleanReason = reason?.trim()
     let updated: ActionProposalRecord | undefined
     try {
       await table.update(proposalId, (current) => {
-        if (current.key !== key || !hasPendingActions(current)) return current
+        if (current.key !== key || !canSupersedeRecord(current)) return current
+        const hadPending = hasPendingActions(current)
         const next: ActionProposalRecord = {
           ...current,
+          superseded: true,
           ...(cleanReason !== undefined && cleanReason !== '' ? { supersededReason: cleanReason } : {}),
           actions: current.actions.map(item =>
             item.status === 'pending' ? { ...item, status: 'superseded' as const } : item),
         }
-        updated = next
+        if (hadPending) updated = next
         return next
       })
       return updated
@@ -149,9 +174,10 @@ export class ActionProposalStore {
   /**
    * Same-session auto-supersede: transition remaining `'pending'` items on all
    * prior proposals of `sessionId` (excluding `exceptProposalId`) to
-   * `'superseded'`, preserving `'triggered'` history items.
+   * `'superseded'` and mark any proposal with in-flight reservations as
+   * `superseded: true` so a subsequent rollback never revives obsolete buttons.
    *
-   * @returns Every record that transitioned, ready for async card refresh.
+   * @returns Every record whose visible `'pending'` items transitioned, ready for async card refresh.
    */
   async supersedeSession(sessionId: string, exceptProposalId?: string): Promise<ActionProposalRecord[]> {
     const table = this.deps.table()
@@ -160,7 +186,7 @@ export class ActionProposalStore {
     for (const [proposalId, record] of table.entries()) {
       if (record.sessionId !== sessionId) continue
       if (exceptProposalId !== undefined && proposalId === exceptProposalId) continue
-      if (!hasPendingActions(record)) continue
+      if (!canSupersedeRecord(record)) continue
       candidates.push(proposalId)
     }
     const superseded: ActionProposalRecord[] = []
@@ -168,13 +194,15 @@ export class ActionProposalStore {
       let updated: ActionProposalRecord | undefined
       try {
         await table.update(proposalId, (current) => {
-          if (!hasPendingActions(current)) return current
+          if (!canSupersedeRecord(current)) return current
+          const hadPending = hasPendingActions(current)
           const next: ActionProposalRecord = {
             ...current,
+            superseded: true,
             actions: current.actions.map(item =>
               item.status === 'pending' ? { ...item, status: 'superseded' as const } : item),
           }
-          updated = next
+          if (hadPending) updated = next
           return next
         })
         if (updated !== undefined) superseded.push(updated)
@@ -196,7 +224,7 @@ export class ActionProposalStore {
     if (existing === undefined || !hasPendingActions(existing)) return undefined
     let updated: ActionProposalRecord | undefined
     await table.update(proposalId, (current) => {
-      if (!hasPendingActions(current)) return current
+      if (current.superseded === true || !hasPendingActions(current)) return current
       const next: ActionProposalRecord = {
         ...current,
         actions: current.actions.map(item =>
@@ -219,6 +247,7 @@ export class ActionProposalStore {
     actionId: string,
     userId: string,
     triggeredAt: number,
+    requestId?: string,
   ): Promise<TriggerActionResult> {
     const table = this.deps.table()
     if (table === undefined) return { changed: false }
@@ -229,7 +258,7 @@ export class ActionProposalStore {
     let changedIds: string[] = []
     await table.update(proposalId, (current) => {
       const target = current.actions.find(item => item.id === actionId)
-      if (target === undefined || target.status !== 'pending') return current
+      if (current.superseded === true || target === undefined || target.status !== 'pending') return current
       const closeOthers = !target.independent
       const ids: string[] = []
       const nextActions = current.actions.map((item): ActionProposalStoredItem => {
@@ -251,7 +280,18 @@ export class ActionProposalStore {
         return item
       })
       changedIds = ids
-      const next: ActionProposalRecord = { ...current, actions: nextActions }
+      const nextReservations = requestId === undefined
+        ? current.reservations
+        : [
+          ...(current.reservations ?? []).filter(entry => entry.requestId !== requestId),
+          { requestId, actionId, changedIds: ids, createdAt: triggeredAt },
+        ]
+      const { reservations: _oldRes, ...base } = current
+      const next: ActionProposalRecord = {
+        ...base,
+        actions: nextActions,
+        ...(nextReservations !== undefined && nextReservations.length > 0 ? { reservations: nextReservations } : {}),
+      }
       updatedRecord = next
       return next
     })
@@ -260,14 +300,49 @@ export class ActionProposalStore {
   }
 
   /**
+   * Confirm an in-flight {@link triggerAction} reservation once its follow-up
+   * turn has been accepted by the Session.
+   */
+  async confirmTrigger(
+    proposalId: string,
+    requestId: string,
+  ): Promise<ActionProposalRecord | undefined> {
+    const table = this.deps.table()
+    if (table === undefined) return undefined
+    let updated: ActionProposalRecord | undefined
+    try {
+      await table.update(proposalId, (current) => {
+        if (current.reservations === undefined || !current.reservations.some(r => r.requestId === requestId)) {
+          updated = current
+          return current
+        }
+        const remaining = current.reservations.filter(r => r.requestId !== requestId)
+        const { reservations: _old, ...base } = current
+        const next: ActionProposalRecord = {
+          ...base,
+          ...(remaining.length > 0 ? { reservations: remaining } : {}),
+        }
+        updated = next
+        return next
+      })
+      return updated
+    } catch (error) {
+      this.deps.warn('dsh-channels: confirming action proposal %s failed: %s', proposalId, String(error))
+      return undefined
+    }
+  }
+
+  /**
    * Roll back a {@link triggerAction} reservation when sending the reply card
    * or submitting the follow-up turn fails before the Session accepts it, so
-   * the user's button stays clickable for retry. Never revives items that were
-   * `superseded` concurrently.
+   * the user's button stays clickable for retry. If the proposal was superseded
+   * while the click was in flight, transitions rolled-back items to
+   * `'superseded'` instead of reviving obsolete `'pending'` buttons.
    */
   async revertTrigger(
     proposalId: string,
     changedIds: readonly string[],
+    requestId?: string,
   ): Promise<ActionProposalRecord | undefined> {
     const table = this.deps.table()
     if (table === undefined || changedIds.length === 0) return undefined
@@ -275,6 +350,7 @@ export class ActionProposalStore {
     let updated: ActionProposalRecord | undefined
     try {
       await table.update(proposalId, (current) => {
+        const rollbackStatus: ActionProposalStatus = current.superseded === true ? 'superseded' : 'pending'
         let mutated = false
         const nextActions = current.actions.map((item): ActionProposalStoredItem => {
           if (!targetIds.has(item.id) || item.status === 'superseded' || item.status === 'pending') {
@@ -282,10 +358,19 @@ export class ActionProposalStore {
           }
           mutated = true
           const { triggeredBy: _by, triggeredAt: _at, ...rest } = item
-          return { ...rest, status: 'pending' }
+          return { ...rest, status: rollbackStatus }
         })
-        if (!mutated) return current
-        const next: ActionProposalRecord = { ...current, actions: nextActions }
+        const remaining = requestId === undefined
+          ? current.reservations
+          : current.reservations?.filter(r => r.requestId !== requestId)
+        const reservationRemoved = remaining?.length !== current.reservations?.length
+        if (!mutated && !reservationRemoved) return current
+        const { reservations: _old, ...base } = current
+        const next: ActionProposalRecord = {
+          ...base,
+          actions: nextActions,
+          ...(remaining !== undefined && remaining.length > 0 ? { reservations: remaining } : {}),
+        }
         updated = next
         return next
       })
@@ -294,6 +379,56 @@ export class ActionProposalStore {
       this.deps.warn('dsh-channels: reverting action proposal %s failed: %s', proposalId, String(error))
       return undefined
     }
+  }
+
+  /**
+   * Startup reconciliation pass: resolve any unconfirmed reservations left behind
+   * if the previous process exited mid-click. Reservations whose `requestId` is
+   * present in `recoverableRequestIds` (an active `inflight` snapshot that
+   * `repairAll()` will recover) are confirmed; any reservation that crashed
+   * before `repair.write()` completed is rolled back to `'pending'` (or
+   * `'superseded'` if superseded) so the user's button is not permanently lost.
+   */
+  async reconcileReservations(recoverableRequestIds: ReadonlySet<string>): Promise<ActionProposalRecord[]> {
+    const table = this.deps.table()
+    if (table === undefined) return []
+    const reconciled: ActionProposalRecord[] = []
+    for (const [proposalId, record] of [...table.entries()]) {
+      if (!hasActiveReservations(record)) continue
+      let updated: ActionProposalRecord | undefined
+      try {
+        await table.update(proposalId, (current) => {
+          if (!hasActiveReservations(current)) return current
+          const rollbackIds = new Set<string>()
+          for (const res of current.reservations ?? []) {
+            if (!recoverableRequestIds.has(res.requestId)) {
+              for (const id of res.changedIds) rollbackIds.add(id)
+            }
+          }
+          const rollbackStatus: ActionProposalStatus = current.superseded === true ? 'superseded' : 'pending'
+          const nextActions = rollbackIds.size === 0
+            ? current.actions
+            : current.actions.map((item): ActionProposalStoredItem => {
+              if (!rollbackIds.has(item.id) || item.status === 'superseded' || item.status === 'pending') {
+                return item
+              }
+              const { triggeredBy: _by, triggeredAt: _at, ...rest } = item
+              return { ...rest, status: rollbackStatus }
+            })
+          const { reservations: _old, ...base } = current
+          const next: ActionProposalRecord = {
+            ...base,
+            actions: nextActions,
+          }
+          updated = next
+          return next
+        })
+        if (updated !== undefined) reconciled.push(updated)
+      } catch (error) {
+        this.deps.warn('dsh-channels: reconciling action proposal %s failed: %s', proposalId, String(error))
+      }
+    }
+    return reconciled
   }
 
   /**
