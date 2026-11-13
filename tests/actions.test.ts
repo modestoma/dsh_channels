@@ -52,6 +52,7 @@ import {
   makeMessage,
   makeSession,
   makeToolsRuntime,
+  sessionEvents,
   TestFeishuService as FeishuService,
 } from './helpers.ts'
 
@@ -1271,6 +1272,7 @@ describe('TurnCardActions button click handling, access pre-checks, invalidation
 
     // 4) Borrowed Session running another turn while snapshot prompt is absent from both log and inbox:
     // `repairAll()` settles snapshot as interrupted without replaying, so reconciliation MUST also roll back the reservation!
+    await h.service.shutdown()
     const borrowed = makeAgent(makeSession(route.sessionId, route.workspacePath))
     ;(borrowed as { status: string }).status = 'running'
     const currentP2BeforeBorrow = proposalsTable.get(p2Id) as ActionProposalRecord
@@ -1307,7 +1309,7 @@ describe('TurnCardActions button click handling, access pre-checks, invalidation
       agent: borrowed,
       dispose: vi.fn(async () => {}),
     })
-    await h.service.restart()
+    await h.service.start()
     await h.waitUntil(() => {
       const reconciled = h.proposals().find(r => r.key === 'race-supersede-2')
       expect(reconciled?.actions.map(a => a.status)).toEqual(['pending'])
@@ -1327,6 +1329,86 @@ describe('TurnCardActions button click handling, access pre-checks, invalidation
     })
     expect(h.proposals().find(r => r.key === 'race-supersede-2')?.actions.map(a => a.status)).toEqual(['triggered'])
     expect(h.proposals().find(r => r.key === 'race-supersede-2')?.reservations).toBeUndefined()
+
+    // 5) Snapshotless reservation whose turn already ran (`confirmTrigger()` failed or crashed after `inflight` clear):
+    // Startup checks the Session log even without an `inflight` snapshot and CONFIRMS instead of rolling back!
+    const p3 = await h.actions.propose({
+      key: 'snapshotless-confirm-1',
+      sessionId: route.sessionId,
+      prompt: '测试无快照已执行确认：',
+      actions: [
+        { id: 'opt_done', label: '已执行动作', independent: true, followUpPrompt: '执行已落盘动作' },
+        { id: 'opt_inbox', label: '队列中动作', independent: true, followUpPrompt: '执行队列动作' },
+      ],
+    })
+    expect(p3.ok).toBe(true)
+    if (!p3.ok) return
+    const p3Id = proposalIdOfKey('snapshotless-confirm-1')
+
+    // Append a completed turn with `rpcId: 'req-completed-without-snapshot'` to `borrowed.session`,
+    // and queue a second message with `rpcId: 'req-inbox-without-snapshot'` in `borrowed.inbox.nextTurn`!
+    const events = sessionEvents(borrowed.session)
+    events.push(
+      {
+        type: 'user/message',
+        seq: events.length,
+        data: {
+          id: 'msg-done-1' as UserMessage['id'],
+          role: 'user',
+          content: [{ type: 'text', text: '执行已落盘动作' }],
+          source: { kind: 'user', rpcId: 'req-completed-without-snapshot', principal: { kind: 'feishu-user', userId: 'u_alice' } },
+        },
+      } as never,
+      {
+        type: 'turn/end',
+        seq: events.length + 1,
+        data: { turn: 2, reason: { kind: 'completed' } },
+      } as never,
+    )
+    ;(borrowed.inbox.nextTurn as UserMessage[]).push({
+      id: 'msg-inbox-1' as UserMessage['id'],
+      role: 'user',
+      content: [{ type: 'text', text: '执行队列动作' }],
+      source: { kind: 'user', rpcId: 'req-inbox-without-snapshot', principal: { kind: 'feishu-user', userId: 'u_alice' } },
+    })
+
+    // Ensure `inflight` table is completely empty (no snapshots at all), while `action_proposals` holds both reservations:
+    const inflightTable = h.ctxState.domain.raw.table('inflight')
+    for (const [k] of [...inflightTable.entries()]) {
+      await inflightTable.delete(k)
+    }
+    expect([...inflightTable.entries()]).toHaveLength(0)
+    const currentP3 = proposalsTable.get(p3Id) as ActionProposalRecord
+    await proposalsTable.put(p3Id, {
+      ...currentP3,
+      actions: currentP3.actions.map(item => ({
+        ...item,
+        status: 'triggered' as const,
+        triggeredBy: 'u_alice',
+        triggeredAt: Date.now(),
+      })),
+      reservations: [
+        {
+          requestId: 'req-completed-without-snapshot',
+          actionId: 'opt_done',
+          changedIds: ['opt_done'],
+          createdAt: Date.now(),
+        },
+        {
+          requestId: 'req-inbox-without-snapshot',
+          actionId: 'opt_inbox',
+          changedIds: ['opt_inbox'],
+          createdAt: Date.now(),
+        },
+      ],
+    })
+
+    await h.service.restart()
+    await h.waitUntil(() => {
+      const reconciledP3 = h.proposals().find(r => r.key === 'snapshotless-confirm-1')
+      expect(reconciledP3?.actions.map(a => a.status)).toEqual(['triggered', 'triggered'])
+      expect(reconciledP3?.reservations).toBeUndefined()
+    })
 
     await h.service.shutdown()
   })

@@ -28,6 +28,7 @@ import { ApprovalStore } from './interactions/approval-store.ts'
 import { QuestionAnswerer } from './interactions/questions.ts'
 import type {
   Agent,
+  AgentHandle,
   CordisFiber,
   HostContext,
   LlmService,
@@ -1200,7 +1201,7 @@ export class FeishuService {
     if (this.config.slashCommandPanel) void this.checks.syncSlashCommands(channel)
     // Before admission opens, so every `running` record left is a previous instance's.
     await this.topicLauncher.markInterrupted()
-    await this.reconcileActionProposals()
+    await this.reconcileActionProposals(lifecycle)
     ensureCurrent()
     this.topicLauncher.open()
     this.feishuActions.open()
@@ -1670,9 +1671,15 @@ export class FeishuService {
 
   /**
    * Reconcile unconfirmed action-proposal click reservations left behind if a
-   * previous process exited between `triggerAction()` and turn acceptance.
+   * previous process exited between `triggerAction()` and `confirmTrigger()`,
+   * or if `confirmTrigger()` failed to persist after submission.
+   *
+   * Every outstanding reservation is checked against its Session log and live
+   * Agent inbox even when its `inflight` snapshot is already absent (for
+   * example, after normal turn finalization deleted the snapshot before
+   * confirmation committed).
    */
-  private async reconcileActionProposals(): Promise<void> {
+  private async reconcileActionProposals(lifecycle: number): Promise<void> {
     const domain = this.domain
     if (domain === undefined) return
     const pendingRecords = [...domain.actionProposals.entries()]
@@ -1687,46 +1694,138 @@ export class FeishuService {
 
     const ttlMs = this.config.routeTtlMs
     const cutoff = ttlMs === 0 ? undefined : Date.now() - ttlMs
-    const recoverable = new Set<string>()
+    const snapshotsByRequestId = new Map<string, InflightSnapshot>()
     for (const [, snapshot] of domain.inflight.entries()) {
       if (cutoff !== undefined && snapshot.startedAt < cutoff) continue
       const snapshotPrompt = snapshot.prompt
       if (snapshotPrompt === undefined || !neededIds.has(snapshotPrompt.requestId)) continue
-      const requestId = snapshotPrompt.requestId
-      const agent = await this.recoveryAgent(snapshot).catch(() => undefined)
-      if (agent === undefined) continue
-      const state = classifyTurn(agent.session.snapshotEvents(), { requestId })
-      if (state.kind !== 'pending') {
-        recoverable.add(requestId)
-        continue
+      snapshotsByRequestId.set(snapshotPrompt.requestId, snapshot)
+    }
+
+    type ResolvedSession =
+      | { readonly kind: 'resolved'; readonly agent: Agent }
+      | { readonly kind: 'deferred' }
+      | { readonly kind: 'unresolvable' }
+
+    const sessionCache = new Map<string, ResolvedSession>()
+    const tempHandles: AgentHandle[] = []
+    const confirmed = new Set<string>()
+    const deferred = new Set<string>()
+
+    const isQueuedInInbox = (agent: Agent, requestId: string): boolean =>
+      [...agent.inbox.nextTurn, ...agent.inbox.nextStep].some((msg) => {
+        if (typeof msg !== 'object' || msg === null) return false
+        const source = (msg as { source?: unknown }).source
+        if (typeof source !== 'object' || source === null || typeof (source as { kind?: unknown }).kind !== 'string') {
+          return false
+        }
+        return promptRequestIdOf(source as { kind: string }) === requestId
+      })
+
+    const resolveProposalSession = async (sessionId: string, routeKey: string): Promise<ResolvedSession> => {
+      const cached = sessionCache.get(sessionId)
+      if (cached !== undefined) return cached
+
+      const route = this.routes.get(routeKey) ?? this.routes.findBySession(sessionId)
+      if (route !== undefined && route.sessionId === sessionId) {
+        try {
+          const live = await this.sessions.ensureLive(route)
+          const out: ResolvedSession = { kind: 'resolved', agent: live.agent }
+          sessionCache.set(sessionId, out)
+          return out
+        } catch (error) {
+          this.ctx.logger?.warn?.(
+            'dsh-channels: resuming session %s for action proposal reconciliation failed: %s',
+            sessionId, String(error),
+          )
+          const out: ResolvedSession = { kind: 'deferred' }
+          sessionCache.set(sessionId, out)
+          return out
+        }
       }
-      const prompt = promptOfSnapshot(snapshotPrompt)
-      const hasPatchableCard = snapshot.cards[0]?.mode === 'card'
-      const queuedInInbox = prompt !== undefined && hasPatchableCard
-        && [...agent.inbox.nextTurn, ...agent.inbox.nextStep].some((msg) => {
-          if (typeof msg !== 'object' || msg === null) return false
-          const source = (msg as { source?: unknown }).source
-          if (typeof source !== 'object' || source === null || typeof (source as { kind?: unknown }).kind !== 'string') {
-            return false
-          }
-          return promptRequestIdOf(source as { kind: string }) === requestId
+
+      const alreadyLive = this.sessions.get(sessionId)?.agent ?? this.ctx.agents.get(sessionId as SessionId)
+      if (alreadyLive !== undefined) {
+        const out: ResolvedSession = { kind: 'resolved', agent: alreadyLive }
+        sessionCache.set(sessionId, out)
+        return out
+      }
+
+      try {
+        const handle = await this.ctx.agents.resume({
+          resumeSessionId: sessionId as SessionId,
+          agentOptions: this.sessions.agentOptions(),
         })
-      if (queuedInInbox) {
-        recoverable.add(requestId)
-        continue
-      }
-      if (
-        agent.status !== 'running'
-        && prompt !== undefined
-        && hasPatchableCard
-        && this.config.replay.pending
-        && (snapshot.replays ?? 0) < 1
-      ) {
-        recoverable.add(requestId)
+        tempHandles.push(handle)
+        const out: ResolvedSession = { kind: 'resolved', agent: handle.agent }
+        sessionCache.set(sessionId, out)
+        return out
+      } catch (error) {
+        const winner = this.ctx.agents.get(sessionId as SessionId)
+        if (winner !== undefined) {
+          const out: ResolvedSession = { kind: 'resolved', agent: winner }
+          sessionCache.set(sessionId, out)
+          return out
+        }
+        this.ctx.logger?.warn?.(
+          'dsh-channels: inspecting unbound session %s for action proposal reconciliation failed: %s',
+          sessionId, String(error),
+        )
+        const out: ResolvedSession = { kind: 'unresolvable' }
+        sessionCache.set(sessionId, out)
+        return out
       }
     }
 
-    const reconciled = await this.actionProposalStore.reconcileReservations(recoverable)
+    try {
+      for (const record of pendingRecords) {
+        if (this.lifecycle !== lifecycle) return
+        const resolved = await resolveProposalSession(record.sessionId, record.routeKey)
+        for (const res of record.reservations ?? []) {
+          if (resolved.kind === 'deferred') {
+            deferred.add(res.requestId)
+            continue
+          }
+          if (resolved.kind === 'unresolvable') {
+            continue
+          }
+          const { agent } = resolved
+          if (classifyTurn(agent.session.snapshotEvents(), { requestId: res.requestId }).kind !== 'pending') {
+            confirmed.add(res.requestId)
+            continue
+          }
+          if (isQueuedInInbox(agent, res.requestId)) {
+            confirmed.add(res.requestId)
+            continue
+          }
+          const snapshot = snapshotsByRequestId.get(res.requestId)
+          const snapshotPrompt = snapshot?.prompt
+          if (snapshot === undefined || snapshotPrompt === undefined) continue
+          const snapRoute = snapshot.routeKey === undefined
+            ? this.routes.findBySession(snapshot.sessionId)
+            : this.routes.get(snapshot.routeKey)
+          const prompt = promptOfSnapshot(snapshotPrompt)
+          const hasPatchableCard = snapshot.cards[0]?.mode === 'card'
+          if (
+            snapRoute !== undefined
+            && snapRoute.sessionId === snapshot.sessionId
+            && snapshot.sessionId === record.sessionId
+            && agent.status !== 'running'
+            && prompt !== undefined
+            && hasPatchableCard
+            && this.config.replay.pending
+            && (snapshot.replays ?? 0) < 1
+          ) {
+            confirmed.add(res.requestId)
+          }
+        }
+      }
+    } finally {
+      await Promise.allSettled(tempHandles.map(handle => handle.dispose()))
+    }
+
+    if (this.lifecycle !== lifecycle) return
+    const reconciled = await this.actionProposalStore.reconcileReservations(confirmed, deferred)
     for (const updated of reconciled) {
       void this.feishuActions.patchCardSerialized(
         updated.proposalId,

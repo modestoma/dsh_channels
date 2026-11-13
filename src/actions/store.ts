@@ -383,13 +383,17 @@ export class ActionProposalStore {
 
   /**
    * Startup reconciliation pass: resolve any unconfirmed reservations left behind
-   * if the previous process exited mid-click. Reservations whose `requestId` is
-   * present in `recoverableRequestIds` (an active `inflight` snapshot that
-   * `repairAll()` will recover) are confirmed; any reservation that crashed
-   * before `repair.write()` completed is rolled back to `'pending'` (or
-   * `'superseded'` if superseded) so the user's button is not permanently lost.
+   * if the previous process exited mid-click or if `confirmTrigger()` failed to
+   * persist. Reservations whose `requestId` is present in `confirmedRequestIds`
+   * (found in the Session log/inbox or slated for `repairAll()` replay) are
+   * confirmed; reservations in `deferredRequestIds` (transient Session resume
+   * failure) stay untouched until a subsequent boot can inspect the Session; all
+   * remaining reservations roll back to `'pending'` (or `'superseded'`).
    */
-  async reconcileReservations(recoverableRequestIds: ReadonlySet<string>): Promise<ActionProposalRecord[]> {
+  async reconcileReservations(
+    confirmedRequestIds: ReadonlySet<string>,
+    deferredRequestIds?: ReadonlySet<string>,
+  ): Promise<ActionProposalRecord[]> {
     const table = this.deps.table()
     if (table === undefined) return []
     const reconciled: ActionProposalRecord[] = []
@@ -400,10 +404,18 @@ export class ActionProposalStore {
         await table.update(proposalId, (current) => {
           if (!hasActiveReservations(current)) return current
           const rollbackIds = new Set<string>()
+          const remaining: ActionReservation[] = []
           for (const res of current.reservations ?? []) {
-            if (!recoverableRequestIds.has(res.requestId)) {
+            if (deferredRequestIds?.has(res.requestId)) {
+              remaining.push(res)
+              continue
+            }
+            if (!confirmedRequestIds.has(res.requestId)) {
               for (const id of res.changedIds) rollbackIds.add(id)
             }
+          }
+          if (rollbackIds.size === 0 && remaining.length === (current.reservations?.length ?? 0)) {
+            return current
           }
           const rollbackStatus: ActionProposalStatus = current.superseded === true ? 'superseded' : 'pending'
           const nextActions = rollbackIds.size === 0
@@ -419,6 +431,7 @@ export class ActionProposalStore {
           const next: ActionProposalRecord = {
             ...base,
             actions: nextActions,
+            ...(remaining.length > 0 ? { reservations: remaining } : {}),
           }
           updated = next
           return next
