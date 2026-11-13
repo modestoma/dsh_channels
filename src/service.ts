@@ -28,6 +28,7 @@ import { ApprovalStore } from './interactions/approval-store.ts'
 import { QuestionAnswerer } from './interactions/questions.ts'
 import type {
   Agent,
+  AgentHandle,
   CordisFiber,
   HostContext,
   LlmService,
@@ -47,9 +48,14 @@ import type { FeishuDomainHandle, InflightSnapshot, RouteRecord } from './domain
 import { Outbox } from './outbox.ts'
 import { RouteStore } from './session/routes.ts'
 import { TopicLauncher } from './topics/launcher.ts'
+import { FeishuActions } from './actions/service.ts'
+import { ActionProposalStore, hasActiveReservations } from './actions/store.ts'
+import { buildActionProposalCard } from './cards/action-proposal.ts'
+import { promptRequestIdOf } from './access/principal.ts'
+import { ProposeActionsToolRuntime } from './feishu/propose-actions.ts'
 import type { TopicLocationPort } from './workspaces.ts'
-import { InflightRepair, storableMessage } from './session/repair.ts'
-import type { ChannelPrompt } from './session/prompt.ts'
+import { classifyTurn, InflightRepair, storableMessage } from './session/repair.ts'
+import { promptOfSnapshot, type ChannelPrompt } from './session/prompt.ts'
 import { PromptSubmitter, submissionFailureText } from './session/submit.ts'
 import type { SubmissionOutcome, TurnCard, TurnSubmission } from './session/submit.ts'
 import { PeerRegistry } from './access/peers.ts'
@@ -188,6 +194,9 @@ export class FeishuService {
   private readonly inbound: InboundRouter
   /** The `feishuTopics` service (other plugins' launches → shared topics). */
   private readonly topicLauncher: TopicLauncher
+  /** The `feishuActions` service (non-blocking follow-up action proposals). */
+  private readonly feishuActions: FeishuActions
+  private readonly actionProposalStore: ActionProposalStore
   /** Agent/session lifecycle: live registry, resume, presets, renew. */
   private readonly sessions: SessionManager
   /**
@@ -198,6 +207,7 @@ export class FeishuService {
   private readonly attachmentFetchTools: AttachmentFetchToolRuntime
   private readonly topicMessagesTools: TopicMessagesToolRuntime
   private readonly sendFileTools: SendFileToolRuntime
+  private readonly proposeActionsTools: ProposeActionsToolRuntime
   private readonly wikiConsent: WikiConsent
   private readonly wikiTools: WikiToolRuntime
   /** FIFO admission for ordinary turns and commands targeting one route. */
@@ -277,6 +287,8 @@ export class FeishuService {
   private unlistenConnection: (() => void) | undefined
   /** Cached Feishu user and chat profiles. */
   readonly profiles: ProfileDirectory
+  /** Requests currently undergoing async `repairAll()` replay submission. */
+  private readonly replayingRequestIds = new Set<string>()
   /** Panel and `/auth` access administration. */
   readonly accessAdmin: AccessAdmin
   /** Panel views over Feishu-routed Sessions and their workspace files. */
@@ -312,6 +324,10 @@ export class FeishuService {
         : { grants: this.domain.approvalGrants, cards: this.domain.approvalCards },
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
     })
+    this.actionProposalStore = new ActionProposalStore({
+      table: () => this.domain?.actionProposals,
+      warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
+    })
     this.repair = new InflightRepair({
       domain: () => this.domain,
       channel: () => this.channel,
@@ -329,11 +345,13 @@ export class FeishuService {
           }
           if (!submit) {
             this.streamer?.attach(agent.session, card.cardMessageId, card.triggerMessageId, card.reactionId, { prompt })
+            void this.settleReplayedActionReservation(prompt.requestId, snapshot.key, true)
             return
           }
           // The same request id as before the restart: `session/prompt`
           // deduplicates against the inbox and the log.
-          void this.runTurn(agent, prompt, card)
+          this.replayingRequestIds.add(prompt.requestId)
+          void this.replayTurn(agent, snapshot.key, prompt, card)
         },
       },
     })
@@ -368,6 +386,7 @@ export class FeishuService {
         }
         mounts.push(this.topicMessagesTools.mount(agentCtx, sessionId))
         mounts.push(this.sendFileTools.mount(agentCtx, sessionId))
+        mounts.push(this.proposeActionsTools.mount(agentCtx, sessionId))
         mounts.push(this.wikiTools.mount(agentCtx, sessionId))
         return Promise.all(mounts).then(() => undefined)
       },
@@ -397,6 +416,22 @@ export class FeishuService {
       table: () => this.domain?.outbox,
       channel: () => this.channel,
       sendSegment: (sessionId, segment, card, text) => this.delivery.segmentCard(sessionId, segment, card, text),
+      warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
+    })
+    this.feishuActions = new FeishuActions({
+      started: () => this.started,
+      channel: () => this.channel,
+      domain: () => this.domain,
+      store: this.actionProposalStore,
+      routes: this.routes,
+      outbox: this.outbox,
+      warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
+    })
+    this.proposeActionsTools = new ProposeActionsToolRuntime({
+      config: () => this.config,
+      actions: this.feishuActions,
+      agentOfSession: sessionId => this.sessions.get(sessionId)?.agent ?? this.ctx.agents.get(sessionId as SessionId),
+      isRoutedSession: sessionId => this.routes.findBySession(sessionId) !== undefined,
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
     })
     this.wikiConsent = new WikiConsent({
@@ -561,6 +596,9 @@ export class FeishuService {
       sessions: this.sessions,
       repair: this.repair,
       approvals: this.approvalStore,
+      actionProposals: this.actionProposalStore,
+      patchProposalCard: (proposalId, cardMessageId, card) =>
+        this.feishuActions.patchCardSerialized(proposalId, cardMessageId, card),
       outbox: this.outbox,
       delivery: this.delivery,
       queue: this.routeOperations,
@@ -866,6 +904,8 @@ export class FeishuService {
 
   /** The `feishuTopics` service, provided by `apply()`. */
   topics(): TopicLauncher { return this.topicLauncher }
+  /** The `feishuActions` service, provided by `apply()`. */
+  actions(): FeishuActions { return this.feishuActions }
   isRunning(): boolean { return this.started }
   isRestarting(): boolean { return this.restarting }
   /** True while the panel's explicit connect action is in flight. */
@@ -1016,6 +1056,13 @@ export class FeishuService {
     this.accessStore.load()
     this.outbox.start()
 
+    // Capture the exact set of unfinished reservations inherited at boot so
+    // background reconciliation never touches concurrent live clicks from this instance.
+    const bootReservationIds = new Set<string>()
+    for (const [, record] of domain.actionProposals.entries()) {
+      for (const res of record.reservations ?? []) bootReservationIds.add(res.requestId)
+    }
+
     // HITL: answer the host's approval/request waterfall for sessions this
     // channel routes. `prepend` claims such requests BEFORE the web gateway's
     // generic answerer (its panel would be invisible to a Feishu user), while
@@ -1088,6 +1135,7 @@ export class FeishuService {
     this.unlistenHost.push(this.ctx.on('session/event', (session, event) => {
       this.streamer?.onSessionEvent(session, event)
       this.approvalAnswerer?.onSessionEvent(session.id, event)
+      this.proposeActionsTools.onSessionEvent(session, event)
     }))
     // DSH removed the durable `assistant/chunk` event (format v2 embeds the
     // stream in the settlement); the live deltas arrive here instead.
@@ -1097,13 +1145,17 @@ export class FeishuService {
     // Binds each card to the turn its own prompt opens (see `TurnStreamer`).
     this.unlistenHost.push(this.ctx.on('agent/inbox/claimed', ({ agent, message, turn }) => {
       this.codeWriteGate.onClaimed(agent.session.id, message)
+      this.proposeActionsTools.onInboxClaimed(agent.session.id, turn)
       this.streamer?.onInboxClaimed(agent.session, message, turn)
     }))
     this.unlistenHost.push(this.ctx.on('agent/inbox/discarded', ({ agent, message }) => {
       this.streamer?.onInboxDiscarded(agent.session, message)
     }))
     this.unlistenHost.push(this.ctx.on('tools/pre-execute', async (exec, next) =>
-      this.codeWriteGate.decide(exec) ?? await this.readFence.decide(exec) ?? await next()))
+      this.proposeActionsTools.decidePreExecute(exec)
+      ?? this.codeWriteGate.decide(exec)
+      ?? await this.readFence.decide(exec)
+      ?? await next()))
     // Writes made for a Feishu Session are answered by where it lives, before
     // the writing plugin asks the user; Sessions this channel does not route
     // are left to other listeners.
@@ -1160,14 +1212,20 @@ export class FeishuService {
     if (this.config.slashCommandPanel) void this.checks.syncSlashCommands(channel)
     // Before admission opens, so every `running` record left is a previous instance's.
     await this.topicLauncher.markInterrupted()
+    await this.reconcileActionProposals(lifecycle, bootReservationIds)
     ensureCurrent()
     this.topicLauncher.open()
+    this.feishuActions.open()
     // Read back what arrived while no instance was connected (background).
     this.missed.start()
     // Repair cards a previous instance left mid-flight (best-effort, background).
-    void this.repair.repairAll().catch((error: unknown) => {
-      this.ctx.logger?.warn?.('dsh-channels: inflight repair failed: %s', String(error))
-    })
+    void this.repair.repairAll()
+      .then(async () => {
+        if (this.lifecycle === lifecycle) await this.reconcileActionProposals(lifecycle, bootReservationIds)
+      })
+      .catch((error: unknown) => {
+        this.ctx.logger?.warn?.('dsh-channels: inflight repair failed: %s', String(error))
+      })
     // Approval cards a crashed previous instance left undecided.
     const interruptedApprovals = answerer.recoverInterrupted()
     if (interruptedApprovals > 0) {
@@ -1259,7 +1317,9 @@ export class FeishuService {
     // already queued route operations observe `started === false` and retire.
     this.started = false
     this.topicLauncher.close()
+    this.feishuActions.close()
     await this.topicLauncher.drain()
+    await this.feishuActions.drain()
     await this.commands.drain()
     this.unlistenBotAdded?.()
     this.unlistenBotAdded = undefined
@@ -1293,7 +1353,9 @@ export class FeishuService {
     await this.sessions.disposeAll()
     await this.peers.clear()
     this.attachmentFetchTools.clear()
+    this.proposeActionsTools.clear()
     this.routeOperations.clear()
+    this.replayingRequestIds.clear()
     this.inbound.clear()
     this.routes.clear()
     this.accessStore.clear()
@@ -1484,6 +1546,10 @@ export class FeishuService {
     if (removedApproval > 0) {
       this.ctx.logger?.info?.('dsh-channels: record GC removed %d approval record(s)', removedApproval)
     }
+    const removedProposals = await this.actionProposalStore.prune(now)
+    if (removedProposals > 0) {
+      this.ctx.logger?.info?.('dsh-channels: record GC removed %d expired action proposal(s)', removedProposals)
+    }
 
     const ttlMs = this.config.routeTtlMs
     if (ttlMs === 0) {
@@ -1617,6 +1683,221 @@ export class FeishuService {
   /** Host projection registry, when this deployment mounts one. */
   private projectionRegistry(): SessionProjections | undefined {
     return this.ctx.get?.('sessionProjections') as SessionProjections | undefined
+  }
+
+  /**
+   * Reconcile unconfirmed action-proposal click reservations left behind if a
+   * previous process exited between `triggerAction()` and `confirmTrigger()`,
+   * or if `confirmTrigger()` failed to persist after submission.
+   *
+   * Every outstanding reservation is checked against its Session log and live
+   * Agent inbox even when its `inflight` snapshot is already absent (for
+   * example, after normal turn finalization deleted the snapshot before
+   * confirmation committed).
+   */
+  private async reconcileActionProposals(lifecycle: number, scopeRequestIds: ReadonlySet<string>): Promise<void> {
+    const domain = this.domain
+    if (domain === undefined || scopeRequestIds.size === 0) return
+    const pendingRecords = [...domain.actionProposals.entries()]
+      .map(([, record]) => record)
+      .filter(record => (record.reservations ?? []).some(res => scopeRequestIds.has(res.requestId)))
+    if (pendingRecords.length === 0) return
+
+    const neededIds = new Set<string>()
+    for (const record of pendingRecords) {
+      for (const res of record.reservations ?? []) {
+        if (scopeRequestIds.has(res.requestId)) neededIds.add(res.requestId)
+      }
+    }
+
+    const ttlMs = this.config.routeTtlMs
+    const cutoff = ttlMs === 0 ? undefined : Date.now() - ttlMs
+    const snapshotsByRequestId = new Map<string, InflightSnapshot>()
+    for (const [, snapshot] of domain.inflight.entries()) {
+      if (cutoff !== undefined && snapshot.startedAt < cutoff) continue
+      const snapshotPrompt = snapshot.prompt
+      if (snapshotPrompt === undefined || !neededIds.has(snapshotPrompt.requestId)) continue
+      snapshotsByRequestId.set(snapshotPrompt.requestId, snapshot)
+    }
+
+    type ResolvedSession =
+      | { readonly kind: 'resolved'; readonly agent: Agent }
+      | { readonly kind: 'deferred' }
+      | { readonly kind: 'unresolvable' }
+
+    const sessionCache = new Map<string, ResolvedSession>()
+    const tempHandles: AgentHandle[] = []
+    const confirmed = new Set<string>()
+    const rollback = new Set<string>()
+
+    const isQueuedInInbox = (agent: Agent, requestId: string): boolean =>
+      [...agent.inbox.nextTurn, ...agent.inbox.nextStep].some((msg) => {
+        if (typeof msg !== 'object' || msg === null) return false
+        const source = (msg as { source?: unknown }).source
+        if (typeof source !== 'object' || source === null || typeof (source as { kind?: unknown }).kind !== 'string') {
+          return false
+        }
+        return promptRequestIdOf(source as { kind: string }) === requestId
+      })
+
+    const resolveProposalSession = async (sessionId: string, routeKey: string): Promise<ResolvedSession> => {
+      const cached = sessionCache.get(sessionId)
+      if (cached !== undefined) return cached
+
+      const route = this.routes.get(routeKey) ?? this.routes.findBySession(sessionId)
+      if (route !== undefined && route.sessionId === sessionId) {
+        try {
+          const live = await this.sessions.ensureLive(route)
+          const out: ResolvedSession = { kind: 'resolved', agent: live.agent }
+          sessionCache.set(sessionId, out)
+          return out
+        } catch (error) {
+          this.ctx.logger?.warn?.(
+            'dsh-channels: resuming session %s for action proposal reconciliation failed: %s',
+            sessionId, String(error),
+          )
+          const out: ResolvedSession = { kind: 'deferred' }
+          sessionCache.set(sessionId, out)
+          return out
+        }
+      }
+
+      const alreadyLive = this.sessions.get(sessionId)?.agent ?? this.ctx.agents.get(sessionId as SessionId)
+      if (alreadyLive !== undefined) {
+        const out: ResolvedSession = { kind: 'resolved', agent: alreadyLive }
+        sessionCache.set(sessionId, out)
+        return out
+      }
+
+      try {
+        const handle = await this.ctx.agents.resume({
+          resumeSessionId: sessionId as SessionId,
+          agentOptions: this.sessions.agentOptions(),
+        })
+        tempHandles.push(handle)
+        const out: ResolvedSession = { kind: 'resolved', agent: handle.agent }
+        sessionCache.set(sessionId, out)
+        return out
+      } catch (error) {
+        const winner = this.ctx.agents.get(sessionId as SessionId)
+        if (winner !== undefined) {
+          const out: ResolvedSession = { kind: 'resolved', agent: winner }
+          sessionCache.set(sessionId, out)
+          return out
+        }
+        this.ctx.logger?.warn?.(
+          'dsh-channels: inspecting unbound session %s for action proposal reconciliation failed: %s',
+          sessionId, String(error),
+        )
+        const out: ResolvedSession = { kind: 'unresolvable' }
+        sessionCache.set(sessionId, out)
+        return out
+      }
+    }
+
+    try {
+      for (const record of pendingRecords) {
+        if (this.lifecycle !== lifecycle) return
+        const resolved = await resolveProposalSession(record.sessionId, record.routeKey)
+        for (const res of record.reservations ?? []) {
+          if (!scopeRequestIds.has(res.requestId)) continue
+          if (this.replayingRequestIds.has(res.requestId) || resolved.kind === 'deferred') {
+            continue
+          }
+          if (resolved.kind === 'unresolvable') {
+            rollback.add(res.requestId)
+            continue
+          }
+          const { agent } = resolved
+          if (classifyTurn(agent.session.snapshotEvents(), { requestId: res.requestId }).kind !== 'pending') {
+            confirmed.add(res.requestId)
+            continue
+          }
+          if (isQueuedInInbox(agent, res.requestId)) {
+            confirmed.add(res.requestId)
+            continue
+          }
+          const snapshot = snapshotsByRequestId.get(res.requestId)
+          const snapshotPrompt = snapshot?.prompt
+          if (snapshot !== undefined && snapshotPrompt !== undefined) {
+            const snapRoute = snapshot.routeKey === undefined
+              ? this.routes.findBySession(snapshot.sessionId)
+              : this.routes.get(snapshot.routeKey)
+            const prompt = promptOfSnapshot(snapshotPrompt)
+            const hasPatchableCard = snapshot.cards[0]?.mode === 'card'
+            if (
+              snapRoute !== undefined
+              && snapRoute.sessionId === snapshot.sessionId
+              && snapshot.sessionId === record.sessionId
+              && agent.status !== 'running'
+              && prompt !== undefined
+              && hasPatchableCard
+              && this.config.replay.pending
+              && (snapshot.replays ?? 0) < 1
+            ) {
+              continue
+            }
+          }
+          rollback.add(res.requestId)
+        }
+      }
+    } finally {
+      await Promise.allSettled(tempHandles.map(handle => handle.dispose()))
+    }
+
+    if (this.lifecycle !== lifecycle) return
+    const reconciled = await this.actionProposalStore.reconcileReservations(confirmed, rollback)
+    for (const updated of reconciled) {
+      void this.feishuActions.patchCardSerialized(
+        updated.proposalId,
+        updated.cardMessageId,
+        buildActionProposalCard(updated),
+      )
+    }
+  }
+
+  private async replayTurn(
+    agent: Agent,
+    snapshotKey: string,
+    prompt: ChannelPrompt,
+    card: TurnCard,
+  ): Promise<void> {
+    try {
+      const outcome = await this.runTurn(agent, prompt, card)
+      await this.settleReplayedActionReservation(prompt.requestId, snapshotKey, outcome.accepted)
+    } catch (error) {
+      this.ctx.logger?.warn?.('dsh-channels: replaying turn %s failed: %s', prompt.requestId, String(error))
+      await this.settleReplayedActionReservation(prompt.requestId, snapshotKey, false)
+    } finally {
+      this.replayingRequestIds.delete(prompt.requestId)
+    }
+  }
+
+  private async settleReplayedActionReservation(
+    requestId: string,
+    snapshotKey: string,
+    accepted: boolean,
+  ): Promise<void> {
+    if (accepted) {
+      const confirmed = await this.actionProposalStore.confirmByRequestId(requestId)
+      for (const updated of confirmed) {
+        void this.feishuActions.patchCardSerialized(
+          updated.proposalId,
+          updated.cardMessageId,
+          buildActionProposalCard(updated),
+        )
+      }
+      return
+    }
+    await this.repair.clear(snapshotKey)
+    const reverted = await this.actionProposalStore.revertByRequestId(requestId)
+    for (const updated of reverted) {
+      void this.feishuActions.patchCardSerialized(
+        updated.proposalId,
+        updated.cardMessageId,
+        buildActionProposalCard(updated),
+      )
+    }
   }
 
   /** Card figures from host projections (token totals / cache hit / window). */

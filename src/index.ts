@@ -23,12 +23,29 @@ import type { ChannelFactory } from './feishu-channel.ts'
 import { OverlayStore, defaultOverlayPath } from './settings/overlay.ts'
 import { mountSettingsRoutes } from './settings/routes.ts'
 import { FEISHU_TOPICS_SERVICE } from './topics/launcher.ts'
+import { FEISHU_ACTIONS_SERVICE } from './actions/contract.ts'
 import { SettingsSurface } from './settings/surface.ts'
 import { settingsTarget } from './settings/target.ts'
 import { createHostCatalog } from './settings/catalog.ts'
 import { createSettingsDirectoryPicker } from './settings/directory-picker.ts'
 
 export type { FeishuConfig } from './config.ts'
+export {
+  FEISHU_ACTIONS_SERVICE,
+  FEISHU_ACTIONS_VERSION,
+} from './actions/contract.ts'
+export type {
+  ActionAccessLevel,
+  ActionButtonStyle,
+  ActionProposalFailureCode,
+  ActionProposalItem,
+  ActionProposalPostResult,
+  ActionProposalSpec,
+  FeishuActionsService,
+  FeishuActionsServiceName,
+  FeishuActionsVersion,
+  ProposeActionsInput,
+} from './actions/contract.ts'
 
 /** Cordis function-plugin name. */
 export const name = 'channels'
@@ -99,6 +116,7 @@ export function apply(ctx: HostContext, config?: unknown): void {
   // Other plugins start group-shared topics through this
   // service; it answers `not-connected` until the Feishu connection is up.
   ctx.provide?.(FEISHU_TOPICS_SERVICE, service.topics())
+  ctx.provide?.(FEISHU_ACTIONS_SERVICE, service.actions())
   ctx.effect(() => {
     // Boot loads the Web overlay and connects only when the Feishu application
     // credentials are complete; an incomplete configuration or a failed

@@ -7,13 +7,19 @@
  * @module dsh-channels/routing/card-actions
  */
 
+import { mkdir } from 'node:fs/promises'
 import type { AccessController } from '../access/controller.ts'
 import { principalOnRoute } from '../access/principal.ts'
+import { RESERVED_DISMISS_ACTION_ID } from '../actions/contract.ts'
+import { hasPendingActions, isActionProposalExpired } from '../actions/store.ts'
+import type { ActionProposalStore } from '../actions/store.ts'
 import {
-  buildApprovalSettledCard, initialStreamingCard, parseApprovalRetryAction, parsePickAction, parseResumeAction,
+  buildActionProposalCard, buildApprovalSettledCard, buildPrunedActionProposalCard, initialStreamingCard,
+  parseActionProposalClick, parseApprovalRetryAction, parsePickAction, parseResumeAction,
   queuedStreamingCard, STEER_ACTION, STOP_ACTION,
 } from '../cards/index.ts'
 import type { RouteOperationQueue } from '../commands.ts'
+import { isGroupRoute } from '../domain.ts'
 import type { CardDelivery } from '../feishu/delivery.ts'
 import type { CardActionEvent, FeishuChannel, NormalizedMessage } from '../feishu-channel.ts'
 import type { HostContext, SessionId } from '../host/index.ts'
@@ -73,6 +79,8 @@ export interface TurnCardActionsDeps {
   sessions: SessionManager
   repair: InflightRepair
   approvals: ApprovalStore
+  actionProposals: ActionProposalStore
+  patchProposalCard?(proposalId: string, cardMessageId: string, card: object): Promise<void>
   outbox: Outbox
   delivery: CardDelivery
   queue: RouteOperationQueue
@@ -80,6 +88,20 @@ export interface TurnCardActionsDeps {
   runTurn(agent: Agent, prompt: ChannelPrompt, card: TurnCard): Promise<SubmissionOutcome>
   /** Run one slash-command line as if the operator had typed it. */
   runCommand(msg: NormalizedMessage, line: string): Promise<void>
+  now?(): number
+}
+
+function escapeXmlAttr(value: string): string {
+  return value
+    .replaceAll('&', '&amp;')
+    .replaceAll('"', '&quot;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+}
+
+/** Assemble the model-facing user text produced when an action proposal button is selected. */
+export function formatActionSelectedPrompt(id: string, label: string, followUpPrompt: string): string {
+  return `<feishu_action_selected id="${escapeXmlAttr(id)}" label="${escapeXmlAttr(label)}"/>\n\n${followUpPrompt}`
 }
 
 /** Buttons on a turn's own cards. */
@@ -88,8 +110,14 @@ export class TurnCardActions {
   private readonly resumedCards = new Set<string>()
   /** Approval cards whose 「重新发起」 click is being handled or was handled (once per card). */
   private readonly retriedApprovalCards = new Set<string>()
+  /** `<proposalId>:<actionId>` clicks currently running through the route queue. */
+  private readonly inFlightProposalClicks = new Set<string>()
 
   constructor(private readonly deps: TurnCardActionsDeps) {}
+
+  private now(): number {
+    return this.deps.now?.() ?? Date.now()
+  }
 
   /** @returns one handler per button kind, for {@link dispatchCardAction}. */
   handlers(): CardActionHandler[] {
@@ -99,6 +127,7 @@ export class TurnCardActions {
       { label: 'continue', handle: event => this.onResumeAction(event) },
       { label: 'approval retry', handle: event => this.onApprovalRetryAction(event) },
       { label: 'picker card', handle: event => this.onPickAction(event) },
+      { label: 'action proposal', handle: event => this.onActionProposalClick(event) },
     ]
   }
 
@@ -292,5 +321,193 @@ export class TurnCardActions {
       ...(route.kind === 'thread' ? { threadId: route.key } : {}),
       createTime: Date.now(),
     }, line))
+  }
+
+  /**
+   * Non-blocking action proposal button click (`feishuActions` / `propose_actions`):
+   * validates the 14-day TTL, route binding, channel ownership and `requiredAccess`
+   * (patching a non-destructive Chinese hint on permission denial without consuming
+   * pending buttons), atomically transitions the selected action to `triggered`
+   * (or remaining pending items to `dismissed` for 「暂不处理」), and wakes the
+   * Session with a streaming card and follow-up turn as the clicker's principal.
+   */
+  private async onActionProposalClick(event: CardActionEvent): Promise<void> {
+    if (!this.deps.started()) return
+    const click = parseActionProposalClick(event.action.value)
+    if (click === undefined) return
+    const clickKey = `${click.proposalId}:${click.actionId}`
+    if (this.inFlightProposalClicks.has(clickKey)) return
+
+    const initial = this.deps.actionProposals.get(click.proposalId)
+    if (initial === undefined) {
+      void this.deps.outbox.patch(event.messageId, buildPrunedActionProposalCard())
+      return
+    }
+    if (initial.cardMessageId !== event.messageId || initial.chatId !== event.chatId) return
+
+    const patchProposal = (card: object): void => {
+      if (this.deps.patchProposalCard !== undefined) {
+        void this.deps.patchProposalCard(initial.proposalId, event.messageId, card)
+      } else {
+        void this.deps.outbox.patch(event.messageId, card)
+      }
+    }
+
+    if (isActionProposalExpired(initial, this.now())) {
+      patchProposal(buildActionProposalCard(initial, { invalidation: 'expired' }))
+      return
+    }
+
+    const bound = this.deps.routes.get(initial.routeKey)
+    if (bound === undefined || bound.sessionId !== initial.sessionId) {
+      patchProposal(buildActionProposalCard(initial, { invalidation: 'unbound' }))
+      return
+    }
+
+    this.inFlightProposalClicks.add(clickKey)
+    try {
+      await this.deps.queue.run(bound.key, async () => {
+        const channel = this.deps.channel()
+        if (!this.deps.started() || channel === undefined) return
+        const proposal = this.deps.actionProposals.get(click.proposalId)
+        if (proposal === undefined) {
+          void this.deps.outbox.patch(event.messageId, buildPrunedActionProposalCard())
+          return
+        }
+        if (proposal.cardMessageId !== event.messageId || proposal.chatId !== event.chatId) return
+
+        if (isActionProposalExpired(proposal, this.now())) {
+          patchProposal(buildActionProposalCard(proposal, { invalidation: 'expired' }))
+          return
+        }
+
+        const route = this.deps.routes.get(proposal.routeKey)
+        if (route === undefined || route.sessionId !== proposal.sessionId) {
+          patchProposal(buildActionProposalCard(proposal, { invalidation: 'unbound' }))
+          return
+        }
+
+        if (!hasPendingActions(proposal)) {
+          patchProposal(buildActionProposalCard(proposal))
+          return
+        }
+
+        if (click.actionId === RESERVED_DISMISS_ACTION_ID) {
+          const refusal = this.deps.access.actionProposalRefusal(event.operator.userId, event.chatId, route, 'chat')
+          if (refusal !== undefined) {
+            patchProposal(buildActionProposalCard(proposal, { notice: refusal }))
+            return
+          }
+          const dismissed = await this.deps.actionProposals.dismissPending(proposal.proposalId)
+          if (dismissed !== undefined) {
+            patchProposal(buildActionProposalCard(dismissed))
+          }
+          return
+        }
+
+        const target = proposal.actions.find(item => item.id === click.actionId)
+        if (target === undefined || target.status !== 'pending') return
+
+        const refusal = this.deps.access.actionProposalRefusal(
+          event.operator.userId,
+          event.chatId,
+          route,
+          target.requiredAccess,
+        )
+        if (refusal !== undefined) {
+          patchProposal(buildActionProposalCard(proposal, { notice: refusal }))
+          return
+        }
+
+        const clickerUserId = event.operator.userId!
+        const live = await this.deps.sessions.ensureLive(route)
+        await mkdir(route.workspacePath, { recursive: true }).catch((error: unknown) => {
+          this.deps.ctx.logger?.warn?.(
+            'dsh-channels: recreating topic directory %s failed: %s',
+            route.workspacePath, String(error),
+          )
+        })
+
+        const liveChannel = this.deps.channel()
+        if (!this.deps.started() || liveChannel === undefined) return
+
+        const now = this.now()
+        const text = formatActionSelectedPrompt(
+          target.id,
+          target.label,
+          target.followUpPrompt,
+        )
+        const prompt = channelPrompt(text, principalOnRoute(route, clickerUserId))
+
+        const triggered = await this.deps.actionProposals.triggerAction(
+          proposal.proposalId,
+          click.actionId,
+          clickerUserId,
+          now,
+          prompt.requestId,
+        )
+        if (!triggered.changed) return
+
+        let accepted = false
+        let repairCardMessageId: string | undefined
+        try {
+          const firstCard = this.deps.streamer()?.hasLiveTurn(route.sessionId) === true
+            ? queuedStreamingCard(route.sessionId)
+            : initialStreamingCard(route.sessionId)
+          const sent = await liveChannel.send(route.chatId, { card: firstCard }, {
+            replyTo: event.messageId,
+            replyInThread: route.kind === 'thread',
+          })
+
+          const stored = storablePrompt(prompt)
+          repairCardMessageId = sent.messageId
+          await this.deps.repair.write({
+            key: sent.messageId,
+            sessionId: route.sessionId,
+            chatId: route.chatId,
+            triggerMessageId: event.messageId,
+            routeKey: route.key,
+            ...(stored === undefined ? {} : { prompt: stored }),
+            cards: [{ messageId: sent.messageId, mode: 'card' }],
+            startedAt: now,
+            attempts: 0,
+          })
+          await this.deps.routes.put(route.key, {
+            ...route,
+            cardMessageId: sent.messageId,
+            lastActivityAt: now,
+            ...(isGroupRoute(route) ? { lastSpeakerUserId: clickerUserId } : {}),
+          })
+          const outcome = await this.deps.runTurn(live.agent, prompt, { cardMessageId: sent.messageId })
+          accepted = outcome.accepted
+        } finally {
+          if (!accepted) {
+            if (repairCardMessageId !== undefined) {
+              await this.deps.repair.clear(repairCardMessageId).catch((error: unknown) => {
+                this.deps.ctx.logger?.warn?.(
+                  'dsh-channels: clearing failed action repair snapshot %s failed: %s',
+                  repairCardMessageId, String(error),
+                )
+              })
+            }
+            const reverted = await this.deps.actionProposals.revertTrigger(
+              proposal.proposalId,
+              triggered.changedIds,
+              prompt.requestId,
+            )
+            if (reverted?.superseded === true) {
+              patchProposal(buildActionProposalCard(reverted))
+            }
+          }
+        }
+        if (!accepted) return
+        const confirmed = await this.deps.actionProposals.confirmTrigger(proposal.proposalId, prompt.requestId)
+        patchProposal(buildActionProposalCard(
+          confirmed ?? this.deps.actionProposals.get(proposal.proposalId) ?? triggered.record,
+        ))
+      })
+    } finally {
+      this.inFlightProposalClicks.delete(clickKey)
+    }
   }
 }

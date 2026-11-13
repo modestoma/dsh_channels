@@ -177,6 +177,7 @@ const BOOLEAN_KEYS = new Set<EditableKey>([
   'prefetchImages',
   'feishuTools.topicMessages',
   'feishuTools.sendFile',
+  'feishuTools.proposeActions',
   'feishuTools.wikiRead',
   'feishuTools.wikiWrite',
 ])
@@ -414,6 +415,12 @@ const FIELD_META: Record<EditableKey, FieldMeta> = {
     group: 'tools',
     summary: '把生成的图片或文件发回会话，需 im:resource 权限',
     help: '工具名 feishu_send_file。图片不超过 10 MB，文件不超过 30 MB。对新会话生效。',
+  },
+  'feishuTools.proposeActions': {
+    label: '后续动作提议',
+    group: 'tools',
+    summary: '主会话在回合末尾附上非阻塞的可选跟进动作按钮卡片',
+    help: '工具名 propose_actions。仅飞书活动路由的主会话（delegationDepth = 0）可用，单回合最多成功调用 1 次；用户点击按钮后按所声明的权限预检并开启跟进回合。对新会话挂载生效（运行中关闭也会立即拒绝调用）。',
   },
   prefetchTimeoutMs: { label: '图片预取超时', group: 'limits', min: 100, max: 120_000, step: 100, unit: 'ms' },
   prefetchImageMaxBytes: { label: '单张预取图片上限', group: 'limits', min: 1, max: 200 * 1024 * 1024, step: 1, unit: BYTES_UNIT },

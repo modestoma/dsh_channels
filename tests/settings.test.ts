@@ -766,6 +766,10 @@ describe('field descriptors', () => {
     expect(byKey.get('feishuTools.sendFile')).toMatchObject({
       kind: 'boolean', group: 'tools', restartRequired: false,
     })
+    expect(byKey.get('feishuTools.proposeActions')).toMatchObject({
+      kind: 'boolean', group: 'tools', restartRequired: false,
+    })
+    expect(byKey.get('feishuTools.proposeActions')?.help).toContain('propose_actions')
     expect(byKey.get('feishuTools.attachmentFetchMaxResources')).toMatchObject({
       kind: 'number', min: 1, max: 50,
     })
@@ -780,7 +784,8 @@ describe('field descriptors', () => {
     // The attachment pipeline and model tools render under「附件与工具」.
     const attachmentsTab = new Set([
       'acceptAttachments', 'prefetchImages', 'prefetchTimeoutMs',
-      'historyBootstrapLimit', 'feishuTools.sendFile', 'feishuTools.topicMessages',
+      'historyBootstrapLimit', 'feishuTools.sendFile', 'feishuTools.proposeActions',
+      'feishuTools.topicMessages',
     ])
     for (const field of FIELD_DESCRIPTORS) {
       if (!attachmentsTab.has(field.key)) continue

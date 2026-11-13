@@ -279,6 +279,11 @@ export const configSchema = z.object({
    *   directory back to the current conversation. Needs the Feishu
    *   `im:resource` (or `im:resource:upload`) scope; without it a call returns
    *   a readable failure and the turn continues.
+   * - `proposeActions` (default on): register `propose_actions` in root
+   *   channel sessions (`delegationDepth === 0`) so the model can post a
+   *   non-blocking follow-up action proposal card at the end of a turn (at
+   *   most one successful call per turn; skipped when a next-turn user message
+   *   is already queued in the inbox).
    *
    * - `wikiRead` (default off): register `feishu_wiki_list`,
    *   `feishu_wiki_read`, `feishu_wiki_sheet_read`, and
@@ -319,6 +324,7 @@ export const configSchema = z.object({
     topicMessagesTimeoutMs: z.number().int().min(1_000).max(120_000)
       .default(DEFAULT_TOPIC_MESSAGES_TIMEOUT_MS),
     sendFile: z.boolean().default(true),
+    proposeActions: z.boolean().default(true),
     wikiRead: z.boolean().default(false),
     wikiWrite: z.boolean().default(false),
   }).default({
@@ -328,6 +334,7 @@ export const configSchema = z.object({
     topicMessages: true,
     topicMessagesTimeoutMs: DEFAULT_TOPIC_MESSAGES_TIMEOUT_MS,
     sendFile: true,
+    proposeActions: true,
     wikiRead: false,
     wikiWrite: false,
   }),
