@@ -1711,12 +1711,13 @@ export class FeishuService {
           }
           return promptRequestIdOf(source as { kind: string }) === requestId
         })
-      if (queuedInInbox || agent.status === 'running') {
+      if (queuedInInbox) {
         recoverable.add(requestId)
         continue
       }
       if (
-        prompt !== undefined
+        agent.status !== 'running'
+        && prompt !== undefined
         && hasPatchableCard
         && this.config.replay.pending
         && (snapshot.replays ?? 0) < 1

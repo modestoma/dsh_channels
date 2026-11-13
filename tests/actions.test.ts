@@ -1269,8 +1269,52 @@ describe('TurnCardActions button click handling, access pre-checks, invalidation
       expect(reconciled?.reservations).toBeUndefined()
     })
 
-    // User can now click `opt_c` after restart and execute it cleanly!
-    const resumedBeforeRetry = h.ctxState.agents.resumed.length
+    // 4) Borrowed Session running another turn while snapshot prompt is absent from both log and inbox:
+    // `repairAll()` settles snapshot as interrupted without replaying, so reconciliation MUST also roll back the reservation!
+    const borrowed = makeAgent(makeSession(route.sessionId, route.workspacePath))
+    ;(borrowed as { status: string }).status = 'running'
+    const currentP2BeforeBorrow = proposalsTable.get(p2Id) as ActionProposalRecord
+    await proposalsTable.put(p2Id, {
+      ...currentP2BeforeBorrow,
+      actions: currentP2BeforeBorrow.actions.map(item => ({
+        ...item,
+        status: 'triggered' as const,
+        triggeredBy: 'u_alice',
+        triggeredAt: Date.now(),
+      })),
+      reservations: [{
+        requestId: 'req-unsubmitted-on-running-borrowed-agent',
+        actionId: 'opt_c',
+        changedIds: ['opt_c'],
+        createdAt: Date.now(),
+      }],
+    })
+    await h.ctxState.domain.raw.table('inflight').put('card_unsubmitted_borrowed', {
+      key: 'card_unsubmitted_borrowed',
+      sessionId: route.sessionId,
+      chatId: 'oc_p2p',
+      routeKey: route.key,
+      prompt: {
+        requestId: 'req-unsubmitted-on-running-borrowed-agent',
+        principal: { kind: 'feishu-user', userId: 'u_alice' },
+        content: [{ type: 'text', text: '执行 C' }],
+      },
+      cards: [{ messageId: 'card_unsubmitted_borrowed', mode: 'card' }],
+      startedAt: Date.now(),
+      attempts: 0,
+    })
+    h.ctxState.agents.liveAgents.set(route.sessionId, {
+      agent: borrowed,
+      dispose: vi.fn(async () => {}),
+    })
+    await h.service.restart()
+    await h.waitUntil(() => {
+      const reconciled = h.proposals().find(r => r.key === 'race-supersede-2')
+      expect(reconciled?.actions.map(a => a.status)).toEqual(['pending'])
+      expect(reconciled?.reservations).toBeUndefined()
+    })
+    // User can now click `opt_c` on that borrowed Session and execute it cleanly!
+    ;(borrowed as { status: string }).status = 'idle'
     await h.clickButton({
       messageId: p2.cardMessageId,
       chatId: 'oc_p2p',
@@ -1279,9 +1323,7 @@ describe('TurnCardActions button click handling, access pre-checks, invalidation
       actionId: 'opt_c',
     })
     await h.waitUntil(() => {
-      expect(h.ctxState.agents.resumed.length).toBeGreaterThan(resumedBeforeRetry)
-      const resumedAgent = h.ctxState.agents.resumed.at(-1)!.handle.agent
-      expect(followupMessagesOf(resumedAgent).length).toBeGreaterThanOrEqual(1)
+      expect(followupMessagesOf(borrowed).length).toBe(1)
     })
     expect(h.proposals().find(r => r.key === 'race-supersede-2')?.actions.map(a => a.status)).toEqual(['triggered'])
     expect(h.proposals().find(r => r.key === 'race-supersede-2')?.reservations).toBeUndefined()
