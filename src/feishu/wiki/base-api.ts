@@ -176,16 +176,94 @@ function recordPage(raw: RawMatrix, where: string): BaseRecordPage {
   }
 }
 
+interface BaseWriteQueueEntry {
+  readonly unlocked: BaseApi
+  readonly serialized: BaseApi
+  readonly queues: Map<string, Promise<unknown>>
+}
+
+const queueEntryByApi = new WeakMap<BaseApi, BaseWriteQueueEntry>()
+
+function baseTableQueueKey(baseToken: string, tableId: string): string {
+  return `${JSON.stringify(baseToken)}:${JSON.stringify(tableId)}`
+}
+
+function enqueueTableWrite<T>(
+  queues: Map<string, Promise<unknown>>,
+  tableKey: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const previous = queues.get(tableKey) ?? Promise.resolve()
+  const next = previous.catch(() => undefined).then(fn)
+  const tracked = next.then(() => undefined, () => undefined).finally(() => {
+    if (queues.get(tableKey) === tracked) {
+      queues.delete(tableKey)
+    }
+  })
+  queues.set(tableKey, tracked)
+  return next
+}
+
+function ensureQueueEntry(bases: BaseApi): BaseWriteQueueEntry {
+  const existing = queueEntryByApi.get(bases)
+  if (existing !== undefined) return existing
+
+  const queues = new Map<string, Promise<unknown>>()
+  const serialized: BaseApi = {
+    listTables: baseToken => bases.listTables(baseToken),
+    listFields: (baseToken, tableId) => bases.listFields(baseToken, tableId),
+    listRecords: (baseToken, tableId, query) => bases.listRecords(baseToken, tableId, query),
+    searchRecords: (baseToken, tableId, search) => bases.searchRecords(baseToken, tableId, search),
+    createRecords: (baseToken, tableId, records) =>
+      enqueueTableWrite(queues, baseTableQueueKey(baseToken, tableId), () =>
+        bases.createRecords(baseToken, tableId, records)),
+    updateRecords: (baseToken, tableId, updates) =>
+      enqueueTableWrite(queues, baseTableQueueKey(baseToken, tableId), () =>
+        bases.updateRecords(baseToken, tableId, updates)),
+    deleteRecords: (baseToken, tableId, recordIds) =>
+      enqueueTableWrite(queues, baseTableQueueKey(baseToken, tableId), () =>
+        bases.deleteRecords(baseToken, tableId, recordIds)),
+  }
+  const entry: BaseWriteQueueEntry = { unlocked: bases, serialized, queues }
+  queueEntryByApi.set(bases, entry)
+  queueEntryByApi.set(serialized, entry)
+  return entry
+}
+
+/**
+ * Wrap a {@link BaseApi} so `createRecords`, `updateRecords`, and `deleteRecords`
+ * serialize per `(baseToken, tableId)` across all callers sharing the instance.
+ * Idempotent: calling this on an already-wrapped API returns the same wrapper.
+ */
+export function serializeBaseApi(bases: BaseApi): BaseApi {
+  return ensureQueueEntry(bases).serialized
+}
+
+/**
+ * Execute a callback inside the shared per-table write queue of `bases`, receiving
+ * the unwrapped underlying {@link BaseApi} so the callback can perform writes without
+ * re-entering the queue.
+ */
+export function withBaseTableWriteLock<T>(
+  bases: BaseApi,
+  baseToken: string,
+  tableId: string,
+  fn: (unlockedBases: BaseApi) => Promise<T>,
+): Promise<T> {
+  const entry = ensureQueueEntry(bases)
+  return enqueueTableWrite(entry.queues, baseTableQueueKey(baseToken, tableId), () => fn(entry.unlocked))
+}
+
 /**
  * {@link BaseApi} over the SDK's generic authenticated request.
  *
  * @param request `Client.request` of the connected SDK client.
- * @returns The API.
+ * @returns The API with per-table write serialization enabled.
  */
 export function createBaseApi(request: WikiRawRequest): BaseApi {
   const tablePath = (baseToken: string, tableId: string): string =>
     `/open-apis/base/v3/bases/${segment(baseToken)}/tables/${segment(tableId)}`
-  return {
+  const rawApi: BaseApi = {
     async listTables(baseToken) {
       const data = await call<{ tables?: unknown; items?: unknown }>(request, {
         method: 'GET',
@@ -264,4 +342,5 @@ export function createBaseApi(request: WikiRawRequest): BaseApi {
       await call<unknown>(request, { method: 'POST', url, data: { record_id_list: recordIds } })
     },
   }
+  return serializeBaseApi(rawApi)
 }
