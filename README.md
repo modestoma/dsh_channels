@@ -12,6 +12,7 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 - **HITL 审批**：当模型请求需要授权的动作（如 bash 沙箱升级 `sandbox_permissions`）时，插件监听主机 `approval/request` 事件，在同一话题里**新发一张独立审批决策卡**：卡片标题带工具名；工具在审批请求里给了说明时，说明按行显示为卡片主体（`标签：值` 行显示成标签和值，缩进行显示成列表，不按 markdown 解析），bash 等带 `command` 参数的工具另外显示将执行的命令，其余参数按 `名称: 值` 收进默认折叠的「调用参数」，没有说明和命令时直接展开显示；提权时写明提权目标。提供 ✅ 允许 / ❌ 拒绝 / ♾️ 本话题不再询问 三个按钮；也可以在话题里直接回复「允许」「拒绝」「全部允许」，回复其他内容视为拒绝并作为下一条指令。等待期间流式卡片状态行显示「✋ 等待审批：工具名」。飞书消息发起的回合等 `approvalTimeoutMs`（默认 24 小时），子代理、后台任务、定时跟进、PR/MR 动态唤醒的回合等 `approvalBackgroundTimeoutMs`（默认 30 分钟），超时自动拒绝（fail-closed）；等待再久也不会锁住话题，回复其他内容就会拒绝审批并作为下一条指令。私聊话题里卡片 `approvalReminderMs`（默认 10 分钟）还没处理，会在卡片下回复一条提醒（只提醒一次，群话题不发）。超时的卡片和服务重启中断的卡片带「🔁 重新发起」按钮：点了以后在卡片下开一轮新回复，让模型先核对当前状态、已经完成的不重做，再重试这一步，需要授权时重新发卡；每张卡只能重新发起一次，7 天后按钮失效。「本话题不再询问」只对当前 Session 有效，会持久保存，重启后仍然生效，`/renew` 开新 Session 后恢复询问。私聊话题只认本人，群话题里通过准入的成员都可以点或回复，其他人无效
 - **结构化提问**：模型调用 `ask_user_question` 时，插件监听主机 `user-questions/request` 瀑布并发一张问答卡（每个问题一组选项按钮，多选先勾选再「提交本题选择」），答案回填给模型；主机自带的应答者只有 Web 客户端，没有本插件时纯飞书会话会以 `NO_PROVIDER` 失败。超时（`questionTimeoutMs`，默认 5 分钟）或回合取消时本轮提问失败（fail-closed）；没有可选项的问题直接提示用文字作答，**阻塞期间普通文本回复即作为该问题的自由文本答案**（同时支持多选后的自定义文本）
 - **非阻塞后续动作提议（`propose_actions` / `feishuActions`）**：与回合中挂起等待的审批卡和提问卡不同，飞书活动路由的主会话（`delegationDepth === 0`，子代理不可调用）在回合收尾时可调用 `propose_actions` 工具（单回合最多成功 1 次；若收件箱已有排队中的下一条用户消息则自动跳过发卡），或其他宿主插件通过 `ctx.get('feishuActions')`（v1）在当前话题发送独立的「💡 后续可选动作」卡片（1–4 个可选按钮 + 自动追加灰色「暂不处理」按钮，本轮立即正常结束、不占用并发槽位）。记录持久化在 `action_proposals` 表（保留 14 天）；同一 Session 产生新提议时自动将此前仍有待选按钮的旧卡刷新为「已被后续新提议替代」（保留已触发的历史选择）。用户点击按钮时先按路由归属与按钮声明的 `requiredAccess`（`chat | code-write | wiki-write | admin`）拦截判权（权限不足仅在卡底回显中文引导提示，不消耗待选按钮），通过后原子流转状态并以点击者飞书身份（`principal`）提交 `<feishu_action_selected id="…" label="…"/>` 加 `followUpPrompt` 开启新一轮流式跟进回复。开关：`feishuTools.proposeActions`（默认开）
+- **多维表格服务（`feishuBitable`）**：面向其他宿主插件的领域无关服务端多维表格读写桥接（`ctx.get('feishuBitable')`，v1），以机器人应用身份经飞书 `base/v3` 与 `wiki/v2` 接口读写独立多维表格（`/base/<token>` / `/bitable/<token>`）或知识库内嵌多维表格（`/wiki/<node_token>`），支持字段结构探查、分页读取与批量新增/更新（单批 ≤200 条），并与模型工具 `feishu_wiki_base_edit` 共用按 `<baseToken>:<tableId>` 维度的全局写操作串行队列。
 - **准入与授权（默认开启）**：准入只看一张扁平的**用户表**，每人有四个独立开关：**对话准入**、**知识库读取**、**知识库写入**、**代码改动**。**管理员也是用户表里的一行**：打开「管理员」开关的人拥有全部权限（其他开关对他不起作用），可以有多个，只能在 Web 设置面板设置。对话准入打开的人可以私聊机器人，也可以在任何群里 @ 它（包括自己把机器人拉进的群），不再有群白名单；对话准入关闭等于停用，其他开关一并失效。新加入的人只打开对话准入。不在表里的人私聊只收到一条固定提示（`/userid` 例外），在群里 @ 机器人或把它拉进群时，管理员私聊收到**用户授权申请卡**。授权入口：飞书 `/auth` 命令、授权卡、Web 设置面板；**管理员只能在面板用户表里设置**（私聊 `/userid` 获取 user_id），飞书里不能授予或移除管理员。用户表里没有管理员时 `guarded` 拒绝所有对话
 - **代码改动开关**：其他插件的写操作经下面的授权事件按「代码改动」开关判权；不经授权事件发问的工具可以列进 `codeWriteTools`（默认空），飞书会话（含它派生的子代理）调用这些工具之前，插件按**会话所在位置**检查：私聊话题要求本人是管理员或打开了「代码改动」开关，群话题要求设置面板「群权限」里该群的「代码改动」开关打开；没有时工具直接返回拒绝原因，模型会转告用户。本地工作区里的修改不受影响。检查在工具自己的审批之前进行，不受工具审批模式影响
 - **授权事件**：其他插件在写操作之前用 `ctx.parallel('access/authorize', { session, level, action, summary })` 发问时（dsh-repo 的写工具和带会话的服务调用问 `code-write`，日志分析插件加仓库问 `admin`），本插件对飞书会话（含子代理，顺着 `parentSession` 找到所属话题）按同样的位置规则回答：`code-write`、`wiki-read`、`wiki-write` 看私聊本人或群的对应开关；`admin` 要求私聊本人是管理员，群会话一律拒绝；不认识的级别拒绝。拒绝时抛出中文原因，发问的插件据此不问用户、不执行；非飞书会话不回答。通过这个事件发问的插件的工具不必再列进 `codeWriteTools`
@@ -558,6 +559,32 @@ await actions?.supersede('task-42-followup', '已生成新版处理方案')
 - **自动追加与多选结算**：卡片末尾自动追加灰色「暂不处理」（`actionId: 'dismiss'`）按钮。单个动作默认 `independent: false`（点选后其余 `pending` 项自动转为 `dismissed` 并收起按钮）；设为 `independent: true` 时支持先后独立点击多项，每次触发在卡面保留 `✅ 已选择：…` 记录。
 - **同 Session 自动替代与生命周期**：记录保存在 `dsh_channels` 域的 `action_proposals` 表，有效期 14 天（随周期 GC 清理，超期点击原地刷新为已过期提示）。同一 `sessionId` 发送新动作提议卡时，此前仍有 `pending` 项的旧记录自动将剩余 `pending` 项标记为 `superseded`（保留已 `triggered` 的历史项）并经 `outbox` 异步刷新旧卡片；`/renew` 切换话题 Session 后旧卡点击原地刷新为已失效提示。
 - **前置判权与唤醒身份**：点击时先校验话题归属与 `requiredAccess`（`chat` 默认、`code-write`、`wiki-write`、`admin`）；权限不足时仅在卡片底部非破坏性回显中文授权指引（保留待选按钮可继续点击）。通过判权与 `table.update` 原子状态流转后，以点击者的渠道身份（`principalOnRoute(route, clickerUserId)`）发送新流式回复卡并提交 `<feishu_action_selected id="…" label="…"/>\n\n${followUpPrompt}` 开启跟进回合。
+
+## 多维表格服务（feishuBitable）
+
+插件向其他 DSH 插件提供 Cordis 服务 `feishuBitable`（当前 `version: 1`，契约定义见 `src/bitable/contract.ts`），作为领域无关的服务端飞书多维表格读写桥梁，直接使用机器人应用身份调用飞书 `base/v3`（与 `wiki/v2`）接口，无需经过飞书会话与 HITL 授权卡即可后台读写，适合问题看板同步、台账回写等后台任务：
+
+```ts
+const bitable = ctx.get('feishuBitable') as FeishuBitableService | undefined
+if (bitable?.version === 1) {
+  const schema = await bitable.inspectTable({ url: 'https://example.feishu.cn/base/bascnxxx?table=tblxxx' })
+  if (schema.ok) {
+    const page = await bitable.listRecords({ url: 'https://example.feishu.cn/base/bascnxxx', table: schema.tableId, limit: 200 })
+    await bitable.createRecords({ url: 'https://example.feishu.cn/base/bascnxxx', table: schema.tableId, records: [{ 标题: '示例' }] })
+    await bitable.updateRecords({ url: 'https://example.feishu.cn/base/bascnxxx', table: schema.tableId, updates: { recxxx: { 状态: '已确认' } } })
+  }
+  const off = bitable.onChange?.(() => { /* 飞书连接就绪或断开时触发 */ })
+}
+```
+
+- **目标解析**：`url` 支持独立多维表格链接（`https://<tenant>.feishu.cn/base/<token>` 或 `/bitable/<token>`）及知识库内嵌多维表格链接（`https://<tenant>.feishu.cn/wiki/<node_token>`，解析并缓存 `wiki -> baseToken` 映射；节点不是 `bitable` 时返回 `invalid-target`）。可通过 URL 查询参数 `?table=<tableId>` 或显式字段 `table`（支持 `tableId` 或精确表名，显式 `table` 优先）定位数据表；Base 仅含 1 张表时省略 `table` 自动选中，含多张表且未指定 `table` 时返回 `ambiguous-table`。
+- **方法契约**：
+  - `inspectTable(target)`：校验并解析目标表，返回 `{ ok: true, baseToken, tableId, tableName, fields }`（含 `fieldId`、`name`、`type`、`properties`）。
+  - `listRecords(input)`：按页读取记录（支持 `fields`、`filter`、`sort`、`viewId`、`offset`、`limit` 1–200），返回 `{ ok: true, baseToken, tableId, records, hasMore, nextOffset?, rev?, ignoredFields }`。
+  - `createRecords(input)` / `updateRecords(input)`：分别按 `records`（数组）与 `updates`（`Record<recordId, fields>` 映射）批量新增或部分更新，单批上限均遵循飞书 `BITABLE_BATCH_MAX_RECORDS`（200 条）。
+  - `onChange(listener)`：飞书渠道连接上线（`open`）或断开关闭（`close`）时通知订阅方，返回取消订阅函数；调用方应通过 `ctx.get('feishuBitable')` 动态读取并在服务热重载时响应通知，不要将其列入主 `inject`。
+- **结构化错误码与共享写队列**：全部方法返回统一的 `BitableResult<T>` 判别联合，错误码固定为 `invalid-target | not-connected | ambiguous-table | table-not-found | permission-denied | not-found | rate-limited | api-error`。所有写操作均通过 `src/feishu/wiki/base-api.ts` 中的 `withBaseTableWriteLock` 按 `<baseToken>:<tableId>` 全局串行排队，与模型工具 `feishu_wiki_base_edit` 共用同一把表级写锁；插件停止或重载前会通过 `drain()` 等待在途读写完成。
+- **所需飞书应用权限**：细分权限 `base:table:read`、`base:field:read`、`base:record:read`、`base:record:create`、`base:record:update`（旧版 `bitable:app` 不满足 `base/v3` 接口）；若使用 `/wiki/<node_token>` 链接还需 `wiki:wiki:readonly` 或 `wiki:wiki`，且需将机器人（或包含机器人的群）设为目标多维表格 / 知识空间的协作者（具备可编辑权限）。
 
 ## 行为与降级
 
