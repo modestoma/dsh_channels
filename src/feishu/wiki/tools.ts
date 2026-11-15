@@ -28,6 +28,7 @@ import type { FeishuConfig } from '../../config.ts'
 import type { AgentContext, ToolContentBlock, ToolDefinition, ToolExecution } from '../../host/agent.ts'
 import type { FeishuChannel } from '../../feishu-channel.ts'
 import type { InteractionRoute } from '../../interactions/pending.ts'
+import { serializeBaseApi } from './base-api.ts'
 import {
   consentFailure, describeError, display, failure, failureOf, FAILURE_REASONS, guarded, nodeUrl, ownedByApp,
   parseArgs, preview, previewBlock,
@@ -381,7 +382,7 @@ export class WikiToolRuntime implements WikiToolKit {
         route,
         api,
         ...(channel.sheets === undefined ? {} : { sheets: channel.sheets }),
-        ...(channel.bases === undefined ? {} : { bases: channel.bases }),
+        ...(channel.bases === undefined ? {} : { bases: serializeBaseApi(channel.bases) }),
         roots: parseWikiRoots(this.deps.config().wikiRoots),
         botOpenId: channel.botOpenId(),
       },

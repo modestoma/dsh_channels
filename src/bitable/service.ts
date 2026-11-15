@@ -14,6 +14,7 @@
 import type { z } from 'zod'
 import { FeishuApiError } from '../feishu-channel.ts'
 import type { FeishuChannel } from '../feishu-channel.ts'
+import { withBaseTableWriteLock } from '../feishu/wiki/base-api.ts'
 import type { BaseRecordFields } from '../feishu/wiki/base-api.ts'
 import {
   BITABLE_BATCH_MAX_RECORDS,
@@ -91,9 +92,7 @@ interface ResolvedTable {
 
 export class FeishuBitable implements FeishuBitableService {
   readonly version = FEISHU_BITABLE_VERSION
-  /** `<baseToken>:<tableId>` -> tail write queue so `base/v3` writes never overlap on one table. */
-  private readonly tableQueues = new Map<string, Promise<unknown>>()
-  /** Every active service call, awaited by `drain()`. */
+  /** Every active service call (including shared Base table write waits), awaited by `drain()`. */
   private readonly inFlight = new Set<Promise<unknown>>()
   /** Cached wiki `nodeToken` -> Bitable `baseToken` (`objToken`), bounded to 64 entries. */
   private readonly wikiNodeToBaseToken = new Map<string, string>()
@@ -117,8 +116,8 @@ export class FeishuBitable implements FeishuBitableService {
 
   /** Wait for all active read/write operations to finish. */
   async drain(): Promise<void> {
-    while (this.inFlight.size > 0 || this.tableQueues.size > 0) {
-      await Promise.allSettled([...this.inFlight, ...this.tableQueues.values()])
+    while (this.inFlight.size > 0) {
+      await Promise.allSettled([...this.inFlight])
     }
   }
 
@@ -145,18 +144,6 @@ export class FeishuBitable implements FeishuBitableService {
     })
     this.inFlight.add(done)
     return done
-  }
-
-  private serializeTable<T>(tableKey: string, fn: () => Promise<T>): Promise<T> {
-    const previous = this.tableQueues.get(tableKey) ?? Promise.resolve()
-    const next = previous.catch(() => undefined).then(fn)
-    const tracked = next.then(() => undefined, () => undefined).finally(() => {
-      if (this.tableQueues.get(tableKey) === tracked) {
-        this.tableQueues.delete(tableKey)
-      }
-    })
-    this.tableQueues.set(tableKey, tracked)
-    return next
   }
 
   private currentChannel(): FeishuChannel | undefined {
@@ -354,12 +341,12 @@ export class FeishuBitable implements FeishuBitableService {
     const table = await this.resolveTable(parsedTarget.parsed)
     if (!table.ok) return table.error
     const { channel, baseToken, tableId } = table.resolved
-    return await this.serializeTable(`${baseToken}:${tableId}`, async () => {
+    return await withBaseTableWriteLock(channel.bases!, baseToken, tableId, async (unlockedBases) => {
       if (this.currentChannel() !== channel) {
         return failure('not-connected', '飞书渠道已断开，无法写入多维表格')
       }
       try {
-        const recordIds = await channel.bases!.createRecords(
+        const recordIds = await unlockedBases.createRecords(
           baseToken,
           tableId,
           validated.data.records as BaseRecordFields[],
@@ -391,12 +378,12 @@ export class FeishuBitable implements FeishuBitableService {
     const table = await this.resolveTable(parsedTarget.parsed)
     if (!table.ok) return table.error
     const { channel, baseToken, tableId } = table.resolved
-    return await this.serializeTable(`${baseToken}:${tableId}`, async () => {
+    return await withBaseTableWriteLock(channel.bases!, baseToken, tableId, async (unlockedBases) => {
       if (this.currentChannel() !== channel) {
         return failure('not-connected', '飞书渠道已断开，无法更新多维表格')
       }
       try {
-        const ignoredFields = await channel.bases!.updateRecords(
+        const ignoredFields = await unlockedBases.updateRecords(
           baseToken,
           tableId,
           validated.data.updates as Readonly<Record<string, BaseRecordFields>>,

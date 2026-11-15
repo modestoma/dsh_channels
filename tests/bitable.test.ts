@@ -18,6 +18,7 @@ import { resolveConfig } from '../src/config.ts'
 import { FeishuApiError } from '../src/feishu-channel.ts'
 import type { ChannelFactory, FeishuChannel } from '../src/feishu-channel.ts'
 import type { WikiApi, WikiNode } from '../src/feishu/wiki/api.ts'
+import { serializeBaseApi } from '../src/feishu/wiki/base-api.ts'
 import type { BaseApi, BaseField, BaseRecord, BaseRecordPage, BaseTable } from '../src/feishu/wiki/base-api.ts'
 import { makeChannel, makeHostContext, TestFeishuService as FeishuService } from './helpers.ts'
 
@@ -76,6 +77,17 @@ function makeFakeBitableChannel() {
   let inFlightWrites = 0
   let maxConcurrentWrites = 0
 
+  async function trackWrite<T>(fn: () => Promise<T> | T): Promise<T> {
+    inFlightWrites += 1
+    maxConcurrentWrites = Math.max(maxConcurrentWrites, inFlightWrites)
+    try {
+      await new Promise(resolve => setTimeout(resolve, 15))
+      return await fn()
+    } finally {
+      inFlightWrites -= 1
+    }
+  }
+
   const wiki: Pick<WikiApi, 'getNode'> = {
     getNode: vi.fn(async (token: string) => {
       const node = nodes.get(token)
@@ -102,11 +114,7 @@ function makeFakeBitableChannel() {
       }
     }),
     searchRecords: vi.fn(async () => ({ records: [], hasMore: false, ignoredFields: [] })),
-    createRecords: vi.fn(async (baseToken: string, tableId: string, rows) => {
-      inFlightWrites += 1
-      maxConcurrentWrites = Math.max(maxConcurrentWrites, inFlightWrites)
-      await new Promise(resolve => setTimeout(resolve, 15))
-      inFlightWrites -= 1
+    createRecords: vi.fn((baseToken: string, tableId: string, rows) => trackWrite(() => {
       const list = recordsByTable.get(`${baseToken}:${tableId}`) ?? []
       const ids: string[] = []
       for (const row of rows) {
@@ -117,12 +125,8 @@ function makeFakeBitableChannel() {
       }
       recordsByTable.set(`${baseToken}:${tableId}`, list)
       return ids
-    }),
-    updateRecords: vi.fn(async (baseToken: string, tableId: string, updates) => {
-      inFlightWrites += 1
-      maxConcurrentWrites = Math.max(maxConcurrentWrites, inFlightWrites)
-      await new Promise(resolve => setTimeout(resolve, 15))
-      inFlightWrites -= 1
+    })),
+    updateRecords: vi.fn((baseToken: string, tableId: string, updates) => trackWrite(() => {
       const list = recordsByTable.get(`${baseToken}:${tableId}`) ?? []
       for (const [recordId, patch] of Object.entries(updates)) {
         const idx = list.findIndex(item => item.recordId === recordId)
@@ -130,8 +134,12 @@ function makeFakeBitableChannel() {
         list[idx] = { recordId, fields: { ...list[idx]!.fields, ...(patch as Record<string, unknown>) } }
       }
       return []
-    }),
-    deleteRecords: vi.fn(async () => {}),
+    })),
+    deleteRecords: vi.fn((baseToken: string, tableId: string, recordIds) => trackWrite(() => {
+      const list = recordsByTable.get(`${baseToken}:${tableId}`) ?? []
+      const remove = new Set(recordIds)
+      recordsByTable.set(`${baseToken}:${tableId}`, list.filter(item => !remove.has(item.recordId)))
+    })),
   }
 
   const base = makeChannel()
@@ -259,7 +267,10 @@ describe('FeishuBitable service', () => {
       records: [{ recordId: 'rec3' }],
     })
 
-    const [c1, c2, u1] = await Promise.all([
+    const sharedBaseApi = serializeBaseApi(fake.bases)
+    expect(serializeBaseApi(sharedBaseApi)).toBe(sharedBaseApi)
+
+    const [c1, c2, u1, baseUpdate, baseDelete] = await Promise.all([
       service.createRecords({
         url: 'https://mi.feishu.cn/base/appBaseSingle',
         records: [{ 问题ID: 'ISS-order-0004' }],
@@ -272,10 +283,16 @@ describe('FeishuBitable service', () => {
         url: 'https://mi.feishu.cn/base/appBaseSingle',
         updates: { rec1: { 问题ID: 'ISS-order-0001-updated' } },
       }),
+      sharedBaseApi.updateRecords('appBaseSingle', 'tblSingle', {
+        rec2: { 问题ID: 'ISS-order-0002-base-tool' },
+      }),
+      sharedBaseApi.deleteRecords('appBaseSingle', 'tblSingle', ['rec3']),
     ])
     expect(c1).toMatchObject({ ok: true, recordIds: ['rec_new_1'] })
     expect(c2).toMatchObject({ ok: true, recordIds: ['rec_new_2'] })
     expect(u1).toMatchObject({ ok: true })
+    expect(baseUpdate).toEqual([])
+    expect(baseDelete).toBeUndefined()
     expect(fake.getMaxConcurrentWrites()).toBe(1)
 
     service.close()
