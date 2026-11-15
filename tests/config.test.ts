@@ -119,7 +119,12 @@ describe('resolveConfig', () => {
       appId: 'FEISHU_APP_ID', appSecret: 'FEISHU_APP_SECRET', promptContextTimeoutMs: 50,
     })).toThrow(/invalid configuration/)
     expect(config.feishuTools.topicMessages).toBe(true)
+    expect(config.feishuTools.proposeActions).toBe(true)
     expect(config.feishuTools.topicMessagesTimeoutMs).toBe(DEFAULT_TOPIC_MESSAGES_TIMEOUT_MS)
+    expect(resolveConfig({
+      appId: 'FEISHU_APP_ID', appSecret: 'FEISHU_APP_SECRET',
+      feishuTools: { proposeActions: false },
+    }).feishuTools.proposeActions).toBe(false)
     // 0 disables the first-turn history bootstrap.
     expect(resolveConfig({
       appId: 'FEISHU_APP_ID', appSecret: 'FEISHU_APP_SECRET', historyBootstrapLimit: 0,

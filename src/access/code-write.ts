@@ -59,7 +59,8 @@ export class CodeWriteGate {
   /**
    * A turn claimed an inbox message: the Feishu user its source names speaks
    * in the turn; a message without a principal keeps the previous speaker;
-   * any other principal makes the speaker unknown.
+   * a group principal without a speaker or any other principal makes the
+   * speaker unknown.
    * @param sessionId - the claiming Session.
    * @param message - the claimed message.
    */
@@ -67,8 +68,10 @@ export class CodeWriteGate {
     const caller = promptCallerOf(message.source)
     switch (caller.kind) {
       case 'feishu-user':
-      case 'feishu-group':
         this.speakers.set(sessionId, caller.userId)
+        return
+      case 'feishu-group':
+        this.speakers.set(sessionId, caller.userId ?? UNKNOWN_SENDER)
         return
       case 'other-principal':
         this.speakers.set(sessionId, UNKNOWN_SENDER)

@@ -11,8 +11,13 @@
 import { z } from 'zod'
 import { outboxEntrySchema } from './outbox.ts'
 import type { OutboxEntry } from './outbox.ts'
+import { ACTION_PROPOSAL_TTL_MS, actionProposalRecordSchema } from './actions/store.ts'
+import type { ActionProposalRecord } from './actions/store.ts'
 import { approvalCardRecordSchema, approvalGrantRecordSchema } from './interactions/approval-store.ts'
 import type { ApprovalCardRecord, ApprovalGrantRecord } from './interactions/approval-store.ts'
+
+export { ACTION_PROPOSAL_TTL_MS, actionProposalRecordSchema }
+export type { ActionProposalRecord }
 import type { StorageDomainFacility } from './host/services.ts'
 import { typedTable } from './storage/table.ts'
 import type { DomainTable } from './storage/table.ts'
@@ -44,10 +49,16 @@ export const routeRecordSchema = z.object({
   chatType: z.enum(['p2p', 'group']),
   /**
    * The user who opened the route. In a private chat the person the topic
-   * belongs to, whose switches gate its tools; in a group the initiator,
-   * shown on cards and records only.
+   * belongs to, whose switches gate its tools (always present); in a group
+   * the initiator, shown on cards and records only, and absent for a topic a
+   * `feishuTopics` launch started for an external requester.
    */
-  senderUserId: z.string().min(1),
+  senderUserId: z.string().min(1).optional(),
+  /**
+   * Display text of the external requester a `feishuTopics` launch named, on
+   * a group route without {@link senderUserId}; shown on records only.
+   */
+  senderLabel: z.string().min(1).optional(),
   /** The topic directory: Session header cwd, sandbox root, and workspace. */
   workspacePath: z.string().min(1),
   /**
@@ -96,8 +107,8 @@ export const expiredRouteRecordSchema = z.object({
   chatId: z.string().min(1),
   /** Original chat type, retained for diagnostics and future policy. */
   chatType: z.enum(['p2p', 'group']),
-  /** Original route owner; never used to grant access after expiry. */
-  senderUserId: z.string().min(1),
+  /** Original route owner (see {@link RouteRecord.senderUserId}); never used to grant access after expiry. */
+  senderUserId: z.string().min(1).optional(),
   /** Epoch ms when the route was retired. */
   expiredAt: z.number().int().nonnegative(),
   /** Workspace the retired route belonged to. */
@@ -160,7 +171,7 @@ export const inflightMessageSchema = z.object({
 /** A principal this channel submits prompts as (`src/access/principal.ts`). */
 export const channelPrincipalSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('feishu-user'), userId: z.string().min(1) }),
-  z.object({ kind: z.literal('feishu-group'), chatId: z.string().min(1), userId: z.string().min(1) }),
+  z.object({ kind: z.literal('feishu-group'), chatId: z.string().min(1), userId: z.string().min(1).optional() }),
 ])
 
 /**
@@ -359,7 +370,8 @@ export const topicRootCardSchema = z.object({
   links: z.object({
     nameHeader: z.string(),
     linkHeader: z.string(),
-    rows: z.array(z.object({ name: z.string(), url: z.string() })),
+    extraLinkHeader: z.string().optional(),
+    rows: z.array(z.object({ name: z.string(), url: z.string().optional(), extraUrl: z.string().optional() })),
   }).optional(),
 })
 
@@ -379,8 +391,10 @@ export const topicLaunchRecordSchema = z.object({
   messageId: z.string().min(1),
   /** Epoch ms when the launch was accepted. */
   acceptedAt: z.number().int().nonnegative(),
-  /** Requester @-mentioned on the root card. */
-  requesterUserId: z.string().min(1),
+  /** Feishu requester @-mentioned on the root card; exactly one of this and {@link requesterLabel} is set. */
+  requesterUserId: z.string().min(1).optional(),
+  /** External requester's text shown on the root card. */
+  requesterLabel: z.string().min(1).optional(),
   /** What the root card shows, kept so the card can be redrawn after a restart. */
   card: topicRootCardSchema,
   /**
@@ -393,6 +407,8 @@ export const topicLaunchRecordSchema = z.object({
   reason: z.string().optional(),
   /** Topic id (the route key) once the topic is opened. */
   threadId: z.string().min(1).optional(),
+}).refine(record => (record.requesterUserId === undefined) !== (record.requesterLabel === undefined), {
+  message: 'exactly one of requesterUserId and requesterLabel must be set',
 })
 
 export type TopicLaunchRecord = z.infer<typeof topicLaunchRecordSchema>
@@ -415,8 +431,13 @@ export const sessionOriginRecordSchema = z.object({
   chatId: z.string().min(1),
   /** `p2p` or `group`. */
   chatType: z.enum(['p2p', 'group']),
-  /** `user_id` of the user who started the Session (the requester for launched topics). */
-  senderUserId: z.string().min(1),
+  /**
+   * `user_id` of the user who started the Session (the requester for launched
+   * topics); absent for a topic launched for an external requester.
+   */
+  senderUserId: z.string().min(1).optional(),
+  /** Display text of the external requester, when {@link senderUserId} is absent. */
+  senderLabel: z.string().min(1).optional(),
   /** Epoch ms when the Session was bound to the route. */
   createdAt: z.number().int().nonnegative(),
 })
@@ -461,6 +482,8 @@ export const feishuDomain = {
     approval_grants: { valueSchema: approvalGrantRecordSchema },
     // Delivered approval cards until decided or retried (key = card message id).
     approval_cards: { valueSchema: approvalCardRecordSchema },
+    // Non-blocking follow-up action proposal cards (key = proposalId).
+    action_proposals: { valueSchema: actionProposalRecordSchema },
   },
 } as const
 
@@ -482,6 +505,7 @@ export interface FeishuDomainHandle {
   outbox: DomainTable<OutboxEntry>
   approvalGrants: DomainTable<ApprovalGrantRecord>
   approvalCards: DomainTable<ApprovalCardRecord>
+  actionProposals: DomainTable<ActionProposalRecord>
   getGlobal(): FeishuDomainGlobal
   setGlobal(value: FeishuDomainGlobal): Promise<unknown>
   close(): Promise<void>
@@ -507,6 +531,7 @@ export async function openFeishuDomain(facility: StorageDomainFacility): Promise
     outbox: typedTable(domain.table('outbox')),
     approvalGrants: typedTable(domain.table('approval_grants')),
     approvalCards: typedTable(domain.table('approval_cards')),
+    actionProposals: typedTable(domain.table('action_proposals')),
     getGlobal: () => (domain.global.get() ?? {}) as FeishuDomainGlobal,
     setGlobal: value => domain.global.set(value),
     close: () => domain.close(),

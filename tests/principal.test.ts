@@ -19,12 +19,17 @@ describe('channel principals', () => {
     expect(principalKey(feishuUserPrincipal('u_1'))).toBe('feishu-user:u_1')
     expect(principalKey(feishuGroupPrincipal('oc_g', 'u_1'))).toBe('feishu-group:oc_g:u_1')
     expect(principalKey(feishuGroupPrincipal('oc_g', 'u_2'))).not.toBe(principalKey(feishuGroupPrincipal('oc_g', 'u_1')))
+    expect(feishuGroupPrincipal('oc_g', undefined)).toEqual({ kind: 'feishu-group', chatId: 'oc_g' })
+    expect(principalKey(feishuGroupPrincipal('oc_g', undefined))).not.toBe(principalKey(feishuGroupPrincipal('oc_g', 'u_1')))
   })
 
   it('reads both kinds back from a logged source and fails closed on anything else', () => {
     expect(promptCallerOf({ kind: 'user', rpcId: 'r', principal: { kind: 'feishu-user', userId: 'u_1' } })).toEqual({ kind: 'feishu-user', userId: 'u_1' })
     expect(promptCallerOf({ kind: 'user', rpcId: 'r', principal: { kind: 'feishu-group', chatId: 'oc_g', userId: 'u_1' } }))
       .toEqual({ kind: 'feishu-group', chatId: 'oc_g', userId: 'u_1' })
+    // A group turn no Feishu user speaks (an external launch's first turn).
+    expect(promptCallerOf({ kind: 'user', rpcId: 'r', principal: { kind: 'feishu-group', chatId: 'oc_g' } }))
+      .toEqual({ kind: 'feishu-group', chatId: 'oc_g' })
     expect(promptCallerOf({ kind: 'user', rpcId: 'r' })).toEqual({ kind: 'none' })
     expect(promptCallerOf({ kind: 'tool-jobs' })).toEqual({ kind: 'none' })
     for (const principal of [
@@ -32,7 +37,9 @@ describe('channel principals', () => {
       { kind: 'feishu-user', userId: '' },
       { kind: 'feishu-group', userId: 'u_1' },
       { kind: 'feishu-group', chatId: '', userId: 'u_1' },
-      { kind: 'feishu-group', chatId: 'oc_g' },
+      { kind: 'feishu-group', chatId: 'oc_g', userId: '' },
+      { kind: 'feishu-group', chatId: 'oc_g', userId: 7 },
+      { kind: 'feishu-user' },
       'u_1',
       null,
       7,

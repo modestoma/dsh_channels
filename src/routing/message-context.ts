@@ -28,7 +28,7 @@ export function messageReadRouteOf(record: RouteRecord): MessageReadRoute {
     kind: record.kind,
     chatId: record.chatId,
     chatType: record.chatType,
-    senderUserId: record.senderUserId,
+    ...(record.senderUserId === undefined ? {} : { senderUserId: record.senderUserId }),
   }
 }
 

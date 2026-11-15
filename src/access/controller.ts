@@ -24,6 +24,7 @@
  * @module dsh-channels/access/controller
  */
 
+import type { ActionAccessLevel } from '../actions/contract.ts'
 import type { FeishuConfig } from '../config.ts'
 import { isGroupRoute } from '../domain.ts'
 import type { AccessPermission, GroupPermission, RouteRecord } from '../domain.ts'
@@ -240,6 +241,62 @@ export class AccessController {
         return this.isAdmin(route.senderUserId) ? undefined : `${where}不是管理员，不能执行 ${event.action}`
       default:
         return `飞书会话不允许未知的授权级别 ${event.level}，不能执行 ${event.action}`
+    }
+  }
+
+  /**
+   * Pre-check whether `userId`, clicking inside `chatId`, may act on an
+   * action proposal card button requiring `requiredAccess` on `route`.
+   *
+   * Returns `undefined` when permitted, or a Chinese hint telling the user how
+   * to obtain the required permission (rendered non-destructively on the card
+   * without consuming pending buttons).
+   */
+  actionProposalRefusal(
+    userId: string | undefined,
+    chatId: string,
+    route: RouteRecord,
+    requiredAccess: ActionAccessLevel = 'chat',
+  ): string | undefined {
+    if (userId === undefined || route.chatId !== chatId) {
+      return '无法识别操作用户或会话归属不匹配，无法操作此卡片。'
+    }
+    const group = isGroupRoute(route)
+    if (!group) {
+      if (route.senderUserId !== userId) {
+        return '仅发起该会话的用户本人可操作此卡片。'
+      }
+      const chatDecision = decideAccess(
+        { chatType: 'p2p', senderId: userId },
+        this.config(),
+        this.deps.store.snapshot(),
+      )
+      if (chatDecision.kind !== 'allow') {
+        return '你尚未获得对话准入权限，请管理员在飞书渠道面板 →「访问授权」中为你开启「对话准入」（或发送 /auth add）。'
+      }
+    } else if (!this.mayActOnRoute(userId, chatId, route)) {
+      return '你尚未获得对话准入权限，请管理员在飞书渠道面板 →「访问授权」中将你加入用户表并开启「对话准入」（或发送 /auth add）。'
+    }
+
+    switch (requiredAccess) {
+      case 'chat':
+        return undefined
+      case 'code-write':
+        if (this.mayUseOnRoute(route, 'codeWrite')) return undefined
+        return group
+          ? '当前群未开启「代码改动」权限，请管理员在飞书渠道面板 →「群权限」中开启本群的「改代码」后再点击重试。'
+          : '你尚未开启「代码改动」权限，请管理员在飞书渠道面板 →「访问授权」中开启「改代码」（或发送 /auth set code on）后再点击重试。'
+      case 'wiki-write':
+        if (this.mayUseOnRoute(route, 'wikiWrite')) return undefined
+        return group
+          ? '当前群未开启「知识库写入」权限，请管理员在飞书渠道面板 →「群权限」中开启本群的「写知识库」后再点击重试。'
+          : '你尚未开启「知识库写入」权限，请管理员在飞书渠道面板 →「访问授权」中开启「写知识库」（或发送 /auth set wiki-write on）后再点击重试。'
+      case 'admin':
+        if (group) {
+          return '该动作需要管理员权限，不能在群会话中执行；请管理员在私聊会话中操作。'
+        }
+        if (this.isAdmin(route.senderUserId)) return undefined
+        return '该动作仅限管理员执行，请部署者在飞书渠道面板 →「访问授权」中将你设为管理员后再点击重试。'
     }
   }
 

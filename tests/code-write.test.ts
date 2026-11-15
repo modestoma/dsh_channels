@@ -170,4 +170,13 @@ describe('CodeWriteGate', () => {
     gate.onClaimed('s_root', { source: { kind: 'user', rpcId: 'r', principal: { kind: 'feishu-group', userId: 'u_carol' } } })
     expect(gate.speakerOf('s_root')).toBeUndefined()
   })
+
+  it('names no speaker for a group turn without one, and none after a restart on a route without an initiator', () => {
+    const { gate, routes } = setup({ chatId: 'oc_group', chatType: 'group' })
+    gate.onClaimed('s_root', { source: { kind: 'user', rpcId: 'r', principal: { kind: 'feishu-group', chatId: 'oc_group' } } })
+    expect(gate.speakerOf('s_root')).toBeUndefined()
+    gate.clear()
+    routes.set('s_root', { ...routes.get('s_root')!, senderUserId: undefined, senderLabel: '[machine] app-1' })
+    expect(gate.speakerOf('s_root')).toBeUndefined()
+  })
 })

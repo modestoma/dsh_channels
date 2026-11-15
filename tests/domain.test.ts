@@ -111,6 +111,41 @@ describe('group permission records', () => {
   })
 })
 
+describe('action proposal records', () => {
+  it('registers action_proposals in the domain and validates stored items', () => {
+    expect(Object.keys(feishuDomain.tables)).toContain('action_proposals')
+    const schema = feishuDomain.tables.action_proposals.valueSchema
+    const parsed = schema.parse({
+      proposalId: '0123456789abcdef0123456789abcdef',
+      key: 'act-1',
+      fingerprint: 'fp-1',
+      sessionId: 'session-1',
+      routeKey: 'omt_1',
+      chatId: 'oc_chat',
+      cardMessageId: 'om_card_1',
+      prompt: '可选择后续处理动作：',
+      actions: [
+        {
+          id: 'apply_patch',
+          label: '应用改动',
+          followUpPrompt: '请应用改动并运行检查',
+          status: 'pending',
+        },
+      ],
+      createdAt: 1_000,
+    })
+    expect(parsed.actions[0]).toMatchObject({
+      id: 'apply_patch',
+      style: 'default',
+      requiredAccess: 'chat',
+      independent: false,
+      status: 'pending',
+    })
+    expect(() => schema.parse({ ...parsed, actions: [] })).toThrow()
+    expect(() => schema.parse({ ...parsed, createdAt: -1 })).toThrow()
+  })
+})
+
 describe('storage domain descriptor', () => {
   it('uses backend-safe table names', () => {
     for (const tableName of Object.keys(feishuDomain.tables)) {

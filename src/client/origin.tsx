@@ -165,9 +165,11 @@ function OriginDetails({ origin, onRefresh }: { origin: SessionOriginWire; onRef
   }
   rows.push([origin.shared ? '请求人' : '发起人', (
     <span className="dsh-channels-origin__who">
-      <Avatar text={origin.senderName ?? origin.senderUserId} url={origin.senderAvatarUrl} size={20} />
+      <Avatar text={origin.senderName ?? origin.senderUserId ?? origin.senderLabel ?? '外部发起'} url={origin.senderAvatarUrl} size={20} />
       {origin.senderName === undefined ? null : <span>{origin.senderName}</span>}
-      <span className="dsh-channels-origin__mono dsh-channels-origin__muted">{origin.senderUserId}</span>
+      {origin.senderUserId === undefined
+        ? <span>{origin.senderLabel ?? '外部发起'}</span>
+        : <span className="dsh-channels-origin__mono dsh-channels-origin__muted">{origin.senderUserId}</span>}
     </span>
   )])
   const heading = originHeading(origin)

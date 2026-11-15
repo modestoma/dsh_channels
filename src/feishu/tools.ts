@@ -96,8 +96,8 @@ export interface AttachmentFetchRoute {
   readonly kind: 'thread' | 'chat'
   readonly chatId: string
   readonly chatType: 'p2p' | 'group'
-  /** Opener of the route; on a group route messages of any sender count as its own. */
-  readonly senderUserId: string
+  /** Opener of the route (absent on a group topic launched for an external requester); on a group route messages of any sender count as its own. */
+  readonly senderUserId?: string
 }
 
 /** Why a message became known to one route. */

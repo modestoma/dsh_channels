@@ -68,7 +68,8 @@ const MAX_ID_CHARS = 128
 /**
  * The channel-plane identity of the conversation whose history may be read.
  * Structurally satisfied by the durable `RouteRecord` (`key` = thread id or
- * the degraded chat route key, `senderUserId` = workspace owner).
+ * the degraded chat route key, `senderUserId` = route opener, absent on a
+ * group topic launched for an external requester).
  */
 export interface MessageReadRoute {
   /** Durable route key (thread id, or the degraded `chat:<chatId>` key). */
@@ -76,7 +77,7 @@ export interface MessageReadRoute {
   readonly kind: 'thread' | 'chat'
   readonly chatId: string
   readonly chatType: 'p2p' | 'group'
-  readonly senderUserId: string
+  readonly senderUserId?: string
 }
 
 /** One downloadable resource discovered on a message (no container id yet). */

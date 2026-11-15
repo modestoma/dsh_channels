@@ -7,7 +7,9 @@
  * same rule the channel plane applies (`AccessController.mayActOnRoute`): a
  * private-chat principal may prompt the Sessions of the private-chat routes
  * it owns; a group principal may prompt the Sessions of that group's routes
- * the admission matrix admits its user to. No binding means the Gateway refuses the call with
+ * the admission matrix admits its user to. A group principal without a
+ * speaker (the first turn of a topic launched for an external requester) may
+ * prompt that group's routes opened without an initiator. No binding means the Gateway refuses the call with
  * `remote-access/denied`, which the submitter turns into a card notice.
  *
  * @module dsh-channels/access/remote-policy
@@ -58,8 +60,10 @@ function routePermits(deps: ChannelAccessPolicyDeps, principal: ChannelPrincipal
     case FEISHU_USER_PRINCIPAL_KIND:
       return !isGroupRoute(record) && deps.mayActOnRoute(principal.userId, record.chatId, record)
     case FEISHU_GROUP_PRINCIPAL_KIND:
-      return isGroupRoute(record) && record.chatId === principal.chatId
-        && deps.mayActOnRoute(principal.userId, principal.chatId, record)
+      if (!isGroupRoute(record) || record.chatId !== principal.chatId) return false
+      return principal.userId === undefined
+        ? record.senderUserId === undefined
+        : deps.mayActOnRoute(principal.userId, principal.chatId, record)
     default:
       return assertNever(principal)
   }

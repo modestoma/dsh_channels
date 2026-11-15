@@ -20,8 +20,12 @@ export interface InteractionRoute {
   cardMessageId: string
   /** Whether the anchor lives in a real topic (replyInThread). */
   inThread: boolean
-  /** The user who opened the session (user_id); the only operator allowed to decide unless `mayDecide` is set. */
-  senderUserId: string
+  /**
+   * The user who opened the session (user_id); the only operator allowed to
+   * decide unless `mayDecide` is set. Absent only on group routes, which set
+   * `mayDecide`.
+   */
+  senderUserId?: string
   /**
    * Decision gate of a group route without a single owner: replaces the
    * owner-only check with the route's member admission (anyone with chat
