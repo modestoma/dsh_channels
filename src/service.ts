@@ -50,6 +50,7 @@ import { RouteStore } from './session/routes.ts'
 import { TopicLauncher } from './topics/launcher.ts'
 import { FeishuActions } from './actions/service.ts'
 import { ActionProposalStore, hasActiveReservations } from './actions/store.ts'
+import { FeishuBitable } from './bitable/service.ts'
 import { buildActionProposalCard } from './cards/action-proposal.ts'
 import { promptRequestIdOf } from './access/principal.ts'
 import { ProposeActionsToolRuntime } from './feishu/propose-actions.ts'
@@ -196,6 +197,8 @@ export class FeishuService {
   private readonly topicLauncher: TopicLauncher
   /** The `feishuActions` service (non-blocking follow-up action proposals). */
   private readonly feishuActions: FeishuActions
+  /** The `feishuBitable` service (domain-agnostic Feishu Base read/write bridge). */
+  private readonly feishuBitable: FeishuBitable
   private readonly actionProposalStore: ActionProposalStore
   /** Agent/session lifecycle: live registry, resume, presets, renew. */
   private readonly sessions: SessionManager
@@ -425,6 +428,11 @@ export class FeishuService {
       store: this.actionProposalStore,
       routes: this.routes,
       outbox: this.outbox,
+      warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
+    })
+    this.feishuBitable = new FeishuBitable({
+      started: () => this.started,
+      channel: () => this.channel,
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
     })
     this.proposeActionsTools = new ProposeActionsToolRuntime({
@@ -906,6 +914,8 @@ export class FeishuService {
   topics(): TopicLauncher { return this.topicLauncher }
   /** The `feishuActions` service, provided by `apply()`. */
   actions(): FeishuActions { return this.feishuActions }
+  /** The `feishuBitable` service, provided by `apply()`. */
+  bitable(): FeishuBitable { return this.feishuBitable }
   isRunning(): boolean { return this.started }
   isRestarting(): boolean { return this.restarting }
   /** True while the panel's explicit connect action is in flight. */
@@ -1216,6 +1226,7 @@ export class FeishuService {
     ensureCurrent()
     this.topicLauncher.open()
     this.feishuActions.open()
+    this.feishuBitable.open()
     // Read back what arrived while no instance was connected (background).
     this.missed.start()
     // Repair cards a previous instance left mid-flight (best-effort, background).
@@ -1318,8 +1329,10 @@ export class FeishuService {
     this.started = false
     this.topicLauncher.close()
     this.feishuActions.close()
+    this.feishuBitable.close()
     await this.topicLauncher.drain()
     await this.feishuActions.drain()
+    await this.feishuBitable.drain()
     await this.commands.drain()
     this.unlistenBotAdded?.()
     this.unlistenBotAdded = undefined
