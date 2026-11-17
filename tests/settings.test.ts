@@ -60,6 +60,7 @@ import type {
   CatalogWire,
   CredentialField,
   EditableValues,
+  MainToolCatalogWire,
   ScopeCheckWire,
   FeishuProfilesWire,
   SessionOriginWire,
@@ -363,6 +364,13 @@ class FakeTarget implements SettingsTarget {
 
   async workspaceFileDownload(workspace: string, path: string | undefined): Promise<WorkspaceDownload> {
     return readWorkspaceFile(this.allowed(workspace), path)
+  }
+
+  toolCatalog: MainToolCatalogWire | Error | undefined
+
+  async mainToolCatalog(): Promise<MainToolCatalogWire | undefined> {
+    if (this.toolCatalog instanceof Error) throw this.toolCatalog
+    return this.toolCatalog
   }
 
   async feishuProfiles(userIds: readonly string[], chatIds: readonly string[]): Promise<FeishuProfilesWire> {
@@ -1060,6 +1068,22 @@ describe('settings panel selector catalog', () => {
       .toEqual(['', 'high', 'low', 'max'])
     expect(byKey.get('agentPreset')?.options?.map(option => option.value))
       .toEqual(['', 'legacy-preset', 'standard'])
+  })
+
+  it('renders dmMainTools as a checklist when a main-Session tool catalog is known', async () => {
+    const { surface, target } = makeSurface()
+    const fieldOf = async () => (await surface.panel()).config.fields.find(field => field.key === 'dmMainTools')
+    expect((await fieldOf())?.toolCatalog).toBeUndefined()
+    const catalog: MainToolCatalogWire = {
+      live: true,
+      observedAt: 1,
+      groups: [{ label: '通用', tools: [{ name: 'read', summary: 'Read a file.' }] }],
+      alwaysAllowed: [{ name: 'run_code', reason: 'r' }],
+    }
+    target.toolCatalog = catalog
+    expect(await fieldOf()).toMatchObject({ kind: 'string-list', toolCatalog: catalog })
+    target.toolCatalog = new Error('boom')
+    expect((await fieldOf())?.toolCatalog).toBeUndefined()
   })
 
   it('keeps the free-text controls when the host exposes no catalog', async () => {

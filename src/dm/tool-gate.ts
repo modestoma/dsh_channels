@@ -7,7 +7,7 @@
  *
  * In PTC mode the model calls tools only from a `run_code` program, and each
  * tool the program calls passes this gate on its own, so `run_code` itself is
- * allowed unless it asks for a wider sandbox. The program's direct Node file,
+ * allowed unless it asks for a wider sandbox, even when `dmMainTools` names it. The program's direct Node file,
  * network and process operations are confined by the Session's OS sandbox,
  * not by this gate.
  *
@@ -19,6 +19,7 @@ import type { RouteRecord } from '../domain.ts'
 import type { PreToolDecision, PreToolExecution } from '../host/index.ts'
 import type { SessionLineage } from '../access/lineage.ts'
 import { DM_TOPIC_TOOL_NAMES } from './tools.ts'
+import { RUN_CODE_TOOL } from './tool-catalog.ts'
 
 export interface MainToolGateDeps {
   /** Live configuration (`dmMainTools`). */
@@ -29,8 +30,6 @@ export interface MainToolGateDeps {
   lineage: SessionLineage
 }
 
-/** PTC mode's program tool (`dsh-tool-executor-ptc`). */
-const RUN_CODE = 'run_code'
 
 /** Whether a `run_code` call asks to run its program under a wider sandbox mode. */
 function asksEscalation(args: unknown): boolean {
@@ -53,14 +52,14 @@ export class MainToolGate {
     const root = this.deps.lineage.rootOfCall(agent.session.id, agent.session.header.parentSession)
     if (root === undefined) return undefined
     if (this.deps.routeOf(root)?.dmRole !== 'main') return undefined
-    if (this.deps.config().dmMainTools.includes(exec.name) || DM_TOPIC_TOOL_NAMES.includes(exec.name)) return undefined
-    if (exec.name === RUN_CODE) {
+    if (exec.name === RUN_CODE_TOOL) {
       if (!asksEscalation(exec.arguments)) return undefined
       return {
         kind: 'deny',
         reason: '私聊主会话不能提升沙箱权限：需要写文件、跑命令或改代码的工作请用 feishu_topic_open 开一个话题去做。',
       }
     }
+    if (this.deps.config().dmMainTools.includes(exec.name) || DM_TOPIC_TOOL_NAMES.includes(exec.name)) return undefined
     return {
       kind: 'deny',
       reason: `私聊主会话不能调用 ${exec.name}：主会话负责对话、阅读和分派，命令行、写文件和改代码等工作请用 feishu_topic_open 开一个话题去做。`,

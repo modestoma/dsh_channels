@@ -39,6 +39,7 @@ import type {
   CredentialField,
   CredentialRefWire,
   EditableFieldWire,
+  MainToolCatalogWire,
   EditableKey,
   EditableValues,
   FeishuProfilesWire,
@@ -146,6 +147,8 @@ export interface SettingsTarget {
   workspaceFiles(workspace: string, path: string | undefined): Promise<WorkspaceListingWire>
   workspaceFilePreview(workspace: string, path: string | undefined): Promise<WorkspacePreviewWire>
   workspaceFileDownload(workspace: string, path: string | undefined): Promise<WorkspaceDownload>
+  /** Tools a projects-mode main Session sees, for the `dmMainTools` checklist; undefined when none was seen. */
+  mainToolCatalog?(): Promise<MainToolCatalogWire | undefined>
 }
 
 /** Presence/source/writability facts returned by the credentials seam. */
@@ -324,7 +327,7 @@ const FIELD_META: Record<EditableKey, FieldMeta> = {
     label: '主会话可用工具',
     group: 'dm',
     summary: 'projects 模式主会话只能调用这些工具，其余调用在执行前拒绝',
-    help: '每行一个工具名。默认只有读文件、搜索、联网、提问、技能和只读的飞书工具，没有命令行、写文件和改代码；这些工作交给话题。对之后的调用立即生效。',
+    help: '勾选主会话能调用的工具。列表从私聊主会话读出（按名字前缀分组），还没有主会话运行过时退回手填，每行一个工具名。默认只有读文件、搜索、联网、提问、技能和只读的飞书工具，没有命令行、写文件和改代码；这些工作交给话题。话题工具和 PTC 的 run_code 总是可用。对之后的调用立即生效。',
     placeholder: 'read',
     wide: true,
   },
@@ -630,6 +633,22 @@ export function withDirectoryBrowse(
   return fields.map(field => (field.key === 'baseDir' ? { ...field, browse: 'directory' } : field))
 }
 
+/**
+ * Render `dmMainTools` as a checklist over the tools a main Session sees.
+ * Without a catalog the field keeps its free-text list.
+ *
+ * @param fields - Host field descriptors.
+ * @param catalog - the main-Session tool catalog, when one is known.
+ * @returns the descriptors with `toolCatalog` on `dmMainTools`.
+ */
+export function withMainToolCatalog(
+  fields: readonly EditableFieldWire[],
+  catalog: MainToolCatalogWire | undefined,
+): EditableFieldWire[] {
+  if (catalog === undefined) return [...fields]
+  return fields.map(field => (field.key === 'dmMainTools' ? { ...field, toolCatalog: catalog } : field))
+}
+
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
@@ -894,7 +913,7 @@ export class SettingsSurface {
       ? RESTART_KEYS.filter(key => configValueOf(effective, key) !== configValueOf(running, key))
       : []
     const catalog = await this.catalogFor(effective.provider, effective.model)
-    const fields = withDirectoryBrowse(
+    const selectorFields = withDirectoryBrowse(
       applyCatalog(FIELD_DESCRIPTORS, catalog, {
         provider: effective.provider,
         model: effective.model,
@@ -903,6 +922,13 @@ export class SettingsSurface {
       }),
       this.directoryPicker?.available === true,
     )
+    let toolCatalog: MainToolCatalogWire | undefined
+    try {
+      toolCatalog = await this.target.mainToolCatalog?.()
+    } catch (error) {
+      this.logger?.warn?.('dsh-channels: 主会话工具目录读取失败：%s', messageOf(error))
+    }
+    const fields = withMainToolCatalog(selectorFields, toolCatalog)
 
     let credentialStates: Record<CredentialField, CredentialInfo> = {
       appId: { configured: false, writable: false },

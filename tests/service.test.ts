@@ -6011,6 +6011,23 @@ describe('private-chat projects mode', () => {
       await h.service.shutdown()
     })
 
+    it('saves the tools a main Session sees for the settings checklist', async () => {
+      const registry = { definitions: vi.fn(() => [{ name: 'read', description: 'Read a file.' }, { name: 'web_search', description: 'Search.' }]) }
+      const h = await setup({ dmStyle: 'project' }, {}, undefined, {}, undefined, undefined, { tools: registry })
+      expect(await h.service.mainToolCatalog()).toBeUndefined()
+      await h.onMessage(dm('主会话'))
+      await waitForEstablishedSession(h)
+      const main = h.ctxState.agents.created[0]!.handle.agent
+      settleTurn(h, main, 1, '好的')
+      await waitUntil(() => expect(h.ctxState.domain.raw.table('dm_tool_snapshots').get('main')).toBeDefined())
+      expect(registry.definitions).toHaveBeenCalledWith(main)
+      expect(await h.service.mainToolCatalog()).toMatchObject({
+        live: true,
+        groups: [{ label: '通用', tools: [{ name: 'read', summary: 'Read a file.' }, { name: 'web_search', summary: 'Search.' }] }],
+      })
+      await h.service.shutdown()
+    })
+
     it('mounts the topic tools again in a renewed main Session', async () => {
       const { h, tools } = await setupTools()
       await h.onMessage(dm('主会话'))

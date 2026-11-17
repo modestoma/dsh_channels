@@ -20,6 +20,8 @@ export { ACTION_PROPOSAL_TTL_MS, actionProposalRecordSchema }
 export type { ActionProposalRecord }
 import { dmTopicRecordSchema } from './dm/topic-directory.ts'
 import type { DmTopicRecord } from './dm/topic-directory.ts'
+import { dmToolSnapshotSchema } from './dm/tool-catalog.ts'
+import type { DmToolSnapshot } from './dm/tool-catalog.ts'
 import type { StorageDomainFacility } from './host/services.ts'
 import { typedTable } from './storage/table.ts'
 import type { DomainTable } from './storage/table.ts'
@@ -507,6 +509,8 @@ export const feishuDomain = {
     action_proposals: { valueSchema: actionProposalRecordSchema },
     // Private-chat projects-mode topics (key = thread id).
     dm_topics: { valueSchema: dmTopicRecordSchema },
+    // Tools the projects-mode main Session last saw (one row, key `main`).
+    dm_tool_snapshots: { valueSchema: dmToolSnapshotSchema },
   },
 } as const
 
@@ -531,6 +535,8 @@ export interface FeishuDomainHandle {
   actionProposals: DomainTable<ActionProposalRecord>
   /** Projects-mode topic directory (key = thread id). */
   dmTopics: DomainTable<DmTopicRecord>
+  /** Tools the projects-mode main Session last saw, for the settings panel. */
+  dmToolSnapshots: DomainTable<DmToolSnapshot>
   getGlobal(): FeishuDomainGlobal
   setGlobal(value: FeishuDomainGlobal): Promise<unknown>
   close(): Promise<void>
@@ -558,6 +564,7 @@ export async function openFeishuDomain(facility: StorageDomainFacility): Promise
     approvalCards: typedTable(domain.table('approval_cards')),
     actionProposals: typedTable(domain.table('action_proposals')),
     dmTopics: typedTable(domain.table('dm_topics')),
+    dmToolSnapshots: typedTable(domain.table('dm_tool_snapshots')),
     getGlobal: () => (domain.global.get() ?? {}) as FeishuDomainGlobal,
     setGlobal: value => domain.global.set(value),
     close: () => domain.close(),

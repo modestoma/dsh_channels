@@ -361,6 +361,33 @@ export interface FieldToggleWire {
   off: string
 }
 
+/** One tool of the main-Session checklist. */
+export interface MainToolWire {
+  name: string
+  /** First sentence of the tool description. */
+  summary: string
+}
+
+/** Tools sharing a name prefix (`feishu_*`), or 通用. */
+export interface MainToolGroupWire {
+  label: string
+  tools: MainToolWire[]
+}
+
+/**
+ * The tools a projects-mode main Session sees, for the `dmMainTools`
+ * checklist. Ticked names are stored as the field's string list.
+ */
+export interface MainToolCatalogWire {
+  /** Read now from a running main Session; false = the last saved list. */
+  live: boolean
+  /** When the list was read (epoch ms). */
+  observedAt: number
+  groups: MainToolGroupWire[]
+  /** Tools the gate always allows, shown apart and not stored. */
+  alwaysAllowed: { name: string; reason: string }[]
+}
+
 /** One editable row, fully described by the Host so the client stays schema-free. */
 export interface EditableFieldWire {
   key: EditableKey
@@ -395,6 +422,8 @@ export interface EditableFieldWire {
   maxItems?: number
   /** `string-list` only: format every non-empty entry must satisfy. */
   itemFormat?: StringListItemFormat
+  /** `dmMainTools` only: render the list as a checklist of these tools. */
+  toolCatalog?: MainToolCatalogWire
   /** Render the control below the label across the row width (paths, lists). */
   wide?: boolean
   /**
@@ -916,6 +945,11 @@ export const PANEL_COPY = {
   listTooMany: '最多 {max} 项（空输入框不计）',
   listNotArray: '必须是字符串列表',
   listEntryNotString: '必须是字符串',
+  toolsLive: '列表读自运行中的私聊主会话；打勾的工具主会话可以调用。',
+  toolsSaved: '列表是 {time} 从私聊主会话读到的（当前没有运行中的主会话）；打勾的工具主会话可以调用。',
+  toolsAlways: '总是可用',
+  toolsUnknown: '未安装',
+  toolsUnknownHint: '这些名字在配置里，但主会话里没有对应的工具（插件没装或名字写错），保存时照常保留，可以移除。',
   browseDirectory: '选择目录…',
   browsingDirectory: '选择中…',
   directoryPicked: '已选择目录',

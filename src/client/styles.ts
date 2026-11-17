@@ -77,6 +77,15 @@ const CSS = `
 .dsh-channels-cfg__inputRow>.dsh-channels-cfg__input:not(.dsh-channels-cfg__input--num){flex:1 1 auto;width:auto}
 .dsh-channels-cfg__stringList{display:flex;flex-direction:column;gap:6px;min-width:0}
 .dsh-channels-cfg__stringListItem{display:flex;flex-direction:column;gap:2px;min-width:0}
+.dsh-channels-cfg__tools{display:flex;flex-direction:column;gap:12px;min-width:0}
+.dsh-channels-cfg__toolsNote{color:var(--dc-fg3);font-size:12px;line-height:18px}
+.dsh-channels-cfg__toolGroup{display:flex;flex-direction:column;gap:2px;min-width:0}
+.dsh-channels-cfg__toolGroupLabel{font-size:12px;font-weight:600;line-height:18px;color:var(--dc-fg2);font-family:var(--dc-mono)}
+.dsh-channels-cfg__toolRow{display:flex;align-items:baseline;gap:8px;min-width:0;padding:3px 0;cursor:pointer}
+.dsh-channels-cfg__toolRow input{flex:none;margin:0;align-self:center}
+.dsh-channels-cfg__toolRow:has(input:disabled){cursor:default}
+.dsh-channels-cfg__toolName{flex:none;font-family:var(--dc-mono);font-size:12px}
+.dsh-channels-cfg__toolSummary{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dc-fg3);font-size:12px}
 .dsh-channels-cfg__fieldError{color:var(--dc-bad);font-size:12px;line-height:18px}
 .dsh-channels-cfg__textBad{color:var(--dc-bad)}
 .dsh-channels-cfg__btn{box-sizing:border-box;display:inline-flex;align-items:center;justify-content:center;gap:6px;height:30px;padding:0 12px;border:1px solid var(--dc-line);border-radius:8px;transition:background .12s,border-color .12s,color .12s;background:transparent;color:inherit;font:inherit;font-size:13px;cursor:pointer;white-space:nowrap;text-decoration:none}
