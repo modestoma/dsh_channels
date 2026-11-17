@@ -22,13 +22,14 @@
 import { randomUUID } from 'node:crypto'
 import { mkdir } from 'node:fs/promises'
 import type {
-  Agent, AgentContext, AgentHandle, AgentPresets, AgentSetup, HostContext, Session, SessionId,
+  Agent, AgentContext, AgentHandle, AgentPresets, AgentSetup, HostContext, Session, SessionId, Workspace,
 } from '../host/index.ts'
 import type { FeishuConfig } from '../config.ts'
 import { mountChannelCommands } from '../commands.ts'
 import { appendSessionHistory } from '../domain.ts'
 import type { RouteRecord } from '../domain.ts'
 import { mountChannelGuidance, mountReplyGuidance } from '../feishu/agent-context.ts'
+import { attachTopicSession, topicWorkspaceAt } from '../workspaces.ts'
 import { installRequestPolicy } from './request-policy.ts'
 import type { RequestPolicyController } from './request-policy.ts'
 
@@ -142,20 +143,22 @@ export class SessionManager {
   }
 
   /**
-   * Create a new topic's Session in its workspace and mount its guidance. A
+   * Create a new topic's Session in its workspace, mount its guidance, and
+   * attach it to the workspace so the GUI lists it there (best-effort). A
    * Session created before a failure is disposed again.
    * @param sessionId - the new Session.
-   * @param cwd - the topic workspace (Session header cwd).
+   * @param workspace - the topic workspace; its path is the Session header cwd.
    * @returns the live handle.
    */
-  async openTopicSession(sessionId: SessionId, cwd: string): Promise<AgentHandle> {
-    const handle = await this.createSession(sessionId, cwd)
+  async openTopicSession(sessionId: SessionId, workspace: Workspace): Promise<AgentHandle> {
+    const handle = await this.createSession(sessionId, workspace.path)
     try {
       await this.mountGuidance(handle.agent)
     } catch (error) {
       await handle.dispose().catch(() => {})
       throw error
     }
+    await attachTopicSession(workspace, sessionId, this.deps.warn)
     return handle
   }
 
@@ -299,7 +302,8 @@ export class SessionManager {
    * Create and atomically publish one renewed route.
    *
    * A renewal keeps the topic's directory: the new Session is created with
-   * the topic directory as its header cwd, recreated when it disappeared.
+   * the topic directory as its header cwd, recreated when it disappeared, and
+   * attached to the topic workspace while that registration exists.
    */
   async renew(record: RouteRecord, oldLive: LiveAgent): Promise<RenewCommit> {
     const sessionId = randomUUID() as SessionId
@@ -321,6 +325,8 @@ export class SessionManager {
       })
       this.requestPolicy(newHandle.agent)
       await this.mountGuidance(newHandle.agent)
+      const workspace = topicWorkspaceAt(this.deps.ctx, cwd)
+      if (workspace !== undefined) await attachTopicSession(workspace, sessionId, this.deps.warn)
       const createdAt = newHandle.agent.session.header.createdAt
 
       const current: RouteRecord = {

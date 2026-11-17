@@ -887,7 +887,7 @@ export class InboundRouter {
     // 4. Create the Session in the topic directory (its header cwd).
     let handle: AgentHandle
     try {
-      handle = await this.sessions.openTopicSession(sessionId, workspace.path)
+      handle = await this.sessions.openTopicSession(sessionId, workspace)
     } catch (error) {
       // The card lands in a final failure state — no repair needed later.
       await failCreation(error)

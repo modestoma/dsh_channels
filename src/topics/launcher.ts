@@ -373,7 +373,7 @@ export class TopicLauncher implements FeishuTopicService {
         titleText: card.title,
       })
       this.assertStarted()
-      handle = await this.deps.sessions.openTopicSession(sessionId, workspace.path)
+      handle = await this.deps.sessions.openTopicSession(sessionId, workspace)
       this.assertStarted()
 
       const record = newTopicRoute({

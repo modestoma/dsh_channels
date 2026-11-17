@@ -54,6 +54,7 @@ import { FeishuBitable } from './bitable/service.ts'
 import { buildActionProposalCard } from './cards/action-proposal.ts'
 import { promptRequestIdOf } from './access/principal.ts'
 import { ProposeActionsToolRuntime } from './feishu/propose-actions.ts'
+import { attachRouteSessions } from './workspaces.ts'
 import type { TopicLocationPort } from './workspaces.ts'
 import { classifyTurn, InflightRepair, storableMessage } from './session/repair.ts'
 import { promptOfSnapshot, type ChannelPrompt } from './session/prompt.ts'
@@ -1065,6 +1066,16 @@ export class FeishuService {
     this.routes.load()
     this.accessStore.load()
     this.outbox.start()
+    // Topic Sessions created without a workspace attachment sit under 「未分组」
+    // in the GUI; attach those of the active routes. Best-effort and off the
+    // connection path.
+    void attachRouteSessions(this.ctx, this.routes.records(), (message, ...args) => this.ctx.logger?.warn?.(message, ...args))
+      .then((attached) => {
+        if (attached > 0) this.ctx.logger?.info?.('dsh-channels: attached %d topic session(s) to their workspaces', attached)
+      })
+      .catch((error: unknown) => {
+        this.ctx.logger?.warn?.('dsh-channels: attaching topic sessions to their workspaces failed: %s', String(error))
+      })
 
     // Capture the exact set of unfinished reservations inherited at boot so
     // background reconciliation never touches concurrent live clicks from this instance.

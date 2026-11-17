@@ -20,6 +20,8 @@ export interface Workspace {
   readonly id: string
   readonly path: string
   readonly title: string
+  /** Sessions the GUI lists under this workspace; membership is explicit, never derived from a header cwd. */
+  readonly sessionIds: readonly SessionId[]
   attachSession(id: SessionId): Promise<void> | void
   detachSession(id: SessionId): Promise<void> | void
   /** Rename the workspace in the host's list (absent on older hosts). */

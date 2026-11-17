@@ -5,11 +5,15 @@
  * - group: `<baseDir>/groups/<chat_id>/<topic>/`
  *
  * The topic directory is the Session header cwd: the sandbox write boundary,
- * the read fence, the confine runner's writable root, and the workspace the
- * Session is grouped under in the GUI are all this one directory, so topics
- * of the same person or group never see each other's files and no working
- * directory is ever switched. The GUI lists topics flat; the records tab
- * groups them by group and person.
+ * the read fence, the confine runner's writable root, and the registered
+ * workspace are all this one directory, so topics of the same person or group
+ * never see each other's files and no working directory is ever switched.
+ * The GUI groups a Session under a workspace only when the workspace accounts
+ * it (`Workspace.attachSession`); a matching header cwd alone leaves it under
+ * 「未分组」. Every topic Session is therefore attached when it is created, and
+ * {@link attachRouteSessions} attaches the Sessions of existing routes at
+ * startup. The GUI lists topics flat; the records tab groups them by group
+ * and person.
  *
  * Older versions placed topics inside one shared workspace per user
  * (`<baseDir>/p2p/<user_id>/topics/<topic>/`, `<baseDir>/groups/<chat_id>/<user_id>/…`)
@@ -30,7 +34,8 @@ import { constants } from 'node:fs'
 import { access, mkdir, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import path from 'node:path'
-import type { HostContext, Workspace } from './host/index.ts'
+import type { HostContext, SessionId, Workspace } from './host/index.ts'
+import type { RouteRecord } from './domain.ts'
 
 const SAFE_SEGMENT = /^[A-Za-z0-9._-]+$/
 
@@ -264,4 +269,62 @@ export async function openTopicWorkspace(ctx: HostContext, location: TopicLocati
   )
   await location.registerGroup(place.chatId, ownerName)
   return workspace
+}
+
+/** Logger for best-effort workspace attachment. */
+export type WorkspaceWarn = (message: string, ...args: unknown[]) => void
+
+/**
+ * Attach one topic Session to its workspace so the GUI lists it there.
+ * Best-effort: a failure is logged and never fails the Feishu turn, because
+ * the Session itself works without the GUI grouping.
+ * @param workspace - the topic workspace (its path is the Session header cwd).
+ * @param sessionId - the Session to attach.
+ * @param warn - logger for a failed attachment.
+ */
+export async function attachTopicSession(workspace: Workspace, sessionId: SessionId, warn: WorkspaceWarn): Promise<void> {
+  try {
+    await workspace.attachSession(sessionId)
+  } catch (error) {
+    warn('dsh-channels: attaching session %s to workspace %s failed: %s', sessionId, workspace.path, String(error))
+  }
+}
+
+/**
+ * The registered workspace whose path is one topic directory.
+ * @param ctx - host context (workspace registry).
+ * @param dir - the topic directory (a route's `workspacePath`).
+ * @returns the workspace, or `undefined` when its registration was deleted.
+ */
+export function topicWorkspaceAt(ctx: HostContext, dir: string): Workspace | undefined {
+  return ctx.workspaceRegistry.list().find(workspace => workspace.path === dir)
+}
+
+/**
+ * Attach every Session of the given routes (their `sessionHistory`: the
+ * current one and earlier `/renew` generations) that its topic workspace does not account yet. A
+ * route whose workspace registration was deleted is skipped: deleting a
+ * workspace in the GUI deliberately moves its Sessions to 「未分组」.
+ * @param ctx - host context (workspace registry).
+ * @param routes - the active route records.
+ * @param warn - logger for failed attachments.
+ * @returns the number of Sessions attached.
+ */
+export async function attachRouteSessions(ctx: HostContext, routes: readonly RouteRecord[], warn: WorkspaceWarn): Promise<number> {
+  let attached = 0
+  for (const route of routes) {
+    const workspace = topicWorkspaceAt(ctx, route.workspacePath)
+    if (workspace === undefined) continue
+    for (const entry of route.sessionHistory) {
+      const sessionId = entry.sessionId as SessionId
+      if (workspace.sessionIds.includes(sessionId)) continue
+      try {
+        await workspace.attachSession(sessionId)
+        attached++
+      } catch (error) {
+        warn('dsh-channels: attaching session %s to workspace %s failed: %s', sessionId, workspace.path, String(error))
+      }
+    }
+  }
+  return attached
 }

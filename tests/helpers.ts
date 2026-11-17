@@ -678,11 +678,15 @@ export function makeWorkspaceRegistry(): { registry: WorkspaceRegistry; workspac
     async create(dir: string, title?: string) {
       const existing = workspaces.get(dir)
       if (existing !== undefined) return existing
+      const sessionIds: SessionId[] = []
       const workspace: Workspace = {
         id: `ws-${dir}`,
         path: dir,
         title: title ?? path.basename(dir),
-        attachSession: vi.fn(),
+        sessionIds,
+        attachSession: vi.fn(async (id: SessionId) => {
+          if (!sessionIds.includes(id)) sessionIds.unshift(id)
+        }),
         detachSession: vi.fn(),
       }
       workspaces.set(dir, workspace)
