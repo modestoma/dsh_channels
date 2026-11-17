@@ -1007,8 +1007,11 @@ describe('FeishuService', () => {
     expect(sessionEvents(old.handle.agent.session).at(-1)).toMatchObject({
       type: 'command/done', data: { kind: 'success' },
     })
-    // The renewed Session is born in the same topic directory; no Session is moved.
+    // The renewed Session is born in the same topic directory and listed under its workspace.
     expect(renewed.options.meta?.cwd).toBe(route.workspacePath)
+    expect(h.ctxState.workspaces.workspaces.get(route.workspacePath)?.sessionIds).toEqual([
+      renewed.options.sessionId, old.options.sessionId,
+    ])
 
     const resultCard = JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)
     expect(resultCard).toContain(old.options.sessionId)
@@ -1799,6 +1802,8 @@ describe('FeishuService', () => {
     // … which is registered under the person's name and the opening message.
     expect(h.ctxState.workspaces.workspaces.get(workspacePath)).toMatchObject({ title: 'u_alice · 你好呀' })
     expect(existsSync(workspacePath)).toBe(true)
+    // The GUI lists the Session under that workspace, not under 「未分组」.
+    expect(h.ctxState.workspaces.workspaces.get(workspacePath)?.sessionIds).toEqual([created.options.sessionId])
 
     // User message handed to the driver.
     expect(mock(created.handle.agent.followup)).toHaveBeenCalledTimes(1)
@@ -2871,6 +2876,51 @@ describe('FeishuService', () => {
       ...partial,
     })
   }
+
+  it('attaches the Sessions of existing routes to their topic workspaces at startup', async () => {
+    const ctxState = makeHostContext()
+    const now = Date.now()
+    const renewed = await ctxState.workspaces.registry.create('/tmp/ws-renewed')
+    const listed = await ctxState.workspaces.registry.create('/tmp/ws-listed')
+    await listed.attachSession('session-listed' as SessionId)
+    mock(listed.attachSession).mockClear()
+    const broken = await ctxState.workspaces.registry.create('/tmp/ws-broken')
+    mock(broken.attachSession).mockRejectedValueOnce(new Error('session log missing'))
+    await seedRoute(ctxState.domain.raw, 'omt_renewed', now, {
+      sessionId: 'session-new',
+      workspacePath: renewed.path,
+      sessionHistory: [{ sessionId: 'session-old', createdAt: now - 2 }, { sessionId: 'session-new', createdAt: now - 1 }],
+    })
+    await seedRoute(ctxState.domain.raw, 'omt_listed', now, {
+      sessionId: 'session-listed',
+      workspacePath: listed.path,
+      sessionHistory: [{ sessionId: 'session-listed', createdAt: now }],
+    })
+    await seedRoute(ctxState.domain.raw, 'omt_broken', now, {
+      sessionId: 'session-broken',
+      workspacePath: broken.path,
+      sessionHistory: [{ sessionId: 'session-broken', createdAt: now }],
+    })
+    // The operator deleted this topic's workspace: its Session stays under 「未分组」.
+    await seedRoute(ctxState.domain.raw, 'omt_deleted', now, {
+      sessionId: 'session-deleted',
+      workspacePath: '/tmp/ws-deleted',
+      sessionHistory: [{ sessionId: 'session-deleted', createdAt: now }],
+    })
+    const channel = makeChannel()
+    const service = new FeishuService(ctxState.ctx, makeConfig(), () => channel)
+    await service.start()
+
+    await waitUntil(() => expect(renewed.sessionIds).toEqual(['session-new', 'session-old']))
+    await waitUntil(() => expect(mock(ctxState.ctx.logger!.warn!)).toHaveBeenCalledWith(
+      'dsh-channels: attaching session %s to workspace %s failed: %s',
+      'session-broken', '/tmp/ws-broken', 'Error: session log missing',
+    ))
+    expect(mock(listed.attachSession)).not.toHaveBeenCalled()
+    expect(ctxState.workspaces.workspaces.has('/tmp/ws-deleted')).toBe(false)
+    expect(broken.sessionIds).toEqual([])
+    await service.shutdown()
+  })
 
   it('garbage-collects route records idle past routeTtlMs at startup', async () => {
     const ctxState = makeHostContext()

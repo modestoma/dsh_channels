@@ -198,7 +198,10 @@ describe('topic launch flow', () => {
       workspacePath: path.join(h.config.baseDir, 'groups', 'oc_group', 'omt_2'),
     })
     expect(h.routes()[0]).not.toHaveProperty('mode')
-    expect(h.ctxState.workspaces.workspaces.get(path.join(h.config.baseDir, 'groups', 'oc_group', 'omt_2'))).toMatchObject({ title: 'oc_group · 日志分析' })
+    expect(h.ctxState.workspaces.workspaces.get(path.join(h.config.baseDir, 'groups', 'oc_group', 'omt_2'))).toMatchObject({
+      title: 'oc_group · 日志分析',
+      sessionIds: [h.ctxState.agents.created[0]!.options.sessionId],
+    })
     expect(h.ctxState.domain.raw.table('group_permissions').get('oc_group')).toMatchObject({ chatId: 'oc_group', codeWrite: false })
     const agent = h.ctxState.agents.created[0]!.handle.agent
     expect(followupMessagesOf(agent).map(message => message.content[0]!.text)).toEqual([PROMPT])
