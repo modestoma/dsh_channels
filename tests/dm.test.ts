@@ -104,6 +104,10 @@ describe('MainToolGate', () => {
     expect(g.decide({ ...call('run_code', 's_main'), arguments: { code: 'x', sandbox_permissions: 'workspace-write', justification: 'j' } }))
       .toMatchObject({ kind: 'deny', reason: expect.stringContaining('不能提升沙箱权限') })
     expect(g.decide({ ...call('run_code', 's_topic'), arguments: { sandbox_permissions: 'workspace-write' } })).toBeUndefined()
+    config.dmMainTools = ['run_code']
+    expect(g.decide({ ...call('run_code', 's_main'), arguments: { code: 'x', sandbox_permissions: 'workspace-write' } }))
+      .toMatchObject({ kind: 'deny', reason: expect.stringContaining('不能提升沙箱权限') })
+    config.dmMainTools = []
     // A call the program makes reaches the gate under its own name.
     expect(g.decide(call('bash', 's_main'))).toMatchObject({ kind: 'deny' })
     expect(g.decide(call('feishu_topic_open', 's_main'))).toBeUndefined()
