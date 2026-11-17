@@ -7,6 +7,7 @@
  * @module dsh-channels/turn/activity
  */
 
+import { CHAT_THINKING } from '../cards/index.ts'
 import type { TurnState, WorkflowRun } from './state.ts'
 
 /** Hard cap on the activity line so it can never threaten the card budget. */
@@ -159,4 +160,26 @@ export function headlineOf(state: TurnState, now: number): string {
  */
 export function activityKind(line: string): string {
   return line === '' ? '' : (line.split('·')[0] ?? '').trim()
+}
+
+/** Notation line under the last chat card of a turn the owner stopped. */
+export const CHAT_STOPPED_LINE = '⏹ 已停止'
+
+/**
+ * The notation line of one chat card (see `TurnState.chat`): while the turn
+ * runs, a short waiting line on the newest card as long as it has no text;
+ * once settled, the stopped notice on the last card. Empty otherwise.
+ * @param state - the chat turn.
+ * @param body - the card's body.
+ * @param last - whether the card is the turn's newest.
+ * @returns the line, or ''.
+ */
+export function chatLine(state: TurnState, body: string, last: boolean): string {
+  if (!last) return ''
+  if (state.finalized) return state.phase === 'stopped' ? CHAT_STOPPED_LINE : ''
+  if (body.trim() !== '') return ''
+  if (state.awaitingApproval.length > 0) return clipActivity(`✋ 等待审批：${state.awaitingApproval.join('、')}`)
+  if (state.awaitingAnswer) return '❓ 等待你回答'
+  if (state.compacting) return '正在整理上下文…'
+  return CHAT_THINKING
 }

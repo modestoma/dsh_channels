@@ -53,6 +53,7 @@ import type {
   SaveConfigResponse,
   SaveCredentialsRequest,
   SaveCredentialsResponse,
+  SelectCatalogWire,
   ScopeCheckWire,
   SessionOriginResponse,
   SessionOriginWire,
@@ -171,6 +172,7 @@ const OPTIONAL_TEXT_KEYS = new Set<EditableKey>([
   'agentPreset',
   'maxTokens',
   'dmMainPreset',
+  'dmMainReasoningEffort',
 ])
 
 const BOOLEAN_KEYS = new Set<EditableKey>([
@@ -262,6 +264,10 @@ const SELECT_OPTIONS: Partial<Record<EditableKey, ReadonlyArray<{ value: string;
     { value: 'topic', label: '话题模式' },
     { value: 'project', label: 'projects 模式' },
   ],
+  dmMainReplyStyle: [
+    { value: 'chat', label: '聊天消息' },
+    { value: 'card', label: '状态卡片' },
+  ],
   dmMode: [
     { value: 'open', label: '开启' },
     { value: 'disabled', label: '关闭' },
@@ -322,6 +328,19 @@ const FIELD_META: Record<EditableKey, FieldMeta> = {
     group: 'dm',
     summary: 'projects 模式主会话使用的预设，留空沿用「模型」页的预设',
     placeholder: '留空 = 沿用 Agent 预设',
+  },
+  dmMainReasoningEffort: {
+    label: '主会话推理档位',
+    group: 'dm',
+    summary: 'projects 模式主会话的推理档位，留空沿用「模型」页的推理档位',
+    help: '主会话主要是对话和分派话题，调低档位第一句回复来得更快；话题仍用「模型」页的档位。会话里用 /effort 改过的以 /effort 为准。之后新建或恢复的主会话生效。',
+    placeholder: '留空 = 沿用推理档位',
+  },
+  dmMainReplyStyle: {
+    label: '主会话回复样式',
+    group: 'dm',
+    summary: '聊天消息：只显示回复文字，两次工具调用之间的每段文字单独一条消息；状态卡片：和话题一样的流式卡片',
+    help: '聊天消息样式不显示状态行、思考过程和统计，工作中只在你的消息上显示「敲键盘」表情。对之后的回复生效。',
   },
   dmMainTools: {
     label: '主会话可用工具',
@@ -576,21 +595,40 @@ function cleanCatalogQuery(value: string | undefined): string | undefined {
   return trimmed
 }
 
+/** Inherit option of the main-Session effort selector, which falls back to `reasoningEffort`. */
+const MAIN_EFFORT_INHERIT_LABEL = '留空 = 沿用推理档位'
+
 /**
- * Attach the live catalog to the four selector fields. A configured value the
- * host no longer advertises stays visible as an extra option so opening the
- * panel never silently rewrites the effective config.
+ * The catalog selector a field renders: its own, or for
+ * `dmMainReasoningEffort` the efforts of the configured model (the main
+ * Session runs the same model) with its own inherit label.
+ */
+function selectorFor(key: EditableKey, catalog: CatalogWire): SelectCatalogWire | undefined {
+  if (key === 'dmMainReasoningEffort') {
+    const efforts = catalog.reasoningEffort
+    const [inherit, ...rest] = efforts.options
+    return inherit === undefined || inherit.value !== ''
+      ? efforts
+      : { ...efforts, options: [{ ...inherit, label: MAIN_EFFORT_INHERIT_LABEL }, ...rest] }
+  }
+  return isCatalogKey(key) ? catalog[key] : undefined
+}
+
+/**
+ * Attach the live catalog to the selector fields (the four catalog keys and
+ * `dmMainReasoningEffort`). A configured value the host no longer advertises
+ * stays visible as an extra option so opening the panel never silently
+ * rewrites the effective config.
  */
 export function applyCatalog(
   fields: readonly EditableFieldWire[],
   catalog: CatalogWire,
-  current: Partial<Record<CatalogKey, ConfigValue | undefined>>,
+  current: Partial<Record<CatalogKey | 'dmMainReasoningEffort', ConfigValue | undefined>>,
 ): EditableFieldWire[] {
   return fields.map((field) => {
-    if (!isCatalogKey(field.key)) return field
-    const selector = catalog[field.key]
-    if (!selector.selectable) return field
-    const value = current[field.key]
+    const selector = selectorFor(field.key, catalog)
+    if (selector === undefined || !selector.selectable) return field
+    const value = current[field.key as CatalogKey | 'dmMainReasoningEffort']
     const options = typeof value === 'string' && value !== ''
       && !selector.options.some(option => option.value === value)
       ? withCurrentOption(selector.options, value)
@@ -919,6 +957,7 @@ export class SettingsSurface {
         model: effective.model,
         reasoningEffort: effective.reasoningEffort,
         agentPreset: effective.agentPreset,
+        dmMainReasoningEffort: effective.dmMainReasoningEffort,
       }),
       this.directoryPicker?.available === true,
     )

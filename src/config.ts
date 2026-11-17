@@ -168,6 +168,21 @@ export const configSchema = z.object({
    */
   dmMainPreset: z.string().trim().min(1).optional(),
   /**
+   * Exact model-advertised reasoning-effort id of the projects-mode main
+   * Session (optional → `reasoningEffort`). The main Session mostly talks and
+   * hands work to topics, so a lower effort makes its first sentence arrive
+   * sooner; topics keep `reasoningEffort`. A Session-level `/effort` still
+   * wins. Applies to main Sessions created or resumed afterwards.
+   */
+  dmMainReasoningEffort: z.string().trim().min(1).optional(),
+  /**
+   * How the projects-mode main Session's replies appear. `chat`: chat-style
+   * messages, one per stretch of text between tool calls, showing only the
+   * text (no headline, reasoning panel or figures). `card`: the streaming
+   * status card topics and groups use.
+   */
+  dmMainReplyStyle: z.enum(['chat', 'card']).default('chat'),
+  /**
    * Tools the projects-mode main Session may call; every other call is denied
    * before it runs. The main Session talks, reads and hands work to topics, so
    * the default allows reading, search, web, questions, skills and the

@@ -61,6 +61,12 @@
  * runs when the content actually changed. Segment sends are serialized per
  * session so cards arrive in order.
  *
+ * Chat cards: a turn of a Session `chatReplies` names (the projects-mode
+ * main Session) renders as chat cards: the body and one short notation line
+ * only, and each stretch of answer text after a committed model step opens a
+ * new card instead of growing the previous one. Chat turns run no keep-alive
+ * heartbeat.
+ *
  * Keep-alive: the headline's elapsed counter is re-rendered on a slow
  * heartbeat (`heartbeatMs`, default 5 s), so the card never sits silently on
  * a live turn.
@@ -80,7 +86,7 @@ import type { CardState, StopControl } from '../cards/index.ts'
 import type { FeishuChannel } from '../feishu-channel.ts'
 import { cacheHitPct, foldAll, foldEvent } from '../stats.ts'
 import type { StatsFold } from '../stats.ts'
-import { activityKind, delegationLine, headlineOf } from './activity.ts'
+import { activityKind, chatLine, delegationLine, headlineOf } from './activity.ts'
 import { CardDelivery } from './delivery.ts'
 import type { DeliveryHooks } from './delivery.ts'
 import {
@@ -102,7 +108,7 @@ export type { SegmentDelivery, TurnOutcome } from './state.ts'
  * console can confirm which build of the activity status line is loaded.
  * Bump on every behavior change to this feature.
  */
-export const ACTIVITY_BUILD_MARKER = 'activity-status-v8'
+export const ACTIVITY_BUILD_MARKER = 'activity-status-v9'
 
 /** Card figures read from host projections (all optional: unit may be unmounted). */
 export interface ProjectedStats {
@@ -138,6 +144,13 @@ export interface StreamerHooks extends DeliveryHooks {
    * `sendSegmentCard` as segment 1.
    */
   hostTurnOrigin?(sessionId: string, message: UserMessage): string | undefined
+  /**
+   * Whether the session's turns render as chat cards (the projects-mode main
+   * Session's chat-style replies): body only, one card per stretch of answer
+   * text, no keep-alive heartbeat. Read once per turn, when its state is
+   * created. Absent: never.
+   */
+  chatReplies?(sessionId: string): boolean
 }
 
 /** What a finalized turn settled with. */
@@ -239,9 +252,9 @@ export class TurnStreamer {
   }
 
   /** Track the session, queue a new state for it and start its heartbeat. */
-  private enqueue(session: Session, init: TurnStateInit, turn?: number): TurnState {
+  private enqueue(session: Session, init: Omit<TurnStateInit, 'chat'>, turn?: number): TurnState {
     this.track(session)
-    const state = newTurnState(init)
+    const state = newTurnState({ ...init, chat: this.hooks.chatReplies?.(session.id) === true })
     state.turn = turn
     const queue = this.bySession.get(session.id) ?? []
     queue.push(state)
@@ -637,7 +650,8 @@ export class TurnStreamer {
    * itself while the turn is pending; `finalize`/`detach` cancel it.
    */
   private scheduleHeartbeat(sessionId: string, state: TurnState): void {
-    if (state.disposed || state.finalized || state.heartbeatTimer !== undefined) return
+    // A chat card shows no elapsed counter.
+    if (state.chat || state.disposed || state.finalized || state.heartbeatTimer !== undefined) return
     state.heartbeatTimer = setTimeout(() => {
       state.heartbeatTimer = undefined
       if (state.disposed || state.finalized) return
@@ -658,6 +672,7 @@ export class TurnStreamer {
    * transition logging stay accurate.
    */
   private cardState(sessionId: string, state: TurnState, body: string, index: number): CardState {
+    if (state.chat) return this.chatCardState(sessionId, state, body, index)
     const active = index === state.cards.length - 1
     const now = Date.now()
     const status = delegationLine(state, now)
@@ -686,6 +701,31 @@ export class TurnStreamer {
       ...(queued ? { queued, queuedDenied: state.queuedDenied } : {}),
       ...(state.dropped ? { dropped: true } : {}),
       stats: this.statsFor(sessionId, state),
+    }
+  }
+
+  /**
+   * Snapshot one chat card (see `TurnState.chat`): the body, the card's
+   * {@link chatLine}, and the stop button on the newest card of the running
+   * turn. Chat cards show no figures, so the stats are not measured.
+   */
+  private chatCardState(sessionId: string, state: TurnState, body: string, index: number): CardState {
+    const last = index === state.cards.length - 1
+    const queued = this.isQueued(sessionId, state)
+    const stop: StopControl | undefined = !last || state.finalized || queued
+      ? undefined
+      : state.stopRequested ? 'stopping' : 'ready'
+    return {
+      phase: state.phase,
+      reasoning: '',
+      body,
+      chat: true,
+      ...(state.origin === undefined ? {} : { origin: state.origin }),
+      headline: chatLine(state, body, last),
+      ...(stop === undefined ? {} : { stop, stopDenied: state.stopDenied }),
+      ...(queued ? { queued, queuedDenied: state.queuedDenied } : {}),
+      ...(state.dropped ? { dropped: true } : {}),
+      stats: { sessionId: this.hooks.sessionLabel(sessionId), inputTokens: 0, outputTokens: 0 },
     }
   }
 

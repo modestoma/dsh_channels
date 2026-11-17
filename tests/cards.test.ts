@@ -25,6 +25,9 @@ import {
   cardJsonBytes,
   buildMergedCard,
   initialStreamingCard,
+  initialChatCard,
+  CHAT_EMPTY_NOTICE,
+  CHAT_THINKING,
   MAX_PICKER_OPTIONS,
   MERGED_NOTICE,
   QUEUED_NOTICE,
@@ -891,5 +894,46 @@ describe('command picker cards', () => {
     expect(parsePickAction({ ...value, arg: 'a b' })).toBeUndefined()
     expect(parsePickAction({ ...value, arg: 1 })).toBeUndefined()
     expect(parsePickAction({ ...value, sessionId: '' })).toBeUndefined()
+  })
+})
+
+describe('chat cards', () => {
+  const stats = { sessionId: 's', inputTokens: 0, outputTokens: 0 }
+  const elementsOfCard = (value: object): unknown[] => (value as { body: { elements: unknown[] } }).body.elements
+
+  it('opens with the thinking line only', () => {
+    expect(elementsOfCard(initialChatCard())).toEqual([{ tag: 'markdown', content: CHAT_THINKING, text_size: 'notation' }])
+  })
+
+  it('renders the origin, the body and the line, with no headline, panel, status or footer', () => {
+    const rendered = buildCard({
+      phase: 'done',
+      reasoning: '推理',
+      body: '结论',
+      status: '🤖 子代理完成',
+      headline: '⏹ 已停止',
+      origin: '🤖 子代理完成后继续',
+      chat: true,
+      stats,
+    })
+    expect(elementsOfCard(rendered)).toEqual([
+      { tag: 'markdown', content: '🤖 子代理完成后继续', text_size: 'notation' },
+      { tag: 'markdown', content: '结论' },
+      { tag: 'markdown', content: '⏹ 已停止', text_size: 'notation' },
+    ])
+  })
+
+  it('keeps a continuation card without a segment header, and never renders an empty card', () => {
+    const blank = buildCard({ phase: 'done', reasoning: '', body: '', chat: true, stats }, { segment: 2 })
+    expect(elementsOfCard(blank)).toEqual([{ tag: 'markdown', content: '…', text_size: 'notation' }])
+    const settled = buildCard({ phase: 'done', reasoning: '', body: '', chat: true, stats })
+    expect(elementsOfCard(settled)).toEqual([{ tag: 'markdown', content: CHAT_EMPTY_NOTICE, text_size: 'notation' }])
+  })
+
+  it('still splits a long chat body within the card budget', () => {
+    const body = '段落。\n\n'.repeat(6_000)
+    const split = segmentCardContent({ phase: 'replying', reasoning: '', body, chat: true, stats })
+    expect(split.tail).not.toBe('')
+    expect(cardJsonBytes(buildCard({ phase: 'replying', reasoning: '', body: split.head, chat: true, stats }))).toBeLessThanOrEqual(CARD_TARGET_BYTES)
   })
 })

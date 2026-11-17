@@ -345,6 +345,8 @@ npm 发行包已包含构建产物：Host 入口是 `lib/index.js`（profile 直
     dmMode: 'open'
     dmStyle: 'topic'                    # 默认私聊模式：topic（每条消息开话题）| project（主会话 + 话题，见「私聊的两种模式」）；用户表可按人覆盖
     # dmMainPreset: 'chat'              # projects 模式主会话的 Agent 预设（缺省沿用 agentPreset）
+    # dmMainReasoningEffort: 'low'      # projects 模式主会话的推理档位（缺省沿用 reasoningEffort）
+    dmMainReplyStyle: 'chat'            # projects 模式主会话的回复样式：chat（聊天消息）| card（状态卡片）
     dmMainTools: [read, read_image, grep, glob, lsp, web_search, web_fetch, ask_user_question, todo_write, skill, feishu_topic_messages, feishu_attachment_fetch, feishu_send_file, propose_actions, feishu_wiki_list, feishu_wiki_read, feishu_wiki_sheet_read, feishu_wiki_base_read]  # 主会话只能调用这些工具（默认值）
     dmMaxRunningTopics: 5               # projects 模式主会话同时在跑的话题上限（1–50）
     dmReportChars: 300                  # 话题每轮报给主会话的小结长度（50–2000 字）
@@ -486,6 +488,7 @@ FEISHU_APP_SECRET: xxxxxxxx
 - 会话创建后经 DSH 的工作目录服务（`workingDirectory`）移到自己的目录；没有这个服务的部署里，会话留在这个人的工作区根目录，读围栏照样只放行自己的目录和 `shared/`。
 - **读写范围**：话题会话只能访问自己的目录和 `shared/`，主会话只能访问 `main/` 和 `shared/`，都看不到其他话题的文件，免得无关文件挤占上下文。约定成果放进 `shared/`。
 - **主会话工具收紧**：主会话只能调用 `dmMainTools` 里的工具（默认是读文件、搜索、联网、提问、技能和只读的飞书工具），其余调用在执行前拒绝，不管挂的是哪个 Agent 预设；命令行、写文件、改代码都在话题里做。主会话可以用 `dmMainPreset` 换一个预设。设置面板里这一项是勾选列表：工具从运行中的私聊主会话读出（每轮结束后保存一份，重启后还能看到上次的列表），按名字前缀分组并带一行说明；配置里有、主会话里没有的名字标「未安装」；话题工具和 `run_code` 显示为总是可用。还没有主会话运行过时退回手填工具名。PTC 模式下模型只能从 `run_code` 程序里调工具：主会话的 `run_code` 放行（程序里调用的每个工具仍按上面的名单逐个检查），但不能带 `sandbox_permissions` 提升沙箱（`dmMainTools` 里写了 `run_code` 也一样）；程序直接做的 Node 文件、网络、进程操作只受会话的 OS 沙箱约束。
+- **主会话回复像聊天**（`dmMainReplyStyle`，默认 `chat`）：主会话的回复是聊天消息，只显示回复文字，没有状态行、思考过程、统计和「回复分段」标题。模型每一步写的文字单独发一条消息（两次工具调用之间的那段写完，下一段就是新的一条），新消息直接发在对话里，不引用你的消息。还没写出文字时消息里只有一行「思考中…」（等审批、等回答时换成对应提示）；工作中你的消息上一直是「敲键盘」表情，结束后换成完成或失败；正在输出的那条带停止按钮，停止后最后一条下面标「已停止」。主会话的提示词要求它先用一两句话回应、再调工具，简单问题直接回答。`dmMainReasoningEffort` 单独设主会话的推理档位（默认沿用 `reasoningEffort`），调低档位第一句回复来得更快，话题仍用 `reasoningEffort`；会话里用 `/effort` 改过的以 `/effort` 为准，之后新建或恢复的主会话生效。设成 `card` 时主会话和话题一样用流式状态卡片，后续卡片同样直接发在对话里。
 - 话题会话首轮带上话题里的消息（包括被回复的那条主会话消息）；主会话首轮不带历史。
 - 群聊不受这两种模式影响。话题模式的话题目录 `<baseDir>/p2p/<user_id>/<话题 id>/` 和这些目录在同一层，话题 id 不会和 `main`、`topics`、`shared` 重名。
 

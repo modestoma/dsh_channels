@@ -54,6 +54,7 @@ function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
     dmMainTools: [...DEFAULT_DM_MAIN_TOOLS],
     dmMaxRunningTopics: 5,
     dmReportChars: 300,
+    dmMainReplyStyle: 'card',
     requireMention: true,
     threadFallback: 'degrade',
     loggerLevel: 'info',
@@ -5646,6 +5647,53 @@ describe('private-chat projects mode', () => {
     await h.onMessage(dm('回到主会话'))
     await waitUntil(() => expect(mock(h.ctxState.agents.created[0]!.handle.agent.followup)).toHaveBeenCalledTimes(1))
     expect(h.ctxState.agents.created).toHaveLength(2)
+    await h.service.shutdown()
+  })
+
+  it('answers the main chat with chat cards sent as new messages, and topics with status cards', async () => {
+    const h = await setup({ dmStyle: 'project', dmMainReplyStyle: 'chat' })
+    const first = dm('今天先聊聊计划')
+    await h.onMessage(first)
+    await waitForEstablishedSession(h)
+    const sent = (index: number) => h.channel.sent.at(index) as { input: object; options?: object }
+    const opening = sent(0)
+    expect(opening.options).toBeUndefined()
+    expect(JSON.stringify(opening.input)).toContain('思考中…')
+    expect(JSON.stringify(opening.input)).not.toContain('⚙️ 进行中')
+    const main = h.ctxState.agents.created[0]!.handle.agent
+    // The text after the next model step follows as its own message.
+    const frame = h.ctxState.assistantStreamListeners[0]!
+    frame({ agent: main, frame: { type: 'chunk', attemptId: 'a1', revision: 1, index: 0, time: 1, chunk: { type: 'text-delta', index: 0, text: '我先看看。' } } })
+    frame({ agent: main, frame: { type: 'end', attemptId: 'a1', revision: 1, index: 1, outcome: { kind: 'committed', eventType: 'assistant/message', seq: 1 } } })
+    frame({ agent: main, frame: { type: 'chunk', attemptId: 'a2', revision: 1, index: 0, time: 2, chunk: { type: 'text-delta', index: 0, text: '看完了。' } } })
+    h.ctxState.sessionListeners[0]!(main.session, { type: 'turn/end', seq: 2, data: { turn: 1, reason: 'stop' } })
+    await waitUntil(() => expect(h.channel.sent.length).toBeGreaterThanOrEqual(2))
+    expect(sent(1).options).toBeUndefined()
+    expect(JSON.stringify(sent(1).input)).toContain('看完了。')
+    expect(JSON.stringify(sent(1).input)).not.toContain('回复分段')
+
+    await resetFollowupAfterEstablishment(main)
+    await h.onMessage(dm('继续'))
+    await waitUntil(() => expect(mock(main.followup)).toHaveBeenCalledTimes(1))
+    expect(sentOptions(h, -1)).toBeUndefined()
+
+    await h.onMessage(dm('展开讲讲', { threadId: 'omt_chat' }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
+    expect(JSON.stringify(sent(-1).input)).toContain('⚙️ 进行中')
+    await h.service.shutdown()
+  })
+
+  it('runs the main Session at dmMainReasoningEffort and topics at reasoningEffort', async () => {
+    const h = await setup({ dmStyle: 'project', reasoningEffort: 'high', dmMainReasoningEffort: 'low' })
+    await h.onMessage(dm('主会话'))
+    await waitForEstablishedSession(h)
+    await h.onMessage(dm('话题', { threadId: 'omt_effort' }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
+    const request = (index: number) => dispatchAgentRequest(h.ctxState.agents.created[index]!.setupCtx, {
+      provider: 'deepseek-official', model: 'deepseek-v4-flash',
+    })
+    await expect(request(0)).resolves.toMatchObject({ reasoningEffort: 'low' })
+    await expect(request(1)).resolves.toMatchObject({ reasoningEffort: 'high' })
     await h.service.shutdown()
   })
 
