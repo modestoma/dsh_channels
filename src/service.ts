@@ -19,6 +19,9 @@ import { CodeWriteGate } from './access/code-write.ts'
 import { ReadFence } from './access/read-fence.ts'
 import { readRootsOf } from './dm/layout.ts'
 import { MainToolGate } from './dm/tool-gate.ts'
+import { DmTopicDirectory, topicTitle, topicUpdatesBlock } from './dm/topic-directory.ts'
+import { DmTopicOpener } from './dm/topic-opener.ts'
+import { DmTopicToolRuntime } from './dm/tools.ts'
 import { SessionLineage } from './access/lineage.ts'
 import { AccessController } from './access/controller.ts'
 import { AccessRequests } from './access/requests.ts'
@@ -85,7 +88,7 @@ import { readProjectionViews } from './stats.ts'
 import { createLogicalSessionExport } from './session-export.ts'
 import type { SessionExportBuilder } from './session-export.ts'
 import { ACTIVITY_BUILD_MARKER, TurnStreamer } from './turn/streamer.ts'
-import type { ProjectedStats, StreamerHooks } from './turn/streamer.ts'
+import type { ProjectedStats, SettledTurn, StreamerHooks } from './turn/streamer.ts'
 import type { FeishuConfig } from './config.ts'
 import { ConnectionChecks } from './feishu/connection-checks.ts'
 import { ProfileDirectory } from './feishu/profiles.ts'
@@ -198,6 +201,10 @@ export class FeishuService {
   private readonly inbound: InboundRouter
   /** The `feishuTopics` service (other plugins' launches → shared topics). */
   private readonly topicLauncher: TopicLauncher
+  /** Private-chat projects-mode topics: directory, opening and forwarding, main-Session tools. */
+  private readonly dmTopics: DmTopicDirectory
+  private readonly dmTopicOpener: DmTopicOpener
+  private readonly dmTopicTools: DmTopicToolRuntime
   /** The `feishuActions` service (non-blocking follow-up action proposals). */
   private readonly feishuActions: FeishuActions
   /** The `feishuBitable` service (domain-agnostic Feishu Base read/write bridge). */
@@ -381,7 +388,7 @@ export class FeishuService {
       persistRoute: (key, record) => this.routes.put(key, record),
       started: () => this.started,
       detachStream: sessionId => this.streamer?.detach(sessionId),
-      mountTools: (agentCtx, sessionId) => {
+      mountTools: (agentCtx, sessionId, dmRole) => {
         // The fetch tool is the only way the model reaches attachment bytes,
         // so it is mounted exactly when the deployment accepts attachments.
         // The topic-messages tool self-gates on `feishuTools.topicMessages`
@@ -395,6 +402,7 @@ export class FeishuService {
         mounts.push(this.sendFileTools.mount(agentCtx, sessionId))
         mounts.push(this.proposeActionsTools.mount(agentCtx, sessionId))
         mounts.push(this.wikiTools.mount(agentCtx, sessionId))
+        if (dmRole === 'main') mounts.push(this.dmTopicTools.mount(agentCtx, sessionId))
         return Promise.all(mounts).then(() => undefined)
       },
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
@@ -569,6 +577,14 @@ export class FeishuService {
       stageImage: (agent, bytes, name) => this.submitter.stageImage(agent, bytes, name),
       run: (agent, prompt, card) => this.runTurn(agent, prompt, card),
     }
+    this.dmTopics = new DmTopicDirectory({
+      table: () => this.domain?.dmTopics,
+      route: key => (this.routes.expiredRoute(key) === undefined ? this.routes.get(key) : undefined),
+      busy: sessionId => this.streamer?.hasLiveTurn(sessionId) === true,
+      waiting: sessionId => this.approvalAnswerer?.hasPendingFor(sessionId) === true
+        || this.questionAnswerer?.hasPendingFor(sessionId) === true,
+      warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
+    })
     this.inbound = new InboundRouter({
       ctx: this.ctx,
       config: () => this.config,
@@ -599,6 +615,22 @@ export class FeishuService {
       streamer: () => this.streamer,
       questionAnswerer: () => this.questionAnswerer,
       approvalAnswerer: () => this.approvalAnswerer,
+      dmTopics: {
+        opened: async (record, content) => {
+          await this.dmTopics.register({
+            key: record.key, userId: record.senderUserId ?? '', chatId: record.chatId, title: topicTitle(content), openedBy: 'user',
+          })
+        },
+        turnStarted: key => this.dmTopicOpener.showTurnStatus(key, { kind: 'running' }),
+        updates: main => {
+          const pending = this.dmTopics.pendingUpdates(main.senderUserId ?? '')
+          const block = topicUpdatesBlock(pending, record => this.dmTopics.statusOf(record))
+          return block === ''
+            ? undefined
+            : { block, delivered: pending.map(record => ({ key: record.key, reportedAt: record.reportedAt ?? 0 })) }
+        },
+        delivered: delivered => this.dmTopics.markDelivered(delivered),
+      },
       commands: {
         owns: (line) => {
           const parsed = parseSlashCommand(line)
@@ -657,6 +689,28 @@ export class FeishuService {
       reserveTopic: threadId => this.inbound.reserveTopic(threadId),
       location: this.topicLocation,
       mayLaunchFor: requesterUserId => this.accessController.mayLaunchFor(requesterUserId),
+    })
+    this.dmTopicOpener = new DmTopicOpener({
+      ctx: this.ctx,
+      config: () => this.config,
+      started: () => this.started,
+      channel: () => this.channel,
+      routes: this.routes,
+      repair: this.repair,
+      sessions: this.sessions,
+      prompts,
+      queue: this.routeOperations,
+      reserveTopic: threadId => this.inbound.reserveTopic(threadId),
+      location: this.topicLocation,
+      directory: this.dmTopics,
+      busy: sessionId => this.streamer?.hasLiveTurn(sessionId) === true,
+      warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
+    })
+    this.dmTopicTools = new DmTopicToolRuntime({
+      routeOfSession: sessionId => this.routes.findBySession(sessionId),
+      opener: this.dmTopicOpener,
+      directory: this.dmTopics,
+      warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
     })
   }
 
@@ -1045,11 +1099,12 @@ export class FeishuService {
       onError: (_key, error) => {
         this.ctx.logger?.warn?.('dsh-channels stream error: %s', String(error))
       },
-      onTurnFinalized: (_sessionId, _turn, mainCardMessageId) => {
+      onTurnFinalized: (sessionId, _turn, mainCardMessageId, settled) => {
         // The turn settled (final patches fired, reaction swap requested):
         // retire its repair snapshot. Kept deliberately non-awaited — repair
         // state is a safety net, never a dependency of the turn lifecycle.
         void this.repair.clear(mainCardMessageId)
+        void this.recordDmTopicTurn(sessionId, settled)
       },
       onSegmentDelivered: (mainCardMessageId, segmentIndex, messageId, mode) => {
         void this.repair.recordSegment(mainCardMessageId, segmentIndex, messageId, mode)
@@ -1355,6 +1410,7 @@ export class FeishuService {
     this.feishuActions.close()
     this.feishuBitable.close()
     await this.topicLauncher.drain()
+    await this.dmTopicOpener.drain()
     await this.feishuActions.drain()
     await this.feishuBitable.drain()
     await this.commands.drain()
@@ -1465,6 +1521,22 @@ export class FeishuService {
       streamer.rejectQueued(agent.id, prompt.requestId, reason)
       return { accepted: false, reason }
     }
+  }
+
+  /**
+   * Record a settled projects-mode topic turn in the topic directory (its
+   * summary then waits for the main Session) and show its outcome on the
+   * topic's root card. Best-effort: a failure is logged.
+   */
+  private async recordDmTopicTurn(sessionId: string, settled: SettledTurn): Promise<void> {
+    const route = this.routes.findBySession(sessionId)
+    if (route?.dmRole !== 'topic' || this.dmTopics.get(route.key) === undefined) return
+    try {
+      await this.dmTopics.recordTurn(route.key, settled.outcome, settled.reply, this.config.dmReportChars)
+    } catch (error) {
+      this.ctx.logger?.warn?.('dsh-channels: recording topic %s turn failed: %s', route.key, String(error))
+    }
+    await this.dmTopicOpener.showTurnStatus(route.key, { kind: settled.outcome })
   }
 
   /** Capture aggregate health only; raw configuration and errors are excluded. */

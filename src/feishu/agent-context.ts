@@ -128,14 +128,23 @@ export function projectGuidance(role: 'main' | 'topic', ownDir: string, sharedDi
 This is the person's main conversation with you in a Feishu private chat. It stays one ongoing session; deeper work happens in topics, each with its own session.
 
 - Your working directory is ${ownDir}. You can read it and the person's shared directory ${sharedDir}; the topics' directories are not visible to you.
-- Here you talk, read, search and look things up. Running commands, writing files and changing code are not available in this conversation. When a request needs them, or a long focused discussion, ask the person to reply in a topic (Feishu 「回复话题」) on the relevant message: that opens a topic session with the full toolset.
+- Here you talk, read, search and look things up. Running commands, writing files and changing code are not available in this conversation.
+- Open a topic with \`feishu_topic_open\` when a request needs those tools, several investigation steps, or more than a few minutes of focused work. Write the brief so the topic can work without this conversation: background, goal, known facts, constraints, expected output. Then tell the person in one sentence which topic you opened, and end your turn; do not wait for the topic. Answer quick questions yourself instead of opening a topic.
+- The person can also open a topic by replying in a topic (Feishu 「回复话题」) on any message.
+- After a topic's turn its summary reaches you in a \`<dm_topic_updates>\` block on the person's next message. Use \`feishu_topic_list\` for an overview, \`feishu_topic_read\` for a topic's latest replies, and \`feishu_topic_send\` to pass a follow-up request into an existing topic instead of opening a duplicate.
 - Results that topics put in ${sharedDir} are readable here.`
   }
   return `## Feishu private chat: topic
 This session is one topic of the person's Feishu private chat. The person's main conversation and their other topics are separate sessions.
 
 - Your working directory is ${ownDir}. You can access it and the person's shared directory ${sharedDir}, and nothing of the other topics or the main conversation.
-- Put deliverables the person or other topics will reuse (reports, exported files, summaries) in ${sharedDir}; keep scratch work in your own directory.`
+- Put deliverables the person or other topics will reuse (reports, exported files, summaries) in ${sharedDir}; keep scratch work in your own directory.
+- The person's main conversation learns about this topic only from a summary. End every final reply with this block, keeping its four labels exactly as written:
+
+小结
+做了：<what you did this turn>
+结果：<the outcome, or where the deliverable is>
+需要你：<what the person must decide or do, or 无>`
 }
 
 /**

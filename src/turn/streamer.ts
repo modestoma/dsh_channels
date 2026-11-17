@@ -126,9 +126,10 @@ export interface StreamerHooks extends DeliveryHooks {
   /**
    * Invoked once when a turn's card reaches its final state. Carries the main
    * card's message id so the caller can retire the turn's in-flight repair
-   * snapshot (the id is the snapshot's storage key).
+   * snapshot (the id is the snapshot's storage key), and what the turn
+   * settled with.
    */
-  onTurnFinalized(sessionId: string, turn: number, mainCardMessageId: string): void
+  onTurnFinalized(sessionId: string, turn: number, mainCardMessageId: string, settled: SettledTurn): void
   /**
    * Decide whether a turn no Feishu message started (a subagent, background
    * job, or schedule waking the Agent, or a prompt typed in a dsh client)
@@ -137,6 +138,14 @@ export interface StreamerHooks extends DeliveryHooks {
    * `sendSegmentCard` as segment 1.
    */
   hostTurnOrigin?(sessionId: string, message: UserMessage): string | undefined
+}
+
+/** What a finalized turn settled with. */
+export interface SettledTurn {
+  /** How the turn ended, as its card shows it. */
+  readonly outcome: TurnOutcome
+  /** The text its cards show, segments joined in order (a failure notice included). */
+  readonly reply: string
 }
 
 /** The turn an Agent is running and the state that renders it. */
@@ -709,7 +718,10 @@ export class TurnStreamer {
       if (index >= 0) queue.splice(index, 1)
     })
 
-    this.hooks.onTurnFinalized(sessionId, state.turn ?? 0, state.cards[0]?.messageId ?? '')
+    this.hooks.onTurnFinalized(sessionId, state.turn ?? 0, state.cards[0]?.messageId ?? '', {
+      outcome: outcomeOf(state),
+      reply: state.cards.map(card => card.body).join(''),
+    })
     if (state.onSettled !== undefined) {
       try {
         state.onSettled(outcomeOf(state))

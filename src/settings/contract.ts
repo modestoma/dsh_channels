@@ -242,6 +242,8 @@ export const EDITABLE_KEYS = [
   'dmStyle',
   'dmMainPreset',
   'dmMainTools',
+  'dmMaxRunningTopics',
+  'dmReportChars',
   // 会话：工作区
   'baseDir',
   // 会话：话题与卡片
