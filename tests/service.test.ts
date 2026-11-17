@@ -23,6 +23,7 @@ import type { Agent, AgentHandle, ApprovalOutcome, CordisPluginRuntime, MessageI
 import { RESUME_ACTION } from '../src/cards/index.ts'
 import { chatRouteKey, dmMainRouteKey } from '../src/domain.ts'
 import type { RouteRecord } from '../src/domain.ts'
+import type { DmTopicRecord } from '../src/dm/topic-directory.ts'
 import { FEISHU_ATTACHMENTS_GUIDANCE, FEISHU_ATTACHMENTS_SECTION, FEISHU_PROJECT_SECTION, FEISHU_REPLIES_GUIDANCE, FEISHU_REPLIES_SECTION } from '../src/feishu/agent-context.ts'
 import { ATTACHMENT_FETCH_TOOL_NAME, TOPIC_MESSAGES_TOOL_NAME } from '../src/feishu/tools.ts'
 import { SEND_FILE_TOOL_NAME } from '../src/feishu/send-file.ts'
@@ -51,6 +52,8 @@ function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
     dmMode: 'open',
     dmStyle: 'topic',
     dmMainTools: [...DEFAULT_DM_MAIN_TOOLS],
+    dmMaxRunningTopics: 5,
+    dmReportChars: 300,
     requireMention: true,
     threadFallback: 'degrade',
     loggerLevel: 'info',
@@ -5717,5 +5720,309 @@ describe('private-chat projects mode', () => {
     await waitUntil(() => expect(h.channel.sent.length).toBeGreaterThan(0))
     expect(sentOptions(h, -1)).toEqual({ replyTo: help.messageId })
     await h.service.shutdown()
+  })
+  describe('main-Session topics', () => {
+    const exec = { signal: new AbortController().signal }
+    /** Projects mode with an Agent tools scope, so channel tools are registered. */
+    const setupTools = async (partial: Partial<FeishuConfig> = {}) => {
+      const tools = makeToolsRuntime()
+      const h = await setup({ dmStyle: 'project', ...partial }, {}, undefined, { agentExtras: { tools } })
+      return { h, tools }
+    }
+    /** The text blocks of one followup prompt, joined. */
+    const promptText = (agent: Agent, call: number): string =>
+      ((mock(agent.followup).mock.calls[call]?.[0] as { content: Array<{ text?: string }> } | undefined)?.content ?? [])
+        .map(block => block.text ?? '').join('\n')
+    /** Stream `text` into an Agent's running turn and end it. */
+    const settleTurn = (h: SetupResult, agent: Agent, turn: number, text: string): void => {
+      h.ctxState.assistantStreamListeners.at(-1)!({ agent, frame: { type: 'start', attemptId: `a${turn}`, revision: 1, turn, step: 1 } })
+      h.ctxState.assistantStreamListeners.at(-1)!({ agent, frame: { type: 'chunk', attemptId: `a${turn}`, revision: 1, index: 0, time: 1, chunk: { type: 'text-delta', index: 0, text } } })
+      h.ctxState.sessionListeners.at(-1)!(agent.session, { type: 'turn/end', seq: turn, data: { turn, reason: { kind: 'completed' } } })
+    }
+    const topicsOf = (h: SetupResult): Map<string, DmTopicRecord> =>
+      new Map(h.ctxState.domain.raw.table('dm_topics').entries() as IterableIterator<[string, DmTopicRecord]>)
+
+    it('mounts the topic tools in the main Session only', async () => {
+      const { h, tools } = await setupTools()
+      await h.onMessage(dm('话题先开', { threadId: 'omt_first' }))
+      await waitForEstablishedSession(h)
+      expect(tools.definitions.has('feishu_topic_open')).toBe(false)
+      await h.onMessage(dm('主会话'))
+      await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
+      await waitUntil(() => expect(tools.definitions.has('feishu_topic_open')).toBe(true))
+      for (const name of ['feishu_topic_list', 'feishu_topic_read', 'feishu_topic_send']) expect(tools.definitions.has(name)).toBe(true)
+      await h.service.shutdown()
+    })
+
+    it('opens a topic below a root card, hands the brief over as its first turn, and reports the summary on the next main turn', async () => {
+      const { h, tools } = await setupTools()
+      await h.onMessage(dm('帮我修一下登录'))
+      await waitForEstablishedSession(h)
+      const main = h.ctxState.agents.created[0]!.handle.agent
+      const sentBefore = h.channel.sent.length
+
+      const opened = await tools.definitions.get('feishu_topic_open')!.execute(
+        { title: '修复登录', brief: '背景：登录接口 500。目标：找到原因并修复。' }, exec,
+      ) as { ok: boolean; topic_id: string; text: string }
+      expect(opened).toMatchObject({ ok: true, topic_id: expect.stringMatching(/^omt_/u) })
+      const topicId = opened.topic_id
+      // Root card in the chat timeline, then the first streaming card in its topic.
+      const rootSend = h.channel.sent[sentBefore] as { input: { card: object }; options?: unknown }
+      expect(rootSend.options).toBeUndefined()
+      expect(JSON.stringify(rootSend.input.card)).toContain('修复登录')
+      expect(sentOptions(h, sentBefore + 1)).toEqual({ replyTo: 'om_' + String(sentBefore + 1), replyInThread: true })
+
+      await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
+      const topic = h.ctxState.agents.created[1]!
+      await waitUntil(() => expect(mock(topic.handle.agent.followup)).toHaveBeenCalled())
+      const root = path.join(h.config.baseDir, 'p2p', 'u_alice')
+      expect(topic.options.meta?.cwd).toBe(root)
+      expect(h.ctxState.workingDirectory.dirs.get(topic.options.sessionId)).toBe(path.join(root, 'topics', topicId))
+      expect(routesOf(h).get(topicId)).toMatchObject({ kind: 'thread', dmRole: 'topic', senderUserId: 'u_alice', chatType: 'p2p' })
+      expect(promptText(topic.handle.agent, 0)).toContain('<dm_topic_brief>')
+      expect(promptText(topic.handle.agent, 0)).toContain('登录接口 500')
+      expect(mock(topic.handle.agent.followup).mock.calls[0]![0]).toMatchObject({ source: { principal: { kind: 'feishu-user', userId: 'u_alice' } } })
+      expect(topicsOf(h).get(topicId)).toMatchObject({ title: '修复登录', openedBy: 'main', userId: 'u_alice' })
+
+      // The topic turn settles: the root card follows it and the summary waits.
+      settleTurn(h, topic.handle.agent, 1, '改好了。\n\n小结\n做了：修了空指针\n结果：登录恢复\n需要你：无')
+      await waitUntil(() => expect(topicsOf(h).get(topicId)?.summary).toBe('做了：修了空指针\n结果：登录恢复\n需要你：无'))
+      const rootId = topicsOf(h).get(topicId)!.rootMessageId!
+      await waitUntil(() => expect(JSON.stringify((h.channel.updated as Array<{ messageId: string; card: object }>).filter(update => update.messageId === rootId).at(-1)?.card)).toContain('已完成'))
+
+      settleTurn(h, main, 1, '我开了个话题去修。')
+      await resetFollowupAfterEstablishment(main)
+      await h.onMessage(dm('进展如何'))
+      await waitUntil(() => expect(mock(main.followup)).toHaveBeenCalledTimes(1))
+      expect(promptText(main, 0)).toContain('<dm_topic_updates>')
+      expect(promptText(main, 0)).toContain(`话题「修复登录」（topic_id: ${topicId}，空闲）`)
+      await waitUntil(() => expect(topicsOf(h).get(topicId)?.deliveredAt).toBe(topicsOf(h).get(topicId)?.reportedAt))
+
+      // A delivered summary is not repeated.
+      settleTurn(h, main, 2, '修好了。')
+      await h.onMessage(dm('好的'))
+      await waitUntil(() => expect(mock(main.followup)).toHaveBeenCalledTimes(2))
+      expect(promptText(main, 1)).not.toContain('<dm_topic_updates>')
+
+      const listed = await tools.definitions.get('feishu_topic_list')!.execute({}, exec) as { ok: boolean; text: string }
+      expect(listed.text).toContain(`「修复登录」 topic_id: ${topicId} · 空闲 · 主会话开的`)
+      const read = await tools.definitions.get('feishu_topic_read')!.execute({ topic_id: topicId }, exec) as { ok: boolean; text: string }
+      expect(read.text).toContain('改好了。')
+      await h.service.shutdown()
+    })
+
+    it('refuses another topic over dmMaxRunningTopics and does not reopen a running topic of the same title', async () => {
+      const { h, tools } = await setupTools({ dmMaxRunningTopics: 1 })
+      await h.onMessage(dm('主会话'))
+      await waitForEstablishedSession(h)
+      const open = tools.definitions.get('feishu_topic_open')!
+      const first = await open.execute({ title: 'A', brief: 'a' }, exec) as { ok: boolean; topic_id: string }
+      expect(first.ok).toBe(true)
+      await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
+      await waitUntil(() => expect(mock(h.ctxState.agents.created[1]!.handle.agent.followup)).toHaveBeenCalled())
+      expect(await open.execute({ title: 'A', brief: 'again' }, exec)).toMatchObject({ ok: true, topic_id: first.topic_id, text: expect.stringContaining('没有重复开') })
+      expect(await open.execute({ title: 'B', brief: 'b' }, exec)).toMatchObject({ ok: false, code: 'limit', reason: expect.stringContaining('上限 1') })
+
+      settleTurn(h, h.ctxState.agents.created[1]!.handle.agent, 1, '完成')
+      await waitUntil(async () => expect(await open.execute({ title: 'B', brief: 'b' }, exec)).toMatchObject({ ok: true }))
+      await h.service.shutdown()
+    })
+
+    it('answers a second open of the same title with the topic still starting', async () => {
+      const { h, tools } = await setupTools()
+      await h.onMessage(dm('主会话'))
+      await waitForEstablishedSession(h)
+      const create = h.ctxState.ctx.agents.create.bind(h.ctxState.ctx.agents)
+      let release!: () => void
+      const gate = new Promise<void>(resolve => { release = resolve })
+      vi.spyOn(h.ctxState.ctx.agents, 'create').mockImplementationOnce(async options => {
+        await gate
+        return await create(options)
+      })
+      const open = tools.definitions.get('feishu_topic_open')!
+      const first = await open.execute({ title: 'A', brief: 'a' }, exec) as { ok: boolean; topic_id: string }
+      expect(await open.execute({ title: 'A', brief: 'a' }, exec)).toMatchObject({ ok: true, topic_id: first.topic_id, text: expect.stringContaining('没有重复开') })
+      release()
+      await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
+      await waitUntil(() => expect(routesOf(h).get(first.topic_id)).toBeDefined())
+      await h.service.shutdown()
+    })
+
+    it('forwards a message sent while the topic is still starting after its hand-over', async () => {
+      const { h, tools } = await setupTools()
+      await h.onMessage(dm('主会话'))
+      await waitForEstablishedSession(h)
+      const create = h.ctxState.ctx.agents.create.bind(h.ctxState.ctx.agents)
+      let release!: () => void
+      const gate = new Promise<void>(resolve => { release = resolve })
+      vi.spyOn(h.ctxState.ctx.agents, 'create').mockImplementationOnce(async options => {
+        await gate
+        return await create(options)
+      })
+      const opened = await tools.definitions.get('feishu_topic_open')!.execute({ title: 'A', brief: '交接说明' }, exec) as { topic_id: string }
+      const sending = tools.definitions.get('feishu_topic_send')!.execute({ topic_id: opened.topic_id, message: '补充一句' }, exec)
+      release()
+      expect(await sending).toMatchObject({ ok: true, topic_id: opened.topic_id })
+      const topic = h.ctxState.agents.created[1]!.handle.agent
+      await waitUntil(() => expect(mock(topic.followup)).toHaveBeenCalledTimes(2))
+      expect(promptText(topic, 0)).toContain('交接说明')
+      expect(promptText(topic, 1)).toContain('补充一句')
+      await h.service.shutdown()
+    })
+
+    it('records a topic opened before the directory existed on its next turn', async () => {
+      const { h } = await setupTools()
+      await h.onMessage(dm('主会话'))
+      await waitForEstablishedSession(h)
+      await h.onMessage(dm('老话题的开头', { threadId: 'omt_old' }))
+      await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
+      const topic = h.ctxState.agents.created[1]!.handle.agent
+      await waitUntil(() => expect(mock(topic.followup)).toHaveBeenCalled())
+      await waitUntil(() => expect(topicsOf(h).get('omt_old')).toBeDefined())
+      await h.ctxState.domain.raw.table('dm_topics').delete('omt_old')
+      const log = sessionEvents(topic.session)
+      log.push({ type: 'user/message', seq: log.length, data: { id: 'm1', role: 'user', content: [{ type: 'text', text: '老话题的开头' }], source: { kind: 'user' } } } as never)
+      settleTurn(h, topic, 1, '做完了')
+      await waitUntil(() => expect(topicsOf(h).get('omt_old')).toMatchObject({ title: '老话题的开头', openedBy: 'user', summary: '做完了' }))
+      await h.service.shutdown()
+    })
+
+    it('marks the root card, the topic card and the directory failed when the topic Session cannot start', async () => {
+      const { h, tools } = await setupTools()
+      await h.onMessage(dm('主会话'))
+      await waitForEstablishedSession(h)
+      vi.spyOn(h.ctxState.ctx.agents, 'create').mockRejectedValueOnce(new Error('没有可用模型'))
+      const opened = await tools.definitions.get('feishu_topic_open')!.execute({ title: 'A', brief: 'a' }, exec) as { ok: boolean; topic_id: string }
+      expect(opened.ok).toBe(true)
+      await waitUntil(() => expect(topicsOf(h).get(opened.topic_id)?.failedReason).toContain('没有可用模型'))
+      expect(routesOf(h).has(opened.topic_id)).toBe(false)
+      const rootId = topicsOf(h).get(opened.topic_id)!.rootMessageId!
+      await waitUntil(() => expect(JSON.stringify((h.channel.updated as Array<{ messageId: string; card: object }>)
+        .filter(update => update.messageId === rootId).at(-1)?.card)).toContain('未能开始'))
+      expect(await tools.definitions.get('feishu_topic_send')!.execute({ topic_id: opened.topic_id, message: 'x' }, exec))
+        .toMatchObject({ ok: false, code: 'topic-closed' })
+      await h.service.shutdown()
+    })
+
+    it('forwards a message into a topic as the person, marked as coming from the main Session', async () => {
+      const { h, tools } = await setupTools()
+      await h.onMessage(dm('主会话'))
+      await waitForEstablishedSession(h)
+      const opened = await tools.definitions.get('feishu_topic_open')!.execute({ title: 'A', brief: 'a' }, exec) as { topic_id: string }
+      await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
+      const topic = h.ctxState.agents.created[1]!.handle.agent
+      await waitUntil(() => expect(mock(topic.followup)).toHaveBeenCalledTimes(1))
+      settleTurn(h, topic, 1, '第一轮')
+
+      const sent = await tools.definitions.get('feishu_topic_send')!.execute({ topic_id: opened.topic_id, message: '再加一个用例' }, exec)
+      expect(sent).toMatchObject({ ok: true, topic_id: opened.topic_id, text: expect.stringContaining('话题开始处理') })
+      await waitUntil(() => expect(mock(topic.followup)).toHaveBeenCalledTimes(2))
+      expect(promptText(topic, 1)).toContain('<dm_main_message>')
+      expect(promptText(topic, 1)).toContain('再加一个用例')
+      expect(h.channel.sent).toContainEqual(expect.objectContaining({ input: { text: '【主会话】再加一个用例' }, options: expect.objectContaining({ replyInThread: true }) }))
+
+      expect(await tools.definitions.get('feishu_topic_send')!.execute({ topic_id: 'omt_nope', message: 'x' }, exec))
+        .toMatchObject({ ok: false, code: 'unknown-topic' })
+      await h.service.shutdown()
+    })
+
+    it('keeps the root card running while a forwarded message waits behind the current turn', async () => {
+      const { h, tools } = await setupTools()
+      await h.onMessage(dm('主会话'))
+      await waitForEstablishedSession(h)
+      const opened = await tools.definitions.get('feishu_topic_open')!.execute({ title: 'A', brief: 'a' }, exec) as { topic_id: string }
+      await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
+      const topic = h.ctxState.agents.created[1]!.handle.agent
+      await waitUntil(() => expect(mock(topic.followup)).toHaveBeenCalledTimes(1))
+      expect(await tools.definitions.get('feishu_topic_send')!.execute({ topic_id: opened.topic_id, message: '再看看' }, exec))
+        .toMatchObject({ ok: true, text: expect.stringContaining('排') })
+      const rootId = topicsOf(h).get(opened.topic_id)!.rootMessageId!
+      const rootCard = (): string => JSON.stringify((h.channel.updated as Array<{ messageId: string; card: object }>)
+        .filter(update => update.messageId === rootId).at(-1)?.card)
+      settleTurn(h, topic, 1, '第一轮')
+      await waitUntil(() => expect(topicsOf(h).get(opened.topic_id)?.summary).toBe('第一轮'))
+      await new Promise(resolve => setTimeout(resolve, 10))
+      expect(rootCard()).toContain('进行中')
+      await h.service.shutdown()
+    })
+
+    it('refuses to forward into a topic past routeTtlMs and retires it instead of resuming it', async () => {
+      const { h, tools } = await setupTools({ routeTtlMs: 86_400_000 })
+      await h.onMessage(dm('主会话'))
+      await waitForEstablishedSession(h)
+      const opened = await tools.definitions.get('feishu_topic_open')!.execute({ title: 'A', brief: 'a' }, exec) as { topic_id: string }
+      await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
+      const topic = h.ctxState.agents.created[1]!.handle.agent
+      await waitUntil(() => expect(mock(topic.followup)).toHaveBeenCalledTimes(1))
+      settleTurn(h, topic, 1, '第一轮')
+      vi.useFakeTimers({ toFake: ['Date'] })
+      try {
+        vi.setSystemTime(Date.now() + 2 * 86_400_000)
+        expect(await tools.definitions.get('feishu_topic_send')!.execute({ topic_id: opened.topic_id, message: 'x' }, exec))
+          .toMatchObject({ ok: false, code: 'topic-closed', reason: expect.stringContaining('已过期') })
+      } finally {
+        vi.useRealTimers()
+      }
+      expect(routesOf(h).has(opened.topic_id)).toBe(false)
+      expect(h.ctxState.domain.raw.table('expired_routes').get(opened.topic_id)).toBeDefined()
+      expect(mock(topic.followup)).toHaveBeenCalledTimes(1)
+      await h.service.shutdown()
+    })
+
+    it('waits on shutdown for a topic still sending its root card', async () => {
+      const { h, tools } = await setupTools()
+      await h.onMessage(dm('主会话'))
+      await waitForEstablishedSession(h)
+      const send = h.channel.send.bind(h.channel)
+      let release!: () => void
+      const gate = new Promise<void>(resolve => { release = resolve })
+      vi.spyOn(h.channel, 'send').mockImplementationOnce(async (...args: Parameters<typeof send>) => {
+        await gate
+        return await send(...args)
+      })
+      let settled = false
+      const opening = Promise.resolve(tools.definitions.get('feishu_topic_open')!.execute({ title: 'A', brief: 'a' }, exec))
+        .finally(() => { settled = true })
+      await waitUntil(() => expect(h.channel.send).toHaveBeenCalled())
+      setTimeout(release, 20)
+      await h.service.shutdown()
+      expect(settled).toBe(true)
+      await opening
+    })
+
+    it('records a topic the person opens and reports its summaries too', async () => {
+      const { h } = await setupTools()
+      await h.onMessage(dm('主会话'))
+      await waitForEstablishedSession(h)
+      const main = h.ctxState.agents.created[0]!.handle.agent
+      await h.onMessage(dm('查一下昨天的报错\n细节……', { threadId: 'omt_mine' }))
+      await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
+      await waitUntil(() => expect(topicsOf(h).get('omt_mine')).toMatchObject({ title: '查一下昨天的报错', openedBy: 'user' }))
+      const topic = h.ctxState.agents.created[1]!.handle.agent
+      await waitUntil(() => expect(mock(topic.followup)).toHaveBeenCalled())
+      settleTurn(h, topic, 1, '没有找到报错。')
+      await waitUntil(() => expect(topicsOf(h).get('omt_mine')?.summary).toBe('没有找到报错。'))
+
+      settleTurn(h, main, 1, 'ok')
+      await resetFollowupAfterEstablishment(main)
+      await h.onMessage(dm('那个话题怎么样'))
+      await waitUntil(() => expect(mock(main.followup)).toHaveBeenCalledTimes(1))
+      expect(promptText(main, 0)).toContain('话题「查一下昨天的报错」')
+      await h.service.shutdown()
+    })
+
+    it('mounts the topic tools again in a renewed main Session', async () => {
+      const { h, tools } = await setupTools()
+      await h.onMessage(dm('主会话'))
+      await waitForEstablishedSession(h)
+      const registrations = (): number => tools.register.mock.calls.filter(([definition]) => (definition as { name: string }).name === 'feishu_topic_open').length
+      await waitUntil(() => expect(registrations()).toBe(1))
+      await h.onMessage(dm('/renew'))
+      await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
+      await waitForRenewedRoute(h, mainKey, h.ctxState.agents.created[1]!.options.sessionId)
+      await waitUntil(() => expect(registrations()).toBe(2))
+      expect(await tools.definitions.get('feishu_topic_list')!.execute({}, exec)).toMatchObject({ ok: true, text: '还没有话题。' })
+      await h.service.shutdown()
+    })
   })
 })

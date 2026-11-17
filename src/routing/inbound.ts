@@ -108,6 +108,26 @@ export interface InboundMessageReadPort {
   }): Promise<{ block: string; messages: readonly KnownAttachmentMessageInput[] } | undefined>
 }
 
+/**
+ * The projects-mode topic directory, as routing uses it: a topic the person
+ * opens by replying in a topic is recorded, a topic turn shows on its root
+ * card, and every main-Session turn carries the topic summaries the main
+ * Session has not received yet.
+ */
+export interface InboundDmTopicsPort {
+  /** Record a topic the person opened (`content` is its opening message). */
+  opened(record: RouteRecord, content: string): Promise<void>
+  /** A turn of a projects-mode topic is starting (redraws its root card). */
+  turnStarted(key: string): Promise<void>
+  /**
+   * The `<dm_topic_updates>` block of a main-Session turn, with what it
+   * delivers, or undefined when no summary is waiting.
+   */
+  updates(main: RouteRecord): { block: string; delivered: ReadonlyArray<{ key: string; reportedAt: number }> } | undefined
+  /** Record that a main-Session turn carrying these summaries was accepted. */
+  delivered(delivered: ReadonlyArray<{ key: string; reportedAt: number }>): Promise<void>
+}
+
 /** Live trigger-image prefetch policy (see `prefetchImages` config). */
 export interface AttachmentPrefetchPolicy {
   readonly enabled: boolean
@@ -157,6 +177,8 @@ export interface InboundDeps {
   streamer(): TurnStreamer | undefined
   questionAnswerer(): QuestionAnswerer | undefined
   approvalAnswerer(): ApprovalAnswerer | undefined
+  /** Projects-mode topic directory. */
+  dmTopics: InboundDmTopicsPort
   commands: CommandPlanePort
 }
 
@@ -998,16 +1020,19 @@ export class InboundRouter {
       //    the submission stay ordered with respect to other turns because
       //    later messages wait on the delivery gate.
       // The main chat's history belongs to earlier Sessions of the person.
-      const prompt = await this.assembleTurnPrompt(msg, record, content, handle.agent, {
+      if (dmRole === 'topic') await this.recordOpenedTopic(record, content)
+      const assembled = await this.assembleTurnPrompt(msg, record, content, handle.agent, {
         firstTurn: dmRole !== 'main',
         excludeMessageIds: [msg.messageId, sent.messageId],
       })
+      const { prompt, delivered } = this.withTopicUpdates(record, assembled)
       await this.repair.recordPrompt(sent.messageId, prompt)
-      await this.deps.prompts.run(handle.agent, prompt, {
+      const outcome = await this.deps.prompts.run(handle.agent, prompt, {
         cardMessageId: sent.messageId,
         triggerMessageId: msg.messageId,
         ...(typingId === undefined ? {} : { reactionId: typingId }),
       })
+      if (outcome.accepted) await this.markTopicUpdatesDelivered(delivered)
     } finally {
       closeDeliveryGate()
     }
@@ -1063,14 +1088,52 @@ export class InboundRouter {
       cardMessageId: sent.messageId,
       lastActivityAt: Date.now(),
     })
-    const prompt = await this.assembleTurnPrompt(msg, current, content, live.agent, {
+    const assembled = await this.assembleTurnPrompt(msg, current, content, live.agent, {
       excludeMessageIds: [msg.messageId, sent.messageId],
     })
+    const { prompt, delivered } = this.withTopicUpdates(current, assembled)
     await this.repair.recordPrompt(sent.messageId, prompt)
-    await this.deps.prompts.run(live.agent, prompt, {
+    const outcome = await this.deps.prompts.run(live.agent, prompt, {
       cardMessageId: sent.messageId,
       triggerMessageId: msg.messageId,
       ...(typingId === undefined ? {} : { reactionId: typingId }),
     })
+    if (!outcome.accepted) return
+    await this.markTopicUpdatesDelivered(delivered)
+    if (current.dmRole === 'topic') await this.deps.dmTopics.turnStarted(current.key)
+  }
+
+  /** Record a topic the person opened by replying in a topic (best-effort). */
+  private async recordOpenedTopic(record: RouteRecord, content: string): Promise<void> {
+    try {
+      await this.deps.dmTopics.opened(record, content)
+    } catch (error) {
+      this.ctx.logger?.warn?.('dsh-channels: recording topic %s failed: %s', record.key, String(error))
+    }
+  }
+
+  /**
+   * A main-Session prompt with the waiting topic summaries appended as a
+   * `<dm_topic_updates>` block; other prompts unchanged.
+   * @returns the prompt and the summaries it delivers.
+   */
+  private withTopicUpdates(
+    record: RouteRecord,
+    prompt: ChannelPrompt,
+  ): { prompt: ChannelPrompt; delivered: ReadonlyArray<{ key: string; reportedAt: number }> } {
+    if (record.dmRole !== 'main') return { prompt, delivered: [] }
+    const updates = this.deps.dmTopics.updates(record)
+    if (updates === undefined) return { prompt, delivered: [] }
+    return { prompt: { ...prompt, content: [...prompt.content, { type: 'text', text: updates.block }] }, delivered: updates.delivered }
+  }
+
+  /** Record delivered topic summaries (best-effort: a failure delivers them again next turn). */
+  private async markTopicUpdatesDelivered(delivered: ReadonlyArray<{ key: string; reportedAt: number }>): Promise<void> {
+    if (delivered.length === 0) return
+    try {
+      await this.deps.dmTopics.delivered(delivered)
+    } catch (error) {
+      this.ctx.logger?.warn?.('dsh-channels: recording delivered topic updates failed: %s', String(error))
+    }
   }
 }

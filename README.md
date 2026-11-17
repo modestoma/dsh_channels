@@ -197,6 +197,7 @@ src/
 │   ├── picker.ts          #   /effort、/permissions 选择卡与按钮回传解析
 │   ├── onboarding.ts      #   私聊首次触达引导卡
 │   ├── topic.ts           #   群话题服务的根卡片（引导句、链接表格、状态标签）
+│   ├── dm-topic.ts        #   私聊 projects 模式主会话开的话题根卡片
 │   ├── approval.ts        #   审批决策卡
 │   ├── missed.ts          #   断连补偿的待处理卡
 │   └── question.ts        #   结构化问答卡
@@ -232,6 +233,13 @@ src/
 │   ├── send-file.ts       # feishu_send_file：把话题工作目录内的图片/文件发回当前会话
 │   ├── wiki/              # 知识库工具：links（wikiRoots 链接解析）、api（wiki/docx/docs_ai 接口）、sheet-api / base-api（电子表格、多维表格接口）、scope（范围判定）、consent（授权卡）、shared（失败码与公共步骤）、tools / sheet-tools / base-tools、a1（A1 范围）
 │   └── agent-context.ts   # agent 作用域 system prompt：附件指引与回复写法
+├── dm/                    # 私聊 projects 模式
+│   ├── layout.ts          #   这个人的目录：main/、topics/<话题>/、shared/，读范围，移到会话自己的目录
+│   ├── tool-gate.ts       #   主会话工具闸门（dmMainTools + 话题工具）
+│   ├── topic-directory.ts #   话题目录（dm_topics）：状态、最近回复、待送达小结、<dm_topic_updates>
+│   ├── report.ts          #   从话题回复里取「小结」
+│   ├── topic-opener.ts    #   主会话开话题、给话题转消息、根卡片跟随
+│   └── tools.ts           #   feishu_topic_open / list / read / send
 ├── routing/
 │   ├── inbound.ts         # 入站路由：去重、准入、路由决策树、建/续会话、首触引导
 │   ├── message-context.ts # 提示里的引用摘录与首轮话题历史
@@ -336,6 +344,8 @@ npm 发行包已包含构建产物：Host 入口是 `lib/index.js`（profile 直
     dmStyle: 'topic'                    # 默认私聊模式：topic（每条消息开话题）| project（主会话 + 话题，见「私聊的两种模式」）；用户表可按人覆盖
     # dmMainPreset: 'chat'              # projects 模式主会话的 Agent 预设（缺省沿用 agentPreset）
     dmMainTools: [read, read_image, grep, glob, lsp, web_search, web_fetch, ask_user_question, todo_write, skill, feishu_topic_messages, feishu_attachment_fetch, feishu_send_file, propose_actions, feishu_wiki_list, feishu_wiki_read, feishu_wiki_sheet_read, feishu_wiki_base_read]  # 主会话只能调用这些工具（默认值）
+    dmMaxRunningTopics: 5               # projects 模式主会话同时在跑的话题上限（1–50）
+    dmReportChars: 300                  # 话题每轮报给主会话的小结长度（50–2000 字）
     threadFallback: 'degrade'           # 话题被拒时降级为会话级路由
     routeTtlMs: 2592000000              # 话题路由 30 天无活动即过期；后续消息明确拒绝，不新建 Session（0 = 关闭）
     approvalTimeoutMs: 86400000         # HITL 审批决策卡等待时长（默认 24 小时，1 分钟–7 天；超时自动拒绝）
@@ -462,7 +472,7 @@ FEISHU_APP_SECRET: xxxxxxxx
 私聊有两种模式，默认模式在设置面板「会话 → 私聊模式」里选（`dmStyle`，默认 `topic`），管理员可以在「访问授权」的用户表里按人改。没有斜杠命令可以切换。切换只影响之后的新消息：已经开着的话题保持原来的模式继续用。
 
 - **话题模式**（`topic`）：上面的表格。私聊里每条新消息开一个新话题，每个话题一个 Session、一个工作区。
-- **projects 模式**（`project`）：私聊对话框本身是这个人的**主会话**，一直是同一个 Session，回复直接发在对话里（不开话题），不按话题过期时间回收，`/renew` 换成新 Session。在任意一条消息上「回复话题」就开一个**话题会话**，在话题里深入讨论。这个人的所有会话在 DSH Web 里归在同一个工作区下：
+- **projects 模式**（`project`）：私聊对话框本身是这个人的**主会话**，一直是同一个 Session，回复直接发在对话里（不开话题），不按话题过期时间回收，`/renew` 换成新 Session。需要命令行、改代码或多步调查的事，主会话自己开一个**话题会话**去做（见下面「主会话开话题」）；用户在任意一条消息上「回复话题」也会开一个话题会话。这个人的所有会话在 DSH Web 里归在同一个工作区下：
 
 ```
 <baseDir>/p2p/<user_id>/        这个人的工作区（所有 projects 模式会话的 header cwd，标题「<人名> · 私聊」）
@@ -476,6 +486,22 @@ FEISHU_APP_SECRET: xxxxxxxx
 - **主会话工具收紧**：主会话只能调用 `dmMainTools` 里的工具（默认是读文件、搜索、联网、提问、技能和只读的飞书工具），其余调用在执行前拒绝，不管挂的是哪个 Agent 预设；命令行、写文件、改代码都在话题里做。主会话可以用 `dmMainPreset` 换一个预设。
 - 话题会话首轮带上话题里的消息（包括被回复的那条主会话消息）；主会话首轮不带历史。
 - 群聊不受这两种模式影响。话题模式的话题目录 `<baseDir>/p2p/<user_id>/<话题 id>/` 和这些目录在同一层，话题 id 不会和 `main`、`topics`、`shared` 重名。
+
+#### 主会话开话题
+
+主会话有四个只挂在它身上的工具（不受 `dmMainTools` 限制，其他会话没有）：
+
+| 工具 | 作用 |
+|---|---|
+| `feishu_topic_open` | 参数 `title`、`brief`。在主聊天里发一张话题根卡片，在它下面开话题，交接说明 `brief` 作为话题的第一轮（以用户身份提交）在后台运行；工具立即返回 `topic_id`，主会话不等待。同名且仍在进行中的话题不重复开 |
+| `feishu_topic_list` | 列出这个人的话题：标题、`topic_id`、状态（进行中 / 等你处理 / 空闲 / 未能开始 / 已过期）、谁开的、最近一次小结 |
+| `feishu_topic_read` | 读一个话题最近几轮（最多 5 轮）的最终回复，每轮截断到 4000 字 |
+| `feishu_topic_send` | 把一条消息发进已有话题：话题里显示「【主会话】…」，作为话题的下一轮，话题正忙时排在当前回合后面 |
+
+- **小结回写**：话题会话的提示词要求每轮最终回复以「小结 / 做了 / 结果 / 需要你」四行结尾。每轮结束后插件取出这一块（截到 `dmReportChars` 字，默认 300；没写小结时取回复最后这么多字），记进话题目录（存储表 `dm_topics`）。主会话**不会被唤醒**：用户下次在主聊天发消息时，所有还没送达的小结作为 `<dm_topic_updates>` 块附在这条消息后面，进会话日志。用户自己「回复话题」开的话题也一样回写。
+- **状态**：「等你处理」= 话题在等审批或提问的回答，或小结的「需要你」不是「无」。主会话开的话题，根卡片跟着每一轮更新（进行中 / 已完成 / 已停止 / 失败 / 未能开始）；还有排队的消息时保持「进行中」。
+- **上限**：同一个人由主会话开、正在跑的话题最多 `dmMaxRunningTopics` 个（默认 5），超出时 `feishu_topic_open` 报错，主会话会告诉用户先等一个话题结束；用户自己开的话题不计入。
+- 话题开不起来（建会话失败等）时，根卡片和话题里的卡片都标成失败，不留路由，小结里记「未能开始：原因」。
 
 ### 读权限与执行隔离
 

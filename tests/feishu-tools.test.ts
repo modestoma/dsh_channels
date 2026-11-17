@@ -610,7 +610,7 @@ describe('feishu attachment-fetch registration', () => {
     }
 
     await manager.ensureLive(record)
-    expect(mountTools).toHaveBeenCalledWith(expect.anything(), 'session-resume')
+    expect(mountTools).toHaveBeenCalledWith(expect.anything(), 'session-resume', undefined)
 
     // A second ensureLive is served from the plugin's own live registry.
     await manager.ensureLive(record)
@@ -634,7 +634,7 @@ describe('feishu attachment-fetch registration', () => {
     const foreignRecord: RouteRecord = { ...record, sessionId: 'session-foreign' }
     const live = await borrowManager.ensureLive(foreignRecord)
     expect(live.agent).toBe(foreign)
-    expect(borrowMount).toHaveBeenCalledWith(foreign.ctx, 'session-foreign')
+    expect(borrowMount).toHaveBeenCalledWith(foreign.ctx, 'session-foreign', undefined)
     await borrowManager.ensureLive(foreignRecord)
     expect(borrowMount).toHaveBeenCalledTimes(1)
   })

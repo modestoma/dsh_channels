@@ -18,6 +18,8 @@ import type { ApprovalCardRecord, ApprovalGrantRecord } from './interactions/app
 
 export { ACTION_PROPOSAL_TTL_MS, actionProposalRecordSchema }
 export type { ActionProposalRecord }
+import { dmTopicRecordSchema } from './dm/topic-directory.ts'
+import type { DmTopicRecord } from './dm/topic-directory.ts'
 import type { StorageDomainFacility } from './host/services.ts'
 import { typedTable } from './storage/table.ts'
 import type { DomainTable } from './storage/table.ts'
@@ -503,6 +505,8 @@ export const feishuDomain = {
     approval_cards: { valueSchema: approvalCardRecordSchema },
     // Non-blocking follow-up action proposal cards (key = proposalId).
     action_proposals: { valueSchema: actionProposalRecordSchema },
+    // Private-chat projects-mode topics (key = thread id).
+    dm_topics: { valueSchema: dmTopicRecordSchema },
   },
 } as const
 
@@ -525,6 +529,8 @@ export interface FeishuDomainHandle {
   approvalGrants: DomainTable<ApprovalGrantRecord>
   approvalCards: DomainTable<ApprovalCardRecord>
   actionProposals: DomainTable<ActionProposalRecord>
+  /** Projects-mode topic directory (key = thread id). */
+  dmTopics: DomainTable<DmTopicRecord>
   getGlobal(): FeishuDomainGlobal
   setGlobal(value: FeishuDomainGlobal): Promise<unknown>
   close(): Promise<void>
@@ -551,6 +557,7 @@ export async function openFeishuDomain(facility: StorageDomainFacility): Promise
     approvalGrants: typedTable(domain.table('approval_grants')),
     approvalCards: typedTable(domain.table('approval_cards')),
     actionProposals: typedTable(domain.table('action_proposals')),
+    dmTopics: typedTable(domain.table('dm_topics')),
     getGlobal: () => (domain.global.get() ?? {}) as FeishuDomainGlobal,
     setGlobal: value => domain.global.set(value),
     close: () => domain.close(),

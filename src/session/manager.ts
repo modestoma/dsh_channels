@@ -69,10 +69,11 @@ export interface SessionManagerDeps {
    * Register this channel's model tools inside one Agent scope. Called from
    * the agent-preset `setup` after the preset is mounted (tools live inside
    * presets in web-profile deployments), and once more for a BORROWED live
-   * agent as a best-effort race guard (D7). Optional: unit tests that do not
-   * compose model tools omit it.
+   * agent as a best-effort race guard (D7). `dmRole` names a projects-mode
+   * route's role (the main Session also gets its topic tools). Optional: unit
+   * tests that do not compose model tools omit it.
    */
-  mountTools?(agentCtx: AgentContext, sessionId: string): Promise<void> | void
+  mountTools?(agentCtx: AgentContext, sessionId: string, dmRole?: RouteRecord['dmRole']): Promise<void> | void
   warn(message: string, ...args: unknown[]): void
 }
 
@@ -134,7 +135,7 @@ export class SessionManager {
     agentOptions: Record<string, unknown> = this.agentOptions(),
     dmRole?: RouteRecord['dmRole'],
   ): Promise<AgentHandle> {
-    const composition = await this.presetComposition(this.presetFor(dmRole), true, sessionId)
+    const composition = await this.presetComposition(this.presetFor(dmRole), true, sessionId, dmRole)
     const handle = await this.deps.ctx.agents.create({
       sessionId,
       meta: {
@@ -281,7 +282,7 @@ export class SessionManager {
     // session without this plugin's setup (web UI resolver, previous plugin
     // instance). mountToolsFor swallows failures, so the borrow itself never
     // fails; awaiting it makes the tool available before the first turn.
-    await this.mountToolsFor(agent.ctx, sessionId)
+    await this.mountToolsFor(agent.ctx, sessionId, record.dmRole)
     // The foreign composition lacks this channel's prompt sections as well.
     await this.mountGuidance(agent, record)
     return borrowed
@@ -295,7 +296,7 @@ export class SessionManager {
       // (config override or roster default). A session persisted before the
       // preset fix has no preset recorded on its header; re-resolving here is
       // what repairs it on the first resume after a restart.
-      const composition = await this.presetComposition(this.presetFor(record.dmRole), true, sessionId)
+      const composition = await this.presetComposition(this.presetFor(record.dmRole), true, sessionId, record.dmRole)
       const handle = await this.deps.ctx.agents.resume({
         resumeSessionId: sessionId,
         agentOptions: this.agentOptions(),
@@ -359,7 +360,7 @@ export class SessionManager {
   async renew(record: RouteRecord, oldLive: LiveAgent): Promise<RenewCommit> {
     const sessionId = randomUUID() as SessionId
     const preset = this.effectivePreset(oldLive.agent.session)
-    const composition = await this.presetComposition(preset, false, sessionId)
+    const composition = await this.presetComposition(preset, false, sessionId, record.dmRole)
     const cwd = record.workspacePath
     await mkdir(cwd, { recursive: true })
 
@@ -445,6 +446,7 @@ export class SessionManager {
     requestedPreset: string | undefined = this.deps.config().agentPreset,
     useRosterDefault = true,
     sessionId?: string,
+    dmRole?: RouteRecord['dmRole'],
   ): Promise<PresetComposition> {
     // Read through ctx.get (safe lookup): only the web profile ships a roster,
     // and direct property access on a cordis context throws for services the
@@ -456,7 +458,7 @@ export class SessionManager {
       // cannot guarantee that the explicit channel value wins.
       this.mountRequestPolicy(agentCtx)
       await mountChannelCommands(agentCtx)
-      if (sessionId !== undefined) await this.mountToolsFor(agentCtx, sessionId)
+      if (sessionId !== undefined) await this.mountToolsFor(agentCtx, sessionId, dmRole)
     }
     if (presets === undefined || (requestedPreset === undefined && !useRosterDefault)) {
       return { setup: channelCommandsOnly }
@@ -468,7 +470,7 @@ export class SessionManager {
         this.mountRequestPolicy(agentCtx)
         await presets.mount(agentCtx, resolved.id)
         await mountChannelCommands(agentCtx)
-        if (sessionId !== undefined) await this.mountToolsFor(agentCtx, sessionId)
+        if (sessionId !== undefined) await this.mountToolsFor(agentCtx, sessionId, dmRole)
       },
     }
   }
@@ -478,11 +480,11 @@ export class SessionManager {
    * scope. A failure is logged and swallowed: missing tools never fail a
    * session (attachment fetch degrades to its structured failures).
    */
-  private async mountToolsFor(agentCtx: AgentContext, sessionId: string): Promise<void> {
+  private async mountToolsFor(agentCtx: AgentContext, sessionId: string, dmRole?: RouteRecord['dmRole']): Promise<void> {
     if (this.deps.mountTools === undefined) return
     if (this.toolMounts.has(agentCtx)) return
     try {
-      await this.deps.mountTools(agentCtx, sessionId)
+      await this.deps.mountTools(agentCtx, sessionId, dmRole)
       this.toolMounts.add(agentCtx)
     } catch (error) {
       this.deps.warn(

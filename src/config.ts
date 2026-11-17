@@ -97,6 +97,12 @@ export const DEFAULT_DM_MAIN_TOOLS = [
   'feishu_wiki_list', 'feishu_wiki_read', 'feishu_wiki_sheet_read', 'feishu_wiki_base_read',
 ] as const
 
+/** Default `dmMaxRunningTopics`: running topics one main Session may have at once. */
+export const DEFAULT_DM_MAX_RUNNING_TOPICS = 5
+
+/** Default `dmReportChars`: length of a topic's summary for the main Session. */
+export const DEFAULT_DM_REPORT_CHARS = 300
+
 /** A credential reference: `FEISHU_APP_ID`-style name resolved through ctx.credentials. */
 const credentialRefSchema = z.string().regex(
   CREDENTIAL_REF_PATTERN,
@@ -169,6 +175,18 @@ export const configSchema = z.object({
    * changes.
    */
   dmMainTools: z.array(z.string().trim().min(1)).max(100).default([...DEFAULT_DM_MAIN_TOOLS]),
+  /**
+   * Most topics one person's projects-mode main Session may have running at
+   * once; `feishu_topic_open` refuses another one until a topic finishes its
+   * turn. Topics the person opens by replying in a topic are not limited.
+   */
+  dmMaxRunningTopics: z.number().int().min(1).max(50).default(DEFAULT_DM_MAX_RUNNING_TOPICS),
+  /**
+   * Length of the summary a projects-mode topic reports to the main Session
+   * after each turn, in characters: the reply's 「小结」 block is cut to it,
+   * and a reply without one is reported as its last this many characters.
+   */
+  dmReportChars: z.number().int().min(50).max(2_000).default(DEFAULT_DM_REPORT_CHARS),
   /**
    * In normal (non-topic) groups, require an @-mention of the bot to start a
    * session. Messages inside a topic the bot already owns never require a

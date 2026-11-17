@@ -244,7 +244,7 @@ describe('TurnStreamer', () => {
       expect(remove).toHaveBeenCalledWith('om_trigger', 'react-typing')
       expect(add).toHaveBeenCalledWith('om_trigger', 'DONE')
     })
-    expect(hooksInstance.onTurnFinalized).toHaveBeenCalledWith('sess-done', 1, 'om_card')
+    expect(hooksInstance.onTurnFinalized).toHaveBeenCalledWith('sess-done', 1, 'om_card', expect.objectContaining({ outcome: 'done' }))
   })
 
   it('skips removal when the Typing reaction was never added, still adds DONE', async () => {
@@ -331,7 +331,7 @@ describe('TurnStreamer', () => {
       expect(add).toHaveBeenCalledWith('om_trigger', 'No')
     })
     expect(add).not.toHaveBeenCalledWith('om_trigger', 'DONE')
-    expect(hooksInstance.onTurnFinalized).toHaveBeenCalledWith('sess-failed', 2, 'om_card')
+    expect(hooksInstance.onTurnFinalized).toHaveBeenCalledWith('sess-failed', 2, 'om_card', expect.objectContaining({ outcome: 'error' }))
   })
 
   it('keeps session-cumulative token figures across turns', async () => {
@@ -1645,7 +1645,7 @@ describe('TurnStreamer headline', () => {
     streamer.onInboxDiscarded(session, prompt('m-2'))
     expect(streamer.steerTargetOf('om_queued')).toBeUndefined()
     expect(latest(ch, 'om_queued')).toEqual({ schema: '2.0', config: { width_mode: 'fill' }, body: { elements: [{ tag: 'markdown', content: DROPPED_NOTICE }] } })
-    expect(hooksInstance.onTurnFinalized).toHaveBeenCalledWith('sess-drop', 0, 'om_queued')
+    expect(hooksInstance.onTurnFinalized).toHaveBeenCalledWith('sess-drop', 0, 'om_queued', expect.objectContaining({ outcome: 'stopped' }))
     await vi.waitFor(() => expect(ch.addReaction).toHaveBeenCalledWith('om_trigger_2', 'No'))
   })
 
@@ -1701,7 +1701,7 @@ describe('TurnStreamer host turns', () => {
     expect(JSON.stringify(ch.updated.filter(update => update.messageId === 'om_user'))).not.toContain('子代理的结论')
 
     streamer.onSessionEvent(session, { type: 'turn/end', seq: 1, data: { turn: 1, reason: 'stop' } })
-    expect(hooksInstance.onTurnFinalized).toHaveBeenCalledWith('sess-host', 1, 'om_seg_1')
+    expect(hooksInstance.onTurnFinalized).toHaveBeenCalledWith('sess-host', 1, 'om_seg_1', { outcome: 'done', reply: '子代理的结论' })
     // No Feishu trigger: the host turn swaps no reaction.
     expect(ch.addReaction).not.toHaveBeenCalled()
 
