@@ -37,7 +37,7 @@ export type SessionHistoryEntry = z.infer<typeof sessionHistoryEntrySchema>
  * cwd, the sandbox root, and the workspace the Session is grouped under.
  */
 export const routeRecordSchema = z.object({
-  /** Route key the record is stored under (thread_id or a {@link chatRouteKey}). */
+  /** Route key the record is stored under (thread_id, a {@link chatRouteKey}, or a {@link dmMainRouteKey}). */
   key: z.string().min(1),
   /** `thread` = real Feishu topic; `chat` = degraded chat-scoped fallback. */
   kind: z.enum(['thread', 'chat']),
@@ -565,6 +565,15 @@ export async function openFeishuDomain(facility: StorageDomainFacility): Promise
  * fails validation instead of matching nobody).
  */
 export const FEISHU_USER_ID_PATTERN = /^(?!ou_|on_|oc_)[A-Za-z0-9_-]+$/u
+
+/**
+ * Key of a person's projects-mode main Session route. Distinct from
+ * {@link chatRouteKey}, so a topic-mode degraded route of the same private
+ * chat never replaces the main Session.
+ */
+export function dmMainRouteKey(chatId: string, userId: string): string {
+  return `dm:main:${chatId}:${userId}`
+}
 
 /** Build a chat-scoped fallback key for degraded (topic-less) routing. */
 export function chatRouteKey(chatType: 'p2p' | 'group', chatId: string, senderUserId: string): string {

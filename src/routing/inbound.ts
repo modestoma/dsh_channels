@@ -17,7 +17,7 @@ import type {
 import type { FeishuConfig } from '../config.ts'
 import { buildOnboardingCard, failedStreamingCard, initialStreamingCard, queuedStreamingCard } from '../cards/index.ts'
 import { RouteOperationQueue } from '../commands.ts'
-import { chatRouteKey, isGroupRoute } from '../domain.ts'
+import { chatRouteKey, dmMainRouteKey, isGroupRoute } from '../domain.ts'
 import type { FeishuDomainHandle, RouteRecord } from '../domain.ts'
 import type { CardDelivery } from '../feishu/delivery.ts'
 import {
@@ -459,11 +459,11 @@ export class InboundRouter {
       }
     }
 
-    // 2. Chat-scoped route: the projects-mode main Session, or a degraded
-    //    topic-less fallback Session; each mode ignores the other's record.
-    const chatKey = chatRouteKey(msg.chatType, msg.chatId, msg.senderId)
-    const chatRecord = this.routes.get(chatKey)
-    if (chatRecord !== undefined && this.continuesChatRoute(msg, chatRecord, projects)) {
+    // 2. Chat-scoped route: the projects-mode main Session (main-chat
+    //    messages only), or a degraded topic-less fallback Session.
+    const chatKey = this.chatScopeKey(msg, projects)
+    const chatRecord = this.continuesChatRoute(msg, projects) ? this.routes.get(chatKey) : undefined
+    if (chatRecord !== undefined) {
       if (!this.access.ownsRoute(msg, chatRecord)) return
       await this.awaitFirstDelivery(chatRecord.key)
       await this.routeOperations.run(chatRecord.key, () => {
@@ -505,14 +505,19 @@ export class InboundRouter {
   }
 
   /**
-   * Whether a message continues the chat-scoped route of its (chat, user)
-   * pair. Groups always do. In projects mode only a main-chat message, and
-   * only the main Session; in topic mode never the main Session.
+   * The key of a message's chat-scoped route: the person's main Session in
+   * projects mode, else the degraded fallback key of its (chat, user) pair.
    */
-  private continuesChatRoute(msg: NormalizedMessage, record: RouteRecord, projects: boolean): boolean {
-    if (msg.chatType !== 'p2p') return true
-    if (projects) return msg.threadId === undefined && record.dmRole === 'main'
-    return record.dmRole !== 'main'
+  private chatScopeKey(msg: NormalizedMessage, projects: boolean): string {
+    return projects ? dmMainRouteKey(msg.chatId, msg.senderId) : chatRouteKey(msg.chatType, msg.chatId, msg.senderId)
+  }
+
+  /**
+   * Whether a message may continue its chat-scoped route: always, except a
+   * projects-mode message in a topic, which belongs to a topic Session.
+   */
+  private continuesChatRoute(msg: NormalizedMessage, projects: boolean): boolean {
+    return !projects || msg.threadId === undefined
   }
 
   /**
@@ -818,10 +823,10 @@ export class InboundRouter {
       const threaded = this.routes.get(msg.threadId)
       if (threaded !== undefined) return threaded
     }
-    const chatKey = chatRouteKey(msg.chatType, msg.chatId, msg.senderId)
     const projects = this.inProjects(msg)
-    const degraded = this.routes.get(chatKey)
-    if (degraded !== undefined && this.continuesChatRoute(msg, degraded, projects)) return degraded
+    const chatKey = this.chatScopeKey(msg, projects)
+    const degraded = this.continuesChatRoute(msg, projects) ? this.routes.get(chatKey) : undefined
+    if (degraded !== undefined) return degraded
     const pending = this.establishing.get(projects && msg.threadId !== undefined ? `${chatKey}#${msg.threadId}` : chatKey)
     if (pending === undefined) return undefined
     const record = await pending.catch(() => undefined)
@@ -903,7 +908,7 @@ export class InboundRouter {
     // 2. First card frame — also creates the topic (reply_in_thread). The
     //    topic identity is only known after Feishu answers, and it names the
     //    topic's workspace directory. A projects-mode main Session answers
-    //    in the chat timeline under the chat-scoped key; a projects-mode
+    //    in the chat timeline under its main-route key; a projects-mode
     //    topic already has its topic.
     const sent = await this.delivery.replyFirstCard(
       msg,

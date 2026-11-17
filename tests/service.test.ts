@@ -21,7 +21,7 @@ import type {
 import { CordisFiberState } from '../src/host/index.ts'
 import type { Agent, AgentHandle, ApprovalOutcome, CordisPluginRuntime, MessageId, Session, SessionId, SessionProjections, UserMessage } from '../src/host/index.ts'
 import { RESUME_ACTION } from '../src/cards/index.ts'
-import { chatRouteKey } from '../src/domain.ts'
+import { chatRouteKey, dmMainRouteKey } from '../src/domain.ts'
 import type { RouteRecord } from '../src/domain.ts'
 import { FEISHU_ATTACHMENTS_GUIDANCE, FEISHU_ATTACHMENTS_SECTION, FEISHU_PROJECT_SECTION, FEISHU_REPLIES_GUIDANCE, FEISHU_REPLIES_SECTION } from '../src/feishu/agent-context.ts'
 import { ATTACHMENT_FETCH_TOOL_NAME, TOPIC_MESSAGES_TOOL_NAME } from '../src/feishu/tools.ts'
@@ -2946,7 +2946,7 @@ describe('FeishuService', () => {
 
   it('never garbage-collects a projects-mode main Session route', async () => {
     const ctxState = makeHostContext()
-    await seedRoute(ctxState.domain.raw, 'chat:p2p:oc_dm:u_alice', Date.now() - 40 * DAY_MS, {
+    await seedRoute(ctxState.domain.raw, 'dm:main:oc_dm:u_alice', Date.now() - 40 * DAY_MS, {
       kind: 'chat', chatType: 'p2p', chatId: 'oc_dm', senderUserId: 'u_alice', dmRole: 'main', currentDir: '/tmp/ws/main',
     })
     await seedRoute(ctxState.domain.raw, 'omt_stale', Date.now() - 40 * DAY_MS)
@@ -2956,7 +2956,7 @@ describe('FeishuService', () => {
 
     await waitUntil(() => {
       const entries = [...(ctxState.domain.raw.table('routes').entries() as IterableIterator<[string, unknown]>)]
-      expect(entries.map(([key]) => key)).toEqual(['chat:p2p:oc_dm:u_alice'])
+      expect(entries.map(([key]) => key)).toEqual(['dm:main:oc_dm:u_alice'])
     })
     await service.shutdown()
   })
@@ -5543,7 +5543,7 @@ describe('private-chat projects mode', () => {
   /** The route table as a key → record map. */
   const routesOf = (h: SetupResult): Map<string, RouteRecord> =>
     new Map(h.ctxState.domain.raw.table('routes').entries() as IterableIterator<[string, RouteRecord]>)
-  const mainKey = chatRouteKey('p2p', 'oc_dm', 'u_alice')
+  const mainKey = dmMainRouteKey('oc_dm', 'u_alice')
   /** Send options of one recorded send (negative index counts from the end). */
   const sentOptions = (h: SetupResult, index: number): unknown =>
     (h.channel.sent.at(index) as { options?: unknown } | undefined)?.options
@@ -5624,6 +5624,25 @@ describe('private-chat projects mode', () => {
     expect(topicRoute?.dmRole).toBeUndefined()
     expect(routesOf(h).get(mainKey)?.sessionId).toBe(h.ctxState.agents.created[0]!.options.sessionId)
     expect(mock(h.ctxState.agents.created[0]!.handle.agent.followup)).toHaveBeenCalledTimes(1)
+    await h.service.shutdown()
+  })
+
+  it('keeps the main Session when a later topic-mode message falls back to a chat-scoped route', async () => {
+    const h = await setup({ dmStyle: 'project' }, { failReplyInThread: true })
+    await h.service.accessAdmin.addUser('u_alice')
+    await h.onMessage(dm('主会话'))
+    await waitForEstablishedSession(h)
+    expect(await h.service.accessAdmin.setDmStyle('u_alice', 'topic')).toMatchObject({ ok: true })
+    await h.onMessage(dm('话题模式'))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
+    await waitUntil(() => expect(routesOf(h).get(chatRouteKey('p2p', 'oc_dm', 'u_alice'))).toBeDefined())
+    expect(routesOf(h).get(mainKey)?.sessionId).toBe(h.ctxState.agents.created[0]!.options.sessionId)
+
+    expect(await h.service.accessAdmin.setDmStyle('u_alice', 'project')).toMatchObject({ ok: true })
+    await resetFollowupAfterEstablishment(h.ctxState.agents.created[0]!.handle.agent)
+    await h.onMessage(dm('回到主会话'))
+    await waitUntil(() => expect(mock(h.ctxState.agents.created[0]!.handle.agent.followup)).toHaveBeenCalledTimes(1))
+    expect(h.ctxState.agents.created).toHaveLength(2)
     await h.service.shutdown()
   })
 
