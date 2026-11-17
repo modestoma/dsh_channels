@@ -2014,6 +2014,34 @@ describe('TurnStreamer chat replies', () => {
     expect(['om_card', 'om_seg_2', 'om_seg_3'].map(id => elementsOf(cards.get(id)!)[0]?.content)).toEqual(['一。', '二。', '三。'])
   })
 
+  it('splits an oversized stretch closed between two refreshes instead of clipping it', async () => {
+    const { ch, h, streamer } = chatStreamer()
+    const session = makeSession('sess-chat-huge')
+    streamer.attach(session, 'om_card', 'om_trigger', undefined)
+    const huge = Array.from({ length: 4_000 }, (_, line) => `第${line}行内容`).join('\n')
+    streamer.onAssistantFrame(session, start('a0', 1))
+    streamer.onAssistantFrame(session, text('a0', '开头。'))
+    streamer.onAssistantFrame(session, committed('a0'))
+    await vi.advanceTimersByTimeAsync(500)
+    streamer.onAssistantFrame(session, start('a1', 2))
+    streamer.onAssistantFrame(session, text('a1', huge))
+    streamer.onAssistantFrame(session, committed('a1'))
+    streamer.onAssistantFrame(session, start('a2', 3))
+    streamer.onAssistantFrame(session, text('a2', '结尾。'))
+    streamer.onAssistantFrame(session, committed('a2'))
+    streamer.onSessionEvent(session, { type: 'turn/end', seq: 1, data: { turn: 1, reason: 'stop' } })
+    await vi.advanceTimersByTimeAsync(500)
+
+    const cards = latest(ch, h)
+    const bodies = ['om_card', ...h.sendSegmentCard.mock.calls.map(call => `om_seg_${call[1]}`)]
+      .map(id => elementsOf(cards.get(id)!).find(element => element.text_size === undefined)?.content ?? '')
+    expect(bodies.length).toBeGreaterThan(3)
+    expect(bodies[0]).toBe('开头。')
+    expect(bodies.at(-1)).toBe('结尾。')
+    expect(bodies.slice(1, -1).join('\n')).toBe(huge)
+    expect(JSON.stringify([...cards.values()])).not.toContain('已截断')
+  })
+
   it('keeps one card when a retried step replaces a discarded attempt', async () => {
     const { ch, h, streamer } = chatStreamer()
     const session = makeSession('sess-chat-retry')
