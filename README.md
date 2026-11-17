@@ -45,7 +45,7 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 
 选择卡的选项单列排列；按钮等同于在该卡下输入对应命令（如点「high」= `/effort high`），走同样的准入、归属与校验，执行结果原地替换该选择卡（更新失败时才另发一张结果卡）；私聊只有本人、群话题里通过准入的成员点击，且卡片仍在原聊天里时才生效，话题换绑 Session 后旧卡上的按钮失效。按钮最多显示 12 个，其余可直接输入命令。
 
-`/new` 是 `/renew` 的别名。`/help` 由命令注册表按分组生成，新增命令只需在注册表里加一行。
+`/new` 是 `/renew` 的别名。`/help` 由命令注册表按分组生成，新增命令只需在注册表里加一行。命令意外失败时，结果卡写明「命令执行失败」并附上异常摘要（最多 300 字），同一条错误还会打到进程控制台（宿主 logger 的告警默认只缓存，不一定进容器日志）。
 
 不在上面命令表中的 `/` 开头消息（如 `/some-skill …`）不由插件处理，而是和普通消息一样经过准入后作为 prompt 交给 DSH，由 DSH 展开对应的用户可调用 skill；没有同名 skill 时按普通文本处理。
 
@@ -662,7 +662,7 @@ if (bitable?.version === 1) {
 - **话题创建**：通过回复消息接口 `reply_in_thread: true`（官方文档明示的“以话题方式回复（即创建话题）”）。响应后经 `im.v1.message.get` 取回 `thread_id` 写入路由表。
 - **话题延续**：`im.message.receive_v1` 事件自带 `thread_id`，命中路由表即 `agent.followup()`，无需 @。同一 (chat, user) 的**并发首消息会被串行化**：后到的消息等待在途的会话建立完成，再按串行语义续聊同一 session 或另起新话题——不会重复建 session、覆盖路由，也不会落入“无路由、无 @”的丢弃窗口。
 - **降级（`threadFallback: 'degrade'`）**：私聊或群聊拒绝话题回复（如 230071）时，自动改为普通回复，路由键退化为 `chat:p2p:<chat_id>:<user_id>` / `chat:group:<chat_id>:<user_id>`（会话级延续）；`strict` 则直接失败。
-- **重启恢复**：路由表持久化在 `storageDomain`；消息到达时 `ctx.agents.resume()` 懒恢复 session。若会话已被其他 owner 恢复为 live（如 Web UI 打开过该会话、并发冷恢复竞态），插件**借用**该 live agent 直接 `followup()`，不再报 "cannot prepare session … while it is live"。借用的 agent 不归插件 dispose；shutdown 与在途 resume 竞态时，刚发布的 agent 会被立即 dispose 以避免泄漏进下一实例的 live 注册表。
+- **重启恢复**：路由表持久化在 `storageDomain`；消息到达时 `ctx.agents.resume()` 懒恢复 session。若会话已被其他 owner 恢复为 live（如 Web UI 打开过该会话、并发冷恢复竞态），插件**借用**该 live agent 直接 `followup()`，不再报 "cannot prepare session … while it is live"。借用的 agent 不带插件的命令，`/renew`、`/effort` 执行时通过注入 `commands` 的子作用域临时装进这个 agent，执行完即移除；借用的 agent 不归插件 dispose；shutdown 与在途 resume 竞态时，刚发布的 agent 会被立即 dispose 以避免泄漏进下一实例的 live 注册表。
 - **重启恢复（流式中断）**：每条正在流式的 turn 会把恢复所需的信息写入 `dsh_channels` 域的 `inflight` 表（键 = 主卡 message id，turn 结束即删）：trigger 消息、Typing reaction id、全部段卡 id、路由，以及交给模型的那条消息（序列化后不超过 256 KB；更大时不保存）。后台唤醒卡片也会写，只是没有 trigger 消息。重启后长连接一建立，插件就恢复这些 turn 所在的 Session，读会话日志，按三种情况处理：
   - **还没轮到处理**（日志里没有这条消息，说明它当时还在排队）：同一张卡片里重新运行一次（`replay.pending`，默认开启；每条消息最多重放一次，再中断就按下面的「被打断」处理）。
   - **已经完成**（日志里这一轮正常结束，只是卡片没来得及更新）：用日志里的最终回复重画卡片，顶部注明「这轮回复在服务重启前已完成」，正文按原来的卡片数依次铺开，放不下时提示到 dsh 客户端查看。

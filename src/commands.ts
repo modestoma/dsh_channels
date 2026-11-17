@@ -173,16 +173,31 @@ export function armEffortCommand(signal: AbortSignal, operation: EffortOperation
   return () => { EFFORT_OPERATIONS.delete(signal) }
 }
 
-/** Install only `/renew` into a borrowed Agent scope that lacks channel commands. */
-export function registerRenewCommand(commands: CommandRuntime): () => void {
-  const descriptor = DESCRIPTORS.find(entry => entry.name === 'renew')!
-  return commands.register({ ...descriptor, handler: renewHandler })
+/** Channel commands a borrowed Agent scope receives for one execution. */
+export type BorrowedCommandName = 'renew' | 'effort'
+
+const BORROWED_HANDLERS: Readonly<Record<BorrowedCommandName, CommandDefinition['handler']>> = {
+  renew: renewHandler,
+  effort: effortHandler,
 }
 
-/** Install only `/effort` into a borrowed Agent scope that lacks channel commands. */
-export function registerEffortCommand(commands: CommandRuntime): () => void {
-  const descriptor = DESCRIPTORS.find(entry => entry.name === 'effort')!
-  return commands.register({ ...descriptor, handler: effortHandler })
+/**
+ * Install one channel command into a borrowed Agent scope that lacks the
+ * channel commands, through a `commands`-injected child scope (a bare Agent
+ * context does not expose `commands`).
+ * @param agentCtx - the borrowed Agent's context.
+ * @param name - the command to install.
+ * @returns a release that unloads the child scope and so removes the command.
+ */
+export async function mountBorrowedCommand(
+  agentCtx: AgentContext,
+  name: BorrowedCommandName,
+): Promise<() => Promise<void>> {
+  const descriptor = DESCRIPTORS.find(entry => entry.name === name)!
+  const scope = await agentCtx.inject(['commands'], (ctx) => {
+    ctx.commands.register({ ...descriptor, handler: BORROWED_HANDLERS[name] })
+  })
+  return async () => { await scope.dispose() }
 }
 
 /**

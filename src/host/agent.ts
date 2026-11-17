@@ -124,6 +124,10 @@ export interface ToolRuntime {
 }
 
 export interface AgentContext {
+  /**
+   * Agent-scoped command registry. Readable only on the context an
+   * `inject(['commands'], …)` callback receives; a bare Agent context throws.
+   */
   commands: CommandRuntime
   /** Present inside a setup scope that injected `systemPrompt`. */
   systemPrompt?: SystemPromptRuntime
@@ -137,11 +141,23 @@ export interface AgentContext {
     listener: AgentRequestListener,
     options?: boolean | AgentRequestListenerOptions,
   ): () => boolean
-  /** Mount a child plugin only after its declared Host services are available. */
+  /**
+   * Mount a child plugin only after its declared Host services are available.
+   * A Host service such as `commands` is readable only on the callback's
+   * context; reading it on the bare Agent context throws on real hosts.
+   * @returns the child scope once mounted; disposing it removes every
+   *   registration the callback made.
+   */
   inject(
     dependencies: readonly string[],
     callback: (ctx: AgentContext) => void,
-  ): PromiseLike<unknown>
+  ): PromiseLike<AgentChildScope>
+}
+
+/** A child plugin mounted by {@link AgentContext.inject}. */
+export interface AgentChildScope {
+  /** Unload the child plugin and settle once its registrations are removed. */
+  dispose(): Promise<unknown>
 }
 
 export interface Agent {
