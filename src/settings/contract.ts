@@ -241,6 +241,8 @@ export const EDITABLE_KEYS = [
   // 会话：私聊模式
   'dmStyle',
   'dmMainPreset',
+  'dmMainReasoningEffort',
+  'dmMainReplyStyle',
   'dmMainTools',
   'dmMaxRunningTopics',
   'dmReportChars',

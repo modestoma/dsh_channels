@@ -276,7 +276,7 @@ export class SessionManager {
   /** Borrow one foreign live agent and mount this channel's scoped policy, tools, and guidance. */
   private async borrow(record: RouteRecord, agent: Agent): Promise<LiveAgent> {
     const sessionId = record.sessionId
-    const borrowed = borrowLiveAgent(agent, this.mountRequestPolicy(agent.ctx, agent))
+    const borrowed = borrowLiveAgent(agent, this.mountRequestPolicy(agent.ctx, agent, record.dmRole))
     this.live.set(sessionId, borrowed)
     // Best-effort tool backfill (D7): the foreign owner may have composed the
     // session without this plugin's setup (web UI resolver, previous plugin
@@ -323,12 +323,17 @@ export class SessionManager {
     }
   }
 
-  /** Mount one mutable Session-aware request policy outside every other wrapper. */
-  mountRequestPolicy(agentCtx: AgentContext, agent?: Agent): () => void {
+  /**
+   * Mount one mutable Session-aware request policy outside every other wrapper.
+   * A projects-mode main Session's configured effort is `dmMainReasoningEffort`
+   * (else `reasoningEffort`).
+   */
+  mountRequestPolicy(agentCtx: AgentContext, agent?: Agent, dmRole?: RouteRecord['dmRole']): () => void {
+    const config = this.deps.config()
     const controller = installRequestPolicy(agentCtx, {
-      effort: this.deps.config().reasoningEffort,
-      provider: this.deps.config().provider,
-      model: this.deps.config().model,
+      effort: dmRole === 'main' ? config.dmMainReasoningEffort ?? config.reasoningEffort : config.reasoningEffort,
+      provider: config.provider,
+      model: config.model,
     })
     if (agent !== undefined) controller.sync(agent.session.snapshotEvents(), agent)
     this.policies.set(agentCtx, controller)
@@ -456,7 +461,7 @@ export class SessionManager {
       // `prepend` is essential: standing preset listeners may have been
       // mounted before this Agent existed, so setup registration order alone
       // cannot guarantee that the explicit channel value wins.
-      this.mountRequestPolicy(agentCtx)
+      this.mountRequestPolicy(agentCtx, undefined, dmRole)
       await mountChannelCommands(agentCtx)
       if (sessionId !== undefined) await this.mountToolsFor(agentCtx, sessionId, dmRole)
     }
@@ -467,7 +472,7 @@ export class SessionManager {
     return {
       agentPreset: resolved.id,
       setup: async (agentCtx) => {
-        this.mountRequestPolicy(agentCtx)
+        this.mountRequestPolicy(agentCtx, undefined, dmRole)
         await presets.mount(agentCtx, resolved.id)
         await mountChannelCommands(agentCtx)
         if (sessionId !== undefined) await this.mountToolsFor(agentCtx, sessionId, dmRole)

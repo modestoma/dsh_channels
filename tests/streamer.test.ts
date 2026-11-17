@@ -1909,3 +1909,155 @@ describe('TurnStreamer settle hooks', () => {
     expect(resendSegment.mock.calls[0]![1]).toBe(2)
   })
 })
+
+describe('TurnStreamer chat replies', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  type Frame = Parameters<TurnStreamer['onAssistantFrame']>[1]
+  const start = (attemptId: string, step: number): Frame => ({ type: 'start', attemptId, revision: 1, turn: 1, step })
+  const text = (attemptId: string, delta: string): Frame => ({
+    type: 'chunk', attemptId, revision: 1, index: 0, time: 1, chunk: { type: 'text-delta', index: 0, text: delta },
+  })
+  const reasoning = (attemptId: string, delta: string): Frame => ({
+    type: 'chunk', attemptId, revision: 1, index: 0, time: 1, chunk: { type: 'reasoning-delta', index: 0, text: delta },
+  })
+  const committed = (attemptId: string): Frame => ({
+    type: 'end', attemptId, revision: 1, index: 1, outcome: { kind: 'committed', eventType: 'assistant/message', seq: 1 },
+  })
+  const abandoned = (attemptId: string): Frame => ({ type: 'end', attemptId, revision: 1, index: 1, outcome: { kind: 'abandoned' } })
+
+  function chatStreamer(chat = true) {
+    const ch = channel()
+    const h = { ...hooks(), chatReplies: vi.fn(() => chat) }
+    const streamer = new DrivenStreamer(ch, 500, h, 1_000)
+    return { ch, h, streamer }
+  }
+
+  /** The newest card each message id was sent or patched with. */
+  function latest(ch: ReturnType<typeof channel>, h: ReturnType<typeof hooks>): Map<string, object> {
+    const cards = new Map<string, object>()
+    for (const call of h.sendSegmentCard.mock.calls) cards.set(`om_seg_${call[1]}`, call[2])
+    for (const update of ch.updated) cards.set(update.messageId, update.card)
+    return cards
+  }
+
+  it('shows only a waiting line until text arrives, then only the text', async () => {
+    const { ch, streamer } = chatStreamer()
+    const session = makeSession('sess-chat')
+    streamer.attach(session, 'om_card', 'om_trigger', 'react-typing')
+    streamer.onAssistantFrame(session, start('a1', 1))
+    streamer.onAssistantFrame(session, reasoning('a1', '先想想'))
+    await vi.advanceTimersByTimeAsync(500)
+    const waiting = JSON.stringify(ch.updated.at(-1)!.card)
+    expect(waiting).toContain('思考中…')
+    expect(waiting).not.toContain('先想想')
+    expect(waiting).not.toContain('思考过程')
+
+    streamer.onAssistantFrame(session, text('a1', '好的，我看一下。'))
+    await vi.advanceTimersByTimeAsync(500)
+    const elements = elementsOf(ch.updated.at(-1)!.card)
+    expect(elements[0]).toEqual({ tag: 'markdown', content: '好的，我看一下。' })
+    expect(JSON.stringify(elements)).not.toContain('思考中')
+    // The running turn's card carries the stop button.
+    expect(JSON.stringify(elements)).toContain('turn-stop')
+  })
+
+  it('sends each stretch of text between model steps as its own card', async () => {
+    const { ch, h, streamer } = chatStreamer()
+    const session = makeSession('sess-chat-blocks')
+    streamer.attach(session, 'om_card', 'om_trigger', 'react-typing')
+    streamer.onAssistantFrame(session, start('a1', 1))
+    streamer.onAssistantFrame(session, text('a1', '我先看看有哪些话题。'))
+    streamer.onAssistantFrame(session, committed('a1'))
+    // The next step starts with blank lines: they do not open a card alone.
+    streamer.onAssistantFrame(session, start('a2', 2))
+    streamer.onAssistantFrame(session, text('a2', '\n\n'))
+    await vi.advanceTimersByTimeAsync(500)
+    expect(h.sendSegmentCard).not.toHaveBeenCalled()
+
+    streamer.onAssistantFrame(session, text('a2', '有两个话题在跑。'))
+    streamer.onAssistantFrame(session, committed('a2'))
+    await vi.advanceTimersByTimeAsync(500)
+    expect(h.sendSegmentCard).toHaveBeenCalledTimes(1)
+    streamer.onSessionEvent(session, { type: 'turn/end', seq: 3, data: { turn: 1, reason: 'stop' } })
+    await vi.advanceTimersByTimeAsync(0)
+
+    const cards = latest(ch, h)
+    const first = elementsOf(cards.get('om_card')!)
+    const second = elementsOf(cards.get('om_seg_2')!)
+    expect(first).toEqual([{ tag: 'markdown', content: '我先看看有哪些话题。' }])
+    expect(second).toEqual([{ tag: 'markdown', content: '有两个话题在跑。' }])
+    // No segment header, headline, panel or footer on settled chat cards.
+    expect(JSON.stringify([first, second])).not.toMatch(/回复分段|已完成|模型|上下文/u)
+  })
+
+  it('keeps one card when a retried step replaces a discarded attempt', async () => {
+    const { ch, h, streamer } = chatStreamer()
+    const session = makeSession('sess-chat-retry')
+    streamer.attach(session, 'om_card', 'om_trigger', undefined)
+    streamer.onAssistantFrame(session, start('a1', 1))
+    streamer.onAssistantFrame(session, text('a1', '第一段。'))
+    streamer.onAssistantFrame(session, committed('a1'))
+    // Step 2's first attempt opens a card, then is abandoned before it was sent.
+    streamer.onAssistantFrame(session, start('a2', 2))
+    streamer.onAssistantFrame(session, text('a2', '坏答案'))
+    streamer.onAssistantFrame(session, abandoned('a2'))
+    streamer.onAssistantFrame(session, start('a3', 2))
+    streamer.onAssistantFrame(session, text('a3', '第二段。'))
+    streamer.onAssistantFrame(session, committed('a3'))
+    streamer.onSessionEvent(session, { type: 'turn/end', seq: 1, data: { turn: 1, reason: 'stop' } })
+    await vi.advanceTimersByTimeAsync(500)
+
+    expect(h.sendSegmentCard).toHaveBeenCalledTimes(1)
+    const cards = latest(ch, h)
+    expect(elementsOf(cards.get('om_card')!)).toEqual([{ tag: 'markdown', content: '第一段。' }])
+    expect(JSON.stringify(cards.get('om_seg_2'))).toContain('第二段。')
+    expect(JSON.stringify([...cards.values()])).not.toContain('坏答案')
+  })
+
+  it('settles a turn without text with a notice, and a stopped turn with the stopped line', async () => {
+    const { ch, streamer } = chatStreamer()
+    const silent = makeSession('sess-chat-silent')
+    streamer.attach(silent, 'om_silent', 'om_trigger', undefined)
+    streamer.onSessionEvent(silent, { type: 'turn/end', seq: 1, data: { turn: 1, reason: 'stop' } })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(elementsOf(ch.updated.at(-1)!.card)).toEqual([{ tag: 'markdown', content: '（本轮没有文字回复）', text_size: 'notation' }])
+
+    const stopped = makeSession('sess-chat-stopped')
+    streamer.attach(stopped, 'om_stopped', 'om_trigger', undefined)
+    streamer.onAssistantFrame(stopped, start('a1', 1))
+    streamer.onAssistantFrame(stopped, text('a1', '写到一半'))
+    streamer.markStopping(stopped.id)
+    streamer.onSessionEvent(stopped, { type: 'turn/end', seq: 1, data: { turn: 1, reason: { kind: 'aborted' } } } as SessionEvent)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(elementsOf(ch.updated.at(-1)!.card)).toEqual([
+      { tag: 'markdown', content: '写到一半' },
+      { tag: 'markdown', content: '⏹ 已停止', text_size: 'notation' },
+    ])
+  })
+
+  it('runs no keep-alive heartbeat on a chat turn', async () => {
+    const { ch, streamer } = chatStreamer()
+    const session = makeSession('sess-chat-quiet')
+    streamer.attach(session, 'om_card', 'om_trigger', undefined)
+    await vi.advanceTimersByTimeAsync(500)
+    const patches = ch.updated.length
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(ch.updated.length).toBe(patches)
+  })
+
+  it('keeps the status card when the hook declines chat replies', async () => {
+    const { ch, h, streamer } = chatStreamer(false)
+    const session = makeSession('sess-card')
+    streamer.attach(session, 'om_card', 'om_trigger', undefined)
+    await vi.advanceTimersByTimeAsync(500)
+    expect(h.chatReplies).toHaveBeenCalledWith('sess-card')
+    expect(headlineOf(ch.updated.at(-1)!.card)).not.toBe('')
+  })
+})

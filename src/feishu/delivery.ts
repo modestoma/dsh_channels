@@ -171,16 +171,19 @@ export class CardDelivery {
    * Reply with the first card frame. Prefers topic replies (`reply_in_thread`)
    * — the documented way a bot creates a topic — and falls back to a plain
    * reply when Feishu refuses (degraded chat-scoped routing). `inThread:
-   * false` replies in the chat timeline (projects-mode main chat).
+   * false` replies in the chat timeline (projects-mode main chat); with
+   * `quote: false` it is sent as a new message instead of a reply.
    */
   async replyFirstCard(
     msg: NormalizedMessage,
     card: object,
-    options: { inThread?: boolean } = {},
+    options: { inThread?: boolean; quote?: boolean } = {},
   ): Promise<{ messageId: string; threadId?: string; degraded: boolean }> {
     const channel = this.requireChannel()
     if (options.inThread === false) {
-      const res = await channel.send(msg.chatId, { card }, { replyTo: msg.messageId })
+      const res = options.quote === false
+        ? await channel.send(msg.chatId, { card })
+        : await channel.send(msg.chatId, { card }, { replyTo: msg.messageId })
       return { messageId: res.messageId, degraded: false }
     }
     try {
@@ -200,7 +203,8 @@ export class CardDelivery {
 
   /**
    * Send one body-segment continuation card into the session's topic (or, for
-   * degraded chat-scoped routes, as a plain reply anchored to the main card).
+   * degraded chat-scoped routes, as a plain reply anchored to the main card;
+   * in a projects-mode main chat, as a new message).
    * When Feishu rejects the card (e.g. per-card table limit, error 11310) the
    * segment is re-delivered as a plain-text message so the content is never
    * lost — text messages carry no card constraints.
@@ -216,7 +220,9 @@ export class CardDelivery {
       throw new Error(`dsh-channels: no route record for session ${sessionId}; segment card not sent`)
     }
     const channel = this.requireChannel()
-    const options = { replyTo: record.cardMessageId, replyInThread: record.kind === 'thread' }
+    // A projects-mode main chat is one conversation: later cards follow as
+    // new messages, not as replies quoting the turn's first card.
+    const options = record.dmRole === 'main' ? undefined : { replyTo: record.cardMessageId, replyInThread: record.kind === 'thread' }
     try {
       const res: SendResult = await channel.send(record.chatId, { card }, options)
       return { messageId: res.messageId, mode: 'card' }

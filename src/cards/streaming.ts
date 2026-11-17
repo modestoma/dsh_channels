@@ -27,6 +27,13 @@
  * Continuation cards (`options.segment`) carry a segment header and the body;
  * they have no panel and no footer, so a long answer is not repeated chrome.
  *
+ * Chat cards (`state.chat`, the projects-mode main Session's chat-style
+ * replies) render only the body: no segment header, headline, panel,
+ * delegation line or footer. While the card has no text yet, `headline`
+ * carries a short waiting line; once settled it carries the stopped notice,
+ * if any. The stop button and the queued/dropped notices render as on any
+ * card.
+ *
  * The stop button follows the activity lines: the streamer only passes it for
  * the card that is currently streaming and drops it once the turn settles, so
  * a settled card never offers a control that can no longer act.
@@ -179,6 +186,8 @@ export interface CardState {
    * Agent), rendered as the first notation line of the main card.
    */
   origin?: string
+  /** Render as a chat card: the body plus the `headline` notation line only. */
+  chat?: boolean
   stats: CardStats
 }
 
@@ -364,6 +373,15 @@ function buildUsageLine(stats: CardStats): string {
 /** Body of a settled turn that wrote no answer text. */
 const EMPTY_BODY = '*（本次无正文输出）*'
 
+/** Notation line of a settled chat card whose turn wrote no answer text. */
+export const CHAT_EMPTY_NOTICE = '（本轮没有文字回复）'
+
+/** Notation line of a chat card left without content (its text was withdrawn after a failed attempt). */
+const CHAT_BLANK_NOTICE = '…'
+
+/** Waiting line of a chat card that has no text yet: the first frame's, and the one shown while the model thinks. */
+export const CHAT_THINKING = '思考中…'
+
 /** The panel's markdown: the reasoning stripped of tables. */
 function panelContent(reasoning: string): string {
   return stripTables(reasoning)
@@ -465,6 +483,7 @@ function renderCard(
   const main = segment === undefined
   if (main && state.dropped === true) return card([markdown(DROPPED_NOTICE)])
   if (main && state.queued === true) return card(queuedElements(state.queuedDenied === true))
+  if (state.chat === true) return card(chatElements(state, main, body))
   const elements: object[] = []
 
   if (main && state.origin !== undefined && state.origin !== '') elements.push(note(state.origin))
@@ -494,6 +513,19 @@ function renderCard(
   }
 
   return card(elements)
+}
+
+/** A chat card's elements: origin (main card), body, the `headline` notation line and the stop button. */
+function chatElements(state: CardState, main: boolean, body: string): object[] {
+  const elements: object[] = []
+  if (main && state.origin !== undefined && state.origin !== '') elements.push(note(state.origin))
+  if (body.trim() !== '') elements.push(markdown(body))
+  const line = activityLine(state.headline)
+  if (line !== undefined) elements.push(note(line))
+  else if (main && body.trim() === '' && isSettled(state.phase)) elements.push(note(CHAT_EMPTY_NOTICE))
+  if (state.stop !== undefined) elements.push(...stopElements(state.stop, state.stopDenied === true))
+  if (elements.length === 0) elements.push(note(CHAT_BLANK_NOTICE))
+  return elements
 }
 
 // ---- budgeting ------------------------------------------------------------
@@ -581,7 +613,7 @@ export function segmentCardContent(state: CardState, options: CardOptions = {}):
   const probe: CardState = {
     ...state,
     phase: 'error',
-    reasoning: main ? PANEL_PROBE_MARKDOWN : '',
+    reasoning: main && state.chat !== true ? PANEL_PROBE_MARKDOWN : '',
     headline: LINE_PROBE,
     status: LINE_PROBE,
     stop: 'stopping',
@@ -776,6 +808,22 @@ export function initialStreamingCard(sessionId: string): object {
     stats: { sessionId, inputTokens: 0, outputTokens: 0 },
   }
   return buildCard(state)
+}
+
+/**
+ * The first frame of a chat-style reply (see `CardState.chat`): the thinking
+ * line only, no stop button (the streamer adds it once the turn is active).
+ * @returns the card.
+ */
+export function initialChatCard(): object {
+  return buildCard({
+    phase: 'thinking',
+    reasoning: '',
+    body: '',
+    chat: true,
+    headline: CHAT_THINKING,
+    stats: { sessionId: '', inputTokens: 0, outputTokens: 0 },
+  })
 }
 
 /**

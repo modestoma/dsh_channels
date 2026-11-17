@@ -178,6 +178,16 @@ export interface TurnState {
   stopDenied: boolean
   /** A non-owner clicked the queued card's steer button. */
   queuedDenied: boolean
+  /**
+   * The turn renders as chat cards (`StreamerHooks.chatReplies`): each
+   * stretch of answer text between model steps opens its own card.
+   */
+  chat: boolean
+  /**
+   * Chat turns only: a model step committed since the last answer text, so
+   * the next non-blank text opens a new card.
+   */
+  blockBreak: boolean
 }
 
 /** One scheduled model-request retry (`llm/retry` → `llm/retry-started`). */
@@ -201,6 +211,7 @@ export interface AttemptMark {
   reasoningLength: number
   reasoningMs: number
   reasoningSince: number | undefined
+  blockBreak: boolean
 }
 
 /** One live `tool-workflow/run-*` fold: run identity and member progress. */
@@ -243,6 +254,8 @@ export interface TurnStateInit {
   origin: string | undefined
   /** The already-sent main card; undefined when the card is still to be sent. */
   cardMessageId: string | undefined
+  /** Render as chat cards (see {@link TurnState.chat}). */
+  chat: boolean
 }
 
 /**
@@ -317,6 +330,8 @@ export function newTurnState(init: TurnStateInit): TurnState {
     stopRequested: false,
     stopDenied: false,
     queuedDenied: false,
+    chat: init.chat,
+    blockBreak: false,
   }
 }
 
@@ -527,9 +542,21 @@ export function foldAssistantFrame(
             changed = true
           }
         }
-        const last = state.cards[state.cards.length - 1]
+        let last = state.cards[state.cards.length - 1]
         if (last !== undefined && !last.frozen && chunk.text !== '') {
-          last.body += chunk.text
+          let text = typeof chunk.text === 'string' ? chunk.text : ''
+          if (state.chat && state.blockBreak && last.body.trim() !== '') {
+            // A chat card ends with its stretch of text: the next stretch
+            // opens a new card, without the blank lines that lead into it.
+            text = text.replace(/^\s+/u, '')
+            if (text === '') return changed
+            last.frozen = true
+            last.dirty = true
+            last = freshSegment('')
+            state.cards.push(last)
+          }
+          state.blockBreak = false
+          last.body += text
           if (state.phase === 'thinking') state.phase = 'replying'
           changed = true
         }
@@ -556,6 +583,7 @@ export function foldAssistantFrame(
       const discarded = frame.outcome.kind === 'abandoned'
         || frame.outcome.eventType === 'assistant/attempt'
       if (discarded && mark !== undefined) rollbackAttempt(state, mark)
+      else if (!discarded && state.chat) state.blockBreak = true
       return true
     }
   }
@@ -640,6 +668,7 @@ function attemptMark(state: TurnState): AttemptMark {
     reasoningLength: state.reasoning.length,
     reasoningMs: state.reasoningMs,
     reasoningSince: state.reasoningSince,
+    blockBreak: state.blockBreak,
   }
 }
 
@@ -684,6 +713,7 @@ function rollbackAttempt(state: TurnState, mark: AttemptMark): void {
   // The discarded attempt's reasoning time is not part of the visible turn.
   state.reasoningMs = mark.reasoningMs
   state.reasoningSince = mark.reasoningSince
+  state.blockBreak = mark.blockBreak
 }
 
 /**

@@ -1131,6 +1131,7 @@ export class FeishuService {
       settleReaction: (messageId, removeReactionId, add) => this.outbox.reaction(messageId, removeReactionId, add),
       resendSegment: (sessionId, segment, card, fallbackText) => this.outbox.segment(sessionId, segment, card, fallbackText),
       hostTurnOrigin: (sessionId, message) => this.hostTurnOrigin(sessionId, message),
+      chatReplies: sessionId => this.routes.findBySession(sessionId)?.dmRole === 'main' && this.config.dmMainReplyStyle === 'chat',
       onHostCardDelivered: (sessionId, messageId, mode, message) => this.writeHostSnapshot(sessionId, messageId, mode, message),
     }
     this.streamer = new TurnStreamer(

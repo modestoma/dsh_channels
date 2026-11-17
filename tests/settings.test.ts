@@ -1070,6 +1070,23 @@ describe('settings panel selector catalog', () => {
       .toEqual(['', 'legacy-preset', 'standard'])
   })
 
+  it('offers the configured model efforts for dmMainReasoningEffort, inheriting reasoningEffort when empty', async () => {
+    const fake = makeCatalog()
+    const { surface } = makeSurface({ provider: 'deepseek-account', model: 'deepseek-flash', dmMainReasoningEffort: 'minimal' }, fake.catalog)
+    const field = (await surface.panel()).config.fields.find(entry => entry.key === 'dmMainReasoningEffort')
+    expect(field?.kind).toBe('select')
+    expect(field?.options?.map(option => option.value)).toEqual(['', 'minimal', 'low', 'max'])
+    expect(field?.options?.[0]?.label).toBe('留空 = 沿用推理档位')
+    expect(field?.options?.[1]?.label).toContain('当前配置')
+  })
+
+  it('renders dmMainReplyStyle as a select with the chat style first', async () => {
+    const { surface } = makeSurface()
+    const field = (await surface.panel()).config.fields.find(entry => entry.key === 'dmMainReplyStyle')
+    expect(field?.kind).toBe('select')
+    expect(field?.options?.map(option => option.value)).toEqual(['chat', 'card'])
+  })
+
   it('renders dmMainTools as a checklist when a main-Session tool catalog is known', async () => {
     const { surface, target } = makeSurface()
     const fieldOf = async () => (await surface.panel()).config.fields.find(field => field.key === 'dmMainTools')

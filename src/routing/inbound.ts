@@ -15,7 +15,7 @@ import type {
   Agent, AgentHandle, AttachmentStore, HostContext, SessionId, Workspace,
 } from '../host/index.ts'
 import type { FeishuConfig } from '../config.ts'
-import { buildOnboardingCard, failedStreamingCard, initialStreamingCard, queuedStreamingCard } from '../cards/index.ts'
+import { buildOnboardingCard, failedStreamingCard, initialChatCard, initialStreamingCard, queuedStreamingCard } from '../cards/index.ts'
 import { RouteOperationQueue } from '../commands.ts'
 import { chatRouteKey, dmMainRouteKey, isGroupRoute } from '../domain.ts'
 import type { FeishuDomainHandle, RouteRecord } from '../domain.ts'
@@ -292,6 +292,11 @@ export class InboundRouter {
 
   private get ctx(): HostContext { return this.deps.ctx }
   private get config(): FeishuConfig { return this.deps.config() }
+
+  /** Whether a projects-mode main Session replies with chat cards (`dmMainReplyStyle`). */
+  private chatReplies(): boolean {
+    return this.config.dmMainReplyStyle === 'chat'
+  }
   private get started(): boolean { return this.deps.started() }
   private get routes(): RouteStore { return this.deps.routes }
   private get repair(): InflightRepair { return this.deps.repair }
@@ -932,10 +937,11 @@ export class InboundRouter {
     //    topic's workspace directory. A projects-mode main Session answers
     //    in the chat timeline under its main-route key; a projects-mode
     //    topic already has its topic.
+    const chat = dmRole === 'main' && this.chatReplies()
     const sent = await this.delivery.replyFirstCard(
       msg,
-      initialStreamingCard(sessionId),
-      dmRole === 'main' ? { inThread: false } : {},
+      chat ? initialChatCard() : initialStreamingCard(sessionId),
+      dmRole === 'main' ? { inThread: false, quote: !chat } : {},
     )
     const typingId = await typingPromise
     const projectTopic = dmRole === 'topic' ? msg.threadId : undefined
@@ -1064,10 +1070,11 @@ export class InboundRouter {
 
     // A message behind a running turn opens as a queued card whose button can
     // move it into that turn instead (see `TurnStreamer.mergeQueued`).
+    const chat = current.dmRole === 'main' && this.chatReplies()
     const firstCard = this.streamer?.hasLiveTurn(current.sessionId) === true
       ? queuedStreamingCard(current.sessionId)
-      : initialStreamingCard(current.sessionId)
-    const sent = await this.delivery.replyFirstCard(msg, firstCard, current.dmRole === 'main' ? { inThread: false } : {})
+      : chat ? initialChatCard() : initialStreamingCard(current.sessionId)
+    const sent = await this.delivery.replyFirstCard(msg, firstCard, current.dmRole === 'main' ? { inThread: false, quote: !chat } : {})
     const typingId = await typingPromise
 
     // Repair snapshot first — same crash-window reasoning as `startSession`.
