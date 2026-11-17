@@ -1526,11 +1526,13 @@ export class FeishuService {
   /**
    * Record a settled projects-mode topic turn in the topic directory (its
    * summary then waits for the main Session) and show its outcome on the
-   * topic's root card. Best-effort: a failure is logged.
+   * topic's root card; the card stays running while another turn of the
+   * topic is in flight or queued. Best-effort: a failure is logged.
    */
   private async recordDmTopicTurn(sessionId: string, settled: SettledTurn): Promise<void> {
     const route = this.routes.findBySession(sessionId)
     if (route?.dmRole !== 'topic') return
+    const more = this.streamer?.hasLiveTurn(sessionId) === true
     try {
       // A topic opened before the directory existed is recorded on its first turn after the upgrade.
       if (this.dmTopics.get(route.key) === undefined) {
@@ -1546,7 +1548,7 @@ export class FeishuService {
     } catch (error) {
       this.ctx.logger?.warn?.('dsh-channels: recording topic %s turn failed: %s', route.key, String(error))
     }
-    await this.dmTopicOpener.showTurnStatus(route.key, { kind: settled.outcome })
+    await this.dmTopicOpener.showTurnStatus(route.key, more ? { kind: 'running' } : { kind: settled.outcome })
   }
 
   /**

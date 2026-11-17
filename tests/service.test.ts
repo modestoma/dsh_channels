@@ -5926,6 +5926,26 @@ describe('private-chat projects mode', () => {
       await h.service.shutdown()
     })
 
+    it('keeps the root card running while a forwarded message waits behind the current turn', async () => {
+      const { h, tools } = await setupTools()
+      await h.onMessage(dm('主会话'))
+      await waitForEstablishedSession(h)
+      const opened = await tools.definitions.get('feishu_topic_open')!.execute({ title: 'A', brief: 'a' }, exec) as { topic_id: string }
+      await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
+      const topic = h.ctxState.agents.created[1]!.handle.agent
+      await waitUntil(() => expect(mock(topic.followup)).toHaveBeenCalledTimes(1))
+      expect(await tools.definitions.get('feishu_topic_send')!.execute({ topic_id: opened.topic_id, message: '再看看' }, exec))
+        .toMatchObject({ ok: true, text: expect.stringContaining('排') })
+      const rootId = topicsOf(h).get(opened.topic_id)!.rootMessageId!
+      const rootCard = (): string => JSON.stringify((h.channel.updated as Array<{ messageId: string; card: object }>)
+        .filter(update => update.messageId === rootId).at(-1)?.card)
+      settleTurn(h, topic, 1, '第一轮')
+      await waitUntil(() => expect(topicsOf(h).get(opened.topic_id)?.summary).toBe('第一轮'))
+      await new Promise(resolve => setTimeout(resolve, 10))
+      expect(rootCard()).toContain('进行中')
+      await h.service.shutdown()
+    })
+
     it('refuses to forward into a topic past routeTtlMs and retires it instead of resuming it', async () => {
       const { h, tools } = await setupTools({ routeTtlMs: 86_400_000 })
       await h.onMessage(dm('主会话'))
