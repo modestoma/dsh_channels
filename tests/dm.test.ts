@@ -218,8 +218,13 @@ describe('DmTopicDirectory', () => {
     expect(dir.runningOpenedByMain('u_alice')).toBe(1)
     waiting.add('s_m')
     expect(status('omt_m')).toBe('waiting')
+    // A turn waiting for an approval or an answer is still live.
+    expect(dir.hasLiveTurn(dir.get('omt_m')!)).toBe(true)
+    expect(dir.runningOpenedByMain('u_alice')).toBe(1)
+    expect(dir.hasLiveTurn(dir.get('omt_f')!)).toBe(false)
     busy.clear()
     waiting.clear()
+    expect(dir.hasLiveTurn(dir.get('omt_m')!)).toBe(false)
     await dir.recordTurn('omt_u', 'done', '小结\n做了：x\n需要你：选一个方案', 300)
     expect(status('omt_u')).toBe('waiting')
     routes.delete('omt_u')

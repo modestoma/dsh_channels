@@ -15,7 +15,8 @@
  * Forwarding posts the message in the topic, marked as coming from the main
  * Session, and submits it to the topic Session as the person through the
  * route's operation queue: a topic with a turn in flight gets a queued card
- * and runs the message next.
+ * and runs the message next. Forwarding to a topic still starting waits for
+ * its start, so the hand-over stays its first turn.
  *
  * Root cards follow the topic's turns: {@link DmTopicOpener.showTurnStatus}
  * redraws them when a turn starts and settles.
@@ -101,6 +102,8 @@ export class DmTopicOpener {
   private readonly starting = new Map<string, number>()
   /** Person and title → topic id of a topic still starting, so the same title is not opened twice meanwhile. */
   private readonly startingTitles = new Map<string, string>()
+  /** Topic id → background start of a topic whose route may not be published yet. */
+  private readonly startingTopics = new Map<string, Promise<void>>()
 
   constructor(private readonly deps: DmTopicOpenerDeps) {}
 
@@ -124,7 +127,7 @@ export class DmTopicOpener {
     const pendingId = this.startingTitles.get(titleKey(userId, name))
     if (pendingId !== undefined) return { ok: true, topicId: pendingId, title: name, replayed: true }
     const same = this.deps.directory.topicsOf(userId).find(record => record.openedBy === 'main' && record.title === name
-      && record.failedReason === undefined && this.deps.directory.statusOf(record) === 'running')
+      && this.deps.directory.hasLiveTurn(record))
     if (same !== undefined) return { ok: true, topicId: same.key, title: same.title, replayed: true }
     const limit = this.deps.config().dmMaxRunningTopics
     const running = this.deps.directory.runningOpenedByMain(userId) + (this.starting.get(userId) ?? 0)
@@ -165,7 +168,11 @@ export class DmTopicOpener {
       const pendingKey = titleKey(userId, name)
       this.startingTitles.set(pendingKey, topic.threadId)
       const run = this.start(main, userId, name, brief, sessionId, rootId, topic, release)
-        .finally(() => { if (this.startingTitles.get(pendingKey) === topic.threadId) this.startingTitles.delete(pendingKey) })
+        .finally(() => {
+          if (this.startingTitles.get(pendingKey) === topic.threadId) this.startingTitles.delete(pendingKey)
+          this.startingTopics.delete(topic.threadId)
+        })
+      this.startingTopics.set(topic.threadId, run)
       this.running.add(run)
       void run.finally(() => { this.running.delete(run) })
       return { ok: true, topicId: topic.threadId, title: name, replayed: false }
@@ -190,9 +197,12 @@ export class DmTopicOpener {
     if (record === undefined || record.userId !== userId) {
       return { ok: false, code: 'unknown-topic', message: `没有 topic_id 为 ${topicId} 的话题；先用 feishu_topic_list 查看` }
     }
+    // A topic still starting is waited for, so its hand-over stays the first turn.
+    await this.startingTopics.get(topicId)
     const route = this.deps.routes.get(topicId)
-    if (route === undefined || record.failedReason !== undefined) {
-      return { ok: false, code: 'topic-closed', message: `话题「${record.title}」已${record.failedReason === undefined ? '过期' : '未能开始'}，不能再发消息；需要的话开一个新话题` }
+    const failedReason = this.deps.directory.get(topicId)?.failedReason
+    if (route === undefined || failedReason !== undefined) {
+      return { ok: false, code: 'topic-closed', message: `话题「${record.title}」已${failedReason === undefined ? '过期' : '未能开始'}，不能再发消息；需要的话开一个新话题` }
     }
     const channel = this.deps.channel()
     if (!this.deps.started() || channel === undefined) {

@@ -236,11 +236,18 @@ export class DmTopicDirectory {
    * @returns the count.
    */
   runningOpenedByMain(userId: string): number {
-    return this.topicsOf(userId).filter(record => {
-      if (record.openedBy !== 'main' || record.failedReason !== undefined) return false
-      const route = this.deps.route(record.key)
-      return route !== undefined && this.deps.busy(route.sessionId)
-    }).length
+    return this.topicsOf(userId).filter(record => record.openedBy === 'main' && this.hasLiveTurn(record)).length
+  }
+
+  /**
+   * Whether a topic has a turn in flight or queued, including one waiting for an approval or an answer.
+   * @param record - the topic.
+   * @returns whether it has a live turn.
+   */
+  hasLiveTurn(record: DmTopicRecord): boolean {
+    if (record.failedReason !== undefined) return false
+    const route = this.deps.route(record.key)
+    return route !== undefined && this.deps.busy(route.sessionId)
   }
 
   /**

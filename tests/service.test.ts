@@ -5848,6 +5848,28 @@ describe('private-chat projects mode', () => {
       await h.service.shutdown()
     })
 
+    it('forwards a message sent while the topic is still starting after its hand-over', async () => {
+      const { h, tools } = await setupTools()
+      await h.onMessage(dm('主会话'))
+      await waitForEstablishedSession(h)
+      const create = h.ctxState.ctx.agents.create.bind(h.ctxState.ctx.agents)
+      let release!: () => void
+      const gate = new Promise<void>(resolve => { release = resolve })
+      vi.spyOn(h.ctxState.ctx.agents, 'create').mockImplementationOnce(async options => {
+        await gate
+        return await create(options)
+      })
+      const opened = await tools.definitions.get('feishu_topic_open')!.execute({ title: 'A', brief: '交接说明' }, exec) as { topic_id: string }
+      const sending = tools.definitions.get('feishu_topic_send')!.execute({ topic_id: opened.topic_id, message: '补充一句' }, exec)
+      release()
+      expect(await sending).toMatchObject({ ok: true, topic_id: opened.topic_id })
+      const topic = h.ctxState.agents.created[1]!.handle.agent
+      await waitUntil(() => expect(mock(topic.followup)).toHaveBeenCalledTimes(2))
+      expect(promptText(topic, 0)).toContain('交接说明')
+      expect(promptText(topic, 1)).toContain('补充一句')
+      await h.service.shutdown()
+    })
+
     it('records a topic opened before the directory existed on its next turn', async () => {
       const { h } = await setupTools()
       await h.onMessage(dm('主会话'))
