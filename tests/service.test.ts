@@ -5961,7 +5961,7 @@ describe('private-chat projects mode', () => {
         return await send(...args)
       })
       let settled = false
-      const opening = tools.definitions.get('feishu_topic_open')!.execute({ title: 'A', brief: 'a' }, exec)
+      const opening = Promise.resolve(tools.definitions.get('feishu_topic_open')!.execute({ title: 'A', brief: 'a' }, exec))
         .finally(() => { settled = true })
       await waitUntil(() => expect(h.channel.send).toHaveBeenCalled())
       setTimeout(release, 20)
