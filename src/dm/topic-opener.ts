@@ -99,6 +99,8 @@ export class DmTopicOpener {
   private readonly running = new Set<Promise<void>>()
   /** Person → topics accepted whose first turn is not queued yet (counted against the limit). */
   private readonly starting = new Map<string, number>()
+  /** Person and title → topic id of a topic still starting, so the same title is not opened twice meanwhile. */
+  private readonly startingTitles = new Map<string, string>()
 
   constructor(private readonly deps: DmTopicOpenerDeps) {}
 
@@ -119,6 +121,8 @@ export class DmTopicOpener {
       return { ok: false, code: 'not-connected', message: '飞书渠道尚未连接，请稍后重试' }
     }
     const name = topicTitle(title)
+    const pendingId = this.startingTitles.get(titleKey(userId, name))
+    if (pendingId !== undefined) return { ok: true, topicId: pendingId, title: name, replayed: true }
     const same = this.deps.directory.topicsOf(userId).find(record => record.openedBy === 'main' && record.title === name
       && record.failedReason === undefined && this.deps.directory.statusOf(record) === 'running')
     if (same !== undefined) return { ok: true, topicId: same.key, title: same.title, replayed: true }
@@ -158,7 +162,10 @@ export class DmTopicOpener {
         this.deps.warn('dsh-channels: recording topic %s failed: %s', topic.threadId, String(error))
       }
       handedOff = true
+      const pendingKey = titleKey(userId, name)
+      this.startingTitles.set(pendingKey, topic.threadId)
       const run = this.start(main, userId, name, brief, sessionId, rootId, topic, release)
+        .finally(() => { if (this.startingTitles.get(pendingKey) === topic.threadId) this.startingTitles.delete(pendingKey) })
       this.running.add(run)
       void run.finally(() => { this.running.delete(run) })
       return { ok: true, topicId: topic.threadId, title: name, replayed: false }
@@ -361,6 +368,11 @@ export class DmTopicOpener {
   private assertStarted(): void {
     if (!this.deps.started()) throw new Error('飞书渠道已断开，已取消')
   }
+}
+
+/** Key of {@link DmTopicOpener}'s pending-title map. */
+function titleKey(userId: string, title: string): string {
+  return `${userId}\n${title}`
 }
 
 /**

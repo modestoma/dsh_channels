@@ -1530,13 +1530,39 @@ export class FeishuService {
    */
   private async recordDmTopicTurn(sessionId: string, settled: SettledTurn): Promise<void> {
     const route = this.routes.findBySession(sessionId)
-    if (route?.dmRole !== 'topic' || this.dmTopics.get(route.key) === undefined) return
+    if (route?.dmRole !== 'topic') return
     try {
+      // A topic opened before the directory existed is recorded on its first turn after the upgrade.
+      if (this.dmTopics.get(route.key) === undefined) {
+        await this.dmTopics.register({
+          key: route.key,
+          userId: route.senderUserId ?? '',
+          chatId: route.chatId,
+          title: topicTitle(this.firstPromptText(sessionId) ?? ''),
+          openedBy: 'user',
+        })
+      }
       await this.dmTopics.recordTurn(route.key, settled.outcome, settled.reply, this.config.dmReportChars)
     } catch (error) {
       this.ctx.logger?.warn?.('dsh-channels: recording topic %s turn failed: %s', route.key, String(error))
     }
     await this.dmTopicOpener.showTurnStatus(route.key, { kind: settled.outcome })
+  }
+
+  /**
+   * The first text block of the first prompt a person submitted to a live
+   * Session, read from its log.
+   * @param sessionId - the Session.
+   * @returns the text, or undefined when the Session is not live or has none.
+   */
+  private firstPromptText(sessionId: string): string | undefined {
+    const agent = this.sessions.get(sessionId)?.agent ?? this.ctx.agents.get(sessionId as SessionId)
+    for (const event of agent?.session.snapshotEvents() ?? []) {
+      if (event.type !== 'user/message' || event.data.source.kind !== 'user') continue
+      const text = event.data.content.find(part => part.type === 'text')?.text
+      return typeof text === 'string' ? text : undefined
+    }
+    return undefined
   }
 
   /** Capture aggregate health only; raw configuration and errors are excluded. */

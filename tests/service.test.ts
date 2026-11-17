@@ -5828,6 +5828,43 @@ describe('private-chat projects mode', () => {
       await h.service.shutdown()
     })
 
+    it('answers a second open of the same title with the topic still starting', async () => {
+      const { h, tools } = await setupTools()
+      await h.onMessage(dm('主会话'))
+      await waitForEstablishedSession(h)
+      const create = h.ctxState.ctx.agents.create.bind(h.ctxState.ctx.agents)
+      let release!: () => void
+      const gate = new Promise<void>(resolve => { release = resolve })
+      vi.spyOn(h.ctxState.ctx.agents, 'create').mockImplementationOnce(async options => {
+        await gate
+        return await create(options)
+      })
+      const open = tools.definitions.get('feishu_topic_open')!
+      const first = await open.execute({ title: 'A', brief: 'a' }, exec) as { ok: boolean; topic_id: string }
+      expect(await open.execute({ title: 'A', brief: 'a' }, exec)).toMatchObject({ ok: true, topic_id: first.topic_id, text: expect.stringContaining('没有重复开') })
+      release()
+      await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
+      await waitUntil(() => expect(routesOf(h).get(first.topic_id)).toBeDefined())
+      await h.service.shutdown()
+    })
+
+    it('records a topic opened before the directory existed on its next turn', async () => {
+      const { h } = await setupTools()
+      await h.onMessage(dm('主会话'))
+      await waitForEstablishedSession(h)
+      await h.onMessage(dm('老话题的开头', { threadId: 'omt_old' }))
+      await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
+      const topic = h.ctxState.agents.created[1]!.handle.agent
+      await waitUntil(() => expect(mock(topic.followup)).toHaveBeenCalled())
+      await waitUntil(() => expect(topicsOf(h).get('omt_old')).toBeDefined())
+      await h.ctxState.domain.raw.table('dm_topics').delete('omt_old')
+      const log = sessionEvents(topic.session)
+      log.push({ type: 'user/message', seq: log.length, data: { id: 'm1', role: 'user', content: [{ type: 'text', text: '老话题的开头' }], source: { kind: 'user' } } } as never)
+      settleTurn(h, topic, 1, '做完了')
+      await waitUntil(() => expect(topicsOf(h).get('omt_old')).toMatchObject({ title: '老话题的开头', openedBy: 'user', summary: '做完了' }))
+      await h.service.shutdown()
+    })
+
     it('marks the root card, the topic card and the directory failed when the topic Session cannot start', async () => {
       const { h, tools } = await setupTools()
       await h.onMessage(dm('主会话'))
