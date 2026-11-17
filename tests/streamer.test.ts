@@ -1997,6 +1997,23 @@ describe('TurnStreamer chat replies', () => {
     expect(JSON.stringify([first, second])).not.toMatch(/回复分段|已完成|模型|上下文/u)
   })
 
+  it('sends every stretch even when several close between two refreshes', async () => {
+    const { ch, h, streamer } = chatStreamer()
+    const session = makeSession('sess-chat-burst')
+    streamer.attach(session, 'om_card', 'om_trigger', undefined)
+    for (const [index, stretch] of ['一。', '二。', '三。'].entries()) {
+      streamer.onAssistantFrame(session, start(`a${index}`, index + 1))
+      streamer.onAssistantFrame(session, text(`a${index}`, stretch))
+      streamer.onAssistantFrame(session, committed(`a${index}`))
+    }
+    streamer.onSessionEvent(session, { type: 'turn/end', seq: 1, data: { turn: 1, reason: 'stop' } })
+    await vi.advanceTimersByTimeAsync(500)
+
+    expect(h.sendSegmentCard.mock.calls.map(call => call[1])).toEqual([2, 3])
+    const cards = latest(ch, h)
+    expect(['om_card', 'om_seg_2', 'om_seg_3'].map(id => elementsOf(cards.get(id)!)[0]?.content)).toEqual(['一。', '二。', '三。'])
+  })
+
   it('keeps one card when a retried step replaces a discarded attempt', async () => {
     const { ch, h, streamer } = chatStreamer()
     const session = makeSession('sess-chat-retry')

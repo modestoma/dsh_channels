@@ -220,6 +220,16 @@ export class CardDelivery {
    * (their sends are chained in order).
    */
   private splitOverflow(sessionId: string, state: TurnState): void {
+    // A chat turn can close several stretches of text between two flushes;
+    // each closed card that was never sent goes out, in order, before the
+    // newest one. Such a card is not split: a stretch that outgrew one card
+    // within a single refresh interval is clipped by `buildCard`.
+    for (const [index, card] of state.cards.entries()) {
+      if (index === state.cards.length - 1) break
+      if (card.frozen && card.messageId === undefined && !card.sending && !card.failed && card.body.trim() !== '') {
+        this.sendSegment(sessionId, state, index)
+      }
+    }
     for (;;) {
       const index = state.cards.length - 1
       const card = state.cards[index]
