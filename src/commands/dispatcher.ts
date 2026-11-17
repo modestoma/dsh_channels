@@ -9,8 +9,8 @@
 import type { AccessAdmin } from '../access/admin.ts'
 import type { AccessController } from '../access/controller.ts'
 import {
-  armEffortCommand, armRenewCommand, commandResultCardKind, parseSlashCommand,
-  registerEffortCommand, registerRenewCommand, supportedCommandHelp, supportedCommandList,
+  armEffortCommand, armRenewCommand, commandResultCardKind, mountBorrowedCommand, parseSlashCommand,
+  supportedCommandHelp, supportedCommandList,
 } from '../commands.ts'
 import type { ParsedSlashCommand, RouteOperationQueue } from '../commands.ts'
 import type { FeishuConfig } from '../config.ts'
@@ -25,7 +25,7 @@ import type {
 } from '../host/index.ts'
 import {
   buildCompactComparisonCard, buildRenewCard, buildSessionHistoryCard, buildSessionStatusCard, buildWorkDirCard,
-  compactFailureContext, resolveWorkDir, SESSION_HISTORY_DISPLAY_LIMIT,
+  compactFailureContext, escapeInlineCode, resolveWorkDir, SESSION_HISTORY_DISPLAY_LIMIT,
 } from '../session-commands.ts'
 import type { SessionHistoryAnnotation } from '../session-commands.ts'
 import type { SessionExportBuilder } from '../session-export.ts'
@@ -41,6 +41,7 @@ import { runRenewCommand } from './renew.ts'
 import type { RenewAdmission } from './renew.ts'
 import type { ChannelCommandSpec } from './registry.ts'
 import { routeWorkDir } from '../dm/layout.ts'
+import { describeError } from '../feishu/wiki/shared.ts'
 
 
 export interface CommandDispatcherDeps {
@@ -252,9 +253,12 @@ export class CommandDispatcher {
           'dsh-channels: command /%s failed for session %s: %s',
           spec.name, current.sessionId, String(error),
         )
+        // The Host logger buffers warnings unless an exporter prints them,
+        // so the failure is also written to the process console.
+        console.error(`[dsh-channels] command /${spec.name} failed for session ${current.sessionId}:`, error)
         await this.deps.delivery.commandCard(msg, {
           kind: 'internal-error', command: spec.name,
-          text: '命令执行失败，请稍后重试；若持续发生，请查看 Harness 日志。',
+          text: `命令执行失败：\`${escapeInlineCode(describeError(error))}\`\n请稍后重试；若持续发生，请查看 Harness 日志。`,
           sessionId: current.sessionId,
         })
       }
@@ -306,17 +310,14 @@ export class CommandDispatcher {
     const line = `/${spec.name}${parsed.rawInput}`
     const live = await this.deps.sessions.ensureLive(current)
     let definition = this.deps.ctx.commands.find(live.agent, spec.name)
-    let unregisterBorrowedCommand: (() => void) | undefined
-    if (definition === undefined && spec.name === 'renew') {
-      unregisterBorrowedCommand = registerRenewCommand(live.agent.ctx.commands)
-      definition = this.deps.ctx.commands.find(live.agent, spec.name)
-    }
-    if (definition === undefined && spec.name === 'effort') {
-      unregisterBorrowedCommand = registerEffortCommand(live.agent.ctx.commands)
+    let releaseBorrowedCommand: (() => Promise<void>) | undefined
+    if (definition === undefined && (spec.name === 'renew' || spec.name === 'effort')) {
+      // A borrowed Agent's composition lacks the channel commands.
+      releaseBorrowedCommand = await mountBorrowedCommand(live.agent.ctx, spec.name)
       definition = this.deps.ctx.commands.find(live.agent, spec.name)
     }
     if (definition === undefined) {
-      unregisterBorrowedCommand?.()
+      await this.releaseBorrowedCommand(releaseBorrowedCommand, spec.name, current.sessionId)
       const text = spec.name === 'compact'
         ? '当前部署未挂载 Harness 原生 /compact 命令。'
         : `当前 Session 未挂载 /${spec.name} 命令。`
@@ -352,7 +353,7 @@ export class CommandDispatcher {
       this.controllers.delete(controller)
       disarmRenew?.()
       disarmEffort?.()
-      unregisterBorrowedCommand?.()
+      await this.releaseBorrowedCommand(releaseBorrowedCommand, spec.name, current.sessionId)
       if (renewAdmission?.commit !== undefined) {
         await this.deps.sessions.releaseRenewed(renewAdmission.commit)
       }
@@ -373,6 +374,26 @@ export class CommandDispatcher {
       renewAdmission,
       effortAdmission,
     })
+  }
+
+  /**
+   * Remove a command installed into a borrowed Agent for one execution. A
+   * failure is logged only: the command itself already settled.
+   */
+  private async releaseBorrowedCommand(
+    release: (() => Promise<void>) | undefined,
+    command: string,
+    sessionId: string,
+  ): Promise<void> {
+    if (release === undefined) return
+    try {
+      await release()
+    } catch (error) {
+      this.deps.ctx.logger?.warn?.(
+        'dsh-channels: removing borrowed /%s from session %s failed: %s',
+        command, sessionId, String(error),
+      )
+    }
   }
 
   /** Render one settled agent-plane command result. */

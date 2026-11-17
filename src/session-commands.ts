@@ -38,7 +38,12 @@ function contextLine(measurement: ContextMeasurement): string {
   return `${fmtCount(tokens)} / ${fmtCount(window)} (${(tokens / window * 100).toFixed(1)}%)`
 }
 
-function escapeInlineCode(value: string): string {
+/**
+ * Escape backticks so a value stays inside one Markdown inline code span.
+ * @param value - raw text.
+ * @returns the escaped text.
+ */
+export function escapeInlineCode(value: string): string {
   return value.replaceAll('`', '\\`')
 }
 

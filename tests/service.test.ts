@@ -31,7 +31,7 @@ import type { SessionExportBuilder } from '../src/session-export.ts'
 import {
   dispatchAgentRequest, makeHostContext, makeChannel, makeMessage, makeAgentPresets, makeSession, makeAgent,
   makeMessageGetResponse, makeMessageListResponse, makeRawMessage, promptSectionsOf, sessionEvents,
-  followupMessagesOf, makeAttachmentStore, makeInstanceLocks, makeToolsRuntime,
+  followupMessagesOf, makeAgentContext, makeAttachmentStore, makeCommandRuntime, makeInstanceLocks, makeToolsRuntime,
 } from './helpers.ts'
 import { MissedMessages } from '../src/routing/missed.ts'
 import { ROUTE_NOT_PERMITTED } from '../src/access/remote-policy.ts'
@@ -717,6 +717,33 @@ describe('FeishuService', () => {
       provider: 'deepseek-official', model: 'deepseek-v4-flash',
     })).resolves.toMatchObject({ reasoningEffort: 'tiny' })
     await service2.shutdown()
+  })
+
+  it('names the cause on the card when a routed command fails unexpectedly', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_command_crash', senderId: 'u_owner',
+      messageId: 'om_command_crash_start', content: '开始',
+    }))
+    await waitForEstablishedSession(h)
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      mock(h.ctxState.ctx.commands.find).mockImplementationOnce(() => {
+        throw new Error('scope `lost`')
+      })
+      await h.onMessage(makeMessage({
+        chatType: 'group', chatId: 'oc_command_crash', senderId: 'u_owner', threadId: 'omt_1',
+        mentionedBot: false, messageId: 'om_command_crash', content: '/status',
+      }))
+      await waitUntil(() => expect(JSON.stringify(h.channel.sent)).toContain('命令执行失败'))
+      const card = JSON.stringify((h.channel.sent.at(-1) as { input: object }).input)
+      expect(card).toContain('scope \\\\`lost\\\\`')
+      expect(consoleError).toHaveBeenCalledWith(
+        expect.stringContaining('command /status failed'), expect.objectContaining({ message: 'scope `lost`' }),
+      )
+    } finally {
+      consoleError.mockRestore()
+    }
   })
 
   it('executes routed /health through the command lifecycle and sends the health card', async () => {
@@ -1713,9 +1740,10 @@ describe('FeishuService', () => {
     await h.service.shutdown()
 
     const foreignDispose = vi.fn(async () => {})
+    const foreignCommands = makeCommandRuntime()
     const foreignAgent = makeAgent(makeSession(route.sessionId, route.workspacePath), {
       provider: 'borrowed-provider', model: 'borrowed-model',
-    })
+    }, makeAgentContext(foreignCommands, { commandsOnlyThroughInject: true }))
     h.ctxState.agents.liveAgents.set(route.sessionId, { agent: foreignAgent, dispose: foreignDispose })
 
     const channel = makeChannel()
@@ -1733,6 +1761,44 @@ describe('FeishuService', () => {
     expect(renewed.options.agentOptions).toEqual(foreignAgent.options)
     await waitForRenewedRoute(h, 'omt_1', renewed.options.sessionId)
     expect(foreignDispose).not.toHaveBeenCalled()
+    await waitUntil(() => expect(JSON.stringify(channel.sent)).toContain('Session 已续建'))
+    expect(JSON.stringify(channel.sent)).not.toContain('命令执行失败')
+    // The command lived in the borrowed scope for this execution only.
+    expect(foreignCommands.definitions.has('renew')).toBe(false)
+    await service.shutdown()
+  })
+
+  it('switches effort through a borrowed external Agent and removes the borrowed command', async () => {
+    const h = await setup({ reasoningEffort: 'high' })
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_effort_borrowed', senderId: 'u_owner', content: '开始',
+    }))
+    await waitForEstablishedSession(h)
+    const route = h.ctxState.domain.raw.table('routes').get('omt_1') as RouteRecord
+    await h.service.shutdown()
+
+    const foreignCommands = makeCommandRuntime()
+    const foreignAgent = makeAgent(
+      makeSession(route.sessionId, route.workspacePath), {},
+      makeAgentContext(foreignCommands, { commandsOnlyThroughInject: true }),
+    )
+    h.ctxState.agents.liveAgents.set(route.sessionId, { agent: foreignAgent, dispose: vi.fn(async () => {}) })
+
+    const channel = makeChannel()
+    const service = new FeishuService(h.ctxState.ctx, h.config, () => channel)
+    await service.start()
+    const handlers = (channel.onMessage as unknown as ReturnType<typeof vi.fn>).mock.calls
+    const onMessage = handlers.at(-1)?.[0] as (msg: NormalizedMessage) => Promise<void> | undefined
+    await onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_effort_borrowed', senderId: 'u_owner', threadId: 'omt_1',
+      mentionedBot: false, messageId: 'om_effort_borrowed', content: '/effort tiny',
+    }))
+    await waitUntil(() => expect(channel.sent.length).toBeGreaterThan(0))
+    expect(JSON.stringify(channel.sent)).not.toContain('命令执行失败')
+    await expect(dispatchAgentRequest(foreignAgent.ctx, {
+      provider: 'deepseek-official', model: 'deepseek-v4-flash',
+    })).resolves.toMatchObject({ reasoningEffort: 'tiny' })
+    expect(foreignCommands.definitions.has('effort')).toBe(false)
     await service.shutdown()
   })
 

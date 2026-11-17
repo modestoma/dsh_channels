@@ -12,7 +12,7 @@ import { vi } from 'vitest'
 import type { AcquireOptions, InstanceLockProvider, LockHolderInfo } from '../src/instance-lock.ts'
 import { FeishuService } from '../src/service.ts'
 import type {
-  Agent, AgentContext, AgentHandle, AgentOptions, AgentRegistry, AgentRequestConfig, AgentRequestListener, ApprovalAnswererListener,
+  Agent, AgentChildScope, AgentContext, AgentHandle, AgentOptions, AgentRegistry, AgentRequestConfig, AgentRequestListener, ApprovalAnswererListener,
   AssistantStreamPayload, AttachmentStore, AuthorizeEvent, CommitTrailersEvent, InboxClaimedPayload, CommandDefinition, CommandInvocation, CommandRuntime, EncodedImageAttachment,
   FileAttachmentRef, HostContext, ImageAttachmentLimits, ImageAttachmentRef, ImageMediaType, PermissionPresets, PreToolDecision,
   PreToolExecution, PromptSection,
@@ -72,6 +72,14 @@ export function sessionEvents(session: Session): SessionEvent[] {
   return (session as unknown as { events: SessionEvent[] }).events
 }
 
+/** Agent-scoped command registry of each fake Agent context, read without touching `ctx.commands`. */
+const scopedCommandRuntimes = new WeakMap<AgentContext, CommandRuntime>()
+
+/** A mounted fake child scope; disposing it runs `dispose`. */
+export function childScope(dispose: () => void = () => {}): AgentChildScope {
+  return { dispose: async () => { dispose() } }
+}
+
 export function makeCommandRuntime(): CommandRuntime & { definitions: Map<string, CommandDefinition> } {
   const definitions = new Map<string, CommandDefinition>()
   let commandSeq = 0
@@ -83,17 +91,19 @@ export function makeCommandRuntime(): CommandRuntime & { definitions: Map<string
     }),
     list: vi.fn((agent: Agent) => {
       const effective = new Map(definitions)
-      if (agent.ctx.commands !== runtime) {
-        for (const entry of agent.ctx.commands.list(agent)) {
-          const definition = agent.ctx.commands.find(agent, entry.name)
+      const scoped = scopedCommandRuntimes.get(agent.ctx)
+      if (scoped !== undefined && scoped !== runtime) {
+        for (const entry of scoped.list(agent)) {
+          const definition = scoped.find(agent, entry.name)
           if (definition !== undefined) effective.set(entry.name, definition)
         }
       }
       return [...effective.values()].map(({ handler: _handler, recordInput: _recordInput, ...entry }) => entry)
     }),
     find: vi.fn((agent: Agent, name: string) => {
-      if (agent.ctx.commands !== runtime) {
-        const scoped = agent.ctx.commands.find(agent, name)
+      const scopedRuntime = scopedCommandRuntimes.get(agent.ctx)
+      if (scopedRuntime !== undefined && scopedRuntime !== runtime) {
+        const scoped = scopedRuntime.find(agent, name)
         if (scoped !== undefined) return scoped
       }
       return definitions.get(name)
@@ -150,6 +160,12 @@ export function promptSectionsOf(ctx: AgentContext): readonly PromptSection[] {
 /** Optional host services exposed inside a fake Agent scope. */
 export interface FakeAgentServices {
   tools?: ToolRuntime
+  /**
+   * Model a real host: `ctx.commands` throws on the bare Agent context and is
+   * readable only on an `inject(['commands'], …)` callback context, whose
+   * registrations the returned child scope removes on dispose.
+   */
+  commandsOnlyThroughInject?: boolean
 }
 
 export function makeAgentContext(
@@ -182,9 +198,32 @@ export function makeAgentContext(
       }
     },
     async inject(_dependencies, callback) {
-      callback(ctx)
+      if (services.commandsOnlyThroughInject !== true) {
+        callback(ctx)
+        return childScope()
+      }
+      const registrations: Array<() => void> = []
+      const child = Object.create(ctx) as AgentContext
+      Object.defineProperty(child, 'commands', {
+        value: {
+          ...commands,
+          register: (definition: CommandDefinition) => {
+            const dispose = commands.register(definition)
+            registrations.push(dispose)
+            return dispose
+          },
+        } satisfies CommandRuntime,
+      })
+      callback(child)
+      return childScope(() => { for (const dispose of registrations.splice(0)) dispose() })
     },
   }
+  if (services.commandsOnlyThroughInject === true) {
+    Object.defineProperty(ctx, 'commands', {
+      get: () => { throw new Error('cannot get property "commands" without inject') },
+    })
+  }
+  scopedCommandRuntimes.set(ctx, commands)
   agentRequestListeners.set(ctx, listeners)
   agentPromptSections.set(ctx, sections)
   return ctx

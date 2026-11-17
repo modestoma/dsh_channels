@@ -17,7 +17,7 @@ import type {
   AttachmentStore, FileAttachmentRef,
   ImageAttachmentRef, ImageAttachmentLimits,
 } from '../src/host/attachments.ts'
-import type { AgentContext, ToolDefinition, ToolRuntime } from '../src/host/agent.ts'
+import type { AgentChildScope, AgentContext, ToolDefinition, ToolRuntime } from '../src/host/agent.ts'
 import type { FeishuChannel, RawMessageListParams } from '../src/feishu-channel.ts'
 import {
   ATTACHMENT_FETCH_TOOL_NAME,
@@ -39,7 +39,7 @@ import {
 import { SessionManager } from '../src/session/manager.ts'
 import type { SessionId } from '../src/host/index.ts'
 import {
-  makeAgent, makeAgentContext, makeAgentPresets, makeChannel, makeHostContext, makeMessage,
+  childScope, makeAgent, makeAgentContext, makeAgentPresets, makeChannel, makeHostContext, makeMessage,
   makeMessageGetResponse, makeMessageListResponse, makeRawMessage, makeSession,
 } from './helpers.ts'
 
@@ -449,7 +449,7 @@ describe('feishu attachment-fetch registration', () => {
     // Real cordis behavior when a required dependency never appears: the
     // injection fiber settles without ever invoking the callback.
     const harness = setupRuntime()
-    vi.spyOn(harness.ctx, 'inject').mockImplementation((() => Promise.resolve()) as typeof harness.ctx.inject)
+    vi.spyOn(harness.ctx, 'inject').mockImplementation((() => Promise.resolve(childScope())) as typeof harness.ctx.inject)
     await harness.runtime.mount(harness.ctx, 'session-tools')
     expect(harness.definitions.size).toBe(0)
     expect(harness.warn).toHaveBeenCalledTimes(1)
@@ -457,7 +457,7 @@ describe('feishu attachment-fetch registration', () => {
 
     // A second scope without the services reuses the one-time warning.
     const second = makeAgentContext()
-    vi.spyOn(second, 'inject').mockImplementation((() => Promise.resolve()) as typeof second.inject)
+    vi.spyOn(second, 'inject').mockImplementation((() => Promise.resolve(childScope())) as typeof second.inject)
     await harness.runtime.mount(second, 'session-tools')
     expect(harness.warn).toHaveBeenCalledTimes(1)
   })
@@ -471,7 +471,7 @@ describe('feishu attachment-fetch registration', () => {
       callback: (ctx: AgentContext) => void,
     ) => {
       callback(callbackCtx)
-      return Promise.resolve()
+      return Promise.resolve(childScope())
     }) as typeof harness.ctx.inject))
 
     await harness.runtime.mount(harness.ctx, 'session-tools')
@@ -501,7 +501,7 @@ describe('feishu attachment-fetch registration', () => {
     ) => {
       callback = cb
       cb(callbackCtx)
-      return Promise.resolve()
+      return Promise.resolve(childScope())
     }) as typeof harness.ctx.inject))
 
     await harness.runtime.mount(harness.ctx, 'session-tools')
@@ -529,7 +529,7 @@ describe('feishu attachment-fetch registration', () => {
     try {
       const harness = setupRuntime()
       let release!: () => void
-      const injection = new Promise<void>((resolve) => { release = resolve })
+      const injection = new Promise<AgentChildScope>((resolve) => { release = () => { resolve(childScope()) } })
       let callback: ((ctx: AgentContext) => void) | undefined
       vi.spyOn(harness.ctx, 'inject').mockImplementation(((_deps: readonly string[], cb: (ctx: AgentContext) => void) => {
         callback = cb
@@ -1639,7 +1639,7 @@ describe('feishu topic-messages registration', () => {
 
   it('warns once when real cordis settles an injection without calling back', async () => {
     const harness = setupRuntime()
-    vi.spyOn(harness.ctx, 'inject').mockImplementation((() => Promise.resolve()) as typeof harness.ctx.inject)
+    vi.spyOn(harness.ctx, 'inject').mockImplementation((() => Promise.resolve(childScope())) as typeof harness.ctx.inject)
     await harness.topic.mount(harness.ctx, 'session-tools')
     expect(harness.definitions.size).toBe(0)
     expect(harness.warn).toHaveBeenCalledTimes(1)
@@ -1660,7 +1660,7 @@ describe('feishu topic-messages registration', () => {
     try {
       const harness = setupRuntime()
       let release!: () => void
-      const injection = new Promise<void>((resolve) => { release = resolve })
+      const injection = new Promise<AgentChildScope>((resolve) => { release = () => { resolve(childScope()) } })
       vi.spyOn(harness.ctx, 'inject').mockImplementation(((
         _deps: readonly string[],
         _callback: (ctx: AgentContext) => void,
