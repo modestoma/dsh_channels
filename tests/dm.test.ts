@@ -93,6 +93,19 @@ describe('MainToolGate', () => {
     }
     expect(g.decide(call('read', 's_main'))).toMatchObject({ kind: 'deny', reason: expect.stringContaining('feishu_topic_open') })
   })
+
+  it('lets a PTC main Session run programs, whose tool calls are gated one by one, but not widen its sandbox', () => {
+    const { gate: g, config } = gate()
+    config.dmMainTools = []
+    expect(g.decide(call('run_code', 's_main'))).toBeUndefined()
+    expect(g.decide({ ...call('run_code', 's_main'), arguments: { code: 'x', sandbox_permissions: '' } })).toBeUndefined()
+    expect(g.decide({ ...call('run_code', 's_main'), arguments: { code: 'x', sandbox_permissions: 'workspace-write', justification: 'j' } }))
+      .toMatchObject({ kind: 'deny', reason: expect.stringContaining('不能提升沙箱权限') })
+    expect(g.decide({ ...call('run_code', 's_topic'), arguments: { sandbox_permissions: 'workspace-write' } })).toBeUndefined()
+    // A call the program makes reaches the gate under its own name.
+    expect(g.decide(call('bash', 's_main'))).toMatchObject({ kind: 'deny' })
+    expect(g.decide(call('feishu_topic_open', 's_main'))).toBeUndefined()
+  })
 })
 
 describe('topic reports', () => {
