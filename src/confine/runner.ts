@@ -16,7 +16,15 @@
  * 3. a read-only bind of each writable root a hide or fence covered, so the
  *    call still sees its own workspace (the profile's later writable bind
  *    makes it writable again);
- * 4. a read-only bind of each `--expose` directory (shared skills).
+ * 4. a read-only bind of each `--expose` directory (shared skills);
+ * 5. for each `--isolate-subdir NAME` and each writable root `R` whose
+ *    `R/NAME` directory strictly contains the working directory of the call:
+ *    a `--tmpfs` over `R/NAME` and a writable bind of the one child of
+ *    `R/NAME` that holds the working directory, so a private-chat
+ *    projects-mode topic (`<person>/topics/<topic>/`) does not see its
+ *    sibling topics. This keeps unrelated files out of the call's view; it
+ *    is not an authorization, since the working directory is the call's own
+ *    choice.
  *
  * A hide or fence that lies strictly inside a writable root is mounted after
  * the profile's writable binds instead, since the later bind of its ancestor
@@ -48,6 +56,8 @@ export interface ConfineOptions {
   readonly hide: readonly string[]
   readonly fence: readonly string[]
   readonly expose: readonly string[]
+  /** Directory names below a writable root whose other children are hidden (see step 5). */
+  readonly isolateSubdir: readonly string[]
   readonly unsetEnv: readonly string[]
   readonly unsetEnvMatching: readonly RegExp[]
 }
@@ -66,20 +76,22 @@ export class ConfineUsageError extends Error {
   override readonly name = 'ConfineUsageError'
 }
 
-const VALUE_OPTIONS = new Set(['--bwrap-path', '--hide', '--fence', '--expose', '--unset-env', '--unset-env-matching'])
+const VALUE_OPTIONS = new Set(['--bwrap-path', '--hide', '--fence', '--expose', '--isolate-subdir', '--unset-env', '--unset-env-matching'])
 
 /**
  * Parse the wrapper's argument vector.
  * @param argv - arguments after the script path.
  * @returns the options, profile, and command.
  * @throws ConfineUsageError for an unknown option, a missing value, a relative
- *   directory, an invalid pattern, or a missing `--bwrap` / `--` / command.
+ *   directory, an `--isolate-subdir` value that is not one plain directory
+ *   name, an invalid pattern, or a missing `--bwrap` / `--` / command.
  */
 export function parseConfineArgs(argv: readonly string[]): ConfineInvocation {
   let bwrap = 'bwrap'
   const hide: string[] = []
   const fence: string[] = []
   const expose: string[] = []
+  const isolateSubdir: string[] = []
   const unsetEnv: string[] = []
   const unsetEnvMatching: RegExp[] = []
   let index = 0
@@ -93,6 +105,7 @@ export function parseConfineArgs(argv: readonly string[]): ConfineInvocation {
       case '--hide': hide.push(absoluteDir(option, value)); break
       case '--fence': fence.push(absoluteDir(option, value)); break
       case '--expose': expose.push(absoluteDir(option, value)); break
+      case '--isolate-subdir': isolateSubdir.push(plainName(option, value)); break
       case '--unset-env': unsetEnv.push(value); break
       case '--unset-env-matching': unsetEnvMatching.push(patternOf(value)); break
     }
@@ -104,7 +117,7 @@ export function parseConfineArgs(argv: readonly string[]): ConfineInvocation {
   const command = rest.slice(separator + 1)
   if (command.length === 0) throw new ConfineUsageError('missing command after --')
   return {
-    options: { bwrap, hide, fence, expose, unsetEnv, unsetEnvMatching },
+    options: { bwrap, hide, fence, expose, isolateSubdir, unsetEnv, unsetEnvMatching },
     profile: rest.slice(0, separator),
     command,
   }
@@ -161,6 +174,14 @@ export function bwrapArgsOf(invocation: ConfineInvocation, host: ConfineHost): s
   for (const dir of exposes) {
     if (late.some(mask => isInside(dir, mask))) after.push('--ro-bind', dir, dir)
   }
+  for (const name of options.isolateSubdir) {
+    for (const root of writable) {
+      const parent = host.realDir(path.join(root, name))
+      if (parent === undefined || parent === host.cwd || !isInside(host.cwd, parent)) continue
+      const child = path.join(parent, path.relative(parent, host.cwd).split(path.sep)[0]!)
+      after.push('--tmpfs', parent, '--bind', child, child)
+    }
+  }
   return [...profile.slice(0, 3), ...before, ...profile.slice(3), ...after, '--', ...command]
 }
 
@@ -191,6 +212,13 @@ function writableRootsOf(profile: readonly string[]): string[] {
 function absoluteDir(option: string, value: string): string {
   if (!path.isAbsolute(value)) throw new ConfineUsageError(`${option} needs an absolute directory, got ${value}`)
   return path.resolve(value)
+}
+
+function plainName(option: string, value: string): string {
+  if (value === '.' || value === '..' || value.includes('/') || value.includes(path.sep)) {
+    throw new ConfineUsageError(`${option} needs one directory name, got ${value}`)
+  }
+  return value
 }
 
 function patternOf(value: string): RegExp {

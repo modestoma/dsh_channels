@@ -40,6 +40,7 @@ import { commandSpec } from './registry.ts'
 import { runRenewCommand } from './renew.ts'
 import type { RenewAdmission } from './renew.ts'
 import type { ChannelCommandSpec } from './registry.ts'
+import { routeWorkDir } from '../dm/layout.ts'
 
 
 export interface CommandDispatcherDeps {
@@ -404,7 +405,7 @@ export class CommandDispatcher {
       await this.deps.delivery.standaloneReply(msg, buildRenewCard({
         previousSessionId: renewAdmission.commit.previous.sessionId,
         currentSessionId: renewAdmission.commit.current.sessionId,
-        sessionDir: renewAdmission.commit.current.workspacePath,
+        sessionDir: routeWorkDir(renewAdmission.commit.current),
       }))
       return
     }
@@ -424,7 +425,7 @@ export class CommandDispatcher {
         context,
         extras: {
           permissionPreset: this.permissionPresetOf(session),
-          sessionDir: current.workspacePath,
+          sessionDir: routeWorkDir(current),
           uptimeMs: this.deps.uptimeMs(),
           liveAgents: this.deps.sessions.liveCount(),
           routeCount: this.deps.routes.size(),

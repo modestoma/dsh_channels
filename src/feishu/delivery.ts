@@ -24,6 +24,12 @@ export interface CardDeliveryDeps {
   started(): boolean
   /** Route owning a session (segment-card anchoring). */
   routeForSession(sessionId: string): RouteRecord | undefined
+  /**
+   * Whether a message belongs to a projects-mode private main chat, where a
+   * reply that opened a topic would start a topic Session: command cards then
+   * reply in the chat timeline unless the caller asks for a topic.
+   */
+  keepsTimeline?(msg: NormalizedMessage): boolean
   warn(message: string, ...args: unknown[]): void
 }
 
@@ -91,7 +97,8 @@ export class CardDelivery {
 
   /**
    * Shared delivery policy for command-plane cards: reply in a new topic by
-   * default, then degrade to a plain reply when Feishu refuses the topic.
+   * default (in the timeline in a projects-mode private main chat), then
+   * degrade to a plain reply when Feishu refuses the topic.
    * `createThread: false` replies in the chat timeline, or inside the topic
    * the message already belongs to. Inside `replacingCard` the card patches
    * the anchored card instead, and falls back to a reply if the patch fails.
@@ -114,7 +121,7 @@ export class CardDelivery {
         )
       }
     }
-    const createThread = options.createThread ?? true
+    const createThread = options.createThread ?? this.deps.keepsTimeline?.(msg) !== true
     try {
       await channel.send(msg.chatId, { card }, createThread || msg.threadId !== undefined
         ? { replyTo: msg.messageId, replyInThread: true }
@@ -163,13 +170,19 @@ export class CardDelivery {
   /**
    * Reply with the first card frame. Prefers topic replies (`reply_in_thread`)
    * — the documented way a bot creates a topic — and falls back to a plain
-   * reply when Feishu refuses (degraded chat-scoped routing).
+   * reply when Feishu refuses (degraded chat-scoped routing). `inThread:
+   * false` replies in the chat timeline (projects-mode main chat).
    */
   async replyFirstCard(
     msg: NormalizedMessage,
     card: object,
+    options: { inThread?: boolean } = {},
   ): Promise<{ messageId: string; threadId?: string; degraded: boolean }> {
     const channel = this.requireChannel()
+    if (options.inThread === false) {
+      const res = await channel.send(msg.chatId, { card }, { replyTo: msg.messageId })
+      return { messageId: res.messageId, degraded: false }
+    }
     try {
       const res = await channel.send(
         msg.chatId,

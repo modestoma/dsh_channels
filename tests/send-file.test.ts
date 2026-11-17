@@ -107,6 +107,18 @@ describe('feishu_send_file', () => {
     expect(h.channel.repliedMedia).toEqual([])
   })
 
+  it('also sends from further roots such as a projects-mode shared/ directory, resolving relative paths against the topic', async () => {
+    const shared = path.join(makeTempBaseDir(), 'shared')
+    mkdirSync(shared, { recursive: true })
+    const h = await setup({ target: { otherRoots: [shared, path.join(shared, 'missing-root')] } })
+    writeFileSync(path.join(shared, 'report.txt'), 'shared report')
+    writeFileSync(path.join(h.outside, 'secret.txt'), 'other topic')
+    expect(await h.run({ path: path.join(shared, 'report.txt') })).toMatchObject({ ok: true, file_name: 'report.txt' })
+    expect(await h.run({ path: 'report.txt' })).toMatchObject({ ok: false, code: 'FILE_NOT_FOUND' })
+    expect(await h.run({ path: path.join(shared, 'missing.txt') })).toMatchObject({ ok: false, code: 'FILE_NOT_FOUND' })
+    expect(await h.run({ path: '../t2/secret.txt' })).toMatchObject({ ok: false, code: 'PATH_OUTSIDE_WORKSPACE' })
+  })
+
   it('reports missing, directory and empty files', async () => {
     const h = await setup()
     mkdirSync(path.join(h.root, 'dir'))

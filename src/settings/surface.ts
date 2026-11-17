@@ -26,6 +26,7 @@ import {
 } from './contract.ts'
 import type {
   AccessMutationResponse,
+  DmStyleWire,
   AccessPermissionWire,
   GroupPermissionWire,
   AccessWire,
@@ -124,6 +125,8 @@ export interface SettingsTarget {
   setAccessPermission(userId: string, permission: AccessPermissionWire, enabled: boolean): Promise<AccessMutationResponse>
   /** Set or clear the git email of a user already in the table (used by the next push). */
   setAccessGitEmail(userId: string, gitEmail: string | undefined): Promise<AccessMutationResponse>
+  /** Set or clear the private-chat mode of a user already in the table (applies to later messages). */
+  setAccessDmStyle(userId: string, dmStyle: DmStyleWire | undefined): Promise<AccessMutationResponse>
   /** Settle one pending request (panel shares this path with the Feishu DM card). */
   resolveAccessRequest(token: string, decision: 'allow' | 'deny'): Promise<AccessMutationResponse>
   /** Set one permission switch of a registered group (takes effect on the next check). */
@@ -164,6 +167,7 @@ const OPTIONAL_TEXT_KEYS = new Set<EditableKey>([
   'reasoningEffort',
   'agentPreset',
   'maxTokens',
+  'dmMainPreset',
 ])
 
 const BOOLEAN_KEYS = new Set<EditableKey>([
@@ -192,6 +196,7 @@ interface StringListSpec {
 /** Editable keys rendered as `string-list` (one input per entry). */
 const STRING_LIST_FIELDS: Partial<Record<EditableKey, StringListSpec>> = {
   wikiRoots: { maxItems: 20, itemFormat: 'wiki-root-link' },
+  dmMainTools: { maxItems: 100 },
 }
 
 /** Entry checks per item format: the readable reason, or `undefined` when valid. */
@@ -250,6 +255,10 @@ export function normalizeStringList(
 }
 
 const SELECT_OPTIONS: Partial<Record<EditableKey, ReadonlyArray<{ value: string; label: string }>>> = {
+  dmStyle: [
+    { value: 'topic', label: '话题模式' },
+    { value: 'project', label: 'projects 模式' },
+  ],
   dmMode: [
     { value: 'open', label: '开启' },
     { value: 'disabled', label: '关闭' },
@@ -299,12 +308,32 @@ interface FieldMeta {
 const FIELD_META: Record<EditableKey, FieldMeta> = {
   dmMode: { label: '私聊', group: 'trigger', summary: '关闭后私聊不再触发会话', help: '群聊和已绑定的话题不受影响。' },
   requireMention: { label: '普通群需要 @ 机器人', group: 'trigger', summary: '话题内始终不需要 @', help: '关闭后普通群里的每条消息都会触发会话。' },
+  dmStyle: {
+    label: '默认私聊模式',
+    group: 'dm',
+    summary: '话题模式：每条消息开一个新话题；projects 模式：私聊是一个持续的主会话，话题里深入讨论',
+    help: '可以在「访问授权」的用户表里按人改。projects 模式下每人一个工作区 <根目录>/p2p/<user_id>/：主会话在 main/，每个话题在 topics/<话题>/，共享文件在 shared/；话题只读自己的目录和 shared/，主会话只读 main/ 和 shared/。切换只影响之后的新消息，已开的话题保持原模式。',
+  },
+  dmMainPreset: {
+    label: '主会话 Agent 预设',
+    group: 'dm',
+    summary: 'projects 模式主会话使用的预设，留空沿用「模型」页的预设',
+    placeholder: '留空 = 沿用 Agent 预设',
+  },
+  dmMainTools: {
+    label: '主会话可用工具',
+    group: 'dm',
+    summary: 'projects 模式主会话只能调用这些工具，其余调用在执行前拒绝',
+    help: '每行一个工具名。默认只有读文件、搜索、联网、提问、技能和只读的飞书工具，没有命令行、写文件和改代码；这些工作交给话题。对之后的调用立即生效。',
+    placeholder: 'read',
+    wide: true,
+  },
   threadFallback: { label: '话题被拒时降级为会话级', group: 'trigger', summary: '飞书不允许建话题时改在会话里回复，关闭则直接报错' },
   baseDir: {
     label: '工作区根目录',
     group: 'workspace',
     summary: '模型和工具生成文件的位置',
-    help: '每个话题一个工作区：私聊 <根目录>/p2p/<user_id>/<话题>/，群聊 <根目录>/groups/<chat_id>/<话题>/。必须是绝对路径（~ 按家目录展开），保存时会创建该目录。只影响之后新建的话题，旧目录不迁移。',
+    help: '每个话题一个工作区：私聊话题模式 <根目录>/p2p/<user_id>/<话题>/，私聊 projects 模式每人一个工作区 <根目录>/p2p/<user_id>/，群聊 <根目录>/groups/<chat_id>/<话题>/。必须是绝对路径（~ 按家目录展开），保存时会创建该目录。只影响之后新建的话题，旧目录不迁移。',
     placeholder: '/Users/you/.dsh/dsh-channels/workspaces',
     wide: true,
   },
@@ -1184,6 +1213,22 @@ export class SettingsSurface {
     const email = normalizeGitEmail(gitEmail)
     if (!email.ok) return { ok: false, error: email.message }
     return this.mutateAccess(() => this.target.setAccessGitEmail(id.value, email.value))
+  }
+
+  /**
+   * Set or clear one user's private-chat mode from the panel.
+   * @param userId - raw `user_id` from the request body.
+   * @param dmStyle - `topic`, `project`, or empty string / null to follow the default.
+   * @returns the refreshed snapshot, or the validation/write failure.
+   */
+  async setAccessDmStyle(userId: unknown, dmStyle: unknown): Promise<AccessMutationResponse> {
+    const id = normalizeAccessId(userId, '用户 user_id', USER_ID_FORMAT)
+    if (!id.ok) return { ok: false, error: id.message }
+    if (dmStyle === undefined || dmStyle === null || dmStyle === '') {
+      return this.mutateAccess(() => this.target.setAccessDmStyle(id.value, undefined))
+    }
+    if (dmStyle !== 'topic' && dmStyle !== 'project') return { ok: false, error: '私聊模式只能是 topic 或 project' }
+    return this.mutateAccess(() => this.target.setAccessDmStyle(id.value, dmStyle))
   }
 
   private async saveUser(

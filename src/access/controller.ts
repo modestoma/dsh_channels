@@ -104,6 +104,16 @@ export class AccessController {
     return this.mayUse(record.senderUserId, permission)
   }
 
+  /**
+   * The private-chat mode of one person: the mode an administrator set in
+   * the user table, else the channel's `dmStyle`.
+   * @param userId - Feishu user_id.
+   * @returns `topic` or `project`.
+   */
+  dmStyleOf(userId: string): 'topic' | 'project' {
+    return this.deps.store.getUser(userId)?.dmStyle ?? this.config().dmStyle
+  }
+
   /** Current user-table snapshot used by the pure policy. */
   snapshot(): AccessStoreSnapshot {
     return this.deps.store.snapshot()

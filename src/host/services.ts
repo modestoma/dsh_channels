@@ -39,11 +39,17 @@ export interface WorkspaceRegistry {
 /**
  * The effective-directory service (`@deepseek-ai/dsh-working-directory`,
  * mounted by every base-backed profile): the directory a Session's file
- * tools resolve relative paths against. This plugin only reads it (the read
- * fence); it never moves a Session.
+ * tools resolve relative paths against. The read fence reads it; a
+ * projects-mode private-chat Session is moved to its own directory with
+ * `set` once, when it is created.
  */
 export interface WorkingDirectoryService {
   get(session: Session): string
+  /**
+   * Durably move one Session (live or unpublished Agent) to an existing directory.
+   * @returns the canonical directory.
+   */
+  set(agent: Agent, path: string, signal?: AbortSignal): Promise<string>
 }
 
 /**

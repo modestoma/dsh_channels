@@ -3,8 +3,8 @@
  * back to the conversation the Session is bound to.
  *
  * Path policy: the model names a path; only a regular file inside the topic's
- * working directory (`RouteRecord.sessionDir`, or `workspacePath` for records
- * written before per-topic directories) is sent. Both the root and the target
+ * working directory (a projects-mode Session's own directory or the person's
+ * `shared/` directory) is sent. Both the roots and the target
  * are resolved with `realpath`, so `..` segments and symlinks cannot reach
  * another topic's directory or the rest of the filesystem. The bytes are read
  * through one file handle whose device/inode must match the contained path
@@ -108,7 +108,7 @@ const FAILURE_REASONS: Readonly<Record<SendFileFailureCode, string>> = {
   TOOL_DISABLED: 'feishu_send_file 已在插件配置中关闭',
   ROUTE_NOT_FOUND: '当前会话没有绑定飞书话题或会话，无法确定发送目标',
   CHANNEL_UNAVAILABLE: '飞书连接当前不可用，请稍后重试',
-  PATH_OUTSIDE_WORKSPACE: '只能发送当前话题工作目录内的文件；请先把文件复制到工作目录再发送',
+  PATH_OUTSIDE_WORKSPACE: '只能发送当前话题工作目录（projects 模式还包括共享目录 shared/）内的文件；请先把文件复制到工作目录再发送',
   FILE_NOT_FOUND: '文件不存在或不可读',
   NOT_A_FILE: '该路径不是普通文件（目录等不能发送）',
   EMPTY_FILE: '文件为空，飞书不接受 0 字节的上传',
@@ -158,8 +158,10 @@ export interface SendFileTarget {
   readonly replyTo: string
   /** Whether the reply stays inside a topic (`kind: 'thread'` route). */
   readonly inThread: boolean
-  /** Topic working directory; the only directory files may be sent from. */
+  /** Topic working directory: relative paths resolve against it, and files may be sent from it. */
   readonly rootDir: string
+  /** Further directories files may be sent from (a projects-mode Session's `shared/`). */
+  readonly otherRoots?: readonly string[]
 }
 
 export interface SendFileRuntimeDeps {
@@ -239,7 +241,7 @@ export class SendFileToolRuntime {
     const target = this.deps.targetOfSession(sessionId)
     if (target === undefined) return failure('ROUTE_NOT_FOUND')
 
-    const loaded = await loadWorkspaceFile(target.rootDir, args)
+    const loaded = await loadWorkspaceFile(target.rootDir, args, target.otherRoots)
     if (!loaded.ok) return loaded
     if (exec.signal.aborted) return failure('ABORTED')
     const channel = this.deps.channel()
@@ -284,29 +286,34 @@ type LoadedFile =
   | Extract<SendFileValue, { ok: false }>
 
 /**
- * Resolve, contain, size-check and read one file under `rootDir`.
+ * Resolve, contain, size-check and read one file under `rootDir` or one of
+ * `otherRoots`.
  *
- * @param rootDir Topic working directory.
+ * @param rootDir Topic working directory; relative paths resolve against it.
  * @param args Validated tool arguments.
+ * @param otherRoots Further directories files may come from; a missing one is skipped.
  * @returns The bytes and the message kind, or a failure value.
  */
-export async function loadWorkspaceFile(rootDir: string, args: SendFileArgs): Promise<LoadedFile> {
+export async function loadWorkspaceFile(rootDir: string, args: SendFileArgs, otherRoots: readonly string[] = []): Promise<LoadedFile> {
   let root: string
   try {
     root = await realpath(rootDir)
   } catch (error) {
     return failure('FILE_NOT_FOUND', `当前话题工作目录不可用：${describeError(error)}`)
   }
+  const others = await Promise.all(otherRoots.map(async dir => await realpath(dir).catch(() => undefined)))
+  const roots = [root, ...others.filter((dir): dir is string => dir !== undefined)]
+  const contained = (target: string): boolean => roots.some(allowed => isInside(allowed, target))
   let real: string
   try {
     real = await realpath(path.resolve(root, args.path))
   } catch {
-    // A missing path outside the root must not reveal anything beyond "not allowed".
-    return isInside(root, path.resolve(root, args.path))
+    // A missing path outside the roots must not reveal anything beyond "not allowed".
+    return contained(path.resolve(root, args.path))
       ? failure('FILE_NOT_FOUND')
       : failure('PATH_OUTSIDE_WORKSPACE')
   }
-  if (!isInside(root, real)) return failure('PATH_OUTSIDE_WORKSPACE')
+  if (!contained(real)) return failure('PATH_OUTSIDE_WORKSPACE')
 
   const requested = args.kind ?? 'auto'
   const ceiling = requested === 'image' ? FEISHU_IMAGE_MAX_BYTES : FEISHU_FILE_MAX_BYTES
@@ -322,7 +329,7 @@ export async function loadWorkspaceFile(rootDir: string, args: SendFileArgs): Pr
     if (!info.isFile()) return failure('NOT_A_FILE')
     // A directory swapped for a symlink after the realpath check would open a
     // different inode than the contained path resolves to now.
-    const recheck = await realpath(real).then(again => (isInside(root, again) ? stat(again) : undefined), () => undefined)
+    const recheck = await realpath(real).then(again => (contained(again) ? stat(again) : undefined), () => undefined)
     if (recheck === undefined || recheck.dev !== info.dev || recheck.ino !== info.ino) {
       return failure('PATH_OUTSIDE_WORKSPACE')
     }

@@ -842,6 +842,10 @@ export function makeWorkingDirectory(): FakeWorkingDirectory {
     get(session) {
       return dirs.get(session.id) ?? session.header.cwd ?? ''
     },
+    async set(agent, directory) {
+      apply(agent, directory)
+      return directory
+    },
   }
   return { service, dirs, apply }
 }

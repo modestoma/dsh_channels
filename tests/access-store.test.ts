@@ -122,6 +122,19 @@ describe('AccessStore 用户表写穿', () => {
     await expect(store.setGitEmail('u_missing', 'x@example.com')).resolves.toBeUndefined()
   })
 
+  it('setDmStyle 设置、清除私聊模式，不影响开关；用户不在表中返回 undefined', async () => {
+    const { store, domain } = makeStore()
+    store.load()
+    await store.putUser(userRecord({ userId: 'u_bob', codeWrite: true }))
+
+    expect(await store.setDmStyle('u_bob', 'project')).toMatchObject({ dmStyle: 'project', codeWrite: true })
+    expect(new Map(durableEntries(domain, 'access_users')).get('u_bob')).toMatchObject({ dmStyle: 'project' })
+    const cleared = await store.setDmStyle('u_bob', undefined)
+    expect(cleared).not.toHaveProperty('dmStyle')
+    expect(new Map(durableEntries(domain, 'access_users')).get('u_bob')).not.toHaveProperty('dmStyle')
+    await expect(store.setDmStyle('u_missing', 'topic')).resolves.toBeUndefined()
+  })
+
   it('allows：chat 关闭时其他开关都视为关闭', async () => {
     const { store } = makeStore()
     store.load()

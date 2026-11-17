@@ -28,7 +28,8 @@ import type { FeishuConfig } from '../config.ts'
 import { mountChannelCommands } from '../commands.ts'
 import { appendSessionHistory } from '../domain.ts'
 import type { RouteRecord } from '../domain.ts'
-import { mountChannelGuidance, mountReplyGuidance } from '../feishu/agent-context.ts'
+import { mountChannelGuidance, mountProjectGuidance, mountReplyGuidance, projectGuidance } from '../feishu/agent-context.ts'
+import { dmSharedDir, enterSessionDir, routeWorkDir } from '../dm/layout.ts'
 import { attachTopicSession, topicWorkspaceAt } from '../workspaces.ts'
 import { installRequestPolicy } from './request-policy.ts'
 import type { RequestPolicyController } from './request-policy.ts'
@@ -121,13 +122,19 @@ export class SessionManager {
    * `cwd` is the Session header cwd (the user workspace when the deployment can
    * switch directories). The caller owns placement, the workspace attachment,
    * the attachment guidance, and the failure card.
+   * @param sessionId - the new Session.
+   * @param cwd - its header cwd.
+   * @param agentOptions - provider/model/token caps.
+   * @param dmRole - projects-mode role; the main Session mounts `dmMainPreset`.
+   * @returns the live handle.
    */
   async createSession(
     sessionId: SessionId,
     cwd: string,
     agentOptions: Record<string, unknown> = this.agentOptions(),
+    dmRole?: RouteRecord['dmRole'],
   ): Promise<AgentHandle> {
-    const composition = await this.presetComposition(undefined, true, sessionId)
+    const composition = await this.presetComposition(this.presetFor(dmRole), true, sessionId)
     const handle = await this.deps.ctx.agents.create({
       sessionId,
       meta: {
@@ -163,13 +170,45 @@ export class SessionManager {
   }
 
   /**
-   * Register the reply guidance and the attachment guidance for one Session.
-   * The reply guidance is mounted for every Feishu Session; its text follows
+   * Create a projects-mode Session: its header cwd is the person's directory
+   * (the workspace it is listed under), and it then moves to its own
+   * directory through the host's working-directory service. A Session created
+   * before a failure is disposed again.
+   * @param sessionId - the new Session.
+   * @param workspace - the person's workspace.
+   * @param dmRole - main Session or topic.
+   * @param dir - the Session's own directory below the workspace.
+   * @returns the live handle.
+   */
+  async openProjectSession(
+    sessionId: SessionId,
+    workspace: Workspace,
+    dmRole: NonNullable<RouteRecord['dmRole']>,
+    dir: string,
+  ): Promise<AgentHandle> {
+    const handle = await this.createSession(sessionId, workspace.path, this.agentOptions(), dmRole)
+    try {
+      await this.mountGuidance(handle.agent, { workspacePath: workspace.path, currentDir: dir, dmRole })
+      await enterSessionDir(this.deps.ctx, handle.agent, dir, this.deps.warn)
+    } catch (error) {
+      await handle.dispose().catch(() => {})
+      throw error
+    }
+    await attachTopicSession(workspace, sessionId, this.deps.warn)
+    return handle
+  }
+
+  /**
+   * Register the reply guidance and the attachment guidance for one Session,
+   * plus the projects-mode guidance for a projects-mode route. The reply
+   * guidance is mounted for every Feishu Session; its text follows
    * `replyGuidance` on each model request. The attachment guidance is mounted
    * only while `acceptAttachments` is on. Best-effort: a missing system-prompt
    * service (headless) is a no-op and a late registration never blocks the turn.
+   * @param agent - the Session's Agent.
+   * @param route - the route it serves, when known (projects-mode guidance).
    */
-  async mountGuidance(agent: Agent): Promise<void> {
+  async mountGuidance(agent: Agent, route?: Pick<RouteRecord, 'workspacePath' | 'currentDir' | 'dmRole'>): Promise<void> {
     // One registration per Agent scope: a re-borrowed Agent keeps its sections.
     if (this.guided.has(agent)) return
     this.guided.add(agent)
@@ -180,6 +219,16 @@ export class SessionManager {
         'dsh-channels: mounting reply guidance for session %s failed: %s',
         agent.id, String(error),
       )
+    }
+    if (route?.dmRole !== undefined) {
+      try {
+        await mountProjectGuidance(agent.ctx, projectGuidance(route.dmRole, routeWorkDir(route), dmSharedDir(route.workspacePath)))
+      } catch (error) {
+        this.deps.warn(
+          'dsh-channels: mounting projects-mode guidance for session %s failed: %s',
+          agent.id, String(error),
+        )
+      }
     }
     // With inbound attachments disabled the Agent has no attachment workflow to
     // discover.
@@ -234,7 +283,7 @@ export class SessionManager {
     // fails; awaiting it makes the tool available before the first turn.
     await this.mountToolsFor(agent.ctx, sessionId)
     // The foreign composition lacks this channel's prompt sections as well.
-    await this.mountGuidance(agent)
+    await this.mountGuidance(agent, record)
     return borrowed
   }
 
@@ -246,7 +295,7 @@ export class SessionManager {
       // (config override or roster default). A session persisted before the
       // preset fix has no preset recorded on its header; re-resolving here is
       // what repairs it on the first resume after a restart.
-      const composition = await this.presetComposition(undefined, true, sessionId)
+      const composition = await this.presetComposition(this.presetFor(record.dmRole), true, sessionId)
       const handle = await this.deps.ctx.agents.resume({
         resumeSessionId: sessionId,
         agentOptions: this.agentOptions(),
@@ -260,7 +309,7 @@ export class SessionManager {
         throw new Error('dsh-channels: session resume aborted by shutdown')
       }
       this.requestPolicy(handle.agent)
-      await this.mountGuidance(handle.agent)
+      await this.mountGuidance(handle.agent, record)
       const liveAgent: LiveAgent = { agent: handle.agent, handle }
       this.live.set(sessionId, liveAgent)
       return liveAgent
@@ -303,7 +352,9 @@ export class SessionManager {
    *
    * A renewal keeps the topic's directory: the new Session is created with
    * the topic directory as its header cwd, recreated when it disappeared, and
-   * attached to the topic workspace while that registration exists.
+   * attached to the topic workspace while that registration exists. A
+   * projects-mode route's new Session also moves to the route's
+   * `currentDir` again.
    */
   async renew(record: RouteRecord, oldLive: LiveAgent): Promise<RenewCommit> {
     const sessionId = randomUUID() as SessionId
@@ -324,7 +375,8 @@ export class SessionManager {
         setup: composition.setup,
       })
       this.requestPolicy(newHandle.agent)
-      await this.mountGuidance(newHandle.agent)
+      await this.mountGuidance(newHandle.agent, record)
+      if (record.currentDir !== undefined) await enterSessionDir(this.deps.ctx, newHandle.agent, record.currentDir, this.deps.warn)
       const workspace = topicWorkspaceAt(this.deps.ctx, cwd)
       if (workspace !== undefined) await attachTopicSession(workspace, sessionId, this.deps.warn)
       const createdAt = newHandle.agent.session.header.createdAt
@@ -368,6 +420,15 @@ export class SessionManager {
     }
     this.live.clear()
     this.pendingResume.clear()
+  }
+
+  /**
+   * The preset a route role starts with: `dmMainPreset` (else `agentPreset`)
+   * for a projects-mode main Session, `agentPreset` otherwise.
+   */
+  private presetFor(dmRole: RouteRecord['dmRole']): string | undefined {
+    const config = this.deps.config()
+    return dmRole === 'main' ? config.dmMainPreset ?? config.agentPreset : config.agentPreset
   }
 
   /**

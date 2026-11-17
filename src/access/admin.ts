@@ -56,6 +56,7 @@ function userWire(record: AccessUserRecord): AccessUserWire {
     wikiWrite: record.wikiWrite,
     codeWrite: record.codeWrite,
     ...(record.gitEmail === undefined ? {} : { gitEmail: record.gitEmail }),
+    ...(record.dmStyle === undefined ? {} : { dmStyle: record.dmStyle }),
   }
 }
 
@@ -178,6 +179,21 @@ export class AccessAdmin {
     if (id === undefined) return { ok: false, error: 'user_id 不合法' }
     return this.mutate('写入 Git 邮箱失败', async () => {
       const updated = await this.deps.store.setGitEmail(id, gitEmail)
+      return updated === undefined ? '该用户不在用户表中，请先添加' : undefined
+    })
+  }
+
+  /**
+   * Set or clear the private-chat mode of a user already in the table.
+   * @param userId - Feishu user_id.
+   * @param dmStyle - the mode, or undefined to follow the channel default.
+   * @returns the refreshed snapshot, or the failure.
+   */
+  async setDmStyle(userId: string, dmStyle: AccessUserRecord['dmStyle']): Promise<AccessMutationResponse> {
+    const id = cleanUserId(userId)
+    if (id === undefined) return { ok: false, error: 'user_id 不合法' }
+    return this.mutate('写入私聊模式失败', async () => {
+      const updated = await this.deps.store.setDmStyle(id, dmStyle)
       return updated === undefined ? '该用户不在用户表中，请先添加' : undefined
     })
   }

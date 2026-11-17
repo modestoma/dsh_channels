@@ -70,6 +70,7 @@ const CSS = `
 .dsh-channels-cfg__input--num{width:120px;text-align:right;font-variant-numeric:tabular-nums}
 .dsh-channels-cfg__input--text{width:260px}
 .dsh-channels-cfg__select{width:220px;appearance:auto;cursor:pointer}
+.dsh-channels-cfg__inputRow>.dsh-channels-cfg__dmStyle{flex:none;width:auto;height:24px;padding:0 6px;border-radius:6px;font-size:12px;appearance:auto;cursor:pointer}
 .dsh-channels-cfg__unit{min-width:36px;color:var(--dc-fg3);font-size:12px}
 .dsh-channels-cfg__bytes{color:var(--dc-fg3);font-size:12px;white-space:nowrap}
 .dsh-channels-cfg__inputRow{display:flex;align-items:center;gap:8px;min-width:0}

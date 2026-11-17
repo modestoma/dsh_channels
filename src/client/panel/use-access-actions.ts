@@ -1,5 +1,5 @@
 /**
- * 用户表与群权限页的写操作：增删用户 / 群、切换权限、设置 git 邮箱、处理申请。
+ * 用户表与群权限页的写操作：增删用户 / 群、切换权限、设置 git 邮箱与私聊模式、处理申请。
  * 每个写操作替换嵌入的访问快照，并在访问页自己的提示行里报告结果。
  *
  * @module dsh-channels/client/panel/use-access-actions
@@ -7,12 +7,13 @@
 
 import { useCallback, useState } from 'react'
 import { PANEL_COPY } from '../../settings/contract.ts'
-import type { AccessMutationResponse, AccessPermissionWire, GroupPermissionWire } from '../../settings/contract.ts'
+import type { AccessMutationResponse, AccessPermissionWire, DmStyleWire, GroupPermissionWire } from '../../settings/contract.ts'
 import {
   addAccessUser,
   removeAccessGroup,
   removeAccessUser,
   resolveAccessRequest,
+  setAccessDmStyle,
   setAccessGitEmail,
   setAccessPermission,
   setGroupPermission,
@@ -34,6 +35,8 @@ export interface AccessActions {
   toggleGroupPermission: (chatId: string, permission: GroupPermissionWire, enabled: boolean) => Promise<boolean>
   /** Resolves true when the editor should close. */
   setGitEmail: (userId: string, gitEmail: string) => Promise<boolean>
+  /** Empty string follows the channel default. */
+  setDmStyle: (userId: string, dmStyle: DmStyleWire | '') => Promise<boolean>
   resolveRequest: (token: string, decision: 'allow' | 'deny') => Promise<boolean>
 }
 
@@ -86,6 +89,7 @@ export function useAccessActions(ops: PanelOps): AccessActions {
     toggleGroupPermission: (chatId, permission, enabled) =>
       run(() => setGroupPermission(chatId, permission, enabled), PANEL_COPY.groupPermissionChanged),
     setGitEmail: (userId, gitEmail) => run(() => setAccessGitEmail(userId, gitEmail), PANEL_COPY.accessGitEmailChanged),
+    setDmStyle: (userId, dmStyle) => run(() => setAccessDmStyle(userId, dmStyle), PANEL_COPY.accessDmStyleChanged),
     resolveRequest: (token, decision) => run(
       () => resolveAccessRequest(token, decision),
       decision === 'allow' ? PANEL_COPY.accessRequestAllowed : PANEL_COPY.accessRequestDenied,

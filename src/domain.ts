@@ -37,7 +37,7 @@ export type SessionHistoryEntry = z.infer<typeof sessionHistoryEntrySchema>
  * cwd, the sandbox root, and the workspace the Session is grouped under.
  */
 export const routeRecordSchema = z.object({
-  /** Route key the record is stored under (thread_id or a {@link chatRouteKey}). */
+  /** Route key the record is stored under (thread_id, a {@link chatRouteKey}, or a {@link dmMainRouteKey}). */
   key: z.string().min(1),
   /** `thread` = real Feishu topic; `chat` = degraded chat-scoped fallback. */
   kind: z.enum(['thread', 'chat']),
@@ -75,6 +75,20 @@ export const routeRecordSchema = z.object({
   lastActivityAt: z.number().int().nonnegative(),
   /** Sessions this topic has pointed at, oldest first; always names `sessionId`. */
   sessionHistory: z.array(sessionHistoryEntrySchema),
+  /**
+   * Role of a private-chat route opened in projects mode: `main` is the
+   * person's main conversation (chat-scoped key), `topic` one topic below it.
+   * Absent on topic-mode and group routes. A projects-mode route's
+   * {@link workspacePath} is the person's directory and its
+   * {@link currentDir} the Session's own directory below it.
+   */
+  dmRole: z.enum(['main', 'topic']).optional(),
+  /**
+   * The Session's working directory inside {@link workspacePath} (projects
+   * mode only): `main/` or `topics/<topic>/`. Its reads are limited to this
+   * directory and the person's `shared/` directory.
+   */
+  currentDir: z.string().min(1).optional(),
 })
 
 export type RouteRecord = z.infer<typeof routeRecordSchema>
@@ -267,6 +281,11 @@ export const accessUserRecordSchema = z.object({
    * account stays the author.
    */
   gitEmail: z.string().optional(),
+  /**
+   * Private-chat mode an administrator set for this user; absent follows the
+   * channel's `dmStyle`.
+   */
+  dmStyle: z.enum(['topic', 'project']).optional(),
 })
 
 /** The four permission switches of one access-table user. */
@@ -546,6 +565,15 @@ export async function openFeishuDomain(facility: StorageDomainFacility): Promise
  * fails validation instead of matching nobody).
  */
 export const FEISHU_USER_ID_PATTERN = /^(?!ou_|on_|oc_)[A-Za-z0-9_-]+$/u
+
+/**
+ * Key of a person's projects-mode main Session route. Distinct from
+ * {@link chatRouteKey}, so a topic-mode degraded route of the same private
+ * chat never replaces the main Session.
+ */
+export function dmMainRouteKey(chatId: string, userId: string): string {
+  return `dm:main:${chatId}:${userId}`
+}
 
 /** Build a chat-scoped fallback key for degraded (topic-less) routing. */
 export function chatRouteKey(chatType: 'p2p' | 'group', chatId: string, senderUserId: string): string {

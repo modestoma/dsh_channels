@@ -1,7 +1,13 @@
 /**
  * Read fence: in a Feishu Session, a configured in-process file tool may only
  * read inside the route's topic directory and the deployment's shared
- * `readableRoots`.
+ * `readableRoots`. A private-chat projects-mode Session may read its own
+ * directory (`main/` or `topics/<topic>/`) and the person's `shared/`
+ * directory instead of the whole workspace; there, a tool missing from
+ * `readFence.tools` is checked too, through the `readFence.pathArguments`
+ * it carries (string or string-array values), unless `uncheckedTools`
+ * exempts it. That check also covers file-writing tools such as `write` and
+ * `edit`.
  *
  * - Ownership: a call is fenced when its agent's Session is routed, or
  *   descends (through `parentSession`) from a routed Session; see
@@ -30,6 +36,7 @@ import { homedir } from 'node:os'
 import path from 'node:path'
 import type { FeishuConfig } from '../config.ts'
 import type { RouteRecord } from '../domain.ts'
+import { readRootsOf } from '../dm/layout.ts'
 import type { PreToolDecision, PreToolExecution, Session } from '../host/index.ts'
 import type { SessionLineage } from './lineage.ts'
 
@@ -62,39 +69,57 @@ export class ReadFence {
     const root = this.deps.lineage.rootOfCall(agent.session.id, agent.session.header.parentSession)
     const fence = this.deps.config().readFence
     if (root === undefined || !fence.enabled) return undefined
-    const argumentNames = Object.hasOwn(fence.tools, exec.name) ? fence.tools[exec.name] : undefined
-    if (argumentNames === undefined) return undefined
     const route = this.deps.routeOf(root)
     if (route === undefined) return undefined
+    const listed = Object.hasOwn(fence.tools, exec.name) ? fence.tools[exec.name] : undefined
     const args = isRecord(exec.arguments) ? exec.arguments : {}
+    // Unlisted tools are checked in projects mode only, and only through the path arguments they carry.
+    const unlisted = listed === undefined && route.dmRole !== undefined && !fence.uncheckedTools.includes(exec.name)
+      ? fence.pathArguments.filter(name => pathValuesOf(args[name]).length > 0)
+      : undefined
+    const argumentNames = listed ?? unlisted
+    if (argumentNames === undefined || argumentNames.length === 0) return undefined
     const base = this.deps.workingDirectory(agent.session) ?? agent.session.header.cwd ?? route.workspacePath
     const allowed = await allowedRootsOf(route, fence.readableRoots)
     const resolvedBase = await resolveReal(path.resolve(expandHome(base)))
     for (const name of argumentNames) {
-      const value = args[name]
-      if (typeof value !== 'string' || value === '') {
+      const values = pathValuesOf(args[name])
+      if (values.length === 0) {
         // An omitted path argument defaults to the effective working directory, which a Session can move.
         if (!allowed.some(rootPath => isInside(resolvedBase, rootPath))) return deny(exec.name, base, route)
         continue
       }
-      const target = name === 'pattern' ? globBase(value, typeof args.path === 'string' && args.path !== '' ? args.path : base) : value
-      if (target === undefined) return deny(exec.name, value, route)
-      const resolved = await resolveReal(path.resolve(base, expandHome(target)))
-      if (!allowed.some(rootPath => isInside(resolved, rootPath))) return deny(exec.name, value, route)
+      for (const value of values) {
+        const target = name === 'pattern' ? globBase(value, typeof args.path === 'string' && args.path !== '' ? args.path : base) : value
+        if (target === undefined) return deny(exec.name, value, route)
+        const resolved = await resolveReal(path.resolve(base, expandHome(target)))
+        if (!allowed.some(rootPath => isInside(resolved, rootPath))) return deny(exec.name, value, route)
+      }
     }
     return undefined
   }
 }
 
+/** The non-empty strings of one path argument (a string, or an array of strings). */
+function pathValuesOf(value: unknown): string[] {
+  if (typeof value === 'string') return value === '' ? [] : [value]
+  if (!Array.isArray(value)) return []
+  return value.filter((item): item is string => typeof item === 'string' && item !== '')
+}
+
 /**
  * The canonical directories one route's Sessions may read.
  *
- * The topic directory is judged without following a symlink at its own path,
- * because a Session that can write its parent could replace it with a link to
- * anywhere. The deployment's `readableRoots` are followed through symlinks.
+ * The route's own directories (see `readRootsOf`) are judged without
+ * following a symlink at their own path, because a Session that can write
+ * their parent could replace them with a link to anywhere. The deployment's
+ * `readableRoots` are followed through symlinks.
  */
 async function allowedRootsOf(route: RouteRecord, readableRoots: readonly string[]): Promise<string[]> {
-  const roots = await Promise.all([ownedRoot(route.workspacePath), ...readableRoots.map(async root => await resolveReal(root))])
+  const roots = await Promise.all([
+    ...readRootsOf(route).map(async dir => await ownedRoot(dir)),
+    ...readableRoots.map(async root => await resolveReal(root)),
+  ])
   return roots.filter((root): root is string => root !== undefined)
 }
 
@@ -116,6 +141,13 @@ async function ownedRoot(dir: string): Promise<string | undefined> {
 }
 
 function deny(toolName: string, value: string, route: RouteRecord): PreToolDecision {
+  if (route.dmRole !== undefined) {
+    const [own, shared] = readRootsOf(route)
+    return {
+      kind: 'deny',
+      reason: `这个会话只能访问自己的目录（${own}）、共享目录（${shared}）和部署允许的共享目录，${toolName} 的路径 ${value} 不在范围内，已拒绝。其他话题的成果请让对方放进共享目录；需要的文件请让用户发到对话里。`,
+    }
+  }
   return {
     kind: 'deny',
     reason: `飞书会话只能读取自己的工作区（${route.workspacePath}）和部署允许的共享目录，${toolName} 的路径 ${value} 不在范围内，已拒绝。请改用工作区内的路径；需要的文件请让用户发到对话里。`,
