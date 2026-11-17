@@ -10,7 +10,7 @@
  */
 
 import { fillCopy, PANEL_COPY, TAB_FIELD_GROUPS } from '../../settings/contract.ts'
-import type { AccessPermissionWire } from '../../settings/contract.ts'
+import type { AccessPermissionWire, DmStyleWire } from '../../settings/contract.ts'
 import type { ProfileView } from './profiles.ts'
 import { FieldSections, NoticeBar } from './shared.tsx'
 import type { FormView } from './shared.tsx'
@@ -25,11 +25,12 @@ export interface AccessTabProps {
   onRemoveUser: (userId: string) => void
   onTogglePermission: (userId: string, permission: AccessPermissionWire, enabled: boolean) => void
   onSetGitEmail: (userId: string, gitEmail: string) => Promise<boolean>
+  onSetDmStyle: (userId: string, dmStyle: DmStyleWire | '') => void
   onResolveRequest: (token: string, decision: 'allow' | 'deny') => void
 }
 
 export function AccessTab(props: AccessTabProps): JSX.Element {
-  const { form, profiles, accessNotice, accessError, onAddUser, onRemoveUser, onTogglePermission, onSetGitEmail, onResolveRequest } = props
+  const { form, profiles, accessNotice, accessError, onAddUser, onRemoveUser, onTogglePermission, onSetGitEmail, onSetDmStyle, onResolveRequest } = props
   const { access } = form.panel
   const working = form.busy === 'access'
   const disabled = form.busy !== null || form.locked || !access.loaded
@@ -58,6 +59,7 @@ export function AccessTab(props: AccessTabProps): JSX.Element {
         onRemove={onRemoveUser}
         onToggle={onTogglePermission}
         onSetGitEmail={onSetGitEmail}
+        onSetDmStyle={onSetDmStyle}
       />
     </div>
   )

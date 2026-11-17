@@ -1,5 +1,5 @@
 /**
- * 用户表：每个用户一行（头像、名字、user_id、Git 邮箱、管理员和四个权限开关、移除），
+ * 用户表：每个用户一行（头像、名字、user_id、Git 邮箱、私聊模式、管理员和四个权限开关、移除），
  * 点 Git 邮箱展开该用户的邮箱编辑行，添加表单点「＋ 添加用户」才展开；以及
  * 待处理申请行。
  *
@@ -8,7 +8,7 @@
 
 import { Fragment, useState } from 'react'
 import { fillCopy, PANEL_COPY } from '../../settings/contract.ts'
-import type { AccessPermissionWire, AccessRequestWire, AccessUserWire } from '../../settings/contract.ts'
+import type { AccessPermissionWire, AccessRequestWire, AccessUserWire, DmStyleWire } from '../../settings/contract.ts'
 import { Avatar } from '../avatar.tsx'
 import type { ProfileView } from './profiles.ts'
 import { EmptyRow, Row, Section } from './shared.tsx'
@@ -39,6 +39,13 @@ const PERMISSION_CHIPS: ReadonlyArray<{ permission: AccessPermissionWire; label:
   { permission: 'codeWrite', label: PANEL_COPY.accessPermCodeWrite },
 ]
 
+/** Private-chat mode choices; the empty value follows the channel default. */
+const DM_STYLE_OPTIONS: ReadonlyArray<{ value: DmStyleWire | ''; label: string }> = [
+  { value: '', label: PANEL_COPY.accessDmStyleDefault },
+  { value: 'topic', label: PANEL_COPY.accessDmStyleTopic },
+  { value: 'project', label: PANEL_COPY.accessDmStyleProject },
+]
+
 /** Whether a chip has no effect: an administrator holds everything; a suspended user's other switches are off. */
 function chipMuted(user: AccessUserWire, permission: AccessPermissionWire): boolean {
   if (permission === 'admin') return false
@@ -58,8 +65,9 @@ export interface UserTableEntry {
 /**
  * The flat user table: one dense row per user with an administrator chip
  * and four switch chips (an administrator's switch chips and a suspended
- * user's other chips are dimmed), remove buttons, a git email link
- * that opens one inline editor, and a collapsed add form. `onAdd` and
+ * user's other chips are dimmed), a private-chat mode selector, remove
+ * buttons, a git email link that opens one inline editor, and a collapsed
+ * add form. `onAdd` and
  * `onSetGitEmail` resolve true when the write succeeded (the form then
  * closes).
  */
@@ -72,8 +80,9 @@ export function UserTable(props: {
   onRemove: (id: string) => void
   onToggle: (id: string, permission: AccessPermissionWire, enabled: boolean) => void
   onSetGitEmail: (id: string, gitEmail: string) => Promise<boolean>
+  onSetDmStyle: (id: string, dmStyle: DmStyleWire | '') => void
 }): JSX.Element {
-  const { entries, loaded, disabled, working, onAdd, onRemove, onToggle, onSetGitEmail } = props
+  const { entries, loaded, disabled, working, onAdd, onRemove, onToggle, onSetGitEmail, onSetDmStyle } = props
   const [adding, setAdding] = useState(false)
   const [id, setId] = useState('')
   const [name, setName] = useState('')
@@ -96,7 +105,7 @@ export function UserTable(props: {
   return (
     <Section
       title={loaded ? `${PANEL_COPY.accessUsersTitle} · ${entries.length}` : PANEL_COPY.accessUsersTitle}
-      footnote={`${PANEL_COPY.accessUsersHint}${PANEL_COPY.accessGitEmailHint}`}
+      footnote={`${PANEL_COPY.accessUsersHint}${PANEL_COPY.accessGitEmailHint}${PANEL_COPY.accessDmStyleHint}`}
     >
       {!loaded ? <EmptyRow text={PANEL_COPY.accessNotLoaded} /> : null}
       {loaded && entries.length === 0 ? <EmptyRow text={PANEL_COPY.accessUsersEmpty} /> : null}
@@ -122,6 +131,16 @@ export function UserTable(props: {
             )}
             control={(
               <div className="dsh-channels-cfg__inputRow">
+                <select
+                  className="dsh-channels-cfg__input dsh-channels-cfg__dmStyle"
+                  value={user.dmStyle ?? ''}
+                  title={PANEL_COPY.accessDmStyle}
+                  aria-label={`${display ?? user.userId} ${PANEL_COPY.accessDmStyle}`}
+                  disabled={disabled}
+                  onChange={event => onSetDmStyle(user.userId, event.target.value === 'topic' || event.target.value === 'project' ? event.target.value : '')}
+                >
+                  {DM_STYLE_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+                </select>
                 {PERMISSION_CHIPS.map(({ permission, label }) => (
                   <button
                     key={permission}

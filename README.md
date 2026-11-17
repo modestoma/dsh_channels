@@ -333,6 +333,9 @@ npm 发行包已包含构建产物：Host 入口是 `lib/index.js`（profile 直
     statusRefreshMs: 5000               # 活动状态行保活间隔（工具/子代理/工作流等待期的计时刷新）
     requireMention: true                # 普通群需 @ 机器人
     dmMode: 'open'
+    dmStyle: 'topic'                    # 默认私聊模式：topic（每条消息开话题）| project（主会话 + 话题，见「私聊的两种模式」）；用户表可按人覆盖
+    # dmMainPreset: 'chat'              # projects 模式主会话的 Agent 预设（缺省沿用 agentPreset）
+    dmMainTools: [read, read_image, grep, glob, lsp, web_search, web_fetch, ask_user_question, todo_write, skill, feishu_topic_messages, feishu_attachment_fetch, feishu_send_file, propose_actions, feishu_wiki_list, feishu_wiki_read, feishu_wiki_sheet_read, feishu_wiki_base_read]  # 主会话只能调用这些工具（默认值）
     threadFallback: 'degrade'           # 话题被拒时降级为会话级路由
     routeTtlMs: 2592000000              # 话题路由 30 天无活动即过期；后续消息明确拒绝，不新建 Session（0 = 关闭）
     approvalTimeoutMs: 86400000         # HITL 审批决策卡等待时长（默认 24 小时，1 分钟–7 天；超时自动拒绝）
@@ -382,6 +385,8 @@ npm 发行包已包含构建产物：Host 入口是 `lib/index.js`（profile 直
         glob: [path, pattern]
         str_replace_editor: [path]
         lsp: [file_path]
+      pathArguments: [path, file_path, filePath, paths, dir, directory]  # projects 模式会话里，未列出的工具按这些参数名检查
+      uncheckedTools: []                # 不做上面这项检查的工具
     accessMode: 'guarded'               # 准入模式：guarded（默认，仅管理员 + 用户表里对话准入打开的人）| open（任何人可对话，不安全；知识库与代码改动开关仍生效）
     codeWriteTools: []                  # 另外需要「代码改动」开关的工具名（默认空；写操作经 access/authorize 发问的插件不用列；飞书会话之外的调用不受影响）
     authRequestTtlDays: 7               # 入群/用户授权申请卡有效期（天，1–30）
@@ -452,11 +457,31 @@ FEISHU_APP_SECRET: xxxxxxxx
 - **入站附件**：图片/文件只存入 DSH 原生附件库，**不写入话题目录**，因此话题目录只承载 Agent 产物。`/renew` 复用同一话题目录。
 - **插件不删除任何话题目录**。需要回收磁盘时手动删除不再需要的话题目录即可：该话题下次对话时会重建一个空目录继续使用。
 
+### 私聊的两种模式
+
+私聊有两种模式，默认模式在设置面板「会话 → 私聊模式」里选（`dmStyle`，默认 `topic`），管理员可以在「访问授权」的用户表里按人改。没有斜杠命令可以切换。切换只影响之后的新消息：已经开着的话题保持原来的模式继续用。
+
+- **话题模式**（`topic`）：上面的表格。私聊里每条新消息开一个新话题，每个话题一个 Session、一个工作区。
+- **projects 模式**（`project`）：私聊对话框本身是这个人的**主会话**，一直是同一个 Session，回复直接发在对话里（不开话题），不按话题过期时间回收，`/renew` 换成新 Session。在任意一条消息上「回复话题」就开一个**话题会话**，在话题里深入讨论。这个人的所有会话在 DSH Web 里归在同一个工作区下：
+
+```
+<baseDir>/p2p/<user_id>/        这个人的工作区（所有 projects 模式会话的 header cwd，标题「<人名> · 私聊」）
+  main/                         主会话的工作目录
+  topics/<话题 id>/             一个话题会话的工作目录
+  shared/                       这个人所有会话共用的文件
+```
+
+- 会话创建后经 DSH 的工作目录服务（`workingDirectory`）移到自己的目录；没有这个服务的部署里，会话留在这个人的工作区根目录，读围栏照样只放行自己的目录和 `shared/`。
+- **读写范围**：话题会话只能访问自己的目录和 `shared/`，主会话只能访问 `main/` 和 `shared/`，都看不到其他话题的文件，免得无关文件挤占上下文。约定成果放进 `shared/`。
+- **主会话工具收紧**：主会话只能调用 `dmMainTools` 里的工具（默认是读文件、搜索、联网、提问、技能和只读的飞书工具），其余调用在执行前拒绝，不管挂的是哪个 Agent 预设；命令行、写文件、改代码都在话题里做。主会话可以用 `dmMainPreset` 换一个预设。
+- 话题会话首轮带上话题里的消息（包括被回复的那条主会话消息）；主会话首轮不带历史。
+- 群聊不受这两种模式影响。话题模式的话题目录 `<baseDir>/p2p/<user_id>/<话题 id>/` 和这些目录在同一层，话题 id 不会和 `main`、`topics`、`shared` 重名。
+
 ### 读权限与执行隔离
 
 DSH 的沙箱只限制写，读不受限：不加处理时，飞书用户的会话可以读到 DSH 的凭据、其他人的会话日志和其他用户的工作区。插件分两层收紧：
 
-- **文件工具读围栏**（插件内，默认开启）：飞书会话及其子代理调用 `readFence.tools` 里的工具时，路径参数（解析符号链接之后）必须落在本路由的工作区、话题目录或 `readFence.readableRoots` 里，否则在 `tools/pre-execute` 直接拒绝并告诉模型原因。相对路径按会话的实际工作目录解析，`~` 按 Host 用户的主目录解析；glob 的 `pattern` 按第一个通配段之前的目录判断，含 `..` 段的一律拒绝。PTC 里的子调用同样经过这道检查。非飞书会话不受影响。管理员的会话同样受围栏限制；需要读工作区以外的文件时在 Web 里操作，或把目录加进 `readableRoots`。
+- **文件工具读围栏**（插件内，默认开启）：飞书会话及其子代理调用 `readFence.tools` 里的工具时，路径参数（解析符号链接之后）必须落在本路由的工作区、话题目录或 `readFence.readableRoots` 里，否则在 `tools/pre-execute` 直接拒绝并告诉模型原因。私聊 projects 模式的会话只放行自己的目录和 `shared/`（见「私聊的两种模式」）；这些会话调用不在 `readFence.tools` 里的工具时，带有 `readFence.pathArguments` 里任一参数（字符串或字符串数组）的调用按同样的范围检查，`write`、`edit` 这类写文件工具也因此只能写自己的目录和 `shared/`；路径参数不是文件路径的工具放进 `readFence.uncheckedTools`。相对路径按会话的实际工作目录解析，`~` 按 Host 用户的主目录解析；glob 的 `pattern` 按第一个通配段之前的目录判断，含 `..` 段的一律拒绝。PTC 里的子调用同样经过这道检查。非飞书会话不受影响。管理员的会话同样受围栏限制；需要读工作区以外的文件时在 Web 里操作，或把目录加进 `readableRoots`。
 - **进程读隔离**（部署配置，强烈建议）：bash、终端、PTC 这类工具启动子进程，读围栏管不到。插件附带一个沙箱 runner 包装 `lib/confine.js`，配到 DSH `@deepseek-ai/dsh-sandbox-local` 的 `runnerCommand` 后，所有受沙箱约束的命令（所有会话，不只飞书）都经过它：在 DSH 的 bwrap 配置上叠加 `--tmpfs` 遮住 `--hide` 目录；命令的可写根或工作目录位于某个 `--fence` 目录里时遮住整个 `--fence` 目录，只把 DSH 授予这次调用的可写根重新挂回来（工作目录可以被会话移到任何地方，不作为授权依据：工作目录被遮住又不在可写根内的命令直接拒绝，只读模式下在隔离目录内运行命令也会被拒绝）；再只读挂回 `--expose` 目录；并在启动前删掉匹配的环境变量。DSH 的 bwrap 配置自带独立 PID 命名空间和新的 `/proc`，命令看不到 Host 进程的环境变量。只支持 Linux + bwrap。
 
 ```yaml
@@ -474,6 +499,8 @@ DSH 的沙箱只限制写，读不受限：不加处理时，飞书用户的会�
       - /data/feishu                    # 本插件的 baseDir：飞书用户之间互相看不到工作区
       - --expose
       - /data/shared-skills             # 共享 SKILL 目录（如果在被遮住的目录里）
+      - --isolate-subdir
+      - topics                          # 私聊 projects 模式：话题之间互相看不到文件
       - --unset-env-matching
       - '(_KEY|_TOKEN|_SECRET|PASSWORD)$'
       - --bwrap                         # 必须是最后一个；DSH 在后面追加 bwrap 配置和命令
@@ -482,7 +509,8 @@ DSH 的沙箱只限制写，读不受限：不加处理时，飞书用户的会�
       - 'bwrap:'
 ```
 
-- `--hide` / `--fence` / `--expose` 必须是绝对路径，可重复；每次调用时检查目录是否存在，不存在的跳过。`--unset-env NAME` 删掉指定变量，`--bwrap-path` 指定 bwrap 位置（默认从 PATH 找）。参数写错时包装直接失败，DSH 报告沙箱 runner 失败，不会不加隔离地运行命令。
+- 私聊 projects 模式下再加 `--isolate-subdir topics`：命令的工作目录在某个可写根的 `topics/<话题>/` 里时，遮住 `topics/` 并只挂回这一个话题目录，话题里的命令看不到其他话题的文件。这只是让无关文件不进视野，不是授权：工作目录由会话自己决定。
+- `--hide` / `--fence` / `--expose` 必须是绝对路径，可重复；`--isolate-subdir` 是一个目录名，可重复；每次调用时检查目录是否存在，不存在的跳过。`--unset-env NAME` 删掉指定变量，`--bwrap-path` 指定 bwrap 位置（默认从 PATH 找）。参数写错时包装直接失败，DSH 报告沙箱 runner 失败，不会不加隔离地运行命令。
 - 只读模式（`read-only`）下 DSH 不挂可写目录，包装按命令的工作目录判断它属于哪个工作区，只挂回这个目录。
 - 被遮住的目录里如果有命令运行需要的东西（例如 `node_modules`、工具链），用 `--expose` 挂回来；改完配置后在飞书里让机器人执行 `ls /root/.dsh` 和 `ls <baseDir>/p2p` 检查效果。
 - 和 dsh-repo 一起部署时：dsh-repo 的镜像目录不能放在本插件的 `baseDir` 下（否则被当成别人的工作区遮住），也不能在 DSH 主目录下；要让飞书会话（例如日志分析的子 Agent）读到代码快照，把 `<镜像目录>/.snapshots` 加进 `readFence.readableRoots`，并在这里用 `--expose` 挂回来（镜像本身只读）。

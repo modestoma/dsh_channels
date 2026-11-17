@@ -43,6 +43,7 @@ export function settingsTarget(service: FeishuService): SettingsTarget {
     removeAccessUser: userId => accessAdmin.removeUser(userId),
     setAccessPermission: (userId, permission, enabled) => accessAdmin.setPermission(userId, permission, enabled),
     setAccessGitEmail: (userId, gitEmail) => accessAdmin.setGitEmail(userId, gitEmail),
+    setAccessDmStyle: (userId, dmStyle) => accessAdmin.setDmStyle(userId, dmStyle),
     resolveAccessRequest: (token, decision) => accessAdmin.resolveRequest(token, decision),
     setGroupPermission: (chatId, permission, enabled) => accessAdmin.setGroupPermission(chatId, permission, enabled),
     removeAccessGroup: chatId => accessAdmin.removeGroup(chatId),

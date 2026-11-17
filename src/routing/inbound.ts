@@ -37,6 +37,7 @@ import type { TurnStreamer } from '../turn/streamer.ts'
 import { principalOnRoute } from '../access/principal.ts'
 import { channelPrompt, type ChannelPrompt, type PromptBlock, type PromptImageBlock } from '../session/prompt.ts'
 import type { TurnSubmission } from '../session/submit.ts'
+import { dmSessionDir, ensureDmProject, routeWorkDir } from '../dm/layout.ts'
 import { openTopicWorkspace, topicTokenFor } from '../workspaces.ts'
 import type { TopicLocationPort } from '../workspaces.ts'
 
@@ -72,6 +73,8 @@ export interface InboundAccessPort {
    * Also guards against cross-chat id confusion.
    */
   ownsRoute(msg: NormalizedMessage, record: RouteRecord): boolean
+  /** The private-chat mode of one person (user-table override, else `dmStyle`). */
+  dmStyleOf(userId: string): 'topic' | 'project'
 }
 
 /**
@@ -434,6 +437,10 @@ export class InboundRouter {
     // text message: the next reply becomes the free-text answer.
     if (await this.tryAnswerPendingQuestion(msg, content)) return
 
+    // A person in projects mode talks to one main Session in the chat
+    // timeline; a reply in a topic without a route opens a topic Session.
+    const projects = this.inProjects(msg)
+
     // 1. Real topic route first (works without a mention, per product spec).
     if (msg.threadId !== undefined) {
       const record = this.routes.get(msg.threadId)
@@ -452,10 +459,11 @@ export class InboundRouter {
       }
     }
 
-    // 2. Degraded chat-scoped route (topic-less fallback sessions).
+    // 2. Chat-scoped route: the projects-mode main Session, or a degraded
+    //    topic-less fallback Session; each mode ignores the other's record.
     const chatKey = chatRouteKey(msg.chatType, msg.chatId, msg.senderId)
     const chatRecord = this.routes.get(chatKey)
-    if (chatRecord !== undefined) {
+    if (chatRecord !== undefined && this.continuesChatRoute(msg, chatRecord, projects)) {
       if (!this.access.ownsRoute(msg, chatRecord)) return
       await this.awaitFirstDelivery(chatRecord.key)
       await this.routeOperations.run(chatRecord.key, () => {
@@ -467,7 +475,8 @@ export class InboundRouter {
 
     // 3. In-flight establishment for this (chat, user) pair: wait for it and
     //    re-route with serial semantics (see the `establishing` field docs).
-    const pending = this.establishing.get(chatKey)
+    const establishKey = projects && msg.threadId !== undefined ? `${chatKey}#${msg.threadId}` : chatKey
+    const pending = this.establishing.get(establishKey)
     if (pending !== undefined) {
       const record = await pending.catch(() => undefined)
       if (record !== undefined
@@ -486,7 +495,24 @@ export class InboundRouter {
     // 4. New session: groups require a mention (unless disabled).
     if (msg.chatType === 'group' && this.config.requireMention && !msg.mentionedBot) return
 
-    await this.startSession(msg, content)
+    const role = !projects ? undefined : msg.threadId === undefined ? 'main' : 'topic'
+    await this.startSession(msg, content, establishKey, chatKey, role)
+  }
+
+  /** Whether a private-chat message follows projects mode (the person's mode decides). */
+  private inProjects(msg: NormalizedMessage): boolean {
+    return msg.chatType === 'p2p' && this.access.dmStyleOf(msg.senderId) === 'project'
+  }
+
+  /**
+   * Whether a message continues the chat-scoped route of its (chat, user)
+   * pair. Groups always do. In projects mode only a main-chat message, and
+   * only the main Session; in topic mode never the main Session.
+   */
+  private continuesChatRoute(msg: NormalizedMessage, record: RouteRecord, projects: boolean): boolean {
+    if (msg.chatType !== 'p2p') return true
+    if (projects) return msg.threadId === undefined && record.dmRole === 'main'
+    return record.dmRole !== 'main'
   }
 
   /**
@@ -793,9 +819,10 @@ export class InboundRouter {
       if (threaded !== undefined) return threaded
     }
     const chatKey = chatRouteKey(msg.chatType, msg.chatId, msg.senderId)
+    const projects = this.inProjects(msg)
     const degraded = this.routes.get(chatKey)
-    if (degraded !== undefined) return degraded
-    const pending = this.establishing.get(chatKey)
+    if (degraded !== undefined && this.continuesChatRoute(msg, degraded, projects)) return degraded
+    const pending = this.establishing.get(projects && msg.threadId !== undefined ? `${chatKey}#${msg.threadId}` : chatKey)
     if (pending === undefined) return undefined
     const record = await pending.catch(() => undefined)
     if (record?.kind === 'chat') return record
@@ -803,26 +830,66 @@ export class InboundRouter {
     return undefined
   }
   /**
-   * Serialize session establishment per (chat, user) pair. The promise is
-   * registered under the chat-scoped key SYNCHRONOUSLY (the key is known
-   * before any network op), so concurrent first messages all observe the same
-   * in-flight establishment instead of racing each other. The entry lives
-   * exactly as long as the establishment; waiters holding the promise still
-   * see the settled record after the entry is gone.
+   * Serialize session establishment per (chat, user) pair, and per topic for
+   * a projects-mode topic. The promise is registered under `establishKey`
+   * SYNCHRONOUSLY (the key is known before any network op), so concurrent
+   * first messages all observe the same in-flight establishment instead of
+   * racing each other. The entry lives exactly as long as the establishment;
+   * waiters holding the promise still see the settled record after the entry
+   * is gone.
    */
-  private startSession(msg: NormalizedMessage, content: string): Promise<RouteRecord> {
-    const chatKey = chatRouteKey(msg.chatType, msg.chatId, msg.senderId)
-    const existing = this.establishing.get(chatKey)
+  private startSession(
+    msg: NormalizedMessage,
+    content: string,
+    establishKey: string,
+    chatKey: string,
+    dmRole: RouteRecord['dmRole'],
+  ): Promise<RouteRecord> {
+    const existing = this.establishing.get(establishKey)
     if (existing !== undefined) return existing
-    const promise = this.establishSession(msg, content, chatKey)
-    this.establishing.set(chatKey, promise)
+    const promise = this.establishSession(msg, content, chatKey, dmRole)
+    this.establishing.set(establishKey, promise)
     void promise.then(
-      () => { this.establishing.delete(chatKey) },
-      () => { this.establishing.delete(chatKey) },
+      () => { this.establishing.delete(establishKey) },
+      () => { this.establishing.delete(establishKey) },
     )
     return promise
   }
-  private async establishSession(msg: NormalizedMessage, content: string, chatKey: string): Promise<RouteRecord> {
+
+  /**
+   * Open the workspace a new Session works in. A topic-mode or group Session
+   * gets its own topic workspace; a projects-mode Session joins the person's
+   * workspace and works in its own directory below it.
+   */
+  private async placeSession(
+    msg: NormalizedMessage,
+    content: string,
+    key: string,
+    kind: RouteRecord['kind'],
+    sessionId: SessionId,
+    dmRole: RouteRecord['dmRole'],
+  ): Promise<{ workspace: Workspace; currentDir?: string }> {
+    if (dmRole !== undefined) {
+      const workspace = await ensureDmProject(this.ctx, this.deps.location, this.config.baseDir, msg.senderId)
+      return { workspace, currentDir: dmSessionDir(workspace.path, dmRole, msg.threadId) }
+    }
+    const workspace = await openTopicWorkspace(this.ctx, this.deps.location, {
+      baseDir: this.config.baseDir,
+      chatType: msg.chatType,
+      chatId: msg.chatId,
+      userId: msg.senderId,
+      topicToken: topicTokenFor(key, kind, sessionId),
+      titleText: content,
+    })
+    return { workspace }
+  }
+
+  private async establishSession(
+    msg: NormalizedMessage,
+    content: string,
+    chatKey: string,
+    dmRole: RouteRecord['dmRole'],
+  ): Promise<RouteRecord> {
     // 0. One-time onboarding for a private chat (persisted, never repeats).
     if (this.config.welcomeOnboarding && msg.chatType === 'p2p') {
       await this.sendOnboardingCard(msg)
@@ -835,34 +902,35 @@ export class InboundRouter {
 
     // 2. First card frame — also creates the topic (reply_in_thread). The
     //    topic identity is only known after Feishu answers, and it names the
-    //    topic's workspace directory.
-    const sent = await this.delivery.replyFirstCard(msg, initialStreamingCard(sessionId))
+    //    topic's workspace directory. A projects-mode main Session answers
+    //    in the chat timeline under the chat-scoped key; a projects-mode
+    //    topic already has its topic.
+    const sent = await this.delivery.replyFirstCard(
+      msg,
+      initialStreamingCard(sessionId),
+      dmRole === 'main' ? { inThread: false } : {},
+    )
     const typingId = await typingPromise
-    const key = sent.degraded || sent.threadId === undefined ? chatKey : sent.threadId
-    const kind = sent.degraded || sent.threadId === undefined ? 'chat' : 'thread'
-
-    const topicToken = topicTokenFor(key, kind, sessionId)
+    const projectTopic = dmRole === 'topic' ? msg.threadId : undefined
+    const threadKey = projectTopic ?? (sent.degraded ? undefined : sent.threadId)
+    const key = dmRole === 'main' || threadKey === undefined ? chatKey : threadKey
+    const kind = key === chatKey ? 'chat' : 'thread'
     /** Patch the streaming card to its terminal creation-failure state. */
     const failCreation = async (error: unknown): Promise<void> => {
       void this.repair.clear(sent.messageId)
       await this.delivery.requireChannel().updateCard(sent.messageId, failedStreamingCard(sessionId, `会话创建失败：${String(error)}`)).catch(() => {})
     }
 
-    // 3. The topic's own workspace (its directory is the Session header cwd:
+    // 3. The Session's workspace (its directory is the Session header cwd:
     //    the sandbox root and the project the Session is grouped under),
     //    titled after the group or person and the opening message. A group
     //    gets its permission record (every switch off) when its first topic
-    //    opens. No Agent exists yet.
+    //    opens. A projects-mode Session uses the person's workspace and its
+    //    own directory below it. No Agent exists yet.
     let workspace: Workspace
+    let currentDir: string | undefined
     try {
-      workspace = await openTopicWorkspace(this.ctx, this.deps.location, {
-        baseDir: this.config.baseDir,
-        chatType: msg.chatType,
-        chatId: msg.chatId,
-        userId: msg.senderId,
-        topicToken,
-        titleText: content,
-      })
+      ({ workspace, currentDir } = await this.placeSession(msg, content, key, kind, sessionId, dmRole))
     } catch (error) {
       await failCreation(error)
       throw error
@@ -884,10 +952,13 @@ export class InboundRouter {
       attempts: 0,
     })
 
-    // 4. Create the Session in the topic directory (its header cwd).
+    // 4. Create the Session in the workspace directory (its header cwd); a
+    //    projects-mode Session then moves to its own directory.
     let handle: AgentHandle
     try {
-      handle = await this.sessions.openTopicSession(sessionId, workspace)
+      handle = dmRole === undefined || currentDir === undefined
+        ? await this.sessions.openTopicSession(sessionId, workspace)
+        : await this.sessions.openProjectSession(sessionId, workspace, dmRole, currentDir)
     } catch (error) {
       // The card lands in a final failure state — no repair needed later.
       await failCreation(error)
@@ -904,6 +975,8 @@ export class InboundRouter {
       senderUserId: msg.senderId,
       workspacePath: workspace.path,
       cardMessageId: sent.messageId,
+      ...(dmRole === undefined ? {} : { dmRole }),
+      ...(currentDir === undefined ? {} : { currentDir }),
     }, handle.agent.session.header.createdAt)
     // The delivery gate is opened BEFORE the route becomes durable: a message
     // that can see the route must also wait for this Session's first followup
@@ -919,8 +992,9 @@ export class InboundRouter {
       //    quoted-message excerpt are attached as text blocks. `routes.put` and
       //    the submission stay ordered with respect to other turns because
       //    later messages wait on the delivery gate.
+      // The main chat's history belongs to earlier Sessions of the person.
       const prompt = await this.assembleTurnPrompt(msg, record, content, handle.agent, {
-        firstTurn: true,
+        firstTurn: dmRole !== 'main',
         excludeMessageIds: [msg.messageId, sent.messageId],
       })
       await this.repair.recordPrompt(sent.messageId, prompt)
@@ -948,8 +1022,9 @@ export class InboundRouter {
     const live = await this.sessions.ensureLive(record)
     // The topic directory can disappear independently of the Session (manual
     // deletion, external cleanup); recreate it so the turn has its directory.
-    await mkdir(record.workspacePath, { recursive: true }).catch((error: unknown) => {
-      this.ctx.logger?.warn?.('dsh-channels: recreating topic directory %s failed: %s', record.workspacePath, String(error))
+    const workDir = routeWorkDir(record)
+    await mkdir(workDir, { recursive: true }).catch((error: unknown) => {
+      this.ctx.logger?.warn?.('dsh-channels: recreating topic directory %s failed: %s', workDir, String(error))
     })
     // A group route remembers its latest speaker for the commit trailer a
     // restart would otherwise attribute to the initiator.
@@ -962,7 +1037,7 @@ export class InboundRouter {
     const firstCard = this.streamer?.hasLiveTurn(current.sessionId) === true
       ? queuedStreamingCard(current.sessionId)
       : initialStreamingCard(current.sessionId)
-    const sent = await this.delivery.replyFirstCard(msg, firstCard)
+    const sent = await this.delivery.replyFirstCard(msg, firstCard, current.dmRole === 'main' ? { inThread: false } : {})
     const typingId = await typingPromise
 
     // Repair snapshot first — same crash-window reasoning as `startSession`.

@@ -44,6 +44,7 @@ import {
   RESOLVE_ACCESS_REQUEST_ROUTE,
   SET_GROUP_PERMISSION_ROUTE,
   SET_ACCESS_GIT_EMAIL_ROUTE,
+  SET_ACCESS_DM_STYLE_ROUTE,
   SET_ACCESS_PERMISSION_ROUTE,
   RESTART_KEYS,
   SAVE_CONFIG_ROUTE,
@@ -52,6 +53,7 @@ import {
 } from '../src/settings/contract.ts'
 import type {
   AccessMutationResponse,
+  DmStyleWire,
   AccessPermissionWire,
   AccessWire,
   GroupPermissionWire,
@@ -319,6 +321,17 @@ class FakeTarget implements SettingsTarget {
     if (user === undefined) return { ok: false, error: '用户不在用户表里' }
     if (gitEmail === undefined) delete user.gitEmail
     else user.gitEmail = gitEmail
+    return { ok: true, access: this.accessSnapshot() }
+  }
+
+  async setAccessDmStyle(userId: string, dmStyle: DmStyleWire | undefined): Promise<AccessMutationResponse> {
+    this.accessCalls.push({ op: 'dm-style', userId, dmStyle })
+    const failed = this.accessFailure()
+    if (failed !== undefined) return failed
+    const user = this.accessState.users.find(item => item.userId === userId)
+    if (user === undefined) return { ok: false, error: '用户不在用户表里' }
+    if (dmStyle === undefined) delete user.dmStyle
+    else user.dmStyle = dmStyle
     return { ok: true, access: this.accessSnapshot() }
   }
 
@@ -640,7 +653,7 @@ describe('field descriptors', () => {
     expect(roots?.placeholder).toContain('/wiki/space/')
     // Only list fields carry list metadata.
     expect(FIELD_DESCRIPTORS.filter(field => field.maxItems !== undefined || field.itemFormat !== undefined)
-      .map(field => field.key)).toEqual(['wikiRoots'])
+      .map(field => field.key)).toEqual(['dmMainTools', 'wikiRoots'])
   })
 
   it('describes the session timing fields with display units and live application', () => {
@@ -1637,6 +1650,25 @@ describe('SettingsSurface access control', () => {
     ])
   })
 
+  it('sets and clears a per-user private-chat mode, rejecting unknown modes before writing', async () => {
+    const { surface, target } = makeSurface()
+    await surface.saveAccessUser('u_alice', 'Alice')
+    const set = await surface.setAccessDmStyle(' u_alice ', 'project')
+    expect(set.ok && set.access.users[0]?.dmStyle).toBe('project')
+    for (const bad of ['projects', 'TOPIC', 42, true]) {
+      expect((await surface.setAccessDmStyle('u_alice', bad)).ok).toBe(false)
+    }
+    expect((await surface.setAccessDmStyle('ou_alice', 'topic')).ok).toBe(false)
+    const cleared = await surface.setAccessDmStyle('u_alice', '')
+    expect(cleared.ok && cleared.access.users[0]).not.toHaveProperty('dmStyle')
+    expect((await surface.setAccessDmStyle('u_alice', null)).ok).toBe(true)
+    expect(target.accessCalls.filter(call => call.op === 'dm-style')).toEqual([
+      { op: 'dm-style', userId: 'u_alice', dmStyle: 'project' },
+      { op: 'dm-style', userId: 'u_alice', dmStyle: undefined },
+      { op: 'dm-style', userId: 'u_alice', dmStyle: undefined },
+    ])
+  })
+
   it('sets, trims, and clears a git email, rejecting malformed ones before writing', async () => {
     const { surface, target } = makeSurface()
     await surface.saveAccessUser('u_alice', 'Alice')
@@ -1883,6 +1915,7 @@ describe('settings routes', () => {
       [REMOVE_ACCESS_USER_ROUTE]: 'POST',
       [SET_ACCESS_PERMISSION_ROUTE]: 'POST',
       [SET_ACCESS_GIT_EMAIL_ROUTE]: 'POST',
+      [SET_ACCESS_DM_STYLE_ROUTE]: 'POST',
       [RESOLVE_ACCESS_REQUEST_ROUTE]: 'POST',
       [SET_GROUP_PERMISSION_ROUTE]: 'POST',
       [REMOVE_ACCESS_GROUP_ROUTE]: 'POST',
@@ -2258,7 +2291,7 @@ describe('apply() web wiring', () => {
     })
 
     expect(injected).toContainEqual(['connection'])
-    expect(routes.size).toBe(24)
+    expect(routes.size).toBe(25)
 
     const panel = await call(routes, PANEL_ROUTE)
     expect(panel.status).toBe(200)

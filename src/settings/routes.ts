@@ -30,6 +30,7 @@ import {
   REMOVE_ACCESS_USER_ROUTE,
   RESOLVE_ACCESS_REQUEST_ROUTE,
   SET_ACCESS_GIT_EMAIL_ROUTE,
+  SET_ACCESS_DM_STYLE_ROUTE,
   SET_ACCESS_PERMISSION_ROUTE,
   SET_GROUP_PERMISSION_ROUTE,
   SAVE_CONFIG_ROUTE,
@@ -255,6 +256,10 @@ export function registerSettingsRoutes(connection: HostConnection, surface: Sett
     post(SET_ACCESS_GIT_EMAIL_ROUTE, async (request) => {
       const payload = await readJsonObject(request)
       return result(await surface.setAccessGitEmail(payload.userId, payload.gitEmail))
+    }),
+    post(SET_ACCESS_DM_STYLE_ROUTE, async (request) => {
+      const payload = await readJsonObject(request)
+      return result(await surface.setAccessDmStyle(payload.userId, payload.dmStyle))
     }),
     post(RESOLVE_ACCESS_REQUEST_ROUTE, async (request) => {
       const payload = await readJsonObject(request)

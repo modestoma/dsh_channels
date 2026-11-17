@@ -13,6 +13,9 @@
  * The same module mounts the Feishu reply guidance
  * ({@link FEISHU_REPLIES_SECTION}): how a final reply reads in a chat card.
  * It applies to every Feishu Session, and its `replyGuidance` switch is read on every model request.
+ * A private-chat projects-mode Session also gets {@link FEISHU_PROJECT_SECTION}:
+ * its own directory, the person's `shared/` directory, and for the main
+ * Session where work that needs the full toolset goes.
  *
  * @module dsh-channels/feishu/agent-context
  */
@@ -100,5 +103,49 @@ export async function mountReplyGuidance(agentCtx: AgentContext, enabled: () => 
       order: FEISHU_REPLIES_ORDER,
       text: () => enabled() ? FEISHU_REPLIES_GUIDANCE : '',
     })
+  })
+}
+
+/** Stable prompt-section name of the private-chat projects-mode guidance; one registration per Agent scope. */
+export const FEISHU_PROJECT_SECTION = 'dsh-channels:feishu-project'
+
+/** Placement right after the reply guidance (960). */
+const FEISHU_PROJECT_ORDER = 970
+
+/**
+ * Projects-mode guidance for one Session: where it works, what it may read,
+ * and (main Session) where work that needs more tools goes. The text names
+ * the Session's directories, which never change for a route, so it stays
+ * stable for the KV cache.
+ * @param role - main Session or topic.
+ * @param ownDir - the Session's own directory.
+ * @param sharedDir - the person's shared directory.
+ * @returns the section text.
+ */
+export function projectGuidance(role: 'main' | 'topic', ownDir: string, sharedDir: string): string {
+  if (role === 'main') {
+    return `## Feishu private chat: main conversation
+This is the person's main conversation with you in a Feishu private chat. It stays one ongoing session; deeper work happens in topics, each with its own session.
+
+- Your working directory is ${ownDir}. You can read it and the person's shared directory ${sharedDir}; the topics' directories are not visible to you.
+- Here you talk, read, search and look things up. Running commands, writing files and changing code are not available in this conversation. When a request needs them, or a long focused discussion, ask the person to reply in a topic (Feishu 「回复话题」) on the relevant message: that opens a topic session with the full toolset.
+- Results that topics put in ${sharedDir} are readable here.`
+  }
+  return `## Feishu private chat: topic
+This session is one topic of the person's Feishu private chat. The person's main conversation and their other topics are separate sessions.
+
+- Your working directory is ${ownDir}. You can access it and the person's shared directory ${sharedDir}, and nothing of the other topics or the main conversation.
+- Put deliverables the person or other topics will reuse (reports, exported files, summaries) in ${sharedDir}; keep scratch work in your own directory.`
+}
+
+/**
+ * Mount the projects-mode guidance into one Agent scope. A missing
+ * `systemPrompt` service degrades to a no-op (headless hosts).
+ * @param agentCtx - the Agent scope the section is registered in.
+ * @param text - the section text ({@link projectGuidance}).
+ */
+export async function mountProjectGuidance(agentCtx: AgentContext, text: string): Promise<void> {
+  await agentCtx.inject(['systemPrompt'], (ctx) => {
+    ctx.systemPrompt?.section({ name: FEISHU_PROJECT_SECTION, order: FEISHU_PROJECT_ORDER, text })
   })
 }

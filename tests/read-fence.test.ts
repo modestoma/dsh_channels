@@ -30,6 +30,8 @@ function setup(overrides: Partial<FenceConfig> = {}) {
     enabled: true,
     readableRoots: [skills],
     tools: { read: ['file_path'], grep: ['path'], glob: ['path', 'pattern'] },
+    pathArguments: ['path', 'file_path', 'paths'],
+    uncheckedTools: [],
     ...overrides,
   }
   const routes = new Map<string, RouteRecord>([['s_alice', { workspacePath: alice } as RouteRecord]])
@@ -139,5 +141,67 @@ describe('ReadFence', () => {
     config.enabled = true
     config.tools = { ...config.tools, write: ['file_path'] }
     expect(await fence.decide(call('write', outside))).toMatchObject(denied)
+  })
+
+  describe('projects-mode private-chat Sessions', () => {
+    /** Alice's projects-mode directory with a main Session, two topics, and shared files. */
+    function projects() {
+      const fixture = setup()
+      const { alice, routes } = fixture
+      const main = path.join(alice, 'main')
+      const mine = path.join(alice, 'topics', 'omt_1')
+      const sibling = path.join(alice, 'topics', 'omt_2')
+      const shared = path.join(alice, 'shared')
+      for (const dir of [main, mine, sibling, shared]) mkdirSync(dir, { recursive: true })
+      writeFileSync(path.join(sibling, 'draft.md'), 'other topic')
+      routes.set('s_alice', { workspacePath: alice, dmRole: 'topic', currentDir: mine } as RouteRecord)
+      routes.set('s_main', { workspacePath: alice, dmRole: 'main', currentDir: main } as RouteRecord)
+      fixture.cwd.set('s_alice', mine)
+      fixture.cwd.set('s_main', main)
+      return { ...fixture, main, mine, sibling, shared }
+    }
+
+    const projectDenied = { kind: 'deny', reason: expect.stringContaining('这个会话只能访问自己的目录') }
+
+    it('lets a topic read its own directory and shared/, not sibling topics, the main directory, or the person root', async () => {
+      const { fence, alice, main, mine, sibling, shared, skills } = projects()
+      expect(await fence.decide(call('read', { file_path: 'notes.md' }))).toBeUndefined()
+      expect(await fence.decide(call('read', { file_path: path.join(mine, 'a.md') }))).toBeUndefined()
+      expect(await fence.decide(call('read', { file_path: path.join(shared, 'report.md') }))).toBeUndefined()
+      expect(await fence.decide(call('read', { file_path: path.join(skills, 'SKILL.md') }))).toBeUndefined()
+      const decision = await fence.decide(call('read', { file_path: '../omt_2/draft.md' }))
+      expect(decision).toMatchObject(projectDenied)
+      expect(decision && 'reason' in decision ? decision.reason : '').toContain(shared)
+      expect(await fence.decide(call('read', { file_path: path.join(sibling, 'draft.md') }))).toMatchObject(projectDenied)
+      expect(await fence.decide(call('read', { file_path: path.join(main, 'x.md') }))).toMatchObject(projectDenied)
+      expect(await fence.decide(call('grep', { pattern: 'x', path: alice }))).toMatchObject(projectDenied)
+    })
+
+    it('lets the main Session read main/ and shared/ only', async () => {
+      const { fence, main, mine, shared } = projects()
+      expect(await fence.decide(call('read', { file_path: path.join(main, 'a.md') }, 's_main'))).toBeUndefined()
+      expect(await fence.decide(call('read', { file_path: '../shared/report.md' }, 's_main'))).toBeUndefined()
+      expect(await fence.decide(call('read', { file_path: path.join(shared, 'r.md') }, 's_main'))).toBeUndefined()
+      expect(await fence.decide(call('read', { file_path: path.join(mine, 'a.md') }, 's_main'))).toMatchObject(projectDenied)
+    })
+
+    it('checks unlisted tools through their path arguments, including string arrays, unless exempted', async () => {
+      const { fence, config, mine, sibling, shared } = projects()
+      expect(await fence.decide(call('write', { file_path: path.join(mine, 'out.md'), content: 'x' }))).toBeUndefined()
+      expect(await fence.decide(call('write', { file_path: path.join(shared, 'out.md') }))).toBeUndefined()
+      expect(await fence.decide(call('write', { file_path: path.join(sibling, 'draft.md') }))).toMatchObject(projectDenied)
+      expect(await fence.decide(call('bundle', { paths: [path.join(mine, 'a'), path.join(sibling, 'b')] }))).toMatchObject(projectDenied)
+      expect(await fence.decide(call('bundle', { paths: [path.join(mine, 'a'), 7, ''] }))).toBeUndefined()
+      // No path argument: nothing to check, and an omitted one is not read as the working directory.
+      expect(await fence.decide(call('web_search', { query: 'x' }))).toBeUndefined()
+      config.uncheckedTools = ['write']
+      expect(await fence.decide(call('write', { file_path: path.join(sibling, 'draft.md') }))).toBeUndefined()
+    })
+
+    it('leaves unlisted tools of topic-mode and group Sessions alone', async () => {
+      const { fence, routes, alice, bob } = projects()
+      routes.set('s_alice', { workspacePath: alice } as RouteRecord)
+      expect(await fence.decide(call('write', { file_path: path.join(bob, 'notes.md') }))).toBeUndefined()
+    })
   })
 })

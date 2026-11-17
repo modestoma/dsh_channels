@@ -71,6 +71,33 @@ describe('confine runner', () => {
     expect(args.slice(0, 8)).toEqual(['--ro-bind', '/', '/', '--tmpfs', '/srv/dsh', '--ro-bind', ws, ws])
   })
 
+  it('hides sibling topics of a projects-mode topic and binds its own topic back writable', () => {
+    const ws = '/srv/feishu/p2p/u_alice'
+    const topics = `${ws}/topics`
+    const own = `${topics}/omt_1`
+    const isolating = { cwd: `${own}/src`, realDir: (dir: string) => (EXISTING.has(dir) || dir === topics ? dir : undefined) }
+    const args = bwrapArgsOf(parseConfineArgs(['--fence', '/srv/feishu', '--isolate-subdir', 'topics', '--bwrap', ...ROOT, ...WRITE(ws), '--', 'ls']), isolating)
+    expect(args).toEqual([
+      '--ro-bind', '/', '/',
+      '--tmpfs', '/srv/feishu',
+      '--ro-bind', ws, ws,
+      ...ROOT.slice(3), ...WRITE(ws),
+      '--tmpfs', topics, '--bind', own, own,
+      '--', 'ls',
+    ])
+  })
+
+  it('isolates nothing when the working directory is outside the named directory or the directory is missing', () => {
+    const ws = '/srv/feishu/p2p/u_alice'
+    const topics = `${ws}/topics`
+    const realDir = (dir: string) => (dir === topics ? dir : undefined)
+    const invocation = parseConfineArgs(['--isolate-subdir', 'topics', '--bwrap', ...ROOT, ...WRITE(ws), '--', 'ls'])
+    const plain = [...ROOT, ...WRITE(ws), '--', 'ls']
+    expect(bwrapArgsOf(invocation, { cwd: `${ws}/main`, realDir })).toEqual(plain)
+    expect(bwrapArgsOf(invocation, { cwd: topics, realDir })).toEqual(plain)
+    expect(bwrapArgsOf(invocation, { cwd: `${topics}/omt_1`, realDir: () => undefined })).toEqual(plain)
+  })
+
   it('removes named and matching environment variables', () => {
     const { options } = parseConfineArgs(['--unset-env', 'DEEPSEEK_BASE_URL', '--unset-env-matching', '(_KEY|_TOKEN|_SECRET)$', '--bwrap', ...ROOT, '--', 'true'])
     expect(confinedEnv({ PATH: '/bin', DEEPSEEK_API_KEY: 'k', DEEPSEEK_BASE_URL: 'u', GITLAB_TOKEN: 't', FEISHU_APP_SECRET: 's', HOME: '/root' }, options))
@@ -87,6 +114,8 @@ describe('confine runner', () => {
     [['--hide'], '--hide needs a value'],
     [['--hide', 'relative/dir', '--bwrap', ...ROOT, '--', 'true'], 'needs an absolute directory'],
     [['--unset-env-matching', '(', '--bwrap', ...ROOT, '--', 'true'], 'not a valid regular expression'],
+    [['--isolate-subdir', 'a/b', '--bwrap', ...ROOT, '--', 'true'], 'needs one directory name'],
+    [['--isolate-subdir', '..', '--bwrap', ...ROOT, '--', 'true'], 'needs one directory name'],
     [[...ROOT, '--', 'true'], 'unknown option --ro-bind'],
     [['--hide', '/srv/dsh'], 'missing --bwrap'],
     [['--bwrap', ...ROOT, 'true'], 'missing -- between'],

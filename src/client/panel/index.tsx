@@ -174,6 +174,7 @@ function FeishuChannelsPanel(): JSX.Element | null {
                 onRemoveUser={userId => { void access.removeUser(userId) }}
                 onTogglePermission={(userId, permission, enabled) => { void access.togglePermission(userId, permission, enabled) }}
                 onSetGitEmail={access.setGitEmail}
+                onSetDmStyle={(userId, dmStyle) => { void access.setDmStyle(userId, dmStyle) }}
                 onResolveRequest={(token, decision) => { void access.resolveRequest(token, decision) }}
               />
             )

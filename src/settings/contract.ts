@@ -42,6 +42,8 @@ export const REMOVE_ACCESS_USER_ROUTE = '/api/dsh-channels.removeAccessUser'
 export const SET_ACCESS_PERMISSION_ROUTE = '/api/dsh-channels.setAccessPermission'
 /** 设置或清除一个用户的 Git 邮箱（POST，body `{ userId, gitEmail }`；空字符串或 null 清除）。 */
 export const SET_ACCESS_GIT_EMAIL_ROUTE = '/api/dsh-channels.setAccessGitEmail'
+/** 设置或清除一个用户的私聊模式（POST，body `{ userId, dmStyle }`；dmStyle 为 topic、project，空字符串或 null 跟随全局默认）。 */
+export const SET_ACCESS_DM_STYLE_ROUTE = '/api/dsh-channels.setAccessDmStyle'
 /** 结算一条待处理授权申请（POST，body `{ token, decision }`）。 */
 export const RESOLVE_ACCESS_REQUEST_ROUTE = '/api/dsh-channels.resolveAccessRequest'
 /** 设置一个群的权限开关（POST，body `{ chatId, permission, enabled }`，permission 为 wikiRead、wikiWrite 或 codeWrite）。 */
@@ -236,6 +238,10 @@ export const EDITABLE_KEYS = [
   'dmMode',
   'requireMention',
   'threadFallback',
+  // 会话：私聊模式
+  'dmStyle',
+  'dmMainPreset',
+  'dmMainTools',
   // 会话：工作区
   'baseDir',
   // 会话：话题与卡片
@@ -326,6 +332,7 @@ export type StringListItemFormat = 'wiki-root-link'
  */
 export type FieldGroup =
   | 'trigger'
+  | 'dm'
   | 'workspace'
   | 'cards'
   | 'features'
@@ -594,7 +601,12 @@ export interface AccessUserWire {
   codeWrite: boolean
   /** Git email set by an administrator; commits for turns this user drives name them as author. */
   gitEmail?: string
+  /** Private-chat mode an administrator set for this user; absent follows the channel's `dmStyle`. */
+  dmStyle?: DmStyleWire
 }
+
+/** Private-chat mode: `topic` (every message opens a topic) or `project` (main chat + topics). */
+export type DmStyleWire = 'topic' | 'project'
 
 /** Permission switches of one group record (same names as the stored record). */
 export type GroupPermissionWire = 'wikiRead' | 'wikiWrite' | 'codeWrite'
@@ -771,7 +783,7 @@ export type PanelTabId = (typeof PANEL_TABS)[number]['id']
 /** Which editable field groups each tab renders, in section order. */
 export const TAB_FIELD_GROUPS: Readonly<Record<PanelTabId, readonly FieldGroup[]>> = {
   connection: [],
-  sessions: ['trigger', 'workspace', 'cards', 'features'],
+  sessions: ['trigger', 'dm', 'workspace', 'cards', 'features'],
   records: [],
   model: ['model'],
   attachments: ['attachments', 'tools', 'limits'],
@@ -784,6 +796,7 @@ export const TAB_FIELD_GROUPS: Readonly<Record<PanelTabId, readonly FieldGroup[]
 /** Section heading for one field group inside its tab. */
 export const FIELD_GROUP_LABELS: Readonly<Record<FieldGroup, string>> = {
   trigger: '触发',
+  dm: '私聊模式',
   workspace: '工作区',
   cards: '话题与卡片',
   features: '飞书侧功能',
@@ -974,6 +987,12 @@ export const PANEL_COPY = {
   accessGitEmailPlaceholder: 'GitHub/GitLab 账号已验证的邮箱，留空清除',
   accessGitEmailSave: '保存',
   accessGitEmailChanged: '已更新 Git 邮箱',
+  accessDmStyle: '私聊模式',
+  accessDmStyleDefault: '跟随默认',
+  accessDmStyleTopic: '话题模式',
+  accessDmStyleProject: 'projects 模式',
+  accessDmStyleChanged: '已更新私聊模式',
+  accessDmStyleHint: '私聊模式默认跟随「会话」页的设置，可以按人改成话题模式或 projects 模式；只影响之后的新消息，已开的话题保持原模式。',
   groupsTitle: '群权限表',
   groupsEmpty: '还没有群开过话题',
   groupsHint: '机器人在群里第一次开话题时自动登记该群，三个开关默认关闭；开关只在这里设置，作用于该群的所有话题（谁能在群里说话仍由用户表决定）。移除后该群下次开话题时重新登记。',

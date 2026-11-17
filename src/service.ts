@@ -17,6 +17,8 @@
 
 import { CodeWriteGate } from './access/code-write.ts'
 import { ReadFence } from './access/read-fence.ts'
+import { readRootsOf } from './dm/layout.ts'
+import { MainToolGate } from './dm/tool-gate.ts'
 import { SessionLineage } from './access/lineage.ts'
 import { AccessController } from './access/controller.ts'
 import { AccessRequests } from './access/requests.ts'
@@ -281,6 +283,7 @@ export class FeishuService {
   /** Disposer of this channel's `remoteAccess` policies (registered per start). */
   private unlistenAccessPolicy: (() => void) | undefined
   private readonly readFence: ReadFence
+  private readonly mainToolGate: MainToolGate
   /** Durable access-control user table and authorization requests. */
   private readonly accessStore: AccessStore
   /** Channel-plane admission gate (administrator / group / user). */
@@ -468,10 +471,12 @@ export class FeishuService {
       targetOfSession: sessionId => {
         const record = this.routes.findBySession(sessionId)
         if (record === undefined) return undefined
+        const [rootDir, ...otherRoots] = readRootsOf(record)
         return {
           replyTo: record.cardMessageId,
           inThread: record.kind === 'thread',
-          rootDir: record.workspacePath,
+          rootDir: rootDir ?? record.workspacePath,
+          otherRoots,
         }
       },
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
@@ -480,6 +485,8 @@ export class FeishuService {
       channel: () => this.channel,
       started: () => this.started,
       routeForSession: sessionId => this.routes.findBySession(sessionId),
+      keepsTimeline: msg => msg.chatType === 'p2p' && msg.threadId === undefined
+        && this.accessController.dmStyleOf(msg.senderId) === 'project',
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
     })
     this.accessStore = new AccessStore({
@@ -497,6 +504,11 @@ export class FeishuService {
       routeOf: sessionId => this.routes.findBySession(sessionId),
       lineage: this.lineage,
       workingDirectory: session => workingDirectoryService(this.ctx)?.get(session),
+    })
+    this.mainToolGate = new MainToolGate({
+      config: () => this.config,
+      routeOf: sessionId => this.routes.findBySession(sessionId),
+      lineage: this.lineage,
     })
     this.accessController = new AccessController({
       config: () => this.config,
@@ -1173,7 +1185,8 @@ export class FeishuService {
       this.streamer?.onInboxDiscarded(agent.session, message)
     }))
     this.unlistenHost.push(this.ctx.on('tools/pre-execute', async (exec, next) =>
-      this.proposeActionsTools.decidePreExecute(exec)
+      this.mainToolGate.decide(exec)
+      ?? this.proposeActionsTools.decidePreExecute(exec)
       ?? this.codeWriteGate.decide(exec)
       ?? await this.readFence.decide(exec)
       ?? await next()))
@@ -1587,7 +1600,8 @@ export class FeishuService {
     const routes = this.domain?.routes
     if (routes !== undefined) {
       for (const [key, record] of [...routes.entries()]) {
-        if (record.lastActivityAt >= cutoff) continue
+        // A person's projects-mode main conversation never expires; `/renew` resets it.
+        if (record.lastActivityAt >= cutoff || record.dmRole === 'main') continue
         try {
           if (record.kind === 'thread') {
             await this.routes.expireThread(key, now)

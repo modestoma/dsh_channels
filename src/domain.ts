@@ -75,6 +75,20 @@ export const routeRecordSchema = z.object({
   lastActivityAt: z.number().int().nonnegative(),
   /** Sessions this topic has pointed at, oldest first; always names `sessionId`. */
   sessionHistory: z.array(sessionHistoryEntrySchema),
+  /**
+   * Role of a private-chat route opened in projects mode: `main` is the
+   * person's main conversation (chat-scoped key), `topic` one topic below it.
+   * Absent on topic-mode and group routes. A projects-mode route's
+   * {@link workspacePath} is the person's directory and its
+   * {@link currentDir} the Session's own directory below it.
+   */
+  dmRole: z.enum(['main', 'topic']).optional(),
+  /**
+   * The Session's working directory inside {@link workspacePath} (projects
+   * mode only): `main/` or `topics/<topic>/`. Its reads are limited to this
+   * directory and the person's `shared/` directory.
+   */
+  currentDir: z.string().min(1).optional(),
 })
 
 export type RouteRecord = z.infer<typeof routeRecordSchema>
@@ -267,6 +281,11 @@ export const accessUserRecordSchema = z.object({
    * account stays the author.
    */
   gitEmail: z.string().optional(),
+  /**
+   * Private-chat mode an administrator set for this user; absent follows the
+   * channel's `dmStyle`.
+   */
+  dmStyle: z.enum(['topic', 'project']).optional(),
 })
 
 /** The four permission switches of one access-table user. */

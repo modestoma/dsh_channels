@@ -21,6 +21,7 @@ import {
   REMOVE_ACCESS_USER_ROUTE,
   RESOLVE_ACCESS_REQUEST_ROUTE,
   SET_ACCESS_GIT_EMAIL_ROUTE,
+  SET_ACCESS_DM_STYLE_ROUTE,
   SET_ACCESS_PERMISSION_ROUTE,
   SET_GROUP_PERMISSION_ROUTE,
   SAVE_CONFIG_ROUTE,
@@ -34,6 +35,7 @@ import {
 } from '../settings/contract.ts'
 import type {
   AccessMutationResponse,
+  DmStyleWire,
   AccessPermissionWire,
   GroupPermissionWire,
   AccessWire,
@@ -362,6 +364,11 @@ export async function setAccessPermission(
 /** Set one user's git email; an empty string clears it. */
 export async function setAccessGitEmail(userId: string, gitEmail: string): Promise<AccessMutationResponse> {
   return mutateAccess(SET_ACCESS_GIT_EMAIL_ROUTE, { userId, gitEmail })
+}
+
+/** Set one user's private-chat mode; an empty string follows the channel default. */
+export async function setAccessDmStyle(userId: string, dmStyle: DmStyleWire | ''): Promise<AccessMutationResponse> {
+  return mutateAccess(SET_ACCESS_DM_STYLE_ROUTE, { userId, dmStyle })
 }
 
 /** Set one permission switch of a registered group. */

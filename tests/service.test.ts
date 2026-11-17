@@ -14,14 +14,16 @@ import { MISSED_RUN_ACTION } from '../src/cards/missed.ts'
 import { hostTurnOriginLine, StartSupersededError } from '../src/service.ts'
 import { FeishuApiError } from '../src/feishu-channel.ts'
 import type { FeishuConfig } from '../src/config.ts'
+import { DEFAULT_DM_MAIN_TOOLS } from '../src/config.ts'
 import type {
   CardActionEvent, ChannelFactory, FeishuChannel, NormalizedMessage, RawMessageListParams,
 } from '../src/feishu-channel.ts'
 import { CordisFiberState } from '../src/host/index.ts'
 import type { Agent, AgentHandle, ApprovalOutcome, CordisPluginRuntime, MessageId, Session, SessionId, SessionProjections, UserMessage } from '../src/host/index.ts'
 import { RESUME_ACTION } from '../src/cards/index.ts'
+import { chatRouteKey } from '../src/domain.ts'
 import type { RouteRecord } from '../src/domain.ts'
-import { FEISHU_ATTACHMENTS_GUIDANCE, FEISHU_ATTACHMENTS_SECTION, FEISHU_REPLIES_GUIDANCE, FEISHU_REPLIES_SECTION } from '../src/feishu/agent-context.ts'
+import { FEISHU_ATTACHMENTS_GUIDANCE, FEISHU_ATTACHMENTS_SECTION, FEISHU_PROJECT_SECTION, FEISHU_REPLIES_GUIDANCE, FEISHU_REPLIES_SECTION } from '../src/feishu/agent-context.ts'
 import { ATTACHMENT_FETCH_TOOL_NAME, TOPIC_MESSAGES_TOOL_NAME } from '../src/feishu/tools.ts'
 import { SEND_FILE_TOOL_NAME } from '../src/feishu/send-file.ts'
 import type { SessionExportBuilder } from '../src/session-export.ts'
@@ -47,6 +49,8 @@ function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
     // Effectively disables the keep-alive heartbeat in service tests (real timers).
     statusRefreshMs: 60_000,
     dmMode: 'open',
+    dmStyle: 'topic',
+    dmMainTools: [...DEFAULT_DM_MAIN_TOOLS],
     requireMention: true,
     threadFallback: 'degrade',
     loggerLevel: 'info',
@@ -63,7 +67,7 @@ function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
     // Tests exercise routing/hitl behavior; access control has its own tests.
     accessMode: 'open',
     codeWriteTools: [],
-    readFence: { enabled: true, readableRoots: [], tools: { read: ['file_path'] } },
+    readFence: { enabled: true, readableRoots: [], tools: { read: ['file_path'] }, pathArguments: ['path', 'file_path'], uncheckedTools: [] },
     authRequestTtlDays: 7,
     // Onboarding is opt-in per test: it adds a card that would shift send counts.
     welcomeOnboarding: false,
@@ -2940,6 +2944,23 @@ describe('FeishuService', () => {
     await service.shutdown()
   })
 
+  it('never garbage-collects a projects-mode main Session route', async () => {
+    const ctxState = makeHostContext()
+    await seedRoute(ctxState.domain.raw, 'chat:p2p:oc_dm:u_alice', Date.now() - 40 * DAY_MS, {
+      kind: 'chat', chatType: 'p2p', chatId: 'oc_dm', senderUserId: 'u_alice', dmRole: 'main', currentDir: '/tmp/ws/main',
+    })
+    await seedRoute(ctxState.domain.raw, 'omt_stale', Date.now() - 40 * DAY_MS)
+    const channel = makeChannel()
+    const service = new FeishuService(ctxState.ctx, makeConfig({ routeTtlMs: 30 * DAY_MS }), () => channel)
+    await service.start()
+
+    await waitUntil(() => {
+      const entries = [...(ctxState.domain.raw.table('routes').entries() as IterableIterator<[string, unknown]>)]
+      expect(entries.map(([key]) => key)).toEqual(['chat:p2p:oc_dm:u_alice'])
+    })
+    await service.shutdown()
+  })
+
   it('drops stale in-flight snapshots during GC without repairing them', async () => {
     const ctxState = makeHostContext()
     await ctxState.domain.raw.table('inflight').put('om_stale_card', {
@@ -5515,5 +5536,167 @@ describe('Feishu principals through session/prompt', () => {
   it('fails loud at start when the host lacks a Web service the submission needs', async () => {
     await expect(setup({}, {}, undefined, {}, undefined, undefined, { typertGateway: undefined }))
       .rejects.toThrow(/typertGateway.*web-app/s)
+  })
+})
+
+describe('private-chat projects mode', () => {
+  /** The route table as a key → record map. */
+  const routesOf = (h: SetupResult): Map<string, RouteRecord> =>
+    new Map(h.ctxState.domain.raw.table('routes').entries() as IterableIterator<[string, RouteRecord]>)
+  const mainKey = chatRouteKey('p2p', 'oc_dm', 'u_alice')
+  /** Send options of one recorded send (negative index counts from the end). */
+  const sentOptions = (h: SetupResult, index: number): unknown =>
+    (h.channel.sent.at(index) as { options?: unknown } | undefined)?.options
+  const dm = (content: string, partial: Partial<NormalizedMessage> = {}): NormalizedMessage =>
+    makeMessage({ chatType: 'p2p', chatId: 'oc_dm', senderId: 'u_alice', mentionedBot: false, content, ...partial })
+
+  it('keeps one main Session in the chat timeline, listed under the person workspace and working in main/', async () => {
+    const h = await setup({ dmStyle: 'project' })
+    const first = dm('今天先聊聊计划')
+    await h.onMessage(first)
+    await waitForEstablishedSession(h)
+
+    const root = path.join(h.config.baseDir, 'p2p', 'u_alice')
+    const created = h.ctxState.agents.created[0]!
+    const sessionId = created.options.sessionId
+    expect(sentOptions(h, 0)).toEqual({ replyTo: first.messageId })
+    expect(created.options.meta?.cwd).toBe(root)
+    expect(h.ctxState.workingDirectory.dirs.get(sessionId)).toBe(path.join(root, 'main'))
+    for (const dir of ['main', 'topics', 'shared']) expect(existsSync(path.join(root, dir))).toBe(true)
+    expect(h.ctxState.workspaces.workspaces.get(root)).toMatchObject({ title: 'u_alice · 私聊', sessionIds: [sessionId] })
+    expect(routesOf(h).get(mainKey)).toMatchObject({
+      kind: 'chat', sessionId, workspacePath: root, dmRole: 'main', currentDir: path.join(root, 'main'),
+    })
+    // The main chat has no topic history to bootstrap.
+    const firstPrompt = mock(created.handle.agent.followup).mock.calls[0]?.[0] as { content: Array<{ text: string }> }
+    expect(firstPrompt.content.map(block => block.text).join('\n')).not.toContain('<feishu_history>')
+
+    await resetFollowupAfterEstablishment(created.handle.agent)
+    const second = dm('继续')
+    await h.onMessage(second)
+    await waitUntil(() => expect(mock(created.handle.agent.followup)).toHaveBeenCalledTimes(1))
+    expect(h.ctxState.agents.created).toHaveLength(1)
+    expect(sentOptions(h, -1)).toEqual({ replyTo: second.messageId })
+    await h.service.shutdown()
+  })
+
+  it('opens a topic Session in topics/<topic>/ for a reply in a topic, under the same workspace', async () => {
+    const h = await setup({ dmStyle: 'project' })
+    await h.onMessage(dm('主会话'))
+    await waitForEstablishedSession(h)
+    const reply = dm('展开讲讲', { threadId: 'omt_deep' })
+    await h.onMessage(reply)
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
+    const topic = h.ctxState.agents.created[1]!
+    await waitUntil(() => expect(mock(topic.handle.agent.followup)).toHaveBeenCalled())
+
+    const root = path.join(h.config.baseDir, 'p2p', 'u_alice')
+    const topicDir = path.join(root, 'topics', 'omt_deep')
+    expect(topic.options.meta?.cwd).toBe(root)
+    expect(h.ctxState.workingDirectory.dirs.get(topic.options.sessionId)).toBe(topicDir)
+    expect(sentOptions(h, -1)).toMatchObject({ replyTo: reply.messageId, replyInThread: true })
+    expect(routesOf(h).get('omt_deep')).toMatchObject({ kind: 'thread', dmRole: 'topic', currentDir: topicDir, workspacePath: root })
+    expect(h.ctxState.workspaces.workspaces.get(root)?.sessionIds)
+      .toEqual([topic.options.sessionId, h.ctxState.agents.created[0]!.options.sessionId])
+
+    // A later message in the topic continues the topic Session.
+    await resetFollowupAfterEstablishment(topic.handle.agent)
+    await h.onMessage(dm('再补充一点', { threadId: 'omt_deep' }))
+    await waitUntil(() => expect(mock(topic.handle.agent.followup)).toHaveBeenCalledTimes(1))
+    expect(h.ctxState.agents.created).toHaveLength(2)
+    await h.service.shutdown()
+  })
+
+  it('follows the per-user mode an administrator sets, and a switch back leaves the main Session alone', async () => {
+    const h = await setup({ dmStyle: 'topic' })
+    await h.service.accessAdmin.addUser('u_alice')
+    expect(await h.service.accessAdmin.setDmStyle('u_alice', 'project')).toMatchObject({ ok: true })
+    await h.onMessage(dm('你好'))
+    await waitForEstablishedSession(h)
+    expect(routesOf(h).get(mainKey)?.dmRole).toBe('main')
+
+    expect(await h.service.accessAdmin.setDmStyle('u_alice', undefined)).toMatchObject({ ok: true })
+    await h.onMessage(dm('新问题'))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
+    await waitUntil(() => expect(mock(h.ctxState.agents.created[1]!.handle.agent.followup)).toHaveBeenCalled())
+    const topicRoute = [...routesOf(h).values()].find(route => route.sessionId === h.ctxState.agents.created[1]!.options.sessionId)
+    expect(topicRoute).toMatchObject({ kind: 'thread' })
+    expect(topicRoute?.dmRole).toBeUndefined()
+    expect(routesOf(h).get(mainKey)?.sessionId).toBe(h.ctxState.agents.created[0]!.options.sessionId)
+    expect(mock(h.ctxState.agents.created[0]!.handle.agent.followup)).toHaveBeenCalledTimes(1)
+    await h.service.shutdown()
+  })
+
+  it('mounts dmMainPreset for the main Session and agentPreset for topics', async () => {
+    const h = await setup({ dmStyle: 'project', agentPreset: 'standard', dmMainPreset: 'chat' }, {}, { defaultId: 'standard' })
+    await h.onMessage(dm('主会话'))
+    await waitForEstablishedSession(h)
+    await h.onMessage(dm('话题', { threadId: 'omt_p' }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
+    expect(h.ctxState.agents.created.map(created => created.options.meta?.agentPreset)).toEqual(['chat', 'standard'])
+    await h.service.shutdown()
+  })
+
+  it('denies tools outside dmMainTools for the main Session only, and fences topics to their own directory', async () => {
+    const h = await setup({ dmStyle: 'project' })
+    await h.onMessage(dm('主会话'))
+    await waitForEstablishedSession(h)
+    await h.onMessage(dm('话题', { threadId: 'omt_f' }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
+    const [main, topic] = h.ctxState.agents.created.map(created => created.handle.agent)
+    const root = path.join(h.config.baseDir, 'p2p', 'u_alice')
+    const listener = h.ctxState.preExecuteListeners.at(-1)!
+    const next = vi.fn(async () => ({ kind: 'allow' as const }))
+    expect(await listener({ name: 'bash', arguments: { command: 'ls' }, agent: main }, next))
+      .toMatchObject({ kind: 'deny', reason: expect.stringContaining('私聊主会话不能调用 bash') })
+    expect(await listener({ name: 'read', arguments: { file_path: path.join(root, 'shared', 'a.md') }, agent: main }, next)).toEqual({ kind: 'allow' })
+    expect(await listener({ name: 'bash', arguments: { command: 'ls' }, agent: topic }, next)).toEqual({ kind: 'allow' })
+    expect(await listener({ name: 'read', arguments: { file_path: path.join(root, 'main', 'a.md') }, agent: topic }, next))
+      .toMatchObject({ kind: 'deny', reason: expect.stringContaining('这个会话只能访问自己的目录') })
+    await h.service.shutdown()
+  })
+
+  it('tells each projects-mode Session where it works and what it may read', async () => {
+    const h = await setup({ dmStyle: 'project' })
+    await h.onMessage(dm('主会话'))
+    await waitForEstablishedSession(h)
+    await h.onMessage(dm('话题', { threadId: 'omt_g' }))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
+    const root = path.join(h.config.baseDir, 'p2p', 'u_alice')
+    const textOf = (index: number): string | undefined => {
+      const section = promptSectionsOf(h.ctxState.agents.created[index]!.handle.agent.ctx).find(entry => entry.name === FEISHU_PROJECT_SECTION)
+      return section === undefined ? undefined : typeof section.text === 'function' ? section.text() : section.text
+    }
+    await waitUntil(() => expect(textOf(1)).toBeDefined())
+    expect(textOf(0)).toContain('main conversation')
+    expect(textOf(0)).toContain(path.join(root, 'main'))
+    expect(textOf(0)).toContain('回复话题')
+    expect(textOf(1)).toContain(path.join(root, 'topics', 'omt_g'))
+    expect(textOf(1)).toContain(path.join(root, 'shared'))
+    await h.service.shutdown()
+  })
+
+  it('renews the main Session in place and moves the new Session back to main/', async () => {
+    const h = await setup({ dmStyle: 'project' })
+    await h.onMessage(dm('主会话'))
+    await waitForEstablishedSession(h)
+    await h.onMessage(dm('/renew'))
+    await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
+    const renewed = h.ctxState.agents.created[1]!
+    await waitForRenewedRoute(h, mainKey, renewed.options.sessionId)
+    const root = path.join(h.config.baseDir, 'p2p', 'u_alice')
+    expect(renewed.options.meta?.cwd).toBe(root)
+    expect(h.ctxState.workingDirectory.dirs.get(renewed.options.sessionId)).toBe(path.join(root, 'main'))
+    expect(routesOf(h).get(mainKey)).toMatchObject({ dmRole: 'main', currentDir: path.join(root, 'main') })
+    await h.service.shutdown()
+  })
+
+  it('answers command cards in the main chat timeline instead of opening a topic', async () => {
+    const h = await setup({ dmStyle: 'project' })
+    const help = dm('/help')
+    await h.onMessage(help)
+    await waitUntil(() => expect(h.channel.sent.length).toBeGreaterThan(0))
+    expect(sentOptions(h, -1)).toEqual({ replyTo: help.messageId })
+    await h.service.shutdown()
   })
 })

@@ -85,6 +85,18 @@ export const DEFAULT_TOPIC_MESSAGES_TIMEOUT_MS = 20_000
  */
 export const DEFAULT_PROMPT_CONTEXT_TIMEOUT_MS = 3_000
 
+/**
+ * Default tool allowlist of a projects-mode main Session: reading, search,
+ * web, questions, skills, and the channel's read-only Feishu tools.
+ */
+export const DEFAULT_DM_MAIN_TOOLS = [
+  'read', 'read_image', 'grep', 'glob', 'lsp',
+  'web_search', 'web_fetch',
+  'ask_user_question', 'todo_write', 'skill',
+  'feishu_topic_messages', 'feishu_attachment_fetch', 'feishu_send_file', 'propose_actions',
+  'feishu_wiki_list', 'feishu_wiki_read', 'feishu_wiki_sheet_read', 'feishu_wiki_base_read',
+] as const
+
 /** A credential reference: `FEISHU_APP_ID`-style name resolved through ctx.credentials. */
 const credentialRefSchema = z.string().regex(
   CREDENTIAL_REF_PATTERN,
@@ -133,6 +145,30 @@ export const configSchema = z.object({
   statusRefreshMs: z.number().int().min(1_000).max(60_000).default(5_000),
   /** Accept p2p (private) chats. */
   dmMode: z.enum(['open', 'disabled']).default('open'),
+  /**
+   * Default private-chat mode; an administrator may set another one per user
+   * in the user table. `topic`: every main-chat message opens a new topic with
+   * its own Session and workspace. `project`: the main chat is one ongoing
+   * Session per person, a reply-in-topic opens a topic Session, and all of
+   * the person's Sessions share one workspace (`<baseDir>/p2p/<user_id>/`)
+   * with `main/`, `topics/<topic>/` and `shared/` below it. Switching only
+   * affects later messages; existing topics keep their mode.
+   */
+  dmStyle: z.enum(['topic', 'project']).default('topic'),
+  /**
+   * Agent preset id of the projects-mode main Session (optional →
+   * `agentPreset`). The `dmMainTools` allowlist is enforced whichever preset
+   * is mounted.
+   */
+  dmMainPreset: z.string().trim().min(1).optional(),
+  /**
+   * Tools the projects-mode main Session may call; every other call is denied
+   * before it runs. The main Session talks, reads and hands work to topics, so
+   * the default allows reading, search, web, questions, skills and the
+   * channel's read-only Feishu tools, and no shell, file writes or code
+   * changes.
+   */
+  dmMainTools: z.array(z.string().trim().min(1)).max(100).default([...DEFAULT_DM_MAIN_TOOLS]),
   /**
    * In normal (non-topic) groups, require an @-mention of the bot to start a
    * session. Messages inside a topic the bot already owns never require a
@@ -431,8 +467,10 @@ export const configSchema = z.object({
   /**
    * Read fence for in-process file tools in Feishu Sessions (and the
    * subagents they spawn). A listed tool's path arguments must resolve, after
-   * symlinks, inside the route's topic directory or one of `readableRoots`; otherwise the call is denied before it runs. Relative
-   * paths resolve against the Session's effective working directory. Shell,
+   * symlinks, inside the route's topic directory (for a private-chat
+   * projects-mode Session: its own directory and the person's `shared/`) or
+   * one of `readableRoots`; otherwise the call is denied before it runs.
+   * Relative paths resolve against the Session's effective working directory. Shell,
    * terminal, and code-execution tools spawn processes and are not covered
    * here: confine them with the sandbox runner described in the README.
    */
@@ -453,6 +491,15 @@ export const configSchema = z.object({
       str_replace_editor: ['path'],
       lsp: ['file_path'],
     }),
+    /**
+     * Argument names treated as paths in a projects-mode Session's calls of
+     * tools missing from `tools`: such a call is checked like a listed tool
+     * (string or string-array values), so a tool added later cannot read
+     * outside the Session's directories unchecked.
+     */
+    pathArguments: z.array(z.string().trim().min(1)).default(['path', 'file_path', 'filePath', 'paths', 'dir', 'directory']),
+    /** Tools exempt from the `pathArguments` check (their path arguments are not file paths). */
+    uncheckedTools: z.array(z.string().trim().min(1)).default([]),
   }).prefault({}),
   /**
    * Lifetime of one pending authorization request and of the DM card that asks

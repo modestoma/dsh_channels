@@ -151,11 +151,14 @@ export type WorkDirResolution =
 export interface WorkDirRoute {
   /** The topic directory (the Session header cwd). */
   readonly workspacePath: string
+  /** A projects-mode Session's own directory below `workspacePath`. */
+  readonly currentDir?: string
 }
 
 /**
  * Validate the Session header cwd against the plugin's durable route and
- * return the Session's working directory (the topic directory).
+ * return the Session's working directory (the topic directory, or a
+ * projects-mode Session's own directory).
  */
 export function resolveWorkDir(
   headerCwd: string | undefined,
@@ -179,7 +182,7 @@ export function resolveWorkDir(
       text: 'Session header 与飞书路由记录的工作目录不一致；为避免返回错误目录，已拒绝显示。',
     }
   }
-  return { kind: 'success', path: route.workspacePath }
+  return { kind: 'success', path: route.currentDir ?? route.workspacePath }
 }
 
 /** Render one verified absolute working directory. */

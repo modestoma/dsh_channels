@@ -105,7 +105,7 @@ export function deleteOverlayKey(patch: OverlayPatch, key: EditableKey): void {
 }
 
 /** Fields whose empty string means "clear the override" (optional text config). */
-const OPTIONAL_TEXT_KEYS = new Set<EditableKey>(['provider', 'model', 'reasoningEffort', 'agentPreset'])
+const OPTIONAL_TEXT_KEYS = new Set<EditableKey>(['provider', 'model', 'reasoningEffort', 'agentPreset', 'dmMainPreset'])
 
 /**
  * Validate only the keys actually present in the input. Validating through

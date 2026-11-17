@@ -167,6 +167,22 @@ export class AccessStore {
     })
   }
 
+  /**
+   * Set or clear the private-chat mode of an existing user.
+   * @param userId - Feishu user_id.
+   * @param dmStyle - the mode, or undefined to follow the channel default.
+   * @returns the updated record, or undefined when the user is not in the table.
+   */
+  async setDmStyle(userId: string, dmStyle: AccessUserRecord['dmStyle']): Promise<AccessUserRecord | undefined> {
+    return await this.serializeUserWrite(async () => {
+      const current = this.users.get(userId)
+      if (current === undefined) return undefined
+      if (current.dmStyle === dmStyle) return current
+      const { dmStyle: _previous, ...rest } = current
+      return await this.writeUser(dmStyle === undefined ? rest : { ...rest, dmStyle })
+    })
+  }
+
   async removeUser(userId: string): Promise<boolean> {
     return await this.serializeUserWrite(async () => {
       if (!this.users.has(userId)) return false
