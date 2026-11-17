@@ -96,6 +96,8 @@ function messageOf(error: unknown): string {
 }
 
 export class DmTopicOpener {
+  /** Acceptances still sending their cards or writing the record (drained on shutdown before `running`). */
+  private readonly accepting = new Set<Promise<DmTopicOpenResult>>()
   /** Background topic starts (drained on shutdown). */
   private readonly running = new Set<Promise<void>>()
   /** Person → topics accepted whose first turn is not queued yet (counted against the limit). */
@@ -115,6 +117,17 @@ export class DmTopicOpener {
    * @returns the topic id, or why nothing was opened.
    */
   async open(main: RouteRecord, title: string, brief: string): Promise<DmTopicOpenResult> {
+    const result = this.accept(main, title, brief)
+    this.accepting.add(result)
+    try {
+      return await result
+    } finally {
+      this.accepting.delete(result)
+    }
+  }
+
+  /** Accept one topic: post its cards, record it, and hand its start to the background. */
+  private async accept(main: RouteRecord, title: string, brief: string): Promise<DmTopicOpenResult> {
     const userId = main.senderUserId
     if (main.dmRole !== 'main' || userId === undefined) {
       return { ok: false, code: 'not-main', message: '只有私聊主会话可以开话题' }
@@ -209,9 +222,11 @@ export class DmTopicOpener {
       return { ok: false, code: 'not-connected', message: '飞书渠道尚未连接，请稍后重试' }
     }
     return await this.deps.queue.run(route.key, async (): Promise<DmTopicSendResult> => {
+      // The same expiry as a reply in the topic: a topic past its TTL is retired, never resumed.
+      const expired = await this.deps.routes.expireThread(topicId)
       const current = this.deps.routes.get(topicId)
-      if (current === undefined || !this.deps.started()) {
-        return { ok: false, code: 'topic-closed', message: `话题「${record.title}」已不可用` }
+      if (expired !== undefined || current === undefined || !this.deps.started()) {
+        return { ok: false, code: 'topic-closed', message: `话题「${record.title}」${expired === undefined ? '已不可用' : '已过期，不能再发消息；需要的话开一个新话题'}` }
       }
       try {
         const live = await this.deps.sessions.ensureLive(current)
@@ -264,8 +279,13 @@ export class DmTopicOpener {
     })
   }
 
-  /** Wait for every background topic start (shutdown, after `started` turned false). */
+  /**
+   * Wait for every acceptance in flight, then every background topic start
+   * (shutdown, after `started` turned false). Each acceptance adds its start
+   * to `running` before it settles.
+   */
   async drain(): Promise<void> {
+    await Promise.allSettled([...this.accepting])
     await Promise.allSettled([...this.running])
   }
 

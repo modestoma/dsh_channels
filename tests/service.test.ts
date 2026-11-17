@@ -5926,6 +5926,50 @@ describe('private-chat projects mode', () => {
       await h.service.shutdown()
     })
 
+    it('refuses to forward into a topic past routeTtlMs and retires it instead of resuming it', async () => {
+      const { h, tools } = await setupTools({ routeTtlMs: 86_400_000 })
+      await h.onMessage(dm('主会话'))
+      await waitForEstablishedSession(h)
+      const opened = await tools.definitions.get('feishu_topic_open')!.execute({ title: 'A', brief: 'a' }, exec) as { topic_id: string }
+      await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
+      const topic = h.ctxState.agents.created[1]!.handle.agent
+      await waitUntil(() => expect(mock(topic.followup)).toHaveBeenCalledTimes(1))
+      settleTurn(h, topic, 1, '第一轮')
+      vi.useFakeTimers({ toFake: ['Date'] })
+      try {
+        vi.setSystemTime(Date.now() + 2 * 86_400_000)
+        expect(await tools.definitions.get('feishu_topic_send')!.execute({ topic_id: opened.topic_id, message: 'x' }, exec))
+          .toMatchObject({ ok: false, code: 'topic-closed', reason: expect.stringContaining('已过期') })
+      } finally {
+        vi.useRealTimers()
+      }
+      expect(routesOf(h).has(opened.topic_id)).toBe(false)
+      expect(h.ctxState.domain.raw.table('expired_routes').get(opened.topic_id)).toBeDefined()
+      expect(mock(topic.followup)).toHaveBeenCalledTimes(1)
+      await h.service.shutdown()
+    })
+
+    it('waits on shutdown for a topic still sending its root card', async () => {
+      const { h, tools } = await setupTools()
+      await h.onMessage(dm('主会话'))
+      await waitForEstablishedSession(h)
+      const send = h.channel.send.bind(h.channel)
+      let release!: () => void
+      const gate = new Promise<void>(resolve => { release = resolve })
+      vi.spyOn(h.channel, 'send').mockImplementationOnce(async (...args: Parameters<typeof send>) => {
+        await gate
+        return await send(...args)
+      })
+      let settled = false
+      const opening = tools.definitions.get('feishu_topic_open')!.execute({ title: 'A', brief: 'a' }, exec)
+        .finally(() => { settled = true })
+      await waitUntil(() => expect(h.channel.send).toHaveBeenCalled())
+      setTimeout(release, 20)
+      await h.service.shutdown()
+      expect(settled).toBe(true)
+      await opening
+    })
+
     it('records a topic the person opens and reports its summaries too', async () => {
       const { h } = await setupTools()
       await h.onMessage(dm('主会话'))
