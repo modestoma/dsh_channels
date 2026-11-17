@@ -26,6 +26,7 @@ import type {
   EditableValues,
   FieldGroup,
   FieldIssueWire,
+  MainToolCatalogWire,
   PanelWire,
 } from '../../settings/contract.ts'
 import { bytesReading, numberDraftValue, numberInputStep, numberInputValue } from '../number-field.ts'
@@ -38,6 +39,8 @@ import {
   withListEntry,
   withoutListEntry,
 } from '../string-list.ts'
+import { toolCatalogNote, toolNames, unknownTools, withTool } from '../tool-checklist.ts'
+import { formatTime } from './records-format.ts'
 
 /** Initial panel load: one request, retried from the error card. */
 export type LoadState =
@@ -395,6 +398,82 @@ function StringListInput(props: {
   )
 }
 
+/**
+ * `dmMainTools` with a tool catalog: one checkbox per tool the main Session
+ * sees, grouped by name prefix; always-allowed tools shown ticked and
+ * locked; configured names the catalog lacks listed apart with a remove
+ * button. The draft stays the field's string list.
+ */
+function ToolChecklist(props: {
+  field: EditableFieldWire
+  catalog: MainToolCatalogWire
+  value: ConfigValue | undefined
+  issues: readonly FieldIssueWire[]
+  disabled: boolean
+  onChange: (key: EditableKey, value: ConfigValue) => void
+}): JSX.Element {
+  const { field, catalog, value, issues, disabled, onChange } = props
+  const checked = new Set(toolNames(value))
+  const unknown = unknownTools(value, catalog)
+  const fieldIssue = issues.find(entry => entry.index === undefined)
+  return (
+    <div className="dsh-channels-cfg__tools">
+      <span className="dsh-channels-cfg__toolsNote">{toolCatalogNote(catalog, formatTime)}</span>
+      {unknown.length === 0
+        ? null
+        : (
+            <div className="dsh-channels-cfg__toolGroup">
+              <span className="dsh-channels-cfg__toolGroupLabel">{PANEL_COPY.toolsUnknown}</span>
+              <span className="dsh-channels-cfg__toolsNote">{PANEL_COPY.toolsUnknownHint}</span>
+              {unknown.map(name => (
+                <div className="dsh-channels-cfg__toolRow" key={name}>
+                  <span className="dsh-channels-cfg__toolName">{name}</span>
+                  <span className="dsh-channels-cfg__pill dsh-channels-cfg__pill--warn">{PANEL_COPY.toolsUnknown}</span>
+                  <button
+                    type="button"
+                    className="dsh-channels-cfg__btn dsh-channels-cfg__btn--remove"
+                    aria-label={`${PANEL_COPY.listRemove} ${name}`}
+                    disabled={disabled}
+                    onClick={() => onChange(field.key, withTool(value, name, false))}
+                  >
+                    {PANEL_COPY.listRemove}
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+      {catalog.groups.map(group => (
+        <div className="dsh-channels-cfg__toolGroup" key={group.label}>
+          <span className="dsh-channels-cfg__toolGroupLabel">{group.label}</span>
+          {group.tools.map(tool => (
+            <label className="dsh-channels-cfg__toolRow" key={tool.name}>
+              <input
+                type="checkbox"
+                checked={checked.has(tool.name)}
+                disabled={disabled}
+                onChange={event => onChange(field.key, withTool(value, tool.name, event.target.checked))}
+              />
+              <span className="dsh-channels-cfg__toolName">{tool.name}</span>
+              <span className="dsh-channels-cfg__toolSummary" title={tool.summary}>{tool.summary}</span>
+            </label>
+          ))}
+        </div>
+      ))}
+      <div className="dsh-channels-cfg__toolGroup">
+        <span className="dsh-channels-cfg__toolGroupLabel">{PANEL_COPY.toolsAlways}</span>
+        {catalog.alwaysAllowed.map(entry => (
+          <label className="dsh-channels-cfg__toolRow" key={entry.name}>
+            <input type="checkbox" checked disabled readOnly />
+            <span className="dsh-channels-cfg__toolName">{entry.name}</span>
+            <span className="dsh-channels-cfg__toolSummary">{entry.reason}</span>
+          </label>
+        ))}
+      </div>
+      {fieldIssue === undefined ? null : <span className="dsh-channels-cfg__fieldError">{fieldIssue.message}</span>}
+    </div>
+  )
+}
+
 /** Number input with its unit (and a MiB reading for byte counts). */
 function NumberInput(props: {
   field: EditableFieldWire
@@ -491,7 +570,9 @@ function FieldControl(props: {
             />
           )
     case 'string-list':
-      return <StringListInput field={field} value={value} issues={issues} disabled={disabled} onChange={onChange} />
+      return field.toolCatalog === undefined
+        ? <StringListInput field={field} value={value} issues={issues} disabled={disabled} onChange={onChange} />
+        : <ToolChecklist field={field} catalog={field.toolCatalog} value={value} issues={issues} disabled={disabled} onChange={onChange} />
     default:
       // Unknown kinds come from a newer Host; render nothing instead of a broken control.
       return null

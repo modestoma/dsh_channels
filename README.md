@@ -236,6 +236,7 @@ src/
 ├── dm/                    # 私聊 projects 模式
 │   ├── layout.ts          #   这个人的目录：main/、topics/<话题>/、shared/，读范围，移到会话自己的目录
 │   ├── tool-gate.ts       #   主会话工具闸门（dmMainTools + 话题工具）
+│   ├── tool-catalog.ts    #   主会话看得到的工具（dm_tool_snapshots），供面板勾选
 │   ├── topic-directory.ts #   话题目录（dm_topics）：状态、最近回复、待送达小结、<dm_topic_updates>
 │   ├── report.ts          #   从话题回复里取「小结」
 │   ├── topic-opener.ts    #   主会话开话题、给话题转消息、根卡片跟随
@@ -285,6 +286,7 @@ src/
 │   │   └── whitelist.tsx  #     用户表（权限开关）与待处理申请列表
 │   ├── number-field.ts    #   数值字段显示单位换算、上下界校验、字节读数
 │   ├── catalog.ts         #   选择器目录折叠：Host 字段 + 实时目录 → 表单字段
+│   ├── tool-checklist.ts  #   「主会话可用工具」勾选列表：勾选、未安装的名字
 │   ├── api.ts             #   同源 /dsh-channels/* 请求封装
 │   └── styles.ts          #   语义 token 样式（注入一次）
 ├── settings/              # Web 设置面板 Host 半区
@@ -483,7 +485,7 @@ FEISHU_APP_SECRET: xxxxxxxx
 
 - 会话创建后经 DSH 的工作目录服务（`workingDirectory`）移到自己的目录；没有这个服务的部署里，会话留在这个人的工作区根目录，读围栏照样只放行自己的目录和 `shared/`。
 - **读写范围**：话题会话只能访问自己的目录和 `shared/`，主会话只能访问 `main/` 和 `shared/`，都看不到其他话题的文件，免得无关文件挤占上下文。约定成果放进 `shared/`。
-- **主会话工具收紧**：主会话只能调用 `dmMainTools` 里的工具（默认是读文件、搜索、联网、提问、技能和只读的飞书工具），其余调用在执行前拒绝，不管挂的是哪个 Agent 预设；命令行、写文件、改代码都在话题里做。主会话可以用 `dmMainPreset` 换一个预设。PTC 模式下模型只能从 `run_code` 程序里调工具：主会话的 `run_code` 放行（程序里调用的每个工具仍按上面的名单逐个检查），但不能带 `sandbox_permissions` 提升沙箱；程序直接做的 Node 文件、网络、进程操作只受会话的 OS 沙箱约束。
+- **主会话工具收紧**：主会话只能调用 `dmMainTools` 里的工具（默认是读文件、搜索、联网、提问、技能和只读的飞书工具），其余调用在执行前拒绝，不管挂的是哪个 Agent 预设；命令行、写文件、改代码都在话题里做。主会话可以用 `dmMainPreset` 换一个预设。设置面板里这一项是勾选列表：工具从运行中的私聊主会话读出（每轮结束后保存一份，重启后还能看到上次的列表），按名字前缀分组并带一行说明；配置里有、主会话里没有的名字标「未安装」；话题工具和 `run_code` 显示为总是可用。还没有主会话运行过时退回手填工具名。PTC 模式下模型只能从 `run_code` 程序里调工具：主会话的 `run_code` 放行（程序里调用的每个工具仍按上面的名单逐个检查），但不能带 `sandbox_permissions` 提升沙箱；程序直接做的 Node 文件、网络、进程操作只受会话的 OS 沙箱约束。
 - 话题会话首轮带上话题里的消息（包括被回复的那条主会话消息）；主会话首轮不带历史。
 - 群聊不受这两种模式影响。话题模式的话题目录 `<baseDir>/p2p/<user_id>/<话题 id>/` 和这些目录在同一层，话题 id 不会和 `main`、`topics`、`shared` 重名。
 

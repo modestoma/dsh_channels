@@ -18,6 +18,8 @@ import { extractTopicReport } from '../src/dm/report.ts'
 import { DmTopicDirectory, topicTitle, topicUpdatesBlock } from '../src/dm/topic-directory.ts'
 import type { DmTopicRecord } from '../src/dm/topic-directory.ts'
 import { forwardedPrompt, handOverPrompt } from '../src/dm/topic-opener.ts'
+import { DmMainToolCatalog, groupTools, toolSummary } from '../src/dm/tool-catalog.ts'
+import type { DmToolSnapshot } from '../src/dm/tool-catalog.ts'
 import type { DomainTable } from '../src/storage/table.ts'
 import type { Agent, HostContext, PreToolExecution } from '../src/host/index.ts'
 
@@ -268,5 +270,82 @@ describe('DmTopicDirectory', () => {
     ].join('\n'))
     expect(handOverPrompt('t', 'b', [])).not.toContain('<dm_topics>')
     expect(forwardedPrompt(' 再加一个用例 ')).toBe('<dm_main_message>\n私聊主会话转来一条消息：\n\n再加一个用例\n</dm_main_message>')
+  })
+})
+
+describe('main-Session tool catalog', () => {
+  it('summarizes a description to its first sentence', () => {
+    expect(toolSummary('Read a file. Supports ranges.\nMore.')).toBe('Read a file.')
+    expect(toolSummary('读取文件。支持范围')).toBe('读取文件。')
+    expect(toolSummary('')).toBe('')
+    expect([...toolSummary('x'.repeat(200))]).toHaveLength(80)
+  })
+
+  it('groups tools sharing a name prefix and leaves the always-allowed ones out', () => {
+    const groups = groupTools([
+      { name: 'web_search', description: 'Search.' },
+      { name: 'read', description: 'Read.' },
+      { name: 'feishu_send_file', description: 'Send.' },
+      { name: 'feishu_wiki_read', description: 'Wiki.' },
+      { name: 'web_fetch', description: 'Fetch.' },
+      { name: 'todo_write', description: 'Todo.' },
+      { name: 'feishu_topic_open', description: 'Open.' },
+      { name: 'run_code', description: 'Run.' },
+      { name: 'read', description: 'Duplicate.' },
+    ])
+    expect(groups.map(group => [group.label, group.tools.map(tool => tool.name)])).toEqual([
+      ['通用', ['read', 'todo_write']],
+      ['feishu_*', ['feishu_send_file', 'feishu_wiki_read']],
+      ['web_*', ['web_fetch', 'web_search']],
+    ])
+  })
+
+  function catalogFixture() {
+    const rows = new Map<string, DmToolSnapshot>()
+    const table: DomainTable<DmToolSnapshot> = {
+      get: key => rows.get(key),
+      put: vi.fn(async (key: string, value: DmToolSnapshot) => { rows.set(key, value) }),
+      update: async () => {},
+      delete: async key => rows.delete(key),
+      entries: () => rows.entries(),
+    }
+    let definitions = [{ name: 'read', description: 'Read a file.' }, { name: 'bash', description: 'Run.' }]
+    const agents: Agent[] = []
+    const scopes: unknown[] = []
+    let now = 5
+    const catalog = new DmMainToolCatalog({
+      tools: () => ({ definitions: scope => { scopes.push(scope); return definitions } }),
+      mainAgents: () => agents,
+      table: () => table,
+      warn: vi.fn(),
+      now: () => now,
+    })
+    return {
+      catalog, table, agents, scopes,
+      setDefinitions: (next: typeof definitions) => { definitions = next },
+      tick: () => { now += 1 },
+    }
+  }
+
+  it('reads a live main Session, saves the list, and serves the saved list once no main Session runs', async () => {
+    const { catalog, table, agents, scopes, setDefinitions, tick } = catalogFixture()
+    expect(await catalog.catalog()).toBeUndefined()
+    const agent = { id: 'a' } as unknown as Agent
+    agents.push(agent)
+    const live = await catalog.catalog()
+    expect(scopes.at(-1)).toBe(agent)
+    expect(live).toMatchObject({ live: true, observedAt: 5, groups: [{ label: '通用', tools: [{ name: 'bash' }, { name: 'read' }] }] })
+    expect(live?.alwaysAllowed.map(entry => entry.name)).toContain('feishu_topic_open')
+
+    // An unchanged list is not written again; a changed one is.
+    tick()
+    await catalog.observe(agent)
+    expect(table.put).toHaveBeenCalledTimes(1)
+    setDefinitions([{ name: 'read', description: 'Read a file.' }])
+    await catalog.observe(agent)
+    expect(table.put).toHaveBeenCalledTimes(2)
+
+    agents.length = 0
+    expect(await catalog.catalog()).toMatchObject({ live: false, observedAt: 6, groups: [{ tools: [{ name: 'read' }] }] })
   })
 })

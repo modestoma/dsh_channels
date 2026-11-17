@@ -22,6 +22,8 @@ import { MainToolGate } from './dm/tool-gate.ts'
 import { DmTopicDirectory, topicTitle, topicUpdatesBlock } from './dm/topic-directory.ts'
 import { DmTopicOpener } from './dm/topic-opener.ts'
 import { DmTopicToolRuntime } from './dm/tools.ts'
+import { DmMainToolCatalog } from './dm/tool-catalog.ts'
+import type { ToolRegistryView } from './dm/tool-catalog.ts'
 import { SessionLineage } from './access/lineage.ts'
 import { AccessController } from './access/controller.ts'
 import { AccessRequests } from './access/requests.ts'
@@ -99,6 +101,7 @@ import { SYSTEM_INSTANCE_LOCK } from './instance-lock.ts'
 import type { InstanceLock, InstanceLockProvider, LockHolderInfo } from './instance-lock.ts'
 import { DSH_CHANNELS_VERSION } from './session-export.ts'
 import type { OverlayPatch, OverlayStore } from './settings/overlay.ts'
+import type { MainToolCatalogWire } from './settings/contract.ts'
 
 /** Periodic route-GC sweep cadence (a long-running instance also accumulates
  *  dead records; TTL semantics make 6 h granularity more than sufficient). */
@@ -205,6 +208,8 @@ export class FeishuService {
   private readonly dmTopics: DmTopicDirectory
   private readonly dmTopicOpener: DmTopicOpener
   private readonly dmTopicTools: DmTopicToolRuntime
+  /** Tools the main Session sees, for the settings panel's checklist. */
+  private readonly dmToolCatalog: DmMainToolCatalog
   /** The `feishuActions` service (non-blocking follow-up action proposals). */
   private readonly feishuActions: FeishuActions
   /** The `feishuBitable` service (domain-agnostic Feishu Base read/write bridge). */
@@ -583,6 +588,17 @@ export class FeishuService {
       busy: sessionId => this.streamer?.hasLiveTurn(sessionId) === true,
       waiting: sessionId => this.approvalAnswerer?.hasPendingFor(sessionId) === true
         || this.questionAnswerer?.hasPendingFor(sessionId) === true,
+      warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
+    })
+    this.dmToolCatalog = new DmMainToolCatalog({
+      tools: () => this.ctx.get?.('tools') as ToolRegistryView | undefined,
+      mainAgents: () => this.routes.records()
+        .filter(record => record.dmRole === 'main')
+        .flatMap(record => {
+          const agent = this.sessions.get(record.sessionId)?.agent
+          return agent === undefined ? [] : [agent]
+        }),
+      table: () => this.domain?.dmToolSnapshots,
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
     })
     this.inbound = new InboundRouter({
@@ -1524,13 +1540,27 @@ export class FeishuService {
   }
 
   /**
-   * Record a settled projects-mode topic turn in the topic directory (its
+   * The tools a projects-mode main Session sees, for the settings panel.
+   * @returns the catalog, or undefined when no main Session was seen yet.
+   */
+  async mainToolCatalog(): Promise<MainToolCatalogWire | undefined> {
+    return await this.dmToolCatalog.catalog()
+  }
+
+  /**
+   * Save the tools a settled main-Session turn saw (settings panel), or record
+   * a settled projects-mode topic turn in the topic directory (its
    * summary then waits for the main Session) and show its outcome on the
    * topic's root card; the card stays running while another turn of the
    * topic is in flight or queued. Best-effort: a failure is logged.
    */
   private async recordDmTopicTurn(sessionId: string, settled: SettledTurn): Promise<void> {
     const route = this.routes.findBySession(sessionId)
+    if (route?.dmRole === 'main') {
+      const agent = this.sessions.get(sessionId)?.agent
+      if (agent !== undefined) await this.dmToolCatalog.observe(agent)
+      return
+    }
     if (route?.dmRole !== 'topic') return
     const more = this.streamer?.hasLiveTurn(sessionId) === true
     try {

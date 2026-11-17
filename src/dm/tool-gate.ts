@@ -19,6 +19,7 @@ import type { RouteRecord } from '../domain.ts'
 import type { PreToolDecision, PreToolExecution } from '../host/index.ts'
 import type { SessionLineage } from '../access/lineage.ts'
 import { DM_TOPIC_TOOL_NAMES } from './tools.ts'
+import { RUN_CODE_TOOL } from './tool-catalog.ts'
 
 export interface MainToolGateDeps {
   /** Live configuration (`dmMainTools`). */
@@ -29,8 +30,6 @@ export interface MainToolGateDeps {
   lineage: SessionLineage
 }
 
-/** PTC mode's program tool (`dsh-tool-executor-ptc`). */
-const RUN_CODE = 'run_code'
 
 /** Whether a `run_code` call asks to run its program under a wider sandbox mode. */
 function asksEscalation(args: unknown): boolean {
@@ -54,7 +53,7 @@ export class MainToolGate {
     if (root === undefined) return undefined
     if (this.deps.routeOf(root)?.dmRole !== 'main') return undefined
     if (this.deps.config().dmMainTools.includes(exec.name) || DM_TOPIC_TOOL_NAMES.includes(exec.name)) return undefined
-    if (exec.name === RUN_CODE) {
+    if (exec.name === RUN_CODE_TOOL) {
       if (!asksEscalation(exec.arguments)) return undefined
       return {
         kind: 'deny',

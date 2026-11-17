@@ -53,5 +53,6 @@ export function settingsTarget(service: FeishuService): SettingsTarget {
     workspaceFiles: (workspace, path) => records.files(workspace, path),
     workspaceFilePreview: (workspace, path) => records.preview(workspace, path),
     workspaceFileDownload: (workspace, path) => records.download(workspace, path),
+    mainToolCatalog: () => service.mainToolCatalog(),
   }
 }
