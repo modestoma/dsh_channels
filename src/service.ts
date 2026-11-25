@@ -20,6 +20,7 @@ import { ReadFence } from './access/read-fence.ts'
 import { readRootsOf } from './dm/layout.ts'
 import { MainToolGate } from './dm/tool-gate.ts'
 import { DmTopicDirectory, topicTitle, topicUpdatesBlock } from './dm/topic-directory.ts'
+import { DmTopicWake } from './dm/topic-wake.ts'
 import { DmTopicOpener } from './dm/topic-opener.ts'
 import { DmTopicToolRuntime } from './dm/tools.ts'
 import { DmMainToolCatalog } from './dm/tool-catalog.ts'
@@ -209,6 +210,7 @@ export class FeishuService {
   /** Private-chat projects-mode topics: directory, opening and forwarding, main-Session tools. */
   private readonly dmTopics: DmTopicDirectory
   private readonly dmTopicOpener: DmTopicOpener
+  private readonly dmTopicWake: DmTopicWake
   private readonly dmTopicTools: DmTopicToolRuntime
   /** Tools the main Session sees, for the settings panel's checklist. */
   private readonly dmToolCatalog: DmMainToolCatalog
@@ -653,6 +655,8 @@ export class FeishuService {
         },
         turnStarted: key => this.dmTopicOpener.showTurnStatus(key, { kind: 'running' }),
         updates: main => {
+          // Every main-chat message of the person asks for updates: their wake count starts over.
+          this.dmTopicWake.personSpoke(main.senderUserId ?? '')
           const pending = this.dmTopics.pendingUpdates(main.senderUserId ?? '')
           const block = topicUpdatesBlock(pending, record => this.dmTopics.statusOf(record))
           return block === ''
@@ -734,6 +738,21 @@ export class FeishuService {
       location: this.topicLocation,
       directory: this.dmTopics,
       busy: sessionId => this.streamer?.hasLiveTurn(sessionId) === true,
+      onStartFailed: (userId, chatId) => this.dmTopicWake.topicReported(userId, chatId),
+      warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
+    })
+    this.dmTopicWake = new DmTopicWake({
+      config: () => this.config,
+      started: () => this.started,
+      channel: () => this.channel,
+      routes: this.routes,
+      directory: this.dmTopics,
+      sessions: this.sessions,
+      prompts,
+      repair: this.repair,
+      queue: this.routeOperations,
+      busy: sessionId => this.streamer?.hasLiveTurn(sessionId) === true,
+      chatReplies: () => this.config.dmMainReplyStyle === 'chat',
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
     })
     this.dmTopicTools = new DmTopicToolRuntime({
@@ -1445,6 +1464,7 @@ export class FeishuService {
     this.feishuBitable.close()
     await this.topicLauncher.drain()
     await this.dmTopicOpener.drain()
+    await this.dmTopicWake.drain()
     await this.feishuActions.drain()
     await this.feishuBitable.drain()
     await this.commands.drain()
@@ -1566,15 +1586,17 @@ export class FeishuService {
   }
 
   /**
-   * Save the tools a settled main-Session turn saw (settings panel), or record
-   * a settled projects-mode topic turn in the topic directory (its
-   * summary then waits for the main Session) and show its outcome on the
+   * Save the tools a settled main-Session turn saw (settings panel) and run
+   * a topic wake deferred for it, or record a settled projects-mode topic
+   * turn in the topic directory (its summary then waits for the main
+   * Session, which a turn it started wakes) and show its outcome on the
    * topic's root card; the card stays running while another turn of the
    * topic is in flight or queued. Best-effort: a failure is logged.
    */
   private async recordDmTopicTurn(sessionId: string, settled: SettledTurn): Promise<void> {
     const route = this.routes.findBySession(sessionId)
     if (route?.dmRole === 'main') {
+      this.dmTopicWake.mainTurnSettled(route)
       const agent = this.sessions.get(sessionId)?.agent
       if (agent !== undefined) await this.dmToolCatalog.observe(agent)
       return
@@ -1592,7 +1614,8 @@ export class FeishuService {
           openedBy: 'user',
         })
       }
-      await this.dmTopics.recordTurn(route.key, settled.outcome, settled.reply, this.config.dmReportChars)
+      const { byMain } = await this.dmTopics.recordTurn(route.key, settled.outcome, settled.reply, this.config.dmReportChars)
+      if (byMain) this.dmTopicWake.topicReported(route.senderUserId ?? '', route.chatId)
     } catch (error) {
       this.ctx.logger?.warn?.('dsh-channels: recording topic %s turn failed: %s', route.key, String(error))
     }

@@ -127,7 +127,7 @@ export class DmTopicToolRuntime {
           topic_id: result.topicId,
           text: result.replayed
             ? `同名话题「${result.title}」已在进行中（topic_id: ${result.topicId}），没有重复开。`
-            : `已开话题「${result.title}」（topic_id: ${result.topicId}），交接说明作为第一轮在话题里后台运行。用一句话告诉用户你开了这个话题；进展会在用户下次发消息时以 <dm_topic_updates> 送来，不要等待它。`,
+            : `已开话题「${result.title}」（topic_id: ${result.topicId}），交接说明作为第一轮在话题里后台运行。用一句话告诉用户你开了这个话题；进展会以 <dm_topic_updates> 送来（话题这一轮结束后单独送来，或随用户下一条消息），不要等待它。`,
         }
       }, false),
       tool(DM_TOPIC_LIST_TOOL, LIST_DESCRIPTION, LIST_PARAMETERS, (main, raw) => {
@@ -212,7 +212,7 @@ function renderValue(value: unknown): readonly ToolContentBlock[] {
 
 const OPEN_DESCRIPTION = '在私聊里开一个话题，把一件需要完整工具（命令行、写文件、改代码、多步调查）或需要长时间专注讨论的事交给它。'
   + '话题是独立会话，工作目录是自己的子目录；交接说明 brief 是它的第一条消息，所以要写全：背景、目标、已知信息、约束、期望的产出，它看不到这个主会话的对话。'
-  + '工具立即返回 topic_id，话题在后台运行，不要等待它；它的进展会在用户下次在主聊天发消息时以 <dm_topic_updates> 送来。'
+  + '工具立即返回 topic_id，话题在后台运行，不要等待它；它的进展会以 <dm_topic_updates> 送来：话题这一轮结束后单独送来，或随用户在主聊天的下一条消息。'
   + '开完用一句话告诉用户你开了什么话题。同名且仍在进行中的话题不会重复开；主会话同时进行中的话题有上限。'
 
 const OPEN_PARAMETERS: Record<string, unknown> = {

@@ -269,6 +269,11 @@ const SELECT_OPTIONS: Partial<Record<EditableKey, ReadonlyArray<{ value: string;
     { value: 'presented', label: '仅声明的（present）' },
     { value: 'off', label: '关闭' },
   ],
+  dmTopicWake: [
+    { value: 'agent', label: '主会话转告' },
+    { value: 'notice', label: '提示卡片' },
+    { value: 'off', label: '关闭' },
+  ],
   dmMainReplyStyle: [
     { value: 'chat', label: '聊天消息' },
     { value: 'card', label: '状态卡片' },
@@ -374,6 +379,21 @@ const FIELD_META: Record<EditableKey, FieldMeta> = {
     max: 2000,
     step: 50,
     unit: '字',
+  },
+  dmTopicWake: {
+    label: '话题有结果时主会话主动说',
+    group: 'dm',
+    summary: '主会话开的话题或转进去的消息有了结果、或话题没能开始时，主会话不等你发消息就在主聊天里告诉你',
+    help: '「主会话转告」：主会话收到话题小结，自己在主聊天里说一两句；连续这么多次你都没回话时改为提示卡片（见下一项）。「提示卡片」：只在主聊天发一张列出小结的卡片，主会话在你下次发消息时才收到。「关闭」：等你下次发消息。你自己在话题里发的消息不会唤醒主会话。几秒内的多个结果合成一次；主会话正在回复时等它说完。',
+  },
+  dmTopicWakeLimit: {
+    label: '主会话连续主动说的上限',
+    group: 'dm',
+    summary: '你没回话时主会话最多连续主动说这么多次，之后改发提示卡片，你发消息后重新计数',
+    min: 1,
+    max: 50,
+    step: 1,
+    unit: '次',
   },
   threadFallback: { label: '话题被拒时降级为会话级', group: 'trigger', summary: '飞书不允许建话题时改在会话里回复，关闭则直接报错' },
   baseDir: {

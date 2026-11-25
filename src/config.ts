@@ -119,6 +119,9 @@ export const MAX_INLINE_MARKDOWN_CHARS = 200_000
 /** Default `dmMaxRunningTopics`: running topics one main Session may have at once. */
 export const DEFAULT_DM_MAX_RUNNING_TOPICS = 5
 
+/** Default `dmTopicWakeLimit`: main-Session wakes in a row without the person writing. */
+export const DEFAULT_DM_TOPIC_WAKE_LIMIT = 5
+
 /** Default `dmReportChars`: length of a topic's summary for the main Session. */
 export const DEFAULT_DM_REPORT_CHARS = 300
 
@@ -221,6 +224,22 @@ export const configSchema = z.object({
    * and a reply without one is reported as its last this many characters.
    */
   dmReportChars: z.number().int().min(50).max(2_000).default(DEFAULT_DM_REPORT_CHARS),
+  /**
+   * What happens in the projects-mode main chat when a topic turn the main
+   * Session started (its hand-over or a forwarded message) settles, or a
+   * topic it opened cannot start. `agent`: the main Session gets the waiting
+   * summaries as a turn of its own and tells the person, in the main chat,
+   * without waiting for the person's next message. `notice`: a card lists the
+   * summaries and the main Session still receives them on the person's next
+   * message. `off`: nothing until the person's next message. Turns the person
+   * typed in a topic never wake the main Session.
+   */
+  dmTopicWake: z.enum(['agent', 'notice', 'off']).default('agent'),
+  /**
+   * Most `agent` wakes in a row without a message from the person in the main
+   * chat; further wakes show the `notice` card until the person writes again.
+   */
+  dmTopicWakeLimit: z.number().int().min(1).max(50).default(DEFAULT_DM_TOPIC_WAKE_LIMIT),
   /**
    * In normal (non-topic) groups, require an @-mention of the bot to start a
    * session. Messages inside a topic the bot already owns never require a

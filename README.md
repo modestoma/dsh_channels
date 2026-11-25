@@ -244,6 +244,7 @@ src/
 │   ├── tool-catalog.ts    #   主会话看得到的工具（dm_tool_snapshots），供面板勾选
 │   ├── topic-directory.ts #   话题目录（dm_topics）：状态、最近回复、待送达小结、<dm_topic_updates>
 │   ├── report.ts          #   从话题回复里取「小结」
+│   ├── topic-wake.ts      #   主会话发起的话题回合结束后唤醒主会话转告（或发提示卡片）
 │   ├── topic-opener.ts    #   主会话开话题、给话题转消息、根卡片跟随
 │   └── tools.ts           #   feishu_topic_open / list / read / send
 ├── routing/
@@ -355,6 +356,8 @@ npm 发行包已包含构建产物：Host 入口是 `lib/index.js`（profile 直
     dmMainTools: [read, read_image, grep, glob, lsp, web_search, web_fetch, ask_user_question, todo_write, skill, feishu_topic_messages, feishu_attachment_fetch, feishu_send_file, propose_actions, feishu_wiki_list, feishu_wiki_read, feishu_wiki_sheet_read, feishu_wiki_base_read]  # 主会话只能调用这些工具（默认值）
     dmMaxRunningTopics: 5               # projects 模式主会话同时在跑的话题上限（1–50）
     dmReportChars: 300                  # 话题每轮报给主会话的小结长度（50–2000 字）
+    dmTopicWake: agent                  # 主会话发起的话题回合结束时：agent 主会话主动转告 | notice 提示卡片 | off
+    dmTopicWakeLimit: 5                 # 用户没回话时主会话最多连续主动转告的次数（1–50），之后改发提示卡片
     threadFallback: 'degrade'           # 话题被拒时降级为会话级路由
     routeTtlMs: 2592000000              # 话题路由 30 天无活动即过期；后续消息明确拒绝，不新建 Session（0 = 关闭）
     approvalTimeoutMs: 86400000         # HITL 审批决策卡等待时长（默认 24 小时，1 分钟–7 天；超时自动拒绝）
@@ -512,7 +515,8 @@ FEISHU_APP_SECRET: xxxxxxxx
 | `feishu_topic_read` | 读一个话题最近几轮（最多 5 轮）的最终回复，每轮截断到 4000 字 |
 | `feishu_topic_send` | 把一条消息发进已有话题：话题里显示「【主会话】…」，作为话题的下一轮，话题正忙时排在当前回合后面 |
 
-- **小结回写**：话题会话的提示词要求每轮最终回复以「小结 / 做了 / 结果 / 需要你」四行结尾，「结果」写结论本身，不写文件放在哪。每轮结束后插件取出这一块（截到 `dmReportChars` 字，默认 300；没写小结时取回复最后这么多字），记进话题目录（存储表 `dm_topics`）。主会话**不会被唤醒**：用户下次在主聊天发消息时，所有还没送达的小结作为 `<dm_topic_updates>` 块附在这条消息后面，进会话日志。用户自己「回复话题」开的话题也一样回写。
+- **小结回写**：话题会话的提示词要求每轮最终回复以「小结 / 做了 / 结果 / 需要你」四行结尾，「结果」写结论本身，不写文件放在哪。每轮结束后插件取出这一块（截到 `dmReportChars` 字，默认 300；没写小结时取回复最后这么多字），记进话题目录（存储表 `dm_topics`）。用户下次在主聊天发消息时，所有还没送达的小结作为 `<dm_topic_updates>` 块附在这条消息后面，进会话日志。用户自己「回复话题」开的话题也一样回写。
+- **主会话主动转告**（`dmTopicWake`，默认 `agent`）：主会话发起的话题回合（交接说明、`feishu_topic_send` 转进去的消息，记在话题目录的 `mainTurns`）结束，或主会话开的话题没能开始时，插件等 3 秒把这期间的结果合在一起，以这个人的身份给主会话提交一轮：内容是所有待送达小结的 `<dm_topic_updates>` 块加一句说明（不是用户发的、简短告诉用户结果和要他做的事、话题里发过的文件不再发），在主聊天时间线新发一张卡片显示主会话的回复，小结记为已送达。主会话正在回复时不打断，等它这轮结束再看；那时小结已随用户的消息送达就什么也不做。连续 `dmTopicWakeLimit` 次（默认 5）用户都没在主聊天说话后，改发提示卡片，用户发消息后重新计数。`notice`：只在主聊天发一张列出各话题状态和小结的卡片，主会话仍在用户下次发消息时收到；`off`：不主动。用户自己在话题里发的消息结束后不会唤醒主会话（用户就在话题里看着）。待唤醒和计数只在内存里，重启后小结照旧随下一条消息送达。
 - **状态**：「等你处理」= 话题在等审批或提问的回答，或小结的「需要你」不是「无」。主会话开的话题，根卡片跟着每一轮更新（进行中 / 已完成 / 已停止 / 失败 / 未能开始）；还有排队的消息时保持「进行中」。
 - **上限**：同一个人由主会话开、正在跑的话题最多 `dmMaxRunningTopics` 个（默认 5），超出时 `feishu_topic_open` 报错，主会话会告诉用户先等一个话题结束；用户自己开的话题不计入。
 - 话题开不起来（建会话失败等）时，根卡片和话题里的卡片都标成失败，不留路由，小结里记「未能开始：原因」。

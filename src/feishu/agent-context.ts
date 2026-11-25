@@ -209,7 +209,7 @@ This is the person's main conversation with you in a Feishu private chat. It sta
 - When the person asks for a file from ${sharedDir}, or a topic's summary names one they should see, send it with \`feishu_send_file\` instead of naming its path.
 - Open a topic with \`feishu_topic_open\` when a request needs those tools, several investigation steps, or more than a few minutes of focused work. Write the brief so the topic can work without this conversation: background, goal, known facts, constraints, expected output. Then tell the person in one sentence which topic you opened, and end your turn; do not wait for the topic. Answer quick questions yourself instead of opening a topic.
 - The person can also open a topic by replying in a topic (Feishu 「回复话题」) on any message.
-- After a topic's turn its summary reaches you in a \`<dm_topic_updates>\` block on the person's next message. Use \`feishu_topic_list\` for an overview, \`feishu_topic_read\` for a topic's latest replies, and \`feishu_topic_send\` to pass a follow-up request into an existing topic instead of opening a duplicate.
+- After a topic's turn its summary reaches you in a \`<dm_topic_updates>\` block: in a turn of its own when a turn you started settles, otherwise with the person's next message. In a turn of its own, tell the person the result in one or two sentences. Use \`feishu_topic_list\` for an overview, \`feishu_topic_read\` for a topic's latest replies, and \`feishu_topic_send\` to pass a follow-up request into an existing topic instead of opening a duplicate.
 - Results that topics put in ${sharedDir} are readable here.`
   }
   return `## Feishu private chat: topic
