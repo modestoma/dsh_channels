@@ -75,6 +75,8 @@ import { SessionManager } from './session/manager.ts'
 import { CardDelivery } from './feishu/delivery.ts'
 import { AttachmentFetchToolRuntime, TopicMessagesToolRuntime } from './feishu/tools.ts'
 import { SendFileToolRuntime } from './feishu/send-file.ts'
+import type { SendFileTarget } from './feishu/send-file.ts'
+import { DeliverableAutoSend } from './deliverables/auto-send.ts'
 import { WikiConsent } from './feishu/wiki/consent.ts'
 import { WikiToolRuntime } from './feishu/wiki/tools.ts'
 import type { KnownAttachmentMessageInput, KnownAttachmentSource } from './feishu/tools.ts'
@@ -225,6 +227,7 @@ export class FeishuService {
   private readonly attachmentFetchTools: AttachmentFetchToolRuntime
   private readonly topicMessagesTools: TopicMessagesToolRuntime
   private readonly sendFileTools: SendFileToolRuntime
+  private readonly autoSend: DeliverableAutoSend
   private readonly proposeActionsTools: ProposeActionsToolRuntime
   private readonly wikiConsent: WikiConsent
   private readonly wikiTools: WikiToolRuntime
@@ -392,7 +395,10 @@ export class FeishuService {
       config: () => this.config,
       persistRoute: (key, record) => this.routes.put(key, record),
       started: () => this.started,
-      detachStream: sessionId => this.streamer?.detach(sessionId),
+      detachStream: (sessionId) => {
+        this.streamer?.detach(sessionId)
+        this.autoSend.forget(sessionId)
+      },
       mountTools: (agentCtx, sessionId, dmRole) => {
         // The fetch tool is the only way the model reaches attachment bytes,
         // so it is mounted exactly when the deployment accepts attachments.
@@ -478,20 +484,28 @@ export class FeishuService {
       consent: this.wikiConsent,
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
     })
+    const sendTargetOf = (sessionId: string): SendFileTarget | undefined => {
+      const record = this.routes.findBySession(sessionId)
+      if (record === undefined) return undefined
+      const [rootDir, ...otherRoots] = readRootsOf(record)
+      return {
+        replyTo: record.cardMessageId,
+        inThread: record.kind === 'thread',
+        rootDir: rootDir ?? record.workspacePath,
+        otherRoots,
+      }
+    }
     this.sendFileTools = new SendFileToolRuntime({
       config: () => this.config,
       channel: () => (this.started ? this.channel : undefined),
-      targetOfSession: sessionId => {
-        const record = this.routes.findBySession(sessionId)
-        if (record === undefined) return undefined
-        const [rootDir, ...otherRoots] = readRootsOf(record)
-        return {
-          replyTo: record.cardMessageId,
-          inThread: record.kind === 'thread',
-          rootDir: rootDir ?? record.workspacePath,
-          otherRoots,
-        }
-      },
+      targetOfSession: sendTargetOf,
+      onSent: (sessionId, file) => this.autoSend.noteSent(sessionId, file),
+      warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
+    })
+    this.autoSend = new DeliverableAutoSend({
+      config: () => this.config,
+      targetOfSession: sendTargetOf,
+      send: async (sessionId, args, signal) => await this.sendFileTools.send(sessionId, args, signal),
       warn: (message, ...args) => this.ctx.logger?.warn?.(message, ...args),
     })
     this.delivery = new CardDelivery({
@@ -1115,12 +1129,13 @@ export class FeishuService {
       onError: (_key, error) => {
         this.ctx.logger?.warn?.('dsh-channels stream error: %s', String(error))
       },
-      onTurnFinalized: (sessionId, _turn, mainCardMessageId, settled) => {
+      onTurnFinalized: (sessionId, turn, mainCardMessageId, settled) => {
         // The turn settled (final patches fired, reaction swap requested):
         // retire its repair snapshot. Kept deliberately non-awaited — repair
         // state is a safety net, never a dependency of the turn lifecycle.
         void this.repair.clear(mainCardMessageId)
         void this.recordDmTopicTurn(sessionId, settled)
+        void this.autoSend.onTurnFinalized(sessionId, turn, settled)
       },
       onSegmentDelivered: (mainCardMessageId, segmentIndex, messageId, mode) => {
         void this.repair.recordSegment(mainCardMessageId, segmentIndex, messageId, mode)
@@ -1241,6 +1256,7 @@ export class FeishuService {
       this.streamer?.onSessionEvent(session, event)
       this.approvalAnswerer?.onSessionEvent(session.id, event)
       this.proposeActionsTools.onSessionEvent(session, event)
+      this.autoSend.onSessionEvent(session, event)
     }))
     // DSH removed the durable `assistant/chunk` event (format v2 embeds the
     // stream in the settlement); the live deltas arrive here instead.
@@ -1251,6 +1267,7 @@ export class FeishuService {
     this.unlistenHost.push(this.ctx.on('agent/inbox/claimed', ({ agent, message, turn }) => {
       this.codeWriteGate.onClaimed(agent.session.id, message)
       this.proposeActionsTools.onInboxClaimed(agent.session.id, turn)
+      this.autoSend.onInboxClaimed(agent.session.id, turn)
       this.streamer?.onInboxClaimed(agent.session, message, turn)
     }))
     this.unlistenHost.push(this.ctx.on('agent/inbox/discarded', ({ agent, message }) => {

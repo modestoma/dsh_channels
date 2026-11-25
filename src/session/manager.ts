@@ -28,7 +28,7 @@ import type { FeishuConfig } from '../config.ts'
 import { mountChannelCommands } from '../commands.ts'
 import { appendSessionHistory } from '../domain.ts'
 import type { RouteRecord } from '../domain.ts'
-import { mountChannelGuidance, mountProjectGuidance, mountReplyGuidance, projectGuidance } from '../feishu/agent-context.ts'
+import { mountChannelGuidance, mountDeliveryGuidance, mountProjectGuidance, mountReplyGuidance, projectGuidance } from '../feishu/agent-context.ts'
 import { dmSharedDir, enterSessionDir, routeWorkDir } from '../dm/layout.ts'
 import { attachTopicSession, topicWorkspaceAt } from '../workspaces.ts'
 import { installRequestPolicy } from './request-policy.ts'
@@ -200,10 +200,11 @@ export class SessionManager {
   }
 
   /**
-   * Register the reply guidance and the attachment guidance for one Session,
-   * plus the projects-mode guidance for a projects-mode route. The reply
-   * guidance is mounted for every Feishu Session; its text follows
-   * `replyGuidance` on each model request. The attachment guidance is mounted
+   * Register the reply guidance, the delivery guidance and the attachment
+   * guidance for one Session, plus the projects-mode guidance for a
+   * projects-mode route. The reply and delivery guidance are mounted for
+   * every Feishu Session; the reply text follows `replyGuidance` and the
+   * delivery text the `feishuTools` delivery settings on each model request. The attachment guidance is mounted
    * only while `acceptAttachments` is on. Best-effort: a missing system-prompt
    * service (headless) is a no-op and a late registration never blocks the turn.
    * @param agent - the Session's Agent.
@@ -218,6 +219,17 @@ export class SessionManager {
     } catch (error) {
       this.deps.warn(
         'dsh-channels: mounting reply guidance for session %s failed: %s',
+        agent.id, String(error),
+      )
+    }
+    try {
+      await mountDeliveryGuidance(agent.ctx, () => {
+        const tools = this.deps.config().feishuTools
+        return { sendFile: tools.sendFile, autoSendFiles: tools.autoSendFiles, inlineMarkdownChars: tools.inlineMarkdownChars }
+      })
+    } catch (error) {
+      this.deps.warn(
+        'dsh-channels: mounting delivery guidance for session %s failed: %s',
         agent.id, String(error),
       )
     }

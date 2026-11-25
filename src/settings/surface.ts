@@ -12,7 +12,7 @@
 
 import { DSH_CHANNELS_VERSION } from '../session-export.ts'
 import type { FeishuConfig } from '../config.ts'
-import { MAX_APPROVAL_TIMEOUT_MS, MAX_TIMER_DELAY_MS } from '../config.ts'
+import { MAX_APPROVAL_TIMEOUT_MS, MAX_INLINE_MARKDOWN_CHARS, MAX_TIMER_DELAY_MS } from '../config.ts'
 import { FEISHU_USER_ID_PATTERN } from '../domain.ts'
 import { parseWikiRootLink, WIKI_ROOT_LINK_ERRORS } from '../feishu/wiki/links.ts'
 import type { HealthSnapshot } from '../health.ts'
@@ -264,6 +264,11 @@ const SELECT_OPTIONS: Partial<Record<EditableKey, ReadonlyArray<{ value: string;
     { value: 'topic', label: '话题模式' },
     { value: 'project', label: 'projects 模式' },
   ],
+  'feishuTools.autoSendFiles': [
+    { value: 'mentioned', label: '声明的和回复里提到的' },
+    { value: 'presented', label: '仅声明的（present）' },
+    { value: 'off', label: '关闭' },
+  ],
   dmMainReplyStyle: [
     { value: 'chat', label: '聊天消息' },
     { value: 'card', label: '状态卡片' },
@@ -443,7 +448,7 @@ const FIELD_META: Record<EditableKey, FieldMeta> = {
   replyGuidance: {
     label: '回复写法规范',
     group: 'features',
-    summary: '要求模型最终回复先给结果、保持简短，技术细节放进 MR 或文件',
+    summary: '要求模型最终回复先给结果、保持简短，技术细节放进 MR，分析报告的结论写进回复',
     help: '在飞书会话的系统提示词里加一段回复写法说明，只影响最终回复的文字，流式卡片的状态和思考过程不变。修改后从下一次模型请求开始生效。',
   },
   slashCommandPanel: {
@@ -487,6 +492,22 @@ const FIELD_META: Record<EditableKey, FieldMeta> = {
     summary: '把生成的图片或文件发回会话，需 im:resource 权限',
     help: '工具名 feishu_send_file。图片不超过 10 MB，文件不超过 30 MB。对新会话生效。',
   },
+  'feishuTools.autoSendFiles': {
+    label: '自动发送交付文件',
+    group: 'tools',
+    summary: '回合完成后把交付的文件发到对话里，不用再说「用飞书发给我」',
+    help: '「声明的和回复里提到的」：发送用 present 声明的文件，以及最终回复里提到的、在共享目录 shared/ 里或本回合在自己目录新建/修改过的文档类文件；「仅声明的」只发 present 声明的；「关闭」不自动发送。同一个文件没改过不会重复发。需要开着「发送文件」。',
+  },
+  'feishuTools.inlineMarkdownChars': {
+    label: 'Markdown 报告直接显示',
+    group: 'tools',
+    summary: '发送不超过这么多字的 .md 文件时，先把正文以卡片显示在对话里，再附上文件；0 只发文件',
+    help: '长报告按回复分段的规则拆成多张卡片，每张最多 5 张表格。对之后发送的文件生效。',
+    min: 0,
+    max: MAX_INLINE_MARKDOWN_CHARS,
+    step: 1_000,
+    unit: '字',
+  },
   'feishuTools.proposeActions': {
     label: '后续动作提议',
     group: 'tools',
@@ -496,6 +517,7 @@ const FIELD_META: Record<EditableKey, FieldMeta> = {
   prefetchTimeoutMs: { label: '图片预取超时', group: 'limits', min: 100, max: 120_000, step: 100, unit: 'ms' },
   prefetchImageMaxBytes: { label: '单张预取图片上限', group: 'limits', min: 1, max: 200 * 1024 * 1024, step: 1, unit: BYTES_UNIT },
   prefetchTotalMaxBytes: { label: '单次预取总量', group: 'limits', min: 1, max: 1024 * 1024 * 1024, step: 1, unit: BYTES_UNIT },
+  'feishuTools.autoSendMaxFiles': { label: '自动发送：每回合文件上限', group: 'limits', min: 1, max: 20, step: 1, unit: '个' },
   'feishuTools.attachmentFetchMaxResources': { label: '读取附件：数量上限', group: 'limits', min: 1, max: 50, step: 1, unit: '个' },
   'feishuTools.attachmentFetchMaxBytes': { label: '读取附件：总字节', group: 'limits', min: 1, step: 1, unit: BYTES_UNIT },
   'feishuTools.attachmentFetchTimeoutMs': { label: '读取附件：超时', group: 'limits', min: 1_000, max: MAX_TIMER_DELAY_MS, step: 1_000, unit: 'ms' },

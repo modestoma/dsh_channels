@@ -78,6 +78,8 @@ export interface PromptSection {
 /** The Agent-scoped slice of the host `systemPrompt` registry. */
 export interface SystemPromptRuntime {
   section(section: PromptSection): () => void
+  /** Order value of a named host section slot; absent on hosts without named slots. */
+  getSectionOrder?(name: string): number
 }
 
 /** One model-facing content block a channel tool may project (text/image/file). */

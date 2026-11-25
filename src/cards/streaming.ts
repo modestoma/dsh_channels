@@ -743,6 +743,39 @@ export function buildRecoveredReplyCards(text: string, count: number): object[] 
   return cards
 }
 
+/** First line of a document card: `📄 <file name>`, then `（续 n）` on later cards. */
+function documentHeader(fileName: string, index: number): string {
+  return index === 0 ? `📄 ${fileName}` : `📄 ${fileName}（续 ${index + 1}）`
+}
+
+function documentCard(fileName: string, index: number, body: string): object {
+  return card([note(documentHeader(fileName, index)), markdown(body)])
+}
+
+/**
+ * Cards that show one Markdown document's text in the chat: as many as the
+ * text needs, each within the card byte budget and the per-card table limit,
+ * split at the same clean breakpoints as a long reply.
+ * @param fileName - the document's file name, shown on every card.
+ * @param text - the document's Markdown text (non-empty).
+ * @returns the cards, in order.
+ */
+export function buildDocumentCards(fileName: string, text: string): object[] {
+  const cards: object[] = []
+  let remaining = text.trim()
+  while (remaining !== '') {
+    const index = cards.length
+    const limit = fitPrefix(remaining, CARD_TARGET_BYTES, content => cardJsonBytes(documentCard(fileName, index, content))).length
+    const cut = Math.max(limit, 1)
+    let split = splitBodyForCard(remaining, cut)
+    // Always advance, even when no clean breakpoint fits.
+    if (split.head === '') split = { head: remaining.slice(0, cut), tail: remaining.slice(cut) }
+    cards.push(documentCard(fileName, index, split.head))
+    remaining = split.tail.trim() === '' ? '' : split.tail
+  }
+  return cards
+}
+
 /**
  * Split a body at a clean breakpoint so `head` fits one card:
  *  1. the head holds at most `maxTables` whole markdown tables — the boundary

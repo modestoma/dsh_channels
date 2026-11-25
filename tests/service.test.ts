@@ -14,9 +14,9 @@ import { MISSED_RUN_ACTION } from '../src/cards/missed.ts'
 import { hostTurnOriginLine, StartSupersededError } from '../src/service.ts'
 import { FeishuApiError } from '../src/feishu-channel.ts'
 import type { FeishuConfig } from '../src/config.ts'
-import { DEFAULT_DM_MAIN_TOOLS } from '../src/config.ts'
+import { DEFAULT_AUTO_SEND_EXTENSIONS, DEFAULT_AUTO_SEND_MAX_FILES, DEFAULT_DM_MAIN_TOOLS, DEFAULT_INLINE_MARKDOWN_CHARS } from '../src/config.ts'
 import type {
-  CardActionEvent, ChannelFactory, FeishuChannel, NormalizedMessage, RawMessageListParams,
+  CardActionEvent, ChannelFactory, FeishuChannel, NormalizedMessage, OutboundMedia, RawMessageListParams,
 } from '../src/feishu-channel.ts'
 import { CordisFiberState } from '../src/host/index.ts'
 import type { Agent, AgentHandle, ApprovalOutcome, CordisPluginRuntime, MessageId, Session, SessionId, SessionProjections, UserMessage } from '../src/host/index.ts'
@@ -24,7 +24,7 @@ import { RESUME_ACTION } from '../src/cards/index.ts'
 import { chatRouteKey, dmMainRouteKey } from '../src/domain.ts'
 import type { RouteRecord } from '../src/domain.ts'
 import type { DmTopicRecord } from '../src/dm/topic-directory.ts'
-import { FEISHU_ATTACHMENTS_GUIDANCE, FEISHU_ATTACHMENTS_SECTION, FEISHU_PROJECT_SECTION, FEISHU_REPLIES_GUIDANCE, FEISHU_REPLIES_SECTION } from '../src/feishu/agent-context.ts'
+import { FEISHU_ATTACHMENTS_GUIDANCE, FEISHU_ATTACHMENTS_SECTION, FEISHU_DELIVERY_SECTION, FEISHU_PROJECT_SECTION, FEISHU_REPLIES_GUIDANCE, FEISHU_REPLIES_SECTION } from '../src/feishu/agent-context.ts'
 import { ATTACHMENT_FETCH_TOOL_NAME, TOPIC_MESSAGES_TOOL_NAME } from '../src/feishu/tools.ts'
 import { SEND_FILE_TOOL_NAME } from '../src/feishu/send-file.ts'
 import type { SessionExportBuilder } from '../src/session-export.ts'
@@ -97,6 +97,10 @@ function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
       topicMessages: true,
       topicMessagesTimeoutMs: 20_000,
       sendFile: true,
+      autoSendFiles: 'mentioned',
+      autoSendMaxFiles: DEFAULT_AUTO_SEND_MAX_FILES,
+      autoSendExtensions: [...DEFAULT_AUTO_SEND_EXTENSIONS],
+      inlineMarkdownChars: DEFAULT_INLINE_MARKDOWN_CHARS,
       proposeActions: true,
       wikiRead: false,
       wikiWrite: false,
@@ -4287,6 +4291,26 @@ describe('reply guidance', () => {
     await h.service.shutdown()
   })
 
+  it('replaces the Web file-delivery text with Feishu delivery guidance that follows the send settings', async () => {
+    const h = await setup()
+    await h.onMessage(makeMessage({
+      chatType: 'group', chatId: 'oc_deliver', senderId: 'u_owner',
+      messageId: 'om_deliver', content: '开始',
+    }))
+    await waitForEstablishedSession(h)
+    const section = promptSectionsOf(h.ctxState.agents.created[0]!.setupCtx)
+      .find(entry => entry.name === FEISHU_DELIVERY_SECTION)
+    expect(resolved(section)).toContain('a file path alone delivers nothing')
+    expect(resolved(section)).toContain('feishu_send_file')
+    expect(resolved(section)).toContain('sent automatically')
+    h.service.applyOverlay({ feishuTools: { autoSendFiles: 'off' } })
+    expect(resolved(section)).not.toContain('sent automatically')
+    h.service.applyOverlay({ feishuTools: { sendFile: false } })
+    expect(resolved(section)).toContain('Files cannot be sent in this conversation')
+    expect(resolved(section)).not.toContain('feishu_send_file')
+    await h.service.shutdown()
+  })
+
   it('adds the reply guidance even when inbound attachments are off', async () => {
     const h = await setup({ acceptAttachments: false })
     await h.onMessage(makeMessage({
@@ -5809,6 +5833,8 @@ describe('private-chat projects mode', () => {
     expect(textOf(0)).toContain('回复话题')
     expect(textOf(1)).toContain(path.join(root, 'topics', 'omt_g'))
     expect(textOf(1)).toContain(path.join(root, 'shared'))
+    expect(textOf(1)).toContain('结果：<the outcome itself, such as the conclusion; never only where a file is stored>')
+    expect(textOf(0)).toContain('send it with `feishu_send_file` instead of naming its path')
     await h.service.shutdown()
   })
 
@@ -5855,6 +5881,24 @@ describe('private-chat projects mode', () => {
     }
     const topicsOf = (h: SetupResult): Map<string, DmTopicRecord> =>
       new Map(h.ctxState.domain.raw.table('dm_topics').entries() as IterableIterator<[string, DmTopicRecord]>)
+
+    it('sends the report a topic only names by its shared/ path into the topic after the turn', async () => {
+      const { h } = await setupTools()
+      await h.onMessage(dm('分析一下投屏日志', { threadId: 'omt_cast' }))
+      await waitForEstablishedSession(h)
+      const topic = h.ctxState.agents.created[0]!.handle.agent
+      const shared = path.join(h.config.baseDir, 'p2p', 'u_alice', 'shared')
+      writeFileSync(path.join(shared, 'cast_analysis.md'), '# 结论\n\n协商阶段失败。')
+      const before = h.channel.repliedMedia.length
+      settleTurn(h, topic, 1, `报告已放到共享目录 ${path.join(shared, 'cast_analysis.md')}（结论 + 时间线）\n\n小结\n做了：分析日志\n结果：协商阶段失败\n需要你：无`)
+      await waitUntil(() => expect(h.channel.repliedMedia.length - before).toBe(2))
+      const [card, file] = h.channel.repliedMedia.slice(before) as Array<{ replyTo: string; media: OutboundMedia; options: { replyInThread: boolean } }>
+      expect(card!.media.kind).toBe('card')
+      expect(JSON.stringify(card!.media)).toContain('协商阶段失败')
+      expect(file).toMatchObject({ media: { kind: 'file', fileName: 'cast_analysis.md' }, options: { replyInThread: true } })
+      expect(file!.replyTo).toBe(routesOf(h).get('omt_cast')!.cardMessageId)
+      await h.service.shutdown()
+    })
 
     it('mounts the topic tools in the main Session only', async () => {
       const { h, tools } = await setupTools()

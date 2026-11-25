@@ -39,10 +39,11 @@ export type FeishuSendInput =
   | { image: { source: Buffer } }
   | { file: { source: string | Buffer; fileName: string } }
 
-/** One outbound image or file uploaded from memory. */
+/** One outbound image or file uploaded from memory, or a card sent as an interactive message. */
 export type OutboundMedia =
   | { readonly kind: 'image'; readonly data: Buffer }
   | { readonly kind: 'file'; readonly data: Buffer; readonly fileName: string }
+  | { readonly kind: 'card'; readonly card: object }
 
 /**
  * One normalized card action (button click) event, as delivered by the
@@ -131,7 +132,7 @@ export interface FeishuChannel {
     options?: { replyTo?: string; replyInThread?: boolean },
   ): Promise<SendResult>
   /**
-   * Upload one image or file and send it as a reply to `replyTo`. Unlike
+   * Upload one image or file (a card needs no upload) and send it as a reply to `replyTo`. Unlike
    * {@link FeishuChannel.send}, a recalled or deleted reply target is NOT
    * retried as a fresh chat message: the call rejects with a
    * {@link FeishuApiError}, so topic output never lands on the main timeline.
@@ -565,7 +566,10 @@ class LarkChannelAdapter implements FeishuChannel {
   async replyMedia(replyTo: string, media: OutboundMedia, options: { replyInThread: boolean }): Promise<SendResult> {
     const im = this.channel.rawClient.im.v1
     let content: string
-    if (media.kind === 'image') {
+    const msgType: 'image' | 'file' | 'interactive' = media.kind === 'card' ? 'interactive' : media.kind
+    if (media.kind === 'card') {
+      content = JSON.stringify(media.card)
+    } else if (media.kind === 'image') {
       const uploaded = await feishuUpload(() => im.image.create({ data: { image_type: 'message', image: media.data } }))
       const imageKey = uploaded?.image_key
       if (imageKey === undefined) throw new FeishuApiError('image_key missing in upload response')
@@ -580,7 +584,7 @@ class LarkChannelAdapter implements FeishuChannel {
     }
     const sent = await feishuCall(() => im.message.reply({
       path: { message_id: replyTo },
-      data: { msg_type: media.kind, content, reply_in_thread: options.replyInThread },
+      data: { msg_type: msgType, content, reply_in_thread: options.replyInThread },
     }))
     const messageId = sent.data?.message_id
     if (messageId === undefined) throw new FeishuApiError('message_id missing in reply response')

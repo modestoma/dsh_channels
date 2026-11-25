@@ -791,6 +791,10 @@ describe('field descriptors', () => {
       kind: 'boolean', group: 'tools', restartRequired: false,
     })
     expect(byKey.get('feishuTools.proposeActions')?.help).toContain('propose_actions')
+    expect(byKey.get('feishuTools.autoSendFiles')).toMatchObject({ kind: 'select', group: 'tools', restartRequired: false })
+    expect(byKey.get('feishuTools.autoSendFiles')?.options?.map(option => option.value)).toEqual(['mentioned', 'presented', 'off'])
+    expect(byKey.get('feishuTools.inlineMarkdownChars')).toMatchObject({ kind: 'number', group: 'tools', min: 0, max: 200_000 })
+    expect(byKey.get('feishuTools.autoSendMaxFiles')).toMatchObject({ kind: 'number', group: 'limits', min: 1, max: 20 })
     expect(byKey.get('feishuTools.attachmentFetchMaxResources')).toMatchObject({
       kind: 'number', min: 1, max: 50,
     })

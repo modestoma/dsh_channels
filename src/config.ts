@@ -97,6 +97,25 @@ export const DEFAULT_DM_MAIN_TOOLS = [
   'feishu_wiki_list', 'feishu_wiki_read', 'feishu_wiki_sheet_read', 'feishu_wiki_base_read',
 ] as const
 
+/** Default `feishuTools.autoSendMaxFiles`: files one turn sends automatically. */
+export const DEFAULT_AUTO_SEND_MAX_FILES = 5
+
+/**
+ * Default `feishuTools.autoSendExtensions`: documents, tables, slides, images
+ * and archives, the files a person opens; scripts and data a turn writes for
+ * itself are left out.
+ */
+export const DEFAULT_AUTO_SEND_EXTENSIONS = [
+  'md', 'markdown', 'txt', 'pdf', 'doc', 'docx', 'xls', 'xlsx', 'csv', 'tsv', 'ppt', 'pptx',
+  'png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'html', 'htm', 'zip', 'tar.gz', 'tgz', '7z',
+] as const
+
+/** Default `feishuTools.inlineMarkdownChars`: longest Markdown file also shown as cards. */
+export const DEFAULT_INLINE_MARKDOWN_CHARS = 20_000
+
+/** Upper bound of `feishuTools.inlineMarkdownChars`. */
+export const MAX_INLINE_MARKDOWN_CHARS = 200_000
+
 /** Default `dmMaxRunningTopics`: running topics one main Session may have at once. */
 export const DEFAULT_DM_MAX_RUNNING_TOPICS = 5
 
@@ -348,6 +367,21 @@ export const configSchema = z.object({
    *   directory back to the current conversation. Needs the Feishu
    *   `im:resource` (or `im:resource:upload`) scope; without it a call returns
    *   a readable failure and the turn continues.
+   * - `autoSendFiles` (default `mentioned`, effective only while `sendFile`
+   *   is on): after a turn completes, send the files it delivered to the
+   *   conversation the way `feishu_send_file` does. `presented` sends the
+   *   files the turn declared through the host `present` tool; `mentioned`
+   *   also sends the files its final reply names, when they are in the
+   *   person's `shared/` directory, or in the Session's own directory with a
+   *   name ending in one of `autoSendExtensions` and changed during the turn.
+   *   A file this Session already sent unchanged is not sent again. `off`
+   *   sends nothing on its own.
+   * - `autoSendMaxFiles` (default 5): most files one turn sends automatically.
+   * - `autoSendExtensions`: file-name endings (lower case, without the dot)
+   *   of the files in the Session's own directory that `mentioned` sends.
+   * - `inlineMarkdownChars` (default 20000): a sent Markdown file
+   *   (`.md`/`.markdown`) of at most this many characters is also shown as
+   *   cards in the chat before the file; 0 shows only the file.
    * - `proposeActions` (default on): register `propose_actions` in root
    *   channel sessions (`delegationDepth === 0`) so the model can post a
    *   non-blocking follow-up action proposal card at the end of a turn (at
@@ -393,6 +427,11 @@ export const configSchema = z.object({
     topicMessagesTimeoutMs: z.number().int().min(1_000).max(120_000)
       .default(DEFAULT_TOPIC_MESSAGES_TIMEOUT_MS),
     sendFile: z.boolean().default(true),
+    autoSendFiles: z.enum(['mentioned', 'presented', 'off']).default('mentioned'),
+    autoSendMaxFiles: z.number().int().min(1).max(20).default(DEFAULT_AUTO_SEND_MAX_FILES),
+    autoSendExtensions: z.array(z.string().trim().toLowerCase().regex(/^[a-z0-9]+(?:\.[a-z0-9]+)*$/u, 'must be a file-name ending such as md or tar.gz'))
+      .max(100).default([...DEFAULT_AUTO_SEND_EXTENSIONS]),
+    inlineMarkdownChars: z.number().int().min(0).max(MAX_INLINE_MARKDOWN_CHARS).default(DEFAULT_INLINE_MARKDOWN_CHARS),
     proposeActions: z.boolean().default(true),
     wikiRead: z.boolean().default(false),
     wikiWrite: z.boolean().default(false),
@@ -403,6 +442,10 @@ export const configSchema = z.object({
     topicMessages: true,
     topicMessagesTimeoutMs: DEFAULT_TOPIC_MESSAGES_TIMEOUT_MS,
     sendFile: true,
+    autoSendFiles: 'mentioned',
+    autoSendMaxFiles: DEFAULT_AUTO_SEND_MAX_FILES,
+    autoSendExtensions: [...DEFAULT_AUTO_SEND_EXTENSIONS],
+    inlineMarkdownChars: DEFAULT_INLINE_MARKDOWN_CHARS,
     proposeActions: true,
     wikiRead: false,
     wikiWrite: false,
@@ -435,8 +478,9 @@ export const configSchema = z.object({
   /**
    * Add the Feishu reply guidance to every Feishu Session's system prompt
    * (`dsh-channels:feishu-replies`): lead with the result, keep the final
-   * reply short, keep technical detail in the merge request or a file, ask one
-   * concrete question when a decision is needed. Read on every model request.
+   * reply short, keep technical detail in the merge request, carry an
+   * analysis's conclusion in the reply, ask one concrete question when a
+   * decision is needed. Read on every model request.
    */
   replyGuidance: z.boolean().default(true),
   /**
