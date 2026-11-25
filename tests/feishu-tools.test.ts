@@ -10,7 +10,7 @@
 
 import { createHash } from 'node:crypto'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { resolveConfig } from '../src/config.ts'
+import { DEFAULT_AUTO_SEND_EXTENSIONS, resolveConfig } from '../src/config.ts'
 import type { FeishuConfig } from '../src/config.ts'
 import type { RouteRecord } from '../src/domain.ts'
 import type {
@@ -2583,10 +2583,21 @@ describe('feishu attachment-fetch presentation and configuration', () => {
       topicMessages: true,
       topicMessagesTimeoutMs: 20_000,
       sendFile: true,
+      autoSendFiles: 'mentioned',
+      autoSendMaxFiles: 5,
+      autoSendExtensions: [...DEFAULT_AUTO_SEND_EXTENSIONS],
+      inlineMarkdownChars: 20_000,
       proposeActions: true,
       wikiRead: false,
       wikiWrite: false,
     })
+  })
+
+  it('normalizes automatic-sending extensions and rejects invalid ones', () => {
+    expect(resolveConfig({ feishuTools: { autoSendExtensions: [' MD ', 'tar.gz'] } }).feishuTools.autoSendExtensions).toEqual(['md', 'tar.gz'])
+    expect(() => resolveConfig({ feishuTools: { autoSendExtensions: ['.md'] } })).toThrow()
+    expect(() => resolveConfig({ feishuTools: { autoSendFiles: 'always' } })).toThrow()
+    expect(() => resolveConfig({ feishuTools: { inlineMarkdownChars: -1 } })).toThrow()
   })
 
   it('accepts nested overrides and rejects out-of-range limits', () => {

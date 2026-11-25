@@ -15,7 +15,7 @@ import {
   FEISHU_FILE_MAX_BYTES, FEISHU_IMAGE_MAX_BYTES, SEND_FILE_TOOL_NAME, SendFileToolRuntime,
   presentSendFileCall, renderSendFileResult,
 } from '../src/feishu/send-file.ts'
-import type { SendFileTarget, SendFileValue } from '../src/feishu/send-file.ts'
+import type { SendFileRuntimeDeps, SendFileTarget, SendFileValue } from '../src/feishu/send-file.ts'
 import { makeAgentContext, makeChannel, makeTempBaseDir } from './helpers.ts'
 
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0])
@@ -33,6 +33,7 @@ async function setup(options: {
   config?: FeishuConfig
   target?: Partial<SendFileTarget> | null
   channel?: FeishuChannel | null
+  onSent?: SendFileRuntimeDeps['onSent']
 } = {}): Promise<Harness> {
   const base = makeTempBaseDir()
   const root = path.join(base, 'ws', 'topics', 't1')
@@ -49,6 +50,7 @@ async function setup(options: {
     config: () => config,
     channel: () => (options.channel === null ? undefined : options.channel ?? channel),
     targetOfSession: id => (id === 's1' ? target : undefined),
+    ...(options.onSent === undefined ? {} : { onSent: options.onSent }),
     warn,
   })
   const definitions = new Map<string, ToolDefinition>()
@@ -195,6 +197,42 @@ describe('feishu_send_file', () => {
     await expect(h.run({ path: 'a', extra: 1 })).rejects.toThrow(/invalid arguments/u)
     const off = resolveConfig({ feishuTools: { sendFile: false } })
     expect((await setup({ config: off })).definitions.size).toBe(0)
+  })
+
+  it('shows a Markdown report as document cards before the file and reports the send', async () => {
+    const onSent = vi.fn()
+    const h = await setup({ onSent })
+    const report = '# 结论\n\n问题出在投屏协商。\n\n| 环节 | 判定 |\n| --- | --- |\n| 发现 | 正常 |\n'
+    writeFileSync(path.join(h.root, 'report.md'), report)
+    expect(await h.run({ path: 'report.md' })).toMatchObject({ ok: true, kind: 'file', file_name: 'report.md' })
+    expect(h.channel.repliedMedia.map(entry => entry.media.kind)).toEqual(['card', 'file'])
+    const shown = JSON.stringify(h.channel.repliedMedia[0]!.media)
+    expect(shown).toContain('📄 report.md')
+    expect(shown).toContain('问题出在投屏协商')
+    expect(h.channel.repliedMedia[0]).toMatchObject({ replyTo: 'om_card', options: { replyInThread: true } })
+    expect(onSent).toHaveBeenCalledWith('s1', expect.objectContaining({ realPath: expect.stringMatching(/report\.md$/u), bytes: Buffer.byteLength(report) }))
+  })
+
+  it('sends a long, non-UTF-8 or switched-off Markdown file as the file alone', async () => {
+    const h = await setup({ config: resolveConfig({ feishuTools: { inlineMarkdownChars: 10 } }) })
+    writeFileSync(path.join(h.root, 'long.md'), '这是一份超过十个字符的报告正文')
+    writeFileSync(path.join(h.root, 'binary.md'), Buffer.from([0xff, 0xfe, 0x00]))
+    await h.run({ path: 'long.md' })
+    await h.run({ path: 'binary.md' })
+    expect(h.channel.repliedMedia.map(entry => entry.media.kind)).toEqual(['file', 'file'])
+    const off = await setup({ config: resolveConfig({ feishuTools: { inlineMarkdownChars: 0 } }) })
+    writeFileSync(path.join(off.root, 'a.md'), '# a')
+    await off.run({ path: 'a.md' })
+    expect(off.channel.repliedMedia.map(entry => entry.media.kind)).toEqual(['file'])
+  })
+
+  it('still sends the file when Feishu refuses a document card', async () => {
+    const channel = makeChannel()
+    const h = await setup({ channel })
+    writeFileSync(path.join(h.root, 'a.md'), '# 报告')
+    vi.mocked(channel.replyMedia).mockRejectedValueOnce(new Error('card rejected'))
+    expect(await h.run({ path: 'a.md' })).toMatchObject({ ok: true, kind: 'file' })
+    expect(h.warn).toHaveBeenCalledWith(expect.stringContaining('document card'), SEND_FILE_TOOL_NAME, 'a.md', 'card rejected')
   })
 
   it('presents the call and the result', () => {

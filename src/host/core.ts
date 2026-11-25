@@ -451,12 +451,27 @@ export interface UserMessageEvent extends SessionEventEnvelope {
   data: UserMessage
 }
 
+/**
+ * Files the host `present` tool declared as a turn's deliverables
+ * (`@deepseek-ai/dsh-tool-present`): absolute paths, or paths relative to the
+ * Session working directory.
+ */
+export interface DeliverablesPresentedEvent extends SessionEventEnvelope {
+  type: 'deliverables/presented'
+  data: {
+    turn: number
+    callId: string
+    files: ReadonlyArray<{ path: string; description?: string }>
+  }
+}
+
 export interface OtherSessionEvent extends SessionEventEnvelope {
   /** Unknown/extension event types are ignored by the folds. */
   type: Exclude<string, 'assistant/message' | 'step/start' | 'turn/end' | 'request/header'
     | 'tool/call' | 'tool/result' | 'subagent/descriptor' | 'llm/retry' | 'llm/retry-started'
     | 'command/run' | 'command/done' | 'user/message' | 'compaction/start' | 'compaction/end'
-    | 'tool-workflow/run-start' | 'tool-workflow/agent-start' | 'tool-workflow/agent-end' | 'tool-workflow/run-end'>
+    | 'tool-workflow/run-start' | 'tool-workflow/agent-start' | 'tool-workflow/agent-end' | 'tool-workflow/run-end'
+    | 'deliverables/presented'>
   data: unknown
 }
 
@@ -481,4 +496,5 @@ export type SessionEvent =
   | LlmRetryStartedEvent
   | CompactionStartEvent
   | CompactionEndEvent
+  | DeliverablesPresentedEvent
 

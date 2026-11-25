@@ -17,6 +17,14 @@
  * deleted reply target fails the call instead of falling back to a fresh
  * chat message.
  *
+ * Markdown files: a `.md`/`.markdown` file of at most
+ * `feishuTools.inlineMarkdownChars` characters of UTF-8 text is first shown
+ * as document cards (its content, split like a long reply), then sent as the
+ * file. A failed card is logged and the file is still sent.
+ *
+ * The same delivery serves the turn-end automatic sending
+ * (`deliverables/auto-send.ts`) through {@link SendFileToolRuntime.send}.
+ *
  * Feishu limits (`im.v1.image.create` / `im.v1.file.create`): images up to
  * 10 MB in JPEG/PNG/WEBP/GIF/TIFF/BMP/ICO, files up to 30 MB, zero-byte
  * uploads rejected. Both uploads need the `im:resource` (or
@@ -35,6 +43,7 @@ import type {
 } from '../host/agent.ts'
 import type { FeishuChannel, OutboundMedia } from '../feishu-channel.ts'
 import { FeishuApiError, sniffImageMediaType } from '../feishu-channel.ts'
+import { buildDocumentCards } from '../cards/streaming.ts'
 import { AgentToolMount } from './tool-mount.ts'
 
 /** Model-facing tool name; stable across releases (session history references it). */
@@ -56,6 +65,7 @@ const SEND_FILE_DESCRIPTION =
   + '目录外的文件请先复制到工作目录。'
   + 'kind 默认 auto：可识别的图片（JPEG/PNG/WEBP/GIF/TIFF/BMP/ICO，≤10 MB）以图片消息发送，其余以文件消息发送；'
   + '文件上限 30 MB，空文件会被拒绝。一次调用发送一个文件；需要发送多个时逐个调用。'
+  + 'Markdown 报告（.md）在长度上限内会先以卡片显示正文，再附上文件。'
 
 /** Tool argument validation (the model may send anything). */
 export const sendFileArgsSchema = z.object({
@@ -164,6 +174,16 @@ export interface SendFileTarget {
   readonly otherRoots?: readonly string[]
 }
 
+/** The file one successful send delivered, identified as it was on disk. */
+export interface SentFile {
+  /** Resolved path (`realpath`) of the sent file. */
+  readonly realPath: string
+  /** Modification time when the file was read (epoch ms). */
+  readonly mtimeMs: number
+  /** Bytes sent. */
+  readonly bytes: number
+}
+
 export interface SendFileRuntimeDeps {
   /** Live plugin configuration (switch). */
   config(): FeishuConfig
@@ -171,6 +191,8 @@ export interface SendFileRuntimeDeps {
   channel(): FeishuChannel | undefined
   /** Resolve the delivery target bound to one session, re-read per call. */
   targetOfSession(sessionId: string): SendFileTarget | undefined
+  /** Called after each successful send, by the tool or by {@link SendFileToolRuntime.send}. */
+  onSent?(sessionId: string, file: SentFile): void
   /** Structured warning sink (mount degradation, unexpected failures). */
   warn(message: string, ...args: unknown[]): void
 }
@@ -236,14 +258,26 @@ export class SendFileToolRuntime {
       const where = issue === undefined || issue.path.length === 0 ? 'arguments' : issue.path.join('.')
       throw new Error(`${SEND_FILE_TOOL_NAME}: invalid ${where}: ${issue?.message ?? 'invalid arguments'}`)
     }
-    const args = parsed.data
+    return await this.send(sessionId, parsed.data, exec.signal)
+  }
+
+  /**
+   * Send one file of a Session's directories to its conversation: the
+   * Markdown cards first when the file qualifies, then the file itself.
+   * Reports a successful send to `onSent`.
+   * @param sessionId - the Session whose route receives the file.
+   * @param args - the file and how to send it.
+   * @param signal - cancels the wait; an upload already started may still arrive.
+   * @returns the result, a failure value when the file cannot be sent.
+   */
+  async send(sessionId: string, args: SendFileArgs, signal: AbortSignal): Promise<SendFileValue> {
     if (!this.enabled()) return failure('TOOL_DISABLED')
     const target = this.deps.targetOfSession(sessionId)
     if (target === undefined) return failure('ROUTE_NOT_FOUND')
 
     const loaded = await loadWorkspaceFile(target.rootDir, args, target.otherRoots)
     if (!loaded.ok) return loaded
-    if (exec.signal.aborted) return failure('ABORTED')
+    if (signal.aborted) return failure('ABORTED')
     const channel = this.deps.channel()
     if (channel === undefined) return failure('CHANNEL_UNAVAILABLE')
 
@@ -251,8 +285,10 @@ export class SendFileToolRuntime {
     const media: OutboundMedia = kind === 'image' ? { kind, data } : { kind, data, fileName }
     let sent: Promise<{ messageId: string }> | undefined
     try {
+      await this.sendDocumentCards(channel, target, loaded, signal)
       sent = channel.replyMedia(target.replyTo, media, { replyInThread: target.inThread })
-      const result = await abortable(sent, exec.signal)
+      const result = await abortable(sent, signal)
+      this.deps.onSent?.(sessionId, { realPath: loaded.realPath, mtimeMs: loaded.mtimeMs, bytes: data.length })
       const label = kind === 'image' ? '图片' : '文件'
       return {
         ok: true,
@@ -263,7 +299,7 @@ export class SendFileToolRuntime {
         message_id: result.messageId,
       }
     } catch (error) {
-      if (exec.signal.aborted) {
+      if (signal.aborted) {
         // The send keeps running; only its late failure is still worth a log line.
         sent?.catch(late => this.deps.warn('dsh-channels: %s failed after abort: %s', SEND_FILE_TOOL_NAME, describeError(late)))
         return failure('ABORTED')
@@ -277,13 +313,65 @@ export class SendFileToolRuntime {
       return failure('SEND_FAILED', `${FAILURE_REASONS.SEND_FAILED}：${detail}`)
     }
   }
+
+  /**
+   * Show a qualifying Markdown file as document cards before the file. A
+   * card Feishu refuses is logged and the remaining cards are skipped; the
+   * file is sent either way. Cancellation propagates to the caller.
+   */
+  private async sendDocumentCards(channel: FeishuChannel, target: SendFileTarget, loaded: LoadedFileOk, signal: AbortSignal): Promise<void> {
+    const text = inlineMarkdownOf(loaded, this.deps.config().feishuTools.inlineMarkdownChars)
+    if (text === undefined) return
+    for (const card of buildDocumentCards(loaded.fileName, text)) {
+      try {
+        await abortable(channel.replyMedia(target.replyTo, { kind: 'card', card }, { replyInThread: target.inThread }), signal)
+      } catch (error) {
+        if (signal.aborted) throw error
+        this.deps.warn('dsh-channels: %s document card for %s failed: %s', SEND_FILE_TOOL_NAME, loaded.fileName, describeError(error))
+        return
+      }
+    }
+  }
+}
+
+/** File-name endings shown as document cards. */
+const MARKDOWN_FILE = /\.(?:md|markdown)$/iu
+
+/**
+ * The text of a file shown as document cards: a Markdown file sent as a file
+ * message, valid UTF-8, of at most `maxChars` characters (0 turns cards off).
+ * @param loaded - the loaded file.
+ * @param maxChars - `feishuTools.inlineMarkdownChars`.
+ * @returns the text, or undefined when the file is sent without cards.
+ */
+export function inlineMarkdownOf(loaded: Pick<LoadedFileOk, 'kind' | 'fileName' | 'data'>, maxChars: number): string | undefined {
+  if (maxChars === 0 || loaded.kind !== 'file' || !MARKDOWN_FILE.test(loaded.fileName)) return undefined
+  let text: string
+  try {
+    text = new TextDecoder('utf-8', { fatal: true }).decode(loaded.data)
+  } catch {
+    // Not UTF-8 text: the file goes out as an attachment only.
+    return undefined
+  }
+  text = text.replace(/^\uFEFF/u, '')
+  return text.trim() === '' || text.length > maxChars ? undefined : text
 }
 
 // ---- File loading -------------------------------------------------------
 
-type LoadedFile =
-  | { readonly ok: true; readonly kind: 'image' | 'file'; readonly fileName: string; readonly data: Buffer }
-  | Extract<SendFileValue, { ok: false }>
+/** A file read for sending. */
+interface LoadedFileOk {
+  readonly ok: true
+  readonly kind: 'image' | 'file'
+  readonly fileName: string
+  readonly data: Buffer
+  /** Resolved path (`realpath`) the bytes were read from. */
+  readonly realPath: string
+  /** Modification time at open (epoch ms). */
+  readonly mtimeMs: number
+}
+
+type LoadedFile = LoadedFileOk | Extract<SendFileValue, { ok: false }>
 
 /**
  * Resolve, contain, size-check and read one file under `rootDir` or one of
@@ -324,8 +412,10 @@ export async function loadWorkspaceFile(rootDir: string, args: SendFileArgs, oth
     return failure('FILE_NOT_FOUND', `${FAILURE_REASONS.FILE_NOT_FOUND}：${describeError(error)}`)
   }
   let data: Buffer
+  let mtimeMs: number
   try {
     const info = await handle.stat()
+    mtimeMs = info.mtimeMs
     if (!info.isFile()) return failure('NOT_A_FILE')
     // A directory swapped for a symlink after the realpath check would open a
     // different inode than the contained path resolves to now.
@@ -351,7 +441,7 @@ export async function loadWorkspaceFile(rootDir: string, args: SendFileArgs, oth
     : requested === 'image' ? 'image'
       : isImage && data.length <= FEISHU_IMAGE_MAX_BYTES ? 'image' : 'file'
   const fileName = sanitizeFileName(args.file_name ?? path.basename(real))
-  return { ok: true, kind, fileName, data }
+  return { ok: true, kind, fileName, data, realPath: real, mtimeMs }
 }
 
 /** Whether `candidate` is `root` itself or below it. */

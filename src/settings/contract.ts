@@ -275,11 +275,14 @@ export const EDITABLE_KEYS = [
   // 模型工具（`feishuTools.*` 是嵌套配置，覆盖层仍写成嵌套对象）
   'feishuTools.topicMessages',
   'feishuTools.sendFile',
+  'feishuTools.autoSendFiles',
+  'feishuTools.inlineMarkdownChars',
   'feishuTools.proposeActions',
   // 限额与超时
   'prefetchTimeoutMs',
   'prefetchImageMaxBytes',
   'prefetchTotalMaxBytes',
+  'feishuTools.autoSendMaxFiles',
   'feishuTools.attachmentFetchMaxResources',
   'feishuTools.attachmentFetchMaxBytes',
   'feishuTools.attachmentFetchTimeoutMs',

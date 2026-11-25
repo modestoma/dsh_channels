@@ -7,7 +7,8 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 - 话题内后续消息**无需再 @**，自动延续该 session
 - 工作区归属：**一个话题一个工作区**：每个话题在 `<baseDir>` 下有自己的目录（私聊 `p2p/<user_id>/<话题 id>/`，群聊 `groups/<chat_id>/<话题 id>/`），这个目录就是 Session 的 header cwd，并以「群名 · 话题标题」或「人名 · 话题标题」登记为 DSH 工作区；会话建立（含 `/renew` 换新会话）后挂到这个工作区下，DSH Web 左侧栏把它列在该工作区里而不是「未分组」，挂载失败只记告警、不影响对话；插件启动时会把现有话题里还没挂上的会话补挂到各自的工作区（工作区登记已在 Web 端删除的话题不补挂）；话题之间的文件互不干扰，群话题属于群而不属于某个人
 - **入站附件（v2，零等待）**：收到消息时**会话、话题、流式卡片立即建立，不等附件下载**。触发消息中的图片自动预取为首轮原生 `ImageBlock`，模型直接可见；文件默认不下载，prompt 用 `<feishu_context>` 清单声明“附件未加载”，模型需要时调用 `feishu_attachment_fetch` 按 `message_id` 懒取；引用消息与话题历史以 `<feishu_quote>` / `<feishu_history>` 摘录，更早的消息用 `feishu_topic_messages` 翻页（发现的资源同时获得 fetch 授权）。**只发附件、不带说明的消息完全静默**：不回复、不建会话、不下载、不加表情，本地也不留任何状态；要让模型看到它，请引用那条消息再提问（多个文件可合并转发后引用），话题内的附件也可由模型用 `feishu_topic_messages` 读到。所有入站图片/文件只存入 **DSH 原生附件库**（不可变、内容寻址去重、读取校验、随 Session 回放；插件不承担入站附件清理）；插件把原生附件库列为必需依赖，不再有工作区 `attachments/` 落盘后端。完整设计见 [docs/attachment-pipeline-v2.md](docs/attachment-pipeline-v2.md)。
-- **把生成的文件发给用户**：模型在话题工作目录里生成图片、报告、表格等文件后，可调用 `feishu_send_file` 直接发回当前话题/会话（可识别图片 ≤10 MB 以图片消息发送，其余以文件消息发送，文件上限 30 MB）。只能发送**当前话题工作目录内**的普通文件（`..` 与符号链接都按真实路径校验，不能读到其他话题或系统文件）；需开通 `im:resource` 权限，缺失时工具返回可读的 `PERMISSION_DENIED`，回合不受影响。开关：`feishuTools.sendFile`（默认开）
+- **把生成的文件发给用户**：模型在话题工作目录里生成图片、报告、表格等文件后，可调用 `feishu_send_file` 直接发回当前话题/会话（可识别图片 ≤10 MB 以图片消息发送，其余以文件消息发送，文件上限 30 MB）。只能发送**当前话题工作目录内**的普通文件（`..` 与符号链接都按真实路径校验，不能读到其他话题或系统文件）；需开通 `im:resource` 权限，缺失时工具返回可读的 `PERMISSION_DENIED`，回合不受影响。开关：`feishuTools.sendFile`（默认开）。不超过 `feishuTools.inlineMarkdownChars` 字（默认 20000，0 关闭）的 `.md` 报告会先以卡片显示正文（按回复分段规则拆卡，每张最多 5 张表），再附上文件
+- **交付文件自动发到对话**：飞书用户看不到服务器上的路径，所以回合完成后插件把这一回合交付的文件自动发进当前话题/会话，不用再追问「用飞书发给我」。先发模型用宿主 `present` 工具声明的文件（会话事件 `deliverables/presented`），再发最终回复里提到、且在这个人的 `shared/` 目录里，或本回合在会话自己目录新建/修改过、扩展名在 `feishuTools.autoSendExtensions` 里的文件；每回合最多 `feishuTools.autoSendMaxFiles` 个（默认 5），同一会话发过且没改过的文件不重发（记在内存里，重启后可能再发一次）。停止或失败的回合不发。`feishuTools.autoSendFiles`：`mentioned`（默认，声明的和提到的）/ `presented`（只发声明的）/ `off`；`feishuTools.sendFile` 关闭时也不自动发送
 - **知识库读写**：开启 `feishuTools.wikiRead` / `feishuTools.wikiWrite`（默认都关）并在 `wikiRoots` 里配置知识空间链接 `https://<租户>.feishu.cn/wiki/space/<space_id>` 或节点链接 `https://<租户>.feishu.cn/wiki/<node_token>` 后，模型可用 `feishu_wiki_list` 浏览、`feishu_wiki_read` 读取飞书文档（Markdown，或带 block id 的飞书文档 XML，支持目录/章节/区间/关键词局部读取）、`feishu_wiki_create` 在范围内新建飞书文档、电子表格或多维表格（新节点也可作为子目录继续往下建）、`feishu_wiki_edit` 修改**本应用创建的**文档（追加、在块后插入、替换/删除块、文本替换、整篇重写；必须带上读取时的 `revision_id`，文档被他人改过会被拒绝）。电子表格用 `feishu_wiki_sheet_read` 按子表和 A1 范围读成 CSV（每行带 `[row=N]` 真实行号），`feishu_wiki_sheet_edit` 向**本应用创建的**表格写入单元格值或公式、在数据末尾追加行（追加位置会越过空行找到真正的最后一行，目标单元格非空时失败、不会覆盖；同样校验 `revision_id`；不改样式、图表和行列结构）。多维表格用 `feishu_wiki_base_read` 列数据表、读字段和记录（支持筛选、排序、关键词搜索、分页），`feishu_wiki_base_edit` 增改删记录：**本应用创建的**多维表格可增改删，其他多维表格**只能新增记录**（不改表和字段结构）。所有调用都用应用身份，并且按**会话所在位置**判权：私聊话题看本人的开关——读取类工具要求**「知识库读取」开关**（`/auth set wiki-read on @用户`），新建与修改类工具要求**「知识库写入」开关**（`/auth set wiki-write on @用户`），管理员两者都有；群话题看设置面板「群权限」里该群的开关（默认都关，只能在面板改），与发言人是谁无关；两个开关互相独立；`wikiRoots` 之外一律拒绝；打开某个文档或表格、每次新建、每次修改都会在话题里弹出**授权卡**，私聊只有本人能点，群话题里通过准入的成员都能点（读取授权在本话题内对该文档持续有效，`/renew` 或重启后重新询问），超时（`approvalTimeoutMs`）自动拒绝；浏览目录不弹卡。需开通 `wiki:wiki`、`docx:document`（只读可用 `wiki:wiki:readonly` / `docx:document:readonly`），电子表格和多维表格另需细分权限 `sheets:spreadsheet:read` / `sheets:spreadsheet:write_only`、`base:table:read` / `base:field:read` / `base:record:read` / `base:record:create|update|delete`（旧版 `sheets:spreadsheet` / `bitable:app` 不生效），且应用要是目标知识空间的成员（可把包含机器人的群加为空间成员/管理员）
 - **HITL 审批**：当模型请求需要授权的动作（如 bash 沙箱升级 `sandbox_permissions`）时，插件监听主机 `approval/request` 事件，在同一话题里**新发一张独立审批决策卡**：卡片标题带工具名；工具在审批请求里给了说明时，说明按行显示为卡片主体（`标签：值` 行显示成标签和值，缩进行显示成列表，不按 markdown 解析），bash 等带 `command` 参数的工具另外显示将执行的命令，其余参数按 `名称: 值` 收进默认折叠的「调用参数」，没有说明和命令时直接展开显示；提权时写明提权目标。提供 ✅ 允许 / ❌ 拒绝 / ♾️ 本话题不再询问 三个按钮；也可以在话题里直接回复「允许」「拒绝」「全部允许」，回复其他内容视为拒绝并作为下一条指令。等待期间流式卡片状态行显示「✋ 等待审批：工具名」。飞书消息发起的回合等 `approvalTimeoutMs`（默认 24 小时），子代理、后台任务、定时跟进、PR/MR 动态唤醒的回合等 `approvalBackgroundTimeoutMs`（默认 30 分钟），超时自动拒绝（fail-closed）；等待再久也不会锁住话题，回复其他内容就会拒绝审批并作为下一条指令。私聊话题里卡片 `approvalReminderMs`（默认 10 分钟）还没处理，会在卡片下回复一条提醒（只提醒一次，群话题不发）。超时的卡片和服务重启中断的卡片带「🔁 重新发起」按钮：点了以后在卡片下开一轮新回复，让模型先核对当前状态、已经完成的不重做，再重试这一步，需要授权时重新发卡；每张卡只能重新发起一次，7 天后按钮失效。「本话题不再询问」只对当前 Session 有效，会持久保存，重启后仍然生效，`/renew` 开新 Session 后恢复询问。私聊话题只认本人，群话题里通过准入的成员都可以点或回复，其他人无效
 - **结构化提问**：模型调用 `ask_user_question` 时，插件监听主机 `user-questions/request` 瀑布并发一张问答卡（每个问题一组选项按钮，多选先勾选再「提交本题选择」），答案回填给模型；主机自带的应答者只有 Web 客户端，没有本插件时纯飞书会话会以 `NO_PROVIDER` 失败。超时（`questionTimeoutMs`，默认 5 分钟）或回合取消时本轮提问失败（fail-closed）；没有可选项的问题直接提示用文字作答，**阻塞期间普通文本回复即作为该问题的自由文本答案**（同时支持多选后的自定义文本）
@@ -74,7 +75,9 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
    - 第二行：`📊 上下文 {tokens}/{window} ({占比}) · 📩 输入 {n} · 📨 输出 {n} · ⚡ 缓存命中 {pct}`。占比 = 上下文 tokens / 窗口（<10% 保留一位小数，≥10% 取整）；没有窗口时只显示 tokens
    - 输入/输出为 session 累计口径；模型、推理强度、缓存命中按**当前轮次**，本轮在请求头产生前失败时模型/缓存命中显示 `—`、推理强度省略，不会沿用上一轮
 
-**回复写法规范**：每个飞书会话的系统提示词里有一段「Replying in Feishu」（`dsh-channels:feishu-replies`），要求模型的最终回复先给结果和可点击链接、通常一到三句、技术细节放进 MR 描述或文件、需要决定时用 `ask_user_question` 问一个具体问题、如实说明未完成或失败、回复语言跟随用户消息、群聊里不转述私聊或其他会话的内容。它只约束最终回复的文字，卡片的状态行和思考过程不变。会话先被其他组合恢复（例如 Web 端先打开了它）时，插件接手时也会补上这一段和附件说明，每个 Agent 只注册一次。`replyGuidance: false` 关闭，修改后从下一次模型请求开始生效。
+**交付写法**：每个飞书会话的系统提示词里有一段「Delivering results in Feishu」，注册名与宿主 Web 组合的 `ui:deliverable-file-references` 相同，会话级注册会盖掉那段 Web 说明（让模型链接完整路径、等文件卡片），飞书里不出现。它告诉模型：用户只能在飞书里看，路径对用户没用；结论和关键发现写进最终回复，提到文件只写文件名；需要整份文件时用 `feishu_send_file` 发出来，`.md` 报告会直接显示正文；`autoSendFiles: mentioned` 时说明回复里提到的文件会自动发送。`feishuTools.sendFile` 关闭时改为「文件发不出来，把内容写进回复」。每次模型请求时按当前设置生成。
+
+**回复写法规范**：每个飞书会话的系统提示词里有一段「Replying in Feishu」（`dsh-channels:feishu-replies`），要求模型的最终回复先给结果和可点击链接、通常一到三句、技术细节放进 MR 描述、用户要分析或报告时回复里写结论和关键发现而不是存放位置、需要决定时用 `ask_user_question` 问一个具体问题、如实说明未完成或失败、回复语言跟随用户消息、群聊里不转述私聊或其他会话的内容。它只约束最终回复的文字，卡片的状态行和思考过程不变。会话先被其他组合恢复（例如 Web 端先打开了它）时，插件接手时也会补上这一段和附件说明，每个 Agent 只注册一次。`replyGuidance: false` 关闭，修改后从下一次模型请求开始生效。
 
 ## Web 设置面板（左侧栏 → 飞书渠道）
 
@@ -95,7 +98,7 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 | 会话 | 「触发」：私聊、普通群需要 @、话题被拒时降级为会话级（均为开关）；「工作区」：工作区根目录（`baseDir`）；「话题与卡片」：话题过期（`routeTtlMs`，按天）、审批卡片等待、后台唤醒的审批等待、私聊审批提醒（`approvalTimeoutMs` / `approvalBackgroundTimeoutMs` / `approvalReminderMs`，按分钟）、提问卡片等待（`questionTimeoutMs`，按秒）、流式刷新与状态行保活间隔；「飞书侧功能」：首次私聊引导、后台唤醒卡片、回复写法规范、斜杠指令面板同步、权限切换 |
 | 会话记录 | 飞书发起的全部会话：群聊按「群 → 用户 → 会话」、私聊按「用户 → 会话」分组，显示飞书群名、姓名和头像；顶部搜索框按群名、姓名或会话标题筛选；点会话行在主区进入该对话，用户行的「文件」只读浏览该用户的工作区（见下文「会话记录」） |
 | 模型 | 服务商、模型、推理档位、单次输出上限（`maxTokens`，留空使用模型默认）、Agent 预设 |
-| 附件与工具 | 「入站附件」：接收图片和文件（附件存入 DSH 原生附件库）、图片预取、首轮话题历史；「工具」：`feishu_topic_messages` / `feishu_send_file` / `propose_actions` 开关（`feishu_attachment_fetch` 随「接收图片和文件」挂载）；「限额与超时」：预取上限、读取附件上限与超时、读取话题消息超时、引用摘录与历史超时（共 8 项，默认收起，有改动或错误时自动展开） |
+| 附件与工具 | 「入站附件」：接收图片和文件（附件存入 DSH 原生附件库）、图片预取、首轮话题历史；「工具」：`feishu_topic_messages` / `feishu_send_file` / `propose_actions` 开关、自动发送交付文件、Markdown 报告直接显示（`feishu_attachment_fetch` 随「接收图片和文件」挂载）；「限额与超时」：预取上限、读取附件上限与超时、读取话题消息超时、引用摘录与历史超时、自动发送每回合文件上限（共 9 项，默认收起，有改动或错误时自动展开） |
 | 访问授权 | 待处理申请（置顶，一键授权 / 忽略）、调试模式（`accessMode`，开关）、申请有效期；用户表：每人一行，「管理员」加四个开关（对话 / 读知识库 / 写知识库 / 改代码）点一下即切换，管理员或对话关闭时其余开关变灰（添加表单默认收起） |
 | 群权限 | 群表：机器人开过话题的群各一行（群名 + `chat_id`，首次在群里开话题时自动登记），三个开关「读知识库 / 写知识库 / 改代码」点一下即切换，默认都关；「移除」删掉记录（下次在群里开话题重新登记，开关归零）；只能在面板改，飞书里没有对应命令 |
 | 知识库 | 知识库读 / 写工具开关（`feishuTools.wikiRead` / `feishuTools.wikiWrite`）、可访问范围 `wikiRoots`（每条链接一个输入框，逐条校验）；「可使用的人」：用户表里读 / 写知识库开关的人数，在「访问授权」里逐人设置；群话题按「群权限」判权 |
@@ -106,7 +109,7 @@ DeepSeek Harness（DSH）飞书渠道插件：**一个 dsh 实例对应一个飞
 **入站附件与模型工具（v2）**：「附件与工具」标签页的字段与 profile 配置同名、写入同一 Web 覆盖文件（`$DSH_HOME/dsh-channels/settings.json`）：
 
 - **入站附件**：附件接收（`acceptAttachments`，同时决定是否挂载 `feishu_attachment_fetch`）、触发消息图片预取（`prefetchImages`）、首轮话题历史条数（`historyBootstrapLimit`）。
-- **工具**：`feishu_topic_messages`（`feishuTools.topicMessages`）、`feishu_send_file`（`feishuTools.sendFile`）、`propose_actions`（`feishuTools.proposeActions`）开关。
+- **工具**：`feishu_topic_messages`（`feishuTools.topicMessages`）、`feishu_send_file`（`feishuTools.sendFile`）、`propose_actions`（`feishuTools.proposeActions`）开关，自动发送交付文件（`feishuTools.autoSendFiles`），Markdown 报告直接显示（`feishuTools.inlineMarkdownChars`）。
 - **限额与超时**：预取单图 / 总量 / 整段超时（`prefetchImageMaxBytes` / `prefetchTotalMaxBytes` / `prefetchTimeoutMs`）、读取附件资源数 / 字节预算 / 超时（`feishuTools.attachmentFetchMaxResources` / `attachmentFetchMaxBytes` / `attachmentFetchTimeoutMs`）、读取话题消息超时（`feishuTools.topicMessagesTimeoutMs`）、被动引用 / 历史读取预算（`promptContextTimeoutMs`）。
 
 `feishuTools.*` 是嵌套配置：面板只把改动过的子键写进覆盖层，其余子键保持原值（Web 覆盖或 profile 配置），不会因部分保存变成未定义。字段默认值、边界与降级规则见下文配置示例和 [docs/attachment-pipeline-v2.md](docs/attachment-pipeline-v2.md)。
@@ -230,9 +233,11 @@ src/
 │   ├── tool-mount.ts      # 在每个 Agent 作用域里注册通道工具（等待有上限、失败只告警一次）
 │   ├── abort.ts           # 读取与工具共用的取消辅助
 │   ├── tools.ts           # feishu_attachment_fetch / feishu_topic_messages 与每 route 白名单
-│   ├── send-file.ts       # feishu_send_file：把话题工作目录内的图片/文件发回当前会话
+│   ├── send-file.ts       # feishu_send_file：把话题工作目录内的图片/文件发回当前会话（.md 先显示正文卡片）
 │   ├── wiki/              # 知识库工具：links（wikiRoots 链接解析）、api（wiki/docx/docs_ai 接口）、sheet-api / base-api（电子表格、多维表格接口）、scope（范围判定）、consent（授权卡）、shared（失败码与公共步骤）、tools / sheet-tools / base-tools、a1（A1 范围）
-│   └── agent-context.ts   # agent 作用域 system prompt：附件指引与回复写法
+│   └── agent-context.ts   # agent 作用域 system prompt：附件指引、回复写法与交付写法
+├── deliverables/
+│   └── auto-send.ts       # 回合完成后自动发送 present 声明的和回复里提到的交付文件
 ├── dm/                    # 私聊 projects 模式
 │   ├── layout.ts          #   这个人的目录：main/、topics/<话题>/、shared/，读范围，移到会话自己的目录
 │   ├── tool-gate.ts       #   主会话工具闸门（dmMainTools + 话题工具）
@@ -370,6 +375,10 @@ npm 发行包已包含构建产物：Host 入口是 `lib/index.js`（profile 直
       topicMessages: true               # feishu_topic_messages：读取引用消息 / 话题历史并授权其附件
       topicMessagesTimeoutMs: 20000     # 单次话题读取整段超时（20 s；被动摘录用独立 3 s 预算）
       sendFile: true                    # feishu_send_file：把话题工作目录内生成的图片/文件发给用户（需 im:resource）
+      autoSendFiles: mentioned          # 回合完成后自动发送交付文件：mentioned（present 声明的 + 回复里提到的）| presented | off
+      autoSendMaxFiles: 5               # 每回合最多自动发送的文件数（1–20）
+      autoSendExtensions: [md, markdown, txt, pdf, doc, docx, xls, xlsx, csv, tsv, ppt, pptx, png, jpg, jpeg, gif, webp, bmp, svg, html, htm, zip, tar.gz, tgz, 7z]  # 会话自己目录里按这些扩展名自动发送（shared/ 里不限）
+      inlineMarkdownChars: 20000        # 不超过这么多字的 .md 文件先以卡片显示正文再附文件，0 只发文件
       proposeActions: true              # propose_actions：飞书主会话在回合末尾发送非阻塞「后续可选动作」按钮卡片
       wikiRead: false                   # feishu_wiki_list / feishu_wiki_read / feishu_wiki_sheet_read / feishu_wiki_base_read：浏览 wikiRoots 内的知识库，读取文档、电子表格、多维表格
       wikiWrite: false                  # feishu_wiki_create / feishu_wiki_edit / feishu_wiki_sheet_edit / feishu_wiki_base_edit：新建文档/表格，修改本应用创建的文档和表格，向多维表格写记录
@@ -486,7 +495,7 @@ FEISHU_APP_SECRET: xxxxxxxx
 ```
 
 - 会话创建后经 DSH 的工作目录服务（`workingDirectory`）移到自己的目录；没有这个服务的部署里，会话留在这个人的工作区根目录，读围栏照样只放行自己的目录和 `shared/`。
-- **读写范围**：话题会话只能访问自己的目录和 `shared/`，主会话只能访问 `main/` 和 `shared/`，都看不到其他话题的文件，免得无关文件挤占上下文。约定成果放进 `shared/`。
+- **读写范围**：话题会话只能访问自己的目录和 `shared/`，主会话只能访问 `main/` 和 `shared/`，都看不到其他话题的文件，免得无关文件挤占上下文。约定成果放进 `shared/`；放进去只是存档，交付要发到对话里（提示词要求写进回复或用 `feishu_send_file` 发出，回复里提到的 `shared/` 文件也会自动发送，见「交付文件自动发到对话」）。主会话的提示词要求：用户要 `shared/` 里的文件，或话题小结提到用户该看的文件时，直接用 `feishu_send_file` 发，不报路径。
 - **主会话工具收紧**：主会话只能调用 `dmMainTools` 里的工具（默认是读文件、搜索、联网、提问、技能和只读的飞书工具），其余调用在执行前拒绝，不管挂的是哪个 Agent 预设；命令行、写文件、改代码都在话题里做。主会话可以用 `dmMainPreset` 换一个预设。设置面板里这一项是勾选列表：工具从运行中的私聊主会话读出（每轮结束后保存一份，重启后还能看到上次的列表），按名字前缀分组并带一行说明；配置里有、主会话里没有的名字标「未安装」；话题工具和 `run_code` 显示为总是可用。还没有主会话运行过时退回手填工具名。PTC 模式下模型只能从 `run_code` 程序里调工具：主会话的 `run_code` 放行（程序里调用的每个工具仍按上面的名单逐个检查），但不能带 `sandbox_permissions` 提升沙箱（`dmMainTools` 里写了 `run_code` 也一样）；程序直接做的 Node 文件、网络、进程操作只受会话的 OS 沙箱约束。
 - **主会话回复像聊天**（`dmMainReplyStyle`，默认 `chat`）：主会话的回复是聊天消息，只显示回复文字，没有状态行、思考过程、统计和「回复分段」标题。模型每一步写的文字单独发一条消息（两次工具调用之间的那段写完，下一段就是新的一条），新消息直接发在对话里，不引用你的消息。还没写出文字时消息里只有一行「思考中…」（等审批、等回答时换成对应提示）；工作中你的消息上一直是「敲键盘」表情，结束后换成完成或失败；正在输出的那条带停止按钮，停止后最后一条下面标「已停止」。主会话的提示词要求它先用一两句话回应、再调工具，简单问题直接回答。`dmMainReasoningEffort` 单独设主会话的推理档位（默认沿用 `reasoningEffort`），调低档位第一句回复来得更快，话题仍用 `reasoningEffort`；会话里用 `/effort` 改过的以 `/effort` 为准，之后新建或恢复的主会话生效。设成 `card` 时主会话和话题一样用流式状态卡片，后续卡片同样直接发在对话里。
 - 话题会话首轮带上话题里的消息（包括被回复的那条主会话消息）；主会话首轮不带历史。
@@ -503,7 +512,7 @@ FEISHU_APP_SECRET: xxxxxxxx
 | `feishu_topic_read` | 读一个话题最近几轮（最多 5 轮）的最终回复，每轮截断到 4000 字 |
 | `feishu_topic_send` | 把一条消息发进已有话题：话题里显示「【主会话】…」，作为话题的下一轮，话题正忙时排在当前回合后面 |
 
-- **小结回写**：话题会话的提示词要求每轮最终回复以「小结 / 做了 / 结果 / 需要你」四行结尾。每轮结束后插件取出这一块（截到 `dmReportChars` 字，默认 300；没写小结时取回复最后这么多字），记进话题目录（存储表 `dm_topics`）。主会话**不会被唤醒**：用户下次在主聊天发消息时，所有还没送达的小结作为 `<dm_topic_updates>` 块附在这条消息后面，进会话日志。用户自己「回复话题」开的话题也一样回写。
+- **小结回写**：话题会话的提示词要求每轮最终回复以「小结 / 做了 / 结果 / 需要你」四行结尾，「结果」写结论本身，不写文件放在哪。每轮结束后插件取出这一块（截到 `dmReportChars` 字，默认 300；没写小结时取回复最后这么多字），记进话题目录（存储表 `dm_topics`）。主会话**不会被唤醒**：用户下次在主聊天发消息时，所有还没送达的小结作为 `<dm_topic_updates>` 块附在这条消息后面，进会话日志。用户自己「回复话题」开的话题也一样回写。
 - **状态**：「等你处理」= 话题在等审批或提问的回答，或小结的「需要你」不是「无」。主会话开的话题，根卡片跟着每一轮更新（进行中 / 已完成 / 已停止 / 失败 / 未能开始）；还有排队的消息时保持「进行中」。
 - **上限**：同一个人由主会话开、正在跑的话题最多 `dmMaxRunningTopics` 个（默认 5），超出时 `feishu_topic_open` 报错，主会话会告诉用户先等一个话题结束；用户自己开的话题不计入。
 - 话题开不起来（建会话失败等）时，根卡片和话题里的卡片都标成失败，不留路由，小结里记「未能开始：原因」。
