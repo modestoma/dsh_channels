@@ -68,6 +68,8 @@ export interface DmTopicOpenerDeps {
   directory: DmTopicDirectory
   /** Whether a Session has a turn in flight or queued (a forwarded message then gets a queued card). */
   busy(sessionId: string): boolean
+  /** A topic the main Session opened could not start (its failure is recorded in the directory). */
+  onStartFailed?(userId: string, chatId: string): void
   warn(message: string, ...args: unknown[]): void
 }
 
@@ -251,11 +253,15 @@ export class DmTopicOpener {
           attempts: 0,
         })
         await this.deps.routes.put(current.key, { ...current, cardMessageId: card.messageId, lastActivityAt: Date.now() })
+        await this.deps.directory.noteMainTurn(topicId)
         const outcome = await this.deps.prompts.run(live.agent, prompt, {
           cardMessageId: card.messageId,
           triggerMessageId: posted.messageId,
         })
-        if (!outcome.accepted) return { ok: false, code: 'submit-failed', message: outcome.reason }
+        if (!outcome.accepted) {
+          await this.deps.directory.noteMainTurn(topicId, -1)
+          return { ok: false, code: 'submit-failed', message: outcome.reason }
+        }
         await this.showTurnStatus(topicId, { kind: 'running' })
         return { ok: true, topicId, queued }
       } catch (error) {
@@ -339,6 +345,8 @@ export class DmTopicOpener {
         this.assertStarted()
         await this.deps.routes.put(threadId, record)
         published = true
+        // A failed start is reported through the directory's failure instead.
+        await this.deps.directory.noteMainTurn(threadId)
         const outcome = await this.deps.prompts.run(agent, prompt, { cardMessageId: cardId })
         if (!outcome.accepted) throw new Error(outcome.reason)
         // The turn is in flight: the directory counts it from here on.
@@ -361,6 +369,7 @@ export class DmTopicOpener {
       await this.deps.directory.markFailed(threadId, reason).catch((markError: unknown) => {
         this.deps.warn('dsh-channels: recording topic %s failure failed: %s', threadId, String(markError))
       })
+      this.deps.onStartFailed?.(userId, main.chatId)
     } finally {
       if (counted) this.unstart(userId)
       release()

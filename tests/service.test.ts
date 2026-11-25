@@ -54,6 +54,9 @@ function makeConfig(partial: Partial<FeishuConfig> = {}): FeishuConfig {
     dmMainTools: [...DEFAULT_DM_MAIN_TOOLS],
     dmMaxRunningTopics: 5,
     dmReportChars: 300,
+    // Topic wakes are covered by their own tests (they run after a merge window).
+    dmTopicWake: 'off',
+    dmTopicWakeLimit: 5,
     dmMainReplyStyle: 'card',
     requireMention: true,
     threadFallback: 'degrade',
@@ -5899,6 +5902,65 @@ describe('private-chat projects mode', () => {
       expect(file!.replyTo).toBe(routesOf(h).get('omt_cast')!.cardMessageId)
       await h.service.shutdown()
     })
+
+    it('wakes the main Session with the summary of a turn it started, once, and keeps person-typed topic turns quiet', async () => {
+      const { h, tools } = await setupTools({ dmTopicWake: 'agent' })
+      await h.onMessage(dm('帮我分析投屏日志'))
+      await waitForEstablishedSession(h)
+      const main = h.ctxState.agents.created[0]!.handle.agent
+      const opened = await tools.definitions.get('feishu_topic_open')!.execute(
+        { title: '投屏分析', brief: '分析三台机的投屏日志' }, exec,
+      ) as { ok: boolean; topic_id: string }
+      await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
+      const topic = h.ctxState.agents.created[1]!.handle.agent
+      await waitUntil(() => expect(mock(topic.followup)).toHaveBeenCalled())
+      await waitUntil(() => expect(topicsOf(h).get(opened.topic_id)?.mainTurns).toBe(1))
+      settleTurn(h, main, 1, '开了话题「投屏分析」。')
+      await resetFollowupAfterEstablishment(main)
+      const sentBefore = h.channel.sent.length
+
+      settleTurn(h, topic, 1, '找到了。\n\n小结\n做了：分析三台机日志\n结果：协商阶段超时\n需要你：无')
+      await vi.waitFor(() => expect(mock(main.followup)).toHaveBeenCalledTimes(1), { timeout: 6_000, interval: 20 })
+      expect(promptText(main, 0)).toContain('<dm_topic_updates>')
+      expect(promptText(main, 0)).toContain('结果：协商阶段超时')
+      expect(promptText(main, 0)).toContain('这条不是用户发的消息')
+      expect(mock(main.followup).mock.calls[0]![0]).toMatchObject({ source: { principal: { kind: 'feishu-user', userId: 'u_alice' } } })
+      // A new card in the main chat timeline, not a reply.
+      const sentSince = h.channel.sent.slice(sentBefore) as Array<{ input: object; options?: unknown }>
+      const wakeCard = sentSince.find(entry => 'card' in entry.input)
+      expect(wakeCard?.options).toBeUndefined()
+      expect(topicsOf(h).get(opened.topic_id)).toMatchObject({ deliveredAt: topicsOf(h).get(opened.topic_id)!.reportedAt })
+      expect(topicsOf(h).get(opened.topic_id)?.mainTurns).toBeUndefined()
+      settleTurn(h, main, 2, '话题查完了：协商阶段超时。')
+
+      // The person's own reply in the topic settles without waking the main Session.
+      await h.onMessage(dm('再看看第三台', { threadId: opened.topic_id }))
+      await waitUntil(() => expect(mock(topic.followup)).toHaveBeenCalledTimes(2))
+      settleTurn(h, topic, 2, '第三台正常。\n\n小结\n做了：看第三台\n结果：正常\n需要你：无')
+      await new Promise(resolve => setTimeout(resolve, 3_500))
+      expect(mock(main.followup)).toHaveBeenCalledTimes(1)
+      await h.service.shutdown()
+    }, 15_000)
+
+    it('shows a notice card instead of a main turn in notice mode and leaves the summary waiting', async () => {
+      const { h, tools } = await setupTools({ dmTopicWake: 'notice' })
+      await h.onMessage(dm('主会话'))
+      await waitForEstablishedSession(h)
+      const main = h.ctxState.agents.created[0]!.handle.agent
+      const opened = await tools.definitions.get('feishu_topic_open')!.execute({ title: '查日志', brief: '查一下' }, exec) as { topic_id: string }
+      await waitUntil(() => expect(h.ctxState.agents.created).toHaveLength(2))
+      const topic = h.ctxState.agents.created[1]!.handle.agent
+      await waitUntil(() => expect(mock(topic.followup)).toHaveBeenCalled())
+      settleTurn(h, main, 1, '开了。')
+      await resetFollowupAfterEstablishment(main)
+      settleTurn(h, topic, 1, '好了。\n\n小结\n做了：查日志\n结果：没有异常\n需要你：无')
+      const lastSent = (): string => JSON.stringify((h.channel.sent.at(-1) as { input: object } | undefined)?.input)
+      await vi.waitFor(() => expect(lastSent()).toContain('话题有进展'), { timeout: 6_000, interval: 20 })
+      expect(lastSent()).toContain('结果：没有异常')
+      expect(mock(main.followup)).not.toHaveBeenCalled()
+      expect(topicsOf(h).get(opened.topic_id)?.deliveredAt).toBeUndefined()
+      await h.service.shutdown()
+    }, 15_000)
 
     it('mounts the topic tools in the main Session only', async () => {
       const { h, tools } = await setupTools()

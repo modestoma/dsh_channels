@@ -8,8 +8,10 @@
  * from the reply. A summary newer than the record's `deliveredAt` is waiting
  * for the main Session: the person's next main-chat message carries every
  * waiting summary as a `<dm_topic_updates>` block ({@link topicUpdatesBlock}),
- * and {@link DmTopicDirectory.markDelivered} records that it went out. The
- * main Session is never woken for a summary.
+ * and {@link DmTopicDirectory.markDelivered} records that it went out. A
+ * turn the main Session started (counted by
+ * {@link DmTopicDirectory.noteMainTurn}) and a topic that could not start
+ * also wake the main Session (`dm/topic-wake.ts`).
  *
  * Records outlive their routes: a topic whose route expired is listed as
  * closed.
@@ -78,6 +80,8 @@ export const dmTopicRecordSchema = z.object({
   reportedAt: z.number().int().nonnegative().optional(),
   /** Epoch ms when the main Session last received this topic's summary. */
   deliveredAt: z.number().int().nonnegative().optional(),
+  /** Turns the main Session submitted (hand-over, forwarded messages) that have not settled yet. */
+  mainTurns: z.number().int().nonnegative().optional(),
   /** The last turns' replies, oldest first, at most {@link DM_TOPIC_REPLIES_KEPT}. */
   replies: z.array(dmTopicReplySchema).default([]),
 })
@@ -181,25 +185,48 @@ export class DmTopicDirectory {
   }
 
   /**
+   * Count one turn the main Session submits to a topic, before submitting it;
+   * the turn settling next ({@link recordTurn}) consumes it. A submission
+   * that was refused takes its count back with `step` -1.
+   * @param key - the topic's thread id.
+   * @param step - 1 to count a turn, -1 to take one back.
+   */
+  async noteMainTurn(key: string, step: 1 | -1 = 1): Promise<void> {
+    await this.change(key, (record) => {
+      const mainTurns = Math.max((record.mainTurns ?? 0) + step, 0)
+      const { mainTurns: _previous, ...rest } = record
+      return mainTurns === 0 ? rest : { ...rest, mainTurns }
+    })
+  }
+
+  /**
    * Record one settled topic turn: its outcome, its reply, and its summary.
    * @param key - the topic's thread id.
    * @param outcome - how the turn settled.
    * @param reply - the reply text of the turn.
    * @param reportChars - longest summary kept.
+   * @returns whether the turn was one the main Session submitted.
    */
-  async recordTurn(key: string, outcome: DmTopicReply['outcome'], reply: string, reportChars: number): Promise<void> {
+  async recordTurn(key: string, outcome: DmTopicReply['outcome'], reply: string, reportChars: number): Promise<{ byMain: boolean }> {
     const now = this.now()
     const report = extractTopicReport(reply, reportChars)
     const summary = report?.summary ?? OUTCOME_WITHOUT_REPLY[outcome]
-    await this.change(key, record => ({
-      ...record,
-      lastOutcome: outcome,
-      summary,
-      needsYou: report?.needsYou ?? false,
-      reportedAt: now,
-      updatedAt: now,
-      replies: [...record.replies, { at: now, outcome, text: clip(reply.trim(), DM_TOPIC_REPLY_MAX_CHARS) }].slice(-DM_TOPIC_REPLIES_KEPT),
-    }))
+    const byMain = (this.get(key)?.mainTurns ?? 0) > 0
+    await this.change(key, (record) => {
+      const mainTurns = Math.max((record.mainTurns ?? 0) - 1, 0)
+      const { mainTurns: _previous, ...rest } = record
+      return {
+        ...rest,
+        ...(mainTurns === 0 ? {} : { mainTurns }),
+        lastOutcome: outcome,
+        summary,
+        needsYou: report?.needsYou ?? false,
+        reportedAt: now,
+        updatedAt: now,
+        replies: [...record.replies, { at: now, outcome, text: clip(reply.trim(), DM_TOPIC_REPLY_MAX_CHARS) }].slice(-DM_TOPIC_REPLIES_KEPT),
+      }
+    })
+    return { byMain }
   }
 
   /**
